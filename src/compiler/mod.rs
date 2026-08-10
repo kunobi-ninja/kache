@@ -176,6 +176,10 @@ pub struct KeyCtx<'a, 'db> {
     /// (see [`crate::cache_key::apply_key_env_vars`]). Empty leaves the key
     /// byte-identical to the undeclared case.
     pub key_env_vars: &'a [String],
+    /// Digest from the invocation's already-resolved extra-input snapshot.
+    /// Rustc folds it into the key; other compiler families currently resolve
+    /// their own declaration because Cargo dep-info completion is Rust-only.
+    pub extra_inputs_digest: Option<&'a str>,
 }
 
 /// Categorization of a compiler output file.

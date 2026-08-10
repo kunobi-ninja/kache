@@ -534,6 +534,30 @@ fn doctor_runs_readonly_diagnostics() {
     e.cmd().arg("doctor").assert().success();
 }
 
+#[test]
+fn doctor_does_not_prescribe_obsolete_build_script_for_extra_inputs() {
+    let e = env();
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname='doctor-extra-inputs'\nversion='0.1.0'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("kache.toml"),
+        "extra_inputs = [\"data/**/*.txt\"]\n",
+    )
+    .unwrap();
+
+    e.cmd()
+        .current_dir(project.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("cargo:rerun-if-changed").not())
+        .stdout(predicates::str::contains("no build.rs").not());
+}
+
 /// kunobi-ninja/kache#176: `doctor --verify` is meant to gate CI, so a store
 /// with unrepairable corruption must exit NON-ZERO, and the same store must
 /// exit zero once `--repair` has cleared it. Drives the real binary because

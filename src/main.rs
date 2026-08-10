@@ -622,6 +622,31 @@ fn is_cc_compiler_invocation(args: &[String]) -> bool {
     compiler::detect_compiler(args).is_some_and(|adapter| adapter.id() == compiler::cc::CC_ID)
 }
 
+/// Run a Cargo `RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER` chain uncached while
+/// retaining Kache-owned freshness for an active `extra_inputs` declaration.
+fn preserve_workspace_wrapper_incremental(
+    preserve_requested: bool,
+    extra_inputs_active: bool,
+) -> bool {
+    preserve_requested && !extra_inputs_active
+}
+
+fn run_workspace_wrapper_chain(config: &config::Config, args: &[String]) -> Result<i32> {
+    let parsed = args::RustcArgs::parse(args).context("parsing workspace-wrapper rustc chain")?;
+    let extra_inputs = wrapper::resolve_extra_inputs_for_passthrough(config, &parsed)?;
+    let preserve_incremental =
+        preserve_workspace_wrapper_incremental(config.preserve_incremental, extra_inputs.is_some());
+    let exit = run_compiler_directly(config, args, preserve_incremental)?;
+    if exit == 0 {
+        wrapper::complete_current_extra_inputs_after_success(
+            config,
+            &parsed,
+            extra_inputs.as_ref(),
+        )?;
+    }
+    Ok(exit)
+}
+
 fn run_compiler_process_directly(args: &[String], preserve_incremental: bool) -> Result<i32> {
     // A previous cache-on build may have restored this crate's outputs
     // as read-only hardlinks into the store (0o444, shared inode).
@@ -805,9 +830,16 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         std::process::exit(wrapper::run_cc_probe(args)?);
     }
 
-    let direct_passthrough = compiler::is_workspace_wrapper_chain(args)
-        || (compiler::is_passthrough_compiler_invocation(args)
-            && !compiler::rustc::RustcCompiler::recognizes(args));
+    if compiler::is_workspace_wrapper_chain(args) {
+        tracing::debug!(
+            program = ?args.first(),
+            "workspace-wrapper chain is uncached; retaining extra-input Cargo freshness"
+        );
+        std::process::exit(run_workspace_wrapper_chain(&config, args)?);
+    }
+
+    let direct_passthrough = compiler::is_passthrough_compiler_invocation(args)
+        && !compiler::rustc::RustcCompiler::recognizes(args);
     if direct_passthrough {
         tracing::debug!(
             program = ?args.first(),
@@ -895,6 +927,21 @@ mod tests {
         assert_eq!(parse_duration_hours("48"), Some(48));
         assert_eq!(parse_duration_hours("invalid"), None);
         assert_eq!(parse_duration_hours("18446744073709551615d"), None);
+    }
+
+    #[test]
+    fn workspace_wrapper_incremental_preservation_requires_opt_in_and_no_extra_inputs() {
+        for (requested, extra_inputs_active, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert_eq!(
+                preserve_workspace_wrapper_incremental(requested, extra_inputs_active),
+                expected
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -209,6 +209,10 @@ pub struct RustcArgs {
     pub out_dir: Option<PathBuf>,
     /// Emit types (--emit): dep-info, metadata, link, etc.
     pub emit: Vec<String>,
+    /// Explicit output path from `--emit=dep-info=<path>`, when present.
+    /// Cargo normally leaves this implicit; direct-rustc layouts are retained
+    /// so cache admission can force a safe passthrough.
+    pub dep_info_output: Option<PathBuf>,
     /// Source file (positional argument, typically the .rs file)
     pub source_file: Option<PathBuf>,
     /// Extern dependencies (--extern name=path)
@@ -282,6 +286,16 @@ pub struct ExternDep {
     pub path: Option<PathBuf>,
 }
 
+fn parse_emit_value(value: &str, kinds: &mut Vec<String>, dep_info_output: &mut Option<PathBuf>) {
+    for part in value.split(',') {
+        let (kind, output) = part.split_once('=').unwrap_or((part, ""));
+        kinds.push(kind.to_string());
+        if kind == "dep-info" && !output.is_empty() {
+            *dep_info_output = Some(PathBuf::from(output));
+        }
+    }
+}
+
 impl RustcArgs {
     /// Parse RUSTC_WRAPPER-style arguments.
     /// In RUSTC_WRAPPER mode, argv[0] = kache, argv[1] = rustc path, argv[2..] = rustc args.
@@ -329,6 +343,7 @@ impl RustcArgs {
             output: None,
             out_dir: None,
             emit: Vec::new(),
+            dep_info_output: None,
             source_file: None,
             externs: Vec::new(),
             target: None,
@@ -379,11 +394,7 @@ impl RustcArgs {
                 "--emit" => {
                     i += 1;
                     if let Some(val) = rustc_args.get(i) {
-                        for part in val.split(',') {
-                            // emit can be "dep-info=path" or just "metadata"
-                            let kind = part.split('=').next().unwrap_or(part);
-                            parsed.emit.push(kind.to_string());
-                        }
+                        parse_emit_value(val, &mut parsed.emit, &mut parsed.dep_info_output);
                     }
                 }
                 "--target" => {
@@ -414,10 +425,7 @@ impl RustcArgs {
                 }
                 _ if arg.starts_with("--emit=") => {
                     let val = &arg["--emit=".len()..];
-                    for part in val.split(',') {
-                        let kind = part.split('=').next().unwrap_or(part);
-                        parsed.emit.push(kind.to_string());
-                    }
+                    parse_emit_value(val, &mut parsed.emit, &mut parsed.dep_info_output);
                 }
                 "--test" => {
                     parsed.is_test = true;
@@ -714,6 +722,40 @@ impl RustcArgs {
             self.crate_name.as_ref()?,
             self.extra_filename.as_deref().unwrap_or(""),
         ))
+    }
+
+    /// Path of the Cargo-facing rustc dep-info output for this invocation.
+    ///
+    /// Cargo's normal invocation uses `<out-dir>/<crate><extra>.d`. Explicit
+    /// `--emit=dep-info=<path>` and `-o` forms are direct-rustc layouts that the
+    /// cache restore model does not preserve; those invocations pass through
+    /// and retain their caller-owned freshness.
+    pub fn dep_info_path(&self) -> Option<PathBuf> {
+        if !self.emit.iter().any(|kind| kind == "dep-info") {
+            return None;
+        }
+        if self.dep_info_output.is_some() {
+            return None;
+        }
+        if self.output.is_some() {
+            return None;
+        }
+        let name = self.crate_name.as_deref()?;
+        let file_name = format!(
+            "{}.d",
+            format_crate_output_stem(name, self.extra_filename.as_deref().unwrap_or(""))
+        );
+        self.out_dir.as_ref().map(|dir| dir.join(file_name))
+    }
+
+    /// Cargo checksum freshness asks rustc to annotate every dep-info input.
+    /// Directories cannot carry those annotations, so extra-input directory
+    /// watches must currently reject this mode instead of staying perpetually
+    /// dirty or silently missing additions.
+    pub fn checksum_freshness_enabled(&self) -> bool {
+        self.unstable_flags
+            .iter()
+            .any(|flag| flag.starts_with("checksum-hash-algorithm"))
     }
 
     /// This compile's own unit identity, for diagnostics only
@@ -1628,6 +1670,102 @@ mod tests {
     #[test]
     fn test_target_dir_none_when_no_paths() {
         assert_eq!(RustcArgs::default().target_dir(), None);
+    }
+
+    #[test]
+    fn dep_info_path_uses_cargo_output_stem() {
+        let args = RustcArgs {
+            crate_name: Some("serde".to_string()),
+            extra_filename: Some("-abc123".to_string()),
+            out_dir: Some(PathBuf::from("/work/proj/target/debug/deps")),
+            emit: vec!["dep-info".to_string(), "metadata".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            args.dep_info_path(),
+            Some(PathBuf::from("/work/proj/target/debug/deps/serde-abc123.d"))
+        );
+    }
+
+    #[test]
+    fn dep_info_path_skips_explicit_emit_path() {
+        let args: Vec<String> = [
+            "rustc",
+            "--crate-name",
+            "x",
+            "src/lib.rs",
+            "--emit=metadata,dep-info=custom/deps.mk",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = RustcArgs::parse(&args).unwrap();
+        assert_eq!(
+            parsed.dep_info_output,
+            Some(PathBuf::from("custom/deps.mk"))
+        );
+        assert_eq!(parsed.dep_info_path(), None);
+    }
+
+    #[test]
+    fn dep_info_path_is_none_when_not_requested() {
+        let args = RustcArgs {
+            crate_name: Some("x".to_string()),
+            out_dir: Some(PathBuf::from("/tmp/out")),
+            emit: vec!["metadata".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(args.dep_info_path(), None);
+    }
+
+    #[test]
+    fn dep_info_path_does_not_guess_direct_rustc_o_naming() {
+        for emit in [vec!["dep-info"], vec!["dep-info", "link"]] {
+            let args = RustcArgs {
+                crate_name: Some("x".to_string()),
+                output: Some(PathBuf::from("named.bin")),
+                emit: emit.into_iter().map(str::to_string).collect(),
+                ..Default::default()
+            };
+            assert_eq!(args.dep_info_path(), None);
+        }
+    }
+
+    #[test]
+    fn dep_info_path_skips_stdout_and_out_dir_plus_o_forms() {
+        let stdout = RustcArgs {
+            emit: vec!["dep-info".to_string()],
+            dep_info_output: Some(PathBuf::from("-")),
+            ..Default::default()
+        };
+        assert_eq!(stdout.dep_info_path(), None);
+
+        let overridden = RustcArgs {
+            crate_name: Some("x".to_string()),
+            output: Some(PathBuf::from("named.bin")),
+            out_dir: Some(PathBuf::from("out")),
+            emit: vec!["dep-info".to_string(), "link".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(overridden.dep_info_path(), None);
+    }
+
+    #[test]
+    fn parses_checksum_freshness_rustc_flag() {
+        let args: Vec<String> = [
+            "rustc",
+            "src/lib.rs",
+            "-Z",
+            "checksum-hash-algorithm=blake3",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(
+            RustcArgs::parse(&args)
+                .unwrap()
+                .checksum_freshness_enabled()
+        );
     }
 
     #[test]

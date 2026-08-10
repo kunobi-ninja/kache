@@ -180,13 +180,10 @@ impl Compiler for RustcCompiler {
     fn cache_key(&self, parsed: &RustcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
         let crate_name = parsed.crate_name.as_deref().unwrap_or("unknown");
         let key = compute_cache_key(parsed, ctx.file_hasher, ctx.path_normalizer)?;
-        let key = crate::extra_inputs::apply_extra_inputs(
-            key,
-            parsed.source_file.as_deref(),
-            crate_name,
-            parsed.is_primary,
-            ctx.file_hasher,
-        );
+        let key = match ctx.extra_inputs_digest {
+            Some(digest) => crate::cache_key::fold_labeled(key, "extra_inputs", digest),
+            None => key,
+        };
         let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, crate_name);
         Ok(crate::cache_key::apply_key_salt(
             key,
@@ -255,6 +252,11 @@ fn rustc_refuse_reasons(
     if parsed.argfile_expansion_failed() {
         reasons.push(RefuseReason::Unsupported(
             "rustc response file could not be safely expanded — not yet supported",
+        ));
+    }
+    if parsed.dep_info_output.is_some() {
+        reasons.push(RefuseReason::Unsupported(
+            "rustc explicit --emit=dep-info=<path> output — not cacheable",
         ));
     }
     // `--pretty`/`--unpretty` (and the `-Z unpretty=…` form) make rustc dump
@@ -420,6 +422,24 @@ mod tests {
             )),
             "expected a response-file refusal, got {reasons:?}"
         );
+    }
+
+    #[test]
+    fn refuse_reasons_refuses_explicit_dep_info_output_path() {
+        let parsed = RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "src/lib.rs",
+                "--crate-name",
+                "foo",
+                "--emit=metadata,dep-info=custom/deps.mk",
+            ]))
+            .unwrap();
+        let reasons = RustcCompiler::new().refuse_reasons(&parsed);
+        assert!(reasons.iter().any(|reason| matches!(
+            reason,
+            RefuseReason::Unsupported(detail) if detail.contains("explicit --emit=dep-info")
+        )));
     }
 
     #[test]

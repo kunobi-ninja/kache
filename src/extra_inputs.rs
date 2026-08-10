@@ -42,6 +42,8 @@
 //!   never collapses to the unconfigured key).
 
 use crate::cache_key::FileHasher;
+use anyhow::{Context, Result};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 /// The co-located per-crate config file. Deliberately distinct from the
@@ -55,6 +57,11 @@ const COLOCATED_NAME: &str = "kache.toml";
 /// tree each compile. Warn so it's visible under default verbosity without
 /// failing the build — over-folding is fail-safe, just slow.
 const OVER_BROAD_FILE_WARN: usize = 1000;
+
+/// A declaration with more distinct Cargo directory dependencies than this is
+/// almost certainly being used as a generated watch list rather than a small
+/// set of input globs. Keep the consumer fingerprint bounded.
+const MAX_WATCH_PATHS: usize = 256;
 
 /// Whether this crate has a co-located extra-input declaration.
 ///
@@ -81,6 +88,91 @@ struct ColocatedConfig {
     extra_inputs: Vec<String>,
 }
 
+/// One invocation's fully-resolved extra-input declaration.
+///
+/// The wrapper resolves this once, passes [`Self::digest`] into key
+/// computation, then uses [`Self::merge_into_dep_info`] on the consumer-facing
+/// dep-info after either compilation or restore. Paths are those of the
+/// current consumer worktree; nothing in this value comes from a cached
+/// producer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExtraInputsSnapshot {
+    config_path: PathBuf,
+    normalized_patterns: Vec<String>,
+    /// `None` for an explicit empty declaration: Cargo still watches the
+    /// config so later activation is visible, while the cache key remains
+    /// byte-identical to an unconfigured crate.
+    digest: Option<String>,
+    matched_files: Vec<PathBuf>,
+    /// Narrow directories Cargo may recursively fingerprint to notice a glob
+    /// addition/deletion, or creation of a currently-missing literal input.
+    watch_paths: Vec<PathBuf>,
+    /// Metadata observed after resolution. This is deliberately outside the
+    /// cache-key digest: it detects ABA races (v1 -> transient -> v1, or a
+    /// glob member added then removed) before Cargo accepts compiler output.
+    observations: Vec<InputObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputObservation {
+    path: PathBuf,
+    size: u64,
+    mtime_ns: i64,
+    ctime_ns: i64,
+    inode: i64,
+}
+
+fn observe_dependency(path: &Path) -> Result<InputObservation> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("reading extra_inputs metadata for {}", path.display()))?;
+    Ok(InputObservation {
+        path: path.to_path_buf(),
+        size: metadata.len(),
+        mtime_ns: crate::cache_key::metadata_mtime_ns(&metadata),
+        ctime_ns: crate::cache_key::metadata_ctime_ns(&metadata),
+        inode: crate::cache_key::metadata_inode(&metadata),
+    })
+}
+
+impl ExtraInputsSnapshot {
+    /// Resolve a crate's active declaration exactly once.
+    ///
+    /// `Ok(None)` retains the old no-op cases: non-primary invocation or no
+    /// co-located config. An explicit empty declaration returns a config-only
+    /// snapshot so Cargo can observe later activation without changing the
+    /// cache key. Invalid declarations and unsafe watches fail closed.
+    pub(crate) fn resolve(
+        source_file: Option<&Path>,
+        crate_name: &str,
+        is_primary: bool,
+        file_hasher: &FileHasher<'_>,
+    ) -> Result<Option<Self>> {
+        resolve_snapshot(source_file, crate_name, is_primary, file_hasher, true)
+    }
+
+    pub(crate) fn digest(&self) -> Option<&str> {
+        self.digest.as_deref()
+    }
+
+    /// Merge config, matched files, and narrow directory watches into the
+    /// first dependency rule of a rustc/Cargo dep-info file.
+    ///
+    /// Only consumer-facing dep-info should be passed here (after a cache
+    /// store/restore boundary), so a restored file never retains a producer's
+    /// absolute worktree paths. Current-consumer paths are emitted absolute so
+    /// Cargo resolves them correctly even when rustc runs from a workspace root.
+    pub(crate) fn merge_into_dep_info(&self, dep_info_path: &Path) -> Result<()> {
+        merge_snapshot_into_dep_info(self, dep_info_path)
+    }
+
+    /// Pure form used by cache restore: complete and validate the expanded
+    /// consumer bytes before any cached artifact is materialized or reported
+    /// as a hit.
+    pub(crate) fn merge_dep_info_content(&self, content: &str) -> Result<String> {
+        merge_snapshot_dep_info_content(self, content)
+    }
+}
+
 /// Compute a digest of a crate's co-located extra inputs, or `None` when the
 /// crate declares none (no `kache.toml`, empty list, or non-cacheable
 /// invocation). Fold the returned digest into the crate's key via
@@ -95,43 +187,17 @@ pub(crate) fn digest(
     is_primary: bool,
     file_hasher: &FileHasher<'_>,
 ) -> Option<String> {
-    // Only cacheable compiles pay any cost; everything else short-circuits
-    // before the `stat`.
-    if !is_primary {
-        return None;
-    }
-
-    let crate_dir = crate_dir_from_source(source_file?)?;
-    let config_path = crate_dir.join(COLOCATED_NAME);
-
-    // Cheap existence check first — the cost paid by the vast majority of
-    // crates that don't use the feature is this one `stat`.
-    let raw = match std::fs::read(&config_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return None,
-    };
-
-    let text = match std::str::from_utf8(&raw) {
-        Ok(t) => t,
-        Err(_) => return Some(unparseable_digest(crate_name, &config_path, &raw)),
-    };
-
-    let config: ColocatedConfig = match toml::from_str(text) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                "[key:{crate_name}] {} is invalid ({e}); folding it as an opaque \
-                 input so the crate rebuilds until fixed",
-                config_path.display()
-            );
-            // We can't know the real inputs, so don't risk a stale hit: fold
-            // the raw bytes as an opaque, deterministic component. Same broken
-            // file → same key; any edit re-keys.
-            return Some(unparseable_digest(crate_name, &config_path, &raw));
+    // Compatibility API for C/C++ and any out-of-tree callers. It deliberately
+    // does not enforce Cargo watch-root policy: that policy is Rust/Cargo-only,
+    // while the digest bytes must retain their existing semantics. New Rust
+    // code should resolve `ExtraInputsSnapshot` and propagate its `Result`.
+    match resolve_snapshot(source_file, crate_name, is_primary, file_hasher, false) {
+        Ok(snapshot) => snapshot.and_then(|snapshot| snapshot.digest),
+        Err(error) => {
+            tracing::warn!("[key:{crate_name}] failed to resolve extra_inputs: {error:#}");
+            None
         }
-    };
-
-    fold_extra_inputs(crate_name, &crate_dir, &config.extra_inputs, file_hasher)
+    }
 }
 
 /// Fold a crate's co-located extra inputs into an already-computed key.
@@ -173,32 +239,258 @@ fn crate_dir_from_source(source_file: &Path) -> Option<PathBuf> {
     None
 }
 
+#[derive(Debug, Clone)]
+struct NormalizedInputPattern {
+    glob: String,
+    watch: WatchIntent,
+}
+
+#[derive(Debug, Clone)]
+enum WatchIntent {
+    /// A matched literal file catches edits/deletion itself. If currently
+    /// missing, Cargo watches its nearest narrow existing parent directory.
+    Literal(PathBuf),
+    /// Cargo recursively fingerprints this literal root directory so a glob
+    /// catches edits, additions, and deletions below it.
+    DirectoryRoot(PathBuf),
+}
+
+fn io_error_is_not_found(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
+fn symlink_metadata_if_present(path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if io_error_is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_file_if_present(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if io_error_is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn legacy_digest_mode(strict_watches: bool) -> bool {
+    !strict_watches
+}
+
+fn strict_input_error<E>(strict_watches: bool, error: E) -> std::result::Result<(), E> {
+    if strict_watches { Err(error) } else { Ok(()) }
+}
+
+fn resolve_snapshot(
+    source_file: Option<&Path>,
+    crate_name: &str,
+    is_primary: bool,
+    file_hasher: &FileHasher<'_>,
+    strict_watches: bool,
+) -> Result<Option<ExtraInputsSnapshot>> {
+    if !is_primary {
+        return Ok(None);
+    }
+    let Some(source_file) = source_file else {
+        return Ok(None);
+    };
+    let Some(crate_dir) = crate_dir_from_source(source_file) else {
+        return Ok(None);
+    };
+    let crate_dir = lexical_normalize(&crate_dir);
+    let config_path = crate_dir.join(COLOCATED_NAME);
+
+    if strict_watches {
+        match symlink_metadata_if_present(&config_path) {
+            Ok(Some(metadata)) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "active extra_inputs config {} is a symlink; Cargo canonicalizes dep-info and \
+                     cannot notice that link being retargeted safely",
+                    config_path.display()
+                );
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "reading active extra_inputs config metadata {}",
+                        config_path.display()
+                    )
+                });
+            }
+        }
+    }
+
+    let raw = match read_file_if_present(&config_path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(None),
+        Err(error) if legacy_digest_mode(strict_watches) => {
+            // Preserve the legacy digest API's unreadable-config no-op. The
+            // strict snapshot API fails closed instead.
+            tracing::warn!(
+                "[key:{crate_name}] cannot read {}: {error}",
+                config_path.display()
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading active extra_inputs config {}",
+                    config_path.display()
+                )
+            });
+        }
+    };
+    if strict_watches && windows_path_uses_device_namespace(&crate_dir) {
+        anyhow::bail!(
+            "active extra_inputs cannot enumerate a crate through a Windows verbatim/device \
+             namespace path safely; use the ordinary drive or UNC spelling"
+        );
+    }
+    if strict_watches {
+        // The parsed pattern set, rather than formatting/comments, defines the
+        // key. Still observe the config through the guarded hasher so a rewrite
+        // racing this snapshot suppresses cache publication.
+        file_hasher.hash(&config_path).with_context(|| {
+            format!(
+                "hashing active extra_inputs config {}",
+                config_path.display()
+            )
+        })?;
+    }
+
+    let opaque_snapshot = |raw: &[u8]| ExtraInputsSnapshot {
+        config_path: config_path.clone(),
+        normalized_patterns: Vec::new(),
+        digest: Some(unparseable_digest(crate_name, &config_path, raw)),
+        matched_files: Vec::new(),
+        watch_paths: Vec::new(),
+        observations: Vec::new(),
+    };
+    let text = match std::str::from_utf8(&raw) {
+        Ok(text) => text,
+        Err(_) if legacy_digest_mode(strict_watches) => return Ok(Some(opaque_snapshot(&raw))),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "active extra_inputs config {} must be valid UTF-8",
+                    config_path.display()
+                )
+            });
+        }
+    };
+    let config: ColocatedConfig = match toml::from_str(text) {
+        Ok(config) => config,
+        Err(error) if strict_watches => {
+            return Err(error).with_context(|| {
+                format!(
+                    "parsing active extra_inputs config {}",
+                    config_path.display()
+                )
+            });
+        }
+        Err(error) => {
+            tracing::warn!(
+                "[key:{crate_name}] {} is invalid ({error}); folding it as an opaque \
+                 input so the crate rebuilds until fixed",
+                config_path.display()
+            );
+            return Ok(Some(opaque_snapshot(&raw)));
+        }
+    };
+
+    resolve_declared_inputs(
+        crate_name,
+        crate_dir,
+        config_path,
+        &config.extra_inputs,
+        file_hasher,
+        strict_watches,
+    )
+}
+
 /// Fold the declared pattern set and the content hashes of every matched file
 /// into a single hex digest. Returns `None` only for the genuinely-empty
 /// declaration (`extra_inputs = []`), an explicit opt-out that must stay
 /// byte-identical to having no `kache.toml`. A non-empty declaration always
 /// folds *something* — even if every pattern is rejected — so it can never
 /// collapse back to the no-config key.
-fn fold_extra_inputs(
+fn resolve_declared_inputs(
     crate_name: &str,
-    crate_dir: &Path,
+    crate_dir: PathBuf,
+    config_path: PathBuf,
     patterns: &[String],
     file_hasher: &FileHasher<'_>,
-) -> Option<String> {
+    strict_watches: bool,
+) -> Result<Option<ExtraInputsSnapshot>> {
     // An explicit empty list is the opt-out: byte-identical to no `kache.toml`.
     if patterns.is_empty() {
-        return None;
+        return if strict_watches {
+            let observations = vec![observe_dependency(&config_path)?];
+            Ok(Some(ExtraInputsSnapshot {
+                config_path,
+                normalized_patterns: Vec::new(),
+                digest: None,
+                matched_files: Vec::new(),
+                watch_paths: Vec::new(),
+                observations,
+            }))
+        } else {
+            Ok(None)
+        };
     }
 
     // Normalize the declared patterns. Out-of-crate patterns (absolute / `..`)
     // are kept (with a portability warning); only a pattern smuggling in the
     // fold separator is skipped.
-    let mut normalized: Vec<String> = patterns
+    let mut by_glob = BTreeMap::new();
+    let mut rejected_patterns = Vec::new();
+    for pattern in patterns {
+        if strict_watches && pattern_uses_dynamic_expansion(pattern) {
+            anyhow::bail!(
+                "active extra_inputs pattern {pattern:?} uses `$ENV` or `~` expansion; Cargo \
+                 cannot notice that expansion changing, so use a stable literal path"
+            );
+        }
+        if strict_watches && windows_pattern_has_ambiguous_root(Path::new(pattern)) {
+            anyhow::bail!(
+                "active extra_inputs pattern {pattern:?} uses a Windows rooted-without-drive or \
+                 drive-relative path; use a fully-qualified absolute path or a crate-relative path"
+            );
+        }
+        if strict_watches && windows_path_uses_device_namespace(Path::new(pattern)) {
+            anyhow::bail!(
+                "active extra_inputs pattern {pattern:?} uses a Windows verbatim/device namespace \
+                 that glob enumeration cannot track safely; use an ordinary drive or UNC path"
+            );
+        }
+        if strict_watches && parent_traversal_follows_glob(pattern) {
+            anyhow::bail!(
+                "active extra_inputs pattern {pattern:?} traverses `..` after a wildcard; \
+                 Cargo cannot derive a bounded watch root that sees new matches"
+            );
+        }
+        if let Some(normalized) = normalize_pattern_info(crate_name, &crate_dir, pattern) {
+            by_glob.entry(normalized.glob.clone()).or_insert(normalized);
+        } else {
+            rejected_patterns.push(pattern);
+        }
+    }
+    if strict_watches && !rejected_patterns.is_empty() {
+        anyhow::bail!(
+            "active extra_inputs contains {} invalid pattern(s); fix the declaration before Cargo freshness can be completed safely",
+            rejected_patterns.len()
+        );
+    }
+    let normalized: Vec<NormalizedInputPattern> = by_glob.into_values().collect();
+    let normalized_patterns: Vec<String> = normalized
         .iter()
-        .filter_map(|p| normalize_pattern(crate_name, crate_dir, p))
+        .map(|pattern| pattern.glob.clone())
         .collect();
-    normalized.sort();
-    normalized.dedup();
 
     // The author DECLARED inputs (non-empty list) but every pattern was
     // rejected. Collapsing to `None` here would make the key byte-identical to
@@ -206,7 +498,7 @@ fn fold_extra_inputs(
     // the feature exists to prevent, while the author believes the file is
     // tracked. Fold the raw declared patterns instead: the key is distinct
     // from no-config and any edit to `kache.toml` re-keys.
-    if normalized.is_empty() {
+    if normalized_patterns.is_empty() {
         tracing::warn!(
             "[key:{crate_name}] every extra_inputs pattern was rejected; folding the raw \
              declaration so the crate stays distinct from an unconfigured one"
@@ -220,14 +512,43 @@ fn fold_extra_inputs(
             hasher.update(p.as_bytes());
             hasher.update(b"\x1f");
         }
-        return Some(hasher.finalize().to_hex().to_string());
+        return Ok(Some(ExtraInputsSnapshot {
+            config_path,
+            normalized_patterns,
+            digest: Some(hasher.finalize().to_hex().to_string()),
+            matched_files: Vec::new(),
+            watch_paths: Vec::new(),
+            observations: Vec::new(),
+        }));
+    }
+
+    // Reject broad recursive directory dependencies before globbing. Cargo
+    // fingerprints a directory recursively; injecting the crate root or a
+    // filesystem root would turn every build into an unbounded tree walk.
+    let watch_paths = match resolve_watch_paths(&crate_dir, &normalized) {
+        Ok(paths) => paths,
+        Err(error) if !strict_watches => {
+            tracing::warn!("[key:{crate_name}] unsafe Cargo extra_inputs watch: {error:#}");
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
+    if strict_watches {
+        for watch in &watch_paths {
+            inspect_safe_watch_tree(watch).with_context(|| {
+                format!(
+                    "checking active extra_inputs watch {} for byte-preserving enumeration",
+                    watch.display()
+                )
+            })?;
+        }
     }
 
     let mut hasher = blake3::Hasher::new();
 
     // (1) The declared pattern set itself — so editing `kache.toml` re-keys
     // even when it currently matches zero files.
-    for pat in &normalized {
+    for pat in &normalized_patterns {
         hasher.update(b"extra_input_pattern:");
         hasher.update(pat.as_bytes());
         hasher.update(b"\x1f");
@@ -239,7 +560,8 @@ fn fold_extra_inputs(
     // — the same fail-safe stance as the per-file `unreadable` sentinel.
     let mut matched: Vec<PathBuf> = Vec::new();
     let mut glob_errors: Vec<String> = Vec::new();
-    for pat in &normalized {
+    for normalized in &normalized {
+        let pat = &normalized.glob;
         // An absolute pattern is used as-is; a relative one anchors at the
         // crate dir (whose literal bytes are escaped so a `[`/`?` in the path
         // can't be read as a glob metachar — the user's pattern is appended
@@ -264,8 +586,12 @@ fn fold_extra_inputs(
         }
         let entries = match glob::glob(&full) {
             Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!("[key:{crate_name}] bad extra_inputs glob {pat:?}: {e}");
+            Err(error) => {
+                let rendered = error.to_string();
+                strict_input_error(strict_watches, error).with_context(|| {
+                    format!("parsing active extra_inputs glob {pat:?} for {crate_name}")
+                })?;
+                tracing::warn!("[key:{crate_name}] bad extra_inputs glob {pat:?}: {rendered}");
                 continue;
             }
         };
@@ -273,10 +599,14 @@ fn fold_extra_inputs(
             match entry {
                 Ok(p) if p.is_file() => matched.push(p),
                 Ok(_) => {}
-                Err(e) => {
-                    let rel = crate_relative_path(crate_dir, e.path());
+                Err(error) => {
+                    let rel = crate_relative_path(&crate_dir, error.path());
+                    let rendered = error.to_string();
+                    strict_input_error(strict_watches, error).with_context(|| {
+                        format!("enumerating active extra_inputs glob {pat:?} for {crate_name}")
+                    })?;
                     tracing::warn!(
-                        "[key:{crate_name}] extra_inputs enumeration error at {rel:?}: {e}"
+                        "[key:{crate_name}] extra_inputs enumeration error at {rel:?}: {rendered}"
                     );
                     glob_errors.push(rel);
                 }
@@ -285,6 +615,24 @@ fn fold_extra_inputs(
     }
     matched.sort();
     matched.dedup();
+
+    // Recheck after globbing. A symlink inserted between the first preflight
+    // and enumeration must not let `glob` follow an unbounded/non-UTF-8 tree
+    // that was absent from the key's safety check.
+    let observed_watch_dirs = if strict_watches {
+        let mut directories = BTreeSet::new();
+        for watch in &watch_paths {
+            directories.extend(inspect_safe_watch_tree(watch).with_context(|| {
+                format!(
+                    "rechecking active extra_inputs watch {} after enumeration",
+                    watch.display()
+                )
+            })?);
+        }
+        directories
+    } else {
+        BTreeSet::new()
+    };
 
     // Empirical breadth guard: catches an over-broad glob regardless of shape
     // (an absolute `/**`, or a relative `**/*` that accidentally spans
@@ -316,11 +664,25 @@ fn fold_extra_inputs(
     let mut readable: Vec<String> = Vec::new();
     let mut unreadable: Vec<String> = Vec::new();
     for path in &matched {
-        let rel = crate_relative_path(crate_dir, path);
+        let rel = crate_relative_path(&crate_dir, path);
+        if strict_watches && rel.contains('\x1f') {
+            anyhow::bail!(
+                "active extra_inputs dependency {} contains the cache-key control separator; \
+                 rename it before the declaration can be keyed unambiguously",
+                path.display()
+            );
+        }
         match file_hasher.hash(path) {
             Ok(h) => readable.push(format!("{rel}={h}")),
-            Err(e) => {
-                tracing::warn!("[key:{crate_name}] extra_input unreadable {rel:?}: {e}");
+            Err(error) => {
+                let rendered = error.to_string();
+                strict_input_error(strict_watches, error).with_context(|| {
+                    format!(
+                        "hashing active extra_inputs dependency {} for {crate_name}",
+                        path.display()
+                    )
+                })?;
+                tracing::warn!("[key:{crate_name}] extra_input unreadable {rel:?}: {rendered}");
                 unreadable.push(rel);
             }
         }
@@ -371,7 +733,43 @@ fn fold_extra_inputs(
         normalized.len()
     );
 
-    Some(hasher.finalize().to_hex().to_string())
+    let dependencies: BTreeSet<PathBuf> = std::iter::once(config_path.clone())
+        .chain(matched.iter().cloned())
+        .chain(watch_paths.iter().cloned())
+        .collect();
+    if strict_watches {
+        for dependency in &dependencies {
+            if let Some(symlink) = first_symlink_below_common(&crate_dir, dependency) {
+                anyhow::bail!(
+                    "active extra_inputs dependency {} crosses symlink {}; Cargo canonicalizes \
+                     dep-info and cannot notice that link being retargeted safely",
+                    dependency.display(),
+                    symlink.display()
+                );
+            }
+        }
+    }
+    let observation_paths: BTreeSet<PathBuf> = std::iter::once(config_path.clone())
+        .chain(matched.iter().cloned())
+        .chain(observed_watch_dirs)
+        .collect();
+    let observations = if strict_watches {
+        observation_paths
+            .iter()
+            .map(|path| observe_dependency(path))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Some(ExtraInputsSnapshot {
+        config_path,
+        normalized_patterns,
+        digest: Some(hasher.finalize().to_hex().to_string()),
+        matched_files: matched,
+        watch_paths,
+        observations,
+    }))
 }
 
 /// A matched file's path as a stable, crate-relative, `/`-separated string for
@@ -394,7 +792,16 @@ fn crate_relative_path(crate_dir: &Path, path: &Path) -> String {
 /// Out-of-crate patterns (absolute / `..`) are *folded*, with a portability
 /// warning: reaching outside the crate is the author's explicit, fail-safe
 /// choice, but it makes the key host-/layout-specific.
+#[cfg(test)]
 fn normalize_pattern(crate_name: &str, crate_dir: &Path, pattern: &str) -> Option<String> {
+    normalize_pattern_info(crate_name, crate_dir, pattern).map(|pattern| pattern.glob)
+}
+
+fn normalize_pattern_info(
+    crate_name: &str,
+    crate_dir: &Path,
+    pattern: &str,
+) -> Option<NormalizedInputPattern> {
     let (normalized, unset_vars) = crate::config::expand_exclude_pattern_collecting(pattern);
 
     // An unset `$VAR` in a pattern is the one failure mode the rest of this
@@ -457,14 +864,295 @@ fn normalize_pattern(crate_name: &str, crate_dir: &Path, pattern: &str) -> Optio
     // force-normalize the pattern: that can only break a match the author's
     // editor already aligned with the on-disk bytes.
     let trimmed = normalized.strip_suffix('/').unwrap_or(&normalized);
-    let reshaped = if crate_dir.join(trimmed).is_dir() {
-        format!("{}/**/*", glob::Pattern::escape(trimmed))
+    let literal_path = anchor_input_path(crate_dir, Path::new(trimmed));
+    let (glob, watch) = if literal_path.is_dir() {
+        (
+            format!("{}/**/*", glob::Pattern::escape(trimmed)),
+            WatchIntent::DirectoryRoot(literal_path),
+        )
     } else if normalized.ends_with('/') {
-        format!("{normalized}**/*")
+        (
+            format!("{normalized}**/*"),
+            WatchIntent::DirectoryRoot(literal_path),
+        )
+    } else if normalized.contains(['*', '?', '[']) {
+        let root = literal_glob_root(&normalized);
+        (
+            normalized,
+            WatchIntent::DirectoryRoot(anchor_input_path(crate_dir, &root)),
+        )
     } else {
-        normalized
+        (normalized, WatchIntent::Literal(literal_path))
     };
-    Some(reshaped)
+    Some(NormalizedInputPattern { glob, watch })
+}
+
+fn pattern_uses_dynamic_expansion(pattern: &str) -> bool {
+    if pattern == "~" || pattern.starts_with("~/") {
+        return true;
+    }
+    let mut chars = pattern.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '$'
+            && chars
+                .peek()
+                .is_some_and(|next| *next == '{' || *next == '_' || next.is_ascii_alphanumeric())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(any(windows, test))]
+fn windows_root_shape_is_ambiguous(is_absolute: bool, has_root: bool, has_prefix: bool) -> bool {
+    !is_absolute && (has_root || has_prefix)
+}
+
+#[cfg(windows)]
+fn windows_pattern_has_ambiguous_root(path: &Path) -> bool {
+    windows_root_shape_is_ambiguous(
+        path.is_absolute(),
+        path.has_root(),
+        matches!(path.components().next(), Some(Component::Prefix(_))),
+    )
+}
+
+#[cfg(not(windows))]
+fn windows_pattern_has_ambiguous_root(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(any(windows, test))]
+fn windows_prefix_uses_device_namespace(prefix: std::path::Prefix<'_>) -> bool {
+    use std::path::Prefix;
+    matches!(
+        prefix,
+        Prefix::Verbatim(_)
+            | Prefix::VerbatimUNC(_, _)
+            | Prefix::VerbatimDisk(_)
+            | Prefix::DeviceNS(_)
+    )
+}
+
+#[cfg(windows)]
+fn windows_path_uses_device_namespace(path: &Path) -> bool {
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if windows_prefix_uses_device_namespace(prefix.kind())
+    )
+}
+
+#[cfg(not(windows))]
+fn windows_path_uses_device_namespace(_path: &Path) -> bool {
+    false
+}
+
+fn parent_traversal_follows_glob(pattern: &str) -> bool {
+    let mut saw_glob = false;
+    for component in Path::new(pattern).components() {
+        match component {
+            Component::ParentDir if saw_glob => return true,
+            Component::Normal(text) => {
+                let text = text.to_string_lossy();
+                saw_glob |= text.contains(['*', '?', '[']);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Literal directory prefix before the first component carrying glob syntax.
+/// A pattern such as `migrations/**/*.sql` yields `migrations`; `**/*.sql`
+/// yields an empty relative path, which anchors to the crate root and is
+/// rejected before enumeration.
+fn literal_glob_root(pattern: &str) -> PathBuf {
+    let mut root = PathBuf::new();
+    for component in Path::new(pattern).components() {
+        let text = component.as_os_str().to_string_lossy();
+        if text.contains(['*', '?', '[']) {
+            break;
+        }
+        root.push(component.as_os_str());
+    }
+    root
+}
+
+fn anchor_input_path(crate_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        lexical_normalize(path)
+    } else {
+        lexical_normalize(&crate_dir.join(path))
+    }
+}
+
+/// Normalize `.`/`..` without requiring the path to exist or resolving
+/// symlinks. Missing literal inputs still need a stable parent watch.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Find a user-controlled symlink component between the crate and one of its
+/// declared dependencies. Cargo canonicalizes dep-info paths, so watching only
+/// the symlink target would miss a later retarget of the link itself.
+fn first_symlink_below_common(crate_dir: &Path, dependency: &Path) -> Option<PathBuf> {
+    let crate_components: Vec<_> = crate_dir.components().collect();
+    let dependency_components: Vec<_> = dependency.components().collect();
+    let common_len = crate_components
+        .iter()
+        .zip(&dependency_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut probe = PathBuf::new();
+    for component in &dependency_components[..common_len] {
+        probe.push(component.as_os_str());
+    }
+    for component in &dependency_components[common_len..] {
+        probe.push(component.as_os_str());
+        if std::fs::symlink_metadata(&probe).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Some(probe);
+        }
+    }
+    None
+}
+
+/// `glob` works through UTF-8 patterns and silently omits non-UTF-8 directory
+/// entries on Unix. Preflight each bounded watch tree with `read_dir`, which
+/// preserves `OsStr`, and fail closed instead of keying an incomplete set.
+fn inspect_safe_watch_tree(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut directories = Vec::new();
+    while let Some(directory) = pending.pop() {
+        directories.push(directory.clone());
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("reading directory {}", directory.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("reading an entry under {}", directory.display()))?;
+            if entry.file_name().to_str().is_none() {
+                anyhow::bail!(
+                    "directory {} contains a non-UTF-8 name that the configured glob cannot enumerate safely",
+                    directory.display()
+                );
+            }
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("reading file type for {}", entry.path().display()))?;
+            if file_type.is_symlink() {
+                anyhow::bail!(
+                    "directory {} contains symlink {} that Cargo/glob cannot follow with bounded, byte-preserving freshness semantics",
+                    directory.display(),
+                    entry.path().display()
+                );
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    directories.sort();
+    directories.dedup();
+    Ok(directories)
+}
+
+fn nearest_existing_directory(start: &Path) -> Option<PathBuf> {
+    let mut candidate = Some(start);
+    while let Some(path) = candidate {
+        if path.is_dir() {
+            return Some(lexical_normalize(path));
+        }
+        candidate = path.parent();
+    }
+    None
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    path.has_root() && path.parent().is_none()
+}
+
+fn any_broad_watch_condition(conditions: [bool; 4]) -> bool {
+    conditions.into_iter().any(|condition| condition)
+}
+
+fn resolve_watch_paths(
+    crate_dir: &Path,
+    patterns: &[NormalizedInputPattern],
+) -> Result<Vec<PathBuf>> {
+    let crate_dir = lexical_normalize(crate_dir);
+    let canonical_crate_dir =
+        std::fs::canonicalize(&crate_dir).unwrap_or_else(|_| crate_dir.clone());
+    let mut watches = BTreeSet::new();
+
+    for pattern in patterns {
+        // Invalid globs retain their existing digest semantics and are skipped
+        // during enumeration; they do not justify a broad directory watch.
+        if glob::Pattern::new(&pattern.glob).is_err() {
+            continue;
+        }
+        let start = match &pattern.watch {
+            WatchIntent::Literal(path) if path.is_file() => continue,
+            WatchIntent::Literal(path) => path.parent(),
+            WatchIntent::DirectoryRoot(path) => Some(path.as_path()),
+        };
+        let Some(start) = start else {
+            anyhow::bail!(
+                "extra_inputs pattern {:?} has no directory that Cargo can watch; \
+                 place the input under a narrow existing directory",
+                pattern.glob
+            );
+        };
+        let Some(watch) = nearest_existing_directory(start) else {
+            anyhow::bail!(
+                "extra_inputs pattern {:?} has no existing directory to watch; \
+                 create a narrow parent directory first",
+                pattern.glob
+            );
+        };
+
+        // Watching the crate root, an ancestor of it, or the filesystem root
+        // makes Cargo recursively fingerprint an unrelated/unbounded tree.
+        // Check the resolved directory too: an in-crate symlink to `/` must
+        // not bypass the lexical guard and hand Cargo a filesystem-root scan.
+        let canonical_watch = std::fs::canonicalize(&watch).unwrap_or_else(|_| watch.clone());
+        if any_broad_watch_condition([
+            is_filesystem_root(&watch),
+            is_filesystem_root(&canonical_watch),
+            crate_dir.starts_with(&watch),
+            canonical_crate_dir.starts_with(&canonical_watch),
+        ]) {
+            anyhow::bail!(
+                "extra_inputs pattern {:?} would make Cargo recursively watch broad directory {} \
+                 (the crate root or an ancestor); add a literal subdirectory to the pattern, or \
+                 create a narrow parent directory for a missing literal input",
+                pattern.glob,
+                watch.display()
+            );
+        }
+
+        watches.insert(watch);
+        if watches.len() > MAX_WATCH_PATHS {
+            anyhow::bail!(
+                "extra_inputs resolves to more than {MAX_WATCH_PATHS} directory watches; \
+                 consolidate patterns under a smaller set of narrow literal roots"
+            );
+        }
+    }
+
+    Ok(watches.into_iter().collect())
 }
 
 /// True if a glob's literal prefix (the part before the first glob
@@ -491,6 +1179,204 @@ fn walks_filesystem_root(glob_pattern: &str) -> bool {
     rooted && base.parent().is_none()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FirstMakeRule {
+    colon: usize,
+    insertion: usize,
+}
+
+fn merge_snapshot_into_dep_info(
+    snapshot: &ExtraInputsSnapshot,
+    dep_info_path: &Path,
+) -> Result<()> {
+    let metadata = std::fs::metadata(dep_info_path).with_context(|| {
+        format!(
+            "reading required consumer dep-info {} for active extra_inputs declaration",
+            dep_info_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "required consumer dep-info {} is not a regular file; refusing to return with an \
+             incomplete Cargo fingerprint for active extra_inputs",
+            dep_info_path.display()
+        );
+    }
+    let original = std::fs::read_to_string(dep_info_path).with_context(|| {
+        format!(
+            "reading required consumer dep-info {} for active extra_inputs declaration",
+            dep_info_path.display()
+        )
+    })?;
+    let updated = merge_snapshot_dep_info_content(snapshot, &original).with_context(|| {
+        format!(
+            "malformed consumer dep-info {} for active extra_inputs declaration",
+            dep_info_path.display()
+        )
+    })?;
+    if updated == original {
+        return Ok(());
+    }
+    crate::atomic::atomic_replace(dep_info_path, updated.as_bytes()).with_context(|| {
+        format!(
+            "atomically updating consumer dep-info {} for active extra_inputs declaration",
+            dep_info_path.display()
+        )
+    })
+}
+
+fn merge_snapshot_dep_info_content(
+    snapshot: &ExtraInputsSnapshot,
+    original: &str,
+) -> Result<String> {
+    tracing::trace!(
+        "merging extra_inputs dep-info: {} normalized pattern(s), {} matched file(s), {} watch path(s)",
+        snapshot.normalized_patterns.len(),
+        snapshot.matched_files.len(),
+        snapshot.watch_paths.len()
+    );
+    let rule = first_make_dependency_rule(original)?;
+    let rule_tail = &original[rule.colon..rule.insertion];
+    let dependencies = rule_tail
+        .strip_prefix(':')
+        .expect("first_make_dependency_rule points at a colon");
+    let existing_words = parse_make_words(dependencies).context("parsing Cargo dependency rule")?;
+    let compiler_cwd = std::env::current_dir()
+        .context("resolving compiler working directory for extra_inputs dep-info")?;
+    let existing: BTreeSet<PathBuf> = existing_words
+        .iter()
+        .map(|word| anchor_input_path(&compiler_cwd, Path::new(word)))
+        .collect();
+
+    let mut dependency_paths = BTreeSet::new();
+    dependency_paths.insert(lexical_normalize(&snapshot.config_path));
+    dependency_paths.extend(
+        snapshot
+            .matched_files
+            .iter()
+            .map(|path| lexical_normalize(path)),
+    );
+    dependency_paths.extend(
+        snapshot
+            .watch_paths
+            .iter()
+            .map(|path| lexical_normalize(path)),
+    );
+
+    let mut additions = Vec::new();
+    for path in dependency_paths {
+        if existing.contains(&path) {
+            continue;
+        }
+        // Cargo interprets rustc dep-info paths relative to rustc's working
+        // directory, which is normally the workspace root rather than the
+        // member crate. Absolute consumer paths are unambiguous and are added
+        // only after cache storage/restoration, so they never leak producer
+        // worktree paths into cached blobs.
+        let text = path.to_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "extra_inputs dependency {} is not valid UTF-8 and cannot be represented safely \
+                 in Cargo dep-info",
+                path.display()
+            )
+        })?;
+        additions.push(make_escape_word(text)?);
+    }
+    additions.sort();
+    additions.dedup();
+    if additions.is_empty() {
+        return Ok(original.to_string());
+    }
+
+    let mut updated = String::with_capacity(
+        original.len() + additions.iter().map(String::len).sum::<usize>() + additions.len(),
+    );
+    updated.push_str(&original[..rule.insertion]);
+    updated.push(' ');
+    updated.push_str(&additions.join(" "));
+    updated.push_str(&original[rule.insertion..]);
+
+    Ok(updated)
+}
+
+/// Locate the first line Cargo will parse as rustc dep-info. Cargo recognizes
+/// the first line containing `: `; drive-letter colons and `#` remain literal.
+fn first_make_dependency_rule(input: &str) -> Result<FirstMakeRule> {
+    let mut offset = 0usize;
+    for line_with_newline in input.split_inclusive('\n') {
+        let line = line_with_newline
+            .strip_suffix('\n')
+            .unwrap_or(line_with_newline);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        // Cargo handles rustc's environment records before looking for the
+        // dependency rule. An env value may itself contain `: ` and must not
+        // be mistaken for the Make target/dependency separator.
+        if line.starts_with("# env-dep:") {
+            offset += line_with_newline.len();
+            continue;
+        }
+        if let Some(relative_colon) = line.find(": ") {
+            let colon = offset + relative_colon;
+            let dependency_start = relative_colon + 2;
+            let trimmed_dependencies = line[dependency_start..].trim_end_matches([' ', '\t']);
+            let insertion = offset + dependency_start + trimmed_dependencies.len();
+            return Ok(FirstMakeRule { colon, insertion });
+        }
+        offset += line_with_newline.len();
+    }
+
+    anyhow::bail!("dep-info contains no Make dependency rule")
+}
+
+/// Parse dependency words exactly as Cargo 0.98 / Rust 1.97 does: split on
+/// whitespace, then join the next token while the current token ends in `\\`.
+fn parse_make_words(input: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut tokens = input.split_whitespace();
+    while let Some(token) = tokens.next() {
+        let mut word = token.to_string();
+        while word.ends_with('\\') {
+            word.pop();
+            word.push(' ');
+            word.push_str(
+                tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("malformed dep-info format, trailing \\"))?,
+            );
+        }
+        words.push(word);
+    }
+    Ok(words)
+}
+
+/// Parse the dependency side of the same rustc dep-info rule Cargo consumes.
+///
+/// Keep cache-restore validation on the exact grammar used by
+/// [`merge_snapshot_dep_info_content`]: Cargo skips leading metadata records
+/// and consumes the first line containing `: `.
+pub(crate) fn parse_dep_info_dependencies(input: &str) -> Result<Vec<PathBuf>> {
+    let rule = first_make_dependency_rule(input)?;
+    parse_make_words(&input[rule.colon + 1..rule.insertion])
+        .map(|words| words.into_iter().map(PathBuf::from).collect())
+}
+
+fn make_escape_word(input: &str) -> Result<String> {
+    if input
+        .chars()
+        .any(|character| character.is_whitespace() && character != ' ')
+    {
+        anyhow::bail!(
+            "extra_inputs dependency contains unsupported whitespace and cannot enter Cargo dep-info"
+        );
+    }
+    if input.ends_with([' ', '\\']) {
+        anyhow::bail!(
+            "extra_inputs dependency ends in a space or backslash, which Cargo dep-info cannot represent"
+        );
+    }
+    Ok(input.replace(' ', "\\ "))
+}
+
 /// Deterministic opaque digest for an unreadable / unparseable `kache.toml`:
 /// the build re-keys on any edit and never aliases "no file present".
 fn unparseable_digest(crate_name: &str, config_path: &Path, raw: &[u8]) -> String {
@@ -502,103 +1388,6 @@ fn unparseable_digest(crate_name: &str, config_path: &Path, raw: &[u8]) -> Strin
         config_path.display()
     );
     hasher.finalize().to_hex().to_string()
-}
-
-/// A crate whose co-located `kache.toml` declares `extra_inputs` but whose
-/// build script won't re-invoke rustc when those files change. Because the key
-/// is only (re)computed when cargo spawns rustc, editing a tracked file in a
-/// warm in-place target restores the stale artifact instead of re-keying —
-/// unless a build script emits a matching `cargo:rerun-if-changed`. Surfaced by
-/// `kache doctor` (rio-build#51 point 1).
-pub(crate) struct RerunGap {
-    pub crate_dir: PathBuf,
-    pub reason: &'static str,
-}
-
-/// Result of [`audit_rerun_coverage`].
-pub(crate) struct RerunAudit {
-    /// Crates found with a non-empty `extra_inputs` declaration.
-    pub declaring: usize,
-    /// Of those, the ones whose build script won't re-trigger rustc.
-    pub gaps: Vec<RerunGap>,
-}
-
-/// Cap on directory entries visited by [`audit_rerun_coverage`], so a `doctor`
-/// run in a huge tree can't walk forever. Generous for any real workspace.
-const AUDIT_WALK_LIMIT: usize = 50_000;
-
-/// Walk `root` for crates that declare `extra_inputs` without a build script
-/// that re-triggers rustc on a tracked-file change.
-///
-/// Heuristic and advisory: a static scan can't know what a build script emits
-/// at runtime, so this only checks whether a `build.rs` exists and mentions
-/// `rerun-if-changed` at all — it can't confirm the rerun path actually covers
-/// the declared globs, nor see a script that emits the directive without the
-/// literal string. Skips `target`, `.git`, and hidden directories.
-pub(crate) fn audit_rerun_coverage(root: &Path) -> RerunAudit {
-    let mut declaring = 0usize;
-    let mut gaps = Vec::new();
-    let mut visited = 0usize;
-    let mut stack = vec![root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            visited += 1;
-            if visited > AUDIT_WALK_LIMIT {
-                return RerunAudit { declaring, gaps };
-            }
-            let path = entry.path();
-            let file_type = entry.file_type();
-            if file_type.map(|t| t.is_dir()).unwrap_or(false) {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                // Skip build output, VCS metadata, and hidden dirs — none hold
-                // a crate root we'd warn about, and `target/` is enormous.
-                if name == "target" || name.starts_with('.') {
-                    continue;
-                }
-                stack.push(path);
-                continue;
-            }
-            if entry.file_name() != COLOCATED_NAME {
-                continue;
-            }
-            // A co-located kache.toml: check its declaration.
-            let Some(crate_dir) = path.parent().map(Path::to_path_buf) else {
-                continue;
-            };
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(config) = toml::from_str::<ColocatedConfig>(&text) else {
-                continue;
-            };
-            if config.extra_inputs.is_empty() {
-                continue;
-            }
-            declaring += 1;
-
-            let build_rs = crate_dir.join("build.rs");
-            let reason = if !build_rs.is_file() {
-                Some("no build.rs to emit cargo:rerun-if-changed")
-            } else {
-                match std::fs::read_to_string(&build_rs) {
-                    Ok(src) if src.contains("rerun-if-changed") => None,
-                    Ok(_) => Some("build.rs emits no cargo:rerun-if-changed"),
-                    Err(_) => None,
-                }
-            };
-            if let Some(reason) = reason {
-                gaps.push(RerunGap { crate_dir, reason });
-            }
-        }
-    }
-
-    gaps.sort_by(|a, b| a.crate_dir.cmp(&b.crate_dir));
-    RerunAudit { declaring, gaps }
 }
 
 #[cfg(test)]
@@ -625,6 +1414,178 @@ mod tests {
     fn dig(src: &Path) -> Option<String> {
         let fh = FileHasher::new();
         digest(Some(src), "x", true, &fh)
+    }
+
+    #[test]
+    fn strict_and_legacy_error_policies_are_complementary() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(io_error_is_not_found(&missing));
+        assert!(!io_error_is_not_found(&denied));
+
+        assert!(legacy_digest_mode(false));
+        assert!(!legacy_digest_mode(true));
+        assert_eq!(strict_input_error(false, "legacy-error"), Ok(()));
+        assert_eq!(
+            strict_input_error(true, "strict-error"),
+            Err("strict-error")
+        );
+    }
+
+    #[test]
+    fn file_presence_helpers_distinguish_missing_paths_from_other_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("regular-file");
+        std::fs::write(&file, b"contents").unwrap();
+        let missing = dir.path().join("missing");
+        // Platform filesystems disagree on whether `file/child` is
+        // NotFound or NotADirectory. An embedded NUL is rejected before the
+        // filesystem lookup everywhere, so it exercises the non-NotFound
+        // branch portably.
+        let invalid = dir.path().join("invalid\0path");
+
+        assert!(
+            symlink_metadata_if_present(&file)
+                .unwrap()
+                .expect("existing file has metadata")
+                .is_file()
+        );
+        assert!(symlink_metadata_if_present(&missing).unwrap().is_none());
+        assert_ne!(
+            symlink_metadata_if_present(&invalid).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        assert_eq!(
+            read_file_if_present(&file).unwrap(),
+            Some(b"contents".to_vec())
+        );
+        assert!(read_file_if_present(&missing).unwrap().is_none());
+        assert_ne!(
+            read_file_if_present(&invalid).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn missing_config_is_a_strict_snapshot_noop() {
+        let (_dir, src) = crate_fixture(&[]);
+        assert!(
+            ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn config_read_errors_preserve_the_strict_legacy_boundary() {
+        let (dir, src) = crate_fixture(&[]);
+        std::fs::create_dir(dir.path().join("kache.toml")).unwrap();
+
+        let strict = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new());
+        assert!(strict.is_err(), "strict resolution must fail closed");
+        assert!(
+            resolve_snapshot(Some(&src), "x", true, &FileHasher::new(), false)
+                .unwrap()
+                .is_none(),
+            "the compatibility digest keeps its unreadable-config no-op"
+        );
+    }
+
+    #[test]
+    fn strict_snapshot_rejects_non_utf8_config() {
+        let (dir, src) = crate_fixture(&[]);
+        std::fs::write(dir.path().join("kache.toml"), b"\xff\xfe extra_inputs").unwrap();
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("strict active declarations must be UTF-8");
+        assert!(format!("{error:#}").contains("valid UTF-8"), "{error:#}");
+    }
+
+    #[test]
+    fn strict_snapshot_rejects_invalid_glob_syntax() {
+        let (_dir, src) = crate_fixture(&[("kache.toml", "extra_inputs = [\"data/[bad\"]")]);
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("strict active declarations must reject invalid globs");
+        assert!(
+            format!("{error:#}").contains("parsing active extra_inputs glob"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn pattern_safety_helpers_cover_both_sides_of_each_boundary() {
+        for pattern in ["~", "~/data", "${DATA}/x", "$_DATA/x", "$DATA/x"] {
+            assert!(pattern_uses_dynamic_expansion(pattern), "{pattern:?}");
+        }
+        for pattern in ["$", "$-", "cash$-value", "path/~"] {
+            assert!(!pattern_uses_dynamic_expansion(pattern), "{pattern:?}");
+        }
+
+        assert!(!parent_traversal_follows_glob("../shared/*.json"));
+        assert!(!parent_traversal_follows_glob("data/../shared/*.json"));
+        assert!(parent_traversal_follows_glob("data/*/../shared.json"));
+
+        assert_eq!(
+            lexical_normalize(Path::new("./x")).as_os_str(),
+            std::ffi::OsStr::new("x")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("foo/../bar")),
+            PathBuf::from("bar")
+        );
+        assert_eq!(lexical_normalize(Path::new("foo/..")), PathBuf::new());
+        assert_eq!(lexical_normalize(Path::new("../x")), PathBuf::from("../x"));
+
+        assert!(is_filesystem_root(Path::new(std::path::MAIN_SEPARATOR_STR)));
+        assert!(!is_filesystem_root(Path::new("not-a-root")));
+        assert!(!any_broad_watch_condition([false; 4]));
+        for index in 0..4 {
+            let mut conditions = [false; 4];
+            conditions[index] = true;
+            assert!(any_broad_watch_condition(conditions));
+        }
+
+        for (is_absolute, has_root, has_prefix, expected) in [
+            (false, false, false, false),
+            (false, false, true, true),
+            (false, true, false, true),
+            (false, true, true, true),
+            (true, false, false, false),
+            (true, false, true, false),
+            (true, true, false, false),
+            (true, true, true, false),
+        ] {
+            assert_eq!(
+                windows_root_shape_is_ambiguous(is_absolute, has_root, has_prefix),
+                expected
+            );
+        }
+
+        use std::path::Prefix;
+        let server = std::ffi::OsStr::new("server");
+        let share = std::ffi::OsStr::new("share");
+        for prefix in [
+            Prefix::Verbatim(server),
+            Prefix::VerbatimUNC(server, share),
+            Prefix::VerbatimDisk(b'C'),
+            Prefix::DeviceNS(server),
+        ] {
+            assert!(windows_prefix_uses_device_namespace(prefix));
+        }
+        for prefix in [Prefix::Disk(b'C'), Prefix::UNC(server, share)] {
+            assert!(!windows_prefix_uses_device_namespace(prefix));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_only_path_rejections_stay_disabled_on_other_platforms() {
+        assert!(!windows_pattern_has_ambiguous_root(Path::new(
+            r"C:\relative"
+        )));
+        assert!(!windows_path_uses_device_namespace(Path::new(
+            r"\\?\C:\repo"
+        )));
     }
 
     #[test]
@@ -798,6 +1759,565 @@ mod tests {
         let (_d2, src2) = crate_fixture(files);
         assert_eq!(dig(&src1), dig(&src2));
         assert!(dig(&src1).is_some());
+    }
+
+    fn snap(src: &Path) -> ExtraInputsSnapshot {
+        let file_hasher = FileHasher::new();
+        ExtraInputsSnapshot::resolve(Some(src), "x", true, &file_hasher)
+            .expect("snapshot resolution succeeds")
+            .expect("fixture has an active declaration")
+    }
+
+    #[test]
+    fn snapshot_tracks_config_matches_and_narrow_watch_across_add_delete() {
+        let (dir, src) = crate_fixture(&[
+            ("kache.toml", "extra_inputs = [\"data/**/*.txt\"]"),
+            ("data/a.txt", "a"),
+            ("data/nested/b.txt", "b"),
+        ]);
+        let root = dir.path();
+
+        let initial = snap(&src);
+        assert_eq!(initial.config_path, root.join("kache.toml"));
+        assert_eq!(
+            initial.matched_files,
+            vec![root.join("data/a.txt"), root.join("data/nested/b.txt")]
+        );
+        assert_eq!(initial.watch_paths, vec![root.join("data")]);
+
+        // The literal root stays the watch dependency while the matched-file
+        // set follows additions and deletions. Cargo recursively fingerprints
+        // that one narrow directory, so either transition makes the unit dirty.
+        std::fs::write(root.join("data/added.txt"), "added").unwrap();
+        let after_add = snap(&src);
+        assert!(
+            after_add
+                .matched_files
+                .contains(&root.join("data/added.txt"))
+        );
+        assert_eq!(after_add.watch_paths, vec![root.join("data")]);
+
+        std::fs::remove_file(root.join("data/a.txt")).unwrap();
+        let after_delete = snap(&src);
+        assert!(
+            !after_delete
+                .matched_files
+                .contains(&root.join("data/a.txt"))
+        );
+        assert_eq!(after_delete.watch_paths, vec![root.join("data")]);
+    }
+
+    #[test]
+    fn snapshot_observes_nested_watch_directories_against_transient_aba() {
+        let (dir, src) = crate_fixture(&[
+            ("kache.toml", "extra_inputs = [\"data/**/*.txt\"]"),
+            ("data/stable.txt", "v1"),
+            ("data/deep/.keep", ""),
+        ]);
+        let nested = dir.path().join("data/deep");
+        let before = snap(&src);
+        assert!(
+            before
+                .observations
+                .iter()
+                .any(|observation| observation.path == nested),
+            "every traversed directory must participate in hit/publication revalidation"
+        );
+
+        // The compiler could observe this member while it exists even though
+        // the final matched-file set and content digest return to the original
+        // state. A changed nested-directory observation must still reject that
+        // result instead of publishing it under the old key.
+        let transient = nested.join("transient.txt");
+        std::fs::write(&transient, "transient").unwrap();
+        std::fs::remove_file(&transient).unwrap();
+        filetime::set_file_mtime(
+            &nested,
+            filetime::FileTime::from_unix_time(2_000_000_000, 123),
+        )
+        .unwrap();
+
+        let after = snap(&src);
+        assert_eq!(before.digest, after.digest, "semantic state returned to v1");
+        assert_eq!(before.matched_files, after.matched_files);
+        assert_ne!(
+            before, after,
+            "nested directory metadata must expose an add/remove ABA race"
+        );
+    }
+
+    #[test]
+    fn empty_declaration_watches_config_without_changing_the_key() {
+        let (dir, src) = crate_fixture(&[("kache.toml", "extra_inputs = []")]);
+        assert_eq!(dig(&src), None, "legacy key semantics stay byte-identical");
+
+        let snapshot = snap(&src);
+        assert_eq!(snapshot.digest(), None);
+        assert_eq!(snapshot.config_path, dir.path().join("kache.toml"));
+        assert!(snapshot.matched_files.is_empty());
+        assert!(snapshot.watch_paths.is_empty());
+    }
+
+    #[test]
+    fn active_snapshot_rejects_dynamic_pattern_expansion() {
+        let (_dir, src) =
+            crate_fixture(&[("kache.toml", "extra_inputs = [\"$HOME/data/**/*.txt\"]")]);
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("environment-dependent paths cannot stay Cargo-fresh");
+        assert!(
+            format!("{error:#}").contains("uses `$ENV` or `~` expansion"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn active_snapshot_rejects_parent_traversal_after_wildcard() {
+        let (_dir, src) = crate_fixture(&[(
+            "kache.toml",
+            "extra_inputs = [\"data/*/../../generated/*.json\"]",
+        )]);
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("a wildcard must not escape the bounded Cargo watch root");
+        assert!(
+            format!("{error:#}").contains("traverses `..` after a wildcard"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_snapshot_rejects_ambiguous_windows_root_shapes() {
+        assert!(windows_pattern_has_ambiguous_root(Path::new(
+            r"\shared\data.json"
+        )));
+        assert!(windows_pattern_has_ambiguous_root(Path::new(
+            r"C:shared\data.json"
+        )));
+        assert!(!windows_pattern_has_ambiguous_root(Path::new(
+            r"C:\shared\data.json"
+        )));
+
+        for pattern in ["/shared/**/*.json", "C:shared/**/*.json"] {
+            let config = format!("extra_inputs = ['{pattern}']");
+            let (_dir, src) = crate_fixture(&[("kache.toml", config.as_str())]);
+            let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+                .expect_err("ambiguous Windows anchoring must fail closed");
+            assert!(
+                format!("{error:#}").contains("rooted-without-drive or drive-relative"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_snapshot_rejects_windows_device_namespace_patterns() {
+        for pattern in [
+            r"\\?\C:\shared\**\*.json",
+            r"\\?\UNC\server\share\**\*.json",
+        ] {
+            let config = format!("extra_inputs = ['{pattern}']");
+            let (_dir, src) = crate_fixture(&[("kache.toml", config.as_str())]);
+            let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+                .expect_err("glob cannot safely enumerate a device namespace");
+            assert!(
+                format!("{error:#}").contains("verbatim/device namespace"),
+                "{error:#}"
+            );
+        }
+        assert!(windows_path_uses_device_namespace(Path::new(
+            r"\\?\C:\repo\crate"
+        )));
+        assert!(!windows_path_uses_device_namespace(Path::new(
+            r"C:\repo\crate"
+        )));
+        assert!(!windows_path_uses_device_namespace(Path::new(
+            r"\\server\share\crate"
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_glob_rejects_non_utf8_names_in_its_watch_tree() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (dir, src) = crate_fixture(&[("kache.toml", "extra_inputs = [\"data/**/*.txt\"]")]);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join(std::ffi::OsString::from_vec(vec![0xff])),
+            "hidden",
+        )
+        .unwrap();
+
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("glob must not silently omit non-UTF-8 names");
+        assert!(format!("{error:#}").contains("non-UTF-8"), "{error:#}");
+    }
+
+    #[test]
+    fn missing_literal_watches_existing_narrow_parent() {
+        let (dir, src) = crate_fixture(&[
+            ("kache.toml", "extra_inputs = [\"inputs/missing.json\"]"),
+            ("inputs/.keep", ""),
+        ]);
+        let snapshot = snap(&src);
+        assert!(snapshot.matched_files.is_empty());
+        assert_eq!(snapshot.watch_paths, vec![dir.path().join("inputs")]);
+    }
+
+    #[test]
+    fn broad_crate_root_watch_is_rejected_before_globbing() {
+        let (_dir, src) = crate_fixture(&[("kache.toml", "extra_inputs = [\"**/*.json\"]")]);
+        let file_hasher = FileHasher::new();
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &file_hasher)
+            .expect_err("crate-root recursive watch must be rejected");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("recursively watch broad directory"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("literal subdirectory"), "{rendered}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_root_watch_is_rejected_without_enumeration() {
+        let (_dir, src) = crate_fixture(&[("kache.toml", "extra_inputs = [\"/**/*.json\"]")]);
+        let file_hasher = FileHasher::new();
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &file_hasher)
+            .expect_err("filesystem-root recursive watch must be rejected");
+        assert!(
+            format!("{error:#}").contains("recursively watch broad directory"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_filesystem_root_cannot_bypass_watch_guard() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, src) =
+            crate_fixture(&[("kache.toml", "extra_inputs = [\"root-link/**/*.json\"]")]);
+        symlink("/", dir.path().join("root-link")).unwrap();
+        let file_hasher = FileHasher::new();
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &file_hasher)
+            .expect_err("a symlink to the filesystem root must be rejected before globbing");
+        assert!(
+            format!("{error:#}").contains("recursively watch broad directory"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_symlink_ancestor_is_not_below_the_crate_dependency_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let crate_dir = target.join("crate");
+        let dependency = crate_dir.join("data/value.txt");
+        std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+        std::fs::write(&dependency, "v1").unwrap();
+
+        let alias = dir.path().join("alias");
+        symlink(&target, &alias).unwrap();
+        let aliased_crate = alias.join("crate");
+        let aliased_dependency = aliased_crate.join("data/value.txt");
+        assert_eq!(
+            first_symlink_below_common(&aliased_crate, &aliased_dependency),
+            None,
+            "only symlinks below the shared crate prefix are unsafe"
+        );
+    }
+
+    #[test]
+    fn watch_path_limit_accepts_the_limit_and_rejects_one_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let crate_dir = dir.path().join("crate");
+        std::fs::create_dir(&crate_dir).unwrap();
+
+        let mut patterns = Vec::with_capacity(MAX_WATCH_PATHS + 1);
+        for index in 0..=MAX_WATCH_PATHS {
+            let watch = crate_dir.join(format!("watch-{index}"));
+            std::fs::create_dir(&watch).unwrap();
+            patterns.push(NormalizedInputPattern {
+                glob: format!("watch-{index}/**/*"),
+                watch: WatchIntent::DirectoryRoot(watch),
+            });
+        }
+
+        let accepted = resolve_watch_paths(&crate_dir, &patterns[..MAX_WATCH_PATHS]).unwrap();
+        assert_eq!(accepted.len(), MAX_WATCH_PATHS);
+        let error = resolve_watch_paths(&crate_dir, &patterns)
+            .expect_err("one watch beyond the bound must fail closed");
+        assert!(
+            format!("{error:#}").contains(&format!("more than {MAX_WATCH_PATHS}")),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_snapshot_rejects_symlinked_input_that_cargo_would_canonicalize() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, src) = crate_fixture(&[("kache.toml", "extra_inputs = [\"data/value.txt\"]")]);
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let target = dir.path().join("target-value.txt");
+        std::fs::write(&target, "v1").unwrap();
+        symlink(&target, dir.path().join("data/value.txt")).unwrap();
+
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("symlink retargeting cannot be represented safely in Cargo dep-info");
+        assert!(
+            format!("{error:#}").contains("crosses symlink"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_snapshot_rejects_symlinked_empty_config() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, src) = crate_fixture(&[]);
+        let target = dir.path().join("empty-config.toml");
+        std::fs::write(&target, "extra_inputs = []\n").unwrap();
+        symlink(&target, dir.path().join("kache.toml")).unwrap();
+
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("retargetable empty config must fail closed");
+        assert!(
+            format!("{error:#}").contains("config") && format!("{error:#}").contains("symlink"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_glob_rejects_symlink_nested_under_its_watch_root() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, src) = crate_fixture(&[("kache.toml", "extra_inputs = [\"data/**/*.txt\"]")]);
+        let external = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(external.path().join("value.txt"), "v1").unwrap();
+        symlink(external.path(), dir.path().join("data/external")).unwrap();
+
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("a glob must not follow a nested symlink outside its bounded watch tree");
+        assert!(
+            format!("{error:#}").contains("contains symlink"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn active_snapshot_rejects_invalid_config_instead_of_watching_only_config() {
+        let (_dir, src) = crate_fixture(&[("kache.toml", "extra_inputs = [")]);
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("invalid active config must fail closed");
+        assert!(
+            format!("{error:#}").contains("parsing active extra_inputs config"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_snapshot_rejects_control_separator_in_matched_filename() {
+        let (dir, src) = crate_fixture(&[("kache.toml", "extra_inputs = [\"data/**/*\"]")]);
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(dir.path().join("data/bad\u{1f}name.txt"), "v1").unwrap();
+
+        let error = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new())
+            .expect_err("matched paths must not cross cache-key framing");
+        assert!(
+            format!("{error:#}").contains("cache-key control separator"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn dep_info_merge_escapes_dedupes_and_preserves_later_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dep_info = root.join("crate.d");
+        let original = concat!(
+            "# generated by rustc\n",
+            "artifact: src/lib.rs\n",
+            "later: keep\\ this\n",
+            "# env-dep:VALUE=unchanged\n",
+        );
+        std::fs::write(&dep_info, original).unwrap();
+        let snapshot = ExtraInputsSnapshot {
+            config_path: root.join("kache.toml"),
+            normalized_patterns: vec!["inputs/**/*".to_string()],
+            digest: Some("digest".to_string()),
+            matched_files: vec![root.join("space #colon:slash\\name.txt")],
+            watch_paths: vec![root.join("watched dir")],
+            observations: Vec::new(),
+        };
+
+        assert_eq!(
+            make_escape_word("space #colon:slash\\name.txt").unwrap(),
+            "space\\ #colon:slash\\name.txt"
+        );
+        snapshot.merge_into_dep_info(&dep_info).unwrap();
+        let once = std::fs::read_to_string(&dep_info).unwrap();
+        assert!(once.contains("space\\ #colon:slash\\name.txt"), "{once}");
+        assert!(once.contains("watched\\ dir"), "{once}");
+        assert_eq!(once.matches("kache.toml").count(), 1, "{once}");
+        assert!(
+            once.ends_with("later: keep\\ this\n# env-dep:VALUE=unchanged\n"),
+            "later rules/comments changed:\n{once}"
+        );
+
+        // Idempotence is the strongest dedupe check: a second merge performs
+        // no rewrite and leaves the complete file byte-identical.
+        snapshot.merge_into_dep_info(&dep_info).unwrap();
+        assert_eq!(once, std::fs::read_to_string(&dep_info).unwrap());
+    }
+
+    #[test]
+    fn dep_info_merge_fails_closed_on_missing_and_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let snapshot = ExtraInputsSnapshot {
+            config_path: root.join("kache.toml"),
+            normalized_patterns: vec!["inputs/**/*".to_string()],
+            digest: Some("digest".to_string()),
+            matched_files: Vec::new(),
+            watch_paths: vec![root.join("inputs")],
+            observations: Vec::new(),
+        };
+
+        let missing = root.join("missing.d");
+        let missing_error = snapshot.merge_into_dep_info(&missing).unwrap_err();
+        assert!(format!("{missing_error:#}").contains("required consumer dep-info"));
+
+        let malformed = root.join("malformed.d");
+        let malformed_bytes = "not a dependency rule\nstill not a dependency rule\n";
+        std::fs::write(&malformed, malformed_bytes).unwrap();
+        let malformed_error = snapshot.merge_into_dep_info(&malformed).unwrap_err();
+        assert!(format!("{malformed_error:#}").contains("malformed consumer dep-info"));
+        assert_eq!(
+            std::fs::read_to_string(&malformed).unwrap(),
+            malformed_bytes
+        );
+    }
+
+    #[test]
+    fn make_escape_round_trips_windows_drive_space_hash_and_backslashes() {
+        let windows = r"C:\work tree\generated#1:file.rs";
+        let escaped = make_escape_word(windows).unwrap();
+        assert_eq!(escaped, r"C:\work\ tree\generated#1:file.rs");
+        assert_eq!(parse_make_words(&escaped).unwrap(), vec![windows]);
+        assert!(make_escape_word("unix-name-ending-in-backslash\\").is_err());
+        assert!(make_escape_word("unix-name-ending-in-space ").is_err());
+    }
+
+    #[test]
+    fn dep_info_codec_treats_hash_and_windows_drive_colons_as_literals() {
+        let input = concat!(
+            "# generated metadata stays literal\n",
+            r"C:\target\crate.d: C:\work\ tree\#member\src\lib.rs C:\work\data:1.txt",
+            "\nsecond: ignored\n",
+        );
+        let rule = first_make_dependency_rule(input).unwrap();
+        assert_eq!(&input[rule.colon..rule.colon + 2], ": ");
+        assert_eq!(
+            parse_make_words(&input[rule.colon + 2..rule.insertion]).unwrap(),
+            vec![r"C:\work tree\#member\src\lib.rs", r"C:\work\data:1.txt"]
+        );
+    }
+
+    #[test]
+    fn first_make_rule_preserves_separator_and_trims_only_trailing_padding() {
+        let separator_only = "foo: ";
+        assert_eq!(
+            first_make_dependency_rule(separator_only)
+                .unwrap()
+                .insertion,
+            separator_only.len(),
+            "the separator's required space is not trailing dependency padding"
+        );
+
+        let extra_separator_padding = "foo:  ";
+        assert_eq!(
+            first_make_dependency_rule(extra_separator_padding)
+                .unwrap()
+                .insertion,
+            "foo: ".len()
+        );
+
+        let padded_dependencies = "foo: dep \t";
+        assert_eq!(
+            first_make_dependency_rule(padded_dependencies)
+                .unwrap()
+                .insertion,
+            "foo: dep".len()
+        );
+    }
+
+    #[test]
+    fn dep_info_codec_skips_env_record_containing_colon_space() {
+        let input = concat!(
+            "# env-dep:CFG=foo: bar\n",
+            "artifact: src/lib.rs data/value.txt\n",
+        );
+        let rule = first_make_dependency_rule(input).unwrap();
+        assert_eq!(
+            &input[rule.colon - "artifact".len()..rule.colon],
+            "artifact"
+        );
+        assert_eq!(
+            parse_dep_info_dependencies(input).unwrap(),
+            vec![PathBuf::from("src/lib.rs"), PathBuf::from("data/value.txt")]
+        );
+    }
+
+    #[test]
+    fn relocated_dep_info_uses_unambiguous_consumer_absolute_paths() {
+        let files = &[
+            ("kache.toml", "extra_inputs = [\"data/**/*.json\"]"),
+            ("data/q.json", "v1"),
+        ];
+        let (dir_a, src_a) = crate_fixture(files);
+        let (dir_b, src_b) = crate_fixture(files);
+        let snapshot_a = snap(&src_a);
+        let snapshot_b = snap(&src_b);
+        assert_eq!(snapshot_a.digest, snapshot_b.digest);
+
+        let dep_a = dir_a.path().join("crate.d");
+        let dep_b = dir_b.path().join("crate.d");
+        std::fs::write(&dep_a, "artifact: src/lib.rs\n").unwrap();
+        std::fs::write(&dep_b, "artifact: src/lib.rs\n").unwrap();
+        snapshot_a.merge_into_dep_info(&dep_a).unwrap();
+        snapshot_b.merge_into_dep_info(&dep_b).unwrap();
+        let output_a = std::fs::read_to_string(&dep_a).unwrap();
+        let output_b = std::fs::read_to_string(&dep_b).unwrap();
+        let dependencies_a = parse_dep_info_dependencies(&output_a).unwrap();
+        let dependencies_b = parse_dep_info_dependencies(&output_b).unwrap();
+
+        assert_ne!(output_a, output_b);
+        assert!(dependencies_a.contains(&dir_a.path().join("data/q.json")));
+        assert!(dependencies_a.contains(&dir_a.path().join("kache.toml")));
+        assert!(dependencies_b.contains(&dir_b.path().join("data/q.json")));
+        assert!(dependencies_b.contains(&dir_b.path().join("kache.toml")));
+        assert!(
+            !dependencies_a
+                .iter()
+                .any(|path| path.starts_with(dir_b.path()))
+        );
+        assert!(
+            !dependencies_b
+                .iter()
+                .any(|path| path.starts_with(dir_a.path()))
+        );
     }
 
     #[test]
@@ -996,6 +2516,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn strict_snapshot_fails_when_a_matched_input_cannot_be_hashed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, src) = crate_fixture(&[
+            ("kache.toml", "extra_inputs = [\"data/**/*\"]"),
+            ("data/secret.bin", "v1"),
+        ]);
+        let input = dir.path().join("data/secret.bin");
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&input).is_ok() {
+            std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let result = ExtraInputsSnapshot::resolve(Some(&src), "x", true, &FileHasher::new());
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = result.expect_err("strict hashing failures must propagate");
+        assert!(
+            format!("{error:#}").contains("hashing active extra_inputs dependency"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unreadable_file_folds_sentinel_distinct_from_absent() {
         use std::os::unix::fs::PermissionsExt;
         let (d, src) = crate_fixture(&[
@@ -1020,59 +2565,5 @@ mod tests {
             unreadable, absent,
             "unreadable must not alias absent (false-hit guard)"
         );
-    }
-
-    #[test]
-    fn audit_rerun_coverage_flags_only_uncovered_declaring_crates() {
-        let root = tempfile::tempdir().unwrap();
-        let r = root.path();
-
-        // A: declares extra_inputs, no build.rs -> gap.
-        std::fs::create_dir_all(r.join("a")).unwrap();
-        std::fs::write(r.join("a/kache.toml"), "extra_inputs = [\".sqlx/**\"]").unwrap();
-
-        // B: declares extra_inputs, build.rs WITH rerun-if-changed -> covered.
-        std::fs::create_dir_all(r.join("b")).unwrap();
-        std::fs::write(r.join("b/kache.toml"), "extra_inputs = [\".sqlx/**\"]").unwrap();
-        std::fs::write(
-            r.join("b/build.rs"),
-            "fn main() { println!(\"cargo:rerun-if-changed=.sqlx\"); }",
-        )
-        .unwrap();
-
-        // C: declares extra_inputs, build.rs WITHOUT rerun-if-changed -> gap.
-        std::fs::create_dir_all(r.join("c")).unwrap();
-        std::fs::write(r.join("c/kache.toml"), "extra_inputs = [\"migrations/**\"]").unwrap();
-        std::fs::write(r.join("c/build.rs"), "fn main() {}").unwrap();
-
-        // D: empty declaration (opt-out) -> not counted at all.
-        std::fs::create_dir_all(r.join("d")).unwrap();
-        std::fs::write(r.join("d/kache.toml"), "extra_inputs = []").unwrap();
-
-        // target/ must be skipped even if it holds a kache.toml.
-        std::fs::create_dir_all(r.join("target/x")).unwrap();
-        std::fs::write(r.join("target/x/kache.toml"), "extra_inputs = [\"z/**\"]").unwrap();
-
-        // E: a malformed kache.toml is skipped (not counted, no panic).
-        std::fs::create_dir_all(r.join("e")).unwrap();
-        std::fs::write(r.join("e/kache.toml"), "this = = not valid toml").unwrap();
-
-        let audit = audit_rerun_coverage(r);
-        assert_eq!(
-            audit.declaring, 3,
-            "A, B, C declare; D opts out; E is malformed; target skipped"
-        );
-        let gap_dirs: Vec<_> = audit
-            .gaps
-            .iter()
-            .map(|g| {
-                g.crate_dir
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        assert_eq!(gap_dirs, vec!["a".to_string(), "c".to_string()]);
     }
 }

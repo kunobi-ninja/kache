@@ -567,6 +567,23 @@ impl GcPolicy {
     }
 }
 
+/// A GC policy can select the same protected entry in several sweeps. The
+/// wire format carries counts rather than keys, so an exact set union is not
+/// available here. Report the largest single-sweep count as a non-duplicating
+/// lower bound; explicit-age requests have no size sweep and use their sole
+/// policy count directly.
+fn gc_entries_pinned_lower_bound(
+    policy: GcPolicy,
+    duplicate: usize,
+    age: usize,
+    size: usize,
+) -> usize {
+    match policy {
+        GcPolicy::ExplicitAge { .. } => age,
+        GcPolicy::Automatic { .. } => duplicate.max(age).max(size),
+    }
+}
+
 impl GcRequest {
     fn automatic(effective_max_age_hours: u64) -> Self {
         Self {
@@ -4361,17 +4378,12 @@ impl Daemon {
                 + orphan_stats.removed,
             duration_ms: start.elapsed().as_millis() as u64,
             skipped: false,
-            // Policies may select the same protected entry. Count-only stats
-            // cannot form an exact union, so report the largest single-sweep
-            // count as a non-duplicating lower bound. Explicit age runs have no
-            // size sweep and must report their age-policy pins directly.
-            entries_pinned: match policy {
-                GcPolicy::ExplicitAge { .. } => age_evict_stats.entries_pinned,
-                GcPolicy::Automatic { .. } => dedup_stats
-                    .entries_pinned
-                    .max(age_evict_stats.entries_pinned)
-                    .max(evict_stats.entries_pinned),
-            },
+            entries_pinned: gc_entries_pinned_lower_bound(
+                policy,
+                dedup_stats.entries_pinned,
+                age_evict_stats.entries_pinned,
+                evict_stats.entries_pinned,
+            ),
         };
 
         tracing::info!(
@@ -8912,6 +8924,30 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stats.total.entries_evicted, 0);
+    }
+
+    #[test]
+    fn gc_pinned_lower_bound_is_policy_aware() {
+        assert_eq!(
+            gc_entries_pinned_lower_bound(GcPolicy::ExplicitAge { hours: 24 }, 9, 2, 8),
+            2
+        );
+
+        for (duplicate, age, size) in [(7, 2, 3), (2, 7, 3), (2, 3, 7)] {
+            assert_eq!(
+                gc_entries_pinned_lower_bound(
+                    GcPolicy::Automatic { max_age_hours: 24 },
+                    duplicate,
+                    age,
+                    size,
+                ),
+                7
+            );
+        }
+        assert_eq!(
+            gc_entries_pinned_lower_bound(GcPolicy::Automatic { max_age_hours: 0 }, 0, 0, 0,),
+            0
+        );
     }
 
     #[test]

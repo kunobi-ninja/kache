@@ -1765,6 +1765,7 @@ impl S3KeyCache {
         self.revision.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub async fn populate(&self, keys: HashMap<String, String>) {
         let revision = self.refresh_revision();
         let _ = self.populate_if_unchanged(keys, revision).await;
@@ -2907,6 +2908,7 @@ impl Daemon {
 
     /// Handle a remote check: look for a cache key and download it if found.
     /// Waits for the manifest prefetch to finish first so batch downloads aren't bypassed.
+    #[cfg(test)]
     pub async fn handle_remote_check(&self, req: &RemoteCheckRequest) -> Response {
         self.handle_remote_check_started_at(req, Instant::now())
             .await
@@ -3421,6 +3423,7 @@ impl Daemon {
     }
 
     /// Handle a batch remote check concurrently.
+    #[cfg(test)]
     pub async fn handle_batch_remote_check(
         self: &Arc<Self>,
         req: &BatchRemoteCheckRequest,

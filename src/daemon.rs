@@ -420,7 +420,11 @@ where
 fn persist_upload_job(config: &Config, job: &UploadJob) -> Result<UploadJob> {
     let normalized = normalize_upload_job(config, job)?;
     let dir = config.upload_spool_dir();
-    ensure_upload_spool_dir_with(&dir, std::fs::create_dir_all, crate::atomic::fsync_dir)?;
+    ensure_upload_spool_dir_with(
+        &dir,
+        |path| std::fs::create_dir_all(path),
+        crate::atomic::fsync_dir,
+    )?;
     if let Some(mut existing) = existing_upload_job(config, &normalized.key)? {
         // The durable first winner stays byte-for-byte unchanged, but the live
         // wire request must carry this caller's epoch so a newer wrapper can
@@ -3593,7 +3597,7 @@ impl Daemon {
 
         // Spawn a single coordinator task with bounded concurrency
         let daemon = Arc::clone(self);
-        let remote_config = remote.clone();
+        let remote_config = (*remote).clone();
         let cancel_rx = self.prefetch_cancel.subscribe();
         tokio::spawn(async move {
             let mut in_flight = futures::stream::FuturesUnordered::new();
@@ -12331,12 +12335,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let spool = dir.path().join("upload-queue");
 
-        let error = ensure_upload_spool_dir_with(&spool, std::fs::create_dir_all, |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "injected upload-spool parent fsync failure",
-            ))
-        })
+        let error = ensure_upload_spool_dir_with(
+            &spool,
+            |path| std::fs::create_dir_all(path),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected upload-spool parent fsync failure",
+                ))
+            },
+        )
         .unwrap_err();
 
         assert!(

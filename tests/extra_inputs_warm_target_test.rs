@@ -847,12 +847,6 @@ edition = "2021"
     // The daemon-local lane reads metadata from cache A without opening cache
     // B's SQLite. Copy only blobs so a successful fresh-target restore proves
     // `BlobSource::StoreDir` completed the consumer dep-info.
-    let daemon_cache = TempDir::new().unwrap();
-    copy_tree(
-        &cache_dir.path().join("store/blobs"),
-        &daemon_cache.path().join("store/blobs"),
-    );
-    let daemon_target = TempDir::new().unwrap();
     let _daemon = DaemonGuard::start(cache_dir.path());
     let daemon_socket = cache_dir.path().join("daemon.sock");
     let daemon_socket_text = daemon_socket.to_string_lossy().into_owned();
@@ -861,24 +855,50 @@ edition = "2021"
         ("KACHE_SOCKET_PATH", daemon_socket_text.as_str()),
         ("KACHE_LOCAL_HIT_TIMEOUT_MS", "1000"),
     ];
-    let daemon_hit = cargo_build_with_env(
-        relocated_project.path(),
-        daemon_target.path(),
-        daemon_cache.path(),
-        &relocated_input,
-        &input_reader,
-        &daemon_env,
-    );
-    assert_build_succeeded(&daemon_hit);
-    assert_eq!(run_fixture(daemon_target.path()), "v4");
-    assert_eq!(
-        last_fixture_event_result(daemon_cache.path()).as_deref(),
-        Some("local_hit")
-    );
-    assert!(
-        !daemon_cache.path().join("index.db").exists(),
-        "daemon hit must not fall back to opening the consumer store"
-    );
+    // The daemon deliberately sheds lookup work after 50ms. A saturated CI
+    // runner may therefore take the sound local fallback even though the
+    // donor entry is present. Retry with a fresh consumer cache/target so the
+    // test still proves an actual daemon restore without weakening that
+    // production latency bound.
+    let mut fallback_results = Vec::new();
+    let (daemon_cache, daemon_target) = (0..8)
+        .find_map(|_| {
+            let daemon_cache = TempDir::new().unwrap();
+            copy_tree(
+                &cache_dir.path().join("store/blobs"),
+                &daemon_cache.path().join("store/blobs"),
+            );
+            let daemon_target = TempDir::new().unwrap();
+            let daemon_hit = cargo_build_with_env(
+                relocated_project.path(),
+                daemon_target.path(),
+                daemon_cache.path(),
+                &relocated_input,
+                &input_reader,
+                &daemon_env,
+            );
+            assert_build_succeeded(&daemon_hit);
+            assert_eq!(run_fixture(daemon_target.path()), "v4");
+            let result = last_fixture_event_result(daemon_cache.path());
+            if result.as_deref() == Some("local_hit")
+                && !daemon_cache.path().join("index.db").exists()
+            {
+                Some((daemon_cache, daemon_target))
+            } else {
+                fallback_results.push((
+                    result,
+                    String::from_utf8_lossy(&daemon_hit.stderr).into_owned(),
+                    std::fs::read_to_string(daemon_cache.path().join("events.jsonl"))
+                        .unwrap_or_default(),
+                ));
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "donor daemon never produced a local hit from 8 fresh consumers: {fallback_results:?}"
+            )
+        });
     let daemon_events = fixture_event_count(daemon_cache.path());
 
     let daemon_fresh = cargo_build_with_env(

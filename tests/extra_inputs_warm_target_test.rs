@@ -787,24 +787,45 @@ edition = "2021"
             (content.contains("kache.toml") && content.contains("declared.txt")).then_some(content)
         })
         .expect("restored consumer dep-info");
+    let dependencies = restored_dep_info
+        .lines()
+        .find_map(|line| {
+            (!line.starts_with("# env-dep:"))
+                .then(|| line.find(": ").map(|separator| &line[separator + 2..]))
+                .flatten()
+        })
+        .expect("Cargo dependency rule");
+    let mut parsed_dependencies = Vec::new();
+    let mut current = String::new();
+    for word in dependencies.split_whitespace() {
+        if let Some(continued) = word.strip_suffix('\\') {
+            current.push_str(continued);
+            current.push(' ');
+        } else {
+            current.push_str(word);
+            parsed_dependencies.push(PathBuf::from(std::mem::take(&mut current)));
+        }
+    }
+    assert!(current.is_empty(), "unterminated Cargo dependency path");
+    let canonical_dependencies: Vec<_> = parsed_dependencies
+        .iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect();
     let producer = std::fs::canonicalize(project.path()).unwrap();
     let consumer = std::fs::canonicalize(relocated_project.path()).unwrap();
-    let normalize_dep_info_spelling = |value: &str| {
-        value
-            .strip_prefix(r"\\?\")
-            .unwrap_or(value)
-            .replace("\\ ", " ")
-            .replace('\\', "/")
-    };
-    let restored_dep_info = normalize_dep_info_spelling(&restored_dep_info);
-    let producer = normalize_dep_info_spelling(&producer.to_string_lossy());
-    let consumer = normalize_dep_info_spelling(&consumer.to_string_lossy());
     assert!(
-        !restored_dep_info.contains(&producer),
+        canonical_dependencies
+            .iter()
+            .all(|dependency| !dependency.starts_with(&producer)),
         "restored dep-info retained the producer workspace: {restored_dep_info}"
     );
     assert!(
-        restored_dep_info.contains(&consumer),
+        canonical_dependencies.iter().any(|dependency| {
+            dependency.starts_with(&consumer)
+                && dependency
+                    .file_name()
+                    .is_some_and(|name| name == "kache.toml")
+        }),
         "restored dep-info did not name the current consumer: {restored_dep_info}"
     );
 

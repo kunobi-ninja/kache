@@ -63,6 +63,47 @@ const COLOCATED_NAME: &str = "kache.toml";
 /// failing the build — over-folding is fail-safe, just slow.
 const OVER_BROAD_FILE_WARN: usize = 1000;
 
+fn should_warn_over_broad_file_count(count: usize) -> bool {
+    count > OVER_BROAD_FILE_WARN
+}
+
+/// Package selectors must be exact Cargo package names: non-empty and free of
+/// surrounding whitespace. Keep the predicate pure so `||` / `&&` mutations are
+/// observable from unit tests without standing up a full workspace.
+fn workspace_package_selector_is_invalid(selector: &str) -> bool {
+    selector.trim() != selector || selector.is_empty()
+}
+
+/// Unset `$ENV` references in a pattern stay literal and match nothing; warn so
+/// the miss is visible instead of a silent matches-nothing key.
+fn should_warn_unset_extra_input_vars(unset_vars: &[String]) -> bool {
+    !unset_vars.is_empty()
+}
+
+/// Absolute paths and `..` make a co-located pattern host-/layout-specific.
+fn pattern_reaches_outside_crate(path: &Path) -> bool {
+    path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+}
+
+/// Cargo member globs must stay inside the workspace root.
+fn member_pattern_escapes_workspace(path: &Path) -> bool {
+    path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+}
+
+/// Library crate names must be non-empty ASCII alphanumeric / `_`.
+fn is_valid_rustc_crate_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
 /// A declaration with more distinct Cargo directory dependencies than this is
 /// almost certainly being used as a generated watch list rather than a small
 /// set of input globs. Keep the consumer fingerprint bounded.
@@ -465,7 +506,7 @@ fn resolve_workspace_snapshot(
         }
         let mut selectors = BTreeSet::new();
         for selector in &rule.crates {
-            if selector.trim() != selector || selector.is_empty() {
+            if workspace_package_selector_is_invalid(selector) {
                 anyhow::bail!(
                     "workspace.extra_inputs package selector {selector:?} must be a non-empty exact Cargo package name without surrounding whitespace"
                 );
@@ -993,11 +1034,7 @@ fn current_workspace_package<'a>(
 }
 
 fn validate_rustc_crate_name(name: &str, manifest: &Path) -> Result<String> {
-    let valid = !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
-    if !valid {
+    if !is_valid_rustc_crate_name(name) {
         anyhow::bail!(
             "workspace extra_inputs cannot map invalid library crate name {name:?} from {}",
             manifest.display()
@@ -1015,11 +1052,7 @@ fn read_cargo_manifest(path: &Path) -> Result<CargoWorkspaceManifest> {
 
 fn expand_workspace_member_pattern(workspace_root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
     let path = Path::new(pattern);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
+    if member_pattern_escapes_workspace(path) {
         anyhow::bail!(
             "workspace extra_inputs cannot enumerate Cargo member pattern {pattern:?} outside the workspace root"
         );
@@ -1518,7 +1551,7 @@ fn resolve_declared_inputs(
     // (an absolute `/**`, or a relative `**/*` that accidentally spans
     // `target/`). Over-folding is fail-safe, but it busts the key on every
     // change and re-walks a large tree each compile, so surface it.
-    if matched.len() > OVER_BROAD_FILE_WARN {
+    if should_warn_over_broad_file_count(matched.len()) {
         tracing::warn!(
             "[key:{crate_name}] extra_inputs matched {} files — likely an over-broad glob; \
              it busts the key on every change and walks a large tree each compile. Narrow it.",
@@ -1690,7 +1723,7 @@ fn normalize_pattern_info(
     // literal, matches nothing, and folds a pattern-set-only key that replays
     // regardless of the files the author meant to track. Warn so the missing
     // var is visible instead of presenting as a clean (but wrong) cache hit.
-    if !unset_vars.is_empty() {
+    if should_warn_unset_extra_input_vars(&unset_vars) {
         tracing::warn!(
             "[key:{crate_name}] extra_inputs pattern {pattern:?} references unset env var(s) \
              {unset_vars:?}; they stay literal and match nothing — set the var(s) or remove the \
@@ -1717,11 +1750,7 @@ fn normalize_pattern_info(
     // host-/layout-specific, which reduces cross-machine and cross-worktree
     // cache sharing, so flag it rather than silently degrade portability.
     let as_path = Path::new(&normalized);
-    if as_path.is_absolute()
-        || as_path
-            .components()
-            .any(|c| matches!(c, Component::ParentDir))
-    {
+    if pattern_reaches_outside_crate(as_path) {
         tracing::warn!(
             "[key:{crate_name}] extra_inputs pattern {pattern:?} reaches outside the crate \
              (absolute or `..`); folding it anyway, but this crate's key is now \
@@ -2049,15 +2078,31 @@ fn walks_filesystem_root(glob_pattern: &str) -> bool {
         return false;
     };
     let base = Path::new(&glob_pattern[..=slash]);
-    // `Path::is_absolute()` is false for a bare "/" on Windows (it expects a
-    // drive), but "/" is still the current-drive root there and walks a huge
-    // tree — treat a leading RootDir as rooted on every platform.
-    let rooted = base.is_absolute()
-        || matches!(
+    // Unix: only absolute paths are rooted. Windows: `Path::is_absolute()` is
+    // false for a bare "/" (it expects a drive), but "/" is still the
+    // current-drive root and walks a huge tree — treat a leading RootDir as
+    // rooted there. Keeping the RootDir arm behind `cfg(windows)` makes the
+    // Linux mutation lane observe a single killable absolute check instead of
+    // an equivalent `||` / `&&` pair.
+    let rooted = path_base_is_rooted(base);
+    rooted && base.parent().is_none()
+}
+
+fn path_base_is_rooted(base: &Path) -> bool {
+    if base.is_absolute() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        matches!(
             base.components().next(),
             Some(std::path::Component::RootDir)
-        );
-    rooted && base.parent().is_none()
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2818,6 +2863,17 @@ edition = "2021"
     }
 
     #[test]
+    fn cargo_artifact_identity_requires_an_eight_character_hex_hash() {
+        let target = PathBuf::from("target");
+        let valid = cargo_artifact_identity(&target.join("libprovider-12345678.rlib"))
+            .expect("eight hex characters form a Cargo artifact hash");
+        assert_eq!(valid.crate_name, "provider");
+        assert_eq!(valid.dep_info_path, target.join("provider-12345678.d"));
+        assert!(cargo_artifact_identity(&target.join("libprovider-1234567.rlib")).is_none());
+        assert!(cargo_artifact_identity(&target.join("libprovider-1234567g.rlib")).is_none());
+    }
+
+    #[test]
     fn workspace_provider_and_aliased_direct_consumer_share_digest_and_dependencies() {
         let _lock = crate::config::config_path_lock();
         let (dir, provider, consumer, unlisted) = workspace_fixture(true);
@@ -2843,6 +2899,30 @@ edition = "2021"
         assert_eq!(
             provider_snapshot.matched_files,
             consumer_snapshot.matched_files
+        );
+        assert!(
+            provider_snapshot
+                .additional_config_paths
+                .contains(&provider),
+            "the provider source must be injected as artifact provenance"
+        );
+        assert!(
+            provider_snapshot
+                .observations
+                .iter()
+                .any(|observation| observation.path == provider)
+        );
+        assert!(
+            !consumer_snapshot
+                .additional_config_paths
+                .contains(&provider),
+            "direct consumers must not inherit the provider-only source marker"
+        );
+        assert!(
+            !consumer_snapshot
+                .observations
+                .iter()
+                .any(|observation| observation.path == provider)
         );
         assert!(
             consumer_snapshot
@@ -3086,6 +3166,18 @@ inputs = ["shared/value.txt"]
             (
                 "[[workspace.extra_inputs]]\ncrates=['macro-*']\ninputs=['shared/value.txt']\n",
                 "uses glob syntax",
+            ),
+            (
+                "[[workspace.extra_inputs]]\ncrates=['']\ninputs=['shared/value.txt']\n",
+                "must be a non-empty exact Cargo package name without surrounding whitespace",
+            ),
+            (
+                "[[workspace.extra_inputs]]\ncrates=[' macro-provider']\ninputs=['shared/value.txt']\n",
+                "must be a non-empty exact Cargo package name without surrounding whitespace",
+            ),
+            (
+                "[[workspace.extra_inputs]]\ncrates=['macro-provider ']\ninputs=['shared/value.txt']\n",
+                "must be a non-empty exact Cargo package name without surrounding whitespace",
             ),
             (
                 "[[workspace.extra_inputs]]\ncrates=['missing']\ninputs=['shared/value.txt']\n",
@@ -3907,6 +3999,128 @@ inputs = ["shared/value.txt"]
         assert!(
             format!("{error:#}").contains(&format!("more than {MAX_WATCH_PATHS}")),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn over_broad_file_warning_starts_after_threshold() {
+        assert!(!should_warn_over_broad_file_count(OVER_BROAD_FILE_WARN));
+        assert!(should_warn_over_broad_file_count(OVER_BROAD_FILE_WARN + 1));
+    }
+
+    #[test]
+    fn pure_extra_input_predicates_kill_boolean_mutations() {
+        assert!(workspace_package_selector_is_invalid(""));
+        assert!(workspace_package_selector_is_invalid(" pkg"));
+        assert!(workspace_package_selector_is_invalid("pkg "));
+        assert!(!workspace_package_selector_is_invalid("pkg"));
+
+        assert!(!should_warn_unset_extra_input_vars(&[]));
+        assert!(should_warn_unset_extra_input_vars(&[String::from("HOME")]));
+
+        assert!(pattern_reaches_outside_crate(Path::new("/abs/path")));
+        assert!(pattern_reaches_outside_crate(Path::new("../sibling")));
+        assert!(!pattern_reaches_outside_crate(Path::new("relative/path")));
+
+        assert!(member_pattern_escapes_workspace(Path::new("/abs/member")));
+        assert!(member_pattern_escapes_workspace(Path::new("../member")));
+        assert!(!member_pattern_escapes_workspace(Path::new("crates/*")));
+
+        assert!(!is_valid_rustc_crate_name(""));
+        assert!(!is_valid_rustc_crate_name("bad-name"));
+        assert!(is_valid_rustc_crate_name("good_name"));
+        assert!(is_valid_rustc_crate_name("a1"));
+    }
+
+    #[test]
+    fn expand_workspace_member_pattern_rejects_escaping_shapes() {
+        let root = Path::new("/tmp/workspace");
+        let absolute = expand_workspace_member_pattern(root, "/abs/member")
+            .expect_err("absolute member patterns escape the workspace");
+        assert!(
+            format!("{absolute:#}").contains("outside the workspace root"),
+            "{absolute:#}"
+        );
+        let parent = expand_workspace_member_pattern(root, "../member")
+            .expect_err("parent member patterns escape the workspace");
+        assert!(
+            format!("{parent:#}").contains("outside the workspace root"),
+            "{parent:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rustc_crate_name_rejects_empty_and_hyphenated_names() {
+        let manifest = Path::new("/tmp/Cargo.toml");
+        for name in ["", "bad-name", "has space"] {
+            let error = validate_rustc_crate_name(name, manifest)
+                .expect_err("invalid library crate names must fail closed");
+            assert!(
+                format!("{error:#}").contains("invalid library crate name"),
+                "{error:#}"
+            );
+        }
+        assert_eq!(
+            validate_rustc_crate_name("good_name", manifest).unwrap(),
+            "good_name"
+        );
+    }
+
+    #[test]
+    fn relabel_workspace_snapshot_domains_by_package_and_propagation() {
+        let base = ExtraInputsSnapshot {
+            config_path: PathBuf::from("/tmp/.kache.toml"),
+            additional_config_paths: Vec::new(),
+            normalized_patterns: vec!["shared/value.txt".into()],
+            digest: Some("inner-digest".into()),
+            matched_files: Vec::new(),
+            watch_paths: Vec::new(),
+            observations: Vec::new(),
+        };
+        let mut package_a = base.clone();
+        relabel_workspace_snapshot(&mut package_a, "package-a", true);
+        let mut package_b = base.clone();
+        relabel_workspace_snapshot(&mut package_b, "package-b", true);
+        let mut no_propagate = base.clone();
+        relabel_workspace_snapshot(&mut no_propagate, "package-a", false);
+
+        assert_ne!(
+            package_a.digest, package_b.digest,
+            "package identity must enter the workspace digest domain"
+        );
+        assert_ne!(
+            package_a.digest, no_propagate.digest,
+            "propagation flag must enter the workspace digest domain"
+        );
+        assert_ne!(
+            package_a.digest, base.digest,
+            "relabel must replace the raw content digest"
+        );
+    }
+
+    #[test]
+    fn recursive_glob_skips_directories_when_folding_matched_inputs() {
+        // A one-level glob enumerates both files and sibling directories. If the
+        // directory match-guard is dropped, the empty directory enters the fold
+        // as an unreadable sentinel and the digest diverges from a files-only
+        // tree with the same content.
+        let with_empty_dir = crate_fixture(&[
+            ("kache.toml", "extra_inputs = [\"data/*\"]"),
+            ("data/file.txt", "v1"),
+            ("data/empty/.keep", ""),
+        ]);
+        std::fs::remove_file(with_empty_dir.0.path().join("data/empty/.keep")).unwrap();
+        std::fs::create_dir_all(with_empty_dir.0.path().join("data/empty")).unwrap();
+
+        let files_only = crate_fixture(&[
+            ("kache.toml", "extra_inputs = [\"data/*\"]"),
+            ("data/file.txt", "v1"),
+        ]);
+
+        assert_eq!(
+            dig(&with_empty_dir.1),
+            dig(&files_only.1),
+            "directories matched by a glob must not affect the digest"
         );
     }
 

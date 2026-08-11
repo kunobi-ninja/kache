@@ -8077,15 +8077,25 @@ mod tests {
         let socket_path = dir.path().join("daemon.sock");
         let socket_path_bg = socket_path.clone();
 
+        // The property under test is that the waiter survives the socket's
+        // absence and then observes it. The listener appears late, and stays
+        // up until the waiter has its answer: dropping it after a fixed
+        // window instead let a loaded runner miss the whole window between
+        // reachability probes (seen as flakes on the macOS runner). The
+        // recv_timeout is a hard failure bound, never a silent early drop.
+        let (done_tx, done_rx) = mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             let listener = bind_sync_listener(&socket_path_bg);
-            std::thread::sleep(Duration::from_millis(200));
+            done_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("test did not report a wait result");
             drop(listener);
         });
 
-        let ready = wait_for_socket_until(&socket_path, None, Duration::from_secs(1)).unwrap();
+        let ready = wait_for_socket_until(&socket_path, None, Duration::from_secs(30)).unwrap();
 
+        done_tx.send(()).unwrap();
         handle.join().unwrap();
         assert!(ready);
     }

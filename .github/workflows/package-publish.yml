@@ -420,9 +420,12 @@ jobs:
   # ssh://aur@aur.archlinux.org/<name>.git — NOT a GitHub repo, just
   # PKGBUILD + .SRCINFO). Enable/disable a flavor per project by adding/removing
   # its aur/<name>/ folder. Versioned packages (-bin, source) get pkgver
-  # refreshed to the release; VCS packages (-git) keep their git-derived pkgver
-  # (so a stable release is a no-op for them — allow_empty_commits:false). STABLE
-  # only — AUR pkgver can't carry a pre-release '-'. Requires the AUR_SSH_KEY secret.
+  # refreshed to the release; VCS packages (-git) get theirs computed from git
+  # as <latest tag>.r<commits>.g<sha> by scripts/aur/vcs-pkgver.sh, matching what
+  # their own pkgver() recomputes at build time. That value moves every release,
+  # so -git packages now produce a real commit each time rather than being a
+  # no-op. STABLE only — AUR pkgver can't carry a pre-release '-'. Requires the
+  # AUR_SSH_KEY secret.
   # ---------------------------------------------------------------------------
   aur-list:
     needs: resolve
@@ -450,17 +453,31 @@ jobs:
       matrix:
         pkg: ${{ fromJson(needs.aur-list.outputs.pkgs) }}
     steps:
+      # fetch-depth: 0 is load-bearing for the -git packages below: their
+      # pkgver embeds `git rev-list --count HEAD`, and the default depth-1
+      # checkout would count 1 commit no matter the real history.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Refresh pkgver for versioned packages (skip -git)
+      - name: Refresh pkgver
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
           PKG: ${{ matrix.pkg }}
         run: |
           set -euo pipefail
-          if [[ "$PKG" != *-git ]]; then
-            sed -i -e "s/^pkgver=.*/pkgver=${VERSION}/" -e "s/^pkgrel=.*/pkgrel=1/" "aur/${PKG}/PKGBUILD"
+          if [[ "$PKG" == *-git ]]; then
+            # A VCS package tracks main, so it must NOT claim the release
+            # version — its pkgver is <latest tag>.r<commits>.g<sha>, the same
+            # shape the PKGBUILD's own pkgver() recomputes at build time.
+            # Without this the placeholder committed in the repo
+            # (0.0.0.r0.g0000000) is what reaches the AUR, which is what every
+            # release so far has published.
+            PKGVER="$(./scripts/aur/vcs-pkgver.sh .)"
+          else
+            PKGVER="$VERSION"
           fi
+          sed -i -e "s/^pkgver=.*/pkgver=${PKGVER}/" -e "s/^pkgrel=.*/pkgrel=1/" "aur/${PKG}/PKGBUILD"
           echo "--- aur/${PKG}/PKGBUILD ---"; cat "aur/${PKG}/PKGBUILD"
 
       - name: Publish ${{ matrix.pkg }} to the AUR

@@ -540,6 +540,12 @@ jobs:
             ./scripts/check-version-consistency.sh
           fi
 
+      # The -git AUR package's pkgver is only ever visible as AUR metadata, so
+      # a wrong value publishes cleanly and no build fails on it. Same class of
+      # release-only logic as the check above, so it is gated in the same job.
+      - name: AUR -git pkgver tests
+        run: ./scripts/aur/test-vcs-pkgver.sh
+
   # --- Dependency policy audit ---
   # Runs `cargo deny check` (via `just audit`) on every push and non-docs PR:
   # RustSec advisories PLUS license / bans / sources policy, matching the

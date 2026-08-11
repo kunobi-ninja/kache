@@ -7840,10 +7840,17 @@ mod tests {
         server.abort();
     }
 
-    fn hold_run_lock_for_test(
+    /// Acquires the run lock, then spawns the blocking child and waits for it
+    /// on the same thread, releasing the lock only after the child has been
+    /// reaped. This mirrors the real daemon, whose death is what releases the
+    /// lock, and keeps the termination tests deterministic on slow runners: a
+    /// fixed hold duration could expire before recovery even sampled the lock
+    /// (seen as flakes on the loaded self-hosted Windows runner), and waiting
+    /// on the exact child avoids liveness polling and pid-reuse concerns.
+    /// Returns once the lock is held and the child is running.
+    fn spawn_blocking_child_holding_run_lock(
         socket_path: &Path,
-        hold_for: Duration,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
         let run_lock_path = socket_path.with_extension("run.lock");
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
@@ -7854,12 +7861,43 @@ mod tests {
                 .open(&run_lock_path)
                 .unwrap();
             file.lock().unwrap();
-            tx.send(()).unwrap();
-            std::thread::sleep(hold_for);
+
+            let mut child = spawn_blocking_child();
+            tx.send(child.id()).unwrap();
+
+            let status = child.wait().unwrap();
+            let _ = file.unlock();
+            status
+        });
+        (rx.recv().unwrap(), handle)
+    }
+
+    /// Acquires the run lock and holds it until explicitly released via the
+    /// returned sender. The timeout is a hard test failure, never a silent
+    /// release that could let an assertion pass by accident.
+    fn hold_run_lock_until_released(
+        socket_path: &Path,
+    ) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let run_lock_path = socket_path.with_extension("run.lock");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&run_lock_path)
+                .unwrap();
+            file.lock().unwrap();
+            ready_tx.send(()).unwrap();
+
+            release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("test did not explicitly release the daemon run lock");
             let _ = file.unlock();
         });
-        rx.recv().unwrap();
-        handle
+        ready_rx.recv().unwrap();
+        (release_tx, handle)
     }
 
     /// Helper: create a Config pointing at a tempdir.
@@ -8243,12 +8281,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
         std::fs::write(&socket_path, b"stale").unwrap();
-        let run_lock_handle = hold_run_lock_for_test(&socket_path, Duration::from_millis(150));
 
-        let mut child = spawn_blocking_child();
+        let (child_pid, child_handle) = spawn_blocking_child_holding_run_lock(&socket_path);
 
         let state = DaemonCoordState {
-            pid: child.id(),
+            pid: child_pid,
             build_epoch: build_epoch(),
             phase: DaemonPhase::Ready,
             updated_at_ms: now_millis(),
@@ -8256,8 +8293,7 @@ mod tests {
         write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
 
         assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
-        run_lock_handle.join().unwrap();
-        assert_ne!(child.wait().unwrap().code(), Some(0));
+        assert_ne!(child_handle.join().unwrap().code(), Some(0));
         assert!(!socket_path.exists());
         assert!(read_daemon_state(&socket_path).is_none());
     }
@@ -8267,12 +8303,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
         std::fs::write(&socket_path, b"stale").unwrap();
-        let run_lock_handle = hold_run_lock_for_test(&socket_path, Duration::from_millis(150));
 
-        let mut child = spawn_blocking_child();
+        let (child_pid, child_handle) = spawn_blocking_child_holding_run_lock(&socket_path);
 
         let state = DaemonCoordState {
-            pid: child.id(),
+            pid: child_pid,
             build_epoch: build_epoch(),
             phase: DaemonPhase::Ready,
             updated_at_ms: now_millis()
@@ -8281,8 +8316,7 @@ mod tests {
         write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
 
         assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
-        run_lock_handle.join().unwrap();
-        assert_ne!(child.wait().unwrap().code(), Some(0));
+        assert_ne!(child_handle.join().unwrap().code(), Some(0));
         assert!(!socket_path.exists());
         assert!(read_daemon_state(&socket_path).is_none());
     }
@@ -8316,9 +8350,10 @@ mod tests {
         // Branch: run lock held with no recoverable coordinator state.
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
-        let run_lock_handle = hold_run_lock_for_test(&socket_path, Duration::from_millis(150));
+        let (release_tx, run_lock_handle) = hold_run_lock_until_released(&socket_path);
 
         assert!(!recover_unhealthy_daemon(&socket_path, "test").unwrap());
+        release_tx.send(()).unwrap();
         run_lock_handle.join().unwrap();
     }
 

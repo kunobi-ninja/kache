@@ -190,7 +190,20 @@ use std::path::{Path, PathBuf};
 // make the invocation uncacheable because their external bytes are absent from
 // the container. This intentionally gives up #471/#691 cross-clone reuse when
 // member names differ, preferring false misses over false hits.
-pub(crate) const CACHE_KEY_VERSION: u32 = 24;
+//
+// v25 (kunobi-ninja/kache#730): the Windows dep-info rewrite (#733) is escape-
+// aware per line, but the entries the OLD rewrite already stored under v24 stay
+// reachable, and they are not merely stale — they are build-breakers. The old
+// whole-content `Relativize` could split an escaped `\\` pair while anchoring,
+// so the CORRUPTION IS BAKED INTO THE STORED BYTES: the fixed `Expand` cannot
+// repair an orphan escape, and cargo hard-rejects the restored `.d` with
+// "unknown escape character", failing the compile on every hit (the nightly
+// Firefox/Windows bench reproduced exactly this). The mixed fleet is exposed
+// both ways too — a pre-#733 client restoring a correctly stored entry runs the
+// old unescaped `Expand` and re-corrupts it. Both directions share key v24, so
+// only a bump makes them unreachable. Cost is one cold rebuild, which v0.13.0
+// users (key v22) already pay crossing to this release regardless.
+pub(crate) const CACHE_KEY_VERSION: u32 = 25;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim

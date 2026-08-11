@@ -1137,6 +1137,19 @@ fn sample_write_clock(path: &Path) -> Result<filetime::FileTime> {
 
 const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";
 
+/// rustc's `# env-dep:NAME=value` records carry their own escape grammar:
+/// backslash is written `\\` (and newline/CR as `\n`/`\r`), and cargo's
+/// parser hard-rejects every other backslash sequence with
+/// "unknown escape character". A path prefix can only contribute the
+/// backslash case.
+#[cfg(any(windows, test))]
+const DEPINFO_ENV_DEP_PREFIX: &str = "# env-dep:";
+
+#[cfg(any(windows, test))]
+fn escape_depinfo_env_value(prefix: &str) -> String {
+    prefix.replace('\\', "\\\\")
+}
+
 /// Pure dep-info path rewrite: relativize absolute project paths to a
 /// kache-only sentinel, or expand that sentinel back to absolute paths.
 /// No I/O.
@@ -1148,32 +1161,77 @@ const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";
 /// place. The store side reaches it via [`rewrite_depinfo`].
 pub fn rewrite_depinfo_content(content: &str, project_dir: &Path, mode: DepInfoMode) -> String {
     let project_prefix = format!("{}/", project_dir.display());
-    match mode {
-        DepInfoMode::Relativize => {
-            // Windows dep-info paths use backslash separators — and often
-            // mix them (`...\out/generated.rs` from an env-var join). A
-            // prefix built with one separator silently fails to match the
-            // other, so the builder's absolute paths shipped verbatim in
-            // the cached entry and poisoned every other project sharing it
-            // (kunobi-ninja/kache#330). Relativize both spellings there; the
-            // sentinel expands with `/`, which every Windows API accepts.
-            // On Unix a backslash is a legal FILENAME character, not a
-            // separator, so the extra spelling must not run there — it
-            // could rewrite a sibling like `target\gen.rs` that lives
-            // outside the directory (cross-model review finding).
-            let rewritten = content.replace(&project_prefix, DEPINFO_ROOT_SENTINEL);
-            #[cfg(windows)]
-            {
-                let backslash_prefix = format!("{}\\", project_dir.display());
-                rewritten.replace(&backslash_prefix, DEPINFO_ROOT_SENTINEL)
-            }
-            #[cfg(not(windows))]
-            {
-                rewritten
-            }
+
+    // Unix keeps the historical whole-content transform byte-for-byte. A
+    // backslash there is a legal FILENAME character, not a separator or an
+    // escape, so neither the dual-spelling prefix nor the env-dep escape
+    // treatment below may run — either could rewrite content the old code
+    // left alone (cross-model review finding).
+    #[cfg(not(windows))]
+    {
+        match mode {
+            DepInfoMode::Relativize => content.replace(&project_prefix, DEPINFO_ROOT_SENTINEL),
+            DepInfoMode::Expand => content.replace(DEPINFO_ROOT_SENTINEL, &project_prefix),
         }
-        DepInfoMode::Expand => content.replace(DEPINFO_ROOT_SENTINEL, &project_prefix),
     }
+
+    // Windows dep-info paths use backslash separators — and often mix them
+    // (`...\out/generated.rs` from an env-var join). A prefix built with one
+    // separator silently fails to match the other, so the builder's absolute
+    // paths shipped verbatim in the cached entry and poisoned every other
+    // project sharing it (kunobi-ninja/kache#330). Relativize both spellings;
+    // the sentinel expands with `/`, which every Windows API accepts.
+    #[cfg(windows)]
+    {
+        let prefixes = [project_prefix, format!("{}\\", project_dir.display())];
+        rewrite_depinfo_content_with_prefixes(content, &prefixes, mode)
+    }
+}
+
+/// Prefix-parameterized core of the Windows [`rewrite_depinfo_content`]
+/// branch, split out so the dual-spelling behavior is unit-testable on every
+/// host.
+///
+/// `# env-dep:NAME=value` values are transformed through rustc's env-dep
+/// escape grammar: a backslash-bearing prefix appears there as `\\`, so
+/// Relativize matches the escaped spelling (never splitting an escape pair
+/// in two) and Expand inserts the escaped spelling (never creating an escape
+/// cargo rejects, kunobi-ninja/kache#730). The record's key is an environment
+/// variable NAME, never a path — it is left untouched, as is a key-only
+/// record without `=`.
+#[cfg(any(windows, test))]
+fn rewrite_depinfo_content_with_prefixes(
+    content: &str,
+    prefixes: &[String],
+    mode: DepInfoMode,
+) -> String {
+    content
+        .split_inclusive('\n')
+        .map(|line| {
+            if let Some(record) = line.strip_prefix(DEPINFO_ENV_DEP_PREFIX) {
+                let Some((key, value)) = record.split_once('=') else {
+                    return line.to_string();
+                };
+                let value = match mode {
+                    DepInfoMode::Relativize => prefixes.iter().fold(value.to_string(), |acc, p| {
+                        acc.replace(&escape_depinfo_env_value(p), DEPINFO_ROOT_SENTINEL)
+                    }),
+                    DepInfoMode::Expand => value.replace(
+                        DEPINFO_ROOT_SENTINEL,
+                        &escape_depinfo_env_value(&prefixes[0]),
+                    ),
+                };
+                format!("{DEPINFO_ENV_DEP_PREFIX}{key}={value}")
+            } else {
+                match mode {
+                    DepInfoMode::Relativize => prefixes.iter().fold(line.to_string(), |acc, p| {
+                        acc.replace(p.as_str(), DEPINFO_ROOT_SENTINEL)
+                    }),
+                    DepInfoMode::Expand => line.replace(DEPINFO_ROOT_SENTINEL, &prefixes[0]),
+                }
+            }
+        })
+        .collect()
 }
 
 /// Rewrite a `.d` (dep-info) file in place.
@@ -1733,6 +1791,127 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
             "consumer-rooted mixed-separator path: {expanded}"
         );
         assert!(!expanded.contains(DEPINFO_ROOT_SENTINEL));
+    }
+
+    /// Mirrors cargo's `unescape_env` grammar for `# env-dep:` values: only
+    /// `\\`, `\n`, and `\r` are legal escapes; anything else makes cargo fail
+    /// the whole compile with "unknown escape character" (kunobi-ninja/kache#730).
+    fn cargo_env_dep_value_parses(value: &str) -> bool {
+        let mut chars = value.trim_end_matches('\n').chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('\\') | Some('n') | Some('r') => {}
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// The oracle itself must be red for the corruption this guards against:
+    /// an orphan single backslash before `x86_64` is exactly what cargo
+    /// rejected in the nightly Firefox/Windows bench.
+    #[test]
+    fn test_env_dep_grammar_rejects_orphan_escape() {
+        assert!(cargo_env_dep_value_parses(
+            r"C:\\proj\\obj\\x86_64-pc-windows-msvc"
+        ));
+        assert!(!cargo_env_dep_value_parses(
+            r"__kache_root__/obj\x86_64-pc-windows-msvc"
+        ));
+        assert!(!cargo_env_dep_value_parses(r"C:\proj\obj"));
+    }
+
+    /// kunobi-ninja/kache#730: `# env-dep:` values escape backslashes as
+    /// `\\`. Relativize must match the escaped spelling of a backslash
+    /// anchor, never leaving half an escape pair behind, and the result must
+    /// stay parseable under cargo's env-dep grammar.
+    #[test]
+    fn test_depinfo_env_dep_relativize_matches_escaped_prefix() {
+        let input = "target\\debug\\deps\\demo.d: C:\\proj\\src\\lib.rs\n\
+                     # env-dep:OUT_DIR=C:\\\\proj\\\\obj\\\\x86_64-pc-windows-msvc\\\\out\n";
+        let prefixes = ["C:\\proj/".to_string(), "C:\\proj\\".to_string()];
+
+        let rewritten =
+            rewrite_depinfo_content_with_prefixes(input, &prefixes, DepInfoMode::Relativize);
+
+        let env_line = rewritten
+            .lines()
+            .find(|l| l.starts_with(DEPINFO_ENV_DEP_PREFIX))
+            .unwrap();
+        assert!(
+            env_line.contains("# env-dep:OUT_DIR=__kache_root__/obj\\\\x86_64"),
+            "escaped anchor must relativize whole, not split an escape pair: {rewritten}"
+        );
+        assert!(
+            cargo_env_dep_value_parses(env_line.split_once('=').unwrap().1),
+            "relativized env-dep value must stay parseable: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("__kache_root__/src\\lib.rs"),
+            "file-list line keeps the plain-spelling rewrite: {rewritten}"
+        );
+    }
+
+    /// env-dep record keys are environment variable NAMES, never paths:
+    /// a key-only record (no `=`) and the key half of a record must survive
+    /// both directions byte-for-byte (cross-model review finding).
+    #[test]
+    fn test_depinfo_env_dep_never_rewrites_keys() {
+        let input = "# env-dep:__kache_root__/WEIRD_KEY\n\
+                     # env-dep:__kache_root__/ALSO_WEIRD=__kache_root__/value\n";
+        let prefixes = ["C:\\proj/".to_string(), "C:\\proj\\".to_string()];
+
+        let expanded = rewrite_depinfo_content_with_prefixes(input, &prefixes, DepInfoMode::Expand);
+        assert!(
+            expanded.contains("# env-dep:__kache_root__/WEIRD_KEY\n"),
+            "key-only record must be untouched: {expanded}"
+        );
+        assert!(
+            expanded.contains("# env-dep:__kache_root__/ALSO_WEIRD=C:\\\\proj/value"),
+            "only the value half may expand: {expanded}"
+        );
+    }
+
+    /// kunobi-ninja/kache#730, the shape that broke the nightly bench: an
+    /// entry relativized under a forward-spelled anchor, expanded under a
+    /// backslash-spelled anchor. Expand must insert the escaped spelling into
+    /// `# env-dep:` lines or cargo rejects the restored `.d` outright.
+    #[test]
+    fn test_depinfo_env_dep_expand_inserts_escaped_prefix() {
+        let stored = "target/debug/deps/demo.d: __kache_root__/src/lib.rs\n\
+                      # env-dep:OUT_DIR=__kache_root__/obj-kache-bench\\\\x86_64-pc-windows-msvc\\\\out\n";
+        let prefixes = [
+            "C:\\other\\clone-b/".to_string(),
+            "C:\\other\\clone-b\\".to_string(),
+        ];
+
+        let expanded =
+            rewrite_depinfo_content_with_prefixes(stored, &prefixes, DepInfoMode::Expand);
+
+        let env_line = expanded
+            .lines()
+            .find(|l| l.starts_with(DEPINFO_ENV_DEP_PREFIX))
+            .unwrap();
+        assert!(
+            env_line.contains("OUT_DIR=C:\\\\other\\\\clone-b/obj-kache-bench\\\\x86_64"),
+            "expanded env-dep anchor must be escaped: {expanded}"
+        );
+        assert!(
+            cargo_env_dep_value_parses(env_line.split_once('=').unwrap().1),
+            "expanded env-dep value must stay parseable: {expanded}"
+        );
+        assert!(
+            expanded.contains("demo.d: C:\\other\\clone-b/src/lib.rs"),
+            "file-list line takes the plain anchor (rustc leaves backslashes raw there): {expanded}"
+        );
+
+        // Round trip: re-relativizing under the same anchor restores the
+        // stored form, so warm entries stay stable across hits.
+        let rerelativized =
+            rewrite_depinfo_content_with_prefixes(&expanded, &prefixes, DepInfoMode::Relativize);
+        assert_eq!(rerelativized, stored, "expand/relativize must round-trip");
     }
 
     #[test]

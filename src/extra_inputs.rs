@@ -4094,6 +4094,17 @@ inputs = ["shared/value.txt"]
             Some(&out_manifest),
             &root
         ));
+
+        // path_base_is_rooted is only composed into walks_filesystem_root with
+        // parent().is_none(), which is equivalent to always-true on Unix for
+        // the patterns we warn about. Test the predicate itself so the Linux
+        // mutation lane still kills replace-with-true / replace-with-false.
+        assert!(path_base_is_rooted(Path::new(
+            std::path::MAIN_SEPARATOR_STR
+        )));
+        assert!(path_base_is_rooted(&host_absolute("any")));
+        assert!(!path_base_is_rooted(Path::new("relative")));
+        assert!(!path_base_is_rooted(Path::new("relative/path/")));
     }
 
     #[test]

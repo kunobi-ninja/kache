@@ -473,7 +473,19 @@ jobs:
             # Without this the placeholder committed in the repo
             # (0.0.0.r0.g0000000) is what reaches the AUR, which is what every
             # release so far has published.
-            PKGVER="$(./scripts/aur/vcs-pkgver.sh .)"
+            #
+            # A `release` event checks out that release's TAG. Re-running the
+            # publish for a tag cut before this script existed would therefore
+            # not find it — leave that case exactly as it behaved then (the
+            # committed placeholder) rather than failing the leg, since
+            # re-running a publish after an outage is a normal admin action.
+            if [ -x ./scripts/aur/vcs-pkgver.sh ]; then
+              PKGVER="$(./scripts/aur/vcs-pkgver.sh .)"
+            else
+              echo "::warning::scripts/aur/vcs-pkgver.sh not present at this ref — leaving ${PKG} pkgver untouched"
+              echo "--- aur/${PKG}/PKGBUILD (unchanged) ---"; cat "aur/${PKG}/PKGBUILD"
+              exit 0
+            fi
           else
             PKGVER="$VERSION"
           fi

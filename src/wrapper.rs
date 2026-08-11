@@ -1341,13 +1341,9 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         extra_inputs_hasher.arm_too_new_guard(invocation_start_ns, 0);
     }
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-    let extra_inputs = crate::extra_inputs::ExtraInputsSnapshot::resolve(
-        args.source_file.as_deref(),
-        crate_name,
-        args.is_primary,
-        &extra_inputs_hasher,
-    )
-    .with_context(|| format!("resolving extra_inputs for {crate_name}"))?;
+    let extra_inputs =
+        crate::extra_inputs::ExtraInputsSnapshot::resolve_for_rustc(&args, &extra_inputs_hasher)
+            .with_context(|| format!("resolving extra_inputs for {crate_name}"))?;
 
     validate_extra_inputs_freshness_mode(&args, extra_inputs.is_some())?;
 
@@ -1401,13 +1397,8 @@ pub(crate) fn resolve_extra_inputs_for_passthrough(
 ) -> Result<Option<crate::extra_inputs::ExtraInputsSnapshot>> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let hasher = crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
-    let snapshot = crate::extra_inputs::ExtraInputsSnapshot::resolve(
-        args.source_file.as_deref(),
-        crate_name,
-        args.is_primary,
-        &hasher,
-    )
-    .with_context(|| format!("resolving extra_inputs for {crate_name}"))?;
+    let snapshot = crate::extra_inputs::ExtraInputsSnapshot::resolve_for_rustc(args, &hasher)
+        .with_context(|| format!("resolving extra_inputs for {crate_name}"))?;
     validate_extra_inputs_freshness_mode(args, snapshot.is_some())?;
     Ok(snapshot)
 }
@@ -1471,12 +1462,7 @@ fn extra_inputs_changed_during_compile(
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let mut hasher = crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
     hasher.arm_too_new_guard(invocation_start_ns, 0);
-    let after = match crate::extra_inputs::ExtraInputsSnapshot::resolve(
-        args.source_file.as_deref(),
-        crate_name,
-        args.is_primary,
-        &hasher,
-    ) {
+    let after = match crate::extra_inputs::ExtraInputsSnapshot::resolve_for_rustc(args, &hasher) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             tracing::warn!(
@@ -1543,7 +1529,7 @@ fn run_parsed_rustc(
         config,
         args,
         std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
-        || crate::extra_inputs::declared(args.source_file.as_deref()),
+        || extra_inputs.is_some(),
     );
 
     // Evaluate every cheap cache-eligibility gate before the learned fast

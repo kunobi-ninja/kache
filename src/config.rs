@@ -529,6 +529,11 @@ pub(crate) struct FileConfig {
     pub(crate) cache: Option<CacheFileConfig>,
     pub(crate) cc: Option<CcFileConfig>,
     pub(crate) paths: Option<PathsFileConfig>,
+    /// Workspace-scoped declarations are interpreted by the compiler wrapper,
+    /// but the config editor must preserve them semantically across a
+    /// load/save round trip even though it does not expose form fields for
+    /// them.
+    pub(crate) workspace: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -2965,6 +2970,7 @@ remote_key_cache_refresh_secs = 900
         let config = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
                 remote_readonly: None,
@@ -3057,6 +3063,7 @@ remote_key_cache_refresh_secs = 900
         let config = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 local_store: Some("~/cache".to_string()),
                 remote: Some(RemoteFileConfig::default()),
@@ -3823,6 +3830,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let config = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 local_store: Some("/tmp/managed-cache".to_string()),
                 ..Default::default()
@@ -3952,6 +3960,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let config = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
                 remote_readonly: None,
@@ -4017,6 +4026,28 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         assert!(config.cache.is_none());
     }
 
+    #[test]
+    fn raw_config_roundtrip_preserves_workspace_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.toml");
+        let saved = dir.path().join("saved.toml");
+        std::fs::write(
+            &source,
+            "[cache]\nlocal_max_size='1GiB'\n\n[[workspace.extra_inputs]]\ncrates=['macro-provider']\ninputs=['shared/value.txt']\npropagate_to_dependents=true\n",
+        )
+        .unwrap();
+
+        let (config, existed) = Config::load_raw_file_config_from(&source);
+        assert!(existed);
+        Config::save_file_config_to(&config, &saved).unwrap();
+
+        let original: toml::Value =
+            toml::from_str(&std::fs::read_to_string(source).unwrap()).unwrap();
+        let roundtripped: toml::Value =
+            toml::from_str(&std::fs::read_to_string(saved).unwrap()).unwrap();
+        assert_eq!(roundtripped.get("workspace"), original.get("workspace"));
+    }
+
     /// #221: `[cache] local_only` must suppress BOTH the remote and the
     /// planner, even when a bucket + endpoint are configured.
     #[test]
@@ -4029,6 +4060,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let file = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 local_only: Some(true),
                 remote: Some(RemoteFileConfig {
@@ -4069,6 +4101,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let file = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 local_only: Some(true),
                 ..Default::default()
@@ -4113,6 +4146,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let file = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 storage_layout_advice: Some(false),
                 heartbeat_secs: None,
@@ -4140,6 +4174,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let file = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 storage_layout_advice: Some(false),
                 heartbeat_secs: None,
@@ -4176,6 +4211,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let config = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 planner: None,
                 remote: Some(RemoteFileConfig {
@@ -4224,6 +4260,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let file = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 planner: None,
                 remote: Some(RemoteFileConfig {
@@ -4255,6 +4292,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let empty = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 planner: None,
                 remote: None,
@@ -4275,6 +4313,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let file = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 remote: Some(RemoteFileConfig {
                     _type: Some("filesystem".to_string()),
@@ -4306,6 +4345,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let file = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 remote: Some(RemoteFileConfig {
                     _type: Some("filesystem".to_string()),
@@ -4356,6 +4396,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let file = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 remote: Some(RemoteFileConfig {
                     bucket: Some("legacy".to_string()),
@@ -4523,6 +4564,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let file = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 remote: Some(RemoteFileConfig {
                     _type: Some("filesystem".to_string()),
@@ -4545,6 +4587,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let file = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 remote: Some(RemoteFileConfig {
                     _type: Some("filesystem".to_string()),
@@ -4573,6 +4616,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let config = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 planner: Some(PlannerFileConfig {
                     endpoint: Some("https://planner.example.com".to_string()),
@@ -4602,6 +4646,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         let config = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 planner: Some(PlannerFileConfig {
                     endpoint: Some("https://planner.example.com".to_string()),

@@ -19,7 +19,7 @@ The config file is TOML. You can edit it directly or use the TUI editor:
 kache config
 ```
 
-The TUI editor surfaces the common fields with their current values, marks which ones are coming from env vars (those are read-only and the cursor skips them), and lets you toggle or edit the rest interactively. Navigate with the arrows or `j`/`k`, jump between sections with Tab/Shift-Tab, Enter edits a field, Space toggles a boolean, `s` (or Ctrl-S) saves, and `q`/Esc quits with an unsaved-changes prompt. Some advanced sections — `[cache.planner]`, `[cc]`, `[paths]`, `cache.path_only_env_vars`, `cache.incremental_crates`, and `cache.key_env_vars` — have no form fields and are preserved verbatim on save.
+The TUI editor surfaces the common fields with their current values, marks which ones are coming from env vars (those are read-only and the cursor skips them), and lets you toggle or edit the rest interactively. Navigate with the arrows or `j`/`k`, jump between sections with Tab/Shift-Tab, Enter edits a field, Space toggles a boolean, `s` (or Ctrl-S) saves, and `q`/Esc quits with an unsaved-changes prompt. Some advanced sections — `[cache.planner]`, `[cc]`, `[paths]`, `[workspace]`, `cache.path_only_env_vars`, `cache.incremental_crates`, and `cache.key_env_vars` — have no form fields and are preserved verbatim on save.
 
 Config file priority:
 
@@ -224,6 +224,46 @@ This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffec
 `extra_inputs = []` leaves the cache key unchanged but still makes Cargo watch
 `kache.toml`, so activating the declaration later works in an already-warm target.
 
+### Workspace-shared provider inputs
+
+Use the project config when several packages share one workspace-root input, or
+when a proc macro reads that input while it executes inside a dependent crate:
+
+```toml title="<workspace-root>/.kache.toml"
+[[workspace.extra_inputs]]
+crates = ["query-macros"]
+inputs = [".sqlx/**/*.json"]
+propagate_to_dependents = true
+```
+
+- `crates` contains exact Cargo **package names**. Selector globs are rejected,
+  and every Rust target in a selected package (library, binary, example, and so
+  on) folds the package's digest. For propagation, Kache maps the package's
+  library/proc-macro target from `[lib].name` or Cargo's default `-` to `_`
+  conversion; `propagate_to_dependents = true` is rejected for a bin-only
+  package.
+- `inputs` are relative to the workspace root; absolute paths and `..` are
+  rejected. Their workspace-relative paths and contents form a relocation-stable
+  digest.
+- The selected package's targets fold that digest. With
+  `propagate_to_dependents = true`, each direct `--extern` consumer also folds
+  it—even when the provider artifact is byte-identical, as happens when a proc
+  macro reads the file only while expanding the consumer. A two-hop dependent
+  then re-keys normally from the rebuilt direct consumer artifact.
+
+Kache verifies propagation against the producer artifact's Cargo dep-info, so
+two packages exposing the same library crate name are not guessed by name. A
+legacy artifact without the provider marker must be rebuilt once.
+
+The table is honored only when the active config is exactly
+`<workspace-root>/.kache.toml`, beside a Cargo manifest containing `[workspace]`.
+An explicit or global `KACHE_CONFIG` elsewhere cannot inject workspace rules.
+Cargo `members` path globs are supported, but every selected provider must
+resolve to an explicit member. Crates that are neither selected providers nor
+direct consumers of a propagated provider retain their existing key bytes, as
+do projects without this table. Workspace rules are Rust/Cargo-only and are
+additive with a provider's co-located `kache.toml`.
+
 <Callout type="warn">
   Keep patterns narrow. Kache rejects watches rooted at the crate root, an
   ancestor of it, or the filesystem root. A narrower watch that still matches
@@ -248,10 +288,10 @@ inputs; Kache uses the normal cache or safe passthrough path instead.
 
 <Callout type="warn">
   Cargo cannot retroactively learn dependencies for an already-fresh target.
-  After upgrading from Kache 0.13 or earlier—or after adding `kache.toml` to a
-  crate whose target is already warm—rebuild that crate once (for example,
-  `cargo clean -p <package> && cargo build`). Later declared-input changes are
-  tracked automatically.
+  After upgrading from Kache 0.13 or earlier—or after adding `kache.toml` or a
+  workspace rule to a target that is already Cargo-fresh—rebuild the affected
+  package once (for example, `cargo clean -p <package> && cargo build`). Later
+  declared-input changes are tracked automatically.
 </Callout>
 
 <Callout type="warn">

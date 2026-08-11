@@ -25,6 +25,7 @@ use crate::config::{
 /// preserves every advanced value instead of silently reverting policy.
 #[derive(Debug, Clone, Default)]
 struct PreservedAdvancedConfig {
+    workspace: Option<toml::Value>,
     path_only_env_vars: Option<Vec<String>>,
     incremental_crates: Option<Vec<String>>,
     key_env_vars: Option<Vec<String>>,
@@ -41,6 +42,7 @@ impl PreservedAdvancedConfig {
     fn from_file_config(file_config: &FileConfig) -> Self {
         let cache = file_config.cache.as_ref();
         Self {
+            workspace: file_config.workspace.clone(),
             path_only_env_vars: cache.and_then(|c| c.path_only_env_vars.clone()),
             incremental_crates: cache.and_then(|c| c.incremental_crates.clone()),
             key_env_vars: cache.and_then(|c| c.key_env_vars.clone()),
@@ -817,6 +819,7 @@ fn fields_to_file_config(
     FileConfig {
         cc: preserved_cc,
         paths: preserved_paths,
+        workspace: preserved_advanced.workspace.clone(),
         cache: Some(CacheFileConfig {
             local_store: get("cache_dir"),
             local_max_size: get("max_size"),
@@ -1500,6 +1503,7 @@ mod tests {
         let config = FileConfig {
             cc: None,
             paths: None,
+            workspace: None,
             cache: Some(CacheFileConfig {
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("100GiB".to_string()),
@@ -1947,6 +1951,7 @@ mod tests {
             paths: Some(PathsFileConfig {
                 base_dirs: Some(vec!["/snap".to_string(), "/var/lib/flatpak".to_string()]),
             }),
+            workspace: None,
             cache: Some(CacheFileConfig {
                 local_only: None,
                 remote_readonly: None,
@@ -2106,6 +2111,12 @@ mod tests {
         // save dropped it, the next build would silently go back to sharing
         // one key between two proc-macro expansions.
         let loaded = FileConfig {
+            workspace: Some(
+                toml::from_str(
+                    "[[extra_inputs]]\ncrates=['macro-provider']\ninputs=['shared/value.txt']\n",
+                )
+                .unwrap(),
+            ),
             cache: Some(CacheFileConfig {
                 key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 path_only_env_vars: Some(vec!["BUILDCONFIG_RS".to_string()]),
@@ -2157,6 +2168,7 @@ mod tests {
             Some(&["BUILDCONFIG_RS".to_string()][..])
         );
         assert_eq!(cache.daemon_idle_timeout_secs, Some(600));
+        assert_eq!(saved.workspace, loaded.workspace);
     }
 
     #[test]

@@ -8116,18 +8116,28 @@ mod tests {
         let socket_path = dir.path().join("daemon.sock");
         let socket_path_bg = socket_path.clone();
 
+        // Same race #734 fixed in the sibling test above, which this one kept:
+        // the socket existed only during [150ms, 350ms] while the waiter polls
+        // every DAEMON_START_POLL_INTERVAL (100ms) against a 1s deadline. On a
+        // loaded runner the background thread may not even bind before that
+        // deadline expires. This is the test that actually failed on macOS CI.
+        // recv_timeout is a hard failure bound, never a silent early drop.
+        let (done_tx, done_rx) = mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             let listener = bind_sync_listener(&socket_path_bg);
-            std::thread::sleep(Duration::from_millis(200));
+            done_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("main thread should signal before the bound");
             drop(listener);
         });
 
         let mut child = spawn_quick_exit_child();
 
         let ready =
-            wait_for_socket_until(&socket_path, Some(&mut child), Duration::from_secs(1)).unwrap();
+            wait_for_socket_until(&socket_path, Some(&mut child), Duration::from_secs(30)).unwrap();
 
+        done_tx.send(()).ok();
         handle.join().unwrap();
         assert!(ready);
     }

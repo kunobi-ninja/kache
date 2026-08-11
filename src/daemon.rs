@@ -8077,15 +8077,22 @@ mod tests {
         let socket_path = dir.path().join("daemon.sock");
         let socket_path_bg = socket_path.clone();
 
+        // Same race as the clean-child-exit test below: a fixed 200ms hold left
+        // the socket present only between t=150ms and t=350ms, so a poll
+        // landing either side of that window on a loaded runner saw nothing.
+        // Hold it until the waiter is done instead.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             let listener = bind_sync_listener(&socket_path_bg);
-            std::thread::sleep(Duration::from_millis(200));
+            let _ = release_rx.recv();
             drop(listener);
         });
 
-        let ready = wait_for_socket_until(&socket_path, None, Duration::from_secs(1)).unwrap();
+        let ready = wait_for_socket_until(&socket_path, None, Duration::from_secs(10)).unwrap();
 
+        let _ = release_tx.send(());
         handle.join().unwrap();
         assert!(ready);
     }
@@ -8106,20 +8113,43 @@ mod tests {
         let socket_path = dir.path().join("daemon.sock");
         let socket_path_bg = socket_path.clone();
 
+        // The listener is held until the waiter has finished, rather than for a
+        // fixed 200ms. Previously the socket existed only between t=150ms and
+        // t=350ms, so on a loaded runner a poll landing either side of that
+        // window saw nothing and `assert!(ready)` failed. The macOS leg flaked
+        // on exactly this.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (bound_tx, bound_rx) = std::sync::mpsc::channel::<()>();
+
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             let listener = bind_sync_listener(&socket_path_bg);
-            std::thread::sleep(Duration::from_millis(200));
+            let _ = bound_tx.send(());
+            // Stay bound until the main thread says it is done.
+            let _ = release_rx.recv();
             drop(listener);
         });
 
         let mut child = spawn_quick_exit_child();
 
+        // Deliberately generous: this test is about a clean child exit not
+        // aborting the wait, not about the timeout. A tight bound only
+        // reintroduces sensitivity to how fast the runner schedules the thread
+        // above — `test_wait_for_socket_until_times_out_cleanly` covers the
+        // timeout itself.
         let ready =
-            wait_for_socket_until(&socket_path, Some(&mut child), Duration::from_secs(1)).unwrap();
+            wait_for_socket_until(&socket_path, Some(&mut child), Duration::from_secs(10)).unwrap();
 
+        let _ = release_tx.send(());
         handle.join().unwrap();
+
         assert!(ready);
+        // Guard against passing for the wrong reason: the socket must actually
+        // have been bound, not merely reported reachable.
+        assert!(
+            bound_rx.try_recv().is_ok(),
+            "the background listener never bound"
+        );
     }
 
     #[test]

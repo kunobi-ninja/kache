@@ -348,6 +348,21 @@ bump VERSION:
   ./scripts/check-version-consistency.sh
   echo "Bumped to {{VERSION}}. Commit + open a PR; after merge, cut the tag with 'just release'."
 
+# Deliberately read-only: the value is only correct once HEAD is the tagged
+# release commit, so package-publish computes it at publish time rather than
+# committing it here. Run from a full clone — it refuses a shallow one.
+# Show the pkgver the -git AUR package will be published with
+[group('release')]
+aur-pkgver:
+  @./scripts/aur/vcs-pkgver.sh .
+
+# Runs in CI on every change: the value it guards is only ever seen as AUR
+# metadata, so a wrong one publishes cleanly and no build fails.
+# Test the -git pkgver computation
+[group('release')]
+test-aur-pkgver:
+  @./scripts/aur/test-vcs-pkgver.sh
+
 # Refuses unless the tree is releasable (clean, on `main`, in sync with
 # origin/main, so a tag is never cut from a dirty / off-main / un-pulled
 # commit), runs the consistency gate, then pushes the tag → gated pipeline →

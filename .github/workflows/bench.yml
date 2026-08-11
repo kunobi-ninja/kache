@@ -354,9 +354,23 @@ jobs:
         # The fuller `firefox-windows` profile is a unique substring, so it
         # selects bench-firefox-windows directly — no `os:` workaround needed
         # (the `bench` recipe already ANDs suite:bench + backend:kache).
+        #
+        # SHORT work dir: Firefox's `./mach build` refuses a source directory
+        # path longer than 62 chars on Windows. The default bench work dir
+        # lives under the runner checkout (`…\_work\kache\kache\tmp\bench\
+        # <scenario>\clone-a` — 84 chars) and trips that guard (#728). Put the
+        # clone under `$RUNNER_TEMP\f` instead (service-writable, already used
+        # by the isolate-tool-state step; `f` keeps it distinct from the pull
+        # job's `b` when inspecting a runner) so the source dir is ~45 chars.
+        # Reports land under that same dir — see the upload paths below.
+        # $RUNNER_TEMP is a Windows path (C:\…\_temp); convert to forward
+        # slashes so the value survives the just/sh layers (see the pull job).
         run: |
           rustc --version && cargo --version && just --version
-          just bench firefox-windows
+          work="$(printf '%s' "$RUNNER_TEMP" | tr '\\' '/')/f"
+          mkdir -p "$work"
+          echo "[bench] work dir: $work"
+          just bench firefox-windows --work-dir "$work"
         env:
           # The bench measures kache itself; it must not run under a wrapper.
           RUSTC_WRAPPER: ""
@@ -376,14 +390,18 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-firefox-windows
+          # Reports live under the SHORT work dir (`$RUNNER_TEMP/f`), not
+          # tmp/bench, because of the mach 62-char source-path guard (see the
+          # run step). The flat globs pick up summaries/reports/logs; clone
+          # worktrees/objdirs/cache are subdirs and excluded.
           path: |
-            tmp/bench/bench-firefox-windows/*.json
-            tmp/bench/bench-firefox-windows/*.md
-            tmp/bench/bench-firefox-windows/report-*.json
-            tmp/bench/bench-firefox-windows/report-*.md
-            tmp/bench/bench-firefox-windows/key-diff.*
-            tmp/bench/bench-firefox-windows/*.log
-            tmp/bench/bench-firefox-windows/*.txt
+            ${{ runner.temp }}/f/*.json
+            ${{ runner.temp }}/f/*.md
+            ${{ runner.temp }}/f/report-*.json
+            ${{ runner.temp }}/f/report-*.md
+            ${{ runner.temp }}/f/key-diff.*
+            ${{ runner.temp }}/f/*.log
+            ${{ runner.temp }}/f/*.txt
           retention-days: 30
           if-no-files-found: warn
 

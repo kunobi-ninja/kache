@@ -73,6 +73,14 @@ fn key_cache_periodic_refresh_disabled(refresh_secs: u64) -> bool {
 }
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Read timeout for a stats round trip. Generous: a busy daemon may be holding
+/// the index lock when the request lands.
+const STATS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read timeout for the stats refetch after a stale daemon was replaced. The
+/// replacement has just bound its socket and has nothing queued, so a slow
+/// answer here means something is wrong rather than busy.
+const STATS_REFETCH_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_COORD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often the daemon re-checks its config file for changes. On a change it
@@ -207,12 +215,58 @@ fn read_daemon_state(socket_path: &Path) -> Option<DaemonCoordState> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn daemon_state_is_recent(state: &DaemonCoordState) -> bool {
-    let age_ms = now_millis().saturating_sub(state.updated_at_ms);
-    age_ms <= DAEMON_COORD_STALE_AFTER.as_millis() as u64
+/// Whether a daemon is serving or coming up right now, asking it nothing.
+///
+/// `doctor`'s liveness checks need an answer that is current and free of side
+/// effects, which a stats request is neither: it makes an older daemon schedule
+/// its own shutdown, and its answer goes stale within the same report. A socket
+/// connect plus the coordinator state file covers both a daemon that is serving
+/// and one that holds the run lock but has not bound its socket yet.
+pub fn daemon_is_live(config: &Config) -> bool {
+    crate::transport::is_reachable(&config.socket_path()) || starting_daemon_epoch(config).is_some()
 }
 
-fn client_epoch_is_newer(client_epoch: u64, daemon_epoch: u64) -> bool {
+/// Build epoch of a daemon that holds the run lock but has not bound its socket
+/// yet, if one is coming up right now.
+///
+/// Read-only and instant: it inspects the coordinator state file rather than the
+/// socket, which is what makes it usable from `doctor` during the window where a
+/// stats request would only report "not reachable" (kunobi-ninja/kache#720).
+///
+/// A coordinator file outlives an unclean exit, so its mere existence proves
+/// nothing, and neither does its PID: PIDs are recycled, and a fresh record whose
+/// PID has been reused by an unrelated process would otherwise read as a live
+/// starter. The run lock is what actually distinguishes them — a daemon takes it
+/// before writing `Starting` and holds it for its whole life, so only a real
+/// starter can be holding it. The lock is probed but never created here: `doctor`
+/// reports on lock files, and a diagnostic that manufactures one would then flag
+/// its own leftovers.
+pub fn starting_daemon_epoch(config: &Config) -> Option<u64> {
+    let socket_path = config.socket_path();
+    let state = read_daemon_state(&socket_path)?;
+    if state.phase != DaemonPhase::Starting
+        || !daemon_state_is_recent(&state)
+        || !process_is_alive(state.pid)
+    {
+        return None;
+    }
+    existing_daemon_run_lock_is_held(&socket_path)
+        .ok()?
+        .then_some(state.build_epoch)
+}
+
+fn daemon_state_is_recent(state: &DaemonCoordState) -> bool {
+    // A timestamp in the future is not a fresh heartbeat, it is a clock that
+    // moved: saturating to an age of zero would read a long-dead record as live
+    // until the wall clock caught back up.
+    now_millis()
+        .checked_sub(state.updated_at_ms)
+        .is_some_and(|age_ms| age_ms <= DAEMON_COORD_STALE_AFTER.as_millis() as u64)
+}
+
+/// Whether `client_epoch` is a strictly newer build than `daemon_epoch`. A zero
+/// on either side means "unknown", never "older".
+pub(crate) fn client_epoch_is_newer(client_epoch: u64, daemon_epoch: u64) -> bool {
     client_epoch > 0 && daemon_epoch > 0 && client_epoch > daemon_epoch
 }
 
@@ -6474,6 +6528,31 @@ pub fn send_stats_request(
     send_stats_request_options(config, include_entries, false, sort_by, event_hours)
 }
 
+/// Read the daemon's stats without starting or waiting for a replacement.
+///
+/// Not the same as side-effect-free, and deliberately not named that way: the
+/// request still carries this binary's build epoch, so an older daemon schedules
+/// its own graceful shutdown after answering, exactly as it does for any other
+/// client. What this variant drops is the *client* side of that handoff —
+/// [`send_stats_request`] spawns the replacement and blocks up to
+/// [`DAEMON_START_TIMEOUT`] waiting for it to bind its socket.
+///
+/// `doctor` reads through this variant because a pending upgrade is something to
+/// describe, not something to stall on (kunobi-ninja/kache#720).
+pub fn send_stats_request_without_restart(
+    config: &Config,
+    include_entries: bool,
+) -> Result<StatsResponse> {
+    fetch_stats(
+        config,
+        include_entries,
+        false,
+        None,
+        None,
+        STATS_READ_TIMEOUT,
+    )
+}
+
 pub(crate) fn send_stats_request_options(
     config: &Config,
     include_entries: bool,
@@ -6481,27 +6560,15 @@ pub(crate) fn send_stats_request_options(
     sort_by: Option<&str>,
     event_hours: Option<u64>,
 ) -> Result<StatsResponse> {
-    let socket_path = config.socket_path();
     let client_epoch = build_epoch();
-
-    let req = Request::Stats(StatsRequest {
+    let stats = fetch_stats(
+        config,
         include_entries,
         include_summaries,
-        sort_by: sort_by.map(String::from),
+        sort_by,
         event_hours,
-        client_epoch,
-    });
-
-    let resp_str =
-        send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(5))?;
-    let resp: Response = serde_json::from_str(&resp_str)?;
-
-    let stats = if resp.ok {
-        resp.stats
-            .ok_or_else(|| anyhow::anyhow!("stats response missing payload"))?
-    } else {
-        anyhow::bail!("daemon stats error: {}", resp.error.unwrap_or_default())
-    };
+        STATS_READ_TIMEOUT,
+    )?;
 
     if client_epoch_is_newer(client_epoch, stats.build_epoch) {
         tracing::info!(
@@ -6510,17 +6577,48 @@ pub(crate) fn send_stats_request_options(
             "stale daemon detected via stats request, restarting"
         );
         if restart_daemon_for_stale_client(config)?
-            && let Ok(fresh_resp_str) =
-                send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(3))
-            && let Ok(fresh_resp) = serde_json::from_str::<Response>(&fresh_resp_str)
-            && fresh_resp.ok
-            && let Some(fresh_stats) = fresh_resp.stats
+            && let Ok(fresh_stats) = fetch_stats(
+                config,
+                include_entries,
+                include_summaries,
+                sort_by,
+                event_hours,
+                STATS_REFETCH_TIMEOUT,
+            )
         {
             return Ok(fresh_stats);
         }
     }
 
     Ok(stats)
+}
+
+/// One stats round trip: no auto-start, no restart, no retry.
+fn fetch_stats(
+    config: &Config,
+    include_entries: bool,
+    include_summaries: bool,
+    sort_by: Option<&str>,
+    event_hours: Option<u64>,
+    read_timeout: Duration,
+) -> Result<StatsResponse> {
+    let req = Request::Stats(StatsRequest {
+        include_entries,
+        include_summaries,
+        sort_by: sort_by.map(String::from),
+        event_hours,
+        client_epoch: build_epoch(),
+    });
+
+    let resp_str = send_request_with_timeout(&config.socket_path(), &req, read_timeout)?;
+    let resp: Response = serde_json::from_str(&resp_str)?;
+
+    if resp.ok {
+        resp.stats
+            .ok_or_else(|| anyhow::anyhow!("stats response missing payload"))
+    } else {
+        anyhow::bail!("daemon stats error: {}", resp.error.unwrap_or_default())
+    }
 }
 
 /// Send a shutdown request to the running daemon.
@@ -6838,7 +6936,7 @@ pub fn restart(config: &Config) -> Result<bool> {
 /// Best-effort restart for stale-daemon detection from stats polling.
 /// This path is intentionally outside build hot paths, so a short bounded wait
 /// is acceptable to keep monitor/status output current.
-fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
+pub(crate) fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
     let socket_path = config.socket_path();
 
     let _ = send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
@@ -7193,22 +7291,46 @@ pub fn start_daemon_background() -> Result<bool> {
     Ok(false)
 }
 
+fn daemon_run_lock_path(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("run.lock")
+}
+
 fn daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
-    let run_lock_path = socket_path.with_extension("run.lock");
     let run_lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(&run_lock_path)
+        .open(daemon_run_lock_path(socket_path))
         .context("opening daemon run lock probe file")?;
 
-    // Probe: if we can acquire the lock, no daemon is running. Releases
-    // immediately on drop (or via explicit unlock below).
-    if run_lock_file.try_lock().is_ok() {
-        let _ = run_lock_file.unlock();
-        Ok(false)
+    Ok(run_lock_file_is_held(&run_lock_file))
+}
+
+/// Like [`daemon_run_lock_is_held`], but never creates the lock file: a missing
+/// file reads as "not held".
+///
+/// For callers that only observe. `doctor` reports leftover lock files, so a
+/// probe that creates one on a host that has never run a daemon would hand it a
+/// finding it manufactured itself — and testing for the file first only narrows
+/// that race rather than closing it.
+fn existing_daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .open(daemon_run_lock_path(socket_path))
+    {
+        Ok(file) => Ok(run_lock_file_is_held(&file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("opening daemon run lock probe file"),
+    }
+}
+
+/// Probe: if we can acquire the lock, no daemon holds it. Releases immediately.
+fn run_lock_file_is_held(file: &std::fs::File) -> bool {
+    if file.try_lock().is_ok() {
+        let _ = file.unlock();
+        false
     } else {
-        Ok(true)
+        true
     }
 }
 
@@ -8392,6 +8514,15 @@ mod tests {
                 .saturating_sub(DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2),
         };
         assert!(!daemon_state_is_recent(&stale));
+
+        // Clock moved backwards: a record stamped in the future is not fresh.
+        let future = DaemonCoordState {
+            pid: 1,
+            build_epoch: build_epoch(),
+            phase: DaemonPhase::Ready,
+            updated_at_ms: now_millis() + DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2,
+        };
+        assert!(!daemon_state_is_recent(&future));
     }
 
     #[test]
@@ -8584,6 +8715,166 @@ mod tests {
             "force_recover would have killed a non-kache process: {found:?} \
              contains decoy {decoy_pid}"
         );
+    }
+
+    /// A missing run lock file means "nobody holds it", which is a different
+    /// answer from "the probe failed": callers treat an error as unknown and
+    /// stop, so collapsing the two would make a host that never ran a daemon
+    /// indistinguishable from one whose lock could not be read.
+    #[test]
+    fn existing_run_lock_probe_separates_missing_from_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+
+        assert!(!existing_daemon_run_lock_is_held(&socket_path).unwrap());
+        // Answering must not have created the file it was asked about.
+        assert!(!daemon_run_lock_path(&socket_path).exists());
+
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(daemon_run_lock_path(&socket_path))
+            .unwrap();
+
+        // Present but free.
+        assert!(!existing_daemon_run_lock_is_held(&socket_path).unwrap());
+
+        lock.try_lock().unwrap();
+        assert!(existing_daemon_run_lock_is_held(&socket_path).unwrap());
+    }
+
+    /// A lock file that cannot be opened must surface as an error, not as
+    /// "nobody holds it".
+    ///
+    /// The probe special-cases exactly one failure — `NotFound`, meaning the
+    /// file was never created — and propagates everything else. The test above
+    /// covers missing, present-and-free, and held, but never an unreadable
+    /// lock, so the `NotFound` guard could be widened to match every error and
+    /// nothing would notice: an unreadable lock would then read as free, and
+    /// doctor would report a host as clean precisely when it could not tell.
+    ///
+    /// A directory where the file belongs is the portable way to fail an open
+    /// with something that is not `NotFound` (EISDIR on unix, access-denied on
+    /// Windows) without depending on running as an unprivileged user, which
+    /// chmod-based variants do.
+    #[test]
+    fn existing_run_lock_probe_propagates_an_unreadable_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        std::fs::create_dir_all(daemon_run_lock_path(&socket_path)).unwrap();
+
+        assert!(
+            existing_daemon_run_lock_is_held(&socket_path).is_err(),
+            "an unopenable lock file must not be reported as unheld"
+        );
+    }
+
+    /// The liveness signal behind doctor's process and stale-lock checks: true
+    /// for a daemon that is serving *or* still binding its socket, and false when
+    /// nothing is there. A signal stuck on either answer silently disables both
+    /// checks, so both directions are pinned here.
+    #[test]
+    fn daemon_is_live_covers_serving_and_starting_daemons() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        assert!(!daemon_is_live(&config), "nothing running");
+
+        // No socket yet, but the run lock is held and the coordinator says a
+        // daemon is on its way up.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(daemon_run_lock_path(&socket_path))
+            .unwrap();
+        lock.try_lock().unwrap();
+        write_json_atomically(
+            &daemon_state_path(&socket_path),
+            &DaemonCoordState {
+                pid: std::process::id(),
+                build_epoch: 4242,
+                phase: DaemonPhase::Starting,
+                updated_at_ms: now_millis(),
+            },
+        )
+        .unwrap();
+        assert!(daemon_is_live(&config), "starting daemon");
+    }
+
+    /// `starting_daemon_epoch` is what lets `doctor` say "a daemon is coming up"
+    /// during the window where the socket is not yet bound. It must answer only
+    /// for a live starter that holds the run lock: a coordinator file survives an
+    /// unclean exit, and a recorded PID can be recycled by an unrelated process,
+    /// so neither the file nor a live PID proves anything on its own (#720).
+    #[test]
+    fn starting_daemon_epoch_reports_only_a_live_starting_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let state_path = daemon_state_path(&socket_path);
+
+        // No coordinator file at all.
+        assert_eq!(starting_daemon_epoch(&config), None);
+
+        let mut state = DaemonCoordState {
+            pid: std::process::id(),
+            build_epoch: 4242,
+            phase: DaemonPhase::Starting,
+            updated_at_ms: now_millis(),
+        };
+        write_json_atomically(&state_path, &state).unwrap();
+
+        // A fresh record naming a live process is exactly what PID reuse looks
+        // like. Without the run lock it must not read as a starting daemon — and
+        // probing must not create the lock file, which `doctor` would then report
+        // as leftover cruft.
+        assert_eq!(starting_daemon_epoch(&config), None);
+        assert!(!daemon_run_lock_path(&socket_path).exists());
+
+        let run_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(daemon_run_lock_path(&socket_path))
+            .unwrap();
+        run_lock.try_lock().unwrap();
+        assert_eq!(starting_daemon_epoch(&config), Some(4242));
+
+        // Already serving: the socket answers, so this is not the starting window.
+        state.phase = DaemonPhase::Ready;
+        write_json_atomically(&state_path, &state).unwrap();
+        assert_eq!(starting_daemon_epoch(&config), None);
+
+        // Starting, but the heartbeat went cold — a crashed starter, not a live one.
+        state.phase = DaemonPhase::Starting;
+        state.updated_at_ms =
+            now_millis().saturating_sub(DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2);
+        write_json_atomically(&state_path, &state).unwrap();
+        assert_eq!(starting_daemon_epoch(&config), None);
+
+        // Fresh record, dead PID: the starter died between writing the file and
+        // binding the socket. Use a reaped child rather than a made-up PID so
+        // the process really is gone.
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit"]
+            } else {
+                vec![]
+            })
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+
+        state.updated_at_ms = now_millis();
+        state.pid = dead_pid;
+        write_json_atomically(&state_path, &state).unwrap();
+        assert_eq!(starting_daemon_epoch(&config), None);
     }
 
     #[test]

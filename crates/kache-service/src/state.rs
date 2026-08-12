@@ -95,23 +95,34 @@ impl SurrealPlannerRepository {
         Ok(())
     }
 
+    /// Define the planner tables, tolerating a database that already has them.
+    ///
+    /// This runs on every `open`, so it runs on every process start — and the
+    /// planner db lives on a persistent volume in production. Plain
+    /// `DEFINE TABLE` errors with "The table 'x' already exists" the second
+    /// time, which is not a startup the service can recover from: it exits 1
+    /// and CrashLoopBackOffs forever while the volume keeps the tables that
+    /// caused it. `IF NOT EXISTS` makes each definition a no-op when present.
+    ///
+    /// Deliberately not `OVERWRITE`: on a SCHEMAFULL table that redefines
+    /// rather than skips, which would churn the schema on every start.
     async fn init_schema(&self) -> Result<()> {
         self.db
             .query(
                 r#"
-DEFINE TABLE namespace_artifact SCHEMAFULL;
-DEFINE FIELD namespace ON namespace_artifact TYPE string;
-DEFINE FIELD dep_key ON namespace_artifact TYPE string;
-DEFINE FIELD cache_key ON namespace_artifact TYPE string;
-DEFINE FIELD crate_name ON namespace_artifact TYPE string;
-DEFINE FIELD last_seen_at ON namespace_artifact TYPE datetime;
-DEFINE INDEX namespace_dep_cache ON namespace_artifact FIELDS namespace, dep_key, cache_key UNIQUE;
+DEFINE TABLE IF NOT EXISTS namespace_artifact SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS namespace ON namespace_artifact TYPE string;
+DEFINE FIELD IF NOT EXISTS dep_key ON namespace_artifact TYPE string;
+DEFINE FIELD IF NOT EXISTS cache_key ON namespace_artifact TYPE string;
+DEFINE FIELD IF NOT EXISTS crate_name ON namespace_artifact TYPE string;
+DEFINE FIELD IF NOT EXISTS last_seen_at ON namespace_artifact TYPE datetime;
+DEFINE INDEX IF NOT EXISTS namespace_dep_cache ON namespace_artifact FIELDS namespace, dep_key, cache_key UNIQUE;
 
-DEFINE TABLE crate_artifact SCHEMAFULL;
-DEFINE FIELD crate_name ON crate_artifact TYPE string;
-DEFINE FIELD cache_key ON crate_artifact TYPE string;
-DEFINE FIELD last_seen_at ON crate_artifact TYPE datetime;
-DEFINE INDEX crate_cache ON crate_artifact FIELDS crate_name, cache_key UNIQUE;
+DEFINE TABLE IF NOT EXISTS crate_artifact SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS crate_name ON crate_artifact TYPE string;
+DEFINE FIELD IF NOT EXISTS cache_key ON crate_artifact TYPE string;
+DEFINE FIELD IF NOT EXISTS last_seen_at ON crate_artifact TYPE datetime;
+DEFINE INDEX IF NOT EXISTS crate_cache ON crate_artifact FIELDS crate_name, cache_key UNIQUE;
 "#,
             )
             .await
@@ -318,6 +329,34 @@ fn composite_id(parts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Defining the schema against a db that already has it must succeed.
+    ///
+    /// Every other test here starts from an empty tempdir, so the suite only
+    /// ever exercised the first-ever start. Production does not: the planner db
+    /// sits on a persistent volume, so the *second* start is the normal case
+    /// and the only one that can hit "table already exists". That gap let a
+    /// non-idempotent `DEFINE TABLE` reach production, where the planner exited
+    /// 1 on boot and CrashLoopBackOffed ~3700 times over 13 days without ever
+    /// becoming ready.
+    ///
+    /// Re-runs `init_schema` rather than reopening the file: surrealkv holds an
+    /// exclusive LOCK that a dropped handle does not release synchronously, so
+    /// a genuine reopen would need a sleep-and-retry and would be flaky in CI.
+    /// A restarting pod runs exactly this statement against exactly this state.
+    #[tokio::test]
+    async fn init_schema_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // `open` defines the schema once.
+        let repo = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
+            .await
+            .unwrap();
+
+        repo.init_schema()
+            .await
+            .expect("defining the schema against an existing schema must succeed");
+    }
 
     #[test]
     fn dep_key_joins_name_and_version() {

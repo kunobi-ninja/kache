@@ -220,7 +220,7 @@ fn read_daemon_state(socket_path: &Path) -> Option<DaemonCoordState> {
 ///
 /// Read-only and instant: it inspects the coordinator state file rather than the
 /// socket, which is what makes it usable from `doctor` during the window where a
-/// stats request would only report "not reachable".
+/// stats request would only report "not reachable" (kunobi-ninja/kache#720).
 ///
 /// A coordinator file outlives an unclean exit, so its mere existence proves
 /// nothing, and neither does its PID: PIDs are recycled, and a fresh record whose
@@ -6527,7 +6527,7 @@ pub fn send_stats_request(
 /// [`DAEMON_START_TIMEOUT`] waiting for it to bind its socket.
 ///
 /// `doctor` reads through this variant because a pending upgrade is something to
-/// describe, not something to stall on.
+/// describe, not something to stall on (kunobi-ninja/kache#720).
 pub fn send_stats_request_without_restart(
     config: &Config,
     include_entries: bool,
@@ -8710,7 +8710,7 @@ mod tests {
     /// during the window where the socket is not yet bound. It must answer only
     /// for a live starter that holds the run lock: a coordinator file survives an
     /// unclean exit, and a recorded PID can be recycled by an unrelated process,
-    /// so neither the file nor a live PID proves anything on its own.
+    /// so neither the file nor a live PID proves anything on its own (#720).
     #[test]
     fn starting_daemon_epoch_reports_only_a_live_starting_daemon() {
         let dir = tempfile::tempdir().unwrap();

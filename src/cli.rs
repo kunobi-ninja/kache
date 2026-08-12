@@ -2678,7 +2678,7 @@ fn daemon_footnote_needed(daemon_optional: bool, results: &[(&str, bool)]) -> bo
 ///
 /// `doctor` reports these states rather than repairing them: restarting a stale
 /// daemon costs an 8s wait for the replacement to come up, which is `--fix`'s
-/// job, not a diagnostic's.
+/// job, not a diagnostic's (kunobi-ninja/kache#720).
 ///
 /// Build epochs are executable mtimes, and `0` means "could not be read". Two
 /// builds are therefore only ever *ordered* through
@@ -3099,7 +3099,7 @@ pub fn doctor(
     // `send_stats_request_without_restart` skips the client-side stale-daemon
     // restart that `send_stats_request` performs, so an upgrade left half-applied
     // is described in the report instead of stalling it for the 8s the
-    // replacement takes to bind its socket. `--fix` opts
+    // replacement takes to bind its socket (kunobi-ninja/kache#720). `--fix` opts
     // into that wait below.
     let my_version = crate::VERSION;
     if let Some(ref cfg) = config {
@@ -3166,7 +3166,7 @@ pub fn doctor(
     //     daemon anything is what makes an outgoing one shut down and what could
     //     spend the 8s restart wait a second time; connecting asks nothing, costs
     //     nothing, and — unlike reusing check 8's answer — is true *now*, so a
-    //     daemon that died in between is not covered for.
+    //     daemon that died in between is not covered for (kunobi-ninja/kache#720).
     if let Some(ref cfg) = config {
         let reachable = daemon_is_live_now(cfg);
         let pids = crate::daemon::find_daemon_pids();
@@ -4708,7 +4708,7 @@ mod tests {
         assert!(!daemon_footnote_needed(true, &[]));
     }
 
-    // ── Daemon version reporting ───────────────────────────────────────────
+    // ── Daemon version reporting (kunobi-ninja/kache#720) ──────────────────
 
     /// The upgrade window: a daemon from before the upgrade is still answering.
     /// It must read as an upgrade left to finish, not as a version conflict, and

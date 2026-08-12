@@ -8744,6 +8744,32 @@ mod tests {
         assert!(existing_daemon_run_lock_is_held(&socket_path).unwrap());
     }
 
+    /// A lock file that cannot be opened must surface as an error, not as
+    /// "nobody holds it".
+    ///
+    /// The probe special-cases exactly one failure — `NotFound`, meaning the
+    /// file was never created — and propagates everything else. The test above
+    /// covers missing, present-and-free, and held, but never an unreadable
+    /// lock, so the `NotFound` guard could be widened to match every error and
+    /// nothing would notice: an unreadable lock would then read as free, and
+    /// doctor would report a host as clean precisely when it could not tell.
+    ///
+    /// A directory where the file belongs is the portable way to fail an open
+    /// with something that is not `NotFound` (EISDIR on unix, access-denied on
+    /// Windows) without depending on running as an unprivileged user, which
+    /// chmod-based variants do.
+    #[test]
+    fn existing_run_lock_probe_propagates_an_unreadable_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        std::fs::create_dir_all(daemon_run_lock_path(&socket_path)).unwrap();
+
+        assert!(
+            existing_daemon_run_lock_is_held(&socket_path).is_err(),
+            "an unopenable lock file must not be reported as unheld"
+        );
+    }
+
     /// The liveness signal behind doctor's process and stale-lock checks: true
     /// for a daemon that is serving *or* still binding its socket, and false when
     /// nothing is there. A signal stuck on either answer silently disables both

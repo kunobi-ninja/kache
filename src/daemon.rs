@@ -73,6 +73,14 @@ fn key_cache_periodic_refresh_disabled(refresh_secs: u64) -> bool {
 }
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
 const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Read timeout for a stats round trip. Generous: a busy daemon may be holding
+/// the index lock when the request lands.
+const STATS_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read timeout for the stats refetch after a stale daemon was replaced. The
+/// replacement has just bound its socket and has nothing queued, so a slow
+/// answer here means something is wrong rather than busy.
+const STATS_REFETCH_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_COORD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often the daemon re-checks its config file for changes. On a change it
@@ -207,12 +215,30 @@ fn read_daemon_state(socket_path: &Path) -> Option<DaemonCoordState> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Build epoch of a daemon that holds the run lock but has not bound its socket
+/// yet, if one is coming up right now.
+///
+/// Read-only and instant: it inspects the coordinator state file rather than the
+/// socket, which is what makes it usable from `doctor` during the window where a
+/// stats request would only report "not reachable" (kunobi-ninja/kache#740). A
+/// stale heartbeat or a dead PID reads as "nothing starting" — a coordinator file
+/// outlives an unclean exit, so its mere existence proves nothing.
+pub fn starting_daemon_epoch(config: &Config) -> Option<u64> {
+    let state = read_daemon_state(&config.socket_path())?;
+    (state.phase == DaemonPhase::Starting
+        && daemon_state_is_recent(&state)
+        && process_is_alive(state.pid))
+    .then_some(state.build_epoch)
+}
+
 fn daemon_state_is_recent(state: &DaemonCoordState) -> bool {
     let age_ms = now_millis().saturating_sub(state.updated_at_ms);
     age_ms <= DAEMON_COORD_STALE_AFTER.as_millis() as u64
 }
 
-fn client_epoch_is_newer(client_epoch: u64, daemon_epoch: u64) -> bool {
+/// Whether `client_epoch` is a strictly newer build than `daemon_epoch`. A zero
+/// on either side means "unknown", never "older".
+pub(crate) fn client_epoch_is_newer(client_epoch: u64, daemon_epoch: u64) -> bool {
     client_epoch > 0 && daemon_epoch > 0 && client_epoch > daemon_epoch
 }
 
@@ -6474,6 +6500,27 @@ pub fn send_stats_request(
     send_stats_request_options(config, include_entries, false, sort_by, event_hours)
 }
 
+/// Read the daemon's stats without the stale-daemon restart side effect.
+///
+/// [`send_stats_request`] upgrades a daemon older than the calling binary and
+/// blocks up to [`DAEMON_START_TIMEOUT`] waiting for the replacement to bind its
+/// socket. `doctor` reports state rather than changing it, so it reads through
+/// this variant: a pending upgrade is something to describe, not something to
+/// stall on (kunobi-ninja/kache#740).
+pub fn send_stats_request_read_only(
+    config: &Config,
+    include_entries: bool,
+) -> Result<StatsResponse> {
+    fetch_stats(
+        config,
+        include_entries,
+        false,
+        None,
+        None,
+        STATS_READ_TIMEOUT,
+    )
+}
+
 pub(crate) fn send_stats_request_options(
     config: &Config,
     include_entries: bool,
@@ -6481,27 +6528,15 @@ pub(crate) fn send_stats_request_options(
     sort_by: Option<&str>,
     event_hours: Option<u64>,
 ) -> Result<StatsResponse> {
-    let socket_path = config.socket_path();
     let client_epoch = build_epoch();
-
-    let req = Request::Stats(StatsRequest {
+    let stats = fetch_stats(
+        config,
         include_entries,
         include_summaries,
-        sort_by: sort_by.map(String::from),
+        sort_by,
         event_hours,
-        client_epoch,
-    });
-
-    let resp_str =
-        send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(5))?;
-    let resp: Response = serde_json::from_str(&resp_str)?;
-
-    let stats = if resp.ok {
-        resp.stats
-            .ok_or_else(|| anyhow::anyhow!("stats response missing payload"))?
-    } else {
-        anyhow::bail!("daemon stats error: {}", resp.error.unwrap_or_default())
-    };
+        STATS_READ_TIMEOUT,
+    )?;
 
     if client_epoch_is_newer(client_epoch, stats.build_epoch) {
         tracing::info!(
@@ -6510,17 +6545,48 @@ pub(crate) fn send_stats_request_options(
             "stale daemon detected via stats request, restarting"
         );
         if restart_daemon_for_stale_client(config)?
-            && let Ok(fresh_resp_str) =
-                send_request_with_timeout(&socket_path, &req, std::time::Duration::from_secs(3))
-            && let Ok(fresh_resp) = serde_json::from_str::<Response>(&fresh_resp_str)
-            && fresh_resp.ok
-            && let Some(fresh_stats) = fresh_resp.stats
+            && let Ok(fresh_stats) = fetch_stats(
+                config,
+                include_entries,
+                include_summaries,
+                sort_by,
+                event_hours,
+                STATS_REFETCH_TIMEOUT,
+            )
         {
             return Ok(fresh_stats);
         }
     }
 
     Ok(stats)
+}
+
+/// One stats round trip: no auto-start, no restart, no retry.
+fn fetch_stats(
+    config: &Config,
+    include_entries: bool,
+    include_summaries: bool,
+    sort_by: Option<&str>,
+    event_hours: Option<u64>,
+    read_timeout: Duration,
+) -> Result<StatsResponse> {
+    let req = Request::Stats(StatsRequest {
+        include_entries,
+        include_summaries,
+        sort_by: sort_by.map(String::from),
+        event_hours,
+        client_epoch: build_epoch(),
+    });
+
+    let resp_str = send_request_with_timeout(&config.socket_path(), &req, read_timeout)?;
+    let resp: Response = serde_json::from_str(&resp_str)?;
+
+    if resp.ok {
+        resp.stats
+            .ok_or_else(|| anyhow::anyhow!("stats response missing payload"))
+    } else {
+        anyhow::bail!("daemon stats error: {}", resp.error.unwrap_or_default())
+    }
 }
 
 /// Send a shutdown request to the running daemon.
@@ -6838,7 +6904,7 @@ pub fn restart(config: &Config) -> Result<bool> {
 /// Best-effort restart for stale-daemon detection from stats polling.
 /// This path is intentionally outside build hot paths, so a short bounded wait
 /// is acceptable to keep monitor/status output current.
-fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
+pub(crate) fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
     let socket_path = config.socket_path();
 
     let _ = send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
@@ -8584,6 +8650,62 @@ mod tests {
             "force_recover would have killed a non-kache process: {found:?} \
              contains decoy {decoy_pid}"
         );
+    }
+
+    /// `starting_daemon_epoch` is what lets `doctor` say "a daemon is coming up"
+    /// during the window where the socket is not yet bound. It must answer only
+    /// for a live, freshly-heartbeating starter: a coordinator file survives an
+    /// unclean exit, so its presence alone proves nothing (#740).
+    #[test]
+    fn starting_daemon_epoch_reports_only_a_live_starting_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let state_path = daemon_state_path(&socket_path);
+
+        // No coordinator file at all.
+        assert_eq!(starting_daemon_epoch(&config), None);
+
+        let mut state = DaemonCoordState {
+            pid: std::process::id(),
+            build_epoch: 4242,
+            phase: DaemonPhase::Starting,
+            updated_at_ms: now_millis(),
+        };
+        write_json_atomically(&state_path, &state).unwrap();
+        assert_eq!(starting_daemon_epoch(&config), Some(4242));
+
+        // Already serving: the socket answers, so this is not the starting window.
+        state.phase = DaemonPhase::Ready;
+        write_json_atomically(&state_path, &state).unwrap();
+        assert_eq!(starting_daemon_epoch(&config), None);
+
+        // Starting, but the heartbeat went cold — a crashed starter, not a live one.
+        state.phase = DaemonPhase::Starting;
+        state.updated_at_ms =
+            now_millis().saturating_sub(DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2);
+        write_json_atomically(&state_path, &state).unwrap();
+        assert_eq!(starting_daemon_epoch(&config), None);
+
+        // Fresh record, dead PID: the starter died between writing the file and
+        // binding the socket. Use a reaped child rather than a made-up PID so
+        // the process really is gone.
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit"]
+            } else {
+                vec![]
+            })
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+
+        state.updated_at_ms = now_millis();
+        state.pid = dead_pid;
+        write_json_atomically(&state_path, &state).unwrap();
+        assert_eq!(starting_daemon_epoch(&config), None);
     }
 
     #[test]

@@ -1083,7 +1083,19 @@ jobs:
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
     # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
     needs: [check, nix-package, e2e, test-macos, test-windows, version-consistency]
-    uses: zondax/_workflows/.github/workflows/_release-rust.yml@7f61511b59d2b86454e65a6bbf48f14469692324 # v11
+    # IN-ORG MIRROR of zondax/_workflows@7f61511 (v11) — a byte-identical import.
+    # The macOS legs run on the self-hosted signing runners, whose runner group
+    # restricts which workflows may use it. GitHub matches that allowlist against
+    # the workflow a job is DEFINED in (not the caller), and an org-owned group
+    # cannot name a workflow from another org — so while this pointed at
+    # `zondax/`, no allowlist entry could authorize the Darwin jobs. They queued
+    # forever against online, idle runners with no error anywhere; v0.14.0 lost
+    # ~2h to exactly that. See kunobi-ninja/_workflows for the full rationale.
+    #
+    # The signing-runners allowlist pins THIS SHA. Bumping the pin without
+    # updating that group's selected_workflows breaks releases SILENTLY — move
+    # both in one change; the mirror's README has the one-liner.
+    uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@ee8dc66895f75bf79c8fa4c87e06aaeb752e7db5 # v1
     with:
       binary_name: kache
       # Build .deb assets (kache_<version>_{amd64,arm64}.deb) for the apt repo,

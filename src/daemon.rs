@@ -215,6 +215,17 @@ fn read_daemon_state(socket_path: &Path) -> Option<DaemonCoordState> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Whether a daemon is serving or coming up right now, asking it nothing.
+///
+/// `doctor`'s liveness checks need an answer that is current and free of side
+/// effects, which a stats request is neither: it makes an older daemon schedule
+/// its own shutdown, and its answer goes stale within the same report. A socket
+/// connect plus the coordinator state file covers both a daemon that is serving
+/// and one that holds the run lock but has not bound its socket yet.
+pub fn daemon_is_live(config: &Config) -> bool {
+    crate::transport::is_reachable(&config.socket_path()) || starting_daemon_epoch(config).is_some()
+}
+
 /// Build epoch of a daemon that holds the run lock but has not bound its socket
 /// yet, if one is coming up right now.
 ///
@@ -8704,6 +8715,68 @@ mod tests {
             "force_recover would have killed a non-kache process: {found:?} \
              contains decoy {decoy_pid}"
         );
+    }
+
+    /// A missing run lock file means "nobody holds it", which is a different
+    /// answer from "the probe failed": callers treat an error as unknown and
+    /// stop, so collapsing the two would make a host that never ran a daemon
+    /// indistinguishable from one whose lock could not be read.
+    #[test]
+    fn existing_run_lock_probe_separates_missing_from_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+
+        assert!(!existing_daemon_run_lock_is_held(&socket_path).unwrap());
+        // Answering must not have created the file it was asked about.
+        assert!(!daemon_run_lock_path(&socket_path).exists());
+
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(daemon_run_lock_path(&socket_path))
+            .unwrap();
+
+        // Present but free.
+        assert!(!existing_daemon_run_lock_is_held(&socket_path).unwrap());
+
+        lock.try_lock().unwrap();
+        assert!(existing_daemon_run_lock_is_held(&socket_path).unwrap());
+    }
+
+    /// The liveness signal behind doctor's process and stale-lock checks: true
+    /// for a daemon that is serving *or* still binding its socket, and false when
+    /// nothing is there. A signal stuck on either answer silently disables both
+    /// checks, so both directions are pinned here.
+    #[test]
+    fn daemon_is_live_covers_serving_and_starting_daemons() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        assert!(!daemon_is_live(&config), "nothing running");
+
+        // No socket yet, but the run lock is held and the coordinator says a
+        // daemon is on its way up.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(daemon_run_lock_path(&socket_path))
+            .unwrap();
+        lock.try_lock().unwrap();
+        write_json_atomically(
+            &daemon_state_path(&socket_path),
+            &DaemonCoordState {
+                pid: std::process::id(),
+                build_epoch: 4242,
+                phase: DaemonPhase::Starting,
+                updated_at_ms: now_millis(),
+            },
+        )
+        .unwrap();
+        assert!(daemon_is_live(&config), "starting daemon");
     }
 
     /// `starting_daemon_epoch` is what lets `doctor` say "a daemon is coming up"

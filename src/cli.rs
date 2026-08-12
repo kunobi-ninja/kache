@@ -2687,16 +2687,18 @@ fn daemon_footnote_needed(daemon_optional: bool, results: &[(&str, bool)]) -> bo
 /// unknown, and gets said so rather than guessed: telling someone their binary is
 /// stale on the strength of an unreadable mtime sends them to reinstall a kache
 /// that was fine.
-/// Whether a daemon is serving or coming up right now, asking it nothing.
+/// Whether leftover lock files are abandoned rather than in use.
 ///
-/// `doctor`'s liveness checks need an answer that is current and free of side
-/// effects, which a stats request is neither: it makes an older daemon schedule
-/// its own shutdown, and its answer goes stale within the same report. A socket
-/// connect plus the coordinator state file covers both a daemon that is serving
-/// and one that has the run lock but has not bound its socket yet.
-fn daemon_is_live_now(config: &crate::config::Config) -> bool {
-    crate::transport::is_reachable(&config.socket_path())
-        || crate::daemon::starting_daemon_epoch(config).is_some()
+/// Split out because the mistake it guards against is a boolean one: any of the
+/// three conditions weakening turns "no daemon owns these" into a claim about a
+/// daemon that is running, and `doctor` then tells someone to restart a healthy
+/// one to clean up files it is still using.
+fn stale_locks_are_abandoned(
+    lock_files_present: bool,
+    daemon_live: bool,
+    daemon_processes: usize,
+) -> bool {
+    lock_files_present && !daemon_live && daemon_processes == 0
 }
 
 /// What `doctor --fix` prints after trying to replace a stale daemon, or `None`
@@ -3168,7 +3170,7 @@ pub fn doctor(
     //     nothing, and — unlike reusing check 8's answer — is true *now*, so a
     //     daemon that died in between is not covered for (kunobi-ninja/kache#720).
     if let Some(ref cfg) = config {
-        let reachable = daemon_is_live_now(cfg);
+        let reachable = crate::daemon::daemon_is_live(cfg);
         let pids = crate::daemon::find_daemon_pids();
         if !reachable && !pids.is_empty() {
             let pids_str = pids
@@ -3225,10 +3227,11 @@ pub fn doctor(
                 stale_files.push(p);
             }
         }
-        if !stale_files.is_empty()
-            && !daemon_is_live_now(cfg)
-            && crate::daemon::find_daemon_pids().is_empty()
-        {
+        if stale_locks_are_abandoned(
+            !stale_files.is_empty(),
+            crate::daemon::daemon_is_live(cfg),
+            crate::daemon::find_daemon_pids().len(),
+        ) {
             if fix {
                 for f in &stale_files {
                     let _ = std::fs::remove_file(f);
@@ -4814,6 +4817,19 @@ mod tests {
         // through the equality arm.
         let (pass, detail, _) = daemon_version_check(None, Some(0), "0.14.0", 0);
         assert!(!pass, "{detail}");
+    }
+
+    /// Lock files are only cruft when nothing owns them. Each condition is
+    /// load-bearing on its own: weaken any one and doctor tells someone to
+    /// restart a healthy daemon to clean up files it is still using.
+    #[test]
+    fn stale_locks_are_abandoned_needs_every_condition() {
+        assert!(stale_locks_are_abandoned(true, false, 0));
+
+        assert!(!stale_locks_are_abandoned(false, false, 0), "no lock files");
+        assert!(!stale_locks_are_abandoned(true, true, 0), "daemon serving");
+        assert!(!stale_locks_are_abandoned(true, false, 1), "daemon process");
+        assert!(!stale_locks_are_abandoned(false, true, 2), "none of them");
     }
 
     /// A restart that did not finish must never read as one that is still

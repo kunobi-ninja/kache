@@ -353,7 +353,6 @@ bump VERSION:
   cargo check --workspace
   # Fail here rather than at the release floor if anything did not line up.
   ./scripts/check-version-consistency.sh
-  ./scripts/check-version-consistency.sh
   echo "Bumped to {{VERSION}}. Commit + open a PR; after merge, cut the tag with 'just release'."
 
 # Deliberately read-only: the value is only correct once HEAD is the tagged

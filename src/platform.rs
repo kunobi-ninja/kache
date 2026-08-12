@@ -410,6 +410,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn kill_process_actually_kills_a_spawned_child() {
+        // SIGKILL is the escalation the daemon recovery path relies on when a
+        // polite SIGTERM does not land, so it needs its own coverage: a
+        // terminate-only test leaves "kill does nothing" indistinguishable
+        // from "kill works".
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        super::kill_process(pid);
+        let status = child.wait().expect("reap child");
+
+        assert!(!status.success(), "child should have been killed");
+        assert!(!super::is_process_alive(pid), "child should be gone");
+    }
+
+    #[cfg(unix)]
+    #[test]
     #[should_panic(expected = "not a descendant of the test process")]
     fn signalling_a_process_the_test_does_not_own_panics() {
         // The test runner that spawned us: a live PID, definitely not ours.

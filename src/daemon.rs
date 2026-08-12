@@ -8429,6 +8429,46 @@ mod tests {
         assert!(!super::comm_is_daemon_exe("   "));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_rejects_broadcast_pids() {
+        // This prunes the in-flight compile map. `kill(0, 0)` and `kill(-1, 0)`
+        // succeed whenever anything signalable exists, so without the guard
+        // entries recorded under a bogus PID would look alive forever.
+        assert!(super::pid_alive(std::process::id()));
+
+        assert!(!super::pid_alive(0), "0 is the caller's process group");
+        assert!(!super::pid_alive(1), "1 is init/launchd, never a compile");
+        assert!(
+            !super::pid_alive(u32::MAX),
+            "u32::MAX casts to the -1 broadcast"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_comm_reports_the_executable_behind_a_pid() {
+        // The executable check is only as good as this lookup: if it silently
+        // returned None or a wrong name, find_daemon_pids would quietly match
+        // nothing and force_recover would stop recovering anything at all.
+        // A test that only asserts "the bystander was excluded" cannot tell
+        // those apart, so pin the lookup itself against the running test
+        // process, whose executable name is known.
+        let comm = super::process_comm(std::process::id()).expect("ps must answer for our own pid");
+        let name = std::path::Path::new(&comm)
+            .file_name()
+            .expect("comm has a file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with("kache"),
+            "expected the test binary's own executable name, got {comm:?}"
+        );
+
+        // A PID that cannot exist has no executable to report.
+        assert_eq!(super::process_comm(0), None);
+    }
+
     #[test]
     fn cmdline_is_daemon_run_matches_only_the_daemon_subcommand() {
         // Windows enumerates by image name only, so this is the sole thing
@@ -8448,6 +8488,42 @@ mod tests {
         assert!(!super::cmdline_is_daemon_run("kache.exe daemon"));
         assert!(!super::cmdline_is_daemon_run("kache.exe run"));
         assert!(!super::cmdline_is_daemon_run(""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_daemon_pids_finds_a_process_running_the_kache_executable() {
+        // The negative test below cannot tell "correctly excluded the
+        // bystander" from "found nothing at all", which is what a broken
+        // lookup or an over-strict filter would do — and finding nothing means
+        // force_recover silently stops recovering. So pin the positive side.
+        //
+        // A real `kache daemon run` cannot be arranged inside a unit test, so
+        // stand one up: any executable named `kache`, placed in a directory
+        // whose name puts "kache daemon run" into the command line that
+        // `pgrep -f` sees.
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("kache daemon run");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let fake = bin_dir.join("kache");
+        std::fs::copy("/bin/sleep", &fake).unwrap();
+
+        let mut child = std::process::Command::new(&fake)
+            .arg("30")
+            .spawn()
+            .expect("spawn fake daemon");
+        let fake_pid = child.id();
+
+        let found = super::find_daemon_pids();
+
+        child.kill().expect("kill fake daemon");
+        child.wait().expect("reap fake daemon");
+
+        assert!(
+            found.contains(&fake_pid),
+            "a process running an executable named kache should be found: \
+             {found:?} is missing {fake_pid}"
+        );
     }
 
     #[cfg(unix)]

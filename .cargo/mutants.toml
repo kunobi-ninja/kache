@@ -95,6 +95,22 @@ gitignore = true
 # The two `windows_*` path adapters only translate host `Path` components into
 # platform-neutral classifiers. Ubuntu cannot compile their Windows bodies;
 # the classifiers remain in scope and have exhaustive Linux-runnable tests.
+#
+# `windows_kache_processes` is `#[cfg(windows)]`: the `sample_write_clock`
+# property again — the ubuntu lane never compiles it, so every mutant inside
+# it survives by construction. Kept as narrow as the name allows: the decision
+# it feeds, `cmdline_is_daemon_run`, is deliberately `#[cfg(any(windows, test))]`
+# precisely so this lane still mutation-tests the matching rule that decides
+# which processes force_recover may kill.
+#
+# The two operator mutants inside `find_daemon_pids` are the same story: both
+# live in its `#[cfg(windows)]` arm — `*pid != own_pid && cmdline_is_daemon_run(..)`
+# — which this lane does not compile. Its Unix arm is untouched by the change
+# that introduced these entries, so nothing here narrows coverage of the code
+# the lane can actually reach. The function's return value stays fully in
+# scope and is killed by tests asserting both directions: a process running a
+# `kache` executable is found, and a shell whose command line merely mentions
+# `kache daemon run` is not.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -117,4 +133,7 @@ exclude_re = [
     "NonInheritableStdio",
     "windows_pattern_has_ambiguous_root",
     "windows_path_uses_device_namespace",
+    "windows_kache_processes",
+    "replace && with \\|\\| in find_daemon_pids",
+    "replace != with == in find_daemon_pids",
 ]

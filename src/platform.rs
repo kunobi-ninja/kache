@@ -9,8 +9,119 @@
 //! On Windows they map to OpenProcess/TerminateProcess and the Windows
 //! console-control events surfaced by tokio::signal::windows.
 
+/// Is `pid` safe to hand to `kill(2)` as a single-process target?
+///
+/// `kill(2)` overloads the pid argument with broadcast modes, and a bogus or
+/// sentinel PID that lands in one of them takes down far more than the
+/// intended process:
+///
+///   - `pid == 0`: every process in the *caller's* process group
+///   - `pid == -1`: every process the caller has permission to signal, i.e.
+///     the user's entire login session
+///   - `pid < -1`: the process group `-pid`
+///   - `pid == 1`: init/launchd, and negating it yields the `-1` broadcast
+///
+/// Note that `u32::MAX` casts to `-1`, so a "definitely dead, made-up PID"
+/// fixture is exactly the value that wipes the session. Reject anything that
+/// is not an ordinary positive PID.
+#[cfg(unix)]
+fn is_single_process_pid(pid: u32) -> bool {
+    pid > 1 && i32::try_from(pid).is_ok()
+}
+
+/// Refuse a PID that `kill(2)` would treat as a broadcast selector.
+///
+/// Production logs and carries on — a corrupt pidfile must not take the daemon
+/// down. Tests panic instead: a fixture that reaches here is the exact bug this
+/// module exists to prevent, and silently no-oping would let it pass green.
+#[cfg(unix)]
+fn refuse_unsafe_pid(pid: u32, what: &str) {
+    tracing::error!(pid, action = what, "refusing to signal a non-process PID");
+
+    #[cfg(test)]
+    panic!(
+        "test passed PID {pid} to {what}; kill(2) reads that as a broadcast \
+         selector (0 = our process group, -1 = every process the user owns). \
+         Use a real spawned child, not a sentinel PID."
+    );
+}
+
+/// Parent of `pid`, or None when that cannot be established — no usable `ps`,
+/// or the process is already gone.
+#[cfg(all(unix, test))]
+fn parent_pid(pid: u32) -> Option<u32> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Test-only blast radius limit: a unit test may only signal processes it
+/// actually spawned.
+///
+/// The pid guard above rejects the broadcast selectors, but it cannot tell a
+/// legitimate target from someone else's PID — and a test that signals a PID
+/// it does not own has no correct outcome, only luck. This walks the target's
+/// parent chain and refuses anything the test process does not sit above, so
+/// a bad fixture fails the test instead of reaching across the machine.
+///
+/// Compiled only under `cfg(test)`, so production keeps the bare `kill(2)`.
+///
+/// Fails only on *positive* evidence of non-descent — a chain walked all the
+/// way to init without meeting us. Where the chain cannot be resolved at all
+/// there is nothing to conclude: the Nix build sandbox ships no `ps`, and
+/// treating that silence as "not yours" failed legitimate tests signalling
+/// their own children. The value guard above still rejects the broadcast
+/// selectors there, which is the catastrophic class; this one is the finer
+/// limit and correctly declines to judge without evidence.
+#[cfg(all(unix, test))]
+fn assert_test_owns_process(pid: u32, what: &str) -> bool {
+    let me = std::process::id();
+    let mut cursor = pid;
+
+    // Depth-limited: a cycle in the reported parent chain must not hang.
+    for _ in 0..64 {
+        if cursor == me {
+            return true;
+        }
+        if cursor <= 1 {
+            // Reached init having never met ourselves: the target really is
+            // somebody else's.
+            break;
+        }
+        let Some(parent) = parent_pid(cursor) else {
+            // No usable `ps`, or the process exited mid-walk. Either way we
+            // cannot show the target is foreign, so do not claim it is.
+            return true;
+        };
+        cursor = parent;
+    }
+
+    panic!(
+        "test tried to {what} PID {pid}, which is not a descendant of the test \
+         process ({me}). Tests may only signal processes they spawned; a PID \
+         from a fixture, a config file, or a `pgrep` sweep belongs to the \
+         developer's machine. (A child orphaned before this check — its \
+         intermediate parent exited, so init reparented it — also lands here; \
+         keep the process you intend to signal a live descendant.)"
+    );
+}
+
 #[cfg(unix)]
 pub fn is_process_alive(pid: u32) -> bool {
+    // Probing with signal 0 is harmless per se, but `kill(-1, 0)` succeeds
+    // whenever *any* signalable process exists, so a broadcast PID would
+    // report "alive" and send callers straight into the terminate path.
+    if !is_single_process_pid(pid) {
+        return false;
+    }
     // kill(pid, 0) returns 0 if the process exists; EPERM also means it
     // exists but is owned by another user.
     let rc = unsafe { libc::kill(pid as i32, 0) };
@@ -61,8 +172,16 @@ pub fn is_process_alive(pid: u32) -> bool {
 /// graceful shutdown should prefer the daemon's own RPC `Shutdown` request.
 pub fn terminate_process(pid: u32) {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
+    {
+        if !is_single_process_pid(pid) {
+            refuse_unsafe_pid(pid, "terminate_process");
+            return;
+        }
+        #[cfg(test)]
+        assert_test_owns_process(pid, "SIGTERM");
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
     }
     #[cfg(windows)]
     {
@@ -73,8 +192,16 @@ pub fn terminate_process(pid: u32) {
 /// Forcefully kill a process. SIGKILL on Unix, TerminateProcess on Windows.
 pub fn kill_process(pid: u32) {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
+    {
+        if !is_single_process_pid(pid) {
+            refuse_unsafe_pid(pid, "kill_process");
+            return;
+        }
+        #[cfg(test)]
+        assert_test_owns_process(pid, "SIGKILL");
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
     }
     #[cfg(windows)]
     {
@@ -85,8 +212,18 @@ pub fn kill_process(pid: u32) {
 /// Forcefully kill a process and all its descendants (process group on Unix, process tree on Windows).
 pub fn kill_process_group(pid: u32) {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
+    {
+        // `-pid` is the group selector, so pid 1 would negate into the `-1`
+        // "signal everything" broadcast and pid 0 into the caller's own group.
+        if !is_single_process_pid(pid) {
+            refuse_unsafe_pid(pid, "kill_process_group");
+            return;
+        }
+        #[cfg(test)]
+        assert_test_owns_process(pid, "SIGKILL the process group of");
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
     }
     #[cfg(windows)]
     {
@@ -200,6 +337,19 @@ pub fn configure_process_group(cmd: &mut std::process::Command) {
 
 #[cfg(test)]
 mod tests {
+    /// Is a usable `ps` on PATH? Tests that assert on the parent-chain walk
+    /// need to know before asserting — the Nix build sandbox has none, and
+    /// there the guard deliberately allows instead of judging.
+    ///
+    /// Deliberately does not call `parent_pid`: this is the skip condition for
+    /// tests that pin `parent_pid` itself, so routing through it would let a
+    /// mutant that stubs it out downgrade those tests to silent skips.
+    #[cfg(unix)]
+    fn ps_available() -> bool {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("ps").is_file()))
+    }
+
     #[cfg(unix)]
     #[test]
     fn process_stat_zombie_detection_uses_leading_state() {
@@ -245,6 +395,141 @@ mod tests {
             "reaped child should no longer be alive"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn broadcast_pids_are_not_single_process_targets() {
+        // The kill(2) broadcast selectors. `u32::MAX` is the dangerous one:
+        // it casts to -1, which signals the user's entire session.
+        for pid in [0, 1, u32::MAX] {
+            assert!(
+                !super::is_single_process_pid(pid),
+                "pid {pid} must never be signalled as a single process"
+            );
+        }
+        assert!(super::is_single_process_pid(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broadcast_pids_are_never_reported_alive() {
+        // `kill(-1, 0)` succeeds whenever anything is signalable, so an
+        // unguarded liveness probe would call u32::MAX "alive" and send
+        // callers into terminate_process with it.
+        for pid in [0, 1, u32::MAX] {
+            assert!(
+                !super::is_process_alive(pid),
+                "pid {pid} must not be reported alive"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_child_is_owned_and_terminable() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        assert!(super::assert_test_owns_process(pid, "probe"));
+
+        // The ownership check must not get in the way of the legitimate case.
+        super::terminate_process(pid);
+        let status = child.wait().expect("reap child");
+        assert!(!status.success(), "child should have been terminated");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_actually_kills_a_spawned_child() {
+        // SIGKILL is the escalation the daemon recovery path relies on when a
+        // polite SIGTERM does not land, so it needs its own coverage: a
+        // terminate-only test leaves "kill does nothing" indistinguishable
+        // from "kill works".
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        super::kill_process(pid);
+        let status = child.wait().expect("reap child");
+
+        assert!(!status.success(), "child should have been killed");
+        assert!(!super::is_process_alive(pid), "child should be gone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signalling_a_process_the_test_does_not_own_panics() {
+        // Needs a working `ps`: without one the guard deliberately allows
+        // rather than judging, so there is nothing to assert. The Nix build
+        // sandbox has no `ps`; the mutation and Test lanes do.
+        //
+        // Probe for the tool directly rather than asking `parent_pid`, which
+        // is part of what this test pins: gating on it would let a mutant that
+        // stubs it out silently turn this test into a skip.
+        if !ps_available() {
+            return;
+        }
+
+        // The test runner that spawned us: a live PID, definitely not ours.
+        // `assert_test_owns_process` only inspects the parent chain — it
+        // never signals — so this stays harmless even if the check regresses.
+        let parent = unsafe { libc::getppid() } as u32;
+        let outcome =
+            std::panic::catch_unwind(|| super::assert_test_owns_process(parent, "SIGTERM"));
+
+        let panic_msg = *outcome
+            .expect_err("signalling a non-descendant must fail the test")
+            .downcast::<String>()
+            .expect("guard panics with a message");
+        assert!(
+            panic_msg.contains("not a descendant of the test process"),
+            "unexpected panic message: {panic_msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owning_a_process_is_not_claimed_without_evidence() {
+        // The complement of the test above: where the parent chain cannot be
+        // resolved the guard must allow, not panic. Pin it against a PID that
+        // no `ps` can answer for, which is the same shape as the missing-`ps`
+        // sandbox and the reaped-child race.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+
+        assert!(
+            super::assert_test_owns_process(pid, "probe"),
+            "an unresolvable chain must not be reported as foreign"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "broadcast")]
+    fn a_broadcast_pid_fails_the_test_that_supplied_it() {
+        // `refuse_unsafe_pid` contains no kill call at all, so exercising the
+        // rejection path here is safe even if every other guard regresses.
+        super::refuse_unsafe_pid(u32::MAX, "terminate_process");
+    }
+
+    // Deliberately NOT tested: calling `terminate_process(u32::MAX)` and
+    // asserting a bystander process survived. That test passes by doing
+    // nothing and fails by killing the developer's entire login session —
+    // and this repo runs cargo-mutants, which would build exactly the
+    // compromised guard that makes it fire (see kunobi-ninja/kache history
+    // for the session-wipe this module now prevents). The guard is a plain
+    // early return over `is_single_process_pid`, so pinning the predicate
+    // above pins the behaviour without arming a live round.
 
     #[cfg(unix)]
     #[test]

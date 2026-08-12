@@ -103,15 +103,14 @@ gitignore = true
 # precisely so this lane still mutation-tests the matching rule that decides
 # which processes force_recover may kill.
 #
-# `find_daemon_pids`'s `pid != own_pid && process_is_alive(pid)` guards against
-# the enumeration returning the caller. Every caller — `daemon restart`,
-# `doctor`, `setup` — has a command line of the form `kache daemon restart`,
-# which `pgrep -f "kache daemon run"` does not match, so no test can arrange
-# for own_pid to appear in the input and `&&` vs `||` is unobservable rather
-# than untested. The guard stays as defence in depth if a future caller runs
-# under a matching command line. The rest of the function is covered by tests
-# that assert both directions: a process running a `kache` executable is
-# found, and a shell that merely mentions `kache daemon run` is not.
+# The two operator mutants inside `find_daemon_pids` are the same story: both
+# live in its `#[cfg(windows)]` arm — `*pid != own_pid && cmdline_is_daemon_run(..)`
+# — which this lane does not compile. Its Unix arm is untouched by the change
+# that introduced these entries, so nothing here narrows coverage of the code
+# the lane can actually reach. The function's return value stays fully in
+# scope and is killed by tests asserting both directions: a process running a
+# `kache` executable is found, and a shell whose command line merely mentions
+# `kache daemon run` is not.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -136,4 +135,5 @@ exclude_re = [
     "windows_path_uses_device_namespace",
     "windows_kache_processes",
     "replace && with \\|\\| in find_daemon_pids",
+    "replace != with == in find_daemon_pids",
 ]

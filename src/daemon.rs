@@ -6411,8 +6411,17 @@ fn prune_in_flight(map: &mut HashMap<u32, CompileStartedRequest>) {
 
 /// Is a process with this PID alive? `kill(pid, 0)` probes without signaling:
 /// success or EPERM (alive, not ours) both mean alive; ESRCH means gone.
+///
+/// Deliberately does not use [`crate::platform::is_process_alive`]: this runs
+/// inside a `retain` over every in-flight compile, and that helper shells out
+/// to `ps` for a zombie check. It does share the helper's pid guard, because
+/// `kill(-1, 0)` succeeds whenever anything is signalable and would keep
+/// bogus entries alive in the map forever.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
+    if pid <= 1 || i32::try_from(pid).is_err() {
+        return false;
+    }
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
@@ -6554,10 +6563,53 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
     }
 }
 
+/// Executable file name a real daemon process must be running.
+#[cfg(unix)]
+const DAEMON_EXE_NAME: &str = "kache";
+
+/// Does `ps -o comm=` output name the kache executable itself?
+///
+/// `pgrep -f` matches against the whole command line, so it also returns
+/// processes that merely *mention* `kache daemon run` — most importantly the
+/// shell or wrapper script that launched the daemon
+/// (`sh -c "kache daemon run"` carries the string in its own argv). Since
+/// `find_daemon_pids` feeds `force_recover`, which SIGTERMs then SIGKILLs
+/// every PID it returns, a command-line match means "nuclear recovery" can
+/// kill the user's script or interactive shell.
+///
+/// macOS reports a full path here and Linux a bare name, so compare on the
+/// file name. Deliberately strict: a renamed binary is missed and recovery
+/// falls through to wiping the stale coordination files, which is recoverable.
+/// Killing the wrong process is not.
+#[cfg(unix)]
+fn comm_is_daemon_exe(comm: &str) -> bool {
+    let comm = comm.trim();
+    !comm.is_empty()
+        && Path::new(comm)
+            .file_name()
+            .is_some_and(|name| name == DAEMON_EXE_NAME)
+}
+
+/// Executable name behind a PID, via `ps -o comm=`. None if the process is
+/// gone or `ps` could not answer.
+#[cfg(unix)]
+fn process_comm(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Find PIDs of running `kache daemon run` processes via pgrep.
 ///
 /// Returns only PIDs that are still alive at the moment of the check — stale
-/// pgrep output is filtered out with a `kill -0` probe.
+/// pgrep output is filtered out with a `kill -0` probe — and only processes
+/// that are the kache executable itself, never something whose command line
+/// merely mentions it. See [`comm_is_daemon_exe`].
 pub fn find_daemon_pids() -> Vec<u32> {
     let own_pid = std::process::id();
 
@@ -6574,12 +6626,29 @@ pub fn find_daemon_pids() -> Vec<u32> {
             .lines()
             .filter_map(|l| l.trim().parse::<u32>().ok())
             .filter(|&pid| pid != own_pid && process_is_alive(pid))
+            .filter(|&pid| process_comm(pid).is_some_and(|comm| comm_is_daemon_exe(&comm)))
             .collect()
     }
 
     #[cfg(windows)]
     {
-        // tasklist is available on all supported Windows versions.
+        // Preferred: Win32_Process gives the command line, so a sibling
+        // `kache.exe build` is not mistaken for a daemon. Falls back to
+        // tasklist when the query is unavailable — see below.
+        if let Some(processes) = windows_kache_processes() {
+            return processes
+                .into_iter()
+                .filter(|(pid, cmdline)| *pid != own_pid && cmdline_is_daemon_run(cmdline))
+                .map(|(pid, _)| pid)
+                .filter(|&pid| process_is_alive(pid))
+                .collect();
+        }
+
+        // Fallback: tasklist is available on all supported Windows versions but
+        // reports no command line, so this matches every kache.exe. That is the
+        // long-standing behaviour; keeping it means a missing or restricted
+        // PowerShell degrades recovery to what it always did rather than
+        // silently finding nothing and leaving a stuck daemon unrecoverable.
         // /FI filters by image name, /FO CSV for parseable output, /NH skips header.
         // CSV format: "kache.exe","1234","Console","1","12,345 K"
         let output = match std::process::Command::new("tasklist")
@@ -6598,6 +6667,66 @@ pub fn find_daemon_pids() -> Vec<u32> {
             .filter(|&pid| pid != own_pid && process_is_alive(pid))
             .collect()
     }
+}
+
+/// Does this command line belong to a `kache daemon run` process?
+///
+/// The Windows enumeration filters by image name, which — unlike the Unix
+/// `pgrep -f` path — says nothing about the subcommand, so without this an
+/// in-flight `kache.exe build` looks like a daemon to `force_recover` and gets
+/// killed. Matches `daemon` immediately followed by `run` as argument tokens,
+/// so `daemon status` and a bare `daemon` do not qualify.
+///
+/// Compiled on Windows and in every test build, so the Unix lanes still cover
+/// the logic even though only Windows calls it.
+#[cfg(any(windows, test))]
+fn cmdline_is_daemon_run(cmdline: &str) -> bool {
+    let mut rest = cmdline.split_whitespace().skip_while(|token| *token != "daemon");
+    rest.next().is_some() && rest.next() == Some("run")
+}
+
+/// `(pid, command line)` for every running `kache.exe`, or None when the query
+/// is unavailable and the caller should fall back to tasklist.
+///
+/// Returns None rather than an empty vec when rows came back but no command
+/// line did: that means the query ran without the access needed to read
+/// command lines, and treating it as "no daemons" would break recovery.
+#[cfg(windows)]
+fn windows_kache_processes() -> Option<Vec<(u32, String)>> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='kache.exe'\" | \
+             ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut rows = Vec::new();
+    let mut saw_command_line = false;
+    for line in stdout.lines() {
+        let Some((pid, cmdline)) = line.trim().split_once('|') else {
+            continue;
+        };
+        let Ok(pid) = pid.trim().parse::<u32>() else {
+            continue;
+        };
+        let cmdline = cmdline.trim();
+        saw_command_line |= !cmdline.is_empty();
+        rows.push((pid, cmdline.to_string()));
+    }
+
+    if rows.is_empty() {
+        // No kache.exe at all — a real, trustworthy answer.
+        return Some(rows);
+    }
+    saw_command_line.then_some(rows)
 }
 
 /// Nuclear recovery: kill any lingering `kache daemon run` processes, then
@@ -8277,14 +8406,94 @@ mod tests {
         assert!(daemon_state_is_recent(&state));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn comm_is_daemon_exe_accepts_only_the_kache_executable() {
+        // macOS reports a full path, Linux a bare name.
+        assert!(super::comm_is_daemon_exe("/Users/x/.cargo/bin/kache"));
+        assert!(super::comm_is_daemon_exe("kache"));
+        assert!(super::comm_is_daemon_exe("  /usr/local/bin/kache  "));
+        assert!(super::comm_is_daemon_exe("./target/debug/kache"));
+
+        // The shell or wrapper that launched the daemon carries
+        // "kache daemon run" in its own argv, so `pgrep -f` returns it.
+        assert!(!super::comm_is_daemon_exe("/bin/sh"));
+        assert!(!super::comm_is_daemon_exe("zsh"));
+        assert!(!super::comm_is_daemon_exe("vim"));
+        // Not a prefix or substring match.
+        assert!(!super::comm_is_daemon_exe("kache-wrapper"));
+        assert!(!super::comm_is_daemon_exe("mykache"));
+        assert!(!super::comm_is_daemon_exe(""));
+        assert!(!super::comm_is_daemon_exe("   "));
+    }
+
+    #[test]
+    fn cmdline_is_daemon_run_matches_only_the_daemon_subcommand() {
+        // Windows enumerates by image name only, so this is the sole thing
+        // separating a daemon from any other kache.exe.
+        assert!(super::cmdline_is_daemon_run(r"C:\bin\kache.exe daemon run"));
+        assert!(super::cmdline_is_daemon_run("kache.exe daemon run --foreground"));
+        assert!(super::cmdline_is_daemon_run(
+            r#""C:\Program Files\kache.exe" daemon run"#
+        ));
+
+        // Sibling CLI invocations force_recover must not kill.
+        assert!(!super::cmdline_is_daemon_run("kache.exe build"));
+        assert!(!super::cmdline_is_daemon_run("kache.exe daemon status"));
+        assert!(!super::cmdline_is_daemon_run("kache.exe daemon stop"));
+        assert!(!super::cmdline_is_daemon_run("kache.exe daemon"));
+        assert!(!super::cmdline_is_daemon_run("kache.exe run"));
+        assert!(!super::cmdline_is_daemon_run(""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_daemon_pids_ignores_processes_that_merely_mention_the_daemon() {
+        // A shell whose command line contains "kache daemon run" — exactly
+        // what a wrapper script looks like. `pgrep -f` matches it; the
+        // executable check must drop it, because force_recover SIGKILLs
+        // everything this function returns.
+        //
+        // Safe by construction: find_daemon_pids only reads.
+        let mut decoy = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 20; : kache daemon run"])
+            .spawn()
+            .expect("spawn decoy");
+        let decoy_pid = decoy.id();
+
+        let found = super::find_daemon_pids();
+
+        decoy.kill().expect("kill decoy");
+        decoy.wait().expect("reap decoy");
+
+        assert!(
+            !found.contains(&decoy_pid),
+            "force_recover would have killed a non-kache process: {found:?} \
+             contains decoy {decoy_pid}"
+        );
+    }
+
     #[test]
     fn test_recover_unhealthy_daemon_cleans_stale_socket_and_state() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
         std::fs::write(&socket_path, b"stale").unwrap();
 
+        // Use a reaped child rather than a made-up PID: `u32::MAX` casts to
+        // -1, and `kill(-1, ...)` signals every process the user owns.
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit"]
+            } else {
+                vec![]
+            })
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+
         let state = DaemonCoordState {
-            pid: u32::MAX,
+            pid: dead_pid,
             build_epoch: build_epoch(),
             phase: DaemonPhase::Starting,
             updated_at_ms: now_millis(),

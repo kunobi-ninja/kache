@@ -1166,3 +1166,35 @@ jobs:
     permissions:
       contents: write
       id-token: write
+
+  # Publish the Helm chart to the OCI registry, tag-only.
+  #
+  # Until now the chart was never published at all: Flux read
+  # ./charts/kache-service straight from the git revision, so there was no
+  # versioned artifact and no way to say which chart a cluster ran. That is the
+  # same shape as tracking a mutable `:latest` image — which is how a build the
+  # planner could not start from reached production and sat there for 13 days.
+  #
+  # Tag-only for a concrete reason: chart versions are IMMUTABLE in the
+  # registry, so a push from main would eventually try to overwrite a released
+  # version and fail. `needs: version-consistency` proves Chart.yaml agrees with
+  # the tag before anything immutable is pushed.
+  publish-chart:
+    name: Publish Helm chart (OCI)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version-consistency]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: azure/setup-helm@v4
+
+      - name: Package & push Helm chart
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          helm registry login registry-1.docker.io -u "$DOCKERHUB_USER" -p "$DOCKERHUB_TOKEN"
+          helm package charts/kache-service
+          helm push kache-*.tgz oci://registry-1.docker.io/zondax

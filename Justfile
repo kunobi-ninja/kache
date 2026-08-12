@@ -341,10 +341,18 @@ bump VERSION:
     fi
   fi
   cargo set-version --workspace {{VERSION}}
+  # Mirror into the chart. Both fields track the release tag: `appVersion` names
+  # the app the chart deploys, `version` is the chart's own identity in the OCI
+  # registry, and publish-chart ships it from the same `v*` tag. A chart-only
+  # fix is therefore a patch release of the whole thing.
+  perl -i -pe 's/^version:.*$/version: {{VERSION}}/' charts/kache-service/Chart.yaml
+  perl -i -pe 's/^appVersion:.*$/appVersion: "{{VERSION}}"/' charts/kache-service/Chart.yaml
   # NO --locked: set-version rewrites the lock's version entries, so --locked
   # would error "lock file needs updating". Plain check settles the lock for the
   # local crates only (it does not advance kunobi-* / registry deps).
   cargo check --workspace
+  # Fail here rather than at the release floor if anything did not line up.
+  ./scripts/check-version-consistency.sh
   ./scripts/check-version-consistency.sh
   echo "Bumped to {{VERSION}}. Commit + open a PR; after merge, cut the tag with 'just release'."
 

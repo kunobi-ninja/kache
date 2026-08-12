@@ -109,6 +109,32 @@ if kache_version != core_version:
         "(the workspace is bumped in lockstep)"
     )
 
+# (1b) Chart.yaml — both fields, because the chart ships from the same `v*` tag
+# (see the publish-chart job). `appVersion` names the app the chart deploys and
+# `version` is the chart's own identity in the registry; kobe learned to keep
+# both on the release tag rather than a separate track, so a chart-only fix is a
+# patch release of the whole thing. Chart versions are immutable once pushed, so
+# a mismatch has to fail here — before the push, not after.
+#
+# Plain line reads rather than a yaml dependency: this gate stays hermetic.
+chart_path = root / "charts" / "kache-service" / "Chart.yaml"
+chart = chart_path.read_text()
+
+
+def chart_field(name):
+    mm = re.search(rf'(?m)^{name}:\s*"?([^"\s]+)"?\s*$', chart)
+    return mm.group(1) if mm else None
+
+
+for field in ("version", "appVersion"):
+    value = chart_field(field)
+    if value is None:
+        errors.append(f"charts/kache-service/Chart.yaml has no `{field}:`")
+    elif value != kache_version:
+        errors.append(
+            f"Chart.yaml {field} {value!r} != workspace version {kache_version!r}"
+        )
+
 # (2) Tag agreement — only when a tag is supplied (tag pushes / publish). The
 # full version must match, prerelease suffix included.
 if tag_version:

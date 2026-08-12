@@ -2692,13 +2692,25 @@ fn daemon_footnote_needed(daemon_optional: bool, results: &[(&str, bool)]) -> bo
 /// Split out because the mistake it guards against is a boolean one: any of the
 /// three conditions weakening turns "no daemon owns these" into a claim about a
 /// daemon that is running, and `doctor` then tells someone to restart a healthy
-/// one to clean up files it is still using.
+/// one to clean up files it is still using. Counts rather than booleans, so the
+/// call site hands over raw observations and keeps no logic of its own.
 fn stale_locks_are_abandoned(
-    lock_files_present: bool,
+    lock_files: usize,
     daemon_live: bool,
     daemon_processes: usize,
 ) -> bool {
-    lock_files_present && !daemon_live && daemon_processes == 0
+    lock_files > 0 && !daemon_live && daemon_processes == 0
+}
+
+/// Whether `doctor` should replace a daemon left over from before an upgrade.
+///
+/// The one-line answer to the bug this all started from: only under `--fix`.
+/// Restarting costs the 8s the replacement needs to bind its socket, and a
+/// diagnostic that silently spends it — then reports the state it just
+/// invalidated — is what made a routine upgrade look like a broken install
+/// (kunobi-ninja/kache#720).
+fn should_restart_stale_daemon(fix_requested: bool, daemon_is_stale: bool) -> bool {
+    fix_requested && daemon_is_stale
 }
 
 /// What `doctor --fix` prints after trying to replace a stale daemon, or `None`
@@ -3114,7 +3126,7 @@ pub fn doctor(
                 .is_some_and(|s| crate::daemon::client_epoch_is_newer(my_epoch, s.build_epoch))
         };
 
-        if fix && is_stale(&stats) {
+        if should_restart_stale_daemon(fix, is_stale(&stats)) {
             // Attributed rather than silent: this is where doctor's runtime goes
             // when it is slow, so say what it is waiting for.
             println!("  Restarting daemon left over from before the upgrade...");
@@ -3228,7 +3240,7 @@ pub fn doctor(
             }
         }
         if stale_locks_are_abandoned(
-            !stale_files.is_empty(),
+            stale_files.len(),
             crate::daemon::daemon_is_live(cfg),
             crate::daemon::find_daemon_pids().len(),
         ) {
@@ -4824,12 +4836,25 @@ mod tests {
     /// restart a healthy daemon to clean up files it is still using.
     #[test]
     fn stale_locks_are_abandoned_needs_every_condition() {
-        assert!(stale_locks_are_abandoned(true, false, 0));
+        assert!(stale_locks_are_abandoned(1, false, 0));
+        assert!(stale_locks_are_abandoned(2, false, 0));
 
-        assert!(!stale_locks_are_abandoned(false, false, 0), "no lock files");
-        assert!(!stale_locks_are_abandoned(true, true, 0), "daemon serving");
-        assert!(!stale_locks_are_abandoned(true, false, 1), "daemon process");
-        assert!(!stale_locks_are_abandoned(false, true, 2), "none of them");
+        assert!(!stale_locks_are_abandoned(0, false, 0), "no lock files");
+        assert!(!stale_locks_are_abandoned(1, true, 0), "daemon serving");
+        assert!(!stale_locks_are_abandoned(1, false, 1), "daemon process");
+        assert!(!stale_locks_are_abandoned(0, true, 2), "none of them");
+    }
+
+    /// The behaviour this whole change exists for: a plain `doctor` run reports
+    /// a stale daemon, it does not replace it and pay the startup wait. Only
+    /// `--fix` opts into that.
+    #[test]
+    fn only_fix_restarts_a_stale_daemon() {
+        assert!(should_restart_stale_daemon(true, true));
+
+        assert!(!should_restart_stale_daemon(false, true), "plain doctor");
+        assert!(!should_restart_stale_daemon(true, false), "nothing stale");
+        assert!(!should_restart_stale_daemon(false, false), "neither");
     }
 
     /// A restart that did not finish must never read as one that is still

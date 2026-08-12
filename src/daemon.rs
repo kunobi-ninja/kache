@@ -236,11 +236,10 @@ pub fn starting_daemon_epoch(config: &Config) -> Option<u64> {
     if state.phase != DaemonPhase::Starting
         || !daemon_state_is_recent(&state)
         || !process_is_alive(state.pid)
-        || !daemon_run_lock_path(&socket_path).exists()
     {
         return None;
     }
-    daemon_run_lock_is_held(&socket_path)
+    existing_daemon_run_lock_is_held(&socket_path)
         .ok()?
         .then_some(state.build_epoch)
 }
@@ -7286,21 +7285,41 @@ fn daemon_run_lock_path(socket_path: &Path) -> PathBuf {
 }
 
 fn daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
-    let run_lock_path = daemon_run_lock_path(socket_path);
     let run_lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(&run_lock_path)
+        .open(daemon_run_lock_path(socket_path))
         .context("opening daemon run lock probe file")?;
 
-    // Probe: if we can acquire the lock, no daemon is running. Releases
-    // immediately on drop (or via explicit unlock below).
-    if run_lock_file.try_lock().is_ok() {
-        let _ = run_lock_file.unlock();
-        Ok(false)
+    Ok(run_lock_file_is_held(&run_lock_file))
+}
+
+/// Like [`daemon_run_lock_is_held`], but never creates the lock file: a missing
+/// file reads as "not held".
+///
+/// For callers that only observe. `doctor` reports leftover lock files, so a
+/// probe that creates one on a host that has never run a daemon would hand it a
+/// finding it manufactured itself — and testing for the file first only narrows
+/// that race rather than closing it.
+fn existing_daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .open(daemon_run_lock_path(socket_path))
+    {
+        Ok(file) => Ok(run_lock_file_is_held(&file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("opening daemon run lock probe file"),
+    }
+}
+
+/// Probe: if we can acquire the lock, no daemon holds it. Releases immediately.
+fn run_lock_file_is_held(file: &std::fs::File) -> bool {
+    if file.try_lock().is_ok() {
+        let _ = file.unlock();
+        false
     } else {
-        Ok(true)
+        true
     }
 }
 

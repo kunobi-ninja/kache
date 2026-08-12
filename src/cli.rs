@@ -2687,6 +2687,38 @@ fn daemon_footnote_needed(daemon_optional: bool, results: &[(&str, bool)]) -> bo
 /// unknown, and gets said so rather than guessed: telling someone their binary is
 /// stale on the strength of an unreadable mtime sends them to reinstall a kache
 /// that was fine.
+/// Whether a daemon is serving or coming up right now, asking it nothing.
+///
+/// `doctor`'s liveness checks need an answer that is current and free of side
+/// effects, which a stats request is neither: it makes an older daemon schedule
+/// its own shutdown, and its answer goes stale within the same report. A socket
+/// connect plus the coordinator state file covers both a daemon that is serving
+/// and one that has the run lock but has not bound its socket yet.
+fn daemon_is_live_now(config: &crate::config::Config) -> bool {
+    crate::transport::is_reachable(&config.socket_path())
+        || crate::daemon::starting_daemon_epoch(config).is_some()
+}
+
+/// What `doctor --fix` prints after trying to replace a stale daemon, or `None`
+/// when it came up and the check below will say so.
+///
+/// A restart that did not finish must not be reported as one that is still
+/// finishing: `Ok(false)` means the replacement was spawned but had not bound its
+/// socket in time, while `Err` means the handoff failed outright and there may be
+/// no replacement at all. Claiming "still coming up in the background" for both
+/// invites the reader to ignore a real failure.
+fn stale_restart_note(outcome: &anyhow::Result<bool>) -> Option<String> {
+    match outcome {
+        Ok(true) => None,
+        Ok(false) => Some(
+            "\x1b[2mthe replacement did not bind its socket within the startup \
+             timeout\x1b[0m"
+                .into(),
+        ),
+        Err(error) => Some(format!("\x1b[31mrestart failed: {error:#}\x1b[0m")),
+    }
+}
+
 fn daemon_version_check(
     daemon: Option<(&str, u64)>,
     starting_epoch: Option<u64>,
@@ -2737,7 +2769,10 @@ fn daemon_version_check(
                 "daemon v{version} (epoch {epoch}) does not match binary v{my_version} \
                  (epoch {my_epoch}), and their build order cannot be determined"
             ),
-            Some("check which kache is on PATH, then `kache daemon restart`".into()),
+            // Deliberately not "restart the daemon": in an unordered state the
+            // daemon may be the newer build, and restarting it through this
+            // binary would downgrade it.
+            Some("work out which kache build should be running, then restart from that one".into()),
         ),
         // Nothing answered, but a daemon is on its way up. Reporting "not
         // reachable → start the daemon" here is what made a routine upgrade look
@@ -2746,9 +2781,13 @@ fn daemon_version_check(
         // Passing: the check asks whether the daemon matches this binary, and the
         // coordinator file answers yes. Not yet accepting connections is what the
         // detail says, not a fault to count against the install.
+        //
+        // Phrased around the epoch, not the version: coordinator state carries no
+        // version string, and one mtime second can carry two of them, so the
+        // matching build is all this state actually establishes.
         (None, Some(epoch)) if epoch > 0 && epoch == my_epoch => (
             true,
-            format!("v{my_version} (epoch {epoch}) is starting — not accepting connections yet"),
+            format!("a daemon of this build (epoch {epoch}) is starting — not serving yet"),
             None,
         ),
         (None, Some(epoch)) => (
@@ -3063,15 +3102,6 @@ pub fn doctor(
     // replacement takes to bind its socket (kunobi-ninja/kache#740). `--fix` opts
     // into that wait below.
     let my_version = crate::VERSION;
-    // One daemon observation, taken here and shared with checks 10 and 11 below.
-    // Re-probing per check made the report disagree with itself: this very
-    // request tells a daemon older than us to shut down (it schedules a graceful
-    // restart on any request from a newer binary), so a probe a few checks later
-    // legitimately sees a different world — one where the daemon just described
-    // as running is gone, its lock files look abandoned, and its process is still
-    // draining. All three checks now describe the same moment.
-    let mut daemon_was_reachable = false;
-    let mut daemon_starting_epoch = None;
     if let Some(ref cfg) = config {
         let my_epoch = crate::daemon::build_epoch();
         let mut stats = crate::daemon::send_stats_request_without_restart(cfg, false).ok();
@@ -3081,33 +3111,23 @@ pub fn doctor(
                 .as_ref()
                 .is_some_and(|s| crate::daemon::client_epoch_is_newer(my_epoch, s.build_epoch))
         };
-        daemon_was_reachable = stats.is_some();
 
         if fix && is_stale(&stats) {
             // Attributed rather than silent: this is where doctor's runtime goes
-            // when it is slow, so say what it is waiting for. And report what the
-            // restart actually did — "still coming up" is a claim, and an `Err`
-            // means no replacement was ever spawned to come up.
+            // when it is slow, so say what it is waiting for.
             println!("  Restarting daemon left over from before the upgrade...");
-            match crate::daemon::restart_daemon_for_stale_client(cfg) {
-                Ok(true) => {}
-                Ok(false) => println!(
-                    "  \x1b[2mthe replacement did not bind its socket within \
-                     the startup timeout\x1b[0m"
-                ),
-                Err(error) => println!("  \x1b[31mrestart failed: {error:#}\x1b[0m"),
+            let outcome = crate::daemon::restart_daemon_for_stale_client(cfg);
+            if let Some(note) = stale_restart_note(&outcome) {
+                println!("  {note}");
             }
             // Re-read either way: the outgoing daemon is gone now, so the report
             // should describe what is there, not what answered a moment ago.
             stats = crate::daemon::send_stats_request_without_restart(cfg, false).ok();
-            daemon_was_reachable = stats.is_some();
         }
-
-        daemon_starting_epoch = crate::daemon::starting_daemon_epoch(cfg);
 
         let (pass, detail, fix_hint) = daemon_version_check(
             stats.as_ref().map(|s| (s.version.as_str(), s.build_epoch)),
-            daemon_starting_epoch,
+            crate::daemon::starting_daemon_epoch(cfg),
             my_version,
             my_epoch,
         );
@@ -3142,12 +3162,13 @@ pub fn doctor(
     //     but `kache daemon run` processes exist, something got stuck.
     //     `kache daemon restart` now force-recovers this automatically.
     //
-    //     Reuses check 8's observation. Probing again through
-    //     `send_stats_request` was the second place doctor could spend the 8s
-    //     restart wait — an outgoing daemon still draining in-flight work answers
-    //     here too, and answering is what triggers it (kunobi-ninja/kache#740).
-    if config.is_some() {
-        let reachable = daemon_was_reachable || daemon_starting_epoch.is_some();
+    //     Liveness here is a bare socket connect, not a stats request. Asking the
+    //     daemon anything is what makes an outgoing one shut down and what could
+    //     spend the 8s restart wait a second time; connecting asks nothing, costs
+    //     nothing, and — unlike reusing check 8's answer — is true *now*, so a
+    //     daemon that died in between is not covered for (kunobi-ninja/kache#740).
+    if let Some(ref cfg) = config {
+        let reachable = daemon_is_live_now(cfg);
         let pids = crate::daemon::find_daemon_pids();
         if !reachable && !pids.is_empty() {
             let pids_str = pids
@@ -3191,10 +3212,10 @@ pub fn doctor(
     //     are legacy cruft from an unclean shutdown. Harmless but worth
     //     surfacing so users know `daemon restart` will tidy them up.
     //
-    //     Reuses the daemon snapshot from check 8 rather than re-probing: the
-    //     lock files of a daemon that is mid-handoff are in use, not cruft, and
-    //     re-probing here would report them the moment the outgoing daemon lets
-    //     go (kunobi-ninja/kache#740).
+    //     "In use" includes a daemon that holds the run lock but has not bound
+    //     its socket yet, which a socket probe alone reads as absent — that is
+    //     how a mid-upgrade handoff came to be reported as leftover cruft
+    //     (kunobi-ninja/kache#740).
     if let Some(ref cfg) = config {
         let sock = cfg.socket_path();
         let mut stale_files = Vec::new();
@@ -3205,8 +3226,7 @@ pub fn doctor(
             }
         }
         if !stale_files.is_empty()
-            && !daemon_was_reachable
-            && daemon_starting_epoch.is_none()
+            && !daemon_is_live_now(cfg)
             && crate::daemon::find_daemon_pids().is_empty()
         {
             if fix {
@@ -4780,6 +4800,8 @@ mod tests {
         assert!(pass, "{detail}");
         assert!(detail.contains("starting"), "{detail}");
         assert!(fix.is_none());
+        // Coordinator state has no version string, so none may be asserted here.
+        assert!(!detail.contains("v0.14.0"), "{detail}");
 
         // A starting daemon of some other build gets named as such rather than
         // silently claimed to be this one.
@@ -4792,6 +4814,22 @@ mod tests {
         // through the equality arm.
         let (pass, detail, _) = daemon_version_check(None, Some(0), "0.14.0", 0);
         assert!(!pass, "{detail}");
+    }
+
+    /// A restart that did not finish must never read as one that is still
+    /// finishing — that is what turns a failed `--fix` into a silent no-op in the
+    /// reader's head.
+    #[test]
+    fn stale_restart_note_never_claims_a_replacement_that_may_not_exist() {
+        assert!(stale_restart_note(&Ok(true)).is_none());
+
+        let timed_out = stale_restart_note(&Ok(false)).unwrap();
+        assert!(timed_out.contains("did not bind"), "{timed_out}");
+        assert!(!timed_out.contains("background"), "{timed_out}");
+
+        let failed = stale_restart_note(&Err(anyhow::anyhow!("spawn refused"))).unwrap();
+        assert!(failed.contains("restart failed"), "{failed}");
+        assert!(failed.contains("spawn refused"), "{failed}");
     }
 
     /// Nothing answering and nothing coming up keeps the original wording.

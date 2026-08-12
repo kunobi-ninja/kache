@@ -6681,7 +6681,9 @@ pub fn find_daemon_pids() -> Vec<u32> {
 /// the logic even though only Windows calls it.
 #[cfg(any(windows, test))]
 fn cmdline_is_daemon_run(cmdline: &str) -> bool {
-    let mut rest = cmdline.split_whitespace().skip_while(|token| *token != "daemon");
+    let mut rest = cmdline
+        .split_whitespace()
+        .skip_while(|token| *token != "daemon");
     rest.next().is_some() && rest.next() == Some("run")
 }
 
@@ -8432,7 +8434,9 @@ mod tests {
         // Windows enumerates by image name only, so this is the sole thing
         // separating a daemon from any other kache.exe.
         assert!(super::cmdline_is_daemon_run(r"C:\bin\kache.exe daemon run"));
-        assert!(super::cmdline_is_daemon_run("kache.exe daemon run --foreground"));
+        assert!(super::cmdline_is_daemon_run(
+            "kache.exe daemon run --foreground"
+        ));
         assert!(super::cmdline_is_daemon_run(
             r#""C:\Program Files\kache.exe" daemon run"#
         ));

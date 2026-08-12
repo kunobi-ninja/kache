@@ -242,7 +242,9 @@ pub fn extract_gnu_cc1_line(stderr: &str) -> Option<&str> {
         let base = base
             .len()
             .checked_sub(4)
-            .filter(|_| base[base.len() - 4..].eq_ignore_ascii_case(".exe"))
+            // `is_char_boundary` so non-ASCII basenames (e.g. `使用内建`
+            // from a localized gcc banner) don't panic the slice.
+            .filter(|&n| base.is_char_boundary(n) && base[n..].eq_ignore_ascii_case(".exe"))
             .map_or(base, |cut| &base[..cut]);
         base.eq_ignore_ascii_case("cc1") || base.eq_ignore_ascii_case("cc1plus")
     })
@@ -849,6 +851,26 @@ mod tests {
         assert!(line.contains("-O2"));
         // The reverse: gnu extractor must not match a clang `-cc1` line.
         assert!(extract_gnu_cc1_line(O2).is_none());
+    }
+
+    /// `gcc -###` prints a localized first line in non-English locales
+    /// (`LANG=zh_CN.UTF-8` → `使用内建 specs。`); its first whitespace token
+    /// is multi-byte non-ASCII, so the `.exe`-suffix strip must guard on a
+    /// UTF-8 char boundary.
+    #[test]
+    fn extract_gnu_cc1_line_handles_non_ascii_chars() {
+        // Banner only — must not panic and must not match anything.
+        assert!(extract_gnu_cc1_line("使用内建 specs。\n").is_none());
+
+        // Banner with a cc1plus subprocess below it — must resolve to the
+        // subprocess line, silently skipping the localized banner header.
+        let stderr = "使用内建 specs。\n\
+                      COLLECT_GCC=gcc\n\
+                       /usr/lib/gcc/cc1plus -quiet -O2 a.c -o /tmp/ccXYZ.s\n";
+        let line =
+            extract_gnu_cc1_line(stderr).expect("cc1plus line resolves past the localized banner");
+        assert!(line.contains("cc1plus"));
+        assert!(line.contains("-O2"));
     }
 
     #[test]

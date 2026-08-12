@@ -867,8 +867,8 @@ mod tests {
         let stderr = "使用内建 specs。\n\
                       COLLECT_GCC=gcc\n\
                        /usr/lib/gcc/cc1plus -quiet -O2 a.c -o /tmp/ccXYZ.s\n";
-        let line = extract_gnu_cc1_line(stderr)
-            .expect("cc1plus line resolves past the localized banner");
+        let line =
+            extract_gnu_cc1_line(stderr).expect("cc1plus line resolves past the localized banner");
         assert!(line.contains("cc1plus"));
         assert!(line.contains("-O2"));
     }

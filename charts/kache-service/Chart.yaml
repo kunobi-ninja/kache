@@ -2,8 +2,8 @@ apiVersion: v2
 name: kache
 description: Advisory remote planner service for kache
 type: application
-version: 0.14.0
-appVersion: "0.14.0"
+version: 0.14.1
+appVersion: "0.14.1"
 keywords:
   - rust
   - cache

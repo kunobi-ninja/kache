@@ -220,20 +220,38 @@ fn read_daemon_state(socket_path: &Path) -> Option<DaemonCoordState> {
 ///
 /// Read-only and instant: it inspects the coordinator state file rather than the
 /// socket, which is what makes it usable from `doctor` during the window where a
-/// stats request would only report "not reachable" (kunobi-ninja/kache#740). A
-/// stale heartbeat or a dead PID reads as "nothing starting" — a coordinator file
-/// outlives an unclean exit, so its mere existence proves nothing.
+/// stats request would only report "not reachable" (kunobi-ninja/kache#740).
+///
+/// A coordinator file outlives an unclean exit, so its mere existence proves
+/// nothing, and neither does its PID: PIDs are recycled, and a fresh record whose
+/// PID has been reused by an unrelated process would otherwise read as a live
+/// starter. The run lock is what actually distinguishes them — a daemon takes it
+/// before writing `Starting` and holds it for its whole life, so only a real
+/// starter can be holding it. The lock is probed but never created here: `doctor`
+/// reports on lock files, and a diagnostic that manufactures one would then flag
+/// its own leftovers.
 pub fn starting_daemon_epoch(config: &Config) -> Option<u64> {
-    let state = read_daemon_state(&config.socket_path())?;
-    (state.phase == DaemonPhase::Starting
-        && daemon_state_is_recent(&state)
-        && process_is_alive(state.pid))
-    .then_some(state.build_epoch)
+    let socket_path = config.socket_path();
+    let state = read_daemon_state(&socket_path)?;
+    if state.phase != DaemonPhase::Starting
+        || !daemon_state_is_recent(&state)
+        || !process_is_alive(state.pid)
+        || !daemon_run_lock_path(&socket_path).exists()
+    {
+        return None;
+    }
+    daemon_run_lock_is_held(&socket_path)
+        .ok()?
+        .then_some(state.build_epoch)
 }
 
 fn daemon_state_is_recent(state: &DaemonCoordState) -> bool {
-    let age_ms = now_millis().saturating_sub(state.updated_at_ms);
-    age_ms <= DAEMON_COORD_STALE_AFTER.as_millis() as u64
+    // A timestamp in the future is not a fresh heartbeat, it is a clock that
+    // moved: saturating to an age of zero would read a long-dead record as live
+    // until the wall clock caught back up.
+    now_millis()
+        .checked_sub(state.updated_at_ms)
+        .is_some_and(|age_ms| age_ms <= DAEMON_COORD_STALE_AFTER.as_millis() as u64)
 }
 
 /// Whether `client_epoch` is a strictly newer build than `daemon_epoch`. A zero
@@ -6500,14 +6518,18 @@ pub fn send_stats_request(
     send_stats_request_options(config, include_entries, false, sort_by, event_hours)
 }
 
-/// Read the daemon's stats without the stale-daemon restart side effect.
+/// Read the daemon's stats without starting or waiting for a replacement.
 ///
-/// [`send_stats_request`] upgrades a daemon older than the calling binary and
-/// blocks up to [`DAEMON_START_TIMEOUT`] waiting for the replacement to bind its
-/// socket. `doctor` reports state rather than changing it, so it reads through
-/// this variant: a pending upgrade is something to describe, not something to
-/// stall on (kunobi-ninja/kache#740).
-pub fn send_stats_request_read_only(
+/// Not the same as side-effect-free, and deliberately not named that way: the
+/// request still carries this binary's build epoch, so an older daemon schedules
+/// its own graceful shutdown after answering, exactly as it does for any other
+/// client. What this variant drops is the *client* side of that handoff —
+/// [`send_stats_request`] spawns the replacement and blocks up to
+/// [`DAEMON_START_TIMEOUT`] waiting for it to bind its socket.
+///
+/// `doctor` reads through this variant because a pending upgrade is something to
+/// describe, not something to stall on (kunobi-ninja/kache#740).
+pub fn send_stats_request_without_restart(
     config: &Config,
     include_entries: bool,
 ) -> Result<StatsResponse> {
@@ -7259,8 +7281,12 @@ pub fn start_daemon_background() -> Result<bool> {
     Ok(false)
 }
 
+fn daemon_run_lock_path(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("run.lock")
+}
+
 fn daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
-    let run_lock_path = socket_path.with_extension("run.lock");
+    let run_lock_path = daemon_run_lock_path(socket_path);
     let run_lock_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -8458,6 +8484,15 @@ mod tests {
                 .saturating_sub(DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2),
         };
         assert!(!daemon_state_is_recent(&stale));
+
+        // Clock moved backwards: a record stamped in the future is not fresh.
+        let future = DaemonCoordState {
+            pid: 1,
+            build_epoch: build_epoch(),
+            phase: DaemonPhase::Ready,
+            updated_at_ms: now_millis() + DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2,
+        };
+        assert!(!daemon_state_is_recent(&future));
     }
 
     #[test]
@@ -8654,8 +8689,9 @@ mod tests {
 
     /// `starting_daemon_epoch` is what lets `doctor` say "a daemon is coming up"
     /// during the window where the socket is not yet bound. It must answer only
-    /// for a live, freshly-heartbeating starter: a coordinator file survives an
-    /// unclean exit, so its presence alone proves nothing (#740).
+    /// for a live starter that holds the run lock: a coordinator file survives an
+    /// unclean exit, and a recorded PID can be recycled by an unrelated process,
+    /// so neither the file nor a live PID proves anything on its own (#740).
     #[test]
     fn starting_daemon_epoch_reports_only_a_live_starting_daemon() {
         let dir = tempfile::tempdir().unwrap();
@@ -8674,6 +8710,21 @@ mod tests {
             updated_at_ms: now_millis(),
         };
         write_json_atomically(&state_path, &state).unwrap();
+
+        // A fresh record naming a live process is exactly what PID reuse looks
+        // like. Without the run lock it must not read as a starting daemon — and
+        // probing must not create the lock file, which `doctor` would then report
+        // as leftover cruft.
+        assert_eq!(starting_daemon_epoch(&config), None);
+        assert!(!daemon_run_lock_path(&socket_path).exists());
+
+        let run_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(daemon_run_lock_path(&socket_path))
+            .unwrap();
+        run_lock.try_lock().unwrap();
         assert_eq!(starting_daemon_epoch(&config), Some(4242));
 
         // Already serving: the socket answers, so this is not the starting window.

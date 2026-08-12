@@ -2679,6 +2679,14 @@ fn daemon_footnote_needed(daemon_optional: bool, results: &[(&str, bool)]) -> bo
 /// `doctor` reports these states rather than repairing them: restarting a stale
 /// daemon costs an 8s wait for the replacement to come up, which is `--fix`'s
 /// job, not a diagnostic's (kunobi-ninja/kache#740).
+///
+/// Build epochs are executable mtimes, and `0` means "could not be read". Two
+/// builds are therefore only ever *ordered* through
+/// [`crate::daemon::client_epoch_is_newer`], which rejects a zero on either side
+/// and rejects equal epochs. Everything it declines to order is genuinely
+/// unknown, and gets said so rather than guessed: telling someone their binary is
+/// stale on the strength of an unreadable mtime sends them to reinstall a kache
+/// that was fine.
 fn daemon_version_check(
     daemon: Option<(&str, u64)>,
     starting_epoch: Option<u64>,
@@ -2686,7 +2694,7 @@ fn daemon_version_check(
     my_epoch: u64,
 ) -> (bool, String, Option<String>) {
     match (daemon, starting_epoch) {
-        (Some((version, epoch)), _) if version == my_version && epoch == my_epoch => {
+        (Some((version, epoch)), _) if epoch > 0 && version == my_version && epoch == my_epoch => {
             (true, format!("v{version} (epoch {epoch})"), None)
         }
         // Left running across an upgrade: the common case, and the one worth
@@ -2701,7 +2709,7 @@ fn daemon_version_check(
             false,
             format!(
                 "daemon v{version} (epoch {epoch}) predates binary v{my_version} \
-                 (epoch {my_epoch}) — it is shutting down to pick up the new build"
+                 (epoch {my_epoch}) — it is shutting down now"
             ),
             Some(
                 "the next build starts the replacement; `kache doctor --fix` or \
@@ -2711,7 +2719,7 @@ fn daemon_version_check(
         ),
         // The daemon is the newer build: an old binary is on PATH, and
         // restarting the daemon would be the wrong advice.
-        (Some((version, epoch)), _) => (
+        (Some((version, epoch)), _) if crate::daemon::client_epoch_is_newer(epoch, my_epoch) => (
             false,
             format!(
                 "daemon v{version} (epoch {epoch}) is newer than binary v{my_version} \
@@ -2719,13 +2727,29 @@ fn daemon_version_check(
             ),
             Some("this binary is the stale one — reinstall kache or fix PATH".into()),
         ),
+        // Mismatched, but in no determinable order: an unreadable mtime on either
+        // side, or one build epoch carrying two version strings. Say that much and
+        // no more — the two arms above are the ones that name a culprit, and
+        // naming the wrong one sends someone to reinstall a working install.
+        (Some((version, epoch)), _) => (
+            false,
+            format!(
+                "daemon v{version} (epoch {epoch}) does not match binary v{my_version} \
+                 (epoch {my_epoch}), and their build order cannot be determined"
+            ),
+            Some("check which kache is on PATH, then `kache daemon restart`".into()),
+        ),
         // Nothing answered, but a daemon is on its way up. Reporting "not
         // reachable → start the daemon" here is what made a routine upgrade look
         // like a broken install.
-        (None, Some(epoch)) if epoch == my_epoch => (
-            false,
+        //
+        // Passing: the check asks whether the daemon matches this binary, and the
+        // coordinator file answers yes. Not yet accepting connections is what the
+        // detail says, not a fault to count against the install.
+        (None, Some(epoch)) if epoch > 0 && epoch == my_epoch => (
+            true,
             format!("v{my_version} (epoch {epoch}) is starting — not accepting connections yet"),
-            Some("re-run `kache doctor` in a moment".into()),
+            None,
         ),
         (None, Some(epoch)) => (
             false,
@@ -3033,21 +3057,24 @@ pub fn doctor(
 
     // 8. Daemon version match
     //
-    // Read-only: `send_stats_request_read_only` skips the stale-daemon restart
-    // that `send_stats_request` performs, so an upgrade left half-applied is
-    // described in the report instead of stalling it for the 8s the replacement
-    // takes to bind its socket (kunobi-ninja/kache#740). `--fix` opts into that
-    // wait below.
+    // `send_stats_request_without_restart` skips the client-side stale-daemon
+    // restart that `send_stats_request` performs, so an upgrade left half-applied
+    // is described in the report instead of stalling it for the 8s the
+    // replacement takes to bind its socket (kunobi-ninja/kache#740). `--fix` opts
+    // into that wait below.
     let my_version = crate::VERSION;
-    // Hoisted so the later daemon checks describe the same daemon this one saw.
-    // A stats request from a newer binary makes the daemon schedule its own
-    // graceful restart, so a second probe further down can legitimately find
-    // nothing running — and would then contradict this check within one report.
+    // One daemon observation, taken here and shared with checks 10 and 11 below.
+    // Re-probing per check made the report disagree with itself: this very
+    // request tells a daemon older than us to shut down (it schedules a graceful
+    // restart on any request from a newer binary), so a probe a few checks later
+    // legitimately sees a different world — one where the daemon just described
+    // as running is gone, its lock files look abandoned, and its process is still
+    // draining. All three checks now describe the same moment.
     let mut daemon_was_reachable = false;
-    let mut daemon_upgrade_pending = false;
+    let mut daemon_starting_epoch = None;
     if let Some(ref cfg) = config {
         let my_epoch = crate::daemon::build_epoch();
-        let mut stats = crate::daemon::send_stats_request_read_only(cfg, false).ok();
+        let mut stats = crate::daemon::send_stats_request_without_restart(cfg, false).ok();
 
         let is_stale = |stats: &Option<crate::daemon::StatsResponse>| {
             stats
@@ -3055,28 +3082,32 @@ pub fn doctor(
                 .is_some_and(|s| crate::daemon::client_epoch_is_newer(my_epoch, s.build_epoch))
         };
         daemon_was_reachable = stats.is_some();
-        daemon_upgrade_pending = is_stale(&stats);
 
-        if fix && daemon_upgrade_pending {
+        if fix && is_stale(&stats) {
             // Attributed rather than silent: this is where doctor's runtime goes
-            // when it is slow, so say what it is waiting for.
+            // when it is slow, so say what it is waiting for. And report what the
+            // restart actually did — "still coming up" is a claim, and an `Err`
+            // means no replacement was ever spawned to come up.
             println!("  Restarting daemon left over from before the upgrade...");
-            if !crate::daemon::restart_daemon_for_stale_client(cfg).unwrap_or(false) {
-                println!(
-                    "  \x1b[2mthe replacement has not bound its socket yet; it keeps \
-                     coming up in the background\x1b[0m"
-                );
+            match crate::daemon::restart_daemon_for_stale_client(cfg) {
+                Ok(true) => {}
+                Ok(false) => println!(
+                    "  \x1b[2mthe replacement did not bind its socket within \
+                     the startup timeout\x1b[0m"
+                ),
+                Err(error) => println!("  \x1b[31mrestart failed: {error:#}\x1b[0m"),
             }
             // Re-read either way: the outgoing daemon is gone now, so the report
             // should describe what is there, not what answered a moment ago.
-            stats = crate::daemon::send_stats_request_read_only(cfg, false).ok();
+            stats = crate::daemon::send_stats_request_without_restart(cfg, false).ok();
             daemon_was_reachable = stats.is_some();
-            daemon_upgrade_pending = is_stale(&stats);
         }
+
+        daemon_starting_epoch = crate::daemon::starting_daemon_epoch(cfg);
 
         let (pass, detail, fix_hint) = daemon_version_check(
             stats.as_ref().map(|s| (s.version.as_str(), s.build_epoch)),
-            crate::daemon::starting_daemon_epoch(cfg),
+            daemon_starting_epoch,
             my_version,
             my_epoch,
         );
@@ -3110,8 +3141,13 @@ pub fn doctor(
     // 10. Lingering live kache daemon processes — if the socket isn't reachable
     //     but `kache daemon run` processes exist, something got stuck.
     //     `kache daemon restart` now force-recovers this automatically.
-    if let Some(ref cfg) = config {
-        let reachable = crate::daemon::send_stats_request(cfg, false, None, None).is_ok();
+    //
+    //     Reuses check 8's observation. Probing again through
+    //     `send_stats_request` was the second place doctor could spend the 8s
+    //     restart wait — an outgoing daemon still draining in-flight work answers
+    //     here too, and answering is what triggers it (kunobi-ninja/kache#740).
+    if config.is_some() {
+        let reachable = daemon_was_reachable || daemon_starting_epoch.is_some();
         let pids = crate::daemon::find_daemon_pids();
         if !reachable && !pids.is_empty() {
             let pids_str = pids
@@ -3170,8 +3206,7 @@ pub fn doctor(
         }
         if !stale_files.is_empty()
             && !daemon_was_reachable
-            && !daemon_upgrade_pending
-            && crate::daemon::starting_daemon_epoch(cfg).is_none()
+            && daemon_starting_epoch.is_none()
             && crate::daemon::find_daemon_pids().is_empty()
         {
             if fix {
@@ -4671,6 +4706,39 @@ mod tests {
         assert!(fix.unwrap().contains("doctor --fix"));
     }
 
+    /// Epochs are executable mtimes and `0` means unreadable, so several
+    /// mismatches are genuinely unordered. Guessing a culprit there sends someone
+    /// to reinstall a working kache, so every one of them must decline to.
+    #[test]
+    fn daemon_version_check_does_not_invent_an_order_it_cannot_determine() {
+        for (daemon, my_version, my_epoch, case) in [
+            (("0.13.0", 0), "0.14.0", 200, "daemon epoch unreadable"),
+            (("0.13.0", 200), "0.14.0", 0, "binary epoch unreadable"),
+            (("0.13.0", 0), "0.14.0", 0, "neither epoch readable"),
+            (
+                ("0.13.0", 200),
+                "0.14.0",
+                200,
+                "one build, two version strings",
+            ),
+        ] {
+            let (pass, detail, fix) =
+                daemon_version_check(Some(daemon), None, my_version, my_epoch);
+            assert!(!pass, "{case}: {detail}");
+            assert!(detail.contains("cannot be determined"), "{case}: {detail}");
+            let fix = fix.unwrap();
+            assert!(
+                !fix.contains("this binary is the stale one"),
+                "{case}: {fix}"
+            );
+        }
+
+        // Equal version strings and unreadable epochs are not evidence of the
+        // same build either — that pair must not pass.
+        let (pass, detail, _) = daemon_version_check(Some(("0.14.0", 0)), None, "0.14.0", 0);
+        assert!(!pass, "{detail}");
+    }
+
     /// The other direction — an old binary against a newer daemon — must not
     /// advise restarting the daemon, which would downgrade it.
     #[test]
@@ -4703,19 +4771,27 @@ mod tests {
 
     /// The window that made a routine upgrade look like a broken install: no
     /// daemon answers yet because the replacement is still binding its socket.
-    /// Reporting "not reachable → start the daemon" there is actively wrong.
+    /// Reporting "not reachable → start the daemon" there is actively wrong, and
+    /// so is counting a healthy transient against the install — the coordinator
+    /// file says the right build is coming up, which is what this check asks.
     #[test]
     fn daemon_version_check_reports_a_daemon_that_is_still_starting() {
         let (pass, detail, fix) = daemon_version_check(None, Some(200), "0.14.0", 200);
-        assert!(!pass);
+        assert!(pass, "{detail}");
         assert!(detail.contains("starting"), "{detail}");
-        assert!(fix.unwrap().contains("re-run"));
+        assert!(fix.is_none());
 
         // A starting daemon of some other build gets named as such rather than
         // silently claimed to be this one.
-        let (_, detail, _) = daemon_version_check(None, Some(100), "0.14.0", 200);
+        let (pass, detail, _) = daemon_version_check(None, Some(100), "0.14.0", 200);
+        assert!(!pass, "{detail}");
         assert!(detail.contains("epoch 100"), "{detail}");
         assert!(detail.contains("0.14.0"), "{detail}");
+
+        // An unreadable epoch on both sides is not a match, so it must not pass
+        // through the equality arm.
+        let (pass, detail, _) = daemon_version_check(None, Some(0), "0.14.0", 0);
+        assert!(!pass, "{detail}");
     }
 
     /// Nothing answering and nothing coming up keeps the original wording.

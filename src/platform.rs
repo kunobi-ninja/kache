@@ -46,6 +46,23 @@ fn refuse_unsafe_pid(pid: u32, what: &str) {
     );
 }
 
+/// Parent of `pid`, or None when that cannot be established — no usable `ps`,
+/// or the process is already gone.
+#[cfg(all(unix, test))]
+fn parent_pid(pid: u32) -> Option<u32> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
 /// Test-only blast radius limit: a unit test may only signal processes it
 /// actually spawned.
 ///
@@ -56,6 +73,14 @@ fn refuse_unsafe_pid(pid: u32, what: &str) {
 /// a bad fixture fails the test instead of reaching across the machine.
 ///
 /// Compiled only under `cfg(test)`, so production keeps the bare `kill(2)`.
+///
+/// Fails only on *positive* evidence of non-descent — a chain walked all the
+/// way to init without meeting us. Where the chain cannot be resolved at all
+/// there is nothing to conclude: the Nix build sandbox ships no `ps`, and
+/// treating that silence as "not yours" failed legitimate tests signalling
+/// their own children. The value guard above still rejects the broadcast
+/// selectors there, which is the catastrophic class; this one is the finer
+/// limit and correctly declines to judge without evidence.
 #[cfg(all(unix, test))]
 fn assert_test_owns_process(pid: u32, what: &str) -> bool {
     let me = std::process::id();
@@ -67,19 +92,14 @@ fn assert_test_owns_process(pid: u32, what: &str) -> bool {
             return true;
         }
         if cursor <= 1 {
+            // Reached init having never met ourselves: the target really is
+            // somebody else's.
             break;
         }
-        let Ok(out) = std::process::Command::new("ps")
-            .args(["-o", "ppid=", "-p", &cursor.to_string()])
-            .output()
-        else {
-            break;
-        };
-        if !out.status.success() {
-            break;
-        }
-        let Ok(parent) = String::from_utf8_lossy(&out.stdout).trim().parse::<u32>() else {
-            break;
+        let Some(parent) = parent_pid(cursor) else {
+            // No usable `ps`, or the process exited mid-walk. Either way we
+            // cannot show the target is foreign, so do not claim it is.
+            return true;
         };
         cursor = parent;
     }
@@ -317,6 +337,19 @@ pub fn configure_process_group(cmd: &mut std::process::Command) {
 
 #[cfg(test)]
 mod tests {
+    /// Is a usable `ps` on PATH? Tests that assert on the parent-chain walk
+    /// need to know before asserting — the Nix build sandbox has none, and
+    /// there the guard deliberately allows instead of judging.
+    ///
+    /// Deliberately does not call `parent_pid`: this is the skip condition for
+    /// tests that pin `parent_pid` itself, so routing through it would let a
+    /// mutant that stubs it out downgrade those tests to silent skips.
+    #[cfg(unix)]
+    fn ps_available() -> bool {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("ps").is_file()))
+    }
+
     #[cfg(unix)]
     #[test]
     fn process_stat_zombie_detection_uses_leading_state() {
@@ -430,13 +463,54 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[should_panic(expected = "not a descendant of the test process")]
     fn signalling_a_process_the_test_does_not_own_panics() {
+        // Needs a working `ps`: without one the guard deliberately allows
+        // rather than judging, so there is nothing to assert. The Nix build
+        // sandbox has no `ps`; the mutation and Test lanes do.
+        //
+        // Probe for the tool directly rather than asking `parent_pid`, which
+        // is part of what this test pins: gating on it would let a mutant that
+        // stubs it out silently turn this test into a skip.
+        if !ps_available() {
+            return;
+        }
+
         // The test runner that spawned us: a live PID, definitely not ours.
         // `assert_test_owns_process` only inspects the parent chain — it
         // never signals — so this stays harmless even if the check regresses.
         let parent = unsafe { libc::getppid() } as u32;
-        super::assert_test_owns_process(parent, "SIGTERM");
+        let outcome =
+            std::panic::catch_unwind(|| super::assert_test_owns_process(parent, "SIGTERM"));
+
+        let panic_msg = *outcome
+            .expect_err("signalling a non-descendant must fail the test")
+            .downcast::<String>()
+            .expect("guard panics with a message");
+        assert!(
+            panic_msg.contains("not a descendant of the test process"),
+            "unexpected panic message: {panic_msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owning_a_process_is_not_claimed_without_evidence() {
+        // The complement of the test above: where the parent chain cannot be
+        // resolved the guard must allow, not panic. Pin it against a PID that
+        // no `ps` can answer for, which is the same shape as the missing-`ps`
+        // sandbox and the reaped-child race.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+
+        assert!(
+            super::assert_test_owns_process(pid, "probe"),
+            "an unresolvable chain must not be reported as foreign"
+        );
     }
 
     #[cfg(unix)]

@@ -8454,7 +8454,17 @@ mod tests {
         // A test that only asserts "the bystander was excluded" cannot tell
         // those apart, so pin the lookup itself against the running test
         // process, whose executable name is known.
-        let comm = super::process_comm(std::process::id()).expect("ps must answer for our own pid");
+        // The Nix build sandbox ships no `ps`, so there is nothing to pin
+        // there. The Test and mutation lanes all have one.
+        //
+        // Probe for the tool rather than asking `process_comm`, which is what
+        // this test pins: gating on its return would let a mutant that stubs
+        // it out turn this test into a silent skip.
+        if find_in_path("ps").is_none() {
+            return;
+        }
+        let comm =
+            super::process_comm(std::process::id()).expect("ps is present, so it must answer");
         let name = std::path::Path::new(&comm)
             .file_name()
             .expect("comm has a file name")
@@ -8490,6 +8500,17 @@ mod tests {
         assert!(!super::cmdline_is_daemon_run(""));
     }
 
+    /// Resolve an executable the way `Command::new(name)` would. Tests that
+    /// shell out need to know whether the tool exists at all before asserting
+    /// on its output — hardcoded paths like `/bin/sleep` do not exist under
+    /// Nix, where everything lives in the store.
+    #[cfg(unix)]
+    fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    }
+
     #[cfg(unix)]
     #[test]
     fn find_daemon_pids_finds_a_process_running_the_kache_executable() {
@@ -8502,11 +8523,23 @@ mod tests {
         // stand one up: any executable named `kache`, placed in a directory
         // whose name puts "kache daemon run" into the command line that
         // `pgrep -f` sees.
+        //
+        // Needs the same tools find_daemon_pids does. The Nix build sandbox
+        // has neither `pgrep` nor `ps` (nor a `/bin/sleep` to copy), and
+        // asserting there would only pin the sandbox, not the behaviour.
+        let (Some(sleep_bin), Some(_pgrep), Some(_ps)) = (
+            find_in_path("sleep"),
+            find_in_path("pgrep"),
+            find_in_path("ps"),
+        ) else {
+            return;
+        };
+
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("kache daemon run");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let fake = bin_dir.join("kache");
-        std::fs::copy("/bin/sleep", &fake).unwrap();
+        std::fs::copy(&sleep_bin, &fake).unwrap();
 
         let mut child = std::process::Command::new(&fake)
             .arg("30")

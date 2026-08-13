@@ -1179,6 +1179,14 @@ jobs:
   # registry, so a push from main would eventually try to overwrite a released
   # version and fail. `needs: version-consistency` proves Chart.yaml agrees with
   # the tag before anything immutable is pushed.
+  #
+  # The chart is named `kache-service`, NOT `kache`, and that is load-bearing:
+  # `helm push` derives the OCI repository from the chart name, so a chart named
+  # `kache` lands on zondax/kache — the same repository and tag as the service
+  # IMAGE. v0.14.1 published the chart, then the image push overwrote the tag
+  # with a manifest list, and `helm show` started failing with "could not load
+  # config with mediatype ...helm.config.v1+json". kobe never hit this because
+  # its chart (kobe) and images (kobe-operator, kobe-sync) already differ.
   publish-chart:
     name: Publish Helm chart (OCI)
     if: startsWith(github.ref, 'refs/tags/v')
@@ -1197,4 +1205,6 @@ jobs:
         run: |
           helm registry login registry-1.docker.io -u "$DOCKERHUB_USER" -p "$DOCKERHUB_TOKEN"
           helm package charts/kache-service
-          helm push kache-*.tgz oci://registry-1.docker.io/zondax
+          # Explicit name, not kache-*.tgz: that glob would also match a stray
+          # kache-<version>.tgz and silently push to the image's repository.
+          helm push kache-service-*.tgz oci://registry-1.docker.io/zondax

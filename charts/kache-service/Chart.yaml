@@ -1,5 +1,5 @@
 apiVersion: v2
-name: kache
+name: kache-service
 description: Advisory remote planner service for kache
 type: application
 version: 0.14.1

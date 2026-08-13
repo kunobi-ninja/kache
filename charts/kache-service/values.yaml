@@ -1,4 +1,9 @@
-nameOverride: ""
+# Pins the rendered app name to `kache`, which is what every resource and —
+# critically — every selector label already uses in the clusters running this
+# chart. Selector labels are immutable on a Deployment, so letting the rendered
+# name follow the chart rename below would make the next upgrade fail rather
+# than roll.
+nameOverride: "kache"
 fullnameOverride: ""
 
 replicaCount: 1

@@ -240,12 +240,66 @@ mod tests {
         );
     }
 
+    /// Value of a sample line, ignoring `# HELP` / `# TYPE`.
+    ///
+    /// Substring matching on the whole render is not safe here: `# HELP
+    /// kache_planner_ready 1 when the planner is serving…` contains the exact
+    /// text `kache_planner_ready 1`, so a `contains` assertion passes whatever
+    /// the gauge holds. That is not hypothetical — it let a mutant that stubbed
+    /// out `set_ready` survive the changed-line lane. Match the sample line.
+    fn sample(rendered: &str, name: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| {
+                let (key, value) = line.rsplit_once(' ')?;
+                (key == name).then(|| value.parse().ok())?
+            })
+    }
+
     #[test]
     fn ready_gauge_tracks_both_directions() {
         let m = metrics();
+
         m.set_ready(false);
-        assert!(m.render().contains("kache_planner_ready 0"));
+        assert_eq!(
+            sample(&m.render(), "kache_planner_ready"),
+            Some(0.0),
+            "gauge did not follow set_ready(false)"
+        );
+
         m.set_ready(true);
-        assert!(m.render().contains("kache_planner_ready 1"));
+        assert_eq!(
+            sample(&m.render(), "kache_planner_ready"),
+            Some(1.0),
+            "gauge did not follow set_ready(true)"
+        );
+    }
+
+    /// Plan size has to actually reach the histogram.
+    ///
+    /// Nothing else observes this one: the request counter moves whether or not
+    /// the candidate count is recorded, so a `record_plan_candidates` that did
+    /// nothing would leave every other assertion here green while the only
+    /// signal describing how much work a plan saves silently stayed empty.
+    #[test]
+    fn recording_plan_candidates_observes_the_histogram() {
+        let m = metrics();
+        let before = sample(&m.render(), "kache_planner_plan_candidates_count").unwrap_or(0.0);
+        let sum_before = sample(&m.render(), "kache_planner_plan_candidates_sum").unwrap_or(0.0);
+
+        m.record_plan_candidates(7);
+
+        let rendered = m.render();
+        assert_eq!(
+            sample(&rendered, "kache_planner_plan_candidates_count"),
+            Some(before + 1.0),
+            "observation was not counted"
+        );
+        assert_eq!(
+            sample(&rendered, "kache_planner_plan_candidates_sum"),
+            Some(sum_before + 7.0),
+            "observation was counted but its value was lost"
+        );
     }
 }

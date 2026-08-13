@@ -26,6 +26,8 @@ use std::{
 };
 use tokio::sync::{RwLock, watch};
 
+mod metrics;
+
 mod state;
 
 pub use state::{DEFAULT_DB_PATH, NamespaceState, PlannerStateFile, SurrealPlannerRepository};
@@ -117,6 +119,7 @@ fn app_with_repository(
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_endpoint))
         .route("/readyz", get(readyz))
         .route("/v1/prefetch-plan", post(prefetch_plan))
         .route("/v2/prefetch-plan", post(prefetch_plan))
@@ -156,6 +159,7 @@ pub async fn serve(config: PlannerConfig) -> Result<()> {
         let repository = load_repository(&config).await?;
         *state.repository.write().await = repository;
         state.ready.store(true, Ordering::Release);
+        metrics::metrics().set_ready(true);
     }
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -222,9 +226,11 @@ where
     let repository = load_repository(&config).await?;
     *state.repository.write().await = repository;
     state.ready.store(true, Ordering::Release);
+    metrics::metrics().set_ready(true);
 
     leadership_lost.await;
     state.ready.store(false, Ordering::Release);
+    metrics::metrics().set_ready(false);
     *state.repository.write().await = None;
     tracing::warn!(namespace = %namespace, lease = %lease_name, "lost kache planner leadership");
     Ok(())
@@ -276,6 +282,21 @@ fn normalize_name(value: String) -> String {
     }
 }
 
+/// Prometheus scrape endpoint.
+///
+/// Deliberately unauthenticated, like /healthz and /readyz: the cluster's
+/// SigNoz collector scrapes by pod annotation and carries no bearer token, and
+/// the series here describe the planner's own behaviour, not cache contents.
+async fn metrics_endpoint() -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        metrics::metrics().render(),
+    )
+}
+
 async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
@@ -321,11 +342,21 @@ async fn prefetch_plan(
     OptionalAuth(identity): OptionalAuth,
     Json(intent): Json<BuildIntent>,
 ) -> Result<Json<PrefetchPlan>, StatusCode> {
+    let started = std::time::Instant::now();
+    // Every exit below records exactly one outcome. Keeping the helper local
+    // means a new early return that forgets to call it shows up as a request
+    // that vanished, rather than as silence.
+    let record = |outcome: metrics::Outcome| {
+        metrics::metrics().record_request(outcome, started.elapsed().as_secs_f64());
+    };
+
     if state.token.is_some() && identity.is_none() {
+        record(metrics::Outcome::Unauthorized);
         return Err(StatusCode::UNAUTHORIZED);
     }
 
     if !state.ready.load(Ordering::Acquire) {
+        record(metrics::Outcome::NotReady);
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -338,6 +369,7 @@ async fn prefetch_plan(
             has_namespace = intent.namespace.is_some(),
             "planner request: no service-side state configured, requesting fallback"
         );
+        record(metrics::Outcome::FallbackNoState);
         return Ok(Json(fallback_plan(&state.planner_name)));
     };
 
@@ -350,6 +382,7 @@ async fn prefetch_plan(
                     %error,
                     "planner request: planning failed, requesting fallback"
                 );
+                record(metrics::Outcome::FallbackPlanningError);
                 return Ok(Json(fallback_plan(&state.planner_name)));
             }
         };
@@ -362,6 +395,7 @@ async fn prefetch_plan(
             has_namespace = intent.namespace.is_some(),
             "planner request: no candidates resolved from service state, requesting fallback"
         );
+        record(metrics::Outcome::FallbackNoCandidates);
         return Ok(Json(fallback_plan(&state.planner_name)));
     }
 
@@ -373,6 +407,9 @@ async fn prefetch_plan(
         candidate_count = plan.candidates.len(),
         "planner request: returning execute plan from service state"
     );
+
+    metrics::metrics().record_plan_candidates(plan.candidates.len());
+    record(metrics::Outcome::Execute);
 
     plan.plan_id.get_or_insert_with(next_plan_id);
     Ok(Json(plan))
@@ -672,6 +709,49 @@ mod tests {
                 planner: "planner".to_string(),
                 version: VERSION.to_string(),
             }
+        );
+    }
+
+    /// The scrape endpoint has to be reachable without a token.
+    ///
+    /// The metrics module's own tests prove the registry renders; they say
+    /// nothing about whether the route is wired, so a missing `.route()` or a
+    /// token check creeping onto /metrics would leave the series correct and
+    /// the scrape silently 404/401 — metrics that exist but nobody collects.
+    #[tokio::test]
+    async fn metrics_endpoint_serves_prometheus_text_without_auth() {
+        let response = test_app(Some("secret-token"), None)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a configured bearer token must not gate the scrape endpoint"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; version=0.0.4"),
+            "the collector needs the Prometheus text content type"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("kache_planner_requests_total"),
+            "scrape body carried no planner series: {body}"
         );
     }
 

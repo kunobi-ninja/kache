@@ -79,3 +79,16 @@ extraEnv: []
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# SigNoz metrics scraping (how the planner's Prometheus metrics reach SigNoz).
+#
+# The cluster's SigNoz OTel collector discovers scrape targets by pod
+# annotations (signoz.io/scrape|port|path) — NOT by Prometheus ServiceMonitors,
+# because these clusters run no Prometheus to consume them. The planner always
+# serves /metrics on the http port (auth-exempt, like the health probes), so
+# this is ON by default; the annotations are inert on any cluster without a
+# SigNoz collector watching for them.
+signoz:
+  scrape: true
+  path: /metrics
+  # port: defaults to service.port (the http port serving /metrics)

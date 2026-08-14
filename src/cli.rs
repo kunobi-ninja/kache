@@ -1790,7 +1790,12 @@ pub(crate) fn compute_link_stats(store_dir: &std::path::Path) -> LinkStats {
 }
 
 /// List all cached entries, or show details for a specific crate.
-pub fn list(config: &Config, crate_name: Option<&str>, sort_by: &str) -> Result<()> {
+pub fn list(
+    config: &Config,
+    crate_name: Option<&str>,
+    sort_by: &str,
+    no_pager: bool,
+) -> Result<()> {
     let store = Store::open(config)?;
 
     if let Some(name) = crate_name {
@@ -1843,11 +1848,13 @@ pub fn list(config: &Config, crate_name: Option<&str>, sort_by: &str) -> Result<
             return Ok(());
         }
 
-        println!(
-            "{:<30} {:<10} {:<8} {:>10} {:>6} {:>12} {:>12}",
-            "Crate", "Type", "Profile", "Size", "Hits", "Created", "Accessed"
-        );
-        println!("{}", "-".repeat(92));
+        let mut lines = vec![
+            format!(
+                "{:<30} {:<10} {:<8} {:>10} {:>6} {:>12} {:>12}",
+                "Crate", "Type", "Profile", "Size", "Hits", "Created", "Accessed"
+            ),
+            "-".repeat(92),
+        ];
 
         for entry in &entries {
             let crate_type = if entry.crate_type.is_empty() {
@@ -1860,7 +1867,7 @@ pub fn list(config: &Config, crate_name: Option<&str>, sort_by: &str) -> Result<
             } else {
                 &entry.profile
             };
-            println!(
+            lines.push(format!(
                 "{:<30} {:<10} {:<8} {:>10} {:>6} {:>12} {:>12}",
                 entry.crate_name,
                 crate_type,
@@ -1869,13 +1876,72 @@ pub fn list(config: &Config, crate_name: Option<&str>, sort_by: &str) -> Result<
                 entry.hit_count,
                 &entry.created_at[..10],
                 &entry.last_accessed[..10],
-            );
+            ));
         }
 
-        println!("\n{} entries", entries.len());
+        lines.push(format!("\n{} entries", entries.len()));
+        write_paged(&lines, no_pager);
     }
 
     Ok(())
+}
+
+/// Write output lines to a pager when stdout is a terminal, else plain stdout.
+/// `KACHE_PAGER` > `$PAGER` > `less -FRX`; `cat` or empty disables. Pager spawn
+/// failures and early quits (EPIPE) fall back to / tolerate plain output.
+fn write_paged(lines: &[String], no_pager: bool) {
+    use std::io::{IsTerminal, Write};
+
+    let plain = || {
+        for line in lines {
+            println!("{line}");
+        }
+    };
+
+    if no_pager || !std::io::stdout().is_terminal() {
+        plain();
+        return;
+    }
+
+    let pager = std::env::var("KACHE_PAGER")
+        .or_else(|_| std::env::var("PAGER"))
+        .unwrap_or_else(|_| {
+            // `more.com` takes no flags and is the only pager guaranteed to
+            // exist on Windows; `less` is not installed there by default.
+            if cfg!(windows) {
+                "more.com".to_string()
+            } else {
+                "less -FRX".to_string()
+            }
+        });
+    if pager.trim().is_empty() || pager == "cat" {
+        plain();
+        return;
+    }
+
+    let mut words = pager.split_whitespace();
+    let program = words.next().unwrap();
+    let mut child = match std::process::Command::new(program)
+        .args(words)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            plain();
+            return;
+        }
+    };
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        for line in lines {
+            if stdin.write_all(line.as_bytes()).is_err() || stdin.write_all(b"\n").is_err() {
+                break; // pager exited early (e.g. user pressed q)
+            }
+        }
+    }
+    drop(child.stdin.take());
+    let _ = child.wait();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

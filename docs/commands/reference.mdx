@@ -15,7 +15,7 @@ When invoked without arguments, kache prints `--help` and exits — it does not 
 | `kache init [-y] [--no-service] [--check]` | Interactive setup: cargo wrapper + service install + daemon start |
 | `kache monitor [--since <dur>]` | Open the live TUI dashboard, optionally scoped to a time window |
 | `kache stats [--since <dur>]` | One-shot stats snapshot, no interactive UI |
-| `kache list [<crate>] [--sort <field>]` | List cache entries or show details for one crate |
+| `kache list [<crate>] [--sort <field>] [--no-pager]` | List cache entries or show details for one crate |
 | `kache why-miss <crate>` | Diagnose why a crate keeps missing the cache |
 | `kache report [--format <fmt>] [--since <dur>] [--root <path>] [--output <path>] [--top <n>]` | Build report in text / json / trace / markdown / github format |
 | `kache gc [--max-age <dur>]` | Evict entries by LRU or age |
@@ -91,7 +91,7 @@ kache stats --since 7d
 ## `kache list`
 
 ```sh
-kache list [<crate-name>] [--sort name|size|hits|age]
+kache list [<crate-name>] [--sort name|size|hits|age] [--no-pager]
 ```
 
 Without a crate name, lists all cached entries with sort control. With a crate name, shows all cached entries for that specific crate including cache keys, artifact sizes, features, and targets.
@@ -102,6 +102,14 @@ kache list --sort size        # largest first
 kache list --sort hits        # most frequently used first
 kache list serde              # all entries for serde
 ```
+
+### Paging
+
+When stdout is a terminal, the full listing is sent to a pager (`less -FRX` by
+default, so short output still prints normally). `--no-pager` prints directly.
+The pager is chosen from `KACHE_PAGER`, then `$PAGER`, then the platform
+default; setting either to `cat` disables paging. Piped or redirected output is
+never paged.
 
 ---
 

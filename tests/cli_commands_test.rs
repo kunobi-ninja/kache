@@ -310,6 +310,23 @@ fn list_accepts_all_sort_modes() {
 }
 
 #[test]
+fn list_piped_stdout_bypasses_pager() {
+    let e = env();
+    e.cmd()
+        .arg("list")
+        .env("KACHE_PAGER", "definitely-not-a-real-pager")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("No cached entries"));
+}
+
+#[test]
+fn list_no_pager_flag_is_accepted() {
+    let e = env();
+    e.cmd().args(["list", "--no-pager"]).assert().success();
+}
+
+#[test]
 fn list_for_specific_missing_crate_succeeds() {
     let e = env();
     e.cmd().args(["list", "serde"]).assert().success();

@@ -88,6 +88,10 @@ enum Commands {
         /// Sort by: name, size, hits, age
         #[arg(long, default_value = "name")]
         sort: String,
+
+        /// Print directly instead of using a pager
+        #[arg(long)]
+        no_pager: bool,
     },
 
     /// Run garbage collection (LRU eviction)
@@ -457,9 +461,11 @@ fn main() -> Result<()> {
     let (config, config_provenance) = config::Config::load_with_provenance()?;
 
     match cli.command {
-        Some(Commands::List { crate_name, sort }) => {
-            cli::list(&config, crate_name.as_deref(), &sort)
-        }
+        Some(Commands::List {
+            crate_name,
+            sort,
+            no_pager,
+        }) => cli::list(&config, crate_name.as_deref(), &sort, no_pager),
         Some(Commands::Gc { max_age }) => {
             let hours = max_age
                 .as_deref()

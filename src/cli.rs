@@ -2175,11 +2175,15 @@ fn draw_clean(
     use ratatui::prelude::*;
     use ratatui::widgets::*;
 
+    // Reclaimable bytes, not raw sizes: storage shared with the store
+    // (hardlink/reflink) is not returned to disk when the dir is deleted —
+    // the store blob still references it. The per-row and header totals
+    // above stay raw on purpose; only the "would delete" number shrinks.
     let selected_size: u64 = targets
         .iter()
         .zip(selected.iter())
         .filter(|(_, s)| **s)
-        .map(|(t, _)| t.size)
+        .map(|(t, _)| t.size.saturating_sub(t.cached_bytes))
         .sum();
     let selected_count = selected.iter().filter(|s| **s).count();
     let total_size: u64 = targets.iter().map(|t| t.size).sum();
@@ -2334,11 +2338,15 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
     // `--yes`: non-interactive, remove every discovered target/ dir. Meant for
     // scripts and cron where the interactive selector cannot run.
     if yes {
-        let to_remove: Vec<_> = targets.iter().map(|t| (t.path.clone(), t.size)).collect();
-        let (removed, freed) = remove_targets(&to_remove, &root);
+        let to_remove: Vec<_> = targets
+            .iter()
+            .map(|t| (t.path.clone(), t.size, t.cached_bytes))
+            .collect();
+        let (removed, freed, shared_kept) = remove_targets(&to_remove, &root);
         println!(
-            "\nRemoved {removed} target/ dirs, freed {}",
-            ByteSize(freed)
+            "\nRemoved {removed} target/ dirs, freed {}{}",
+            ByteSize(freed),
+            shared_kept_note(shared_kept)
         );
         return Ok(());
     }
@@ -2367,7 +2375,7 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
                         .iter()
                         .zip(selected.iter())
                         .filter(|(_, s)| **s)
-                        .map(|(t, _)| (t.path.clone(), t.size))
+                        .map(|(t, _)| (t.path.clone(), t.size, t.cached_bytes))
                         .collect();
                     break Some(to_remove);
                 }
@@ -2388,10 +2396,11 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
             println!("Nothing selected.");
         }
         Some(to_remove) => {
-            let (removed, freed) = remove_targets(&to_remove, &root);
+            let (removed, freed, shared_kept) = remove_targets(&to_remove, &root);
             println!(
-                "\nRemoved {removed} target/ dirs, freed {}",
-                ByteSize(freed)
+                "\nRemoved {removed} target/ dirs, freed {}{}",
+                ByteSize(freed),
+                shared_kept_note(shared_kept)
             );
         }
     }
@@ -2399,19 +2408,28 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// Delete each `(path, size)` target/ dir, printing a per-directory `removed` /
-/// `failed` line (paths shown relative to `root`). A failure on one directory is
-/// reported and skipped, never aborting the rest. Returns `(removed_count,
-/// freed_bytes)` — bytes are only counted for directories that were actually
-/// removed. Shared by the interactive TUI path and the non-interactive `--yes` path.
-fn remove_targets(to_remove: &[(std::path::PathBuf, u64)], root: &std::path::Path) -> (usize, u64) {
+/// Delete each `(path, size, cached_bytes)` target/ dir, printing a
+/// per-directory `removed` / `failed` line (paths shown relative to `root`). A
+/// failure on one directory is reported and skipped, never aborting the rest.
+/// Returns `(removed_count, freed_bytes, shared_kept_bytes)`: freed counts
+/// `size - cached_bytes` per dir because storage shared with the store
+/// (hardlink/reflink) is not returned to disk while the store blob still
+/// references it, and bytes are only counted for directories that were
+/// actually removed. Shared by the interactive TUI path and the
+/// non-interactive `--yes` path.
+fn remove_targets(
+    to_remove: &[(std::path::PathBuf, u64, u64)],
+    root: &std::path::Path,
+) -> (usize, u64, u64) {
     let mut freed = 0u64;
+    let mut shared_kept = 0u64;
     let mut removed = 0usize;
-    for (path, size) in to_remove {
+    for (path, size, cached_bytes) in to_remove {
         let rel = path.strip_prefix(root).unwrap_or(path);
         match std::fs::remove_dir_all(path) {
             Ok(()) => {
-                freed += size;
+                freed += size.saturating_sub(*cached_bytes);
+                shared_kept += *cached_bytes;
                 removed += 1;
                 println!("  removed {}", rel.display());
             }
@@ -2420,7 +2438,19 @@ fn remove_targets(to_remove: &[(std::path::PathBuf, u64)], root: &std::path::Pat
             }
         }
     }
-    (removed, freed)
+    (removed, freed, shared_kept)
+}
+
+/// Parenthetical for clean summaries explaining why the freed number is
+/// smaller than the directory sizes: bytes shared with the store survive the
+/// delete because the store blob still references them. Omitted when nothing
+/// is shared (plain copies, or filesystems without the sharing probe).
+fn shared_kept_note(shared: u64) -> String {
+    if shared > 0 {
+        format!(" ({} shared with the store is kept)", ByteSize(shared))
+    } else {
+        String::new()
+    }
 }
 
 fn render_clean_dry_run(targets: &[TargetEntry], root: &std::path::Path) -> Vec<String> {
@@ -2457,7 +2487,17 @@ fn render_clean_dry_run(targets: &[TargetEntry], root: &std::path::Path) -> Vec<
             ByteSize(t.cached_bytes)
         ));
     }
-    lines.push(format!("\nDry run: would free {}", ByteSize(total_size)));
+    // Would-free is reclaimable bytes (size - cached), not the raw total: the
+    // shared portion stays on disk because the store blob references it.
+    let reclaimable: u64 = targets
+        .iter()
+        .map(|t| t.size.saturating_sub(t.cached_bytes))
+        .sum();
+    lines.push(format!(
+        "\nDry run: would free {}{}",
+        ByteSize(reclaimable),
+        shared_kept_note(total_cached)
+    ));
     lines
 }
 
@@ -7877,8 +7917,8 @@ mod tests {
                 stale: false,
             },
         ];
-        // Second row selected, cursor on the first row.
-        let selected = vec![false, true];
+        // First row selected (the one carrying cached bytes), cursor on it.
+        let selected = vec![true, false];
 
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
@@ -7893,6 +7933,20 @@ mod tests {
         );
         // The selected row's checkbox is set.
         assert!(rendered.contains("[x]"), "selected row shows a checked box");
+        // Selected total is reclaimable (size - cached), not the raw 4.8 MiB.
+        assert!(
+            rendered.contains("Selected: 1 (1.9 MiB)"),
+            "selected total subtracts cached bytes, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Selected: 1 (4.8 MiB)"),
+            "selected total must not report the raw size"
+        );
+        // The header's dir totals stay raw (4.8 + 1.9 MiB, 2.9 MiB cached).
+        assert!(
+            rendered.contains("2 dirs (6.7 MiB total, 2.9 MiB cached)"),
+            "header totals remain raw sizes"
+        );
     }
 
     #[test]
@@ -7911,6 +7965,9 @@ mod tests {
         assert!(single_out.contains("Found 1 target/ directory"));
         assert!(single_out.contains("proj/target"));
         assert!(single_out.contains("[debug]"));
+        // Would-free is reclaimable (size - cached) and says what was kept.
+        assert!(single_out.contains("Dry run: would free 512 B"));
+        assert!(single_out.contains("(512 B shared with the store is kept)"));
 
         let many = vec![
             TargetEntry {
@@ -7933,7 +7990,11 @@ mod tests {
         let many_out = render_clean_dry_run(&many, root).join("\n");
         assert!(many_out.contains("Found 2 target/ directories"));
         assert!(many_out.contains("/outside/proj-b/target"));
-        assert!(many_out.contains("Dry run: would free 30 B"));
+        // 30 B raw - 5 B shared = 25 B reclaimable; the raw total must not be
+        // presented as freed.
+        assert!(many_out.contains("Dry run: would free 25 B"));
+        assert!(many_out.contains("(5 B shared with the store is kept)"));
+        assert!(!many_out.contains("would free 30 B"));
     }
 
     #[test]
@@ -7994,18 +8055,21 @@ mod tests {
 
     #[test]
     fn remove_targets_deletes_all_and_reports_freed_bytes() {
-        // Two real target/ dirs under a root; --yes removes every one.
+        // Two real target/ dirs under a root; --yes removes every one. Freed is
+        // reclaimable (size - cached) per dir; the shared remainder is reported
+        // separately so the smaller number is not mistaken for undercounting.
         let root = tempfile::tempdir().unwrap();
         let a = root.path().join("proj-a/target");
         let b = root.path().join("proj-b/target");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
 
-        let to_remove = vec![(a.clone(), 100u64), (b.clone(), 200u64)];
-        let (removed, freed) = remove_targets(&to_remove, root.path());
+        let to_remove = vec![(a.clone(), 100u64, 40u64), (b.clone(), 200u64, 0u64)];
+        let (removed, freed, shared_kept) = remove_targets(&to_remove, root.path());
 
         assert_eq!(removed, 2, "both target/ dirs removed");
-        assert_eq!(freed, 300, "freed bytes sum the sizes of removed dirs");
+        assert_eq!(freed, 260, "freed sums size - cached over removed dirs");
+        assert_eq!(shared_kept, 40, "shared bytes are reported as kept");
         assert!(!a.exists() && !b.exists(), "directories are gone from disk");
     }
 
@@ -8018,11 +8082,12 @@ mod tests {
         let real = root.path().join("proj/target");
         std::fs::create_dir_all(&real).unwrap();
 
-        let to_remove = vec![(missing, 100u64), (real.clone(), 200u64)];
-        let (removed, freed) = remove_targets(&to_remove, root.path());
+        let to_remove = vec![(missing, 100u64, 10u64), (real.clone(), 200u64, 50u64)];
+        let (removed, freed, shared_kept) = remove_targets(&to_remove, root.path());
 
         assert_eq!(removed, 1, "only the existing dir counts as removed");
-        assert_eq!(freed, 200, "failed dir's bytes are not counted");
+        assert_eq!(freed, 150, "failed dir's bytes are not counted");
+        assert_eq!(shared_kept, 50, "only the removed dir's shared bytes count");
         assert!(!real.exists(), "the reachable dir was still removed");
     }
 

@@ -256,6 +256,8 @@ kache clean -y           # non-interactive: delete all target/ dirs (alias: --ye
 
 This is useful for freeing disk space when you're done with a project or before a fresh build.
 
+Freed-space totals (`Selected:` in the selector, `would free` in a dry run, and `freed` after removal) count only bytes that return to disk: storage kache shares with the directory (hardlink or reflink) is kept by the store blob and reported as `shared with the store is kept`, not as freed.
+
 <Callout type="info">
 On macOS, the scan skips TCC-protected locations (`/System`, `/Library`, `/private`, `/Applications`, `/Volumes`, and home folders like `~/Desktop`, `~/Documents`, `~/Downloads`, `~/Library`, `~/Pictures`) to avoid permission prompts, so `target/` directories under those paths are never found or cleaned.
 </Callout>

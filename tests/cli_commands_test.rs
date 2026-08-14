@@ -525,7 +525,10 @@ fn clean_dry_run_reports_a_populated_target_dir() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Found 1 target"))
-        .stdout(predicates::str::contains("Dry run: would free"));
+        .stdout(predicates::str::contains("Dry run: would free 10.0 KiB"))
+        // Plain copies share nothing with the store, so the would-free number
+        // equals the raw total and no "shared is kept" note is printed.
+        .stdout(predicates::str::contains("shared with the store").not());
 }
 
 #[test]

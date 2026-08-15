@@ -1808,37 +1808,39 @@ pub fn list(
             return Ok(());
         }
 
+        let mut lines = Vec::new();
         for entry in &matching {
-            println!("Cache key: {}", &entry.cache_key[..16]);
-            println!("  Crate:    {}", entry.crate_name);
+            lines.push(format!("Cache key: {}", &entry.cache_key[..16]));
+            lines.push(format!("  Crate:    {}", entry.crate_name));
             if !entry.crate_type.is_empty() {
-                println!("  Type:     {}", entry.crate_type);
+                lines.push(format!("  Type:     {}", entry.crate_type));
             }
             if !entry.profile.is_empty() {
-                println!("  Profile:  {}", entry.profile);
+                lines.push(format!("  Profile:  {}", entry.profile));
             }
-            println!("  Size:     {}", ByteSize(entry.size));
-            println!("  Hits:     {}", entry.hit_count);
-            println!("  Created:  {}", entry.created_at);
-            println!("  Accessed: {}", entry.last_accessed);
+            lines.push(format!("  Size:     {}", ByteSize(entry.size)));
+            lines.push(format!("  Hits:     {}", entry.hit_count));
+            lines.push(format!("  Created:  {}", entry.created_at));
+            lines.push(format!("  Accessed: {}", entry.last_accessed));
 
             let meta_path = store.entry_dir(&entry.cache_key).join("meta.json");
             if let Ok(content) = std::fs::read_to_string(&meta_path)
                 && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
             {
                 if !meta.features.is_empty() {
-                    println!("  Features: {}", meta.features.join(", "));
+                    lines.push(format!("  Features: {}", meta.features.join(", ")));
                 }
                 if !meta.target.is_empty() {
-                    println!("  Target:   {}", meta.target);
+                    lines.push(format!("  Target:   {}", meta.target));
                 }
-                println!("  Files:");
+                lines.push("  Files:".to_string());
                 for file in &meta.files {
-                    println!("    {} ({})", file.name, ByteSize(file.size));
+                    lines.push(format!("    {} ({})", file.name, ByteSize(file.size)));
                 }
             }
-            println!();
+            lines.push(String::new());
         }
+        write_paged(&lines, no_pager);
     } else {
         // Summary view of all entries
         let entries = store.list_entries(sort_by)?;
@@ -1886,9 +1888,83 @@ pub fn list(
     Ok(())
 }
 
+/// Resolve the pager to a direct process argv. Quotes group whitespace but are
+/// not shell syntax: there is no expansion, operator handling, or interpolation.
+fn resolve_pager_argv(
+    no_pager: bool,
+    stdout_is_terminal: bool,
+    kache_pager: Option<&str>,
+    pager: Option<&str>,
+    is_windows: bool,
+) -> Option<Vec<String>> {
+    if no_pager || !stdout_is_terminal {
+        return None;
+    }
+
+    let command = match kache_pager {
+        Some(command) => command,
+        None => pager.unwrap_or(if is_windows { "more.com" } else { "less -FRX" }),
+    };
+    let argv = parse_pager_argv(command)?;
+    if argv.first().is_none_or(|program| program.is_empty())
+        || (argv.len() == 1 && argv[0] == "cat")
+    {
+        None
+    } else {
+        Some(argv)
+    }
+}
+
+/// Split a pager command into argv without invoking a shell. Single and double
+/// quotes may group whitespace and are removed; every other character remains
+/// literal. An unmatched quote makes the command invalid.
+fn parse_pager_argv(command: &str) -> Option<Vec<String>> {
+    let mut argv = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut word_started = false;
+
+    for character in command.chars() {
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            } else {
+                word.push(character);
+            }
+            continue;
+        }
+
+        match character {
+            '\'' | '"' => {
+                quote = Some(character);
+                word_started = true;
+            }
+            character if character.is_whitespace() => {
+                if word_started {
+                    argv.push(std::mem::take(&mut word));
+                    word_started = false;
+                }
+            }
+            character => {
+                word.push(character);
+                word_started = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+    if word_started {
+        argv.push(word);
+    }
+    Some(argv)
+}
+
 /// Write output lines to a pager when stdout is a terminal, else plain stdout.
-/// `KACHE_PAGER` > `$PAGER` > `less -FRX`; `cat` or empty disables. Pager spawn
-/// failures and early quits (EPIPE) fall back to / tolerate plain output.
+/// `KACHE_PAGER` > `$PAGER` > platform default; `cat` or empty disables. Invalid
+/// commands and spawn failures fall back to plain output. An early pager exit
+/// stops further delivery without failing the command or reprinting the listing.
 fn write_paged(lines: &[String], no_pager: bool) {
     use std::io::{IsTerminal, Write};
 
@@ -1898,31 +1974,28 @@ fn write_paged(lines: &[String], no_pager: bool) {
         }
     };
 
-    if no_pager || !std::io::stdout().is_terminal() {
+    let kache_pager = std::env::var_os("KACHE_PAGER");
+    let pager = std::env::var_os("PAGER");
+    let Some(argv) = resolve_pager_argv(
+        no_pager,
+        std::io::stdout().is_terminal(),
+        kache_pager
+            .as_deref()
+            .map(|value| value.to_str().unwrap_or("")),
+        pager.as_deref().map(|value| value.to_str().unwrap_or("")),
+        cfg!(windows),
+    ) else {
         plain();
         return;
-    }
+    };
 
-    let pager = std::env::var("KACHE_PAGER")
-        .or_else(|_| std::env::var("PAGER"))
-        .unwrap_or_else(|_| {
-            // `more.com` takes no flags and is the only pager guaranteed to
-            // exist on Windows; `less` is not installed there by default.
-            if cfg!(windows) {
-                "more.com".to_string()
-            } else {
-                "less -FRX".to_string()
-            }
-        });
-    if pager.trim().is_empty() || pager == "cat" {
+    let mut argv = argv.into_iter();
+    let Some(program) = argv.next() else {
         plain();
         return;
-    }
-
-    let mut words = pager.split_whitespace();
-    let program = words.next().unwrap();
+    };
     let mut child = match std::process::Command::new(program)
-        .args(words)
+        .args(argv)
         .stdin(std::process::Stdio::piped())
         .spawn()
     {
@@ -4746,6 +4819,88 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── List pager resolution ───────────────────────────────────────────────
+
+    #[test]
+    fn pager_resolution_obeys_tty_disable_and_environment_precedence() {
+        assert_eq!(
+            resolve_pager_argv(false, true, Some("most -R"), Some("less -S"), false),
+            Some(vec!["most".to_string(), "-R".to_string()])
+        );
+        assert_eq!(
+            resolve_pager_argv(false, true, None, Some("less -S"), false),
+            Some(vec!["less".to_string(), "-S".to_string()])
+        );
+        assert_eq!(
+            resolve_pager_argv(true, true, Some("less"), None, false),
+            None
+        );
+        assert_eq!(
+            resolve_pager_argv(false, false, Some("less"), None, false),
+            None
+        );
+
+        // A present but empty KACHE_PAGER wins over PAGER and disables paging.
+        assert_eq!(
+            resolve_pager_argv(false, true, Some(""), Some("less"), false),
+            None
+        );
+        assert_eq!(
+            resolve_pager_argv(false, true, Some("cat"), Some("less"), false),
+            None
+        );
+        assert_eq!(
+            resolve_pager_argv(false, true, None, Some("cat"), false),
+            None
+        );
+    }
+
+    #[test]
+    fn pager_resolution_uses_platform_defaults() {
+        assert_eq!(
+            resolve_pager_argv(false, true, None, None, false),
+            Some(vec!["less".to_string(), "-FRX".to_string()])
+        );
+        assert_eq!(
+            resolve_pager_argv(false, true, None, None, true),
+            Some(vec!["more.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn pager_resolution_groups_quotes_without_shell_evaluation() {
+        assert_eq!(
+            resolve_pager_argv(
+                false,
+                true,
+                Some(r#""C:\Program Files\Git\usr\bin\less.exe" -FRX"#),
+                None,
+                true
+            ),
+            Some(vec![
+                r"C:\Program Files\Git\usr\bin\less.exe".to_string(),
+                "-FRX".to_string()
+            ])
+        );
+        assert_eq!(
+            resolve_pager_argv(
+                false,
+                true,
+                Some("less --prompt='literal ; $HOME | text'"),
+                None,
+                false
+            ),
+            Some(vec![
+                "less".to_string(),
+                "--prompt=literal ; $HOME | text".to_string()
+            ])
+        );
+        assert_eq!(
+            resolve_pager_argv(false, true, Some("less 'unterminated"), None, false),
+            None
+        );
+    }
 
     // ── Doctor check dispositions (kunobi-ninja/kache#443, #626) ──────────
 

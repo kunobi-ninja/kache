@@ -105,11 +105,18 @@ kache list serde              # all entries for serde
 
 ### Paging
 
-When stdout is a terminal, the full listing is sent to a pager (`less -FRX` by
-default, so short output still prints normally). `--no-pager` prints directly.
-The pager is chosen from `KACHE_PAGER`, then `$PAGER`, then the platform
-default; setting either to `cat` disables paging. Piped or redirected output is
-never paged.
+When stdout is a terminal, populated summary and crate-detail listings are sent
+to a pager. The platform default is `less -FRX` on Unix and `more.com` on
+Windows. `--no-pager` prints directly. The pager is chosen from `KACHE_PAGER`,
+then `$PAGER`, then that platform default; an empty value or the single command
+`cat` disables paging. Piped or redirected output is never paged.
+
+Pager values are parsed directly into a program and arguments, without a shell.
+Single or double quotes may group whitespace (for example,
+`KACHE_PAGER='"/opt/My Pager/less" -FRX'`), but shell expansion and operators are
+not interpreted. An invalid value or a program that cannot be started falls
+back to direct output. Quitting a running pager stops delivery without
+reprinting the listing.
 
 ---
 

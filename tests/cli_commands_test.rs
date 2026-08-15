@@ -310,17 +310,6 @@ fn list_accepts_all_sort_modes() {
 }
 
 #[test]
-fn list_piped_stdout_bypasses_pager() {
-    let e = env();
-    e.cmd()
-        .arg("list")
-        .env("KACHE_PAGER", "definitely-not-a-real-pager")
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("No cached entries"));
-}
-
-#[test]
 fn list_no_pager_flag_is_accepted() {
     let e = env();
     e.cmd().args(["list", "--no-pager"]).assert().success();
@@ -923,9 +912,11 @@ fn commands_operate_on_a_populated_cache() {
         String::from_utf8_lossy(&warm.stderr)
     );
 
-    // `list` now shows the crate we built.
+    // `list` now shows the crate we built. assert_cmd captures stdout through a
+    // pipe, so this reaches populated non-TTY rendering with a pager configured.
     e.cmd()
         .arg("list")
+        .env("KACHE_PAGER", "definitely-not-a-real-pager")
         .assert()
         .success()
         .stdout(predicates::str::contains("kachetestlib"));
@@ -981,8 +972,14 @@ fn commands_operate_on_a_populated_cache() {
             "Diagnosis: first build with these inputs -- entry is now cached",
         ));
 
-    // Listing the specific crate shows its entry detail.
-    e.cmd().args(["list", "kachetestlib"]).assert().success();
+    // Listing the specific crate reaches the same populated non-TTY renderer.
+    e.cmd()
+        .args(["list", "kachetestlib"])
+        .env("KACHE_PAGER", "definitely-not-a-real-pager")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Cache key:"))
+        .stdout(predicates::str::contains("kachetestlib"));
 
     // Purging that crate empties the cache for it; a subsequent list is clean.
     e.cmd()

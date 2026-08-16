@@ -2922,24 +2922,25 @@ pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEn
         }
     }
 
-    if has_cargo_toml && let Some(target) = subdirs.iter().find(|(n, _)| n == "target") {
-        if let Some(scan_identity) = directory_identity(&target.1) {
-            let (ps, breakdown) = compute_project_stats(&target.1);
-            // Do not publish estimates for a directory that was replaced while
-            // it was being scanned. Deletion checks the same identity again.
-            if ps.total_bytes > 0 && directory_identity(&target.1) == Some(scan_identity) {
-                let profiles = detect_profiles(&target.1);
-                results.push(TargetEntry {
-                    path: target.1.clone(),
-                    size: ps.total_bytes,
-                    cached_bytes: ps.cached_bytes,
-                    estimated_reclaimable_bytes: ps.estimated_reclaimable_bytes,
-                    scan_identity: Some(scan_identity),
-                    profiles,
-                    breakdown,
-                    stale: false,
-                });
-            }
+    if has_cargo_toml
+        && let Some(target) = subdirs.iter().find(|(n, _)| n == "target")
+        && let Some(scan_identity) = directory_identity(&target.1)
+    {
+        let (ps, breakdown) = compute_project_stats(&target.1);
+        // Do not publish estimates for a directory that was replaced while
+        // it was being scanned. Deletion checks the same identity again.
+        if ps.total_bytes > 0 && directory_identity(&target.1) == Some(scan_identity) {
+            let profiles = detect_profiles(&target.1);
+            results.push(TargetEntry {
+                path: target.1.clone(),
+                size: ps.total_bytes,
+                cached_bytes: ps.cached_bytes,
+                estimated_reclaimable_bytes: ps.estimated_reclaimable_bytes,
+                scan_identity: Some(scan_identity),
+                profiles,
+                breakdown,
+                stale: false,
+            });
         }
     }
 

@@ -204,7 +204,7 @@ kache purge --crate-name tokio     # remove all tokio entries
 kache clean [-n | --dry-run] [-y | --yes]
 ```
 
-Recursively finds all `target/` directories under the current directory and removes them. Reports disk usage per directory before deleting, including how much of each `target/` is already cached in kache's store — so you can see at a glance which projects are safe to wipe.
+Recursively finds all `target/` directories under the current directory and removes them. Reports disk usage per directory before deleting, including how much appears to share storage with another file. Kache restores normally create that state, but the filesystem probe cannot prove that every other reference belongs to Kache's store.
 
 With no flags, `clean` opens an interactive selector (shown below). For scripts and cron, pass `-y`/`--yes` to skip the selector and remove **every** `target/` directory found, or `-n`/`--dry-run` to preview what would be removed without deleting. If both are given, `--dry-run` wins.
 
@@ -214,7 +214,7 @@ Static layout for reference:
 
 ```text
 ┌ kache clean ──────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ 8 dirs (73.2 GiB total, 7.4 GiB cached)    Selected: 0 (0 B)                                                      │
+│ 8 dirs (73.2 GiB total, 7.4 GiB cached)    Selected: 0 (est. 0 B)                                                 │
 └───────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Select directories to remove ─────────────────────────────────────────────────────────────────────────────────────┐
 │ [ ]  workspace/compiler-core/target                                             34.7 GiB    5.7 GiB [debug, release]│
@@ -256,7 +256,9 @@ kache clean -y           # non-interactive: delete all target/ dirs (alias: --ye
 
 This is useful for freeing disk space when you're done with a project or before a fresh build.
 
-Freed-space totals (`Selected:` in the selector, `would free` in a dry run, and `freed` after removal) count only bytes that return to disk: storage kache shares with the directory (hardlink or reflink) is kept by the store blob and reported as `shared with the store is kept`, not as freed.
+Freed-space totals are labelled as estimates. On macOS and Linux, the scan uses private extent bytes for partially shared reflinks and includes binary-shaped artifacts. On macOS, Linux, and Windows, it counts a file identity only once when all of its hardlinks are inside one `target/`. The output explains any gap from apparent size as storage that is shared, sparse, or duplicate; it does not assume every shared extent or hardlink belongs to kache's store.
+
+The estimate is calculated independently per `target/`, so deleting several selected directories that share links or clones can reclaim more than their summed estimates. The real post-delete filesystem delta can also differ because unsupported filesystems fall back to apparent sizes, files can change after the scan, and a failed recursive removal may already have deleted part of a tree. Before deletion, Kache verifies that each path is still the same non-symlink directory it scanned. The after-removal summary includes only directories whose removal returned success, but remains a scan-time estimate.
 
 <Callout type="info">
 On macOS, the scan skips TCC-protected locations (`/System`, `/Library`, `/private`, `/Applications`, `/Volumes`, and home folders like `~/Desktop`, `~/Documents`, `~/Downloads`, `~/Library`, `~/Pictures`) to avoid permission prompts, so `target/` directories under those paths are never found or cleaned.

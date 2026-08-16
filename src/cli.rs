@@ -1496,32 +1496,335 @@ pub(crate) fn store_over_limit(total_size: Option<u64>, max_size: u64) -> bool {
 
 // ── Project stats ──────────────────────────────────────────────────────────
 
+#[derive(Default)]
 struct ProjectStats {
     total_bytes: u64,
     cached_bytes: u64,
+    /// Scan-time estimate of bytes returned if this whole target/ disappears.
+    /// Unlike `cached_bytes`, this uses private extents and collapses hardlinks.
+    estimated_reclaimable_bytes: u64,
     #[allow(dead_code)] // tracked but not yet surfaced in the clean TUI
     cached_files: u64,
     local_bytes: u64,
     local_files: u64,
 }
 
-/// Whether a build artifact's storage is shared with kache's store, and how
-/// much of it a delete would really return.
-///
-/// Shared means *either* a hardlink (`nlink > 1`, the fallback restore path) or
-/// shared extents (a reflink/clone, which `link_to_target` prefers and which
-/// leaves `nlink == 1`). Testing only `nlink` reported ~0% cached on exactly the
-/// filesystems kache works best on — APFS, btrfs, XFS (kunobi-ninja/kache#602).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectBucket {
+    Incremental,
+    BuildScripts,
+    Fingerprints,
+    Binaries,
+    Deps,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HardlinkObservation {
+    id: FileIdentity,
+    total_links: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StorageObservation {
+    sharing: crate::sharing::Sharing,
+    hardlink: Option<HardlinkObservation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HardlinkGroup {
+    private_bytes: u64,
+    links_seen: u64,
+    total_links: u64,
+}
+
+/// Estimate physical reclaim without treating every shared file as wholly
+/// unreclaimable. Reflinks contribute their private extents; hardlinked paths
+/// are collapsed by inode and contribute once only when every link is inside
+/// this target/. If another hardlink remains elsewhere, deleting this target/
+/// cannot remove the inode and contributes zero.
+#[derive(Default)]
+struct ReclaimEstimator {
+    single_link_private_bytes: u64,
+    hardlinks: std::collections::HashMap<FileIdentity, HardlinkGroup>,
+}
+
+impl ReclaimEstimator {
+    fn record(&mut self, size: u64, observation: StorageObservation) {
+        let private_bytes = observation.sharing.private_bytes.min(size);
+        if let Some(link) = observation.hardlink {
+            let group = self.hardlinks.entry(link.id).or_insert(HardlinkGroup {
+                private_bytes,
+                links_seen: 0,
+                total_links: link.total_links.max(1),
+            });
+            // Metadata can change while the scan runs. The minimum private-byte
+            // answer and maximum link count are the conservative combination.
+            group.private_bytes = group.private_bytes.min(private_bytes);
+            group.links_seen = group.links_seen.saturating_add(1);
+            group.total_links = group.total_links.max(link.total_links.max(1));
+        } else {
+            self.single_link_private_bytes =
+                self.single_link_private_bytes.saturating_add(private_bytes);
+        }
+    }
+
+    fn estimated_reclaimable_bytes(&self) -> u64 {
+        self.hardlinks
+            .values()
+            .filter(|group| group.links_seen >= group.total_links)
+            .fold(self.single_link_private_bytes, |total, group| {
+                total.saturating_add(group.private_bytes)
+            })
+    }
+
+    fn hardlink_has_external_ref(&self, id: FileIdentity) -> bool {
+        self.hardlinks
+            .get(&id)
+            .is_some_and(|group| group.links_seen < group.total_links)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CacheCandidate {
+    size: u64,
+    bucket: ProjectBucket,
+    reflink_shared: bool,
+    hardlink_id: Option<FileIdentity>,
+}
+
 #[cfg(unix)]
-fn artifact_sharing(path: &std::path::Path, meta: &std::fs::Metadata) -> crate::sharing::Sharing {
+fn clamp_private_bytes(size: u64, private_bytes: u64, allocated_bytes: Option<u64>) -> u64 {
+    let private_bytes = private_bytes.min(size);
+    allocated_bytes.map_or(private_bytes, |allocated| {
+        private_bytes.min(allocated.min(size))
+    })
+}
+
+#[cfg(unix)]
+fn observe_storage(path: &std::path::Path, meta: &std::fs::Metadata) -> StorageObservation {
     let size = meta.len();
     let mut sharing = crate::sharing::probe(path, size);
-    if meta.nlink() > 1 {
-        // A hardlink is sharing whatever the extent probe managed to see, and on
-        // a filesystem with no probe at all it is the only signal there is.
-        sharing.shared = true;
+    sharing.private_bytes = clamp_private_bytes(
+        size,
+        sharing.private_bytes,
+        Some(meta.blocks().saturating_mul(512)),
+    );
+    let hardlink = (meta.nlink() > 1).then_some(HardlinkObservation {
+        id: FileIdentity {
+            device: meta.dev(),
+            inode: meta.ino(),
+        },
+        total_links: meta.nlink(),
+    });
+    StorageObservation { sharing, hardlink }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &std::path::Path) -> Option<(FileIdentity, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    (ok != 0).then_some((
+        FileIdentity {
+            device: u64::from(info.dwVolumeSerialNumber),
+            inode: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        },
+        u64::from(info.nNumberOfLinks),
+    ))
+}
+
+#[cfg(windows)]
+fn observe_storage(path: &std::path::Path, meta: &std::fs::Metadata) -> StorageObservation {
+    match windows_file_identity(path) {
+        Some((id, total_links)) => StorageObservation {
+            sharing: crate::sharing::Sharing::unknown_for(meta.len()),
+            hardlink: (total_links > 1).then_some(HardlinkObservation { id, total_links }),
+        },
+        None => StorageObservation {
+            // Without a stable identity we cannot rule out an external
+            // hardlink, so claiming the file's full length would overstate
+            // physical reclaim. Omit it from the estimate instead.
+            sharing: crate::sharing::Sharing {
+                shared: false,
+                private_bytes: 0,
+            },
+            hardlink: None,
+        },
     }
-    sharing
+}
+
+#[cfg(not(any(unix, windows)))]
+fn observe_storage(_path: &std::path::Path, meta: &std::fs::Metadata) -> StorageObservation {
+    StorageObservation {
+        sharing: crate::sharing::Sharing::unknown_for(meta.len()),
+        hardlink: None,
+    }
+}
+
+fn directory_identity(path: &std::path::Path) -> Option<FileIdentity> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_dir() {
+        return None;
+    }
+
+    #[cfg(unix)]
+    {
+        Some(FileIdentity {
+            device: meta.dev(),
+            inode: meta.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        windows_file_identity(path).map(|(identity, _)| identity)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+fn add_local_bytes(
+    stats: &mut ProjectStats,
+    breakdown: &mut CategoryBreakdown,
+    bucket: ProjectBucket,
+    size: u64,
+) {
+    stats.local_bytes = stats.local_bytes.saturating_add(size);
+    stats.local_files = stats.local_files.saturating_add(1);
+    match bucket {
+        ProjectBucket::Incremental => {
+            breakdown.incremental = breakdown.incremental.saturating_add(size)
+        }
+        ProjectBucket::BuildScripts => {
+            breakdown.build_scripts = breakdown.build_scripts.saturating_add(size)
+        }
+        ProjectBucket::Fingerprints => {
+            breakdown.fingerprints = breakdown.fingerprints.saturating_add(size)
+        }
+        ProjectBucket::Binaries => breakdown.binaries = breakdown.binaries.saturating_add(size),
+        ProjectBucket::Deps => breakdown.deps_local = breakdown.deps_local.saturating_add(size),
+        ProjectBucket::Other => breakdown.other = breakdown.other.saturating_add(size),
+    }
+}
+
+fn record_scanned_file(
+    stats: &mut ProjectStats,
+    breakdown: &mut CategoryBreakdown,
+    reclaim: &mut ReclaimEstimator,
+    cache_candidates: &mut Vec<CacheCandidate>,
+    size: u64,
+    bucket: ProjectBucket,
+    cache_eligible: bool,
+    observation: StorageObservation,
+) {
+    stats.total_bytes = stats.total_bytes.saturating_add(size);
+    reclaim.record(size, observation);
+    if cache_eligible {
+        cache_candidates.push(CacheCandidate {
+            size,
+            bucket,
+            reflink_shared: observation.sharing.shared,
+            hardlink_id: observation.hardlink.map(|link| link.id),
+        });
+    } else {
+        add_local_bytes(stats, breakdown, bucket, size);
+    }
+}
+
+fn finalize_cache_candidates(
+    stats: &mut ProjectStats,
+    breakdown: &mut CategoryBreakdown,
+    reclaim: &ReclaimEstimator,
+    candidates: &[CacheCandidate],
+) {
+    for candidate in candidates {
+        // A hardlink is useful evidence of cache backing only when another link
+        // survives outside this target/. Links wholly inside the target are a
+        // local link group, not evidence that kache's store retains the inode.
+        let cache_backed = candidate.reflink_shared
+            || candidate
+                .hardlink_id
+                .is_some_and(|id| reclaim.hardlink_has_external_ref(id));
+        if cache_backed {
+            stats.cached_bytes = stats.cached_bytes.saturating_add(candidate.size);
+            stats.cached_files = stats.cached_files.saturating_add(1);
+        } else {
+            add_local_bytes(stats, breakdown, candidate.bucket, candidate.size);
+        }
+    }
+}
+
+fn walk_project_dir(
+    dir: &std::path::Path,
+    bucket: ProjectBucket,
+    cache_eligible: bool,
+    stats: &mut ProjectStats,
+    breakdown: &mut CategoryBreakdown,
+    reclaim: &mut ReclaimEstimator,
+    cache_candidates: &mut Vec<CacheCandidate>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        // Never follow a target/ symlink into storage that clean itself will
+        // not recursively remove. Omitting the link's tiny allocation keeps the
+        // estimate conservative and, more importantly, bounded to this tree.
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            walk_project_dir(
+                &path,
+                bucket,
+                cache_eligible,
+                stats,
+                breakdown,
+                reclaim,
+                cache_candidates,
+            );
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        let observation = observe_storage(&path, &meta);
+        record_scanned_file(
+            stats,
+            breakdown,
+            reclaim,
+            cache_candidates,
+            meta.len(),
+            bucket,
+            cache_eligible,
+            observation,
+        );
+    }
 }
 
 /// Analyze a project's target/ directory: which files share storage with kache's
@@ -1530,16 +1833,19 @@ fn compute_project_stats(target_dir: &std::path::Path) -> (ProjectStats, Categor
     let mut stats = ProjectStats {
         total_bytes: 0,
         cached_bytes: 0,
+        estimated_reclaimable_bytes: 0,
         cached_files: 0,
         local_bytes: 0,
         local_files: 0,
     };
     let mut breakdown = CategoryBreakdown::default();
+    let mut reclaim = ReclaimEstimator::default();
+    let mut cache_candidates = Vec::new();
 
     let profiles = ["debug", "release", "profiling", "coverage"];
     for profile in &profiles {
         let profile_dir = target_dir.join(profile);
-        if !profile_dir.is_dir() {
+        if !std::fs::symlink_metadata(&profile_dir).is_ok_and(|meta| meta.file_type().is_dir()) {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&profile_dir) else {
@@ -1549,67 +1855,94 @@ fn compute_project_stats(target_dir: &std::path::Path) -> (ProjectStats, Categor
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
 
-            if path.is_dir() {
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            if file_type.is_dir() {
                 match name_str.as_ref() {
                     "incremental" => {
-                        let size = dir_size(&path);
-                        breakdown.incremental += size;
-                        stats.total_bytes += size;
-                        stats.local_bytes += size;
+                        walk_project_dir(
+                            &path,
+                            ProjectBucket::Incremental,
+                            false,
+                            &mut stats,
+                            &mut breakdown,
+                            &mut reclaim,
+                            &mut cache_candidates,
+                        );
                     }
                     ".fingerprint" => {
-                        let size = dir_size(&path);
-                        breakdown.fingerprints += size;
-                        stats.total_bytes += size;
-                        stats.local_bytes += size;
+                        walk_project_dir(
+                            &path,
+                            ProjectBucket::Fingerprints,
+                            false,
+                            &mut stats,
+                            &mut breakdown,
+                            &mut reclaim,
+                            &mut cache_candidates,
+                        );
                     }
                     "build" => {
-                        let size = dir_size(&path);
-                        breakdown.build_scripts += size;
-                        stats.total_bytes += size;
-                        stats.local_bytes += size;
+                        walk_project_dir(
+                            &path,
+                            ProjectBucket::BuildScripts,
+                            false,
+                            &mut stats,
+                            &mut breakdown,
+                            &mut reclaim,
+                            &mut cache_candidates,
+                        );
                     }
                     "deps" => {
-                        walk_deps_dir(&path, &mut stats, &mut breakdown);
+                        walk_project_dir(
+                            &path,
+                            ProjectBucket::Deps,
+                            true,
+                            &mut stats,
+                            &mut breakdown,
+                            &mut reclaim,
+                            &mut cache_candidates,
+                        );
                     }
                     _ => {
-                        let size = dir_size(&path);
-                        breakdown.other += size;
-                        stats.total_bytes += size;
-                        stats.local_bytes += size;
+                        walk_project_dir(
+                            &path,
+                            ProjectBucket::Other,
+                            false,
+                            &mut stats,
+                            &mut breakdown,
+                            &mut reclaim,
+                            &mut cache_candidates,
+                        );
                     }
                 }
-            } else {
+            } else if file_type.is_file() {
                 let Ok(meta) = std::fs::metadata(&path) else {
                     continue;
                 };
                 let size = meta.len();
-                stats.total_bytes += size;
-
-                if is_binary_artifact(&path) {
-                    breakdown.binaries += size;
-                    stats.local_bytes += size;
-                    stats.local_files += 1;
+                let binary = is_binary_artifact(&path);
+                let bucket = if binary {
+                    ProjectBucket::Binaries
                 } else {
-                    #[cfg(unix)]
-                    {
-                        if artifact_sharing(&path, &meta).shared {
-                            stats.cached_bytes += size;
-                            stats.cached_files += 1;
-                        } else {
-                            breakdown.other += size;
-                            stats.local_bytes += size;
-                            stats.local_files += 1;
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        breakdown.other += size;
-                        stats.local_bytes += size;
-                        stats.local_files += 1;
-                    }
-                }
+                    ProjectBucket::Other
+                };
+                let observation = observe_storage(&path, &meta);
+                record_scanned_file(
+                    &mut stats,
+                    &mut breakdown,
+                    &mut reclaim,
+                    &mut cache_candidates,
+                    size,
+                    bucket,
+                    !binary,
+                    observation,
+                );
             }
         }
     }
@@ -1618,58 +1951,27 @@ fn compute_project_stats(target_dir: &std::path::Path) -> (ProjectStats, Categor
     if let Ok(entries) = std::fs::read_dir(target_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file()
+            if entry.file_type().is_ok_and(|file_type| file_type.is_file())
                 && let Ok(meta) = std::fs::metadata(&path)
             {
-                breakdown.other += meta.len();
-                stats.total_bytes += meta.len();
-                stats.local_bytes += meta.len();
-                stats.local_files += 1;
+                let observation = observe_storage(&path, &meta);
+                record_scanned_file(
+                    &mut stats,
+                    &mut breakdown,
+                    &mut reclaim,
+                    &mut cache_candidates,
+                    meta.len(),
+                    ProjectBucket::Other,
+                    false,
+                    observation,
+                );
             }
         }
     }
 
+    finalize_cache_candidates(&mut stats, &mut breakdown, &reclaim, &cache_candidates);
+    stats.estimated_reclaimable_bytes = reclaim.estimated_reclaimable_bytes();
     (stats, breakdown)
-}
-
-fn walk_deps_dir(
-    dir: &std::path::Path,
-    stats: &mut ProjectStats,
-    breakdown: &mut CategoryBreakdown,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_deps_dir(&path, stats, breakdown);
-            continue;
-        }
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        let size = meta.len();
-        stats.total_bytes += size;
-
-        #[cfg(unix)]
-        {
-            if artifact_sharing(&path, &meta).shared {
-                stats.cached_bytes += size;
-                stats.cached_files += 1;
-            } else {
-                breakdown.deps_local += size;
-                stats.local_bytes += size;
-                stats.local_files += 1;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            breakdown.deps_local += size;
-            stats.local_bytes += size;
-            stats.local_files += 1;
-        }
-    }
 }
 
 /// Whether a file in `target/` is a binary-shaped artifact (executable
@@ -2175,15 +2477,14 @@ fn draw_clean(
     use ratatui::prelude::*;
     use ratatui::widgets::*;
 
-    // Reclaimable bytes, not raw sizes: storage shared with the store
-    // (hardlink/reflink) is not returned to disk when the dir is deleted —
-    // the store blob still references it. The per-row and header totals
-    // above stay raw on purpose; only the "would delete" number shrinks.
+    // Keep the raw per-row/header totals, but label the selection's scan-time
+    // physical-reclaim estimate explicitly. It is not the cached-file total:
+    // partial reflinks and hardlink groups need extent/link-aware accounting.
     let selected_size: u64 = targets
         .iter()
         .zip(selected.iter())
         .filter(|(_, s)| **s)
-        .map(|(t, _)| t.size.saturating_sub(t.cached_bytes))
+        .map(|(t, _)| t.estimated_reclaimable_bytes)
         .sum();
     let selected_count = selected.iter().filter(|s| **s).count();
     let total_size: u64 = targets.iter().map(|t| t.size).sum();
@@ -2201,7 +2502,7 @@ fn draw_clean(
 
     // Header
     let header = Paragraph::new(format!(
-        " {} dirs ({} total, {} cached)    Selected: {} ({})",
+        " {} dirs ({} total, {} cached)    Selected: {} (est. {})",
         targets.len(),
         ByteSize(total_size),
         ByteSize(total_cached),
@@ -2338,15 +2639,12 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
     // `--yes`: non-interactive, remove every discovered target/ dir. Meant for
     // scripts and cron where the interactive selector cannot run.
     if yes {
-        let to_remove: Vec<_> = targets
-            .iter()
-            .map(|t| (t.path.clone(), t.size, t.cached_bytes))
-            .collect();
-        let (removed, freed, shared_kept) = remove_targets(&to_remove, &root);
+        let to_remove: Vec<_> = targets.iter().map(RemovalTarget::from_entry).collect();
+        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, &root);
         println!(
-            "\nRemoved {removed} target/ dirs, freed {}{}",
-            ByteSize(freed),
-            shared_kept_note(shared_kept)
+            "\nRemoved {removed} target/ dirs; estimated reclaimed {}{}",
+            ByteSize(estimated_reclaimed),
+            estimate_context_note(apparent_gap)
         );
         return Ok(());
     }
@@ -2375,7 +2673,7 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
                         .iter()
                         .zip(selected.iter())
                         .filter(|(_, s)| **s)
-                        .map(|(t, _)| (t.path.clone(), t.size, t.cached_bytes))
+                        .map(|(t, _)| RemovalTarget::from_entry(t))
                         .collect();
                     break Some(to_remove);
                 }
@@ -2396,11 +2694,11 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
             println!("Nothing selected.");
         }
         Some(to_remove) => {
-            let (removed, freed, shared_kept) = remove_targets(&to_remove, &root);
+            let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, &root);
             println!(
-                "\nRemoved {removed} target/ dirs, freed {}{}",
-                ByteSize(freed),
-                shared_kept_note(shared_kept)
+                "\nRemoved {removed} target/ dirs; estimated reclaimed {}{}",
+                ByteSize(estimated_reclaimed),
+                estimate_context_note(apparent_gap)
             );
         }
     }
@@ -2408,28 +2706,50 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// Delete each `(path, size, cached_bytes)` target/ dir, printing a
-/// per-directory `removed` / `failed` line (paths shown relative to `root`). A
-/// failure on one directory is reported and skipped, never aborting the rest.
-/// Returns `(removed_count, freed_bytes, shared_kept_bytes)`: freed counts
-/// `size - cached_bytes` per dir because storage shared with the store
-/// (hardlink/reflink) is not returned to disk while the store blob still
-/// references it, and bytes are only counted for directories that were
-/// actually removed. Shared by the interactive TUI path and the
-/// non-interactive `--yes` path.
-fn remove_targets(
-    to_remove: &[(std::path::PathBuf, u64, u64)],
-    root: &std::path::Path,
-) -> (usize, u64, u64) {
-    let mut freed = 0u64;
-    let mut shared_kept = 0u64;
+#[derive(Debug)]
+struct RemovalTarget {
+    path: std::path::PathBuf,
+    scanned_identity: Option<FileIdentity>,
+    estimated_reclaimable: u64,
+    apparent_gap: u64,
+}
+
+impl RemovalTarget {
+    fn from_entry(entry: &TargetEntry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            scanned_identity: entry.scan_identity,
+            estimated_reclaimable: entry.estimated_reclaimable_bytes,
+            apparent_gap: entry.size.saturating_sub(entry.estimated_reclaimable_bytes),
+        }
+    }
+}
+
+/// Delete each validated target/ dir,
+/// printing a per-directory `removed` / `failed` line (paths shown relative to
+/// `root`). A failure on one directory is reported and skipped, never aborting
+/// the rest. Returns the scan-time estimates only for directories whose
+/// `remove_dir_all` completed successfully. The actual filesystem delta can
+/// differ after a concurrent change or a partially-completed failed removal.
+fn remove_targets(to_remove: &[RemovalTarget], root: &std::path::Path) -> (usize, u64, u64) {
+    let mut estimated_reclaimed = 0u64;
+    let mut apparent_gap = 0u64;
     let mut removed = 0usize;
-    for (path, size, cached_bytes) in to_remove {
-        let rel = path.strip_prefix(root).unwrap_or(path);
-        match std::fs::remove_dir_all(path) {
+    for target in to_remove {
+        let rel = target.path.strip_prefix(root).unwrap_or(&target.path);
+        let current_identity = directory_identity(&target.path);
+        if target.scanned_identity.is_none() || current_identity != target.scanned_identity {
+            println!(
+                "  failed  {} — directory changed since scan; refusing to remove",
+                rel.display()
+            );
+            continue;
+        }
+        match std::fs::remove_dir_all(&target.path) {
             Ok(()) => {
-                freed += size.saturating_sub(*cached_bytes);
-                shared_kept += *cached_bytes;
+                estimated_reclaimed =
+                    estimated_reclaimed.saturating_add(target.estimated_reclaimable);
+                apparent_gap = apparent_gap.saturating_add(target.apparent_gap);
                 removed += 1;
                 println!("  removed {}", rel.display());
             }
@@ -2438,16 +2758,18 @@ fn remove_targets(
             }
         }
     }
-    (removed, freed, shared_kept)
+    (removed, estimated_reclaimed, apparent_gap)
 }
 
-/// Parenthetical for clean summaries explaining why the freed number is
-/// smaller than the directory sizes: bytes shared with the store survive the
-/// delete because the store blob still references them. Omitted when nothing
-/// is shared (plain copies, or filesystems without the sharing probe).
-fn shared_kept_note(shared: u64) -> String {
-    if shared > 0 {
-        format!(" ({} shared with the store is kept)", ByteSize(shared))
+/// Explain the gap between apparent size and estimated physical reclaim without
+/// pretending every shared extent belongs to kache or survives the selected
+/// deletion set. The gap can also contain sparse holes and duplicate hardlinks.
+fn estimate_context_note(apparent_gap: u64) -> String {
+    if apparent_gap > 0 {
+        format!(
+            " ({} of apparent size is shared, sparse, or duplicate)",
+            ByteSize(apparent_gap)
+        )
     } else {
         String::new()
     }
@@ -2487,16 +2809,11 @@ fn render_clean_dry_run(targets: &[TargetEntry], root: &std::path::Path) -> Vec<
             ByteSize(t.cached_bytes)
         ));
     }
-    // Would-free is reclaimable bytes (size - cached), not the raw total: the
-    // shared portion stays on disk because the store blob references it.
-    let reclaimable: u64 = targets
-        .iter()
-        .map(|t| t.size.saturating_sub(t.cached_bytes))
-        .sum();
+    let estimated_reclaimable: u64 = targets.iter().map(|t| t.estimated_reclaimable_bytes).sum();
     lines.push(format!(
-        "\nDry run: would free {}{}",
-        ByteSize(reclaimable),
-        shared_kept_note(total_cached)
+        "\nDry run: estimated to free {}{}",
+        ByteSize(estimated_reclaimable),
+        estimate_context_note(total_size.saturating_sub(estimated_reclaimable))
     ));
     lines
 }
@@ -2515,6 +2832,8 @@ pub(crate) struct TargetEntry {
     pub path: std::path::PathBuf,
     pub size: u64,
     pub cached_bytes: u64,
+    pub estimated_reclaimable_bytes: u64,
+    pub(crate) scan_identity: Option<FileIdentity>,
     pub profiles: Vec<String>,
     pub breakdown: CategoryBreakdown,
     /// Marked true when a rescan starts; cleared when fresh data arrives.
@@ -2604,17 +2923,23 @@ pub(crate) fn find_target_dirs(dir: &std::path::Path, results: &mut Vec<TargetEn
     }
 
     if has_cargo_toml && let Some(target) = subdirs.iter().find(|(n, _)| n == "target") {
-        let (ps, breakdown) = compute_project_stats(&target.1);
-        if ps.total_bytes > 0 {
-            let profiles = detect_profiles(&target.1);
-            results.push(TargetEntry {
-                path: target.1.clone(),
-                size: ps.total_bytes,
-                cached_bytes: ps.cached_bytes,
-                profiles,
-                breakdown,
-                stale: false,
-            });
+        if let Some(scan_identity) = directory_identity(&target.1) {
+            let (ps, breakdown) = compute_project_stats(&target.1);
+            // Do not publish estimates for a directory that was replaced while
+            // it was being scanned. Deletion checks the same identity again.
+            if ps.total_bytes > 0 && directory_identity(&target.1) == Some(scan_identity) {
+                let profiles = detect_profiles(&target.1);
+                results.push(TargetEntry {
+                    path: target.1.clone(),
+                    size: ps.total_bytes,
+                    cached_bytes: ps.cached_bytes,
+                    estimated_reclaimable_bytes: ps.estimated_reclaimable_bytes,
+                    scan_identity: Some(scan_identity),
+                    profiles,
+                    breakdown,
+                    stale: false,
+                });
+            }
         }
     }
 
@@ -2637,7 +2962,7 @@ fn detect_profiles(target_dir: &std::path::Path) -> Vec<String> {
     let mut profiles = Vec::new();
     for (dir_name, label) in &known {
         let p = target_dir.join(dir_name);
-        if p.is_dir() {
+        if std::fs::symlink_metadata(&p).is_ok_and(|meta| meta.file_type().is_dir()) {
             profiles.push(label.to_string());
         }
     }
@@ -5098,12 +5423,11 @@ mod tests {
         assert_eq!(stats.saved_bytes, 4096 + 3072, "saturating, not wrapping");
     }
 
-    /// A hardlinked artifact is shared even where the extent probe reports
-    /// nothing, which is the only signal available on a filesystem without
-    /// reflinks (kunobi-ninja/kache#602).
+    /// Hardlink identity is tracked separately from extent sharing so callers
+    /// can distinguish an external survivor from two names inside one target/.
     #[cfg(unix)]
     #[test]
-    fn a_hardlinked_artifact_is_reported_as_shared() {
+    fn a_hardlinked_artifact_records_its_link_group() {
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("blob.bin");
         let linked = dir.path().join("target-copy.bin");
@@ -5111,19 +5435,20 @@ mod tests {
         fs::hard_link(&blob, &linked).unwrap();
 
         let meta = fs::metadata(&linked).unwrap();
-        assert!(
-            artifact_sharing(&linked, &meta).shared,
-            "nlink > 1 is sharing regardless of what the extent probe says"
-        );
+        let observation = observe_storage(&linked, &meta);
+        let hardlink = observation.hardlink.expect("nlink > 1 records a group");
+        assert_eq!(hardlink.total_links, 2);
+        let mut reclaim = ReclaimEstimator::default();
+        reclaim.record(meta.len(), observation);
+        assert_eq!(reclaim.estimated_reclaimable_bytes(), 0);
+        assert!(reclaim.hardlink_has_external_ref(hardlink.id));
 
         let plain = dir.path().join("plain.bin");
         fs::write(&plain, vec![0u8; 4096]).unwrap();
         let plain_meta = fs::metadata(&plain).unwrap();
-        assert!(
-            !artifact_sharing(&plain, &plain_meta).shared,
-            "a file with one link and no shared extents is local-only — calling \
-             it shared would tell users their build outputs are already cached"
-        );
+        let plain_observation = observe_storage(&plain, &plain_meta);
+        assert!(plain_observation.hardlink.is_none());
+        assert!(!plain_observation.sharing.shared);
     }
 
     fn zero_event_stats() -> daemon::EventStatsResponse {
@@ -5490,7 +5815,129 @@ mod tests {
         let (stats, breakdown) = compute_project_stats(dir.path());
         assert_eq!(stats.total_bytes, 0);
         assert_eq!(stats.cached_bytes, 0);
+        assert_eq!(stats.estimated_reclaimable_bytes, 0);
         assert_eq!(breakdown.incremental, 0);
+    }
+
+    #[test]
+    fn reclaim_estimator_uses_private_bytes_for_partial_reflinks() {
+        let mut reclaim = ReclaimEstimator::default();
+        reclaim.record(
+            10_000,
+            StorageObservation {
+                sharing: crate::sharing::Sharing {
+                    shared: true,
+                    private_bytes: 4_000,
+                },
+                hardlink: None,
+            },
+        );
+
+        assert_eq!(
+            reclaim.estimated_reclaimable_bytes(),
+            4_000,
+            "a partially shared reflink reclaims its private extents, not zero"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_estimator_clamps_private_bytes_to_allocated_storage() {
+        assert_eq!(clamp_private_bytes(1 << 30, 1 << 30, Some(0)), 0);
+        assert_eq!(clamp_private_bytes(10_000, 8_000, Some(4_096)), 4_096);
+        assert_eq!(clamp_private_bytes(10_000, 4_000, Some(8_192)), 4_000);
+    }
+
+    #[test]
+    fn reclaim_estimator_collapses_internal_hardlink_groups() {
+        let id = FileIdentity {
+            device: 7,
+            inode: 11,
+        };
+        let observation = StorageObservation {
+            sharing: crate::sharing::Sharing::unknown_for(100),
+            hardlink: Some(HardlinkObservation { id, total_links: 2 }),
+        };
+        let mut stats = ProjectStats::default();
+        let mut breakdown = CategoryBreakdown::default();
+        let mut reclaim = ReclaimEstimator::default();
+        let mut candidates = Vec::new();
+
+        for _ in 0..2 {
+            record_scanned_file(
+                &mut stats,
+                &mut breakdown,
+                &mut reclaim,
+                &mut candidates,
+                100,
+                ProjectBucket::Deps,
+                true,
+                observation,
+            );
+        }
+        finalize_cache_candidates(&mut stats, &mut breakdown, &reclaim, &candidates);
+
+        assert_eq!(
+            reclaim.estimated_reclaimable_bytes(),
+            100,
+            "two names for one inode reclaim that inode only once"
+        );
+        assert_eq!(
+            stats.cached_bytes, 0,
+            "hardlinks wholly inside target/ are not evidence of a store link"
+        );
+        assert_eq!(stats.local_bytes, 200, "both apparent paths stay local");
+    }
+
+    #[test]
+    fn reclaim_estimator_counts_binary_reflink_private_bytes() {
+        let mut stats = ProjectStats::default();
+        let mut breakdown = CategoryBreakdown::default();
+        let mut reclaim = ReclaimEstimator::default();
+        let mut candidates = Vec::new();
+
+        record_scanned_file(
+            &mut stats,
+            &mut breakdown,
+            &mut reclaim,
+            &mut candidates,
+            100,
+            ProjectBucket::Binaries,
+            false,
+            StorageObservation {
+                sharing: crate::sharing::Sharing {
+                    shared: true,
+                    private_bytes: 25,
+                },
+                hardlink: None,
+            },
+        );
+        finalize_cache_candidates(&mut stats, &mut breakdown, &reclaim, &candidates);
+
+        assert_eq!(reclaim.estimated_reclaimable_bytes(), 25);
+        assert_eq!(stats.cached_bytes, 0, "binary bucketing stays unchanged");
+        assert_eq!(breakdown.binaries, 100);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hardlinks_share_one_reclaimable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.rlib");
+        let second = dir.path().join("second.rlib");
+        fs::write(&first, vec![0u8; 4096]).unwrap();
+        fs::hard_link(&first, &second).unwrap();
+
+        let first_meta = fs::metadata(&first).unwrap();
+        let second_meta = fs::metadata(&second).unwrap();
+        let first_observation = observe_storage(&first, &first_meta);
+        let second_observation = observe_storage(&second, &second_meta);
+        assert_eq!(first_observation.hardlink, second_observation.hardlink);
+
+        let mut reclaim = ReclaimEstimator::default();
+        reclaim.record(first_meta.len(), first_observation);
+        reclaim.record(second_meta.len(), second_observation);
+        assert_eq!(reclaim.estimated_reclaimable_bytes(), 4096);
     }
 
     #[test]
@@ -5526,6 +5973,20 @@ mod tests {
         assert!(breakdown.build_scripts >= 30);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn compute_project_stats_does_not_follow_profile_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("outside.rlib"), vec![0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("debug")).unwrap();
+
+        let (stats, _) = compute_project_stats(dir.path());
+        assert_eq!(stats.total_bytes, 0);
+        assert_eq!(stats.estimated_reclaimable_bytes, 0);
+        assert!(detect_profiles(dir.path()).is_empty());
+    }
+
     #[test]
     fn test_compute_project_stats_classifies_remaining_buckets() {
         // Profile files/directories -> binaries, deps-local, and other buckets.
@@ -5545,7 +6006,10 @@ mod tests {
         assert!(breakdown.binaries >= 11, "got {}", breakdown.binaries);
         assert!(breakdown.deps_local >= 13, "got {}", breakdown.deps_local);
         assert!(breakdown.other >= 36, "got {}", breakdown.other);
-        assert_eq!(stats.local_files, 3);
+        assert_eq!(
+            stats.local_files, 4,
+            "nested local files are counted individually"
+        );
     }
 
     #[test]
@@ -7904,6 +8368,8 @@ mod tests {
                 path: std::path::PathBuf::from("/work/proj-a/target"),
                 size: 5_000_000,
                 cached_bytes: 3_000_000,
+                estimated_reclaimable_bytes: 2_000_000,
+                scan_identity: None,
                 profiles: vec!["debug".to_string(), "release".to_string()],
                 breakdown: CategoryBreakdown::default(),
                 stale: false,
@@ -7912,6 +8378,8 @@ mod tests {
                 path: std::path::PathBuf::from("/work/proj-b/target"),
                 size: 2_000_000,
                 cached_bytes: 0,
+                estimated_reclaimable_bytes: 2_000_000,
+                scan_identity: None,
                 profiles: vec![],
                 breakdown: CategoryBreakdown::default(),
                 stale: false,
@@ -7933,13 +8401,13 @@ mod tests {
         );
         // The selected row's checkbox is set.
         assert!(rendered.contains("[x]"), "selected row shows a checked box");
-        // Selected total is reclaimable (size - cached), not the raw 4.8 MiB.
+        // Selection uses the separate scan-time reclaim estimate, not cached bytes.
         assert!(
-            rendered.contains("Selected: 1 (1.9 MiB)"),
+            rendered.contains("Selected: 1 (est. 1.9 MiB)"),
             "selected total subtracts cached bytes, got: {rendered}"
         );
         assert!(
-            !rendered.contains("Selected: 1 (4.8 MiB)"),
+            !rendered.contains("Selected: 1 (est. 4.8 MiB)"),
             "selected total must not report the raw size"
         );
         // The header's dir totals stay raw (4.8 + 1.9 MiB, 2.9 MiB cached).
@@ -7957,6 +8425,8 @@ mod tests {
             path: std::path::PathBuf::from("/work/proj/target"),
             size: 1024,
             cached_bytes: 512,
+            estimated_reclaimable_bytes: 512,
+            scan_identity: None,
             profiles: vec!["debug".to_string()],
             breakdown: CategoryBreakdown::default(),
             stale: false,
@@ -7965,15 +8435,16 @@ mod tests {
         assert!(single_out.contains("Found 1 target/ directory"));
         assert!(single_out.contains("proj/target"));
         assert!(single_out.contains("[debug]"));
-        // Would-free is reclaimable (size - cached) and says what was kept.
-        assert!(single_out.contains("Dry run: would free 512 B"));
-        assert!(single_out.contains("(512 B shared with the store is kept)"));
+        assert!(single_out.contains("Dry run: estimated to free 512 B"));
+        assert!(single_out.contains("(512 B of apparent size is shared, sparse, or duplicate)"));
 
         let many = vec![
             TargetEntry {
                 path: std::path::PathBuf::from("/work/proj-a/target"),
                 size: 10,
                 cached_bytes: 0,
+                estimated_reclaimable_bytes: 10,
+                scan_identity: None,
                 profiles: Vec::new(),
                 breakdown: CategoryBreakdown::default(),
                 stale: false,
@@ -7982,6 +8453,8 @@ mod tests {
                 path: std::path::PathBuf::from("/outside/proj-b/target"),
                 size: 20,
                 cached_bytes: 5,
+                estimated_reclaimable_bytes: 15,
+                scan_identity: None,
                 profiles: vec!["release".to_string()],
                 breakdown: CategoryBreakdown::default(),
                 stale: false,
@@ -7990,11 +8463,9 @@ mod tests {
         let many_out = render_clean_dry_run(&many, root).join("\n");
         assert!(many_out.contains("Found 2 target/ directories"));
         assert!(many_out.contains("/outside/proj-b/target"));
-        // 30 B raw - 5 B shared = 25 B reclaimable; the raw total must not be
-        // presented as freed.
-        assert!(many_out.contains("Dry run: would free 25 B"));
-        assert!(many_out.contains("(5 B shared with the store is kept)"));
-        assert!(!many_out.contains("would free 30 B"));
+        assert!(many_out.contains("Dry run: estimated to free 25 B"));
+        assert!(many_out.contains("(5 B of apparent size is shared, sparse, or duplicate)"));
+        assert!(!many_out.contains("estimated to free 30 B"));
     }
 
     #[test]
@@ -8054,22 +8525,34 @@ mod tests {
     }
 
     #[test]
-    fn remove_targets_deletes_all_and_reports_freed_bytes() {
-        // Two real target/ dirs under a root; --yes removes every one. Freed is
-        // reclaimable (size - cached) per dir; the shared remainder is reported
-        // separately so the smaller number is not mistaken for undercounting.
+    fn remove_targets_deletes_all_and_reports_estimates() {
+        // Two real target/ dirs under a root; --yes removes every one and sums
+        // the scan-time estimate/gap only for successful removals.
         let root = tempfile::tempdir().unwrap();
         let a = root.path().join("proj-a/target");
         let b = root.path().join("proj-b/target");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
 
-        let to_remove = vec![(a.clone(), 100u64, 40u64), (b.clone(), 200u64, 0u64)];
-        let (removed, freed, shared_kept) = remove_targets(&to_remove, root.path());
+        let to_remove = vec![
+            RemovalTarget {
+                path: a.clone(),
+                scanned_identity: directory_identity(&a),
+                estimated_reclaimable: 60,
+                apparent_gap: 40,
+            },
+            RemovalTarget {
+                path: b.clone(),
+                scanned_identity: directory_identity(&b),
+                estimated_reclaimable: 200,
+                apparent_gap: 0,
+            },
+        ];
+        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, root.path());
 
         assert_eq!(removed, 2, "both target/ dirs removed");
-        assert_eq!(freed, 260, "freed sums size - cached over removed dirs");
-        assert_eq!(shared_kept, 40, "shared bytes are reported as kept");
+        assert_eq!(estimated_reclaimed, 260);
+        assert_eq!(apparent_gap, 40);
         assert!(!a.exists() && !b.exists(), "directories are gone from disk");
     }
 
@@ -8082,13 +8565,58 @@ mod tests {
         let real = root.path().join("proj/target");
         std::fs::create_dir_all(&real).unwrap();
 
-        let to_remove = vec![(missing, 100u64, 10u64), (real.clone(), 200u64, 50u64)];
-        let (removed, freed, shared_kept) = remove_targets(&to_remove, root.path());
+        let to_remove = vec![
+            RemovalTarget {
+                path: missing,
+                scanned_identity: None,
+                estimated_reclaimable: 90,
+                apparent_gap: 10,
+            },
+            RemovalTarget {
+                path: real.clone(),
+                scanned_identity: directory_identity(&real),
+                estimated_reclaimable: 150,
+                apparent_gap: 50,
+            },
+        ];
+        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, root.path());
 
         assert_eq!(removed, 1, "only the existing dir counts as removed");
-        assert_eq!(freed, 150, "failed dir's bytes are not counted");
-        assert_eq!(shared_kept, 50, "only the removed dir's shared bytes count");
+        assert_eq!(
+            estimated_reclaimed, 150,
+            "failed dir's estimate is not counted"
+        );
+        assert_eq!(apparent_gap, 50, "failed dir's gap is not counted");
         assert!(!real.exists(), "the reachable dir was still removed");
+    }
+
+    #[test]
+    fn remove_targets_refuses_a_directory_replaced_after_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("proj/target");
+        let moved = root.path().join("proj/scanned-target");
+        std::fs::create_dir_all(&target).unwrap();
+        let scanned_identity = directory_identity(&target);
+        std::fs::rename(&target, &moved).unwrap();
+        std::fs::create_dir(&target).unwrap();
+
+        let to_remove = vec![RemovalTarget {
+            path: target.clone(),
+            scanned_identity,
+            estimated_reclaimable: 100,
+            apparent_gap: 0,
+        }];
+        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, root.path());
+
+        assert_eq!((removed, estimated_reclaimed, apparent_gap), (0, 0, 0));
+        assert!(
+            target.exists(),
+            "replacement directory must be left untouched"
+        );
+        assert!(
+            moved.exists(),
+            "the scanned directory was moved, not removed"
+        );
     }
 
     #[test]

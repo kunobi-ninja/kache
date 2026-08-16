@@ -1812,12 +1812,8 @@ pub fn list(
         for entry in &matching {
             lines.push(format!("Cache key: {}", &entry.cache_key[..16]));
             lines.push(format!("  Crate:    {}", entry.crate_name));
-            if !entry.crate_type.is_empty() {
-                lines.push(format!("  Type:     {}", entry.crate_type));
-            }
-            if !entry.profile.is_empty() {
-                lines.push(format!("  Profile:  {}", entry.profile));
-            }
+            push_nonempty_detail(&mut lines, "  Type:     ", &entry.crate_type);
+            push_nonempty_detail(&mut lines, "  Profile:  ", &entry.profile);
             lines.push(format!("  Size:     {}", ByteSize(entry.size)));
             lines.push(format!("  Hits:     {}", entry.hit_count));
             lines.push(format!("  Created:  {}", entry.created_at));
@@ -1827,12 +1823,8 @@ pub fn list(
             if let Ok(content) = std::fs::read_to_string(&meta_path)
                 && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
             {
-                if !meta.features.is_empty() {
-                    lines.push(format!("  Features: {}", meta.features.join(", ")));
-                }
-                if !meta.target.is_empty() {
-                    lines.push(format!("  Target:   {}", meta.target));
-                }
+                push_nonempty_detail(&mut lines, "  Features: ", &meta.features.join(", "));
+                push_nonempty_detail(&mut lines, "  Target:   ", &meta.target);
                 lines.push("  Files:".to_string());
                 for file in &meta.files {
                     lines.push(format!("    {} ({})", file.name, ByteSize(file.size)));
@@ -1886,6 +1878,12 @@ pub fn list(
     }
 
     Ok(())
+}
+
+fn push_nonempty_detail(lines: &mut Vec<String>, prefix: &str, value: &str) {
+    if !value.is_empty() {
+        lines.push(format!("{prefix}{value}"));
+    }
 }
 
 /// Resolve the pager to a direct process argv. Quotes group whitespace but are
@@ -1961,12 +1959,24 @@ fn parse_pager_argv(command: &str) -> Option<Vec<String>> {
     Some(argv)
 }
 
+fn write_pager_lines<W: std::io::Write>(writer: &mut W, lines: &[String]) -> bool {
+    for line in lines {
+        if writer.write_all(line.as_bytes()).is_err() {
+            return false;
+        }
+        if writer.write_all(b"\n").is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Write output lines to a pager when stdout is a terminal, else plain stdout.
 /// `KACHE_PAGER` > `$PAGER` > platform default; `cat` or empty disables. Invalid
 /// commands and spawn failures fall back to plain output. An early pager exit
 /// stops further delivery without failing the command or reprinting the listing.
 fn write_paged(lines: &[String], no_pager: bool) {
-    use std::io::{IsTerminal, Write};
+    use std::io::IsTerminal;
 
     let plain = || {
         for line in lines {
@@ -2007,11 +2017,7 @@ fn write_paged(lines: &[String], no_pager: bool) {
     };
 
     if let Some(stdin) = child.stdin.as_mut() {
-        for line in lines {
-            if stdin.write_all(line.as_bytes()).is_err() || stdin.write_all(b"\n").is_err() {
-                break; // pager exited early (e.g. user pressed q)
-            }
-        }
+        let _ = write_pager_lines(stdin, lines);
     }
     drop(child.stdin.take());
     let _ = child.wait();
@@ -4821,6 +4827,68 @@ mod tests {
     use std::fs;
 
     // ── List pager resolution ───────────────────────────────────────────────
+
+    #[test]
+    fn detail_fields_render_only_nonempty_values() {
+        let mut lines = Vec::new();
+        push_nonempty_detail(&mut lines, "  Type:     ", "");
+        assert!(lines.is_empty());
+
+        push_nonempty_detail(&mut lines, "  Type:     ", "lib");
+        push_nonempty_detail(&mut lines, "  Features: ", "serde, std");
+        assert_eq!(
+            lines,
+            vec![
+                "  Type:     lib".to_string(),
+                "  Features: serde, std".to_string(),
+            ]
+        );
+    }
+
+    struct FailOnWrite {
+        fail_on_call: usize,
+        calls: usize,
+    }
+
+    impl std::io::Write for FailOnWrite {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == self.fail_on_call {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pager exited",
+                ))
+            } else {
+                Ok(buffer.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pager_line_writer_stops_on_content_or_newline_errors() {
+        let lines = vec!["first".to_string(), "second".to_string()];
+        let mut output = Vec::new();
+        assert!(write_pager_lines(&mut output, &lines));
+        assert_eq!(output, b"first\nsecond\n");
+
+        let mut content_error = FailOnWrite {
+            fail_on_call: 1,
+            calls: 0,
+        };
+        assert!(!write_pager_lines(&mut content_error, &lines));
+        assert_eq!(content_error.calls, 1);
+
+        let mut newline_error = FailOnWrite {
+            fail_on_call: 2,
+            calls: 0,
+        };
+        assert!(!write_pager_lines(&mut newline_error, &lines));
+        assert_eq!(newline_error.calls, 2);
+    }
 
     #[test]
     fn pager_resolution_obeys_tty_disable_and_environment_precedence() {

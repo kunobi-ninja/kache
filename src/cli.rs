@@ -1626,35 +1626,32 @@ fn observe_storage(path: &std::path::Path, meta: &std::fs::Metadata) -> StorageO
     StorageObservation { sharing, hardlink }
 }
 
-#[cfg(windows)]
-fn windows_file_identity(path: &std::path::Path) -> Option<(FileIdentity, u64)> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
-    };
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .ok()?;
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
-    (ok != 0).then_some((
-        FileIdentity {
-            device: u64::from(info.dwVolumeSerialNumber),
-            inode: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        },
-        u64::from(info.nNumberOfLinks),
-    ))
+/// Reconstruct Windows' 64-bit file index from the two DWORDs returned by
+/// `GetFileInformationByHandle`. Kept platform-neutral so the Linux mutation
+/// lane can exercise the packing rule that the Windows syscall wrapper uses.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_file_identity_from_parts(
+    volume_serial: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+) -> FileIdentity {
+    FileIdentity {
+        device: u64::from(volume_serial),
+        inode: (u64::from(file_index_high) << 32).saturating_add(u64::from(file_index_low)),
+    }
 }
 
-#[cfg(windows)]
-fn observe_storage(path: &std::path::Path, meta: &std::fs::Metadata) -> StorageObservation {
-    match windows_file_identity(path) {
+/// Turn a successful or failed Windows identity query into conservative
+/// reclaim evidence. This is pure so every link-count boundary remains covered
+/// on the Linux mutation workers as well as by the hosted Windows tests.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_storage_observation(
+    size: u64,
+    identity: Option<(FileIdentity, u64)>,
+) -> StorageObservation {
+    match identity {
         Some((id, total_links)) => StorageObservation {
-            sharing: crate::sharing::Sharing::unknown_for(meta.len()),
+            sharing: crate::sharing::Sharing::unknown_for(size),
             hardlink: (total_links > 1).then_some(HardlinkObservation { id, total_links }),
         },
         None => StorageObservation {
@@ -1670,13 +1667,60 @@ fn observe_storage(path: &std::path::Path, meta: &std::fs::Metadata) -> StorageO
     }
 }
 
-#[cfg(not(any(unix, windows)))]
-fn observe_storage(_path: &std::path::Path, meta: &std::fs::Metadata) -> StorageObservation {
+#[cfg(windows)]
+fn query_windows_file_identity(path: &std::path::Path) -> Option<(FileIdentity, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    (ok != 0).then_some((
+        windows_file_identity_from_parts(
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ),
+        u64::from(info.nNumberOfLinks),
+    ))
+}
+
+#[cfg(windows)]
+fn observe_storage_windows(path: &std::path::Path, meta: &std::fs::Metadata) -> StorageObservation {
+    windows_storage_observation(meta.len(), query_windows_file_identity(path))
+}
+
+#[cfg(windows)]
+use self::observe_storage_windows as observe_storage;
+
+/// Conservative fallback for targets without a native sharing/identity probe.
+/// The pure helper keeps the actual fallback value visible to Linux mutation
+/// testing even though the platform wrapper itself is cfg-only.
+#[cfg_attr(any(unix, windows), allow(dead_code))]
+fn unsupported_storage_observation(size: u64) -> StorageObservation {
     StorageObservation {
-        sharing: crate::sharing::Sharing::unknown_for(meta.len()),
+        sharing: crate::sharing::Sharing::unknown_for(size),
         hardlink: None,
     }
 }
+
+#[cfg(not(any(unix, windows)))]
+fn observe_storage_unsupported(
+    _path: &std::path::Path,
+    meta: &std::fs::Metadata,
+) -> StorageObservation {
+    unsupported_storage_observation(meta.len())
+}
+
+#[cfg(not(any(unix, windows)))]
+use self::observe_storage_unsupported as observe_storage;
 
 fn directory_identity(path: &std::path::Path) -> Option<FileIdentity> {
     let meta = std::fs::symlink_metadata(path).ok()?;
@@ -1693,7 +1737,7 @@ fn directory_identity(path: &std::path::Path) -> Option<FileIdentity> {
     }
     #[cfg(windows)]
     {
-        windows_file_identity(path).map(|(identity, _)| identity)
+        query_windows_file_identity(path).map(|(identity, _)| identity)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -5740,6 +5784,22 @@ mod tests {
     }
 
     #[test]
+    fn find_target_dirs_ignores_an_empty_cargo_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("empty-project");
+        fs::create_dir_all(project.join("target")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"empty\"").unwrap();
+
+        let mut results = Vec::new();
+        find_target_dirs(dir.path(), &mut results);
+
+        assert!(
+            results.is_empty(),
+            "an empty target has no reclaimable bytes and must not be offered for deletion"
+        );
+    }
+
+    #[test]
     fn test_find_target_dirs_skips_hidden() {
         let dir = tempfile::tempdir().unwrap();
         let hidden = dir.path().join(".hidden");
@@ -5891,6 +5951,48 @@ mod tests {
     }
 
     #[test]
+    fn cache_candidates_accept_each_independent_store_sharing_signal() {
+        let external_id = FileIdentity {
+            device: 17,
+            inode: 23,
+        };
+        let mut reclaim = ReclaimEstimator::default();
+        reclaim.record(
+            200,
+            StorageObservation {
+                sharing: crate::sharing::Sharing::unknown_for(200),
+                hardlink: Some(HardlinkObservation {
+                    id: external_id,
+                    total_links: 2,
+                }),
+            },
+        );
+
+        let candidates = [
+            CacheCandidate {
+                size: 100,
+                bucket: ProjectBucket::Deps,
+                reflink_shared: true,
+                hardlink_id: None,
+            },
+            CacheCandidate {
+                size: 200,
+                bucket: ProjectBucket::Deps,
+                reflink_shared: false,
+                hardlink_id: Some(external_id),
+            },
+        ];
+        let mut stats = ProjectStats::default();
+        let mut breakdown = CategoryBreakdown::default();
+        finalize_cache_candidates(&mut stats, &mut breakdown, &reclaim, &candidates);
+
+        assert_eq!(stats.cached_bytes, 300);
+        assert_eq!(stats.cached_files, 2);
+        assert_eq!(stats.local_bytes, 0);
+        assert_eq!(breakdown.deps_local, 0);
+    }
+
+    #[test]
     fn reclaim_estimator_counts_binary_reflink_private_bytes() {
         let mut stats = ProjectStats::default();
         let mut breakdown = CategoryBreakdown::default();
@@ -5920,6 +6022,52 @@ mod tests {
         assert_eq!(breakdown.binaries, 100);
     }
 
+    #[test]
+    fn windows_identity_parts_preserve_volume_and_both_file_index_halves() {
+        let identity = windows_file_identity_from_parts(0x1020_3040, 0x1122_3344, 0x5566_7788);
+        assert_eq!(identity.device, 0x1020_3040);
+        assert_eq!(identity.inode, 0x1122_3344_5566_7788);
+        assert_ne!(
+            identity,
+            windows_file_identity_from_parts(0x1020_3040, 0x1122_3344, 0x5566_7789),
+            "the low DWORD remains part of the stable identity"
+        );
+    }
+
+    #[test]
+    fn windows_storage_observation_covers_identity_and_link_count_boundaries() {
+        let id = FileIdentity {
+            device: 5,
+            inode: 8,
+        };
+
+        let single = windows_storage_observation(4096, Some((id, 1)));
+        assert_eq!(single.sharing.private_bytes, 4096);
+        assert!(
+            single.hardlink.is_none(),
+            "one link is not a hardlink group"
+        );
+
+        let linked = windows_storage_observation(4096, Some((id, 2)));
+        assert_eq!(
+            linked.hardlink,
+            Some(HardlinkObservation { id, total_links: 2 })
+        );
+
+        let unavailable = windows_storage_observation(4096, None);
+        assert_eq!(unavailable.sharing.private_bytes, 0);
+        assert!(!unavailable.sharing.shared);
+        assert!(unavailable.hardlink.is_none());
+    }
+
+    #[test]
+    fn unsupported_storage_observation_treats_the_whole_file_as_private() {
+        let observation = unsupported_storage_observation(4096);
+        assert_eq!(observation.sharing.private_bytes, 4096);
+        assert!(!observation.sharing.shared);
+        assert!(observation.hardlink.is_none());
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_hardlinks_share_one_reclaimable_file() {
@@ -5931,9 +6079,29 @@ mod tests {
 
         let first_meta = fs::metadata(&first).unwrap();
         let second_meta = fs::metadata(&second).unwrap();
+        let (first_identity, first_links) =
+            query_windows_file_identity(&first).expect("first hardlink has a Windows identity");
+        let (second_identity, second_links) =
+            query_windows_file_identity(&second).expect("second hardlink has a Windows identity");
+        assert_eq!(first_identity, second_identity);
+        assert_eq!((first_links, second_links), (2, 2));
+
+        let distinct = dir.path().join("distinct.rlib");
+        fs::write(&distinct, vec![0u8; 4096]).unwrap();
+        let (distinct_identity, distinct_links) =
+            query_windows_file_identity(&distinct).expect("a plain file has a Windows identity");
+        assert_ne!(first_identity, distinct_identity);
+        assert_eq!(distinct_links, 1);
+        assert!(
+            query_windows_file_identity(&dir.path().join("missing.rlib")).is_none(),
+            "a failed open must not invent an identity"
+        );
+
         let first_observation = observe_storage(&first, &first_meta);
         let second_observation = observe_storage(&second, &second_meta);
         assert_eq!(first_observation.hardlink, second_observation.hardlink);
+        let distinct_observation = observe_storage(&distinct, &fs::metadata(&distinct).unwrap());
+        assert!(distinct_observation.hardlink.is_none());
 
         let mut reclaim = ReclaimEstimator::default();
         reclaim.record(first_meta.len(), first_observation);
@@ -5972,6 +6140,26 @@ mod tests {
         assert!(breakdown.incremental >= 100);
         assert!(breakdown.fingerprints >= 50);
         assert!(breakdown.build_scripts >= 30);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compute_project_stats_classifies_an_externally_hardlinked_rlib_as_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let debug = target.join("debug");
+        fs::create_dir_all(&debug).unwrap();
+
+        let retained_blob = dir.path().join("store-blob.rlib");
+        fs::write(&retained_blob, vec![0u8; 4096]).unwrap();
+        fs::hard_link(&retained_blob, debug.join("libcached.rlib")).unwrap();
+
+        let (stats, breakdown) = compute_project_stats(&target);
+        assert_eq!(stats.total_bytes, 4096);
+        assert_eq!(stats.cached_bytes, 4096);
+        assert_eq!(stats.cached_files, 1);
+        assert_eq!(stats.local_bytes, 0);
+        assert_eq!(breakdown.other, 0);
     }
 
     #[cfg(unix)]

@@ -111,6 +111,16 @@ gitignore = true
 # scope and is killed by tests asserting both directions: a process running a
 # `kache` executable is found, and a shell whose command line merely mentions
 # `kache daemon run` is not.
+#
+# The clean reclaim scanner has the same narrow platform boundary. The Windows
+# syscall adapter and the unsupported-target wrapper are not compiled by the
+# Ubuntu mutation lane, so replacement mutants inside those wrappers cannot be
+# observed there. Their logic is deliberately extracted into the platform-neutral
+# `windows_file_identity_from_parts`, `windows_storage_observation`, and
+# `unsupported_storage_observation` helpers, which remain mutation-tested on
+# Linux. Hosted Windows tests still exercise the real identity syscall, stable
+# identity, link count, and failure behavior. Only the cfg-only adapters below
+# are excluded.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -136,4 +146,7 @@ exclude_re = [
     "windows_kache_processes",
     "replace && with \\|\\| in find_daemon_pids",
     "replace != with == in find_daemon_pids",
+    "query_windows_file_identity",
+    "observe_storage_windows",
+    "observe_storage_unsupported",
 ]

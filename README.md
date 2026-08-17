@@ -265,7 +265,7 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 | `kache doctor [--fix [--purge-sccache]] [--verify] [--checksums] [--repair]` | Diagnose setup; `--fix` migrates from sccache, `--verify` checks cache integrity, `--checksums` also hashes blobs, `--repair` deletes corrupted entries |
 | `kache monitor [--since <dur>]` | Live TUI dashboard showing build events, cache stats, and project breakdown |
 | `kache stats [--since <dur>]` | Non-interactive cache stats summary |
-| `kache list [<crate>] [--sort name\|size\|hits\|age]` | List cached entries, or show details for a specific crate |
+| `kache list [<crate>] [--sort name\|size\|hits\|age] [--no-pager]` | List cached entries, or show details for a specific crate (paged when interactive) |
 | `kache why-miss <crate>` | Explain why a specific crate missed the cache |
 | `kache report [--format text\|json\|markdown\|github\|perfetto\|chrome-trace] [--since <dur>] [--top <n>] [--output <path>]` | Generate a detailed hit/dup/miss build report or Perfetto/Chrome trace (`--top` defaults to 10) |
 | `kache sync [--manifest-path <path>] [--pull] [--push] [--all] [--workspace] [--dry-run]` | Synchronize the local cache with its configured remote (pull + push); `--manifest-path` controls the push-side workspace filter; `--workspace` scopes the pull to workspace members only (one LIST per member) |

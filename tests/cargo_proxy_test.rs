@@ -62,9 +62,10 @@ fn canonical_cargo_home_alias_keeps_existing_cargo_unit_fresh() {
     std::os::unix::fs::symlink(&cargo_home, home.join("work/.cargo")).unwrap();
 
     let mut warm = Command::new(KACHE_BIN);
-    warm.args(["cargo", "--", "check", "--verbose"])
+    warm.args(["cargo", "--", "check", "--verbose", "--color=never"])
         .current_dir(&project)
-        .env("KACHE_REAL_CARGO", env!("CARGO"));
+        .env("KACHE_REAL_CARGO", env!("CARGO"))
+        .env("CARGO_TERM_COLOR", "always");
     cargo_env(&mut warm, &home, &cache, &cold_target);
     let warm = warm.output().unwrap();
     assert!(

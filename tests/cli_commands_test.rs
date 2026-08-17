@@ -511,7 +511,7 @@ fn clean_dry_run_reports_no_targets_in_empty_dir() {
 #[test]
 fn clean_dry_run_reports_a_populated_target_dir() {
     // A cargo project with a non-empty target/ exercises the populated
-    // branch of find_target_dirs -> compute_project_stats -> walk_deps_dir ->
+    // branch of find_target_dirs -> compute_project_stats -> walk_project_dir ->
     // detect_profiles, plus the dry-run size reporting.
     let e = env();
     let project = TempDir::new().unwrap();
@@ -531,7 +531,39 @@ fn clean_dry_run_reports_a_populated_target_dir() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Found 1 target"))
-        .stdout(predicates::str::contains("Dry run: would free"));
+        .stdout(predicates::str::contains(
+            "Dry run: estimated to free 10.0 KiB",
+        ))
+        // Plain copies have no apparent-size accounting gap.
+        .stdout(predicates::str::contains("shared, sparse, or duplicate").not());
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn clean_dry_run_collapses_hardlinks_wholly_inside_target() {
+    let e = env();
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"p\"\n").unwrap();
+    let deps = root.join("target/debug/deps");
+    std::fs::create_dir_all(&deps).unwrap();
+    let first = deps.join("libfoo.rlib");
+    let second = deps.join("libfoo-copy.rlib");
+    std::fs::write(&first, vec![0u8; 4096]).unwrap();
+    std::fs::hard_link(&first, &second).unwrap();
+
+    e.cmd()
+        .current_dir(root)
+        .args(["clean", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("8.0 KiB total, 0 B cached"))
+        .stdout(predicates::str::contains(
+            "Dry run: estimated to free 4.0 KiB",
+        ))
+        .stdout(predicates::str::contains(
+            "4.0 KiB of apparent size is shared, sparse, or duplicate",
+        ));
 }
 
 #[test]

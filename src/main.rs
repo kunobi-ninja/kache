@@ -441,17 +441,23 @@ fn main() -> Result<()> {
     // adapters still parse UTF-8 option syntax; a wrapper invocation with a
     // non-UTF-8 path is detected here and fails closed below.
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let detection_args: Vec<String> = raw_args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
     let env_args: Option<Vec<String>> = raw_args
         .iter()
         .cloned()
         .map(|arg| arg.into_string())
         .collect::<Result<_, _>>()
         .ok();
-    let log_mode = detect_log_mode(&detection_args);
+    let lossy_args;
+    let detection_args = if let Some(args) = env_args.as_deref() {
+        args
+    } else {
+        lossy_args = raw_args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        &lossy_args
+    };
+    let log_mode = detect_log_mode(detection_args);
 
     // Detect RUSTC_WRAPPER mode: cargo passes the rustc path as arg[1]
     // In this mode: argv[0]=kache, argv[1]=rustc, argv[2..]=rustc args

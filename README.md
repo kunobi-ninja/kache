@@ -262,6 +262,7 @@ See [`scenarios/README.md`](scenarios/README.md) for the scenario format.
 |---|---|
 | `kache` | Print help (bare invocation) |
 | `kache init [-y] [--no-service] [--check]` | Interactive setup: cargo wrapper + service install + daemon start |
+| `kache cargo -- <build\|check> [args...]` | Keep an existing Cargo unit fresh when an ancestor symlinks Cargo home's array-valued `build.rustflags` |
 | `kache doctor [--fix [--purge-sccache]] [--verify] [--checksums] [--repair]` | Diagnose setup; `--fix` migrates from sccache, `--verify` checks cache integrity, `--checksums` also hashes blobs, `--repair` deletes corrupted entries |
 | `kache monitor [--since <dur>]` | Live TUI dashboard showing build events, cache stats, and project breakdown |
 | `kache stats [--since <dur>]` | Non-interactive cache stats summary |

@@ -121,6 +121,10 @@ gitignore = true
 # Linux. Hosted Windows tests still exercise the real identity syscall, stable
 # identity, link count, and failure behavior. Only the cfg-only adapters below
 # are excluded.
+#
+# `run_cargo_non_unix` is the process-status half of the guarded Cargo
+# front-end. The Ubuntu mutation lane compiles only the Unix `exec` half;
+# hosted Windows tests still compile the status/exit-code path.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -149,4 +153,5 @@ exclude_re = [
     "query_windows_file_identity",
     "observe_storage_windows",
     "observe_storage_unsupported",
+    "run_cargo_non_unix",
 ]

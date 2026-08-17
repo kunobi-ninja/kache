@@ -13,6 +13,7 @@ When invoked without arguments, kache prints `--help` and exits — it does not 
 |---|---|
 | `kache` | Print `--help` and exit (use `kache monitor` for the live TUI) |
 | `kache init [-y] [--no-service] [--check]` | Interactive setup: cargo wrapper + service install + daemon start |
+| `kache cargo -- <build\|check> [args...]` | Keep existing Cargo units fresh when Cargo discovers a canonical duplicate of Cargo-home `build.rustflags` |
 | `kache monitor [--since <dur>]` | Open the live TUI dashboard, optionally scoped to a time window |
 | `kache stats [--since <dur>]` | One-shot stats snapshot, no interactive UI |
 | `kache list [<crate>] [--sort <field>] [--no-pager]` | List cache entries or show details for one crate |
@@ -48,6 +49,38 @@ kache init --check        # report what init would do, change nothing
 ```
 
 If you'd rather wire things up manually, see [Quick start](/docs/getting-started/quick-start#manual-setup-without-kache-init).
+
+---
+
+## `kache cargo`
+
+```sh
+kache cargo -- check
+kache cargo -- build --workspace
+```
+
+Runs Cargo's built-in `build` or `check` from the current directory with its
+arguments unchanged. If Cargo's
+ancestor search finds a symlink to the selected Cargo-home config, Cargo would
+normally merge the same array-valued `build.rustflags` twice and re-key every
+unit. This front-end identifies that duplicate by canonical path, contributes
+the Cargo-home array once, and passes the corrected argument sequence to Cargo.
+User-authored repeated flags inside one config and contributions from distinct
+config files remain repeated and ordered.
+
+Normalization is deliberately conservative. Existing `RUSTFLAGS` or encoded
+flags take precedence unchanged. Config includes, target-specific rustflags,
+string-form rustflags, and rustflags supplied through `[env]` run unchanged
+with a warning rather than risk reproducing Cargo's selection rules
+incorrectly. Cargo `-C`/`--config`, unstable flags, `install`, aliases, and
+external subcommands pass through unchanged. Config paths and contents are
+revalidated immediately before Cargo starts; concurrent config editing should
+still be avoided. Ordinary `cargo` remains supported; this command is needed
+only for the canonical-config alias case.
+
+The command prevents Cargo's spurious rebuild in an existing target directory.
+It does not alias Kache entries across different rustflags transport sources;
+an empty target still uses Kache's normal exact-key safety.
 
 ---
 

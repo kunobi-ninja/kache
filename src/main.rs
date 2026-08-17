@@ -3,6 +3,7 @@ mod atomic;
 mod build_intent;
 mod cache_fs;
 mod cache_key;
+mod cargo_proxy;
 mod cli;
 mod compile;
 mod compiler;
@@ -80,6 +81,13 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run Cargo with canonical duplicate Cargo-home rustflags collapsed once
+    Cargo {
+        /// Built-in build/check arguments passed verbatim to Cargo (use `--` first)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
+
     /// List cache entries, or show details for one crate
     List {
         /// Crate name to show details for (omit to list all)
@@ -429,8 +437,21 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let env_args: Vec<String> = std::env::args().collect();
-    let log_mode = detect_log_mode(&env_args);
+    // Keep the original argv byte-preserving for `kache cargo`. Compiler
+    // adapters still parse UTF-8 option syntax; a wrapper invocation with a
+    // non-UTF-8 path is detected here and fails closed below.
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let detection_args: Vec<String> = raw_args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let env_args: Option<Vec<String>> = raw_args
+        .iter()
+        .cloned()
+        .map(|arg| arg.into_string())
+        .collect::<Result<_, _>>()
+        .ok();
+    let log_mode = detect_log_mode(&detection_args);
 
     // Detect RUSTC_WRAPPER mode: cargo passes the rustc path as arg[1]
     // In this mode: argv[0]=kache, argv[1]=rustc, argv[2..]=rustc args
@@ -438,7 +459,12 @@ fn main() -> Result<()> {
     init_logging(log_mode);
 
     if is_wrapper {
-        return run_wrapper_mode(&env_args[1..]);
+        if let Some(env_args) = env_args {
+            return run_wrapper_mode(&env_args[1..]);
+        }
+        anyhow::bail!(
+            "compiler wrapper arguments contain non-UTF-8 bytes and cannot be cached safely"
+        );
     }
 
     // CLI mode: parse subcommands
@@ -447,6 +473,7 @@ fn main() -> Result<()> {
     // Config and Completions run before Config::load() (broken/missing config).
     match &cli.command {
         Some(Commands::Config) => return config_tui::run_config_editor(),
+        Some(Commands::Cargo { args }) => return cargo_proxy::run(args.clone()),
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;
             use clap_complete::generate;
@@ -579,6 +606,7 @@ fn main() -> Result<()> {
             let hours = since.as_deref().and_then(parse_duration_hours);
             tui::run_monitor(&config, hours)
         }
+        Some(Commands::Cargo { .. }) => unreachable!(),
         Some(Commands::Config) => unreachable!(),
         Some(Commands::Completions { .. }) => unreachable!(),
         None => {

@@ -8,6 +8,14 @@ fullnameOverride: ""
 
 replicaCount: 1
 
+# Deployment update strategy, honoured only when
+# `planner.persistence.type` is `ephemeral`.
+#
+# With `pvc` the chart forces `Recreate` and ignores this: the planner DB is
+# single-writer, so any surge deadlocks the rollout permanently (see the
+# comment in templates/deployment.yaml). Empty means the Kubernetes default.
+updateStrategy: {}
+
 image:
   repository: zondax/kache
   tag: ""

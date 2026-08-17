@@ -6,7 +6,39 @@ metadata:
   labels:
     {{- include "kache-service.labels" . | nindent 4 }}
 spec:
+{{- if eq .Values.planner.persistence.type "pvc" }}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- fail "planner.persistence.type=pvc is single-writer: replicaCount must be 1. Two Pods cannot open the planner DB at once — the second fails on its LOCK file." }}
+{{- end }}
+{{- end }}
   replicas: {{ .Values.replicaCount }}
+{{- if eq .Values.planner.persistence.type "pvc" }}
+  # Recreate, NOT the RollingUpdate default.
+  #
+  # The planner DB takes an exclusive LOCK when opened, so exactly one Pod can
+  # hold it. RollingUpdate starts the replacement before terminating the old
+  # Pod, which deadlocks permanently: the new Pod cannot open the DB while the
+  # old one holds the LOCK, so it never becomes Ready — and the old Pod is
+  # never terminated precisely because the new one never becomes Ready. The
+  # rollout then sits there forever while the old Pod keeps serving, so the
+  # release looks healthy while the new version silently never ships.
+  #
+  # Observed on int-pro: stuck 3d18h across 1061 CrashLoopBackOff restarts,
+  # each logging "planner.db/LOCK is already locked by another process".
+  #
+  # Enabling `ha` does not substitute for this. Leader election would make the
+  # new Pod wait for the lease instead of crashing, but it would still never
+  # become Ready while the old Pod holds it — the same deadlock, just quieter.
+  #
+  # Not overridable by design: any value reintroducing surge here recreates the
+  # deadlock. `ephemeral` gives each Pod its own emptyDir and keeps the
+  # RollingUpdate default.
+  strategy:
+    type: Recreate
+{{- else if .Values.updateStrategy }}
+  strategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+{{- end }}
   selector:
     matchLabels:
       {{- include "kache-service.selectorLabels" . | nindent 6 }}

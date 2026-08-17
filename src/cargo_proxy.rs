@@ -166,7 +166,7 @@ fn normalization_plan(cwd: &Path, cargo_args: &[OsString]) -> PlanDecision {
     let home_canonical = home_source.canonical_path.clone();
     let duplicate_paths: Vec<PathBuf> = sources
         .iter()
-        .filter(|source| !source.cargo_home && source.canonical_path == home_canonical)
+        .filter(|source| is_cargo_home_alias(source, &home_canonical))
         .map(|source| source.logical_path.clone())
         .collect();
     if duplicate_paths.is_empty() {
@@ -175,7 +175,7 @@ fn normalization_plan(cwd: &Path, cargo_args: &[OsString]) -> PlanDecision {
 
     let mut rustflags = Vec::new();
     for source in &sources {
-        if !source.cargo_home && source.canonical_path == home_canonical {
+        if is_cargo_home_alias(source, &home_canonical) {
             continue;
         }
         match source_rustflags(&source.value, &source.logical_path) {
@@ -200,6 +200,10 @@ fn normalization_plan(cwd: &Path, cargo_args: &[OsString]) -> PlanDecision {
     })
 }
 
+fn is_cargo_home_alias(source: &ConfigSource, home_canonical: &Path) -> bool {
+    !source.cargo_home && source.canonical_path == home_canonical
+}
+
 fn rustflags_environment_is_explicit() -> bool {
     std::env::vars_os().any(|(key, _)| {
         let Some(key) = key.to_str() else {
@@ -221,20 +225,27 @@ fn rustflags_env_name(key: &str, case_insensitive: bool) -> bool {
 }
 
 fn supported_cargo_command(args: &[OsString]) -> std::result::Result<(), String> {
-    let command_index = usize::from(
-        args.first()
-            .and_then(|arg| arg.to_str())
-            .is_some_and(|arg| arg.starts_with('+')),
-    );
-    let Some(command) = args.get(command_index).and_then(|arg| arg.to_str()) else {
+    let Some((first, remaining)) = args.split_first() else {
         return Err("no Cargo build/check command was provided".into());
+    };
+    let (command, trailing) = if first
+        .to_str()
+        .is_some_and(|argument| argument.starts_with('+'))
+    {
+        remaining
+            .split_first()
+            .ok_or_else(|| "no Cargo build/check command was provided".to_string())?
+    } else {
+        (first, remaining)
+    };
+    let Some(command) = command.to_str() else {
+        return Err("the Cargo command is not UTF-8".into());
     };
     if !matches!(command, "build" | "check") {
         return Err("only Cargo's built-in build/check commands are normalized".into());
     }
-    if args
+    if trailing
         .iter()
-        .skip(command_index + 1)
         .any(|arg| arg.to_str().is_none_or(cargo_arg_may_change_config))
     {
         return Err("Cargo -C/-Z/--config arguments are not normalized".into());
@@ -489,6 +500,25 @@ mod tests {
             source_rustflags(&value, Path::new("config.toml")).unwrap(),
             Some(vec!["-Clink-arg=-lfoo".into(), "-Clink-arg=-lfoo".into()])
         );
+    }
+
+    #[test]
+    fn only_non_home_sources_with_the_same_identity_are_aliases() {
+        let canonical = PathBuf::from("/physical/config.toml");
+        let mut source = ConfigSource {
+            logical_path: PathBuf::from("/cargo-home/config.toml"),
+            canonical_path: canonical.clone(),
+            content_hash: blake3::hash(b""),
+            value: toml::Value::Table(Default::default()),
+            cargo_home: true,
+        };
+        assert!(!is_cargo_home_alias(&source, &canonical));
+
+        source.cargo_home = false;
+        assert!(is_cargo_home_alias(&source, &canonical));
+
+        source.canonical_path = PathBuf::from("/different/config.toml");
+        assert!(!is_cargo_home_alias(&source, &canonical));
     }
 
     #[test]

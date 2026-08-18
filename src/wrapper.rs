@@ -1537,7 +1537,7 @@ fn run_parsed_rustc(
     // must take effect immediately even when this unit was already active.
     let refuse = compiler.refuse_reasons(args);
     let current_dir = std::env::current_dir().ok();
-    let workspace_root = args.workspace_root().or_else(|| current_dir.clone());
+    let workspace_root = args.path_normalization_root().map(Path::to_path_buf);
     let exclude_roots: Vec<_> = workspace_root
         .iter()
         .chain(current_dir.iter())
@@ -2226,35 +2226,20 @@ fn run_parsed_rustc(
         _ => "release",
     };
 
-    // Relativize dep-info (`.d`) files before they are cached so the
-    // stored blob is worktree-independent. cargo records each crate's
-    // inputs in its `.d` by *absolute* path; without this, a cached
-    // `.d` carries the producing build's paths, and a build that
-    // restores it at a different location finds those paths missing on
-    // its freshness `stat()` and recompiles — a cache hit that saved
-    // nothing. `store.put*` hashes the file at its on-disk source path,
-    // so we rewrite in place; the matching expand below restores the
-    // absolute paths the *current* build's cargo still needs to see.
+    // Rust dep-info is normalized into a private staging file before Store::put
+    // reads it. Cargo's compiler-owned `.d` stays untouched, while the cached
+    // blob gets target/package/workspace sentinels instead of donor paths.
     let depinfo_anchor = args.target_dir();
-    if let Some(anchor) = depinfo_anchor.as_deref() {
-        rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Relativize);
-    }
+    let depinfo_working_dir = current_dir.as_deref().unwrap_or_else(|| Path::new("."));
+    let depinfo_workspace_dir = args.path_normalization_root();
+    let depinfo_configured_roots = configured_rustc_depinfo_roots(config, depinfo_workspace_dir);
 
-    // Validate the exact producer-neutral dep-info bytes before Store::put
-    // makes the entry observable. Restores complete the same bytes in memory;
-    // proving that transform now closes the publication window where another
-    // wrapper could otherwise observe an entry the producer later evicts.
+    // Validate the compiler's consumer-facing dep-info before Store::put makes
+    // an entry observable. The staging transform below cannot alter its input.
     if let Some(snapshot) = extra_inputs
-        && let Err(error) = validate_extra_inputs_dep_info_before_store(
-            args,
-            &result.artifacts,
-            depinfo_anchor.as_deref(),
-            snapshot,
-        )
+        && let Err(error) =
+            validate_extra_inputs_dep_info_before_store(args, &result.artifacts, snapshot)
     {
-        if let Some(anchor) = depinfo_anchor.as_deref() {
-            rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Expand);
-        }
         return Err(error).context("validating extra_inputs dep-info before cache commit");
     }
 
@@ -2304,8 +2289,51 @@ fn run_parsed_rustc(
         }
     }
 
+    let prepared_store = match prepare_rustc_store_files(
+        &result.artifacts,
+        depinfo_anchor.as_deref(),
+        depinfo_working_dir,
+        depinfo_workspace_dir,
+        &depinfo_configured_roots,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!(
+                "not caching {}: dep-info could not be staged safely: {error:#}",
+                crate_name
+            );
+            let elapsed = start.elapsed().as_millis() as u64;
+            log_event_with_hash_stats(
+                config,
+                &event_root,
+                crate_name,
+                EventResult::Skipped,
+                elapsed,
+                compile_time_ms,
+                0,
+                &cache_key,
+                key_ms,
+                key_hash_stats,
+                lookup_ms,
+                0,
+                0,
+            );
+            print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+            clean_incremental_dir(config, args);
+            drop(lock);
+            return Ok(result.exit_code);
+        }
+    };
+
+    // Finish Cargo's consumer-facing dep-info before Store::put makes the
+    // neutral staged blob observable. The store reads only the private staged
+    // `.d`, so completing Cargo's compiler-owned file cannot change it.
+    if let Some(snapshot) = extra_inputs {
+        complete_extra_inputs_dep_info(args, snapshot)
+            .context("completing extra_inputs dep-info before cache publication")?;
+    }
+
     let store_start = std::time::Instant::now();
-    let store_files = result.artifacts.store_files();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
     match store.put_with_compile_time(
@@ -2315,7 +2343,7 @@ fn run_parsed_rustc(
         &args.features,
         target,
         profile,
-        &store_files,
+        &prepared_store.files,
         &result.stdout,
         &result.stderr,
         compile_time_ms,
@@ -2341,23 +2369,6 @@ fn run_parsed_rustc(
         }
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
-
-    // Expand the on-disk `.d` files back to absolute paths. The store
-    // already captured the relativized form above; this leaves the
-    // current build's `.d` valid for cargo's own freshness checks.
-    if let Some(anchor) = depinfo_anchor.as_deref() {
-        rewrite_depinfo_outputs(&result.artifacts, anchor, link::DepInfoMode::Expand);
-    }
-
-    // Do not publish a cache entry until the consumer-facing dep-info is known
-    // to be completable. The stored blob remains the producer-neutral version
-    // captured above; on failure, evict it before any remote upload is queued.
-    if let Some(snapshot) = extra_inputs
-        && let Err(error) = complete_extra_inputs_dep_info(args, snapshot)
-    {
-        let _ = store.remove_entry(&cache_key);
-        return Err(error).context("validating extra_inputs dep-info before cache publication");
-    }
 
     // 6. Async upload to remote (if configured) — sends job to the daemon
     if config.remote.is_some() {
@@ -2458,35 +2469,88 @@ fn prepare_cc_store_files(
     })
 }
 
-/// Rewrite every dep-info (`.d`) file in a compiler artifact set, in place,
-/// against `anchor`.
+#[derive(Debug)]
+struct PreparedRustcStoreFiles {
+    files: Vec<(PathBuf, String)>,
+    _temporary_files: Vec<tempfile::TempPath>,
+}
+
+/// Freeze rustc store inputs without modifying compiler-owned outputs.
 ///
-/// Dep-info files are identified by the adapter-provided artifact kind,
-/// so the store and restore sides stay in lock-step on what counts as a
-/// `.d`.
-///
-/// Rewrite failures are logged and skipped, not propagated: a malformed
-/// `.d` must not abort an otherwise-successful cache store.
-fn rewrite_depinfo_outputs(artifacts: &ArtifactSet, anchor: &Path, mode: link::DepInfoMode) {
+/// Dep-info is normalized while copying it into a private staging file. The
+/// store therefore observes one immutable snapshot and a failed rewrite can
+/// only skip caching; it can never leave Cargo's output partially rewritten.
+fn prepare_rustc_store_files(
+    artifacts: &ArtifactSet,
+    target_dir: Option<&Path>,
+    working_dir: &Path,
+    workspace_dir: Option<&Path>,
+    configured_roots: &[(PathBuf, String, u8)],
+) -> Result<PreparedRustcStoreFiles> {
+    use std::io::{Read, Write};
+
+    let mut files = Vec::with_capacity(artifacts.outputs().len());
+    let mut temporary_files = Vec::with_capacity(artifacts.outputs().len());
     for artifact in artifacts.outputs() {
         if artifact.kind != ArtifactKind::DepInfo {
+            // Preserve the compiler-owned path (and therefore executable mode)
+            // for ordinary artifacts. Only dep-info needs transformed bytes.
+            files.push((artifact.path.clone(), artifact.store_name.clone()));
             continue;
         }
-        if let Err(e) = link::rewrite_depinfo(&artifact.path, anchor, mode) {
-            tracing::warn!(
-                "failed to rewrite dep-info {} ({:?}): {}",
-                artifact.path.display(),
-                mode,
-                e
-            );
-        }
+
+        let mut staged = tempfile::Builder::new()
+            .prefix("kache-rustc-artifact-")
+            .tempfile()
+            .context("rustc store: creating private artifact staging file")?;
+        let anchor = target_dir.context("rustc store: missing dep-info rewrite anchor")?;
+        let mut content = String::new();
+        std::fs::File::open(&artifact.path)
+            .with_context(|| format!("rustc store: opening dep-info {}", artifact.path.display()))?
+            .read_to_string(&mut content)
+            .with_context(|| {
+                format!("rustc store: reading dep-info {}", artifact.path.display())
+            })?;
+        let normalized = link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &content,
+            anchor,
+            working_dir,
+            workspace_dir,
+            configured_roots,
+            link::DepInfoMode::Relativize,
+        );
+        staged
+            .write_all(normalized.as_bytes())
+            .context("rustc store: writing normalized dep-info staging file")?;
+        staged
+            .flush()
+            .context("rustc store: flushing private artifact staging file")?;
+        let staged = staged.into_temp_path();
+        files.push((staged.to_path_buf(), artifact.store_name.clone()));
+        temporary_files.push(staged);
     }
+
+    Ok(PreparedRustcStoreFiles {
+        files,
+        _temporary_files: temporary_files,
+    })
+}
+
+fn configured_rustc_depinfo_roots(
+    config: &Config,
+    workspace_root: Option<&Path>,
+) -> Vec<(PathBuf, String, u8)> {
+    crate::path_normalizer::PathNormalizer::from_env(workspace_root)
+        .with_base_dirs(&config.base_dirs)
+        .depinfo_source_roots()
+        .into_iter()
+        .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+        .collect()
 }
 
 fn validate_extra_inputs_dep_info_before_store(
     args: &RustcArgs,
     artifacts: &ArtifactSet,
-    depinfo_anchor: Option<&Path>,
     snapshot: &crate::extra_inputs::ExtraInputsSnapshot,
 ) -> Result<()> {
     let expected_name = args
@@ -2506,12 +2570,8 @@ fn validate_extra_inputs_dep_info_before_store(
         saw_dep_info = true;
         let raw = std::fs::read_to_string(&artifact.path)
             .with_context(|| format!("reading producer dep-info {}", artifact.path.display()))?;
-        let consumer = depinfo_anchor.map_or_else(
-            || raw.clone(),
-            |anchor| crate::link::rewrite_depinfo_content(&raw, anchor, link::DepInfoMode::Expand),
-        );
         snapshot
-            .merge_dep_info_content(&consumer)
+            .merge_dep_info_content(&raw)
             .with_context(|| format!("completing producer dep-info {}", artifact.path.display()))?;
     }
     anyhow::ensure!(
@@ -2611,6 +2671,9 @@ fn materialize_cached_artifact(
     target_path: &Path,
     kind: ArtifactKind,
     depinfo_anchor: &Path,
+    depinfo_working_dir: &Path,
+    depinfo_workspace_dir: Option<&Path>,
+    depinfo_configured_roots: &[(PathBuf, String, u8)],
     platform: &dyn crate::compiler::Platform,
     context: &str,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
@@ -2645,6 +2708,20 @@ fn materialize_cached_artifact(
         let mut content = original.clone();
         for action in &transforms {
             content = action.transform(content, depinfo_anchor);
+        }
+        if kind == ArtifactKind::DepInfo {
+            content = match String::from_utf8(content) {
+                Ok(text) => crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+                    &text,
+                    depinfo_anchor,
+                    depinfo_working_dir,
+                    depinfo_workspace_dir,
+                    depinfo_configured_roots,
+                    link::DepInfoMode::Expand,
+                )
+                .into_bytes(),
+                Err(error) => error.into_bytes(),
+            };
         }
         if let Some(snapshot) = complete_extra_inputs {
             let text = String::from_utf8(content)
@@ -2800,11 +2877,10 @@ fn compute_rustc_cache_key(
         // up but refuse to store (kunobi-ninja/kache#324).
         file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     }
-    // Workspace root for normalization: derive from `--out-dir`
-    // (see `RustcArgs::workspace_root` for the rationale — cargo
-    // cd's into each transitive dep's source dir, so CWD is the
-    // wrong anchor). Falls back to CWD if --out-dir isn't set
-    // (defensive — cargo always sets it for cacheable invocations).
+    // Workspace root for normalization: use the output-derived candidate only
+    // when it is verified against Cargo's cwd. An external target directory
+    // otherwise points at an unrelated parent; keying and rustc injection must
+    // both fall back to cwd through `RustcArgs::path_normalization_root`.
     // Re-virtualize rust std sources to `/rustc/<hash>` so profilers resolve
     // them (kunobi-ninja/kache#485). MUST match the injection-side normalizer in
     // `RustcCompiler::execute`, or the key would represent one remap rule set
@@ -3038,19 +3114,20 @@ fn restore_from_cache(
     std::fs::create_dir_all(&output_dir)
         .with_context(|| format!("creating output directory {}", output_dir.display()))?;
 
-    // Anchor for dep-info (`.d`) path expansion. Cached `.d` blobs hold
-    // paths relativized against the *producing* build's target dir
-    // (`<target>/...` → kache's dep-info sentinel); on restore they must
-    // be re-rooted at *this* invocation's target dir so cargo's freshness
-    // `stat()`s find them. `args.target_dir()` derives that from
-    // `--out-dir` / `-o` — cargo's cwd is the package source dir, so it
-    // cannot be used.
+    // Anchors for dep-info (`.d`) expansion. Cached blobs independently
+    // relativize the producer's target directory and package working
+    // directory; restore re-roots both for this invocation so Cargo watches
+    // the consumer worktree rather than a live donor (#760).
     // Falls back to cwd only for ad-hoc invocations outside cargo's
     // layout, where there is no cached `.d` to rewrite anyway.
     let depinfo_anchor = args
         .target_dir()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let depinfo_working_dir =
+        std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let depinfo_workspace_dir = args.path_normalization_root();
+    let depinfo_configured_roots = configured_rustc_depinfo_roots(config, depinfo_workspace_dir);
 
     // Dep-info validation gate (kunobi-ninja/kache#330): a restored `.d`
     // whose paths do not resolve for THIS consumer poisons cargo's
@@ -3088,8 +3165,14 @@ fn restore_from_cache(
                 });
             }
         };
-        let expanded =
-            crate::link::rewrite_depinfo_content(&raw, &depinfo_anchor, link::DepInfoMode::Expand);
+        let expanded = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &raw,
+            &depinfo_anchor,
+            &depinfo_working_dir,
+            depinfo_workspace_dir,
+            &depinfo_configured_roots,
+            link::DepInfoMode::Expand,
+        );
         let expanded = if let Some(snapshot) = extra_inputs {
             match snapshot.merge_dep_info_content(&expanded) {
                 Ok(completed) => completed,
@@ -3185,6 +3268,9 @@ fn restore_from_cache(
             &target_path,
             kind,
             &depinfo_anchor,
+            &depinfo_working_dir,
+            depinfo_workspace_dir,
+            &depinfo_configured_roots,
             &*platform,
             "rustc restore",
             extra_inputs,
@@ -5291,7 +5377,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let artifacts = ArtifactSet::new(Vec::new());
-        let error = validate_extra_inputs_dep_info_before_store(&args, &artifacts, None, &snapshot)
+        let error = validate_extra_inputs_dep_info_before_store(&args, &artifacts, &snapshot)
             .expect_err("active extra_inputs requires the dep-info Cargo requested");
         assert!(
             format!("{error:#}").contains("no expected dep-info artifact"),
@@ -5352,7 +5438,7 @@ mod tests {
             },
         ]);
 
-        validate_extra_inputs_dep_info_before_store(&args, &artifacts, None, &snapshot)
+        validate_extra_inputs_dep_info_before_store(&args, &artifacts, &snapshot)
             .expect("the expected producer dep-info artifact is valid");
     }
 
@@ -5504,123 +5590,126 @@ mod tests {
         );
     }
 
-    /// `rewrite_depinfo_outputs` rewrites dep-info files in place and the
-    /// relativize→expand round trip re-roots the cached blob's paths at
-    /// the restoring build's target dir — the property that lets dep-info
-    /// produced at one location be restored valid at another.
+    /// Rust store staging leaves compiler outputs untouched while the cached
+    /// dep-info round trip re-roots target, package, and workspace paths.
     #[test]
-    fn rewrite_depinfo_outputs_round_trips_depinfo_files_across_target_dirs() {
+    fn rustc_store_staging_round_trips_depinfo_without_mutating_outputs() {
         let dir = tempfile::tempdir().unwrap();
-        let depfile = dir.path().join("foo-abc.d");
-        let mozilla_depfile = dir.path().join("host_pathsub.o.pp");
-        let producing_target = std::path::Path::new("/build/worktree-a/target");
-        std::fs::write(
-            &depfile,
-            format!(
-                "{}/release/deps/libfoo-abc.rlib: src/lib.rs",
-                producing_target.display()
-            ),
+        let producing_workspace = dir.path().join("worktree-a");
+        let producing_working_dir = producing_workspace.join("member");
+        let producing_target = producing_workspace.join("target");
+        let depfile = producing_target.join("release/deps/foo-abc.d");
+        let rlib = producing_target.join("release/deps/libfoo-abc.rlib");
+        std::fs::create_dir_all(depfile.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&producing_working_dir).unwrap();
+        let original = format!(
+            "{}: {} {}\n",
+            rlib.display(),
+            producing_working_dir.join("src/lib.rs").display(),
+            producing_workspace.join("shared/asset.txt").display(),
+        );
+        std::fs::write(&depfile, &original).unwrap();
+        std::fs::write(&rlib, b"rlib bytes").unwrap();
+        let outputs = ArtifactSet::new(vec![
+            crate::compiler::Artifact {
+                path: depfile.clone(),
+                store_name: "foo-abc.d".to_string(),
+                kind: ArtifactKind::DepInfo,
+                required: true,
+            },
+            crate::compiler::Artifact {
+                path: rlib.clone(),
+                store_name: "libfoo-abc.rlib".to_string(),
+                kind: ArtifactKind::Library,
+                required: true,
+            },
+        ]);
+
+        let prepared = prepare_rustc_store_files(
+            &outputs,
+            Some(&producing_target),
+            &producing_working_dir,
+            Some(&producing_workspace),
+            &[],
         )
         .unwrap();
-        std::fs::write(
-            &mozilla_depfile,
-            format!(
-                "{}/config/host_pathsub.o: {}/config/pathsub.c",
-                producing_target.display(),
-                producing_target.display()
-            ),
-        )
-        .unwrap();
+        assert_eq!(std::fs::read_to_string(&depfile).unwrap(), original);
+        assert_eq!(std::fs::read(&rlib).unwrap(), b"rlib bytes");
+        assert_ne!(prepared.files[0].0, depfile);
+        assert_eq!(prepared.files[1].0, rlib);
+        assert_eq!(std::fs::read(&prepared.files[1].0).unwrap(), b"rlib bytes");
 
-        let outputs = ArtifactSet::from_output_files(
-            vec![
-                (depfile.clone(), "foo-abc.d".to_string()),
-                (mozilla_depfile.clone(), "host_pathsub.o.pp".to_string()),
-            ],
-            classify_by_filename,
-        );
+        let stored = std::fs::read_to_string(&prepared.files[0].0).unwrap();
+        assert!(stored.contains("__kache_root__/release/deps/libfoo-abc.rlib"));
+        assert!(stored.contains("__kache_cwd__/src/lib.rs"));
+        assert!(stored.contains("__kache_workspace__/shared/asset.txt"));
+        assert!(!stored.contains(producing_workspace.to_str().unwrap()));
 
-        // Store side: relativize against the producing build's target dir.
-        rewrite_depinfo_outputs(&outputs, producing_target, link::DepInfoMode::Relativize);
-        let stored = std::fs::read_to_string(&depfile).unwrap();
-        assert!(
-            stored.starts_with("__kache_root__/release/deps/libfoo-abc.rlib:"),
-            "stored `.d` must be relativized, got: {stored}"
+        let restoring_workspace = dir.path().join("worktree-b");
+        let restoring_working_dir = restoring_workspace.join("member");
+        let restoring_target = restoring_workspace.join("target");
+        let restored = link::rewrite_rustc_depinfo_content(
+            &stored,
+            &restoring_target,
+            &restoring_working_dir,
+            Some(&restoring_workspace),
+            link::DepInfoMode::Expand,
         );
         assert!(
-            !stored.contains("/build/worktree-a/"),
-            "no producing-worktree path may survive relativization: {stored}"
+            restored.contains(
+                restoring_target
+                    .join("release/deps/libfoo-abc.rlib")
+                    .to_str()
+                    .unwrap()
+            )
         );
-        let stored_mozilla = std::fs::read_to_string(&mozilla_depfile).unwrap();
+        assert!(restored.contains(restoring_working_dir.join("src/lib.rs").to_str().unwrap()));
         assert!(
-            stored_mozilla.starts_with(
-                "__kache_root__/config/host_pathsub.o: __kache_root__/config/pathsub.c"
-            ),
-            "stored `.pp` must be relativized, got: {stored_mozilla}"
-        );
-
-        // Restore side: expand against a *different* target dir.
-        let restoring_target = std::path::Path::new("/build/worktree-b/target");
-        rewrite_depinfo_outputs(&outputs, restoring_target, link::DepInfoMode::Expand);
-        let restored = std::fs::read_to_string(&depfile).unwrap();
-        assert!(
-            restored.starts_with("/build/worktree-b/target/release/deps/libfoo-abc.rlib:"),
-            "restored `.d` must be re-rooted at the restoring target dir, got: {restored}"
-        );
-        // Source paths that were already package-relative are untouched.
-        assert!(restored.contains("src/lib.rs"), "got: {restored}");
-        let restored_mozilla = std::fs::read_to_string(&mozilla_depfile).unwrap();
-        assert!(
-            restored_mozilla.starts_with(
-                "/build/worktree-b/target/config/host_pathsub.o: /build/worktree-b/target/config/pathsub.c"
-            ),
-            "restored `.pp` must be re-rooted at the restoring target dir, got: {restored_mozilla}"
+            restored.contains(
+                restoring_workspace
+                    .join("shared/asset.txt")
+                    .to_str()
+                    .unwrap()
+            )
         );
     }
 
-    /// Only dep-info files are touched — the helper identifies them via
-    /// `ArtifactKind::DepInfo`, so an `.rlib` (or any non-dep-info artifact)
-    /// in the same output set is left byte-for-byte intact.
+    /// Any staging failure skips cache publication without changing an output
+    /// that was already read successfully.
     #[test]
-    fn rewrite_depinfo_outputs_ignores_non_dep_info_artifacts() {
+    fn rustc_store_staging_refuses_missing_depinfo_without_mutating_outputs() {
         let dir = tempfile::tempdir().unwrap();
-        let rlib = dir.path().join("libfoo-abc.rlib");
-        // Content that *looks* rewritable but must not be: an `.rlib` is
-        // not dep-info, so the helper must skip it entirely.
-        let original = "/build/worktree-a/target/release/deps/x";
-        std::fs::write(&rlib, original).unwrap();
-
-        let outputs = ArtifactSet::from_output_files(
-            vec![(rlib.clone(), "libfoo-abc.rlib".to_string())],
-            classify_by_filename,
+        let valid = dir.path().join("valid.d");
+        let original = format!(
+            "{}/valid: {}/input.rs\n",
+            dir.path().display(),
+            dir.path().display()
         );
-        rewrite_depinfo_outputs(
+        std::fs::write(&valid, &original).unwrap();
+        let outputs = ArtifactSet::new(vec![
+            crate::compiler::Artifact {
+                path: valid.clone(),
+                store_name: "valid.d".to_string(),
+                kind: ArtifactKind::DepInfo,
+                required: true,
+            },
+            crate::compiler::Artifact {
+                path: dir.path().join("missing.d"),
+                store_name: "missing.d".to_string(),
+                kind: ArtifactKind::DepInfo,
+                required: true,
+            },
+        ]);
+        let error = prepare_rustc_store_files(
             &outputs,
-            std::path::Path::new("/build/worktree-a/target"),
-            link::DepInfoMode::Relativize,
-        );
-
-        assert_eq!(
-            std::fs::read_to_string(&rlib).unwrap(),
-            original,
-            "non-`.d` artifacts must be left untouched"
-        );
-    }
-
-    /// A missing `.d` file is logged and skipped, not propagated — a
-    /// malformed output set must never abort an otherwise-good store.
-    #[test]
-    fn rewrite_depinfo_outputs_is_silent_on_missing_file() {
-        let outputs = ArtifactSet::from_output_files(
-            vec![(PathBuf::from("/nonexistent/foo.d"), "foo.d".to_string())],
-            classify_by_filename,
-        );
-        // Must not panic.
-        rewrite_depinfo_outputs(
-            &outputs,
-            std::path::Path::new("/some/target"),
-            link::DepInfoMode::Relativize,
-        );
+            Some(dir.path()),
+            dir.path(),
+            Some(dir.path()),
+            &[],
+        )
+        .expect_err("a missing dep-info must prevent cache publication");
+        assert!(format!("{error:#}").contains("opening dep-info"));
+        assert_eq!(std::fs::read_to_string(valid).unwrap(), original);
     }
 
     #[test]
@@ -5980,6 +6069,9 @@ mod tests {
             &target,
             ArtifactKind::Library,
             dir.path(),
+            dir.path(),
+            None,
+            &[],
             &*platform,
             "test restore",
             None,
@@ -6001,7 +6093,7 @@ mod tests {
         let config = test_config(dir.path().join("cache"));
         let store = Store::open(&config).unwrap();
         let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let stored = "__kache_root__/debug/deps/libfoo.rlib: src/lib.rs\n";
+        let stored = "__kache_root__/debug/deps/libfoo.rlib: __kache_cwd__/src/lib.rs\n";
         create_blob(&store, hash, stored.as_bytes());
         let cached = cached_file("foo.d", hash);
         let target = dir
@@ -6019,6 +6111,9 @@ mod tests {
             &target,
             ArtifactKind::DepInfo,
             &anchor,
+            dir.path(),
+            None,
+            &[],
             &*platform,
             "test restore",
             None,
@@ -6029,6 +6124,10 @@ mod tests {
         assert!(
             restored.starts_with(&format!("{}/debug/deps/libfoo.rlib:", anchor.display())),
             "dep-info should be expanded at restore anchor, got: {restored}"
+        );
+        assert!(
+            restored.contains(&format!("{}/src/lib.rs", dir.path().display())),
+            "dep-info source should be expanded at the consumer cwd: {restored}"
         );
         assert_eq!(
             std::fs::read_to_string(store.blob_path(hash)).unwrap(),
@@ -6072,6 +6171,9 @@ mod tests {
             &target,
             ArtifactKind::Other("rustc:unknown"),
             dir.path(),
+            dir.path(),
+            None,
+            &[],
             &*platform,
             "test restore",
             None,
@@ -6109,6 +6211,9 @@ mod tests {
             &target,
             ArtifactKind::Library,
             dir.path(),
+            dir.path(),
+            None,
+            &[],
             &*platform,
             "test restore",
             None,
@@ -6282,6 +6387,9 @@ mod tests {
             &target,
             ArtifactKind::DebugBundle,
             dir.path(),
+            dir.path(),
+            None,
+            &[],
             &*platform,
             "test restore",
             None,
@@ -6372,6 +6480,9 @@ mod tests {
             &target,
             ArtifactKind::DebugBundle,
             restore_dir.path(),
+            restore_dir.path(),
+            None,
+            &[],
             &*platform,
             "test restore",
             None,

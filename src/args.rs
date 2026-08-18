@@ -278,6 +278,10 @@ pub struct RustcArgs {
     /// via [`RustcArgs::skip_path_remap`], so they can never observe different
     /// process-global env values and desync the key from the artifact.
     pub path_normalize_disabled: bool,
+    /// Path-normalization root selected once at parse time. Key construction,
+    /// rustc injection, and dep-info transport all reuse this frozen value so
+    /// filesystem drift cannot make them observe different remap rules.
+    path_normalization_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +370,7 @@ impl RustcArgs {
             is_test: false,
             is_primary: false,
             path_normalize_disabled: !crate::path_normalizer::rustc_path_normalize_enabled(),
+            path_normalization_root: None,
         };
 
         let mut i = 0;
@@ -556,6 +561,9 @@ impl RustcArgs {
 
         parsed.features.sort();
         parsed.is_primary = parsed.crate_name.is_some() && parsed.source_file.is_some();
+        parsed.path_normalization_root = std::env::current_dir()
+            .ok()
+            .map(|cwd| parsed.select_path_normalization_root(&cwd));
 
         Ok(parsed)
     }
@@ -636,6 +644,42 @@ impl RustcArgs {
     pub fn workspace_root(&self) -> Option<PathBuf> {
         self.target_dir()
             .and_then(|t| t.parent().map(Path::to_path_buf))
+    }
+
+    /// Return the target-derived workspace root only when it is consistent
+    /// with Cargo's compiler working directory.
+    ///
+    /// An external `CARGO_TARGET_DIR` makes [`Self::workspace_root`] point at
+    /// the target's parent rather than the source workspace. Treating that as
+    /// a relocatable source root can alias unrelated files. Requiring a
+    /// manifest at the candidate and the compiler cwd beneath it fails closed
+    /// for external/shared targets while retaining normal workspace layouts.
+    pub fn verified_workspace_root(&self, cwd: &Path) -> Option<PathBuf> {
+        let candidate = self.workspace_root()?;
+        if !candidate.join("Cargo.toml").is_file() {
+            return None;
+        }
+        let canonical_candidate = candidate.canonicalize().ok()?;
+        let canonical_cwd = cwd.canonicalize().ok()?;
+        canonical_cwd
+            .starts_with(&canonical_candidate)
+            .then(|| std::path::absolute(&candidate).unwrap_or(candidate))
+    }
+
+    /// Workspace anchor shared by cache-key construction and rustc remapping.
+    ///
+    /// Cargo's output-derived candidate is valid for an in-workspace target,
+    /// but an external `CARGO_TARGET_DIR` makes it point at the target's parent.
+    /// Fall back to the compiler working directory in that case so key and
+    /// artifact remapping never treat an unrelated target parent as sources.
+    fn select_path_normalization_root(&self, cwd: &Path) -> PathBuf {
+        self.verified_workspace_root(cwd)
+            .unwrap_or_else(|| cwd.to_path_buf())
+    }
+
+    /// Frozen root shared by the key, rustc invocation, and dep-info rewrite.
+    pub fn path_normalization_root(&self) -> Option<&Path> {
+        self.path_normalization_root.as_deref()
     }
 
     /// Derive the cargo target directory (e.g. `<workspace>/target`) from
@@ -1790,6 +1834,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(args.workspace_root(), Some(PathBuf::from("/work/proj")));
+    }
+
+    #[test]
+    fn verified_workspace_root_rejects_external_target_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let member = workspace.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        let local = RustcArgs {
+            out_dir: Some(workspace.join("target/debug/deps")),
+            ..Default::default()
+        };
+        assert_eq!(
+            local.verified_workspace_root(&member),
+            Some(workspace.clone())
+        );
+        assert_eq!(local.select_path_normalization_root(&member), workspace);
+
+        let external = RustcArgs {
+            out_dir: Some(dir.path().join("external/shared-target/debug/deps")),
+            ..Default::default()
+        };
+        assert_eq!(external.verified_workspace_root(&member), None);
+        assert_eq!(external.select_path_normalization_root(&member), member);
     }
 
     #[test]

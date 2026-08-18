@@ -23,6 +23,15 @@ kache init --check
 
 After `kache init`, your next `cargo build` is already cached. The first run is a normal cold compile; the second run restores everything from kache's store with zero-copy reflinks (copy-on-write) where the filesystem supports it, and hardlink or copy otherwise.
 
+<Callout type="warning" title="Do not share one Cargo target directory across live worktrees">
+  With ordinary `cargo`, share Kache's cache but give each worktree its own
+  `CARGO_TARGET_DIR`. Cargo can declare an older worktree's unit `Fresh` from
+  shared fingerprint state without invoking `RUSTC_WRAPPER`, so no compiler
+  cache can validate that unit. If final artifacts must share one target, use
+  `kache cargo -- build` on Cargo 1.91+: it keeps intermediate fingerprints
+  worktree-local while Kache shares compiled artifacts.
+</Callout>
+
 ![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact with zero-copy reflinks](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
 
 ## Verify the setup

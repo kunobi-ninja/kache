@@ -1136,18 +1136,22 @@ fn sample_write_clock(path: &Path) -> Result<filetime::FileTime> {
 }
 
 const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";
+const DEPINFO_CWD_SENTINEL: &str = "__kache_cwd__/";
+const DEPINFO_WORKSPACE_SENTINEL: &str = "__kache_workspace__/";
 
 /// rustc's `# env-dep:NAME=value` records carry their own escape grammar:
 /// backslash is written `\\` (and newline/CR as `\n`/`\r`), and cargo's
 /// parser hard-rejects every other backslash sequence with
 /// "unknown escape character". A path prefix can only contribute the
 /// backslash case.
-#[cfg(any(windows, test))]
 const DEPINFO_ENV_DEP_PREFIX: &str = "# env-dep:";
 
-#[cfg(any(windows, test))]
 fn escape_depinfo_env_value(prefix: &str) -> String {
     prefix.replace('\\', "\\\\")
+}
+
+fn escape_depinfo_make_path(prefix: &str) -> String {
+    prefix.replace(' ', "\\ ")
 }
 
 /// Pure dep-info path rewrite: relativize absolute project paths to a
@@ -1158,34 +1162,226 @@ fn escape_depinfo_env_value(prefix: &str) -> String {
 /// it directly — it computes the final `.d` content from the store blob
 /// and materializes the result with [`write_restored`], so it never
 /// rewrites a restored, possibly read-only, possibly inode-shared file in
-/// place. The store side reaches it via [`rewrite_depinfo`].
+/// place. The Rust store side calls the two-root variant while creating a
+/// private store snapshot; C/C++ keeps using this one-root form.
 pub fn rewrite_depinfo_content(content: &str, project_dir: &Path, mode: DepInfoMode) -> String {
-    let project_prefix = format!("{}/", project_dir.display());
+    rewrite_depinfo_content_with_sentinel(content, project_dir, DEPINFO_ROOT_SENTINEL, mode)
+}
 
-    // Unix keeps the historical whole-content transform byte-for-byte. A
-    // backslash there is a legal FILENAME character, not a separator or an
-    // escape, so neither the dual-spelling prefix nor the env-dep escape
-    // treatment below may run — either could rewrite content the old code
-    // left alone (cross-model review finding).
-    #[cfg(not(windows))]
-    {
-        match mode {
-            DepInfoMode::Relativize => content.replace(&project_prefix, DEPINFO_ROOT_SENTINEL),
-            DepInfoMode::Expand => content.replace(DEPINFO_ROOT_SENTINEL, &project_prefix),
+/// Rust dep-info carries two independently relocatable path families: target
+/// outputs and sources below Cargo's invocation directory. Re-root both with
+/// distinct sentinels so a cached `.d` never leaves Cargo watching a live donor
+/// worktree after the artifact moves (#760).
+#[cfg(test)]
+pub fn rewrite_rustc_depinfo_content(
+    content: &str,
+    target_dir: &Path,
+    working_dir: &Path,
+    workspace_dir: Option<&Path>,
+    mode: DepInfoMode,
+) -> String {
+    rewrite_rustc_depinfo_content_with_configured_roots(
+        content,
+        target_dir,
+        working_dir,
+        workspace_dir,
+        &[],
+        mode,
+    )
+}
+
+pub fn rewrite_rustc_depinfo_content_with_configured_roots(
+    content: &str,
+    target_dir: &Path,
+    working_dir: &Path,
+    workspace_dir: Option<&Path>,
+    configured_roots: &[(PathBuf, String, u8)],
+    mode: DepInfoMode,
+) -> String {
+    let mut automatic_roots = vec![(
+        working_dir.to_path_buf(),
+        DEPINFO_CWD_SENTINEL.to_string(),
+        4_u8,
+        2_u8,
+    )];
+    if let Some(workspace_dir) = workspace_dir {
+        automatic_roots.push((
+            workspace_dir.to_path_buf(),
+            DEPINFO_WORKSPACE_SENTINEL.to_string(),
+            4_u8,
+            1_u8,
+        ));
+    }
+
+    if matches!(mode, DepInfoMode::Relativize) {
+        let mut roots = configured_roots
+            .iter()
+            .map(|(root, sentinel, priority)| {
+                (root.clone(), sentinel.clone(), *priority, 0_u8, true)
+            })
+            .chain(
+                automatic_roots
+                    .iter()
+                    .map(|(root, sentinel, priority, tie)| {
+                        (root.clone(), sentinel.clone(), *priority, *tie, false)
+                    }),
+            )
+            .collect::<Vec<_>>();
+        roots.sort_by_key(|(root, _, priority, tie, _)| {
+            std::cmp::Reverse((
+                *priority,
+                root.components().count(),
+                root.as_os_str().len(),
+                *tie,
+            ))
+        });
+        let target_rewritten = rewrite_rustc_depinfo_targets(content, target_dir, mode);
+        return roots.into_iter().fold(
+            target_rewritten,
+            |rewritten, (root, sentinel, _, _, exact)| {
+                if exact {
+                    rewrite_depinfo_content_with_exact_sentinel(&rewritten, &root, &sentinel, mode)
+                } else {
+                    rewrite_depinfo_content_with_sentinel(&rewritten, &root, &sentinel, mode)
+                }
+            },
+        );
+    }
+
+    // A portable owner may have multiple producer aliases, but the first entry
+    // for its sentinel is the designated lexical consumer root. Expand each
+    // sentinel exactly once so a longer canonical alias cannot steal restore.
+    let mut rewritten = content.to_string();
+    let mut expanded = std::collections::HashSet::new();
+    for (root, sentinel, _) in configured_roots {
+        if expanded.insert(sentinel) {
+            rewritten =
+                rewrite_depinfo_content_with_exact_sentinel(&rewritten, root, sentinel, mode);
         }
     }
+    let rewritten =
+        automatic_roots
+            .into_iter()
+            .fold(rewritten, |rewritten, (root, sentinel, _, _)| {
+                rewrite_depinfo_content_with_sentinel(&rewritten, &root, &sentinel, mode)
+            });
+    rewrite_rustc_depinfo_targets(&rewritten, target_dir, mode)
+}
 
-    // Windows dep-info paths use backslash separators — and often mix them
-    // (`...\out/generated.rs` from an env-var join). A prefix built with one
-    // separator silently fails to match the other, so the builder's absolute
-    // paths shipped verbatim in the cached entry and poisoned every other
-    // project sharing it (kunobi-ninja/kache#330). Relativize both spellings;
-    // the sentinel expands with `/`, which every Windows API accepts.
-    #[cfg(windows)]
-    {
-        let prefixes = [project_prefix, format!("{}\\", project_dir.display())];
-        rewrite_depinfo_content_with_prefixes(content, &prefixes, mode)
+/// Rebase only Makefile target tokens (left of rustc's `: ` delimiter).
+/// Dependencies on the right are source inputs and must follow PathNormalizer
+/// ownership instead; a generated source beneath `target/` can still belong to
+/// workspace/configured source identity.
+fn rewrite_rustc_depinfo_targets(content: &str, target_dir: &Path, mode: DepInfoMode) -> String {
+    content
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.starts_with(DEPINFO_ENV_DEP_PREFIX) {
+                return line.to_string();
+            }
+            let Some(delimiter) = line.find(": ") else {
+                return line.to_string();
+            };
+            let (targets, dependencies) = line.split_at(delimiter);
+            let rewritten = rewrite_depinfo_content_with_sentinel(
+                targets,
+                target_dir,
+                DEPINFO_ROOT_SENTINEL,
+                mode,
+            );
+            format!("{rewritten}{dependencies}")
+        })
+        .collect()
+}
+
+/// Rewrite one exact configured-rule spelling. Configured roots already carry
+/// their explicitly constructed lexical/canonical/Windows aliases; adding a
+/// fresh canonical alias here could let one configured symlink steal another
+/// configured slot's sentinel.
+fn rewrite_depinfo_content_with_exact_sentinel(
+    content: &str,
+    project_dir: &Path,
+    sentinel: &str,
+    mode: DepInfoMode,
+) -> String {
+    rewrite_depinfo_content_with_exact_sentinel_for_platform(
+        content,
+        project_dir,
+        sentinel,
+        mode,
+        cfg!(windows),
+    )
+}
+
+fn rewrite_depinfo_content_with_exact_sentinel_for_platform(
+    content: &str,
+    project_dir: &Path,
+    sentinel: &str,
+    mode: DepInfoMode,
+    windows: bool,
+) -> String {
+    let prefixes = depinfo_prefixes_for_exact_display(&project_dir.to_string_lossy(), windows);
+    rewrite_depinfo_content_with_prefixes_and_sentinel(content, &prefixes, sentinel, mode)
+}
+
+fn depinfo_prefixes_for_exact_display(raw: &str, windows: bool) -> Vec<String> {
+    if windows {
+        // Expand uses the first spelling. Verbatim Windows paths (`\\?\...`)
+        // do not accept forward slashes, so the native separator must lead.
+        vec![format!("{raw}\\"), format!("{raw}/")]
+    } else {
+        vec![format!("{raw}/")]
     }
+}
+
+fn rewrite_depinfo_content_with_sentinel(
+    content: &str,
+    project_dir: &Path,
+    sentinel: &str,
+    mode: DepInfoMode,
+) -> String {
+    let mut roots = vec![project_dir.to_path_buf()];
+    if matches!(mode, DepInfoMode::Relativize)
+        && let Ok(canonical) = project_dir.canonicalize()
+        && canonical != project_dir
+    {
+        roots.push(canonical);
+    }
+    let mut prefixes = Vec::new();
+    for root in roots {
+        prefixes.extend(depinfo_prefixes_for_display(
+            &root.to_string_lossy(),
+            matches!(mode, DepInfoMode::Relativize),
+            cfg!(windows),
+        ));
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    rewrite_depinfo_content_with_prefixes_and_sentinel(content, &prefixes, sentinel, mode)
+}
+
+fn depinfo_prefixes_for_display(
+    raw: &str,
+    retain_verbatim_alias: bool,
+    windows: bool,
+) -> Vec<String> {
+    let stripped = raw
+        .strip_prefix(r"\\?\UNC\")
+        .map(|path| format!(r"\\{path}"))
+        .or_else(|| raw.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| raw.to_string());
+    let mut displays = vec![stripped.clone()];
+    if retain_verbatim_alias && raw != stripped {
+        displays.push(raw.to_string());
+    }
+    let mut prefixes = Vec::new();
+    for display in displays {
+        prefixes.push(format!("{display}/"));
+        if windows {
+            prefixes.push(format!("{display}\\"));
+        }
+    }
+    prefixes
 }
 
 /// Prefix-parameterized core of the Windows [`rewrite_depinfo_content`]
@@ -1199,10 +1395,24 @@ pub fn rewrite_depinfo_content(content: &str, project_dir: &Path, mode: DepInfoM
 /// cargo rejects, kunobi-ninja/kache#730). The record's key is an environment
 /// variable NAME, never a path — it is left untouched, as is a key-only
 /// record without `=`.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn rewrite_depinfo_content_with_prefixes(
     content: &str,
     prefixes: &[String],
+    mode: DepInfoMode,
+) -> String {
+    rewrite_depinfo_content_with_prefixes_and_sentinel(
+        content,
+        prefixes,
+        DEPINFO_ROOT_SENTINEL,
+        mode,
+    )
+}
+
+fn rewrite_depinfo_content_with_prefixes_and_sentinel(
+    content: &str,
+    prefixes: &[String],
+    sentinel: &str,
     mode: DepInfoMode,
 ) -> String {
     content
@@ -1214,24 +1424,132 @@ fn rewrite_depinfo_content_with_prefixes(
                 };
                 let value = match mode {
                     DepInfoMode::Relativize => prefixes.iter().fold(value.to_string(), |acc, p| {
-                        acc.replace(&escape_depinfo_env_value(p), DEPINFO_ROOT_SENTINEL)
+                        replace_depinfo_text(
+                            &acc,
+                            &escape_depinfo_env_value(p),
+                            sentinel,
+                            cfg!(windows),
+                            DepInfoTextContext::EnvValue,
+                        )
                     }),
-                    DepInfoMode::Expand => value.replace(
-                        DEPINFO_ROOT_SENTINEL,
+                    DepInfoMode::Expand => replace_depinfo_text(
+                        value,
+                        sentinel,
                         &escape_depinfo_env_value(&prefixes[0]),
+                        false,
+                        DepInfoTextContext::EnvValue,
                     ),
                 };
                 format!("{DEPINFO_ENV_DEP_PREFIX}{key}={value}")
             } else {
                 match mode {
                     DepInfoMode::Relativize => prefixes.iter().fold(line.to_string(), |acc, p| {
-                        acc.replace(p.as_str(), DEPINFO_ROOT_SENTINEL)
+                        let escaped = escape_depinfo_make_path(p);
+                        let escaped = replace_depinfo_text(
+                            &acc,
+                            &escaped,
+                            sentinel,
+                            cfg!(windows),
+                            DepInfoTextContext::MakeLine,
+                        );
+                        replace_depinfo_text(
+                            &escaped,
+                            p,
+                            sentinel,
+                            cfg!(windows),
+                            DepInfoTextContext::MakeLine,
+                        )
                     }),
-                    DepInfoMode::Expand => line.replace(DEPINFO_ROOT_SENTINEL, &prefixes[0]),
+                    DepInfoMode::Expand => replace_depinfo_text(
+                        line,
+                        sentinel,
+                        &escape_depinfo_make_path(&prefixes[0]),
+                        false,
+                        DepInfoTextContext::MakeLine,
+                    ),
                 }
             }
         })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+enum DepInfoTextContext {
+    MakeLine,
+    EnvValue,
+}
+
+fn replace_depinfo_text(
+    input: &str,
+    needle: &str,
+    replacement: &str,
+    ascii_case_insensitive: bool,
+    context: DepInfoTextContext,
+) -> String {
+    if needle.is_empty() {
+        return input.to_string();
+    }
+    let input_bytes = input.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while search + needle_bytes.len() <= input_bytes.len() {
+        let offset = if ascii_case_insensitive {
+            input_bytes[search..]
+                .windows(needle_bytes.len())
+                .position(|window| window.eq_ignore_ascii_case(needle_bytes))
+        } else {
+            input[search..].find(needle)
+        };
+        let Some(offset) = offset else {
+            break;
+        };
+        let found = search + offset;
+        let end = found + needle_bytes.len();
+        // UTF-8 is self-synchronizing: a valid UTF-8 `needle` cannot match
+        // across code-point boundaries. `str::find` guarantees this directly;
+        // the ASCII-insensitive byte scan changes only ASCII case.
+        if !depinfo_path_prefix_has_left_boundary(input, found, context) {
+            search = input[found..]
+                .char_indices()
+                .nth(1)
+                .map_or(input.len(), |(next, _)| found + next);
+            continue;
+        }
+        output.push_str(&input[copied..found]);
+        output.push_str(replacement);
+        copied = end;
+        search = copied;
+    }
+    output.push_str(&input[copied..]);
+    output
+}
+
+fn depinfo_path_prefix_has_left_boundary(
+    input: &str,
+    start: usize,
+    context: DepInfoTextContext,
+) -> bool {
+    if start == 0 {
+        return true;
+    }
+    if matches!(context, DepInfoTextContext::EnvValue) {
+        return false;
+    }
+    let before = &input[..start];
+    let Some((delimiter_start, delimiter)) = before.char_indices().next_back() else {
+        return false;
+    };
+    if !delimiter.is_whitespace() && delimiter != ':' {
+        return false;
+    }
+    before[..delimiter_start]
+        .chars()
+        .rev()
+        .take_while(|ch| *ch == '\\')
+        .count()
+        .is_multiple_of(2)
 }
 
 /// Rewrite a `.d` (dep-info) file in place.
@@ -1239,15 +1557,20 @@ fn rewrite_depinfo_content_with_prefixes(
 /// Used on the **store** side, where the file is the build's own
 /// freshly-written, writable dep-info. The restore side does NOT use this
 /// — it computes the rewritten content in memory via
-/// [`rewrite_depinfo_content`] and materializes it with [`write_restored`],
-/// honoring "compute the final bytes, then materialize" rather than
-/// patching a restored file in place.
+/// [`rewrite_depinfo_content`] (or its Rust two-root variant), then materializes
+/// it with [`write_restored`]. This honors "compute the final bytes, then
+/// materialize" rather than patching a restored file in place.
+#[cfg(test)]
 pub fn rewrite_depinfo(depinfo_path: &Path, project_dir: &Path, mode: DepInfoMode) -> Result<()> {
     let content = fs::read_to_string(depinfo_path)
         .with_context(|| format!("reading dep-info file {}", depinfo_path.display()))?;
 
     let rewritten = rewrite_depinfo_content(&content, project_dir, mode);
+    write_rewritten_depinfo(depinfo_path, rewritten)
+}
 
+#[cfg(test)]
+fn write_rewritten_depinfo(depinfo_path: &Path, rewritten: String) -> Result<()> {
     // Defense-in-depth: if the file is hardlinked (nlink > 1), unlink
     // first so the in-place write can't mutate a shared inode. On the
     // store side `Store::put` never hardlinks `.d` blobs (DepInfo is
@@ -1753,6 +2076,474 @@ mod tests {
 
         let content = fs::read_to_string(&depfile).unwrap();
         assert!(content.contains("/home/user/project/"));
+    }
+
+    #[test]
+    fn rustc_depinfo_rewrite_rebases_target_and_worktree_separately() {
+        let producer_target = Path::new("/build/worktree-a/target");
+        let producer_cwd = Path::new("/build/worktree-a");
+        let input = "/build/worktree-a/target/debug/deps/libdemo.rlib: \
+/build/worktree-a/src/lib.rs /build/worktree-a/assets/value.txt\n";
+
+        let stored = rewrite_rustc_depinfo_content(
+            input,
+            producer_target,
+            producer_cwd,
+            None,
+            DepInfoMode::Relativize,
+        );
+        assert!(stored.contains("__kache_root__/debug/deps/libdemo.rlib"));
+        assert!(stored.contains("__kache_cwd__/src/lib.rs"));
+        assert!(stored.contains("__kache_cwd__/assets/value.txt"));
+        assert!(!stored.contains("worktree-a"));
+
+        let restored = rewrite_rustc_depinfo_content(
+            &stored,
+            Path::new("/build/worktree-b/target"),
+            Path::new("/build/worktree-b"),
+            None,
+            DepInfoMode::Expand,
+        );
+        assert!(restored.contains("/build/worktree-b/target/debug/deps/libdemo.rlib"));
+        assert!(restored.contains("/build/worktree-b/src/lib.rs"));
+        assert!(restored.contains("/build/worktree-b/assets/value.txt"));
+        assert!(!restored.contains("worktree-a"));
+    }
+
+    #[test]
+    fn rustc_depinfo_rewrite_handles_workspace_and_make_escaped_paths() {
+        let producer_workspace = Path::new("/build/work tree-a");
+        let producer_target = producer_workspace.join("target");
+        let producer_cwd = producer_workspace.join("crates/demo");
+        let input = "/build/work\\ tree-a/target/debug/deps/libdemo.rlib: \
+/build/work\\ tree-a/crates/demo/src/lib.rs \
+/build/work\\ tree-a/shared/schema.txt\n\
+# env-dep:SCHEMA_ROOT=/build/work tree-a/shared\n";
+
+        let stored = rewrite_rustc_depinfo_content(
+            input,
+            &producer_target,
+            &producer_cwd,
+            Some(producer_workspace),
+            DepInfoMode::Relativize,
+        );
+        assert!(stored.contains("__kache_root__/debug/deps/libdemo.rlib"));
+        assert!(stored.contains("__kache_cwd__/src/lib.rs"));
+        assert!(stored.contains("__kache_workspace__/shared/schema.txt"));
+        assert!(stored.contains("# env-dep:SCHEMA_ROOT=__kache_workspace__/shared"));
+        assert!(!stored.contains("work tree-a"));
+        assert!(!stored.contains("work\\ tree-a"));
+
+        let consumer_workspace = Path::new("/build/work tree-b");
+        let restored = rewrite_rustc_depinfo_content(
+            &stored,
+            &consumer_workspace.join("target"),
+            &consumer_workspace.join("crates/demo"),
+            Some(consumer_workspace),
+            DepInfoMode::Expand,
+        );
+        assert!(restored.contains("/build/work\\ tree-b/target/debug/deps/libdemo.rlib"));
+        assert!(restored.contains("/build/work\\ tree-b/crates/demo/src/lib.rs"));
+        assert!(restored.contains("/build/work\\ tree-b/shared/schema.txt"));
+        assert!(restored.contains("# env-dep:SCHEMA_ROOT=/build/work tree-b/shared"));
+        assert!(!restored.contains("work tree-a"));
+        assert!(!restored.contains("work\\ tree-a"));
+    }
+
+    #[test]
+    fn rustc_depinfo_rewrite_round_trips_configured_external_roots() {
+        let producer = PathBuf::from("/mount-a/generated");
+        let consumer = PathBuf::from("/mount-b/generated");
+        let sentinel = "__kache_base_dir_0__/".to_string();
+        let input = "/work-a/target/demo.d: /mount-a/generated/schema/data.json\n";
+
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            input,
+            Path::new("/work-a/target"),
+            Path::new("/work-a/crate"),
+            Some(Path::new("/work-a")),
+            &[(producer, sentinel.clone(), 8)],
+            DepInfoMode::Relativize,
+        );
+        assert!(stored.contains("__kache_base_dir_0__/schema/data.json"));
+        assert!(!stored.contains("/mount-a/generated"));
+
+        let restored = rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            Path::new("/work-b/target"),
+            Path::new("/work-b/crate"),
+            Some(Path::new("/work-b")),
+            &[(consumer, sentinel, 8)],
+            DepInfoMode::Expand,
+        );
+        assert!(restored.contains("/mount-b/generated/schema/data.json"));
+        assert!(!restored.contains("/mount-a/generated"));
+    }
+
+    #[test]
+    fn configured_root_wins_when_it_equals_the_working_directory() {
+        let root = PathBuf::from("/work/crate");
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            "/work/target/demo.d: /work/crate/generated.rs\n",
+            Path::new("/work/target"),
+            &root,
+            Some(Path::new("/work")),
+            &[(root.clone(), "__kache_base_dir_0__/".to_string(), 8)],
+            DepInfoMode::Relativize,
+        );
+        assert!(stored.contains("__kache_base_dir_0__/generated.rs"));
+        assert!(!stored.contains(DEPINFO_CWD_SENTINEL));
+    }
+
+    #[test]
+    fn configured_ancestor_precedes_more_specific_automatic_roots() {
+        let configured = PathBuf::from("/sandbox");
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            "/sandbox/worktree-a/target/demo.d: /sandbox/worktree-a/crate/generated.rs\n",
+            Path::new("/sandbox/worktree-a/target"),
+            Path::new("/sandbox/worktree-a/crate"),
+            Some(Path::new("/sandbox/worktree-a")),
+            &[(configured, "__kache_base_dir_0__/".to_string(), 8)],
+            DepInfoMode::Relativize,
+        );
+        assert!(stored.starts_with("__kache_root__/demo.d:"), "{stored}");
+        assert!(stored.contains("__kache_base_dir_0__/worktree-a/crate/generated.rs"));
+        assert!(!stored.contains(DEPINFO_CWD_SENTINEL));
+        assert!(!stored.contains(DEPINFO_WORKSPACE_SENTINEL));
+    }
+
+    #[test]
+    fn target_output_rebases_separately_from_generated_source_ownership() {
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            "/work/target/demo.d: /work/target/generated.rs\n",
+            Path::new("/work/target"),
+            Path::new("/work"),
+            Some(Path::new("/work")),
+            &[],
+            DepInfoMode::Relativize,
+        );
+
+        assert_eq!(
+            stored,
+            "__kache_root__/demo.d: __kache_cwd__/target/generated.rs\n"
+        );
+    }
+
+    #[test]
+    fn external_target_generated_source_round_trips_independently_from_output() {
+        let producer_target = PathBuf::from("/external-a/target");
+        let consumer_target = PathBuf::from("/external-b/target");
+        let target_sentinel = "__kache_target_rule__/".to_string();
+        let input = "/external-a/target/debug/deps/demo.d: \
+/external-a/target/debug/build/demo/out/generated.rs\n";
+
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            input,
+            &producer_target,
+            Path::new("/work-a/crate"),
+            Some(Path::new("/work-a")),
+            &[(producer_target.clone(), target_sentinel.clone(), 3)],
+            DepInfoMode::Relativize,
+        );
+        assert_eq!(
+            stored,
+            "__kache_root__/debug/deps/demo.d: \
+__kache_target_rule__/debug/build/demo/out/generated.rs\n"
+        );
+
+        let restored = rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            &consumer_target,
+            Path::new("/work-b/crate"),
+            Some(Path::new("/work-b")),
+            &[(consumer_target.clone(), target_sentinel, 3)],
+            DepInfoMode::Expand,
+        );
+        assert_eq!(
+            restored,
+            "/external-b/target/debug/deps/demo.d: \
+/external-b/target/debug/build/demo/out/generated.rs\n"
+        );
+    }
+
+    #[test]
+    fn configured_root_does_not_match_an_interior_path_component() {
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            "out: /mnt/sandbox/file.rs /mnt/@/sandbox/punctuation.rs \
+/mnt/foo\\ /sandbox/escaped-space.rs /sandbox/owned.rs\n\
+# env-dep:ASSET=/mnt/sandbox/asset.txt\n",
+            Path::new("/target"),
+            Path::new("/work"),
+            None,
+            &[(
+                PathBuf::from("/sandbox"),
+                "__kache_base_dir_0__/".to_string(),
+                8,
+            )],
+            DepInfoMode::Relativize,
+        );
+
+        assert!(stored.contains("/mnt/sandbox/file.rs"));
+        assert!(stored.contains("/mnt/@/sandbox/punctuation.rs"));
+        assert!(stored.contains("/mnt/foo\\ /sandbox/escaped-space.rs"));
+        assert!(stored.contains("# env-dep:ASSET=/mnt/sandbox/asset.txt"));
+        assert!(stored.contains("__kache_base_dir_0__/owned.rs"));
+    }
+
+    #[test]
+    fn portable_home_root_does_not_steal_nested_workspace_paths() {
+        let producer_roots = [(
+            PathBuf::from("/home/alice"),
+            "__kache_home__/".to_string(),
+            1,
+        )];
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            "out: /home/alice/project/src/lib.rs /home/alice/shared/schema.json\n",
+            Path::new("/target"),
+            Path::new("/home/alice/project"),
+            Some(Path::new("/home/alice/project")),
+            &producer_roots,
+            DepInfoMode::Relativize,
+        );
+        assert!(stored.contains("__kache_cwd__/src/lib.rs"), "{stored}");
+        assert!(
+            stored.contains("__kache_home__/shared/schema.json"),
+            "{stored}"
+        );
+
+        let consumer_roots = [(
+            PathBuf::from("/Users/bob"),
+            "__kache_home__/".to_string(),
+            1,
+        )];
+        let restored = rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            Path::new("/other-target"),
+            Path::new("/Users/bob/project"),
+            Some(Path::new("/Users/bob/project")),
+            &consumer_roots,
+            DepInfoMode::Expand,
+        );
+        assert!(restored.contains("/Users/bob/project/src/lib.rs"));
+        assert!(restored.contains("/Users/bob/shared/schema.json"));
+        assert!(!restored.contains("/home/alice"));
+    }
+
+    #[test]
+    fn depinfo_prefix_replacement_can_match_windows_ascii_case_aliases() {
+        assert_eq!(
+            replace_depinfo_text(
+                r"c:\\WORKTREE\\src\\lib.rs",
+                r"C:\\worktree\\",
+                DEPINFO_CWD_SENTINEL,
+                true,
+                DepInfoTextContext::MakeLine,
+            ),
+            r"__kache_cwd__/src\\lib.rs"
+        );
+        assert_eq!(
+            replace_depinfo_text(
+                "unrelated",
+                "C:\\worktree\\",
+                DEPINFO_CWD_SENTINEL,
+                true,
+                DepInfoTextContext::MakeLine,
+            ),
+            "unrelated"
+        );
+        assert_eq!(
+            replace_depinfo_text(
+                r"c:\WORKTREE\",
+                r"C:\worktree\",
+                DEPINFO_CWD_SENTINEL,
+                true,
+                DepInfoTextContext::MakeLine,
+            ),
+            DEPINFO_CWD_SENTINEL,
+            "a case-insensitive match ending exactly at EOF must be replaced"
+        );
+        assert_eq!(
+            replace_depinfo_text(
+                r"keep c:\WORKTREE\src\lib.rs and C:\worktree\asset.txt",
+                r"C:\worktree\",
+                DEPINFO_CWD_SENTINEL,
+                true,
+                DepInfoTextContext::MakeLine,
+            ),
+            r"keep __kache_cwd__/src\lib.rs and __kache_cwd__/asset.txt"
+        );
+    }
+
+    #[test]
+    fn windows_depinfo_prefixes_retain_drive_and_unc_verbatim_aliases() {
+        let drive = depinfo_prefixes_for_display(r"\\?\C:\Work", true, true);
+        assert!(drive.contains(&r"C:\Work\".to_string()));
+        assert!(drive.contains(&r"\\?\C:\Work\".to_string()));
+        assert!(drive.contains(&r"C:\Work/".to_string()));
+        assert!(drive.contains(&r"\\?\C:\Work/".to_string()));
+
+        let unc = depinfo_prefixes_for_display(r"\\?\UNC\server\share\root", true, true);
+        assert!(unc.contains(&r"\\server\share\root\".to_string()));
+        assert!(unc.contains(&r"\\?\UNC\server\share\root\".to_string()));
+
+        let expand = depinfo_prefixes_for_display(r"\\?\C:\Work", false, true);
+        assert!(!expand.iter().any(|prefix| prefix.starts_with(r"\\?\")));
+        assert!(expand.iter().all(|prefix| prefix.starts_with(r"C:\Work")));
+    }
+
+    #[test]
+    fn configured_windows_roots_keep_verbatim_and_plain_slots_distinct() {
+        let verbatim_drive = depinfo_prefixes_for_exact_display(r"\\?\C:\Work", true);
+        assert_eq!(verbatim_drive.len(), 2);
+        assert!(verbatim_drive.contains(&r"\\?\C:\Work/".to_string()));
+        assert!(verbatim_drive.contains(&r"\\?\C:\Work\".to_string()));
+        assert!(
+            verbatim_drive
+                .iter()
+                .all(|prefix| prefix.starts_with(r"\\?\"))
+        );
+        assert!(
+            !verbatim_drive
+                .iter()
+                .any(|prefix| prefix.starts_with(r"C:\Work"))
+        );
+
+        let verbatim_unc = depinfo_prefixes_for_exact_display(r"\\?\UNC\server\share", true);
+        assert_eq!(verbatim_unc.len(), 2);
+        assert!(verbatim_unc.contains(&r"\\?\UNC\server\share/".to_string()));
+        assert!(verbatim_unc.contains(&r"\\?\UNC\server\share\".to_string()));
+        assert!(
+            verbatim_unc
+                .iter()
+                .all(|prefix| prefix.starts_with(r"\\?\UNC\server\share"))
+        );
+        assert!(
+            !verbatim_unc
+                .iter()
+                .any(|prefix| prefix.starts_with(r"\\server\share"))
+        );
+
+        let input = r"out: \\?\C:\Work\src\verbatim.rs C:\Work\src\plain.rs \\?\UNC\server\share\src\verbatim_unc.rs \\server\share\src\plain_unc.rs";
+        let producer_roots = [
+            (
+                PathBuf::from(r"\\?\C:\Work"),
+                "__kache_base_dir_0__/".to_string(),
+            ),
+            (
+                PathBuf::from(r"C:\Work"),
+                "__kache_base_dir_1__/".to_string(),
+            ),
+            (
+                PathBuf::from(r"\\?\UNC\server\share"),
+                "__kache_base_dir_2__/".to_string(),
+            ),
+            (
+                PathBuf::from(r"\\server\share"),
+                "__kache_base_dir_3__/".to_string(),
+            ),
+        ];
+        let stored = producer_roots
+            .iter()
+            .fold(input.to_string(), |content, (root, sentinel)| {
+                rewrite_depinfo_content_with_exact_sentinel_for_platform(
+                    &content,
+                    root,
+                    sentinel,
+                    DepInfoMode::Relativize,
+                    true,
+                )
+            });
+        assert!(
+            stored.contains(r"__kache_base_dir_0__/src\verbatim.rs"),
+            "{stored}"
+        );
+        assert!(
+            stored.contains(r"__kache_base_dir_1__/src\plain.rs"),
+            "{stored}"
+        );
+        assert!(
+            stored.contains(r"__kache_base_dir_2__/src\verbatim_unc.rs"),
+            "{stored}"
+        );
+        assert!(
+            stored.contains(r"__kache_base_dir_3__/src\plain_unc.rs"),
+            "{stored}"
+        );
+
+        let consumer_roots = [
+            (
+                PathBuf::from(r"\\?\D:\Other"),
+                "__kache_base_dir_0__/".to_string(),
+            ),
+            (
+                PathBuf::from(r"D:\Other"),
+                "__kache_base_dir_1__/".to_string(),
+            ),
+            (
+                PathBuf::from(r"\\?\UNC\server2\share2"),
+                "__kache_base_dir_2__/".to_string(),
+            ),
+            (
+                PathBuf::from(r"\\server2\share2"),
+                "__kache_base_dir_3__/".to_string(),
+            ),
+        ];
+        let restored = consumer_roots
+            .iter()
+            .fold(stored, |content, (root, sentinel)| {
+                rewrite_depinfo_content_with_exact_sentinel_for_platform(
+                    &content,
+                    root,
+                    sentinel,
+                    DepInfoMode::Expand,
+                    true,
+                )
+            });
+        assert!(restored.contains(r"\\?\D:\Other\src\verbatim.rs"));
+        assert!(restored.contains(r"D:\Other\src\plain.rs"));
+        assert!(restored.contains(r"\\?\UNC\server2\share2\src\verbatim_unc.rs"));
+        assert!(restored.contains(r"\\server2\share2\src\plain_unc.rs"));
+        assert!(!restored.contains(r"C:\Work"));
+        assert!(!restored.contains(r"\\server\share"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn rustc_depinfo_rewrite_handles_native_windows_cwd_and_env_dep() {
+        let input = "D:\\WORK TREE\\target\\debug\\deps\\demo.d: \
+D:\\WORK TREE\\crate\\src\\lib.rs\n\
+# env-dep:ASSET=D:\\\\WORK TREE\\\\crate\\\\asset.txt\n";
+        let stored = rewrite_rustc_depinfo_content(
+            input,
+            Path::new(r"d:\work tree\target"),
+            Path::new(r"d:\work tree\crate"),
+            Some(Path::new(r"d:\work tree")),
+            DepInfoMode::Relativize,
+        );
+        assert!(stored.contains("__kache_root__/debug\\deps\\demo.d"));
+        assert!(stored.contains("__kache_cwd__/src\\lib.rs"));
+        assert!(stored.contains("# env-dep:ASSET=__kache_cwd__/asset.txt"));
+        assert!(!stored.to_ascii_lowercase().contains(r"d:\work tree"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn depinfo_relativize_matches_a_canonical_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-target");
+        let alias = dir.path().join("target-alias");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let canonical = real.canonicalize().unwrap();
+        let input = format!(
+            "{}/debug/demo.d: {}/debug/input.rs\n",
+            canonical.display(),
+            canonical.display()
+        );
+
+        let stored = rewrite_depinfo_content(&input, &alias, DepInfoMode::Relativize);
+        assert_eq!(stored.matches(DEPINFO_ROOT_SENTINEL).count(), 2, "{stored}");
+        assert!(!stored.contains(canonical.to_str().unwrap()), "{stored}");
     }
 
     /// kunobi-ninja/kache#330: Windows dep-info uses backslash separators and

@@ -51,6 +51,16 @@ fn rustc_sysroot() -> String {
 /// Compile a trivial rlib through kache-as-RUSTC_WRAPPER with `extra` flags
 /// appended to the rustc argv. Asserts the compile succeeds.
 fn run_kache_rustc(cache_dir: &Path, out_dir: &Path, src: &Path, extra: &[&str]) {
+    run_kache_rustc_from(cache_dir, out_dir, src, extra, None);
+}
+
+fn run_kache_rustc_from(
+    cache_dir: &Path,
+    out_dir: &Path,
+    src: &Path,
+    extra: &[&str],
+    cwd: Option<&Path>,
+) {
     let mut args: Vec<String> = vec![
         rustc_path(),
         "--crate-name".into(),
@@ -66,15 +76,18 @@ fn run_kache_rustc(cache_dir: &Path, out_dir: &Path, src: &Path, extra: &[&str])
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
 
-    let output = std::process::Command::new(kache_binary())
+    let mut command = std::process::Command::new(kache_binary());
+    command
         .args(&args)
         .env("KACHE_CACHE_DIR", cache_dir)
         .env("KACHE_CONFIG", isolated_config_path(cache_dir))
         .env("KACHE_LOG", "kache=info")
         .env_remove("RUSTC_WRAPPER")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-        .output()
-        .expect("failed to run kache rustc");
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command.output().expect("failed to run kache rustc");
 
     assert!(
         output.status.success(),
@@ -207,16 +220,41 @@ fn direct_remap_path_prefix_changes_cache_key() {
     let portable_b = format!("--remap-path-prefix={}=/virtual/a", root_b.display());
     let different_target_b = format!("--remap-path-prefix={}=/virtual/b", root_b.display());
 
-    run_kache_rustc(
+    run_kache_rustc_from(
         cache_dir.path(),
         &out_a,
         &src_a,
         &["--remap-path-prefix", &map_a],
+        Some(&root_a),
     ); // miss
-    run_kache_rustc(cache_dir.path(), &out_a, &src_a, &[&attached_a]); // hit
-    run_kache_rustc(cache_dir.path(), &out_a, &src_a, &[&nonmatching_a]); // miss
-    run_kache_rustc(cache_dir.path(), &out_b, &src_b, &[&portable_b]); // hit
-    run_kache_rustc(cache_dir.path(), &out_b, &src_b, &[&different_target_b]); // miss
+    run_kache_rustc_from(
+        cache_dir.path(),
+        &out_a,
+        &src_a,
+        &[&attached_a],
+        Some(&root_a),
+    ); // hit
+    run_kache_rustc_from(
+        cache_dir.path(),
+        &out_a,
+        &src_a,
+        &[&nonmatching_a],
+        Some(&root_a),
+    ); // miss
+    run_kache_rustc_from(
+        cache_dir.path(),
+        &out_b,
+        &src_b,
+        &[&portable_b],
+        Some(&root_b),
+    ); // hit
+    run_kache_rustc_from(
+        cache_dir.path(),
+        &out_b,
+        &src_b,
+        &[&different_target_b],
+        Some(&root_b),
+    ); // miss
 
     assert_eq!(
         compiled_hit_counts(cache_dir.path()),
@@ -338,5 +376,102 @@ fn colocated_extra_input_changes_cache_key() {
         (2, 1),
         "editing a declared extra input must diverge the key; the pre-feature \
          behavior (ignoring it) would falsely hit and show compiled=1, hits=2"
+    );
+}
+
+/// #760: source identity is the path-to-content mapping, not merely the
+/// unordered multiset of source bytes. Swapping two module bodies keeps the
+/// byte multiset unchanged but changes which module owns each definition, so
+/// the third invocation must compile instead of restoring the first artifact.
+#[test]
+fn swapping_module_contents_changes_cache_key() {
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let crate_dir = TempDir::new().unwrap();
+    let src = crate_dir.path().join("lib.rs");
+    let module_a = crate_dir.path().join("a.rs");
+    let module_b = crate_dir.path().join("b.rs");
+    let body_a = b"pub const VALUE: u8 = 1;\n";
+    let body_b = b"pub const VALUE: u8 = 2;\n";
+
+    std::fs::write(
+        &src,
+        b"mod a;\nmod b;\npub fn values() -> (u8, u8) { (a::VALUE, b::VALUE) }\n",
+    )
+    .unwrap();
+    std::fs::write(&module_a, body_a).unwrap();
+    std::fs::write(&module_b, body_b).unwrap();
+
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &[]); // miss
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &[]); // hit
+
+    std::fs::write(&module_a, body_b).unwrap();
+    std::fs::write(&module_b, body_a).unwrap();
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &[]); // must miss
+
+    assert_eq!(
+        compiled_hit_counts(cache_dir.path()),
+        (2, 1),
+        "swapping equal-multiset module contents must not restore the artifact for the old path mapping"
+    );
+}
+
+/// Linux filesystems can distinguish canonically equivalent Unicode names.
+/// Normalizing path identity to NFC would merge those names, so swapping their
+/// contents would preserve the sorted source records and recreate #760.
+#[test]
+#[cfg(target_os = "linux")]
+fn unicode_distinct_source_names_remain_distinct() {
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let crate_dir = TempDir::new().unwrap();
+    let src = crate_dir.path().join("lib.rs");
+    let nfc = "\u{e9}.txt";
+    let nfd = "e\u{301}.txt";
+    let body_a = b"alpha";
+    let body_b = b"bravo";
+
+    std::fs::write(
+        &src,
+        format!(
+            "pub static A: &[u8] = include_bytes!({nfc:?});\n\
+             pub static B: &[u8] = include_bytes!({nfd:?});\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(crate_dir.path().join(nfc), body_a).unwrap();
+    std::fs::write(crate_dir.path().join(nfd), body_b).unwrap();
+
+    run_kache_rustc_from(
+        cache_dir.path(),
+        out.path(),
+        &src,
+        &[],
+        Some(crate_dir.path()),
+    );
+    run_kache_rustc_from(
+        cache_dir.path(),
+        out.path(),
+        &src,
+        &[],
+        Some(crate_dir.path()),
+    );
+
+    std::fs::write(crate_dir.path().join(nfc), body_b).unwrap();
+    std::fs::write(crate_dir.path().join(nfd), body_a).unwrap();
+    run_kache_rustc_from(
+        cache_dir.path(),
+        out.path(),
+        &src,
+        &[],
+        Some(crate_dir.path()),
+    );
+
+    assert_eq!(
+        compiled_hit_counts(cache_dir.path()),
+        (2, 1),
+        "filesystem-distinct Unicode source names must remain distinct key identities"
     );
 }

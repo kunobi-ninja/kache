@@ -203,7 +203,14 @@ use std::path::{Path, PathBuf};
 // old unescaped `Expand` and re-corrupts it. Both directions share key v24, so
 // only a bump makes them unreachable. Cost is one cold rebuild, which v0.13.0
 // users (key v22) already pay crossing to this release regardless.
-pub(crate) const CACHE_KEY_VERSION: u32 = 25;
+//
+// v26 (kunobi-ninja/kache#760): source identity now folds each normalized path
+// together with its content hash. v25 retained only the sorted multiset of
+// contents, so swapping two module bodies (or renaming an include_dir asset)
+// could preserve the key while changing the compiled program. The same bump
+// also makes old dep-info blobs that retain donor-worktree absolute paths
+// unreachable; v26 stores separate target/cwd sentinels and re-roots both.
+pub(crate) const CACHE_KEY_VERSION: u32 = 26;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -739,6 +746,27 @@ pub fn take_last_key_unit_id() -> Option<String> {
     LAST_KEY_UNIT_ID.lock().ok().and_then(|mut g| g.take())
 }
 
+/// Stable identity for one dep-info source path.
+///
+/// Cargo/worktree-local roots use the same rule rustc receives through
+/// `--remap-path-prefix`. Keep the dep-info spelling intact: canonicalizing a
+/// symlink would merge two spellings even though rustc may embed them
+/// differently through `file!()` or debug info. An unmodeled spelling stays
+/// deliberately path-local through an opaque, lossless-OS-byte digest.
+fn source_path_identity(file: &Path, path_normalizer: &PathNormalizer) -> Result<Vec<u8>> {
+    if let Some(identity) = path_normalizer.source_path_identity(file) {
+        return Ok(identity);
+    }
+
+    // Preserve the exact dep-info OS representation before hashing. Lossy
+    // UTF-8, NFC normalization, or canonicalization can merge distinct source
+    // spellings and recreate #760.
+    let mut opaque = blake3::Hasher::new();
+    opaque.update(b"kache-source-path-v1\0");
+    opaque.update(&env_os_key_bytes(file.as_os_str()));
+    Ok(format!("<OPAQUE_PATH>/{}", opaque.finalize().to_hex()).into_bytes())
+}
+
 /// Compute the blake3 cache key for a rustc invocation.
 ///
 /// The key captures everything that affects compilation output:
@@ -999,40 +1027,27 @@ pub fn compute_cache_key(
     // ── Group A: source files + env deps (from dep-info pre-pass) ──
     hasher.set_group("sources");
     if let Some(dep_info) = &dep_info {
-        // Hash source files in CONTENT-HASH order, not path order. Only
-        // the content hash enters the key (not the path), so the set of
-        // contents is what matters — and `dep_info.source_files` is
-        // sorted by absolute path, which is NOT path-independent: a
-        // build-script-generated file under `OUT_DIR` sorts among the
-        // registry sources differently once the build tree moves (e.g.
-        // `C:\Windows\...\tmp\...` vs `C:\actions-runner\...`), flipping
-        // the update order and changing the key — so a relocated build
-        // missed (kunobi-ninja/kache#201). Sorting by hash makes the
-        // order depend only on contents.
-        let mut hashed: Vec<(String, &std::path::Path)> =
-            Vec::with_capacity(dep_info.source_files.len());
+        // A source is identified by its stable normalized path and bytes.
+        // Hashing only a sorted content multiset lets swapping modules/assets
+        // preserve the key while changing semantics (#760). Matched paths use
+        // stable sentinels for relocation (#201); unmatched paths stay local
+        // rather than risk a false hit.
+        let mut hashed: Vec<(Vec<u8>, String)> = Vec::with_capacity(dep_info.source_files.len());
         for file in &dep_info.source_files {
-            match file_hasher.hash(file) {
-                Ok(file_hash) => hashed.push((file_hash, file.as_path())),
-                Err(e) => {
-                    tracing::warn!(
-                        "[key:{}] failed to hash source {}: {}",
-                        crate_name,
-                        file.display(),
-                        e
-                    );
-                }
-            }
+            let file_hash = file_hasher
+                .hash(file)
+                .with_context(|| format!("hashing source identity {}", file.display()))?;
+            let normalized_path = source_path_identity(file, path_normalizer)?;
+            hashed.push((normalized_path, file_hash));
         }
         hashed.sort();
-        for (file_hash, file) in &hashed {
-            hasher.update(b"source:");
-            hasher.update(file_hash.as_bytes());
-            hasher.update(b"\n");
+        for (normalized_path, file_hash) in &hashed {
+            fold_field(&mut hasher, b"source_path:", normalized_path);
+            fold_field(&mut hasher, b"source_hash:", file_hash.as_bytes());
             tracing::trace!(
                 "[key:{}] source:{}={}",
                 crate_name,
-                file.display(),
+                String::from_utf8_lossy(normalized_path),
                 &file_hash[..16]
             );
         }
@@ -1477,7 +1492,7 @@ pub fn compute_cache_key(
 /// working directory; `decl_file`s under the workspace / `$CARGO_TARGET_DIR` /
 /// `$CARGO_HOME` / `$RUSTUP_HOME` / `$HOME` / the tempdir / a build-script
 /// `OUT_DIR`). Without this fold the rest of `compute_cache_key` normalizes
-/// those path inputs to sentinels and hashes source by content, leaving the
+/// those path inputs to sentinels and hashes source by normalized path/content,
 /// `remap:none` key path-independent and letting a shared cache hand one
 /// checkout's real-path artifact to another (kunobi-ninja/kache#480 for the
 /// opt-out; the same hazard for coverage).
@@ -3483,6 +3498,89 @@ mod tests {
 
     const GNU_RUSTC_VERSION: &str =
         "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
+
+    #[test]
+    fn source_identity_uses_a_stable_configured_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        let source = checkout.join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub fn value() {}\n").unwrap();
+        let normalizer =
+            PathNormalizer::empty().with_base_dirs(&[checkout.to_string_lossy().into_owned()]);
+
+        let mut expected = b"<BASE_DIR_0>/".to_vec();
+        expected.extend_from_slice(
+            source
+                .strip_prefix(&checkout)
+                .unwrap()
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        assert_eq!(
+            source_path_identity(&source, &normalizer).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn source_identity_uses_a_configured_external_root_losslessly() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = dir.path().join("external");
+        let source = external.join("generated/value.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub const VALUE: u8 = 1;\n").unwrap();
+        let normalizer =
+            PathNormalizer::empty().with_base_dirs(&[external.to_string_lossy().into_owned()]);
+
+        let mut expected = b"<BASE_DIR_0>/".to_vec();
+        expected.extend_from_slice(
+            source
+                .strip_prefix(&external)
+                .unwrap()
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        assert_eq!(
+            source_path_identity(&source, &normalizer).unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_identity_keeps_distinct_symlink_spellings_of_one_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.rs");
+        let alias = dir.path().join("alias.rs");
+        std::fs::write(&real, "pub const VALUE: u8 = 1;\n").unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let real_identity = source_path_identity(&real, &PathNormalizer::empty()).unwrap();
+        let alias_identity = source_path_identity(&alias, &PathNormalizer::empty()).unwrap();
+        assert_ne!(real_identity, alias_identity);
+        assert!(real_identity.starts_with(b"<OPAQUE_PATH>/"));
+        assert!(alias_identity.starts_with(b"<OPAQUE_PATH>/"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_identity_opaque_fallback_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let external = dir.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let path_a = external.join(std::ffi::OsString::from_vec(vec![b'a', 0x80]));
+        let path_b = external.join(std::ffi::OsString::from_vec(vec![b'a', 0x81]));
+        std::fs::write(&path_a, b"same").unwrap();
+        std::fs::write(&path_b, b"same").unwrap();
+        let identity_a = source_path_identity(&path_a, &PathNormalizer::empty()).unwrap();
+        let identity_b = source_path_identity(&path_b, &PathNormalizer::empty()).unwrap();
+        assert_ne!(identity_a, identity_b);
+        assert!(identity_a.starts_with(b"<OPAQUE_PATH>/"));
+        assert!(identity_b.starts_with(b"<OPAQUE_PATH>/"));
+    }
 
     /// #131 load-bearing invariant: the grouped tee must produce EXACTLY the
     /// digest a plain blake3 hasher produces over the same update sequence —
@@ -7141,6 +7239,7 @@ exec {} \"$@\"\n",
         }
 
         let old_out_dir = std::env::var_os("OUT_DIR");
+        let old_manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
         let dir = tempfile::tempdir().unwrap();
         let workspace_a = dir.path().join("checkout-a");
         let workspace_b = dir.path().join("checkout-b");
@@ -7175,6 +7274,7 @@ pub fn value() -> u8 {
         let out_a = out_a.canonicalize().unwrap();
         unsafe {
             std::env::set_var("OUT_DIR", &out_a);
+            std::env::set_var("CARGO_MANIFEST_DIR", &workspace_a);
         }
         let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
         let pn_a = PathNormalizer::from_env(Some(&workspace_a));
@@ -7183,12 +7283,14 @@ pub fn value() -> u8 {
         let out_b = out_b.canonicalize().unwrap();
         unsafe {
             std::env::set_var("OUT_DIR", &out_b);
+            std::env::set_var("CARGO_MANIFEST_DIR", &workspace_b);
         }
         let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
         let pn_b = PathNormalizer::from_env(Some(&workspace_b));
         let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
 
         restore_env_var("OUT_DIR", old_out_dir);
+        restore_env_var("CARGO_MANIFEST_DIR", old_manifest_dir);
 
         assert_eq!(
             key_a, key_b,

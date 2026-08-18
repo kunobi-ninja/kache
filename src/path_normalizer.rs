@@ -129,6 +129,10 @@ struct Rule {
     /// Key portability depends on this; unchanged from the original
     /// single-sentinel design.
     key_sentinel: String,
+    /// Source-key owner. Usually identical to `key_sentinel`, except the
+    /// process CWD and workspace root need distinct identities even though
+    /// rustc remaps both to the same debug-path target.
+    source_sentinel: String,
     /// Absolute, profiler-resolvable path injected into rustc
     /// `--remap-path-prefix` by [`PathNormalizer::remap_args`] so the spelling
     /// baked into debug info is resolvable by samply / the Firefox Profiler and
@@ -136,6 +140,24 @@ struct Rule {
     /// from `key_sentinel` so debug-info resolvability and cache-key portability
     /// evolve independently (kunobi-ninja/kache#480, #485).
     flag_target: String,
+}
+
+/// A user-configured source root that can be represented losslessly in source
+/// keys and round-tripped through rustc dep-info.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredSourceRoot {
+    pub root: PathBuf,
+    pub key_sentinel: String,
+    pub depinfo_sentinel: String,
+    pub priority: u8,
+}
+
+#[derive(Debug, Clone)]
+struct ConfiguredSourceRootGroup {
+    restore_root: PathBuf,
+    aliases: Vec<PathBuf>,
+    key_sentinel: String,
+    depinfo_sentinel: String,
 }
 
 /// Replaces machine-local path prefixes with stable sentinels so
@@ -153,6 +175,14 @@ pub struct PathNormalizer {
     /// from the expanded/deduplicated rules: two configured symlinks may
     /// resolve to the same prefix without ceasing to be two configured slots.
     configured_base_dir_count: usize,
+    /// Existing configured roots grouped by stable slot. The lexical root is
+    /// always emitted first for dep-info expansion; canonical/Windows aliases
+    /// are accepted only while relativizing producer paths.
+    configured_source_root_groups: Vec<ConfiguredSourceRootGroup>,
+    /// Lexical consumer root for automatic owners whose rule list also carries
+    /// canonical, Unicode, Windows, or 8.3 aliases. Key/remap matching may use
+    /// any alias; dep-info expansion must return to this designated spelling.
+    source_restore_roots: Vec<(String, PathBuf)>,
     /// Plain env vars and scoped `rustc_crate_name:VAR` assertions opted into
     /// path-only cache-key normalization. See
     /// [`crate::config::Config::path_only_env_vars`].
@@ -191,6 +221,7 @@ impl PathNormalizer {
     /// flow through tempdirs.
     pub fn from_env(workspace_root: Option<&Path>) -> Self {
         let mut rules = Vec::new();
+        let mut source_restore_roots = Vec::new();
 
         // User-declared base dir (`KACHE_BASE_DIR`, the analog of ccache's
         // `CCACHE_BASEDIR`). Highest priority — an explicit prefix the
@@ -198,33 +229,42 @@ impl PathNormalizer {
         // checkout location. Covers paths the auto-derived rules below
         // can't see (container mounts, generated-file env-deps that point
         // outside the workspace, etc.).
-        push_rule_with_variants(
+        let legacy_base_dir = std::env::var_os("KACHE_BASE_DIR");
+        push_legacy_base_dir_rules(
             &mut rules,
-            std::env::var_os("KACHE_BASE_DIR")
-                .filter(|v| !v.is_empty())
-                .and_then(|v| canonical_string(Path::new(&v))),
-            "<BASE_DIR>",
+            &mut source_restore_roots,
+            legacy_base_dir.as_deref(),
         );
 
-        push_rule_with_variants(
-            &mut rules,
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| canonical_string(&p)),
-            "<WORKSPACE>",
-        );
+        if let Ok(current_dir) = std::env::current_dir() {
+            push_path_rule_aliases(
+                &mut rules,
+                &mut source_restore_roots,
+                &current_dir,
+                "<WORKSPACE>",
+                "<CWD>",
+            );
+        }
 
-        push_rule_with_variants(
-            &mut rules,
-            workspace_root.and_then(canonical_string),
-            "<WORKSPACE>",
-        );
+        if let Some(workspace_root) = workspace_root {
+            push_path_rule_aliases(
+                &mut rules,
+                &mut source_restore_roots,
+                workspace_root,
+                "<WORKSPACE>",
+                "<WORKSPACE>",
+            );
+        }
 
-        push_rule_with_variants(
-            &mut rules,
-            std::env::var_os("CARGO_TARGET_DIR").and_then(|p| canonical_string(Path::new(&p))),
-            "<TARGET>",
-        );
+        if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
+            push_path_rule_aliases(
+                &mut rules,
+                &mut source_restore_roots,
+                Path::new(&target_dir),
+                "<TARGET>",
+                "<TARGET>",
+            );
+        }
 
         // CARGO_HOME defaults to $HOME/.cargo if not set; honor that
         // so users with the default layout still get the substitution.
@@ -298,6 +338,8 @@ impl PathNormalizer {
         Self {
             rules,
             configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots,
             path_only_env_vars: Vec::new(),
         }
     }
@@ -317,8 +359,8 @@ impl PathNormalizer {
     /// Within this explicit list, longer prefixes are placed first so an
     /// overlapping child root wins over its parent.
     pub fn with_base_dirs(mut self, base_dirs: &[String]) -> Self {
-        let (configured_count, mut extra_rules) = configured_base_dir_rules(base_dirs);
-        self.configured_base_dir_count = configured_count;
+        let (configured, mut extra_rules) = configured_base_dir_rules(base_dirs);
+        self.configured_base_dir_count = configured.len();
 
         let legacy_prefixes: std::collections::HashSet<String> = self
             .rules
@@ -343,6 +385,39 @@ impl PathNormalizer {
         let mut seen = std::collections::HashSet::new();
         extra_rules.retain(|rule| seen.insert(rule.prefix.clone()));
         self.rules = extra_rules;
+        self.configured_source_root_groups = configured
+            .iter()
+            .enumerate()
+            .filter_map(|(index, lexical)| {
+                let restore_root = PathBuf::from(lexical);
+                if !restore_root.exists() {
+                    return None;
+                }
+                let key_sentinel = configured_base_dir_sentinel(index);
+                if self
+                    .source_rule_for_path(&restore_root)
+                    .is_none_or(|winner| winner.key_sentinel != key_sentinel)
+                {
+                    return None;
+                }
+                let depinfo_sentinel = format!("__kache_base_dir_{index}__/");
+                let aliases = self
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.key_sentinel == key_sentinel)
+                    .filter(|rule| is_native_configured_path(&rule.prefix))
+                    .filter(|rule| rule.prefix != *lexical)
+                    .map(|rule| PathBuf::from(&rule.prefix))
+                    .filter(|alias| alias.exists())
+                    .collect();
+                Some(ConfiguredSourceRootGroup {
+                    restore_root,
+                    aliases,
+                    key_sentinel,
+                    depinfo_sentinel,
+                })
+            })
+            .collect();
         self
     }
 
@@ -375,6 +450,145 @@ impl PathNormalizer {
             .iter()
             .map(|r| r.prefix.as_str())
             .filter(|p| !p.is_empty())
+    }
+
+    /// Existing configured roots with raw OS-path identity preserved.
+    ///
+    /// Non-existent cross-platform entries remain useful for flag remapping
+    /// but cannot contain a source in this invocation, so they are omitted.
+    /// Each returned spelling is an actual winning rustc remap rule. Do not
+    /// canonicalize or merge them: a configured symlink and its target may be
+    /// distinct configured slots, and dep-info must retain that ownership.
+    pub(crate) fn depinfo_source_roots(&self) -> Vec<ConfiguredSourceRoot> {
+        let mut groups = self.configured_source_root_groups.clone();
+        for source_sentinel in [
+            "<CWD>",
+            "<WORKSPACE>",
+            "<TARGET>",
+            "<CARGO_HOME>",
+            "<BASE_DIR>",
+            "<RUSTUP_HOME>",
+            "<HOME>",
+            "<APPDATA>",
+            "<LOCALAPPDATA>",
+            "<PROGRAMFILES>",
+            "<TMPDIR>",
+        ] {
+            let owned_rules = self
+                .rules
+                .iter()
+                .filter(|rule| rule.source_sentinel == source_sentinel)
+                .filter(|rule| is_native_configured_path(&rule.prefix))
+                .filter(|rule| Path::new(&rule.prefix).exists())
+                .collect::<Vec<_>>();
+            let designated = self
+                .source_restore_roots
+                .iter()
+                .find(|(sentinel, _)| sentinel == source_sentinel)
+                .map(|(_, root)| root.clone());
+            let restore_root = designated
+                .and_then(|root| {
+                    self.source_rule_for_path(&root)
+                        .is_some_and(|rule| rule.source_sentinel == source_sentinel)
+                        .then_some(root)
+                })
+                .or_else(|| {
+                    owned_rules.iter().find_map(|rule| {
+                        let root = PathBuf::from(&rule.prefix);
+                        self.source_rule_for_path(&root)
+                            .is_some_and(|winner| winner.source_sentinel == source_sentinel)
+                            .then_some(root)
+                    })
+                });
+            if let Some(restore_root) = restore_root {
+                let restore_spelling = restore_root.as_os_str();
+                let aliases = owned_rules
+                    .iter()
+                    .filter(|rule| {
+                        self.source_rule_for_path(Path::new(&rule.prefix))
+                            .is_some_and(|winner| winner.source_sentinel == source_sentinel)
+                    })
+                    .filter(|rule| std::ffi::OsStr::new(&rule.prefix) != restore_spelling)
+                    .map(|rule| PathBuf::from(&rule.prefix))
+                    .collect();
+                let Some(key_sentinel) = self
+                    .source_rule_for_path(&restore_root)
+                    .map(|rule| rule.key_sentinel.clone())
+                else {
+                    continue;
+                };
+                groups.push(ConfiguredSourceRootGroup {
+                    restore_root,
+                    aliases,
+                    key_sentinel,
+                    depinfo_sentinel: depinfo_sentinel_for_source(source_sentinel)
+                        .expect("listed source roots have dep-info sentinels"),
+                });
+            }
+        }
+        groups.sort_by_key(|group| {
+            let longest = std::iter::once(&group.restore_root)
+                .chain(group.aliases.iter())
+                .map(|root| root.as_os_str().len())
+                .max()
+                .unwrap_or_default();
+            std::cmp::Reverse((flag_emit_rank(&group.key_sentinel), longest))
+        });
+        groups
+            .into_iter()
+            .flat_map(|group| {
+                let key_sentinel = group.key_sentinel;
+                let depinfo_sentinel = group.depinfo_sentinel;
+                std::iter::once(group.restore_root)
+                    .chain(group.aliases)
+                    .map(move |root| ConfiguredSourceRoot {
+                        root,
+                        key_sentinel: key_sentinel.clone(),
+                        depinfo_sentinel: depinfo_sentinel.clone(),
+                        priority: flag_emit_rank(&key_sentinel),
+                    })
+            })
+            .collect()
+    }
+
+    /// Lossless source identity matching the rule rustc will actually apply.
+    ///
+    /// `remap_args` is last-match-wins by semantic rank, then prefix length.
+    /// Reusing that exact ordering prevents a key from collapsing paths that
+    /// rustc embeds differently (notably nested target/workspace roots).
+    /// Non-UTF-8 or unmatched paths return `None` so callers can bind an opaque
+    /// machine-local identity instead of guessing.
+    pub(crate) fn source_path_identity(&self, path: &Path) -> Option<Vec<u8>> {
+        let input = path.as_os_str().to_str()?;
+        let winner = self.source_rule_for_path(path)?;
+        depinfo_sentinel_for_source(&winner.source_sentinel)?;
+        let remainder = input.strip_prefix(&winner.prefix)?;
+        let remainder = remainder
+            .strip_prefix('/')
+            .or_else(|| remainder.strip_prefix('\\'))
+            .unwrap_or(remainder);
+        let mut identity = winner.source_sentinel.as_bytes().to_vec();
+        if !remainder.is_empty() {
+            identity.push(b'/');
+            identity.extend_from_slice(remainder.as_bytes());
+        }
+        Some(identity)
+    }
+
+    fn source_rule_for_path<'a>(&'a self, path: &Path) -> Option<&'a Rule> {
+        let input = path.as_os_str().to_str()?;
+        self.rules
+            .iter()
+            .filter(|rule| !rule.prefix.is_empty())
+            .filter_map(|rule| {
+                input.strip_prefix(&rule.prefix)?;
+                if !configured_prefix_boundaries_match(input, 0, rule.prefix.len(), &rule.prefix) {
+                    return None;
+                }
+                Some((flag_emit_rank(&rule.key_sentinel), rule.prefix.len(), rule))
+            })
+            .max_by_key(|(rank, prefix_len, _)| (*rank, *prefix_len))
+            .map(|(_, _, rule)| rule)
     }
 
     /// Add the toolchain-source rule that re-virtualizes rust std/core paths to
@@ -448,6 +662,8 @@ impl PathNormalizer {
         Self {
             rules: Vec::new(),
             configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: Vec::new(),
             path_only_env_vars: Vec::new(),
         }
     }
@@ -675,11 +891,15 @@ fn flag_emit_rank(key_sentinel: &str) -> u8 {
 /// Otherwise `/a-link -> /z-real` could steal the exact `/z-real` spelling
 /// from a second configured entry and make sentinel assignment depend on
 /// whether the symlink exists on this host.
-fn configured_base_dir_rules(base_dirs: &[String]) -> (usize, Vec<Rule>) {
+fn configured_base_dir_rules(base_dirs: &[String]) -> (Vec<String>, Vec<Rule>) {
     let mut configured = base_dirs.to_vec();
     configured.sort();
     configured.dedup();
-    let configured_count = configured.len();
+    // Production configuration rejects filesystem roots. Keep this builder
+    // fail-safe for direct/test callers too: mapping `/` or `C:/` would erase
+    // every absolute-path distinction and cannot be safely represented in
+    // dep-info with whole-string replacement.
+    configured.retain(|path| !is_filesystem_root_prefix(path));
 
     let mut lexical_rules = Vec::new();
     for (index, path) in configured.iter().enumerate() {
@@ -700,16 +920,18 @@ fn configured_base_dir_rules(base_dirs: &[String]) -> (usize, Vec<Rule>) {
         if !is_native_configured_path(path) {
             continue;
         }
-        let Some(canonical) = canonical_string(Path::new(path)) else {
+        let Ok(canonical) = Path::new(path).canonicalize() else {
             continue;
         };
-        if canonical == lexical {
-            continue;
+        for canonical in os_path_spellings(&canonical) {
+            if canonical == lexical {
+                continue;
+            }
+            let mut candidates = Vec::new();
+            push_configured_base_dir_rule(&mut candidates, canonical, index);
+            candidates.retain(|rule| !reserved_lexical.contains(&rule.prefix));
+            alias_rules.extend(candidates);
         }
-        let mut candidates = Vec::new();
-        push_configured_base_dir_rule(&mut candidates, canonical, index);
-        candidates.retain(|rule| !reserved_lexical.contains(&rule.prefix));
-        alias_rules.extend(candidates);
     }
 
     lexical_rules.extend(alias_rules);
@@ -723,7 +945,7 @@ fn configured_base_dir_rules(base_dirs: &[String]) -> (usize, Vec<Rule>) {
     });
     let mut seen = std::collections::HashSet::new();
     lexical_rules.retain(|rule| seen.insert(rule.prefix.clone()));
-    (configured_count, lexical_rules)
+    (configured, lexical_rules)
 }
 
 fn push_configured_base_dir_rule(rules: &mut Vec<Rule>, prefix: String, index: usize) {
@@ -735,6 +957,7 @@ fn push_configured_base_dir_rule(rules: &mut Vec<Rule>, prefix: String, index: u
     rules.push(Rule {
         prefix: prefix.clone(),
         key_sentinel: sentinel.clone(),
+        source_sentinel: sentinel.clone(),
         flag_target: target.clone(),
     });
 
@@ -742,16 +965,17 @@ fn push_configured_base_dir_rule(rules: &mut Vec<Rule>, prefix: String, index: u
     // entry's syntax, not the OS running kache. In particular, `/snap` must not
     // gain a `\snap` alias merely because the client runs on Windows.
     if is_windows_absolute_path(&prefix) {
-        push_slash_and_case_variants(rules, &prefix, &sentinel, &target);
+        push_slash_and_case_variants(rules, &prefix, &sentinel, &sentinel, &target);
         if let Some(short) = short_path_name(&prefix)
             && short != prefix
         {
             rules.push(Rule {
                 prefix: short.clone(),
                 key_sentinel: sentinel.clone(),
+                source_sentinel: sentinel.clone(),
                 flag_target: target.clone(),
             });
-            push_slash_and_case_variants(rules, &short, &sentinel, &target);
+            push_slash_and_case_variants(rules, &short, &sentinel, &sentinel, &target);
         }
     }
 }
@@ -801,6 +1025,29 @@ fn configured_base_dir_index(sentinel: &str) -> Option<usize> {
         .strip_suffix('>')?
         .parse()
         .ok()
+}
+
+fn depinfo_sentinel_for_source(source_sentinel: &str) -> Option<String> {
+    if let Some(index) = configured_base_dir_index(source_sentinel) {
+        return Some(format!("__kache_base_dir_{index}__/"));
+    }
+    Some(
+        match source_sentinel {
+            "<CWD>" => "__kache_cwd__/",
+            "<WORKSPACE>" => "__kache_workspace__/",
+            "<TARGET>" => "__kache_target_rule__/",
+            "<CARGO_HOME>" => "__kache_cargo_home__/",
+            "<BASE_DIR>" => "__kache_base_dir__/",
+            "<RUSTUP_HOME>" => "__kache_rustup_home__/",
+            "<HOME>" => "__kache_home__/",
+            "<APPDATA>" => "__kache_appdata__/",
+            "<LOCALAPPDATA>" => "__kache_localappdata__/",
+            "<PROGRAMFILES>" => "__kache_programfiles__/",
+            "<TMPDIR>" => "__kache_tmpdir__/",
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 /// The resolvable `--remap-path-prefix` target for a given cache-key sentinel.
@@ -984,6 +1231,30 @@ fn strip_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+pub(crate) fn is_filesystem_root_prefix(value: &str) -> bool {
+    let value = strip_verbatim_prefix(value);
+    if value == "/" {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() == 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+    {
+        return true;
+    }
+
+    let normalized = value.replace('\\', "/");
+    let Some(unc) = normalized.strip_prefix("//") else {
+        return false;
+    };
+    let mut components = unc.trim_end_matches('/').split('/');
+    components.next().is_some_and(|part| !part.is_empty())
+        && components.next().is_some_and(|part| !part.is_empty())
+        && components.next().is_none()
+}
+
 /// Push a rule + its Windows-shape variants into the rule list.
 ///
 /// On unix, this is just `rules.push(Rule { prefix, sentinel })` —
@@ -1021,6 +1292,91 @@ fn push_rule_with_variants(rules: &mut Vec<Rule>, prefix: Option<String>, sentin
     push_rule_with_variants_target(rules, prefix, sentinel, &flag_target);
 }
 
+fn push_rule_with_variants_source(
+    rules: &mut Vec<Rule>,
+    prefix: Option<String>,
+    sentinel: &str,
+    source_sentinel: &str,
+) {
+    let flag_target = flag_target_for(sentinel);
+    push_rule_with_variants_target_and_source(
+        rules,
+        prefix,
+        sentinel,
+        source_sentinel,
+        &flag_target,
+    );
+}
+
+/// Add lexical and canonical spellings for one automatic source root.
+///
+/// Cargo can pass a lexical root while proc macros canonicalize included
+/// files (`/var` versus `/private/var` on macOS, plain versus `\\?\` on
+/// Windows). Every spelling maps to the same source identity/remap target and
+/// is exposed through [`PathNormalizer::depinfo_source_roots`].
+fn push_path_rule_aliases(
+    rules: &mut Vec<Rule>,
+    source_restore_roots: &mut Vec<(String, PathBuf)>,
+    path: &Path,
+    sentinel: &str,
+    source_sentinel: &str,
+) {
+    let lexical = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    source_restore_roots.push((source_sentinel.to_string(), lexical.clone()));
+    let mut spellings = os_path_spellings(&lexical);
+    if let Ok(canonical) = path.canonicalize()
+        && canonical != lexical
+    {
+        spellings.extend(os_path_spellings(&canonical));
+    }
+    spellings.sort_by_key(|prefix| std::cmp::Reverse(prefix.len()));
+    spellings.dedup();
+    for prefix in spellings {
+        push_rule_with_variants_source(rules, Some(prefix), sentinel, source_sentinel);
+    }
+}
+
+/// Add the legacy explicit source root without letting an empty value or a
+/// filesystem root erase every absolute-path distinction.
+fn push_legacy_base_dir_rules(
+    rules: &mut Vec<Rule>,
+    source_restore_roots: &mut Vec<(String, PathBuf)>,
+    base_dir: Option<&std::ffi::OsStr>,
+) {
+    let Some(base_dir) = base_dir.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let path = Path::new(base_dir);
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let Some(prefix) = absolute.as_os_str().to_str() else {
+        return;
+    };
+    if is_filesystem_root_prefix(prefix) {
+        return;
+    }
+    push_path_rule_aliases(
+        rules,
+        source_restore_roots,
+        path,
+        "<BASE_DIR>",
+        "<BASE_DIR>",
+    );
+}
+
+/// Preserve raw filesystem spelling while also adding the NFC/key form and
+/// the ordinary Windows spelling of a verbatim canonical path.
+fn os_path_spellings(path: &Path) -> Vec<String> {
+    let Some(raw) = path.as_os_str().to_str().filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    let normalized: String = raw.nfc().collect();
+    let stripped = strip_verbatim_prefix(&normalized).into_owned();
+    let mut spellings = vec![raw.to_string(), normalized, stripped];
+    spellings.retain(|spelling| !is_filesystem_root_prefix(spelling));
+    spellings.dedup();
+    spellings
+}
+
 /// As [`push_rule_with_variants`] but with an explicit `flag_target`, for rules
 /// whose target isn't derivable from the sentinel alone (e.g. `<RUST_SRC>` →
 /// `/rustc/<commit-hash>`).
@@ -1028,6 +1384,16 @@ fn push_rule_with_variants_target(
     rules: &mut Vec<Rule>,
     prefix: Option<String>,
     sentinel: &str,
+    flag_target: &str,
+) {
+    push_rule_with_variants_target_and_source(rules, prefix, sentinel, sentinel, flag_target);
+}
+
+fn push_rule_with_variants_target_and_source(
+    rules: &mut Vec<Rule>,
+    prefix: Option<String>,
+    sentinel: &str,
+    source_sentinel: &str,
     flag_target: &str,
 ) {
     let Some(prefix) = prefix else { return };
@@ -1039,6 +1405,7 @@ fn push_rule_with_variants_target(
     rules.push(Rule {
         prefix: prefix.clone(),
         key_sentinel: sentinel.to_string(),
+        source_sentinel: source_sentinel.to_string(),
         flag_target: flag_target.to_string(),
     });
 
@@ -1049,7 +1416,7 @@ fn push_rule_with_variants_target(
         return;
     }
 
-    push_slash_and_case_variants(rules, &prefix, sentinel, flag_target);
+    push_slash_and_case_variants(rules, &prefix, sentinel, source_sentinel, flag_target);
 
     // 8.3 short-name form (issue #126). Resolved once at rule-build
     // time; `None` when the path doesn't exist, has no short name, or
@@ -1061,9 +1428,10 @@ fn push_rule_with_variants_target(
         rules.push(Rule {
             prefix: short.clone(),
             key_sentinel: sentinel.to_string(),
+            source_sentinel: source_sentinel.to_string(),
             flag_target: flag_target.to_string(),
         });
-        push_slash_and_case_variants(rules, &short, sentinel, flag_target);
+        push_slash_and_case_variants(rules, &short, sentinel, source_sentinel, flag_target);
     }
 }
 
@@ -1075,12 +1443,14 @@ fn push_slash_and_case_variants(
     rules: &mut Vec<Rule>,
     prefix: &str,
     sentinel: &str,
+    source_sentinel: &str,
     flag_target: &str,
 ) {
     let push = |rules: &mut Vec<Rule>, p: String| {
         rules.push(Rule {
             prefix: p,
             key_sentinel: sentinel.to_string(),
+            source_sentinel: source_sentinel.to_string(),
             flag_target: flag_target.to_string(),
         });
     };
@@ -1313,9 +1683,12 @@ mod tests {
             rules: vec![Rule {
                 prefix: String::new(),
                 key_sentinel: "<NEVER>".to_string(),
+                source_sentinel: "<NEVER>".to_string(),
                 flag_target: "<NEVER>".to_string(),
             }],
             configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: Vec::new(),
             path_only_env_vars: Vec::new(),
         };
         assert_eq!(n.normalize("hello world"), "hello world");
@@ -1506,9 +1879,12 @@ mod tests {
             rules: vec![Rule {
                 prefix: String::new(),
                 key_sentinel: "<NEVER>".to_string(),
+                source_sentinel: "<NEVER>".to_string(),
                 flag_target: "<NEVER>".to_string(),
             }],
             configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: Vec::new(),
             path_only_env_vars: Vec::new(),
         };
         assert!(n.remap_args().is_empty());
@@ -1629,6 +2005,8 @@ mod tests {
         let n = PathNormalizer {
             rules,
             configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: Vec::new(),
             path_only_env_vars: Vec::new(),
         };
 
@@ -1637,6 +2015,16 @@ mod tests {
         assert!(
             out.contains("<BASE_DIR>"),
             "8.3 short-name input {input:?} should normalize via the short variant, got {out:?}"
+        );
+        assert_eq!(
+            n.source_path_identity(Path::new(&input)).unwrap(),
+            b"<BASE_DIR>/src\\main.rs"
+        );
+        assert!(
+            n.depinfo_source_roots()
+                .iter()
+                .any(|root| root.root == PathBuf::from(&short)),
+            "the same short spelling must be accepted while relativizing dep-info"
         );
     }
 
@@ -1667,6 +2055,8 @@ mod tests {
         let n = PathNormalizer {
             rules,
             configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: Vec::new(),
             path_only_env_vars: Vec::new(),
         };
 
@@ -1730,6 +2120,8 @@ mod tests {
         let names: Vec<_> = rules_for(&PathNormalizer {
             rules,
             configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: Vec::new(),
             path_only_env_vars: Vec::new(),
         })
         .into_iter()
@@ -1786,10 +2178,13 @@ mod tests {
                 .map(|(p, s)| Rule {
                     prefix: p.to_string(),
                     key_sentinel: s.to_string(),
+                    source_sentinel: s.to_string(),
                     flag_target: flag_target_for(s),
                 })
                 .collect(),
             configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: Vec::new(),
             path_only_env_vars: Vec::new(),
         }
     }
@@ -2118,6 +2513,8 @@ mod tests {
         let n = PathNormalizer {
             rules,
             configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: Vec::new(),
             path_only_env_vars: Vec::new(),
         };
         let args = n.remap_args();
@@ -2213,6 +2610,46 @@ mod tests {
         // Plain paths (and all Unix paths) pass through untouched.
         assert_eq!(strip_verbatim_prefix(r"C:\proj\out"), r"C:\proj\out");
         assert_eq!(strip_verbatim_prefix("/home/u/proj"), "/home/u/proj");
+    }
+
+    #[test]
+    fn filesystem_root_prefix_distinguishes_unc_share_roots() {
+        for root in [
+            "//server/share",
+            "//server/share/",
+            r"\\server\share",
+            r"\\server\share\",
+            r"\\?\UNC\server\share",
+        ] {
+            assert!(is_filesystem_root_prefix(root), "{root:?}");
+        }
+        for narrower_or_incomplete in [
+            "//server",
+            "//server/",
+            "///share",
+            "//server/share/app",
+            r"\\server\share\app",
+        ] {
+            assert!(
+                !is_filesystem_root_prefix(narrower_or_incomplete),
+                "{narrower_or_incomplete:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn os_path_spellings_keep_raw_and_plain_verbatim_windows_forms() {
+        assert_eq!(
+            os_path_spellings(Path::new(r"\\?\C:\Work\Root")),
+            vec![r"\\?\C:\Work\Root".to_string(), r"C:\Work\Root".to_string()]
+        );
+        assert_eq!(
+            os_path_spellings(Path::new(r"\\?\UNC\server\share\Root")),
+            vec![
+                r"\\?\UNC\server\share\Root".to_string(),
+                r"\\server\share\Root".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2355,6 +2792,74 @@ mod tests {
         assert!(is_native_configured_path_for(r"\\server\share", true));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn configured_plain_root_owns_verbatim_canonical_sources_and_depinfo() {
+        let producer = TempDir::new().unwrap();
+        let consumer = TempDir::new().unwrap();
+        let producer_root = producer.path().join("Configured Root");
+        let consumer_root = consumer.path().join("Configured Root");
+        std::fs::create_dir_all(producer_root.join("src")).unwrap();
+        std::fs::create_dir_all(consumer_root.join("src")).unwrap();
+        std::fs::write(producer_root.join("src/value.rs"), "pub const V: u8 = 1;").unwrap();
+
+        let producer_cfg = producer_root.to_string_lossy().into_owned();
+        let consumer_cfg = consumer_root.to_string_lossy().into_owned();
+        let producer_normalizer =
+            PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&producer_cfg));
+        let consumer_normalizer =
+            PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&consumer_cfg));
+        let canonical_source = producer_root.join("src/value.rs").canonicalize().unwrap();
+
+        assert_eq!(
+            producer_normalizer
+                .source_path_identity(&canonical_source)
+                .unwrap(),
+            b"<BASE_DIR_0>/src\\value.rs"
+        );
+        assert_eq!(
+            apply_last_match(
+                &producer_normalizer.remap_args(),
+                canonical_source.to_str().unwrap()
+            ),
+            "/kache/base-dir-0\\src\\value.rs"
+        );
+
+        let producer_roots = producer_normalizer
+            .depinfo_source_roots()
+            .into_iter()
+            .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+            .collect::<Vec<_>>();
+        let consumer_roots = consumer_normalizer
+            .depinfo_source_roots()
+            .into_iter()
+            .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+            .collect::<Vec<_>>();
+        let raw = format!(r"C:\target\demo.d: {}", canonical_source.display());
+        let stored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &raw,
+            Path::new(r"C:\target"),
+            Path::new(r"C:\work"),
+            None,
+            &producer_roots,
+            crate::link::DepInfoMode::Relativize,
+        );
+        assert!(
+            stored.contains("__kache_base_dir_0__/src\\value.rs"),
+            "{stored}"
+        );
+        let restored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            Path::new(r"C:\target"),
+            Path::new(r"C:\work"),
+            None,
+            &consumer_roots,
+            crate::link::DepInfoMode::Expand,
+        );
+        assert!(restored.contains(&format!(r"{}\src\value.rs", consumer_root.display())));
+        assert!(!restored.contains(&producer_root.to_string_lossy().into_owned()));
+    }
+
     #[test]
     fn configured_root_wins_consistently_in_key_and_rustc_remap() {
         let cargo_home = "/sandbox/.cargo";
@@ -2370,19 +2875,448 @@ mod tests {
             apply_last_match(&normalizer.remap_args(), path),
             "/kache/base-dir-0/.cargo/registry/src/pkg/lib.rs"
         );
+        assert_eq!(
+            normalizer.source_path_identity(Path::new(path)).unwrap(),
+            b"<BASE_DIR_0>/.cargo/registry/src/pkg/lib.rs"
+        );
+    }
+
+    #[test]
+    fn legacy_base_dir_is_a_complete_owner_and_rejects_empty_or_root() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("legacy");
+        let source = base.join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub const VALUE: u8 = 1;").unwrap();
+
+        let mut rules = Vec::new();
+        let mut source_restore_roots = Vec::new();
+        push_legacy_base_dir_rules(
+            &mut rules,
+            &mut source_restore_roots,
+            Some(base.as_os_str()),
+        );
+        let normalizer = PathNormalizer {
+            rules,
+            configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots,
+            path_only_env_vars: Vec::new(),
+        };
+        let relative = source.strip_prefix(&base).unwrap().to_string_lossy();
+        assert_eq!(
+            normalizer.source_path_identity(&source).unwrap(),
+            format!("<BASE_DIR>/{relative}").as_bytes()
+        );
+        assert_eq!(
+            apply_last_match(&normalizer.remap_args(), source.to_str().unwrap()),
+            format!("{}/{relative}", flag_target_for("<BASE_DIR>"))
+        );
+        assert!(normalizer.depinfo_source_roots().iter().any(|root| {
+            root.root == base
+                && root.key_sentinel == "<BASE_DIR>"
+                && root.depinfo_sentinel == "__kache_base_dir__/"
+        }));
+
+        let filesystem_root = if cfg!(windows) {
+            Path::new(r"C:\")
+        } else {
+            Path::new("/")
+        };
+        for invalid in [std::ffi::OsStr::new(""), filesystem_root.as_os_str()] {
+            let mut rules = Vec::new();
+            let mut restore_roots = Vec::new();
+            push_legacy_base_dir_rules(&mut rules, &mut restore_roots, Some(invalid));
+            assert!(rules.is_empty());
+            assert!(restore_roots.is_empty());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_base_dir_owns_verbatim_canonical_sources() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("Legacy Root");
+        let source = base.join("src/value.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub const VALUE: u8 = 1;").unwrap();
+
+        let mut rules = Vec::new();
+        let mut source_restore_roots = Vec::new();
+        push_legacy_base_dir_rules(
+            &mut rules,
+            &mut source_restore_roots,
+            Some(base.as_os_str()),
+        );
+        let normalizer = PathNormalizer {
+            rules,
+            configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots,
+            path_only_env_vars: Vec::new(),
+        };
+        let canonical_source = source.canonicalize().unwrap();
+        assert_eq!(
+            normalizer.source_path_identity(&canonical_source).unwrap(),
+            b"<BASE_DIR>/src\\value.rs"
+        );
+        assert_eq!(
+            apply_last_match(&normalizer.remap_args(), canonical_source.to_str().unwrap()),
+            "/kache/base-dir\\src\\value.rs"
+        );
+        let canonical_base = base.canonicalize().unwrap();
+        assert!(normalizer.depinfo_source_roots().iter().any(|root| {
+            root.root == canonical_base && root.depinfo_sentinel == "__kache_base_dir__/"
+        }));
+    }
+
+    #[test]
+    fn legacy_base_dir_exposes_a_depinfo_restore_descriptor() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let normalizer = pn_with_rules(vec![(&root, "<BASE_DIR>")]);
+        let roots = normalizer.depinfo_source_roots();
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].root, dir.path());
+        assert_eq!(roots[0].key_sentinel, "<BASE_DIR>");
+        assert_eq!(roots[0].depinfo_sentinel, "__kache_base_dir__/");
+        assert_eq!(roots[0].priority, flag_emit_rank("<BASE_DIR>"));
+    }
+
+    #[test]
+    fn external_target_exposes_a_distinct_source_restore_descriptor() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let normalizer = pn_with_rules(vec![(&root, "<TARGET>")]);
+        let roots = normalizer.depinfo_source_roots();
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].root, dir.path());
+        assert_eq!(roots[0].key_sentinel, "<TARGET>");
+        assert_eq!(roots[0].depinfo_sentinel, "__kache_target_rule__/");
+        assert_eq!(roots[0].priority, flag_emit_rank("<TARGET>"));
+    }
+
+    #[test]
+    fn configured_slot_does_not_duplicate_an_identical_legacy_owner() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let normalizer =
+            pn_with_rules(vec![(&root, "<BASE_DIR>")]).with_base_dirs(std::slice::from_ref(&root));
+        let roots = normalizer.depinfo_source_roots();
+
+        assert_eq!(normalizer.configured_base_dir_count(), 1);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].key_sentinel, "<BASE_DIR>");
+        assert_eq!(roots[0].depinfo_sentinel, "__kache_base_dir__/");
+        assert!(
+            !roots
+                .iter()
+                .any(|descriptor| descriptor.key_sentinel == "<BASE_DIR_0>")
+        );
+    }
+
+    #[test]
+    fn source_identity_matches_rustc_semantic_root_precedence() {
+        let normalizer = pn_with_rules(vec![
+            ("/workspace/target-a", "<TARGET>"),
+            ("/workspace", "<WORKSPACE>"),
+        ]);
+        let source = Path::new("/workspace/target-a/generated.rs");
+
+        assert_eq!(
+            normalizer.source_path_identity(source).unwrap(),
+            b"<WORKSPACE>/target-a/generated.rs"
+        );
+        assert_eq!(
+            apply_last_match(&normalizer.remap_args(), source.to_str().unwrap()),
+            format!("{}/target-a/generated.rs", workspace_flag_target())
+        );
+    }
+
+    #[test]
+    fn source_identity_distinguishes_member_cwd_from_workspace_root() {
+        let normalizer = PathNormalizer {
+            rules: vec![
+                Rule {
+                    prefix: "/repo/member".to_string(),
+                    key_sentinel: "<WORKSPACE>".to_string(),
+                    source_sentinel: "<CWD>".to_string(),
+                    flag_target: workspace_flag_target().to_string(),
+                },
+                Rule {
+                    prefix: "/repo".to_string(),
+                    key_sentinel: "<WORKSPACE>".to_string(),
+                    source_sentinel: "<WORKSPACE>".to_string(),
+                    flag_target: workspace_flag_target().to_string(),
+                },
+            ],
+            configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: Vec::new(),
+            path_only_env_vars: Vec::new(),
+        };
+
+        assert_eq!(
+            normalizer
+                .source_path_identity(Path::new("/repo/member/value.rs"))
+                .unwrap(),
+            b"<CWD>/value.rs"
+        );
+        assert_eq!(
+            normalizer
+                .source_path_identity(Path::new("/repo/value.rs"))
+                .unwrap(),
+            b"<WORKSPACE>/value.rs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_workspace_root_round_trips_lexical_and_canonical_spellings() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real/workspace");
+        let link = dir.path().join("workspace-link");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let normalizer = PathNormalizer::from_env(Some(&link));
+        let lexical = link.join("src/lib.rs");
+        let canonical = real.canonicalize().unwrap().join("src/lib.rs");
+
+        for source in [&lexical, &canonical] {
+            assert_eq!(
+                normalizer.source_path_identity(source).unwrap(),
+                b"<WORKSPACE>/src/lib.rs"
+            );
+            assert_eq!(
+                apply_last_match(&normalizer.remap_args(), source.to_str().unwrap()),
+                format!("{}/src/lib.rs", workspace_flag_target())
+            );
+        }
+
+        let roots = normalizer.depinfo_source_roots();
+        let workspace_roots = roots
+            .iter()
+            .filter(|root| root.depinfo_sentinel == "__kache_workspace__/")
+            .map(|root| root.root.as_path())
+            .collect::<Vec<_>>();
+        assert_eq!(workspace_roots.first().copied(), Some(link.as_path()));
+        assert!(workspace_roots.contains(&real.canonicalize().unwrap().as_path()));
+
+        let depinfo_roots = roots
+            .into_iter()
+            .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+            .collect::<Vec<_>>();
+        let target = dir.path().join("target");
+        let raw = format!("{}/demo.d: {}\n", target.display(), canonical.display());
+        let stored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &raw,
+            &target,
+            &link,
+            Some(&link),
+            &depinfo_roots,
+            crate::link::DepInfoMode::Relativize,
+        );
+        assert!(
+            stored.contains("__kache_workspace__/src/lib.rs"),
+            "{stored}"
+        );
+        let restored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            &target,
+            &link,
+            Some(&link),
+            &depinfo_roots,
+            crate::link::DepInfoMode::Expand,
+        );
+        assert!(restored.contains(&format!("{}/src/lib.rs", link.display())));
+        assert!(!restored.contains(&format!("{}/src/lib.rs", real.display())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_ancestor_keeps_a_winning_workspace_canonical_alias() {
+        let dir = TempDir::new().unwrap();
+        let producer_configured = dir.path().join("producer/configured");
+        let consumer_configured = dir.path().join("consumer/configured");
+        let producer_link = producer_configured.join("workspace");
+        let consumer_link = consumer_configured.join("workspace");
+        let producer_real = dir.path().join("producer-real/workspace");
+        let consumer_real = dir.path().join("consumer-real/workspace");
+        std::fs::create_dir_all(producer_real.join("src")).unwrap();
+        std::fs::create_dir_all(consumer_real.join("src")).unwrap();
+        std::fs::create_dir_all(&producer_configured).unwrap();
+        std::fs::create_dir_all(&consumer_configured).unwrap();
+        std::os::unix::fs::symlink(&producer_real, &producer_link).unwrap();
+        std::os::unix::fs::symlink(&consumer_real, &consumer_link).unwrap();
+
+        let producer = PathNormalizer::from_env(Some(&producer_link))
+            .with_base_dirs(&[producer_configured.to_string_lossy().into_owned()]);
+        let consumer = PathNormalizer::from_env(Some(&consumer_link))
+            .with_base_dirs(&[consumer_configured.to_string_lossy().into_owned()]);
+        let producer_canonical = producer_real.canonicalize().unwrap();
+        let consumer_canonical = consumer_real.canonicalize().unwrap();
+        let producer_source = producer_canonical.join("src/lib.rs");
+        assert_eq!(
+            producer.source_path_identity(&producer_source).unwrap(),
+            b"<WORKSPACE>/src/lib.rs"
+        );
+
+        let producer_roots = producer
+            .depinfo_source_roots()
+            .into_iter()
+            .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+            .collect::<Vec<_>>();
+        assert!(producer_roots.iter().any(|(root, sentinel, _)| {
+            root == &producer_canonical && sentinel == "__kache_workspace__/"
+        }));
+        let target = producer_link.join("target");
+        let raw = format!(
+            "{}/demo.d: {}\n",
+            target.display(),
+            producer_source.display()
+        );
+        let stored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &raw,
+            &target,
+            &producer_link,
+            Some(&producer_link),
+            &producer_roots,
+            crate::link::DepInfoMode::Relativize,
+        );
+        assert!(
+            stored.contains("__kache_workspace__/src/lib.rs"),
+            "{stored}"
+        );
+
+        let consumer_roots = consumer
+            .depinfo_source_roots()
+            .into_iter()
+            .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+            .collect::<Vec<_>>();
+        let restored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            &consumer_link.join("target"),
+            &consumer_link,
+            Some(&consumer_link),
+            &consumer_roots,
+            crate::link::DepInfoMode::Expand,
+        );
+        assert!(restored.contains(&format!("{}/src/lib.rs", consumer_canonical.display())));
+        assert!(!restored.contains(&producer_canonical.to_string_lossy().into_owned()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_filesystem_root_is_never_added_as_an_alias() {
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("root-link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+
+        let mut legacy_rules = Vec::new();
+        let mut restore_roots = Vec::new();
+        push_legacy_base_dir_rules(
+            &mut legacy_rules,
+            &mut restore_roots,
+            Some(link.as_os_str()),
+        );
+        assert!(legacy_rules.iter().all(|rule| rule.prefix != "/"));
+
+        let configured =
+            PathNormalizer::empty().with_base_dirs(&[link.to_string_lossy().into_owned()]);
+        assert!(configured.rules.iter().all(|rule| rule.prefix != "/"));
+        assert!(
+            configured
+                .source_path_identity(Path::new("/etc/passwd"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn source_identity_stays_local_for_roots_without_depinfo_restore_ownership() {
+        let normalizer = pn_with_rules(vec![("/toolchain/rust", "<RUST_SRC>")]);
+        assert!(
+            normalizer
+                .source_path_identity(Path::new("/toolchain/rust/library/core/src/lib.rs"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn configured_ancestor_wins_over_nested_workspace_for_source_identity() {
+        let normalizer = pn_with_rules(vec![("/sandbox/checkout", "<WORKSPACE>")])
+            .with_base_dirs(&["/sandbox".to_string()]);
+        let source = Path::new("/sandbox/checkout/src/lib.rs");
+
+        assert_eq!(
+            normalizer.source_path_identity(source).unwrap(),
+            b"<BASE_DIR_0>/checkout/src/lib.rs"
+        );
+        assert_eq!(
+            apply_last_match(&normalizer.remap_args(), source.to_str().unwrap()),
+            "/kache/base-dir-0/checkout/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn configured_ancestor_also_wins_depinfo_ownership() {
+        let dir = TempDir::new().unwrap();
+        let configured = dir.path().join("configured");
+        let workspace = configured.join("checkout");
+        let source = workspace.join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub const VALUE: u8 = 1;").unwrap();
+
+        let normalizer = PathNormalizer::from_env(Some(&workspace))
+            .with_base_dirs(&[configured.to_string_lossy().into_owned()]);
+        assert_eq!(
+            normalizer.source_path_identity(&source).unwrap(),
+            b"<BASE_DIR_0>/checkout/src/lib.rs"
+        );
+
+        let roots = normalizer.depinfo_source_roots();
+        assert!(!roots.iter().any(|root| {
+            root.root == workspace
+                && matches!(
+                    root.depinfo_sentinel.as_str(),
+                    "__kache_cwd__/" | "__kache_workspace__/"
+                )
+        }));
+        let roots = roots
+            .into_iter()
+            .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+            .collect::<Vec<_>>();
+        let target = workspace.join("target");
+        let raw = format!("{}/demo.d: {}\n", target.display(), source.display());
+        let stored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &raw,
+            &target,
+            &workspace,
+            Some(&workspace),
+            &roots,
+            crate::link::DepInfoMode::Relativize,
+        );
+        assert!(
+            stored.contains("__kache_base_dir_0__/checkout/src/lib.rs"),
+            "{stored}"
+        );
+        assert!(!stored.contains("__kache_cwd__/"), "{stored}");
+        assert!(!stored.contains("__kache_workspace__/"), "{stored}");
     }
 
     #[cfg(unix)]
     #[test]
     fn configured_lexical_root_is_not_stolen_by_another_roots_alias() {
         let dir = TempDir::new().unwrap();
-        let real = dir.path().join("z-real");
-        let link = dir.path().join("a-link");
-        std::fs::create_dir_all(&real).unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real_path = dir.path().join("z-real");
+        let link_path = dir.path().join("a-link");
+        std::fs::create_dir_all(real_path.join("src")).unwrap();
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
 
-        let link = link.to_string_lossy().into_owned();
-        let real = real.to_string_lossy().into_owned();
+        let link = link_path.to_string_lossy().into_owned();
+        let real = real_path.to_string_lossy().into_owned();
         let normalizer = PathNormalizer::empty().with_base_dirs(&[link.clone(), real.clone()]);
 
         assert_eq!(normalizer.configured_base_dir_count(), 2);
@@ -2394,6 +3328,90 @@ mod tests {
             normalizer.normalize(format!("{real}/src")),
             "<BASE_DIR_1>/src"
         );
+        assert_eq!(
+            normalizer
+                .source_path_identity(&link_path.join("src/lib.rs"))
+                .unwrap(),
+            b"<BASE_DIR_0>/src/lib.rs"
+        );
+        assert_eq!(
+            normalizer
+                .source_path_identity(&real_path.join("src/lib.rs"))
+                .unwrap(),
+            b"<BASE_DIR_1>/src/lib.rs"
+        );
+
+        let roots = normalizer.depinfo_source_roots();
+        assert!(roots.iter().any(|root| {
+            root.root == link_path
+                && root.key_sentinel == "<BASE_DIR_0>"
+                && root.depinfo_sentinel == "__kache_base_dir_0__/"
+                && root.priority == flag_emit_rank("<BASE_DIR_0>")
+        }));
+        assert!(roots.iter().any(|root| {
+            root.root == real_path
+                && root.key_sentinel == "<BASE_DIR_1>"
+                && root.depinfo_sentinel == "__kache_base_dir_1__/"
+                && root.priority == flag_emit_rank("<BASE_DIR_1>")
+        }));
+        assert!(!roots.iter().any(|root| {
+            root.root == real_path
+                && (root.key_sentinel != "<BASE_DIR_1>"
+                    || root.depinfo_sentinel != "__kache_base_dir_1__/")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_symlink_alias_restores_through_lexical_root_after_retarget() {
+        let dir = TempDir::new().unwrap();
+        let old_real = dir.path().join("a-very-long-old-real-target");
+        let new_real = dir.path().join("new-real-target");
+        let link = dir.path().join("x");
+        std::fs::create_dir_all(old_real.join("src")).unwrap();
+        std::fs::create_dir_all(new_real.join("src")).unwrap();
+        std::os::unix::fs::symlink(&old_real, &link).unwrap();
+        let configured = link.to_string_lossy().into_owned();
+
+        let producer = PathNormalizer::empty().with_base_dirs(std::slice::from_ref(&configured));
+        let producer_roots = producer
+            .depinfo_source_roots()
+            .into_iter()
+            .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+            .collect::<Vec<_>>();
+        let old_canonical = old_real.canonicalize().unwrap();
+        let input = format!("out: {}/src/value.rs\n", old_canonical.display());
+        let stored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &input,
+            Path::new("/unrelated-target"),
+            Path::new("/unrelated-cwd"),
+            None,
+            &producer_roots,
+            crate::link::DepInfoMode::Relativize,
+        );
+        assert!(
+            stored.contains("__kache_base_dir_0__/src/value.rs"),
+            "{stored}"
+        );
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&new_real, &link).unwrap();
+        let consumer = PathNormalizer::empty().with_base_dirs(&[configured]);
+        let consumer_roots = consumer
+            .depinfo_source_roots()
+            .into_iter()
+            .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+            .collect::<Vec<_>>();
+        let restored = crate::link::rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            Path::new("/other-target"),
+            Path::new("/other-cwd"),
+            None,
+            &consumer_roots,
+            crate::link::DepInfoMode::Expand,
+        );
+        assert!(restored.contains(&format!("{}/src/value.rs", link.display())));
+        assert!(!restored.contains(old_canonical.to_str().unwrap()));
     }
 
     #[test]

@@ -1327,11 +1327,20 @@ fn rewrite_depinfo_content_with_exact_sentinel_for_platform(
 
 fn depinfo_prefixes_for_exact_display(raw: &str, windows: bool) -> Vec<String> {
     if windows {
-        // Expand uses the first spelling. Verbatim Windows paths (`\\?\...`)
-        // do not accept forward slashes, so the native separator must lead.
-        vec![format!("{raw}\\"), format!("{raw}/")]
+        // Expand uses the first spelling. Preserve the configured spelling:
+        // verbatim/native Windows paths require `\`, while slash-form paths
+        // (including the platform-neutral paths used by pure tests) keep `/`.
+        let (first, second) = if windows_display_prefers_backslash(raw) {
+            ('\\', '/')
+        } else {
+            ('/', '\\')
+        };
+        vec![
+            with_trailing_separator(raw, first),
+            with_trailing_separator(raw, second),
+        ]
     } else {
-        vec![format!("{raw}/")]
+        vec![with_trailing_separator(raw, '/')]
     }
 }
 
@@ -1340,6 +1349,22 @@ fn rewrite_depinfo_content_with_sentinel(
     project_dir: &Path,
     sentinel: &str,
     mode: DepInfoMode,
+) -> String {
+    rewrite_depinfo_content_with_sentinel_for_platform(
+        content,
+        project_dir,
+        sentinel,
+        mode,
+        cfg!(windows),
+    )
+}
+
+fn rewrite_depinfo_content_with_sentinel_for_platform(
+    content: &str,
+    project_dir: &Path,
+    sentinel: &str,
+    mode: DepInfoMode,
+    windows: bool,
 ) -> String {
     let mut roots = vec![project_dir.to_path_buf()];
     if matches!(mode, DepInfoMode::Relativize)
@@ -1353,11 +1378,11 @@ fn rewrite_depinfo_content_with_sentinel(
         prefixes.extend(depinfo_prefixes_for_display(
             &root.to_string_lossy(),
             matches!(mode, DepInfoMode::Relativize),
-            cfg!(windows),
+            windows,
         ));
     }
-    prefixes.sort();
-    prefixes.dedup();
+    let mut seen = std::collections::HashSet::new();
+    prefixes.retain(|prefix| seen.insert(prefix.clone()));
     rewrite_depinfo_content_with_prefixes_and_sentinel(content, &prefixes, sentinel, mode)
 }
 
@@ -1377,12 +1402,54 @@ fn depinfo_prefixes_for_display(
     }
     let mut prefixes = Vec::new();
     for display in displays {
-        prefixes.push(format!("{display}/"));
         if windows {
-            prefixes.push(format!("{display}\\"));
+            let prefers_backslash = windows_display_prefers_backslash(&display);
+            let verbatim = display.starts_with(r"\\?\");
+            let preferred = if verbatim {
+                display.clone()
+            } else if prefers_backslash {
+                display.replace('/', "\\")
+            } else {
+                display.replace('\\', "/")
+            };
+            let alternate = if prefers_backslash {
+                display.replace('\\', "/")
+            } else {
+                display.replace('/', "\\")
+            };
+            let (first, second) = if prefers_backslash {
+                ('\\', '/')
+            } else {
+                ('/', '\\')
+            };
+            prefixes.push(with_trailing_separator(&preferred, first));
+            prefixes.push(with_trailing_separator(&display, first));
+            prefixes.push(with_trailing_separator(&display, second));
+            if retain_verbatim_alias && !verbatim {
+                prefixes.push(with_trailing_separator(&alternate, second));
+            }
+        } else {
+            prefixes.push(with_trailing_separator(&display, '/'));
         }
     }
     prefixes
+}
+
+fn windows_display_prefers_backslash(display: &str) -> bool {
+    let bytes = display.as_bytes();
+    display.starts_with('\\')
+        || (bytes.first().is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(1) == Some(&b':')
+            && bytes.get(2) == Some(&b'\\'))
+}
+
+fn with_trailing_separator(display: &str, separator: char) -> String {
+    let mut value = display.to_string();
+    if value.ends_with('/') || value.ends_with('\\') {
+        value.pop();
+    }
+    value.push(separator);
+    value
 }
 
 /// Prefix-parameterized core of the Windows [`rewrite_depinfo_content`]
@@ -2390,6 +2457,47 @@ __kache_target_rule__/debug/build/demo/out/generated.rs\n"
         let expand = depinfo_prefixes_for_display(r"\\?\C:\Work", false, true);
         assert!(!expand.iter().any(|prefix| prefix.starts_with(r"\\?\")));
         assert!(expand.iter().all(|prefix| prefix.starts_with(r"C:\Work")));
+    }
+
+    #[test]
+    fn windows_depinfo_expansion_preserves_native_and_slash_root_styles() {
+        assert!(windows_display_prefers_backslash(r"C:\work"));
+        assert!(windows_display_prefers_backslash(r"\\?\C:\work"));
+        assert!(windows_display_prefers_backslash(r"\\server\share"));
+        assert!(!windows_display_prefers_backslash("C:/work"));
+        assert!(!windows_display_prefers_backslash("/external/work"));
+
+        assert_eq!(with_trailing_separator("/", '/'), "/");
+        assert_eq!(with_trailing_separator("/work/", '/'), "/work/");
+        assert_eq!(with_trailing_separator(r"C:\", '\\'), r"C:\");
+        assert_eq!(with_trailing_separator(r"C:\work\", '/'), "C:\\work/");
+
+        let native = rewrite_depinfo_content_with_sentinel_for_platform(
+            "__kache_root__/debug/deps/demo.d\n",
+            Path::new(r"C:\work\target"),
+            DEPINFO_ROOT_SENTINEL,
+            DepInfoMode::Expand,
+            true,
+        );
+        assert_eq!(native, "C:\\work\\target\\debug/deps/demo.d\n");
+
+        let slash = rewrite_depinfo_content_with_sentinel_for_platform(
+            "__kache_root__/debug/deps/demo.d\n",
+            Path::new("/external/target"),
+            DEPINFO_ROOT_SENTINEL,
+            DepInfoMode::Expand,
+            true,
+        );
+        assert_eq!(slash, "/external/target/debug/deps/demo.d\n");
+
+        let mixed = rewrite_depinfo_content_with_sentinel_for_platform(
+            "/build/work/target/debug/deps/demo.d\n",
+            Path::new(r"/build/work\target"),
+            DEPINFO_ROOT_SENTINEL,
+            DepInfoMode::Relativize,
+            true,
+        );
+        assert_eq!(mixed, "__kache_root__/debug/deps/demo.d\n");
     }
 
     #[test]

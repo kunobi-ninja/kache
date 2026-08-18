@@ -2894,7 +2894,8 @@ mod tests {
             &consumer_roots,
             crate::link::DepInfoMode::Expand,
         );
-        assert!(restored.contains(&format!(r"{}\src\value.rs", consumer_root.display())));
+        let expected = format!(r"{}\src\value.rs", consumer_root.display()).replace(' ', "\\ ");
+        assert!(restored.contains(&expected), "{restored}");
         assert!(!restored.contains(&producer_root.to_string_lossy().into_owned()));
     }
 
@@ -2948,7 +2949,15 @@ mod tests {
         );
         assert_eq!(
             apply_last_match(&normalizer.remap_args(), source.to_str().unwrap()),
-            format!("{}/{relative}", flag_target_for("<BASE_DIR>"))
+            format!(
+                "{}{}",
+                flag_target_for("<BASE_DIR>"),
+                source
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix(base.to_str().unwrap())
+                    .unwrap()
+            )
         );
         assert!(normalizer.depinfo_source_roots().iter().any(|root| {
             root.root == base
@@ -3333,9 +3342,10 @@ mod tests {
 
         let normalizer = PathNormalizer::from_env(Some(&workspace))
             .with_base_dirs(&[configured.to_string_lossy().into_owned()]);
+        let relative = source.strip_prefix(&configured).unwrap().to_string_lossy();
         assert_eq!(
             normalizer.source_path_identity(&source).unwrap(),
-            b"<BASE_DIR_0>/checkout/src/lib.rs"
+            format!("<BASE_DIR_0>/{relative}").as_bytes()
         );
 
         let roots = normalizer.depinfo_source_roots();

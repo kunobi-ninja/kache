@@ -2680,14 +2680,14 @@ S:\\proj\\target\\debug\\build\\demo-8a22\\out/generated.rs\n";
             "both references relativize: {rewritten}"
         );
 
-        // Expansion re-roots at the consumer with `/`, which Windows accepts.
+        // Expansion re-roots at the consumer using its native separator.
         let expanded = rewrite_depinfo_content(
             &rewritten,
             Path::new("T:\\other\\target"),
             DepInfoMode::Expand,
         );
         assert!(
-            expanded.contains("T:\\other\\target/debug\\build\\demo-8a22\\out/generated.rs"),
+            expanded.contains("T:\\other\\target\\debug\\build\\demo-8a22\\out/generated.rs"),
             "consumer-rooted mixed-separator path: {expanded}"
         );
         assert!(!expanded.contains(DEPINFO_ROOT_SENTINEL));

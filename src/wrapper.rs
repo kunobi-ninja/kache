@@ -6128,11 +6128,19 @@ mod tests {
 
         let restored = std::fs::read_to_string(&target).unwrap();
         assert!(
-            restored.starts_with(&format!("{}/debug/deps/libfoo.rlib:", anchor.display())),
+            restored.starts_with(&format!(
+                "{}{}debug/deps/libfoo.rlib:",
+                anchor.display(),
+                std::path::MAIN_SEPARATOR
+            )),
             "dep-info should be expanded at restore anchor, got: {restored}"
         );
         assert!(
-            restored.contains(&format!("{}/src/lib.rs", dir.path().display())),
+            restored.contains(&format!(
+                "{}{}src/lib.rs",
+                dir.path().display(),
+                std::path::MAIN_SEPARATOR
+            )),
             "dep-info source should be expanded at the consumer cwd: {restored}"
         );
         assert_eq!(

@@ -3371,7 +3371,7 @@ mod tests {
             crate::link::DepInfoMode::Relativize,
         );
         assert!(
-            stored.contains("__kache_base_dir_0__/checkout/src/lib.rs"),
+            stored.contains(&format!("__kache_base_dir_0__/{relative}")),
             "{stored}"
         );
         assert!(!stored.contains("__kache_cwd__/"), "{stored}");

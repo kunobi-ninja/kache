@@ -546,6 +546,9 @@ jobs:
       - name: AUR -git pkgver tests
         run: ./scripts/aur/test-vcs-pkgver.sh
 
+      - name: Stable branch update tests
+        run: ./scripts/ci/test-update-stable-branch.sh
+
   # --- Dependency policy audit ---
   # Runs `cargo deny check` (via `just audit`) on every push and non-docs PR:
   # RustSec advisories PLUS license / bans / sources policy, matching the

@@ -155,21 +155,21 @@ kache is also published to Homebrew, APT, winget, Scoop, Chocolatey, and the AUR
 
 ## Nix
 
-The repo is a flake. Unlike the methods above it builds kache from source, with the Rust toolchain pinned in `rust-toolchain.toml` rather than whatever rustc your nixpkgs happens to ship.
+The repo is a flake. Unlike the methods above it builds kache from source, with the Rust toolchain pinned in `rust-toolchain.toml` rather than whatever rustc your nixpkgs happens to ship. Use the `stable` branch: it advances only after a non-prerelease GitHub release has passed the gated release build. The default `main` branch contains unreleased development work.
 
 ```sh
 # Run it once without installing
-nix run github:kunobi-ninja/kache -- --version
+nix run github:kunobi-ninja/kache/stable -- --version
 
 # Install into your profile
-nix profile install github:kunobi-ninja/kache
+nix profile install github:kunobi-ninja/kache/stable
 ```
 
 To consume it from your own flake, add the input and apply the overlay. The overlay provides `pkgs.kache` and `pkgs.kache-rust-toolchain`:
 
 ```nix
 {
-  inputs.kache.url = "github:kunobi-ninja/kache";
+  inputs.kache.url = "github:kunobi-ninja/kache/stable";
 
   outputs = { nixpkgs, kache, ... }: {
     # ...

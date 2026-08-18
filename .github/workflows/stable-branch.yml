@@ -1,0 +1,97 @@
+name: Stable branch
+
+on:
+  # The release builder publishes the GitHub Release before its final asset
+  # upload step completes, so the job below waits for that exact CI job.
+  release:
+    types: [published]
+  # Bootstrap the branch when this workflow first lands. Later edits are safe:
+  # the updater is idempotent and still gates on the released commit's CI.
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/stable-branch.yml
+      - scripts/ci/update-stable-branch.sh
+  workflow_dispatch:
+
+concurrency:
+  group: stable-branch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  update:
+    name: Point stable at the latest GA release
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve the authoritative stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          latest_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest")"
+          latest_tag="$(jq -r '.tag_name' <<<"$latest_json")"
+          draft="$(jq -r '.draft' <<<"$latest_json")"
+          prerelease="$(jq -r '.prerelease' <<<"$latest_json")"
+
+          if [[ ! "$latest_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "latest GitHub release is not a GA semver tag: $latest_tag" >&2
+            exit 1
+          fi
+          if [ "$draft" != "false" ] || [ "$prerelease" != "false" ]; then
+            echo "latest GitHub release is not a published GA release" >&2
+            exit 1
+          fi
+
+          tag="${EVENT_TAG:-$latest_tag}"
+          if [ "$tag" != "$latest_tag" ]; then
+            echo "$tag is not the latest stable release ($latest_tag); skipping"
+            echo "update=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          sha="$(git rev-parse --verify "refs/tags/$tag^{commit}")"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "latest_tag=$latest_tag" >>"$GITHUB_OUTPUT"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          echo "update=true" >>"$GITHUB_OUTPUT"
+
+      - name: Require the release build and asset upload to be green
+        if: steps.release.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_GREEN_MAX_ATTEMPTS: "120"
+        run: |
+          ./scripts/require-ci-green.sh \
+            "${{ steps.release.outputs.sha }}" \
+            "release / Upload release assets"
+
+      - name: Update stable with compare-and-swap protection
+        if: steps.release.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The release gate can wait for up to an hour. Re-read `latest` at the
+          # mutation boundary so an older queued event cannot briefly rewind
+          # the branch after a newer GA was published.
+          latest_tag="$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/latest" \
+            --jq '.tag_name')"
+          ./scripts/ci/update-stable-branch.sh \
+            "${{ steps.release.outputs.tag }}" \
+            "$latest_tag"

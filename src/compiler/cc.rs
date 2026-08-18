@@ -999,10 +999,10 @@ impl CcArgs {
     /// Whether an existing output needs the selected compiler's own path
     /// handling instead of cache materialization.
     ///
-    /// GCC and clang can differ in how they handle an existing output, and
-    /// filesystem permissions/ACLs can make truncate and replace semantics
-    /// observably different. Kache cannot safely infer those semantics from a
-    /// pathname, so every existing output uses the selected compiler directly.
+    /// Ordinary compiler-owned outputs are private, owner-writable regular
+    /// files. Kache may replace those on a hit and let the compiler overwrite
+    /// them on a miss. Symlinks, hardlinks, read-only files and non-regular
+    /// paths still need the selected compiler's exact pathname semantics.
     pub(crate) fn requires_compiler_output_semantics(&self) -> bool {
         self.compiler_output_paths()
             .into_iter()
@@ -1073,11 +1073,29 @@ impl CcArgs {
     }
 }
 
-fn output_path_requires_compiler_semantics(path: &Path) -> bool {
+pub(crate) fn output_path_requires_compiler_semantics(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
-        Ok(_) => true,
+        Ok(meta) => !meta.file_type().is_file() || !regular_output_is_replaceable(path, &meta),
         Err(err) => err.kind() != std::io::ErrorKind::NotFound,
     }
+}
+
+fn regular_output_is_replaceable(path: &Path, meta: &std::fs::Metadata) -> bool {
+    regular_output_is_independent(path, meta) && regular_output_is_owner_writable(meta)
+}
+
+#[cfg(unix)]
+fn regular_output_is_owner_writable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // SAFETY: geteuid has no arguments, pointers, or preconditions.
+    let current_uid = unsafe { libc::geteuid() };
+    meta.uid() == current_uid && meta.permissions().mode() & 0o200 != 0
+}
+
+#[cfg(not(unix))]
+fn regular_output_is_owner_writable(meta: &std::fs::Metadata) -> bool {
+    !meta.permissions().readonly()
 }
 
 #[cfg(unix)]
@@ -8499,7 +8517,7 @@ mod tests {
     }
 
     #[test]
-    fn cc_output_safety_refuses_existing_writable_regular_file() {
+    fn cc_output_safety_allows_existing_writable_private_regular_file() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("plain.o");
         std::fs::write(&output, b"ordinary compiler output").unwrap();
@@ -8507,7 +8525,12 @@ mod tests {
         let output_str = output.to_string_lossy().into_owned();
         let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", &output_str])).unwrap();
 
-        assert!(parsed.requires_compiler_output_semantics());
+        assert!(!parsed.requires_compiler_output_semantics());
+        assert!(!parsed.refuse_reasons(&[]).iter().any(|reason| {
+            reason
+                .description()
+                .contains("requires compiler write semantics")
+        }));
         assert_eq!(
             discover_cc_output_artifacts(&parsed).outputs().len(),
             1,

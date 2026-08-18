@@ -779,7 +779,7 @@ fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
     Ok(())
 }
 
-/// A fully-written C/C++ cache artifact awaiting no-clobber publication.
+/// A fully-written C/C++ cache artifact awaiting publication.
 ///
 /// The staging file is created in the target directory with the same requested
 /// mode as a compiler output (`0666`). The kernel therefore applies the current
@@ -807,6 +807,21 @@ impl PreparedWritableTarget {
                     target.display()
                 )
             })?;
+        crate::opcounts::record_copied(self.bytes);
+        Ok(())
+    }
+
+    /// Atomically replace an existing ordinary compiler output.
+    ///
+    /// The caller must first establish that the target is a private, writable
+    /// regular file. Special paths retain the no-clobber path above and are
+    /// handled by the selected compiler instead.
+    pub(crate) fn publish_replacing(self) -> Result<()> {
+        let target = self.target;
+        self.staged
+            .persist(&target)
+            .map_err(|error| error.error)
+            .with_context(|| format!("publishing cc output over {}", target.display()))?;
         crate::opcounts::record_copied(self.bytes);
         Ok(())
     }

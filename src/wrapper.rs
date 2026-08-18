@@ -5008,6 +5008,63 @@ mod tests {
     }
 
     #[test]
+    fn configured_rustc_depinfo_roots_cover_every_restorable_anchor() {
+        // This is the set the store side relativizes dep-info against. Losing a
+        // root leaves a live producer path in the stored `.d`, so a relocated
+        // hit lets cargo validate freshness against the donor's worktree
+        // instead of the consumer's (#760).
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let workspace = base.join("workspace");
+        let target = base.join("shared-target");
+        let vendored = base.join("vendored-sources");
+        for path in [&workspace, &target, &vendored] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+
+        let config = Config {
+            base_dirs: vec![vendored.to_string_lossy().into_owned()],
+            ..test_config(base.join("cache"))
+        };
+        let roots = configured_rustc_depinfo_roots(&config, Some(&workspace), Some(&target));
+
+        let found = |root: &Path, sentinel: &str| {
+            roots
+                .iter()
+                .any(|(path, depinfo_sentinel, _)| path == root && depinfo_sentinel == sentinel)
+        };
+        assert!(
+            found(&workspace, "__kache_workspace__/"),
+            "workspace root missing from {roots:?}"
+        );
+        assert!(
+            found(&target, "__kache_target_rule__/"),
+            "external target root missing from {roots:?}"
+        );
+        assert!(
+            found(&vendored, "__kache_base_dir_0__/"),
+            "configured base dir missing from {roots:?}"
+        );
+
+        // Priorities are what break ties when roots nest, so they must be the
+        // real ranks rather than a uniform placeholder.
+        let workspace_priority = roots
+            .iter()
+            .find(|(path, _, _)| path == &workspace)
+            .map(|(_, _, priority)| *priority)
+            .unwrap();
+        let target_priority = roots
+            .iter()
+            .find(|(path, _, _)| path == &target)
+            .map(|(_, _, priority)| *priority)
+            .unwrap();
+        assert!(
+            workspace_priority > target_priority,
+            "the workspace must outrank an external target ({workspace_priority} vs {target_priority})"
+        );
+    }
+
+    #[test]
     fn input_race_store_suppression_truth_table() {
         for (extra_inputs_racy, guard_enabled, key_too_new, expected) in [
             (false, false, false, false),

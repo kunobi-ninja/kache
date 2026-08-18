@@ -125,6 +125,14 @@ gitignore = true
 # `run_cargo_non_unix` is the process-status half of the guarded Cargo
 # front-end. The Ubuntu mutation lane compiles only the Unix `exec` half;
 # hosted Windows tests still compile the status/exit-code path.
+#
+# `report_key_divergence` is a two-line stderr printer for the e2e convergence
+# diagnostic. Its only effect is bytes on the e2e driver's stderr, which an
+# in-process test cannot observe. Kept as narrow as the name allows: every
+# decision it delegates to stays in scope and is killed by direct unit tests —
+# `parse_keytrace` (which crate and field a trace line names),
+# `render_key_divergence` (which fields count as diverged), and
+# `key_divergence_report` (reading both phase logs off disk).
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -154,4 +162,5 @@ exclude_re = [
     "observe_storage_windows",
     "observe_storage_unsupported",
     "run_cargo_non_unix",
+    "replace report_key_divergence with \\(\\)",
 ]

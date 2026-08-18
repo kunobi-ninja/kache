@@ -2061,7 +2061,7 @@ mod tests {
         assert!(
             n.depinfo_source_roots()
                 .iter()
-                .any(|root| root.root == PathBuf::from(&short)),
+                .any(|root| root.root.as_path() == Path::new(short.as_str())),
             "the same short spelling must be accepted while relativizing dep-info"
         );
     }
@@ -3043,6 +3043,177 @@ mod tests {
         assert_eq!(roots[0].key_sentinel, "<TARGET>");
         assert_eq!(roots[0].depinfo_sentinel, "__kache_target_rule__/");
         assert_eq!(roots[0].priority, flag_emit_rank("<TARGET>"));
+    }
+
+    #[test]
+    fn every_source_sentinel_has_a_distinct_depinfo_sentinel() {
+        // `depinfo_source_roots` walks exactly this sentinel list. A source
+        // sentinel missing its dep-info mapping silently drops that root from
+        // the portable rewrite, so the stored `.d` keeps a live local path and
+        // a relocated hit validates against the donor's tree.
+        let mapped = [
+            ("<CWD>", "__kache_cwd__/"),
+            ("<WORKSPACE>", "__kache_workspace__/"),
+            ("<TARGET>", "__kache_target_rule__/"),
+            ("<CARGO_HOME>", "__kache_cargo_home__/"),
+            ("<BASE_DIR>", "__kache_base_dir__/"),
+            ("<RUSTUP_HOME>", "__kache_rustup_home__/"),
+            ("<HOME>", "__kache_home__/"),
+            ("<APPDATA>", "__kache_appdata__/"),
+            ("<LOCALAPPDATA>", "__kache_localappdata__/"),
+            ("<PROGRAMFILES>", "__kache_programfiles__/"),
+            ("<TMPDIR>", "__kache_tmpdir__/"),
+        ];
+        for (source_sentinel, expected) in mapped {
+            assert_eq!(
+                depinfo_sentinel_for_source(source_sentinel).as_deref(),
+                Some(expected),
+                "{source_sentinel} must map to a portable dep-info sentinel"
+            );
+        }
+
+        let distinct: std::collections::HashSet<&str> =
+            mapped.iter().map(|(_, sentinel)| *sentinel).collect();
+        assert_eq!(
+            distinct.len(),
+            mapped.len(),
+            "two source roots sharing a dep-info sentinel would expand to the wrong tree"
+        );
+
+        // `<RUST_SRC>` is remapped for debug info but is never a restorable
+        // source root, and an unknown sentinel must not invent one.
+        assert_eq!(depinfo_sentinel_for_source("<RUST_SRC>"), None);
+        assert_eq!(depinfo_sentinel_for_source("<NOT_A_SENTINEL>"), None);
+
+        // Configured slots are numbered rather than named.
+        assert_eq!(
+            depinfo_sentinel_for_source("<BASE_DIR_2>").as_deref(),
+            Some("__kache_base_dir_2__/")
+        );
+    }
+
+    #[test]
+    fn a_second_target_root_lands_between_its_higher_and_lower_ranked_peers() {
+        // `with_target_dir` splices the new rules at the one position that
+        // preserves rustc's precedence: after every rule that outranks
+        // `<TARGET>` and after an equal-ranked peer (`from_env` already
+        // installed one when `CARGO_TARGET_DIR` is set), but before anything
+        // that ranks below it. `normalize` applies rules in list order, so
+        // landing on either side of that slot silently changes which root owns
+        // a generated source — and with it the cache key.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let outer_target = base.join("target");
+        let nested = outer_target.join("wasm32-unknown-unknown");
+        fs::create_dir_all(&nested).unwrap();
+        let workspace_prefix = base.join("workspace").to_string_lossy().into_owned();
+        let outer_prefix = outer_target.to_string_lossy().into_owned();
+        let tmpdir_prefix = base.join("tmp").to_string_lossy().into_owned();
+
+        // Ranks: <WORKSPACE> 4 > <TARGET> 3 > <TMPDIR> 0.
+        let normalizer = pn_with_rules(vec![
+            (&workspace_prefix, "<WORKSPACE>"),
+            (&outer_prefix, "<TARGET>"),
+            (&tmpdir_prefix, "<TMPDIR>"),
+        ])
+        .with_target_dir(Some(&nested));
+
+        let spellings = || {
+            normalizer
+                .rules
+                .iter()
+                .map(|rule| rule.prefix.clone())
+                .collect::<Vec<_>>()
+        };
+        let at = |prefix: &str| {
+            normalizer
+                .rules
+                .iter()
+                .position(|rule| rule.prefix == prefix)
+                .unwrap_or_else(|| panic!("{prefix} survives, got {:?}", spellings()))
+        };
+        let nested_at = normalizer
+            .rules
+            .iter()
+            .position(|rule| {
+                rule.prefix.starts_with(&outer_prefix) && rule.prefix.len() > outer_prefix.len()
+            })
+            .expect("the nested target rule is added");
+
+        assert!(
+            at(&workspace_prefix) < nested_at,
+            "a higher-ranked root must stay ahead of a new <TARGET>, got {:?}",
+            spellings()
+        );
+        assert!(
+            at(&outer_prefix) < nested_at,
+            "the established <TARGET> peer must keep normalizing first, got {:?}",
+            spellings()
+        );
+        assert!(
+            nested_at < at(&tmpdir_prefix),
+            "a lower-ranked root must not consume the target first, got {:?}",
+            spellings()
+        );
+
+        let generated = nested.join("generated.rs").to_string_lossy().into_owned();
+        let suffix = generated
+            .strip_prefix(&outer_prefix)
+            .expect("the nested target is under the outer target");
+        assert_eq!(
+            normalizer.normalize(&generated),
+            format!("<TARGET>{suffix}"),
+            "the outer target owns the prefix, so the nested segment stays in the key"
+        );
+    }
+
+    #[test]
+    fn depinfo_restore_root_prefers_the_designated_spelling_over_the_first_alias() {
+        // `from_env` records one restore root per source sentinel in push order
+        // (`<CWD>`, `<WORKSPACE>`, then `<TARGET>`), so a sentinel's designated
+        // entry is routinely preceded by a different sentinel's. Selecting the
+        // wrong entry falls back to whichever alias rule happens to come first,
+        // which rewrites dep-info against a spelling the build never used.
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let alias = base.join("alias-target");
+        let designated = base.join("designated-target");
+        let workspace = base.join("workspace");
+        for path in [&alias, &designated, &workspace] {
+            fs::create_dir(path).unwrap();
+        }
+        let rule = |path: &Path, sentinel: &str| Rule {
+            prefix: path.to_string_lossy().into_owned(),
+            key_sentinel: sentinel.to_string(),
+            source_sentinel: sentinel.to_string(),
+            flag_target: flag_target_for(sentinel),
+        };
+
+        let normalizer = PathNormalizer {
+            // The alias rule comes first, so the fallback scan would pick it.
+            rules: vec![
+                rule(&alias, "<TARGET>"),
+                rule(&designated, "<TARGET>"),
+                rule(&workspace, "<WORKSPACE>"),
+            ],
+            configured_base_dir_count: 0,
+            configured_source_root_groups: Vec::new(),
+            source_restore_roots: vec![
+                ("<WORKSPACE>".to_string(), workspace.clone()),
+                ("<TARGET>".to_string(), designated.clone()),
+            ],
+            path_only_env_vars: Vec::new(),
+        };
+
+        let target_root = normalizer
+            .depinfo_source_roots()
+            .into_iter()
+            .find(|root| root.key_sentinel == "<TARGET>")
+            .expect("the target sentinel has an existing native root");
+        assert_eq!(
+            target_root.root, designated,
+            "the designated <TARGET> spelling must win over the earlier alias rule"
+        );
     }
 
     #[test]

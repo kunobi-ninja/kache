@@ -1863,6 +1863,36 @@ mod tests {
     }
 
     #[test]
+    fn path_normalization_root_exposes_the_frozen_root() {
+        // The key, the rustc invocation, and the dep-info rewrite all read this
+        // one accessor. If it stops reporting the frozen root they silently
+        // disagree about which anchor a source path is relative to, so a
+        // relocated hit rewrites dep-info against the wrong tree.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let member = workspace.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        let mut args = RustcArgs {
+            out_dir: Some(workspace.join("target/debug/deps")),
+            ..Default::default()
+        };
+        assert_eq!(
+            args.path_normalization_root(),
+            None,
+            "unset until the parse freezes it"
+        );
+
+        args.path_normalization_root = Some(args.select_path_normalization_root(&member));
+        assert_eq!(
+            args.path_normalization_root(),
+            Some(workspace.as_path()),
+            "the frozen workspace anchor must be readable back"
+        );
+    }
+
+    #[test]
     fn test_build_script_probe_detected_from_probe_out_dir() {
         let args: Vec<String> = vec![
             "rustc",

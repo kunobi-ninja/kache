@@ -280,71 +280,88 @@ fn keytrace_dir(cache_dir: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("kache-keytrace-{tag}"))
 }
 
-/// Diff the per-crate cache-key fields between the cold and relocate phases and
-/// print, for every crate whose key changed, the fields that differ. Reads the
-/// `keytrace-<phase>.log` files `run_step` writes (see [`keytrace_dir`]) when
-/// `KACHE_E2E_KEYTRACE` is set. Pure diagnostics: a convergence miss already
-/// failed the fixture; this just makes the cause legible (which keyed field
-/// carried a build-location-dependent value) without a platform-specific local
-/// reproduction. Best-effort — silent if the trace files are absent (the
-/// common case: the opt-in env var was not set, or the cold phase itself
-/// failed).
-fn report_key_divergence(cache_dir: &Path) {
-    let kt_dir = keytrace_dir(cache_dir);
-    let parse = |phase: &str| -> std::collections::HashMap<String, Vec<String>> {
-        let mut by_crate: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        let Ok(text) = std::fs::read_to_string(kt_dir.join(format!("keytrace-{phase}.log"))) else {
-            return by_crate;
+/// The per-crate keyed fields recorded in one `keytrace-<phase>.log`.
+type KeytraceFields = std::collections::HashMap<String, Vec<String>>;
+
+/// Parse one keytrace log body into per-crate keyed-field lists.
+///
+/// Lines look like `... kache::cache_key: [key:<crate>] <field>`; anything
+/// without the `[key:` marker (ordinary log output) is ignored, as is a marker
+/// with no closing `]` or an empty field.
+fn parse_keytrace(text: &str) -> KeytraceFields {
+    let mut by_crate: KeytraceFields = std::collections::HashMap::new();
+    for line in text.lines() {
+        let Some(idx) = line.find("[key:") else {
+            continue;
         };
-        for line in text.lines() {
-            // Lines look like: `... kache::cache_key: [key:<crate>] <field>`.
-            let Some(idx) = line.find("[key:") else {
-                continue;
-            };
-            let rest = &line[idx + "[key:".len()..];
-            let Some((crate_name, field)) = rest.split_once(']') else {
-                continue;
-            };
-            let crate_name = crate_name.to_string();
-            let field = field.trim().to_string();
-            if !field.is_empty() {
-                by_crate.entry(crate_name).or_default().push(field);
-            }
+        let rest = &line[idx + "[key:".len()..];
+        let Some((crate_name, field)) = rest.split_once(']') else {
+            continue;
+        };
+        let crate_name = crate_name.to_string();
+        let field = field.trim().to_string();
+        if !field.is_empty() {
+            by_crate.entry(crate_name).or_default().push(field);
         }
-        by_crate
-    };
-
-    let cold = parse("cold");
-    let relocate = parse("relocate");
-    if cold.is_empty() || relocate.is_empty() {
-        return;
     }
+    by_crate
+}
 
-    let mut printed_header = false;
+/// Render the cold-vs-relocate field diff for every crate whose keyed fields
+/// moved. `None` when no crate diverged, which covers the common case of a
+/// phase that recorded nothing at all (the opt-in trace was never captured):
+/// a crate absent from either map can never contribute a difference.
+fn render_key_divergence(cold: &KeytraceFields, relocate: &KeytraceFields) -> Option<String> {
+    let mut out = String::new();
     let mut crates: Vec<&String> = cold.keys().collect();
     crates.sort();
     for crate_name in crates {
         let Some(reloc_fields) = relocate.get(crate_name) else {
             continue;
         };
-        let cold_fields = &cold[crate_name];
-        let cold_set: std::collections::BTreeSet<&String> = cold_fields.iter().collect();
+        let cold_set: std::collections::BTreeSet<&String> = cold[crate_name].iter().collect();
         let reloc_set: std::collections::BTreeSet<&String> = reloc_fields.iter().collect();
         if cold_set == reloc_set {
             continue;
         }
-        if !printed_header {
-            eprintln!("   key divergence (cold vs relocate):");
-            printed_header = true;
+        if out.is_empty() {
+            out.push_str("   key divergence (cold vs relocate):\n");
         }
-        eprintln!("   [{crate_name}]");
+        out.push_str(&format!("   [{crate_name}]\n"));
         for f in cold_set.difference(&reloc_set) {
-            eprintln!("     - cold-only:     {f}");
+            out.push_str(&format!("     - cold-only:     {f}\n"));
         }
         for f in reloc_set.difference(&cold_set) {
-            eprintln!("     + relocate-only: {f}");
+            out.push_str(&format!("     + relocate-only: {f}\n"));
         }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Diff the per-crate cache-key fields between the cold and relocate phases so
+/// a convergence miss names the exact diverging field. Reads the
+/// `keytrace-<phase>.log` files `run_step` writes (see [`keytrace_dir`]) when
+/// `KACHE_E2E_KEYTRACE` is set. Pure diagnostics: a convergence miss already
+/// failed the fixture; this just makes the cause legible (which keyed field
+/// carried a build-location-dependent value) without a platform-specific local
+/// reproduction. Best-effort — `None` if the trace files are absent (the
+/// common case: the opt-in env var was not set, or the cold phase itself
+/// failed).
+fn key_divergence_report(cache_dir: &Path) -> Option<String> {
+    let kt_dir = keytrace_dir(cache_dir);
+    let read = |phase: &str| -> KeytraceFields {
+        std::fs::read_to_string(kt_dir.join(format!("keytrace-{phase}.log")))
+            .map(|text| parse_keytrace(&text))
+            .unwrap_or_default()
+    };
+    render_key_divergence(&read("cold"), &read("relocate"))
+}
+
+/// Print the divergence report, if there is one. Pure stderr I/O: everything
+/// it decides lives in [`key_divergence_report`] and is tested directly.
+fn report_key_divergence(cache_dir: &Path) {
+    if let Some(report) = key_divergence_report(cache_dir) {
+        eprint!("{report}");
     }
 }
 
@@ -1257,8 +1274,149 @@ fn inspect_restored_depinfo(root: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{artifact_candidates, inspect_restored_depinfo, resolve_artifact};
+    use super::{
+        KeytraceFields, artifact_candidates, inspect_restored_depinfo, key_divergence_report,
+        keytrace_dir, parse_keytrace, render_key_divergence, resolve_artifact,
+    };
     use std::path::{Path, PathBuf};
+
+    /// A realistic tracing line, so the `[key:` offset arithmetic is exercised
+    /// against the prefix the real logger emits rather than a bare marker.
+    fn keytrace_line(crate_name: &str, field: &str) -> String {
+        format!("  2026-08-18T09:00:00Z DEBUG kache::cache_key: [key:{crate_name}] {field}")
+    }
+
+    fn fields(entries: &[(&str, &[&str])]) -> KeytraceFields {
+        entries
+            .iter()
+            .map(|(name, fields)| {
+                (
+                    (*name).to_string(),
+                    fields.iter().map(|f| (*f).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_keytrace_reads_the_crate_and_field_from_a_real_log_line() {
+        // The crate name must come from inside the `[key:...]` marker: an
+        // off-by-one in the marker offset silently attributes fields to a
+        // mangled crate name and the divergence report names the wrong crate.
+        let text = [
+            keytrace_line("serde_derive", "source:src/lib.rs=abc123"),
+            keytrace_line("serde_derive", "env:CARGO_PKG_VERSION=1.0.0"),
+            keytrace_line("syn", "source:src/lib.rs=def456"),
+            "  2026-08-18T09:00:00Z DEBUG kache::store: unrelated line".to_string(),
+        ]
+        .join("\n");
+
+        let parsed = parse_keytrace(&text);
+
+        assert_eq!(parsed.len(), 2, "only the two keyed crates are recorded");
+        assert_eq!(
+            parsed.get("serde_derive"),
+            Some(&vec![
+                "source:src/lib.rs=abc123".to_string(),
+                "env:CARGO_PKG_VERSION=1.0.0".to_string(),
+            ]),
+            "fields keep their emitted order under the exact crate name"
+        );
+        assert_eq!(
+            parsed.get("syn"),
+            Some(&vec!["source:src/lib.rs=def456".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_keytrace_skips_unusable_lines() {
+        let text = [
+            "no marker at all".to_string(),
+            "prefix [key:unterminated field".to_string(),
+            keytrace_line("empty_field", "   "),
+        ]
+        .join("\n");
+
+        assert!(parse_keytrace(&text).is_empty());
+    }
+
+    #[test]
+    fn render_key_divergence_reports_only_fields_that_moved() {
+        let cold = fields(&[
+            ("moved", &["source:a.rs=cold", "env:SHARED=1"]),
+            ("stable", &["source:b.rs=same"]),
+        ]);
+        let relocate = fields(&[
+            ("moved", &["source:a.rs=relocate", "env:SHARED=1"]),
+            ("stable", &["source:b.rs=same"]),
+        ]);
+
+        let report = render_key_divergence(&cold, &relocate).expect("a diverging crate reports");
+
+        assert!(report.contains("key divergence (cold vs relocate):"));
+        assert!(report.contains("[moved]"));
+        assert!(report.contains("- cold-only:     source:a.rs=cold"));
+        assert!(report.contains("+ relocate-only: source:a.rs=relocate"));
+        assert!(
+            !report.contains("env:SHARED=1"),
+            "a field present in both phases is not a divergence: {report}"
+        );
+        assert!(
+            !report.contains("[stable]"),
+            "a crate whose fields all match is omitted: {report}"
+        );
+    }
+
+    #[test]
+    fn render_key_divergence_is_silent_without_a_divergence() {
+        let same = fields(&[("crate_a", &["source:a.rs=hash"])]);
+        assert_eq!(render_key_divergence(&same, &same), None);
+
+        // A phase that recorded nothing means the opt-in trace was never
+        // captured, which must not be reported as "everything converged".
+        assert_eq!(
+            render_key_divergence(&same, &KeytraceFields::new()),
+            None,
+            "an empty relocate phase yields no report"
+        );
+        assert_eq!(
+            render_key_divergence(&KeytraceFields::new(), &same),
+            None,
+            "an empty cold phase yields no report"
+        );
+    }
+
+    #[test]
+    fn key_divergence_report_reads_both_phase_logs_from_disk() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        // `keytrace_dir` is derived from the cache dir's basename and lives
+        // outside it, so the report has to look in that derived location.
+        let kt_dir = keytrace_dir(cache_dir.path());
+        std::fs::create_dir_all(&kt_dir).unwrap();
+        std::fs::write(
+            kt_dir.join("keytrace-cold.log"),
+            keytrace_line("relocatable", "source:src/lib.rs=cold-hash"),
+        )
+        .unwrap();
+        std::fs::write(
+            kt_dir.join("keytrace-relocate.log"),
+            keytrace_line("relocatable", "source:src/lib.rs=relocate-hash"),
+        )
+        .unwrap();
+
+        let report = key_divergence_report(cache_dir.path()).expect("both phase logs are present");
+        assert!(report.contains("[relocatable]"), "{report}");
+        assert!(report.contains("- cold-only:     source:src/lib.rs=cold-hash"));
+        assert!(report.contains("+ relocate-only: source:src/lib.rs=relocate-hash"));
+
+        std::fs::remove_file(kt_dir.join("keytrace-relocate.log")).unwrap();
+        assert_eq!(
+            key_divergence_report(cache_dir.path()),
+            None,
+            "a missing phase log is best-effort silence, not a panic"
+        );
+        std::fs::remove_dir_all(&kt_dir).ok();
+    }
 
     #[test]
     fn artifact_candidates_unix_is_single_unchanged() {

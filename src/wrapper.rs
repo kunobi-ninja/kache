@@ -5143,6 +5143,7 @@ mod tests {
     fn meta_with_diagnostics(stdout: &str, stderr: &str) -> crate::store::EntryMeta {
         crate::store::EntryMeta {
             cache_key: "k".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "c".to_string(),
             crate_types: vec![],
             files: vec![],
@@ -5237,6 +5238,7 @@ mod tests {
     ) -> crate::store::EntryMeta {
         crate::store::EntryMeta {
             cache_key: cache_key.to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "foo".to_string(),
             crate_types: vec!["lib".to_string()],
             files,
@@ -5628,6 +5630,7 @@ mod tests {
         fn meta(names: &[&str]) -> crate::store::EntryMeta {
             crate::store::EntryMeta {
                 cache_key: "key".to_string(),
+                key_schema: crate::cache_key::CACHE_KEY_VERSION,
                 crate_name: "foo.c".to_string(),
                 crate_types: vec![],
                 files: names

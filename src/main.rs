@@ -102,11 +102,15 @@ enum Commands {
         no_pager: bool,
     },
 
-    /// Run garbage collection (LRU eviction)
+    /// Run garbage collection
     Gc {
         /// Evict entries older than this duration (e.g. 7d, 24h)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "stale_schema")]
         max_age: Option<String>,
+
+        /// Remove entries from old or unrecorded cache-key schemas
+        #[arg(long)]
+        stale_schema: bool,
     },
 
     /// Wipe entire cache or entries for a specific crate
@@ -499,7 +503,10 @@ fn main() -> Result<()> {
             sort,
             no_pager,
         }) => cli::list(&config, crate_name.as_deref(), &sort, no_pager),
-        Some(Commands::Gc { max_age }) => {
+        Some(Commands::Gc {
+            max_age,
+            stale_schema,
+        }) => {
             let hours = max_age
                 .as_deref()
                 .map(|value| {
@@ -510,7 +517,7 @@ fn main() -> Result<()> {
                     })
                 })
                 .transpose()?;
-            cli::gc(&config, hours)
+            cli::gc(&config, hours, stale_schema)
         }
         Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
         Some(Commands::Clean { dry_run, yes }) => cli::clean(dry_run, yes),

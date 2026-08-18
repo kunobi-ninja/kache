@@ -2491,7 +2491,28 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
 }
 
 /// Run garbage collection via the daemon.
-pub fn gc(config: &Config, max_age_hours: Option<u64>) -> Result<()> {
+pub fn gc(config: &Config, max_age_hours: Option<u64>, stale_schema: bool) -> Result<()> {
+    if stale_schema {
+        let store = Store::open(config)?;
+        let _gc_lock = match store.try_gc_lock()? {
+            Some(lock) => lock,
+            None => {
+                println!("Another GC is already running; skipping.");
+                return Ok(());
+            }
+        };
+        let stats = store.evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)?;
+        println!(
+            "Stale-schema GC:{}\nCurrent key schema: {}.",
+            describe_eviction(&stats, false),
+            crate::cache_key::CACHE_KEY_VERSION,
+        );
+        let total_size = store.total_size()?;
+        let entry_count = store.entry_count()?;
+        println!("Store: {} ({} entries)", ByteSize(total_size), entry_count);
+        return Ok(());
+    }
+
     let mode = GcMode::from_env();
     if mode == GcMode::Background {
         let sleep_secs = std::env::var("KACHE_AUTO_GC_RETRY_DELAY_SECS")
@@ -8194,6 +8215,7 @@ mod tests {
     ) -> crate::store::EntryMeta {
         crate::store::EntryMeta {
             cache_key: "k".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "c".to_string(),
             crate_types: crate_types.iter().map(|v| (*v).to_string()).collect(),
             files: Vec::new(),

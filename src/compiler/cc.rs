@@ -1084,18 +1084,24 @@ fn regular_output_is_replaceable(path: &Path, meta: &std::fs::Metadata) -> bool 
     regular_output_is_independent(path, meta) && regular_output_is_owner_writable(meta)
 }
 
-#[cfg(unix)]
 fn regular_output_is_owner_writable(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if meta.permissions().readonly() {
+        return false;
+    }
 
-    // SAFETY: geteuid has no arguments, pointers, or preconditions.
-    let current_uid = unsafe { libc::geteuid() };
-    meta.uid() == current_uid && meta.permissions().mode() & 0o200 != 0
-}
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-#[cfg(not(unix))]
-fn regular_output_is_owner_writable(meta: &std::fs::Metadata) -> bool {
-    !meta.permissions().readonly()
+        // SAFETY: geteuid has no arguments, pointers, or preconditions.
+        let current_uid = unsafe { libc::geteuid() };
+        meta.uid() == current_uid && meta.permissions().mode() & 0o200 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(unix)]
@@ -8536,6 +8542,27 @@ mod tests {
             1,
             "post-compile discovery may ingest an independent regular file"
         );
+    }
+
+    #[test]
+    fn regular_output_writability_distinguishes_readonly_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("permissions.o");
+        std::fs::write(&output, b"ordinary compiler output").unwrap();
+
+        let writable = std::fs::metadata(&output).unwrap();
+        let original_permissions = writable.permissions();
+        assert!(regular_output_is_owner_writable(&writable));
+
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_readonly(true);
+        std::fs::set_permissions(&output, readonly_permissions).unwrap();
+        let readonly = std::fs::metadata(&output).unwrap();
+        assert!(!regular_output_is_owner_writable(&readonly));
+
+        // Windows refuses to remove a read-only file, so restore the exact
+        // original permissions before the temporary directory is dropped.
+        std::fs::set_permissions(&output, original_permissions).unwrap();
     }
 
     /// A user-owned read-only output must reach the selected compiler intact.

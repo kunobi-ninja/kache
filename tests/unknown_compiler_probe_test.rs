@@ -3,7 +3,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn kache_binary() -> &'static str {
     env!("CARGO_BIN_EXE_kache")
@@ -101,6 +101,14 @@ fn probe_recovers_when_wrapper_leaves_descendant_on_stdout() {
     if let Ok(pid_str) = fs::read_to_string(&pid_file)
         && let Ok(pid) = pid_str.trim().parse::<i32>()
     {
+        // The process-group SIGKILL has been sent before kache returns, but an
+        // orphaned descendant can remain visible as a zombie until init reaps
+        // it. Give that asynchronous reap a small bounded window before
+        // treating the process as still alive.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) == 0 } && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let still_alive = unsafe { libc::kill(pid, 0) == 0 };
         assert!(
             !still_alive,

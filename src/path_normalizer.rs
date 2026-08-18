@@ -351,6 +351,44 @@ impl PathNormalizer {
         self
     }
 
+    /// Add Cargo's effective target directory derived from the rustc argv.
+    ///
+    /// `CARGO_TARGET_DIR` is often unset, especially for Cargo's default
+    /// `<workspace>/target`. Dependency crates are compiled with their own
+    /// package directory as cwd, so the workspace root cannot always be
+    /// verified from cwd either. The rustc output layout still identifies the
+    /// target directory exactly; adding it here keeps build-script generated
+    /// sources portable without trusting an inferred workspace root.
+    pub(crate) fn with_target_dir(mut self, target_dir: Option<&Path>) -> Self {
+        let Some(target_dir) = target_dir else {
+            return self;
+        };
+
+        let mut target_rules = Vec::new();
+        push_path_rule_aliases(
+            &mut target_rules,
+            &mut self.source_restore_roots,
+            target_dir,
+            "<TARGET>",
+            "<TARGET>",
+        );
+
+        // Keep the same semantic order as rustc's last-match-wins remap set:
+        // workspace/configured/Cargo-home owners outrank TARGET, while user
+        // dirs and TMPDIR must not consume an external target first.
+        let target_rank = flag_emit_rank("<TARGET>");
+        let insert_at = self
+            .rules
+            .iter()
+            .position(|rule| flag_emit_rank(&rule.key_sentinel) < target_rank)
+            .unwrap_or(self.rules.len());
+        self.rules.splice(insert_at..insert_at, target_rules);
+
+        let mut seen = std::collections::HashSet::new();
+        self.rules.retain(|rule| seen.insert(rule.prefix.clone()));
+        self
+    }
+
     /// Add the validated `[paths].base_dirs` rule set.
     ///
     /// Entries are sorted by their lexical spelling before sentinel assignment,
@@ -3206,6 +3244,30 @@ mod tests {
         );
         assert!(restored.contains(&format!("{}/src/lib.rs", consumer_canonical.display())));
         assert!(!restored.contains(&producer_canonical.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn argv_target_dir_owns_generated_sources_without_a_workspace_root() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        let generated = target.join("release/build/serde-core/out/private.rs");
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::fs::write(&generated, "pub const PRIVATE: bool = true;\n").unwrap();
+
+        let normalizer = PathNormalizer::empty().with_target_dir(Some(&target));
+        assert_eq!(
+            normalizer.source_path_identity(&generated).unwrap(),
+            b"<TARGET>/release/build/serde-core/out/private.rs"
+        );
+        assert!(normalizer.depinfo_source_roots().iter().any(|root| {
+            root.root == target && root.depinfo_sentinel == "__kache_target_rule__/"
+        }));
+        assert!(
+            normalizer
+                .remap_args()
+                .iter()
+                .any(|arg| arg.contains("=/kache/target"))
+        );
     }
 
     #[cfg(unix)]

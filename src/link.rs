@@ -1227,9 +1227,10 @@ pub fn rewrite_rustc_depinfo_content_with_configured_roots(
                     }),
             )
             .collect::<Vec<_>>();
-        roots.sort_by_key(|(root, _, priority, tie, _)| {
+        roots.sort_by_key(|(root, _, priority, tie, exact)| {
             std::cmp::Reverse((
                 *priority,
+                u8::from(*exact),
                 root.components().count(),
                 root.as_os_str().len(),
                 *tie,

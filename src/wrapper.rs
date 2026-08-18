@@ -2232,7 +2232,8 @@ fn run_parsed_rustc(
     let depinfo_anchor = args.target_dir();
     let depinfo_working_dir = current_dir.as_deref().unwrap_or_else(|| Path::new("."));
     let depinfo_workspace_dir = args.path_normalization_root();
-    let depinfo_configured_roots = configured_rustc_depinfo_roots(config, depinfo_workspace_dir);
+    let depinfo_configured_roots =
+        configured_rustc_depinfo_roots(config, depinfo_workspace_dir, depinfo_anchor.as_deref());
 
     // Validate the compiler's consumer-facing dep-info before Store::put makes
     // an entry observable. The staging transform below cannot alter its input.
@@ -2539,8 +2540,10 @@ fn prepare_rustc_store_files(
 fn configured_rustc_depinfo_roots(
     config: &Config,
     workspace_root: Option<&Path>,
+    target_dir: Option<&Path>,
 ) -> Vec<(PathBuf, String, u8)> {
     crate::path_normalizer::PathNormalizer::from_env(workspace_root)
+        .with_target_dir(target_dir)
         .with_base_dirs(&config.base_dirs)
         .depinfo_source_roots()
         .into_iter()
@@ -2886,6 +2889,7 @@ fn compute_rustc_cache_key(
     // `RustcCompiler::execute`, or the key would represent one remap rule set
     // and the binary another.
     let path_normalizer = crate::path_normalizer::PathNormalizer::from_env(workspace_root)
+        .with_target_dir(args.target_dir().as_deref())
         .with_base_dirs(&config.base_dirs)
         .with_path_only_env_vars(config.path_only_env_vars.clone())
         .with_rust_src_rule(
@@ -3120,14 +3124,16 @@ fn restore_from_cache(
     // the consumer worktree rather than a live donor (#760).
     // Falls back to cwd only for ad-hoc invocations outside cargo's
     // layout, where there is no cached `.d` to rewrite anyway.
-    let depinfo_anchor = args
-        .target_dir()
+    let cargo_target_dir = args.target_dir();
+    let depinfo_anchor = cargo_target_dir
+        .clone()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| Path::new(".").to_path_buf());
     let depinfo_working_dir =
         std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     let depinfo_workspace_dir = args.path_normalization_root();
-    let depinfo_configured_roots = configured_rustc_depinfo_roots(config, depinfo_workspace_dir);
+    let depinfo_configured_roots =
+        configured_rustc_depinfo_roots(config, depinfo_workspace_dir, cargo_target_dir.as_deref());
 
     // Dep-info validation gate (kunobi-ninja/kache#330): a restored `.d`
     // whose paths do not resolve for THIS consumer poisons cargo's

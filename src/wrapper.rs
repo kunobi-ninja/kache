@@ -509,10 +509,7 @@ fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
 }
 
 fn cc_output_path_requires_passthrough(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => true,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-    }
+    crate::compiler::cc::output_path_requires_compiler_semantics(path)
 }
 
 /// Forward a `cc`-crate compiler-family probe (`kache -E <file>`) to
@@ -1210,15 +1207,19 @@ fn publish_prepared_cc_artifacts_with(
     mut before_publish: impl FnMut(usize, &Path) -> Result<()>,
 ) -> Result<()> {
     // Validate the whole set before making any final pathname visible.
+    let mut replace_existing = Vec::with_capacity(prepared.len());
     for artifact in &prepared {
         if cc_output_path_requires_passthrough(artifact.target()) {
             anyhow::bail!(
                 "cc restore: output path changed and now requires compiler passthrough semantics"
             );
         }
+        replace_existing.push(std::fs::symlink_metadata(artifact.target()).is_ok());
     }
 
-    for (index, artifact) in prepared.into_iter().enumerate() {
+    for (index, (artifact, replace_existing)) in
+        prepared.into_iter().zip(replace_existing).enumerate()
+    {
         if let Err(error) = before_publish(index, artifact.target()) {
             return if index == 0 {
                 Err(error)
@@ -1226,7 +1227,18 @@ fn publish_prepared_cc_artifacts_with(
                 Err(error.context(PartialCcRestore))
             };
         }
-        if let Err(error) = artifact.publish() {
+        let publish = if replace_existing {
+            if cc_output_path_requires_passthrough(artifact.target()) {
+                Err(anyhow::anyhow!(
+                    "cc restore: output path changed and now requires compiler passthrough semantics"
+                ))
+            } else {
+                artifact.publish_replacing()
+            }
+        } else {
+            artifact.publish()
+        };
+        if let Err(error) = publish {
             return if index == 0 {
                 Err(error)
             } else {
@@ -1239,9 +1251,10 @@ fn publish_prepared_cc_artifacts_with(
 
 /// Restore cached cc artifacts to this invocation's output paths.
 ///
-/// Every artifact is staged first, then the set is published absent-only. If a
-/// race wins after publication starts, the caller receives `PartialCcRestore`
-/// and must not run the compiler over the partially restored output set.
+/// Every artifact is staged first. Absent paths use no-clobber publication;
+/// validated ordinary existing outputs are atomically replaced. If a race wins
+/// after publication starts, the caller receives `PartialCcRestore` and must
+/// not run the compiler over the partially restored output set.
 fn restore_cc_from_cache(
     store: &Store,
     parsed: &crate::compiler::cc::CcArgs,
@@ -5854,6 +5867,60 @@ mod tests {
     }
 
     #[test]
+    fn restore_cc_from_cache_replaces_existing_plain_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "abababababababababababababababababababababababababababababababab";
+        create_blob(&store, hash, b"cached object");
+
+        let output = dir.path().join("output.o");
+        std::fs::write(&output, b"stale object").unwrap();
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcCompiler::new()
+            .parse(&s(&["cc", "-c", "foo.c", "-o", &output_str]))
+            .unwrap();
+        let meta = entry_meta("cc-replace-key", vec![cached_file("foo.o", hash)], &[]);
+
+        restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+
+        assert_eq!(std::fs::read(&output).unwrap(), b"cached object");
+        assert_eq!(
+            std::fs::read(store.blob_path(hash)).unwrap(),
+            b"cached object"
+        );
+    }
+
+    #[test]
+    fn cc_restore_revalidates_existing_target_before_replacing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output.o");
+        std::fs::write(&output, b"race winner").unwrap();
+        let prepared =
+            vec![link::prepare_writable_target_from_bytes(&output, b"cached object").unwrap()];
+
+        let error = publish_prepared_cc_artifacts_with(prepared, |_, target| {
+            let mut permissions = std::fs::metadata(target)?.permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(target, permissions)?;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requires compiler passthrough"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"race winner");
+
+        // TempDir cleanup cannot remove a read-only Windows file.
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&output).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&output, permissions).unwrap();
+        }
+    }
+
+    #[test]
     fn cc_restore_marks_partial_publication_and_preserves_race_winner() {
         let dir = tempfile::tempdir().unwrap();
         let object = dir.path().join("foo.o");
@@ -6800,13 +6867,13 @@ exit 0
     }
 
     #[test]
-    fn cc_output_path_passthrough_distinguishes_absent_and_existing_paths() {
+    fn cc_output_path_passthrough_allows_plain_files_but_refuses_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("output.o");
 
         assert!(!cc_output_path_requires_passthrough(&output));
         std::fs::write(&output, b"existing").unwrap();
-        assert!(cc_output_path_requires_passthrough(&output));
+        assert!(!cc_output_path_requires_passthrough(&output));
 
         #[cfg(unix)]
         {
@@ -6846,6 +6913,7 @@ exit 0
         .unwrap();
         std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(&output, b"existing output").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let capture_arg = capture.to_string_lossy().into_owned();
         let output_arg = output.to_string_lossy().into_owned();

@@ -4421,17 +4421,28 @@ fn write_session_marker(mut file: &std::fs::File, session_id: &str) {
     let _ = file.flush();
 }
 
-/// Mint a new session id: hex(blake3(root, pid, nanos))[..16]. Opaque and
+/// Mint a new session id: hex(blake3(root, pid, nanos, seq))[..16]. Opaque and
 /// dependency-free; uniqueness only needs to hold per cache dir per window.
+///
+/// `seq` is what makes two ids from one process distinct. `nanos` alone is not:
+/// the clock's real resolution can be coarser than the gap between two
+/// back-to-back calls, so `SystemTime::now()` returns the same value twice and
+/// the digests collide. That is rare on a fast bare-metal host and routine in a
+/// build sandbox or a loaded VM, which is why it surfaced as a flaky test in
+/// Nix builds (#756) rather than in CI.
 fn mint_session_id(root: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut hasher = blake3::Hasher::new();
     hasher.update(root.as_bytes());
     hasher.update(&std::process::id().to_le_bytes());
     hasher.update(&nanos.to_le_bytes());
+    hasher.update(&seq.to_le_bytes());
     hasher.finalize().to_hex().as_str()[..16].to_string()
 }
 
@@ -8193,10 +8204,18 @@ exit 0
 
     #[test]
     fn mint_session_id_is_opaque_and_distinct() {
-        let a = mint_session_id("/repo");
-        let b = mint_session_id("/repo");
-        assert_eq!(a.len(), 16);
-        assert_ne!(a, b, "nanos+pid make consecutive ids distinct");
+        // A tight loop is the point: it drives the interval between calls below
+        // the clock's resolution, which is exactly the case where the old
+        // nanos-only digest repeated itself.
+        let ids: Vec<String> = (0..256).map(|_| mint_session_id("/repo")).collect();
+
+        assert!(ids.iter().all(|id| id.len() == 16));
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "the seq counter makes ids distinct even when the clock does not move"
+        );
     }
 
     #[test]

@@ -470,6 +470,22 @@ fn gc_on_empty_cache_succeeds() {
     e.cmd().arg("gc").assert().success();
     let e = env();
     e.cmd().args(["gc", "--max-age", "7d"]).assert().success();
+    let e = env();
+    e.cmd()
+        .args(["gc", "--stale-schema"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Stale-schema GC:"));
+}
+
+#[test]
+fn gc_rejects_overlapping_explicit_policies() {
+    let e = env();
+    e.cmd()
+        .args(["gc", "--max-age", "7d", "--stale-schema"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"));
 }
 
 #[test]

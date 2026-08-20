@@ -502,6 +502,13 @@ fn run_tmutil_addexclusion_bounded(dir: &str) {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EntryMeta {
     pub cache_key: String,
+    /// Cache-key recipe version that produced `cache_key`.
+    ///
+    /// Entries written before this field existed deserialize as `0` (unknown),
+    /// so an explicit stale-schema sweep can reclaim them without making old
+    /// stores unreadable during an ordinary upgrade.
+    #[serde(default)]
+    pub key_schema: u32,
     pub crate_name: String,
     pub crate_types: Vec<String>,
     pub files: Vec<CachedFile>,
@@ -960,6 +967,11 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     // this column the cache has no way to weigh what it is about to destroy.
     let _ = db
         .execute_batch("ALTER TABLE entries ADD COLUMN compile_time_ms INTEGER NOT NULL DEFAULT 0");
+    // Cache-key recipe version for targeted reclamation after a key bump
+    // (kunobi-ninja/kache#750). Legacy rows are `0` = unknown and remain usable
+    // until the user explicitly requests a stale-schema sweep.
+    let _ =
+        db.execute_batch("ALTER TABLE entries ADD COLUMN key_schema INTEGER NOT NULL DEFAULT 0");
 
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS blobs (
@@ -1764,6 +1776,7 @@ impl Store {
         // Write metadata (only meta.json in the entry directory)
         let meta = EntryMeta {
             cache_key: cache_key.to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: crate_name.to_string(),
             crate_types: crate_types.to_vec(),
             files: cached_files,
@@ -1808,8 +1821,8 @@ impl Store {
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
-            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, crate::cache_key::CACHE_KEY_VERSION],
         )?;
         tx.commit()?;
 
@@ -1979,8 +1992,8 @@ impl Store {
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
-            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64, meta.key_schema],
         )?;
         tx.commit()?;
 
@@ -2124,7 +2137,7 @@ impl Store {
         // Claim the entry row first. If it is already there, a concurrent or
         // earlier rebuild owns this entry's refcounts and we must not add more.
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+            "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
             params![
                 cache_key,
                 meta.crate_name,
@@ -2133,7 +2146,8 @@ impl Store {
                 num_features,
                 total_size as i64,
                 content_hash,
-                meta.compile_time_ms as i64
+                meta.compile_time_ms as i64,
+                meta.key_schema
             ],
         )?;
         if inserted == 0 {
@@ -2636,6 +2650,39 @@ impl Store {
     /// Evict entries older than the given duration.
     pub fn evict_older_than(&self, hours: u64) -> Result<GcStats> {
         self.evict_with(&crate::eviction::OlderThanPolicy { hours }, None)
+    }
+
+    /// Remove entries written by a different (or unknown legacy) cache-key
+    /// recipe while retaining every entry from the running recipe.
+    ///
+    /// This is deliberately explicit rather than part of ordinary GC: rows
+    /// created before key-schema recording use `0`, and an upgrade must not
+    /// discard a still-reachable cache merely because its metadata predates
+    /// this field. `kache gc --stale-schema` is the user's opt-in boundary.
+    pub fn evict_stale_key_schemas(&self, current_schema: u32) -> Result<GcStats> {
+        let keys = {
+            let mut stmt = self.db.prepare(
+                "SELECT cache_key FROM entries
+                 WHERE committed = 1 AND key_schema != ?1
+                 ORDER BY cache_key",
+            )?;
+            stmt.query_map(params![current_schema], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let candidates = self.eviction_candidates()?;
+        let by_key = candidates
+            .iter()
+            .map(|entry| (entry.key.as_str(), entry))
+            .collect::<std::collections::HashMap<_, _>>();
+        let durable_upload_keys = self.durable_upload_keys()?;
+        Ok(self.apply_eviction(
+            &keys,
+            &by_key,
+            "stale_schema",
+            None,
+            None,
+            &durable_upload_keys,
+        ))
     }
 
     /// Evict duplicate entries that share the same content_hash.
@@ -5644,6 +5691,7 @@ mod tests {
         fs::create_dir_all(&entry_dir).unwrap();
         let meta = EntryMeta {
             cache_key: cache_key.to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "empty".to_string(),
             crate_types: vec!["rlib".to_string()],
             files: vec![],
@@ -6191,6 +6239,103 @@ mod tests {
     }
 
     #[test]
+    fn evict_stale_key_schemas_keeps_only_the_running_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        for (key, content) in [
+            ("current", b"current artifact".as_slice()),
+            ("old", b"old artifact".as_slice()),
+            ("legacy", b"legacy artifact".as_slice()),
+        ] {
+            let output = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&output, content).unwrap();
+            store
+                .put(
+                    key,
+                    key,
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(output, format!("{key}.rlib"))],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+
+        let prior_schema = crate::cache_key::CACHE_KEY_VERSION.saturating_sub(1);
+        store
+            .db
+            .execute(
+                "UPDATE entries
+                 SET key_schema = ?1, last_accessed = datetime('now', '-1 day')
+                 WHERE cache_key = 'old'",
+                params![prior_schema],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE entries
+                 SET key_schema = 0, last_accessed = datetime('now', '-1 day')
+                 WHERE cache_key = 'legacy'",
+                [],
+            )
+            .unwrap();
+
+        let stats = store
+            .evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)
+            .unwrap();
+        assert_eq!(stats.entries_evicted, 2);
+        assert!(stats.bytes_freed > 0);
+        assert_eq!(stats.blobs_removed, 2);
+        assert_eq!(stats.entries_pinned, 0);
+        assert!(store.contains("current"));
+        assert!(!store.contains("old"));
+        assert!(!store.contains("legacy"));
+        assert_eq!(store.entry_count().unwrap(), 1);
+
+        let second = store
+            .evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)
+            .unwrap();
+        assert_eq!(second.entries_evicted, 0);
+    }
+
+    #[test]
+    fn entry_meta_key_schema_defaults_to_unknown_for_legacy_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("lib.rlib");
+        std::fs::write(&output, b"artifact").unwrap();
+        store
+            .put(
+                "key",
+                "crate",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let content = std::fs::read_to_string(store.entry_dir("key").join("meta.json")).unwrap();
+        let current: EntryMeta = serde_json::from_str(&content).unwrap();
+        assert_eq!(current.key_schema, crate::cache_key::CACHE_KEY_VERSION);
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&content).unwrap();
+        legacy.as_object_mut().unwrap().remove("key_schema");
+        let parsed: EntryMeta = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.key_schema, 0);
+    }
+
+    #[test]
     fn test_store_import_downloaded_entry() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -6205,8 +6350,10 @@ mod tests {
         // Real content hash — the import trust boundary re-hashes and rejects a
         // mismatch (kunobi-ninja/kache#211).
         let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
+        let prior_schema = crate::cache_key::CACHE_KEY_VERSION.saturating_sub(1);
         let meta = EntryMeta {
             cache_key: "downloaded_key".to_string(),
+            key_schema: prior_schema,
             crate_name: "downloaded_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -6229,6 +6376,15 @@ mod tests {
         store.import_downloaded_entry("downloaded_key").unwrap();
         assert!(store.contains("downloaded_key"));
         assert_eq!(store.entry_count().unwrap(), 1);
+        let indexed_schema: u32 = store
+            .db
+            .query_row(
+                "SELECT key_schema FROM entries WHERE cache_key = 'downloaded_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed_schema, prior_schema);
     }
 
     #[test]
@@ -6243,6 +6399,7 @@ mod tests {
 
         let meta = EntryMeta {
             cache_key: "incomplete_key".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "incomplete_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -6286,6 +6443,7 @@ mod tests {
         let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
         let meta = EntryMeta {
             cache_key: "dl_key".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "dl_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -6635,6 +6793,7 @@ mod tests {
 
         let meta = EntryMeta {
             cache_key: "mismatch_key".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "mismatch_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -6685,6 +6844,7 @@ mod tests {
         mutate(&mut file);
         let meta = EntryMeta {
             cache_key: key.to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "c".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![file],
@@ -8180,6 +8340,7 @@ mod tests {
         let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
         let meta = EntryMeta {
             cache_key: "old_key".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "old_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -8238,6 +8399,7 @@ mod tests {
         let hash = crate::cache_key::hash_file(&artifact).unwrap();
         let meta = EntryMeta {
             cache_key: "old_bad_key".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "old_bad_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -8303,6 +8465,7 @@ mod tests {
 
             let meta = EntryMeta {
                 cache_key: key.to_string(),
+                key_schema: crate::cache_key::CACHE_KEY_VERSION,
                 crate_name: "shared_crate".to_string(),
                 crate_types: vec!["lib".to_string()],
                 files: vec![CachedFile {
@@ -8849,6 +9012,7 @@ mod tests {
 
         let meta = EntryMeta {
             cache_key: "legacy_key".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "legacy_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![
@@ -8940,6 +9104,7 @@ mod tests {
         let size = fs::metadata(&artifact).unwrap().len();
         let meta = EntryMeta {
             cache_key: "legacy_race".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "legacy_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -9194,6 +9359,7 @@ mod tests {
     fn covers_requested_emit_semantics() {
         let mk = |kinds: &[&str]| EntryMeta {
             cache_key: "k".into(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "c".into(),
             crate_types: vec![],
             files: vec![],
@@ -9252,6 +9418,7 @@ mod tests {
 
         let meta = EntryMeta {
             cache_key: "k".into(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "rococo_runtime".into(),
             crate_types: vec!["cdylib".into()],
             files,
@@ -9325,6 +9492,7 @@ mod tests {
 
         let meta = EntryMeta {
             cache_key: "dl_ch_test".to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
             crate_name: "dlcrate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {

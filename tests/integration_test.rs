@@ -1406,8 +1406,8 @@ fn test_cc_dev_null_output_is_passthrough_and_preserved() {
 }
 
 /// C/C++ cache materialization must never recreate the read-only/shared shape
-/// that forced unsafe pre-cleaning. An existing warm output is passed to the
-/// selected compiler unchanged rather than replaced by Kache.
+/// that forced unsafe pre-cleaning. A private writable output remains cacheable,
+/// while every restored output remains independently compiler-writable.
 #[cfg(unix)]
 #[test]
 fn test_cc_cache_output_stays_writable_across_miss_hit_and_recompile() {
@@ -1439,12 +1439,56 @@ fn test_cc_cache_output_stays_writable_across_miss_hit_and_recompile() {
     assert_ne!(
         std::fs::metadata(&output).unwrap().permissions().mode() & 0o200,
         0,
-        "passthrough compiler must overwrite the warm output without pre-clean"
+        "compiler must overwrite the warm output without unsafe pre-clean"
     );
 
     let report = kache_report(cache_dir.path());
-    assert_cc_report_counts(&report, 1, 1);
-    assert_eq!(report["summary"]["passthroughs"].as_u64(), Some(1));
+    assert_cc_report_counts(&report, 2, 1);
+    assert_eq!(report["summary"]["passthroughs"].as_u64(), Some(0));
+}
+
+/// Regression for #744: an ordinary compiler-owned object remains cacheable
+/// when the build system leaves it in place. This covers both halves of the
+/// regression: a matching key may replace the stale object from cache, and a
+/// configuration change must compile and store rather than pass through.
+#[test]
+fn test_cc_existing_plain_output_hits_and_reconfigured_miss_is_stored() {
+    build_kache();
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    let source = project.path().join("foo.c");
+    let output = project.path().join("foo.o");
+    std::fs::write(&source, "int f(void) { return 42; }\n").unwrap();
+
+    let source_str = source.to_string_lossy().into_owned();
+    let output_str = output.to_string_lossy().into_owned();
+    let o0 = ["cc", "-c", &source_str, "-o", &output_str, "-O0", "-g0"];
+    let o2 = ["cc", "-c", &source_str, "-o", &output_str, "-O2", "-g0"];
+
+    run_kache_cc(project.path(), cache_dir.path(), &o0);
+    let cached_o0 = std::fs::read(&output).unwrap();
+
+    std::fs::write(&output, b"stale ordinary object").unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &o0);
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        cached_o0,
+        "an existing private regular object must be replaceable on a cache hit"
+    );
+
+    run_kache_cc(project.path(), cache_dir.path(), &o2);
+    std::fs::remove_file(&output).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &o2);
+
+    let report = kache_report(cache_dir.path());
+    let summary = &report["summary"];
+    assert_eq!(summary["local_hits"].as_u64(), Some(2));
+    assert_eq!(summary["passthroughs"].as_u64(), Some(0));
+    assert_eq!(
+        summary["misses"].as_u64().unwrap_or(0) + summary["dups"].as_u64().unwrap_or(0),
+        2,
+        "both cold configurations must be admitted to the cache"
+    );
 }
 
 /// A cache hit must not create an output directory that the selected compiler

@@ -46,6 +46,26 @@ pub struct Sharing {
     pub private_bytes: u64,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeError {
+    /// The filesystem does not implement the platform sharing query.
+    Unsupported,
+    /// The query should have worked, but the reply was unusable.
+    Failed,
+}
+
+#[cfg(target_os = "linux")]
+fn probe_error_from_errno(errno: Option<i32>) -> ProbeError {
+    // OpenZFS rejects unknown ioctls with ENOTTY; other filesystems commonly
+    // use EOPNOTSUPP for an unsupported FIEMAP implementation.
+    if matches!(errno, Some(libc::ENOTTY) | Some(libc::EOPNOTSUPP)) {
+        ProbeError::Unsupported
+    } else {
+        ProbeError::Failed
+    }
+}
+
 impl Sharing {
     /// The answer for a file we could not interrogate: assume nothing is shared
     /// and every byte is private. See the module docs on why this direction.
@@ -435,6 +455,13 @@ fn fiemap_verdict(
 
 #[cfg(target_os = "linux")]
 fn probe_linux(path: &Path, size: u64) -> Sharing {
+    try_probe_linux(path, size).unwrap_or_else(|_| Sharing::unknown_for(size))
+}
+
+/// Preserve whether FIEMAP itself is unsupported so capability-dependent
+/// tests can skip ZFS without hiding malformed replies on supported filesystems.
+#[cfg(target_os = "linux")]
+fn try_probe_linux(path: &Path, size: u64) -> Result<Sharing, ProbeError> {
     use std::os::fd::AsRawFd;
 
     const FIEMAP_MAX_EXTENTS: usize = 32;
@@ -471,17 +498,18 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
 
     // An empty file shares nothing and frees nothing; skip the syscall.
     if size == 0 {
-        return Sharing {
+        return Ok(Sharing {
             shared: false,
             private_bytes: 0,
-        };
+        });
     }
 
     let Ok(file) = std::fs::File::open(path) else {
-        return Sharing::unknown_for(size);
+        return Err(ProbeError::Failed);
     };
 
-    walk_extent_map(size, |offset| {
+    let mut ioctl_error = None;
+    let sharing = walk_extent_map(size, |offset| {
         let mut fm: Fiemap = unsafe { std::mem::zeroed() };
         fm.fm_start = offset;
         fm.fm_length = fiemap_window_length(offset);
@@ -496,6 +524,8 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
             )
         };
         if rc != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            ioctl_error = Some(probe_error_from_errno(errno));
             return None;
         }
         // The kernel must never report more extents than it was given room for.
@@ -515,7 +545,12 @@ fn probe_linux(path: &Path, size: u64) -> Sharing {
                 })
                 .collect(),
         )
-    })
+    });
+
+    match ioctl_error {
+        Some(error) => Err(error),
+        None => Ok(sharing),
+    }
 }
 
 // ── Everything else ─────────────────────────────────────────────────────────
@@ -532,6 +567,20 @@ fn probe_unsupported(_path: &Path, size: u64) -> Sharing {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn capability_test_probe(path: &Path, size: u64) -> Option<Sharing> {
+        match try_probe_linux(path, size) {
+            Ok(sharing) => Some(sharing),
+            Err(ProbeError::Unsupported) => None,
+            Err(ProbeError::Failed) => panic!("storage-sharing probe returned an invalid reply"),
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn capability_test_probe(path: &Path, size: u64) -> Option<Sharing> {
+        Some(probe(path, size))
+    }
+
     #[test]
     fn unknown_reports_everything_private_and_unshared() {
         // The conservative direction: a filesystem we can't interrogate must
@@ -539,6 +588,25 @@ mod tests {
         let s = Sharing::unknown_for(4096);
         assert!(!s.shared);
         assert_eq!(s.private_bytes, 4096);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_unsupported_fiemap_errnos_are_skippable() {
+        assert_eq!(
+            probe_error_from_errno(Some(libc::ENOTTY)),
+            ProbeError::Unsupported,
+            "OpenZFS rejects FIEMAP as an unknown ioctl"
+        );
+        assert_eq!(
+            probe_error_from_errno(Some(libc::EOPNOTSUPP)),
+            ProbeError::Unsupported
+        );
+        assert_eq!(
+            probe_error_from_errno(Some(libc::EINVAL)),
+            ProbeError::Failed
+        );
+        assert_eq!(probe_error_from_errno(None), ProbeError::Failed);
     }
 
     #[test]
@@ -651,7 +719,10 @@ mod tests {
             return;
         }
 
-        let s = probe(&path, size);
+        let Some(s) = capability_test_probe(&path, size) else {
+            eprintln!("skipping: this filesystem has no storage-sharing probe");
+            return;
+        };
         assert!(
             s.private_bytes < size,
             "a hole is not reclaimable storage: {s:?} for a {size}-byte file \
@@ -661,7 +732,8 @@ mod tests {
 
     /// The case the whole module exists for: a reflinked copy has `nlink == 1`
     /// yet shares all its blocks, which is what made `clean` report 0% cached
-    /// on APFS. Skips itself where the platform or filesystem has no reflink.
+    /// on APFS. Skips itself where the filesystem lacks reflinks or a storage-
+    /// sharing query (for example, ZFS supports the former but not FIEMAP).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_reflinked_copy_is_detected_as_shared_despite_nlink_1() {
@@ -689,7 +761,10 @@ mod tests {
              wrong signal (#602)"
         );
 
-        let s = probe(&dst, size);
+        let Some(s) = capability_test_probe(&dst, size) else {
+            eprintln!("skipping: this filesystem has reflinks but no storage-sharing probe");
+            return;
+        };
         assert!(
             s.shared,
             "a reflinked clone must be detected as sharing storage: {s:?}"

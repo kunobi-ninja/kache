@@ -1,7 +1,0 @@
-# Local-only, NOT for committing (mise loads it automatically; kept out of git
-# so CI and other contributors are unaffected): dogfood kache on kache's own
-# builds. The wrapper is the RELEASED build installed from origin/main via
-# `cargo install --path <main worktree> --locked` — never the dev binary being
-# edited, so a broken work-in-progress wrapper can't corrupt its own build.
-[env]
-RUSTC_WRAPPER = "{{env.HOME}}/.cargo/bin/kache"

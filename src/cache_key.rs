@@ -657,43 +657,60 @@ impl GroupedHasher {
     }
 }
 
-/// Per-group digests of the most recent [`compute_cache_key`] run in this
-/// process, for the wrapper's event logging (one compile per wrapper process,
-/// same stash pattern as `link.rs`'s toggles). `None` until a key is computed
-/// (cc compiles, passthroughs).
-static LAST_KEY_FIELDS: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    /// Per-group digests of the most recent [`compute_cache_key`] run on this
+    /// thread, for the wrapper's event logging (one compile per wrapper
+    /// process, same stash pattern as `link.rs`'s toggles). `None` until a key
+    /// is computed (cc compiles, passthroughs).
+    ///
+    /// Thread-local rather than process-global (kunobi-ninja/kache#777): the
+    /// write and every read are one wrapper invocation on one thread, so
+    /// per-thread storage costs the production path nothing and makes the
+    /// take-once contract hold under `cargo test`, where libtest runs each test
+    /// on its own thread and a concurrent key computation would otherwise
+    /// consume or overwrite another test's stash.
+    static LAST_KEY_FIELDS: std::cell::RefCell<Option<std::collections::BTreeMap<String, String>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Clone the per-group key digests without consuming them.
 ///
 /// Adaptive incremental policy needs the same input-group evidence as miss
-/// diagnostics before event logging takes the process-local stash.
+/// diagnostics before event logging takes the thread-local stash.
 pub fn peek_last_key_fields() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_FIELDS.lock().ok().and_then(|g| g.clone())
+    LAST_KEY_FIELDS
+        .try_with(|stash| stash.borrow().clone())
+        .ok()
+        .flatten()
 }
 
 /// Take (consume) the per-group key digests of the last computed rustc key.
 pub fn take_last_key_fields() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_FIELDS.lock().ok().and_then(|mut g| g.take())
+    LAST_KEY_FIELDS
+        .try_with(|stash| stash.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
-/// Per-EXTERN artifact digests of the most recent [`compute_cache_key`] run
-/// (kunobi-ninja/kache#609), stashed like [`LAST_KEY_FIELDS`].
-///
-/// The `externs` group digest says only THAT some dependency's artifact
-/// changed. In an `extern:` cascade — one native `-sys` crate's `.a` diverging
-/// and re-keying everything above it — every downstream crate reports the same
-/// undifferentiated "externs changed", which is exactly the case that has to
-/// be diagnosed by hand today. Keeping the per-dependency hashes lets
-/// `why-miss` name WHICH dependency moved, then follow that dependency's own
-/// events to the root of the chain.
-///
-/// The value is the dependency artifact's own content hash (the same bytes
-/// folded into the key), truncated to [`KEY_FIELD_HEX`] — not a digest of the
-/// folded segment. Same discriminating power, and it can be compared against
-/// hashes recorded elsewhere.
-static LAST_KEY_EXTERNS: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    /// Per-EXTERN artifact digests of the most recent [`compute_cache_key`] run
+    /// (kunobi-ninja/kache#609), stashed like [`LAST_KEY_FIELDS`].
+    ///
+    /// The `externs` group digest says only THAT some dependency's artifact
+    /// changed. In an `extern:` cascade — one native `-sys` crate's `.a`
+    /// diverging and re-keying everything above it — every downstream crate
+    /// reports the same undifferentiated "externs changed", which is exactly
+    /// the case that has to be diagnosed by hand today. Keeping the
+    /// per-dependency hashes lets `why-miss` name WHICH dependency moved, then
+    /// follow that dependency's own events to the root of the chain.
+    ///
+    /// The value is the dependency artifact's own content hash (the same bytes
+    /// folded into the key), truncated to [`KEY_FIELD_HEX`] — not a digest of
+    /// the folded segment. Same discriminating power, and it can be compared
+    /// against hashes recorded elsewhere.
+    static LAST_KEY_EXTERNS: std::cell::RefCell<Option<std::collections::BTreeMap<String, String>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Marker recorded for an extern whose artifact could not be hashed — a
 /// sysroot crate (`std`, `core`), whose identity rides on rustc version + name
@@ -703,40 +720,56 @@ pub const EXTERN_UNREADABLE: &str = "(sysroot)";
 /// Take (consume) the per-extern artifact digests of the last computed rustc
 /// key. `None` for cc compiles and passthroughs, which compute no rustc key.
 pub fn take_last_key_externs() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_EXTERNS.lock().ok().and_then(|mut g| g.take())
+    LAST_KEY_EXTERNS
+        .try_with(|stash| stash.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
-/// Producing-unit identity per extern, teed off the same loop that computes
-/// [`LAST_KEY_EXTERNS`] (kunobi-ninja/kache#627).
-///
-/// Keyed by the name the CONSUMER used, which under Cargo's `package = "..."`
-/// renaming is an alias (`foo_old` for a crate whose own events say `foo`). The
-/// value is the producer's `-C extra-filename`, recovered from the artifact path
-/// — the one identity visible from both sides, so `why-miss` can join a changed
-/// dependency to the exact unit that produced it instead of guessing by name.
-///
-/// Absent for an extern whose path carries no such suffix (sysroot crates,
-/// non-cargo invocations); the walk then falls back to matching by name.
-static LAST_KEY_EXTERN_UNITS: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    /// Producing-unit identity per extern, teed off the same loop that computes
+    /// [`LAST_KEY_EXTERNS`] (kunobi-ninja/kache#627).
+    ///
+    /// Keyed by the name the CONSUMER used, which under Cargo's
+    /// `package = "..."` renaming is an alias (`foo_old` for a crate whose own
+    /// events say `foo`). The value is the producer's `-C extra-filename`,
+    /// recovered from the artifact path — the one identity visible from both
+    /// sides, so `why-miss` can join a changed dependency to the exact unit
+    /// that produced it instead of guessing by name.
+    ///
+    /// Absent for an extern whose path carries no such suffix (sysroot crates,
+    /// non-cargo invocations); the walk then falls back to matching by name.
+    static LAST_KEY_EXTERN_UNITS: std::cell::RefCell<
+        Option<std::collections::BTreeMap<String, String>>,
+    > = const { std::cell::RefCell::new(None) };
+}
 
 /// Take (consume) the per-extern producing-unit ids of the last computed rustc
 /// key. Always taken alongside [`take_last_key_externs`] so a stale map cannot
 /// outlive its digests.
 pub fn take_last_key_extern_units() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_EXTERN_UNITS.lock().ok().and_then(|mut g| g.take())
+    LAST_KEY_EXTERN_UNITS
+        .try_with(|stash| stash.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
-/// The compiling unit's own identity, stashed at key computation so the event
-/// writer needs no extra plumbing — the same pattern the per-group digests use
-/// (kunobi-ninja/kache#131). Set unconditionally at the top of
-/// [`compute_cache_key`], including to `None` when cargo passed no
-/// `-C extra-filename`, so it can never carry over from a previous compile.
-static LAST_KEY_UNIT_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+thread_local! {
+    /// The compiling unit's own identity, stashed at key computation so the
+    /// event writer needs no extra plumbing — the same pattern the per-group
+    /// digests use (kunobi-ninja/kache#131). Set unconditionally at the top of
+    /// [`compute_cache_key`], including to `None` when cargo passed no
+    /// `-C extra-filename`, so it can never carry over from a previous compile.
+    static LAST_KEY_UNIT_ID: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Take (consume) the unit id of the last computed rustc key.
 pub fn take_last_key_unit_id() -> Option<String> {
-    LAST_KEY_UNIT_ID.lock().ok().and_then(|mut g| g.take())
+    LAST_KEY_UNIT_ID
+        .try_with(|stash| stash.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
 /// Compute the blake3 cache key for a rustc invocation.
@@ -767,18 +800,12 @@ pub fn compute_cache_key(
     // or one that never reaches the event writer — would otherwise leave a
     // previous invocation's dependency digests to be picked up as if they
     // belonged to this compile.
-    if let Ok(mut stash) = LAST_KEY_EXTERNS.lock() {
-        *stash = None;
-    }
+    let _ = LAST_KEY_EXTERNS.try_with(|stash| *stash.borrow_mut() = None);
     // Same reasoning for the unit ids (#627); both are cleared and written
     // together so the walk can never pair one compile's digests with another's
     // identities.
-    if let Ok(mut stash) = LAST_KEY_EXTERN_UNITS.lock() {
-        *stash = None;
-    }
-    if let Ok(mut stash) = LAST_KEY_UNIT_ID.lock() {
-        *stash = args.unit_id();
-    }
+    let _ = LAST_KEY_EXTERN_UNITS.try_with(|stash| *stash.borrow_mut() = None);
+    let _ = LAST_KEY_UNIT_ID.try_with(|stash| *stash.borrow_mut() = args.unit_id());
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
     hasher.update(b"key_version:");
@@ -1113,12 +1140,8 @@ pub fn compute_cache_key(
             }
         }
     }
-    if let Ok(mut stash) = LAST_KEY_EXTERNS.lock() {
-        *stash = Some(extern_digests);
-    }
-    if let Ok(mut stash) = LAST_KEY_EXTERN_UNITS.lock() {
-        *stash = Some(extern_units);
-    }
+    let _ = LAST_KEY_EXTERNS.try_with(|stash| *stash.borrow_mut() = Some(extern_digests));
+    let _ = LAST_KEY_EXTERN_UNITS.try_with(|stash| *stash.borrow_mut() = Some(extern_units));
 
     // RUSTFLAGS — normalize via PathNormalizer (canonical-prefix
     // sentinel substitution; supersedes the older CWD-only
@@ -1461,9 +1484,7 @@ pub fn compute_cache_key(
     tracing::trace!("[key:{}] remap={}", crate_name, remap);
 
     let (hash, fields) = hasher.finalize_with_fields();
-    if let Ok(mut stash) = LAST_KEY_FIELDS.lock() {
-        *stash = Some(fields);
-    }
+    let _ = LAST_KEY_FIELDS.try_with(|stash| *stash.borrow_mut() = Some(fields));
     let key = hash.to_hex().to_string();
     tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
     Ok(key)
@@ -6657,6 +6678,78 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             Some("0532daf0ee3516f0")
         );
         assert_eq!(take_last_key_extern_units(), None, "taken, not copied");
+    }
+
+    /// The key stashes are per-thread, so a concurrent key computation can
+    /// neither overwrite nor consume another's (kunobi-ninja/kache#777).
+    ///
+    /// Before the stashes were thread-local this was the shape that made
+    /// `key_computation_stashes_unit_identity_and_yields_it_once` flaky under
+    /// the default `cargo test` parallelism: any other thread computing a key
+    /// between a compute and its take would win the race. The outer
+    /// `key_test_lock` still serializes this group against the env-mutating
+    /// matrix; what runs concurrently here is the stash access itself.
+    #[test]
+    fn key_stashes_do_not_leak_across_threads() {
+        let _lock = key_test_lock();
+
+        // Distinct unit ids per thread, so a leak shows up as another thread's
+        // value rather than as an absence.
+        let units = ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"];
+        std::thread::scope(|scope| {
+            for unit in units {
+                scope.spawn(move || {
+                    let extra = format!("extra-filename=-{unit}");
+                    let extern_arg = format!("dep_{unit}=/w/target/debug/deps/libdep-{unit}.rlib");
+                    let args: Vec<String> = [
+                        "rustc",
+                        "--crate-name",
+                        "app",
+                        "src/lib.rs",
+                        "-C",
+                        &extra,
+                        "--extern",
+                        &extern_arg,
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                    let mut parsed = RustcArgs::parse(&args).unwrap();
+                    // Skip the dep-info pre-pass, as above: forking rustc from
+                    // every thread would swamp the point being made.
+                    parsed.source_file = None;
+
+                    // Loop so the interleaving windows overlap rather than each
+                    // thread racing through its compute/take once.
+                    for _ in 0..16 {
+                        compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty())
+                            .unwrap();
+
+                        assert_eq!(
+                            take_last_key_unit_id().as_deref(),
+                            Some(unit),
+                            "each thread sees its own unit id"
+                        );
+                        assert_eq!(take_last_key_unit_id(), None, "taken, not copied");
+
+                        let recorded =
+                            take_last_key_extern_units().expect("recorded with the digests");
+                        assert_eq!(
+                            recorded.get(&format!("dep_{unit}")).map(String::as_str),
+                            Some(unit),
+                            "each thread sees its own extern units"
+                        );
+                        assert_eq!(take_last_key_extern_units(), None, "taken, not copied");
+
+                        assert!(
+                            take_last_key_externs().is_some(),
+                            "digests ride the same thread as their identities"
+                        );
+                        assert!(take_last_key_fields().is_some(), "per-group digests too");
+                    }
+                });
+            }
+        });
     }
 
     /// True if a bare `rustc` is invocable. `compute_cache_key` forks

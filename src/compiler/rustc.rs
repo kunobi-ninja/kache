@@ -135,14 +135,14 @@ impl RustcCompiler {
         skip_remap_override: Option<bool>,
     ) -> Result<CompileResult> {
         // The invocation and key must use the same path-normalization rules.
-        let workspace_root = parsed.workspace_root();
-        let path_normalizer =
-            crate::path_normalizer::PathNormalizer::from_env(workspace_root.as_deref())
-                .with_base_dirs(&self.base_dirs)
-                .with_rust_src_rule(
-                    crate::cache_key::get_rustc_sysroot(parsed).as_deref(),
-                    crate::cache_key::get_rustc_commit_hash(&parsed.rustc).as_deref(),
-                );
+        let workspace_root = parsed.path_normalization_root();
+        let path_normalizer = crate::path_normalizer::PathNormalizer::from_env(workspace_root)
+            .with_target_dir(parsed.target_dir().as_deref())
+            .with_base_dirs(&self.base_dirs)
+            .with_rust_src_rule(
+                crate::cache_key::get_rustc_sysroot(parsed).as_deref(),
+                crate::cache_key::get_rustc_commit_hash(&parsed.rustc).as_deref(),
+            );
         let skip_remap = skip_remap_override.unwrap_or_else(|| parsed.skip_path_remap());
         compile::run_rustc(
             &parsed.rustc,

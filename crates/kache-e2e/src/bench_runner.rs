@@ -1631,18 +1631,6 @@ fn parse_key_line(line: &str) -> Option<(String, String)> {
 /// set-diffing reflects real key-input divergence — not chatty trace
 /// formatting.
 ///
-/// `cache_key.rs` emits `source:PATH=hash` for human readability, but
-/// the hasher only consumes the content hash. Two clones at different
-/// absolute paths that share identical source content emit different
-/// trace lines for the same key input. Without normalization the diff
-/// counts them as diverging when the cache key is actually stable —
-/// observed as 475 false positives in the first trace bench (the bug
-/// that made `final` appear as the top diverging field with only 77
-/// crates, despite the diff helper claiming 552 diverging crates).
-///
-/// Normalize to `source:hash` so the comparison reflects what the
-/// hasher actually consumes.
-///
 /// `link_lib_content:static=NAME=HASH (PATH)` has the same shape of noise:
 /// `cache_key.rs` hashes only `link_lib_content:` + the content hash, but the
 /// trace line appends the lib name and absolute `.a` path for readability. Two
@@ -1655,11 +1643,6 @@ fn parse_key_line(line: &str) -> Option<(String, String)> {
 /// association. Genuine content differences (e.g. `quickjs`, `jemalloc`, which
 /// bake the build path into the archive) keep distinct hashes and still diverge.
 fn normalize_payload(payload: &str) -> String {
-    if let Some(rest) = payload.strip_prefix("source:")
-        && let Some(eq) = rest.rfind('=')
-    {
-        return format!("source:{}", &rest[eq + 1..]);
-    }
     if let Some(rest) = payload.strip_prefix("link_lib_content:") {
         // The path is the trailing ` (PATH)` group. Split on the FIRST ` (`:
         // the lib name (a linker `-l` spec) has no ` (`, so the first one is the
@@ -3146,24 +3129,16 @@ mod tests {
     }
 
     #[test]
-    fn normalize_payload_strips_display_only_source_path() {
-        // `source:PATH=hash` is display-only path noise; the hasher
-        // consumes only the right-hand content hash. Normalizing to
-        // `source:hash` makes cross-clone set-diffing reflect what's
-        // actually in the cache key.
+    fn normalize_payload_preserves_keyed_source_identity() {
+        // Source path-to-content association is a real key input (#760), so
+        // diagnostics must not discard it as display-only noise.
         assert_eq!(
             normalize_payload("source:/Users/a/clone-a/foo.rs=254dfb8084fc2e3f"),
-            "source:254dfb8084fc2e3f"
+            "source:/Users/a/clone-a/foo.rs=254dfb8084fc2e3f"
         );
-        assert_eq!(
+        assert_ne!(
+            normalize_payload("source:/Users/a/clone-a/foo.rs=254dfb8084fc2e3f"),
             normalize_payload("source:/Users/b/clone-b/foo.rs=254dfb8084fc2e3f"),
-            "source:254dfb8084fc2e3f",
-        );
-        // Sanity: two clone paths with identical content collapse to
-        // the same normalized payload.
-        assert_eq!(
-            normalize_payload("source:/clone-a/x.rs=H"),
-            normalize_payload("source:/clone-b/x.rs=H"),
         );
         // Non-source payloads pass through untouched.
         assert_eq!(

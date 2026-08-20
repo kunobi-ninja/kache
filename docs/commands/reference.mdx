@@ -60,7 +60,16 @@ kache cargo -- build --workspace
 ```
 
 Runs Cargo's built-in `build` or `check` from the current directory with its
-arguments unchanged. If Cargo's
+arguments unchanged. It also keeps Cargo's intermediate build state under
+`{workspace-root}/target` while leaving final artifacts in the selected target
+directory. Cargo 1.91 introduced this `build-dir` split. It prevents a shared
+`CARGO_TARGET_DIR` from carrying fingerprints between worktrees and declaring
+the wrong unit `Fresh` before `RUSTC_WRAPPER` can run. Each worktree owns its
+freshness state, while Kache still shares compiled artifacts. Set
+`CARGO_BUILD_BUILD_DIR` explicitly, or configure `[build] build-dir`, to retain
+a different build-dir policy; Kache does not override either form.
+
+If Cargo's
 ancestor search finds a symlink to the selected Cargo-home config, Cargo would
 normally merge the same array-valued `build.rustflags` twice and re-key every
 unit. This front-end identifies that duplicate by canonical path, contributes
@@ -75,8 +84,9 @@ with a warning rather than risk reproducing Cargo's selection rules
 incorrectly. Cargo `-C`/`--config`, unstable flags, `install`, aliases, and
 external subcommands pass through unchanged. Config paths and contents are
 revalidated immediately before Cargo starts; concurrent config editing should
-still be avoided. Ordinary `cargo` remains supported; this command is needed
-only for the canonical-config alias case.
+still be avoided. Ordinary `cargo` remains supported. Use this front-end for
+the canonical-config alias case or when final artifacts intentionally share a
+target directory across worktrees.
 
 The command prevents Cargo's spurious rebuild in an existing target directory.
 It does not alias Kache entries across different rustflags transport sources;

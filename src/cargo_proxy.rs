@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ENCODED_SEPARATOR: char = '\x1f';
+const WORKTREE_BUILD_DIR: &str = "{workspace-root}/target";
 
 #[derive(Debug, Clone)]
 struct ConfigSource {
@@ -33,6 +34,14 @@ struct NormalizationPlan {
 }
 
 #[derive(Debug)]
+struct BuildDirIsolationPlan {
+    snapshots: Vec<ConfigSource>,
+    cwd: PathBuf,
+    cargo_home: PathBuf,
+    candidate_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
 enum PlanDecision {
     Apply(NormalizationPlan),
     Passthrough,
@@ -49,6 +58,27 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
     let cargo = real_cargo_program()?;
     let mut command = Command::new(&cargo);
     command.args(&cargo_args).current_dir(&cwd);
+
+    // Cargo owns freshness before RUSTC_WRAPPER runs. Sharing its intermediate
+    // fingerprint directory across worktrees can therefore declare the wrong
+    // worktree Fresh without invoking Kache at all (#760). Cargo 1.91+'s
+    // build-dir split keeps intermediates local while leaving final artifacts
+    // in the caller's target-dir. Explicit environment or Cargo-config
+    // build-dir policies retain precedence.
+    let build_dir_plan = match worktree_build_dir_isolation_plan(
+        &cwd,
+        &cargo_args,
+        std::env::var_os("CARGO_BUILD_BUILD_DIR").as_deref(),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            eprintln!(
+                "kache: cannot safely isolate Cargo's build directory: {reason}; \
+                 retaining Cargo's configured layout"
+            );
+            None
+        }
+    };
 
     match normalization_plan(&cwd, &cargo_args) {
         PlanDecision::Apply(plan) => {
@@ -72,6 +102,20 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
             );
         }
         PlanDecision::Passthrough => {}
+    }
+
+    // Revalidate immediately before launch. If a config file or candidate set
+    // changed after inspection, leave Cargo's layout untouched rather than
+    // override a newly configured build-dir policy with stale information.
+    if let Some(plan) = build_dir_plan {
+        if build_dir_plan_is_current(&plan) {
+            command.env("CARGO_BUILD_BUILD_DIR", WORKTREE_BUILD_DIR);
+        } else {
+            eprintln!(
+                "kache: Cargo config changed while build-dir isolation was being inspected; \
+                 retaining Cargo's configured layout"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -253,6 +297,47 @@ fn supported_cargo_command(args: &[OsString]) -> std::result::Result<(), String>
     Ok(())
 }
 
+fn worktree_build_dir_isolation_plan(
+    cwd: &Path,
+    args: &[OsString],
+    explicit: Option<&OsStr>,
+) -> std::result::Result<Option<BuildDirIsolationPlan>, String> {
+    if !worktree_build_dir_isolation_enabled(args, explicit, false) {
+        return Ok(None);
+    }
+    let cargo_home = cargo_home(cwd)?;
+    build_dir_isolation_plan_from_sources(cwd, cargo_home)
+}
+
+fn build_dir_isolation_plan_from_sources(
+    cwd: &Path,
+    cargo_home: PathBuf,
+) -> std::result::Result<Option<BuildDirIsolationPlan>, String> {
+    let candidates = cargo_config_candidates(cwd, &cargo_home);
+    let candidate_paths = candidates.iter().map(|(path, _)| path.clone()).collect();
+    let mut snapshots = Vec::with_capacity(candidates.len());
+    for (path, cargo_home_source) in candidates {
+        snapshots.push(read_source(path, cargo_home_source)?);
+    }
+    if configured_build_dir_in_sources(&snapshots)? {
+        return Ok(None);
+    }
+    Ok(Some(BuildDirIsolationPlan {
+        snapshots,
+        cwd: cwd.to_path_buf(),
+        cargo_home,
+        candidate_paths,
+    }))
+}
+
+fn worktree_build_dir_isolation_enabled(
+    args: &[OsString],
+    explicit: Option<&OsStr>,
+    configured: bool,
+) -> bool {
+    explicit.is_none() && !configured && supported_cargo_command(args).is_ok()
+}
+
 fn cargo_arg_may_change_config(arg: &str) -> bool {
     arg == "--config"
         || arg.starts_with("--config=")
@@ -277,6 +362,44 @@ fn cargo_config_candidates(cwd: &Path, cargo_home: &Path) -> Vec<(PathBuf, bool)
         }
     }
     candidates
+}
+
+fn configured_build_dir_in_sources(sources: &[ConfigSource]) -> std::result::Result<bool, String> {
+    for source in sources {
+        let table = source
+            .value
+            .as_table()
+            .ok_or_else(|| format!("{} is not a TOML table", source.logical_path.display()))?;
+        if table.contains_key("include") {
+            return Err(format!(
+                "{} uses Cargo config include",
+                source.logical_path.display()
+            ));
+        }
+        if let Some(build) = table.get("build") {
+            let build = build
+                .as_table()
+                .ok_or_else(|| format!("{}.build is not a table", source.logical_path.display()))?;
+            if build.contains_key("build-dir") {
+                return Ok(true);
+            }
+        }
+        if let Some(env) = table.get("env") {
+            let env = env
+                .as_table()
+                .ok_or_else(|| format!("{}.env is not a table", source.logical_path.display()))?;
+            if env.keys().any(|key| {
+                if cfg!(windows) {
+                    key.eq_ignore_ascii_case("CARGO_BUILD_BUILD_DIR")
+                } else {
+                    key == "CARGO_BUILD_BUILD_DIR"
+                }
+            }) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn cargo_home(cwd: &Path) -> std::result::Result<PathBuf, String> {
@@ -402,6 +525,14 @@ fn plan_is_current(plan: &NormalizationPlan) -> bool {
     revalidate_sources(&plan.snapshots).is_ok()
 }
 
+fn build_dir_plan_is_current(plan: &BuildDirIsolationPlan) -> bool {
+    let rescanned: Vec<PathBuf> = cargo_config_candidates(&plan.cwd, &plan.cargo_home)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    rescanned == plan.candidate_paths && revalidate_sources(&plan.snapshots).is_ok()
+}
+
 fn revalidate_sources(sources: &[ConfigSource]) -> std::result::Result<(), String> {
     for source in sources {
         let canonical = source.logical_path.canonicalize().map_err(|error| {
@@ -459,6 +590,101 @@ mod tests {
             let args = [OsString::from("check"), OsString::from_vec(vec![0x80])];
             assert!(supported_cargo_command(&args).is_err());
         }
+    }
+
+    #[test]
+    fn worktree_build_dir_is_scoped_and_respects_explicit_env() {
+        let build = [OsString::from("build")];
+        let check = [OsString::from("check"), OsString::from("--workspace")];
+        let install = [OsString::from("install"), OsString::from("demo")];
+
+        assert!(worktree_build_dir_isolation_enabled(&build, None, false));
+        assert!(worktree_build_dir_isolation_enabled(&check, None, false));
+        assert!(!worktree_build_dir_isolation_enabled(
+            &build,
+            Some(OsStr::new("/explicit/build-dir")),
+            false,
+        ));
+        assert!(!worktree_build_dir_isolation_enabled(&build, None, true,));
+        assert!(!worktree_build_dir_isolation_enabled(&install, None, false,));
+    }
+
+    #[test]
+    fn configured_build_dir_policy_is_never_overridden() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo-home");
+        let cwd = dir.path().join("project");
+        let config_dir = cwd.join(".cargo");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        assert!(
+            build_dir_isolation_plan_from_sources(&cwd, cargo_home.clone())
+                .unwrap()
+                .is_some()
+        );
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[build]\nbuild-dir = \"custom-build\"\n",
+        )
+        .unwrap();
+        assert!(
+            build_dir_isolation_plan_from_sources(&cwd, cargo_home.clone())
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[env]\nCARGO_BUILD_BUILD_DIR = \"custom-build\"\n",
+        )
+        .unwrap();
+        assert!(
+            build_dir_isolation_plan_from_sources(&cwd, cargo_home.clone())
+                .unwrap()
+                .is_none()
+        );
+
+        std::fs::write(config_dir.join("config.toml"), "include = \"other.toml\"\n").unwrap();
+        assert!(build_dir_isolation_plan_from_sources(&cwd, cargo_home).is_err());
+    }
+
+    #[test]
+    fn build_dir_plan_revalidation_detects_content_and_candidate_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo-home");
+        let root = dir.path().join("root");
+        let cwd = root.join("project");
+        let project_config_dir = cwd.join(".cargo");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(&project_config_dir).unwrap();
+        let project_config = project_config_dir.join("config.toml");
+        std::fs::write(&project_config, "[net]\noffline = true\n").unwrap();
+
+        let content_plan = build_dir_isolation_plan_from_sources(&cwd, cargo_home.clone())
+            .unwrap()
+            .unwrap();
+        assert!(build_dir_plan_is_current(&content_plan));
+        std::fs::write(&project_config, "[net]\noffline = false\n").unwrap();
+        assert!(
+            !build_dir_plan_is_current(&content_plan),
+            "changed content with the same candidate set must invalidate the plan"
+        );
+
+        let candidate_plan = build_dir_isolation_plan_from_sources(&cwd, cargo_home.clone())
+            .unwrap()
+            .unwrap();
+        let ancestor_config_dir = root.join(".cargo");
+        std::fs::create_dir_all(&ancestor_config_dir).unwrap();
+        std::fs::write(
+            ancestor_config_dir.join("config.toml"),
+            "[net]\ngit-fetch-with-cli = true\n",
+        )
+        .unwrap();
+        assert!(
+            !build_dir_plan_is_current(&candidate_plan),
+            "a new config candidate with unchanged snapshots must invalidate the plan"
+        );
     }
 
     #[test]

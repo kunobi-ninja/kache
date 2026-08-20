@@ -27,6 +27,31 @@ enum Tab {
     Passthrough,
 }
 
+impl Tab {
+    const ORDER: [Tab; 5] = [
+        Tab::Build,
+        Tab::Projects,
+        Tab::Store,
+        Tab::Transfer,
+        Tab::Passthrough,
+    ];
+
+    fn index(self) -> usize {
+        Self::ORDER
+            .iter()
+            .position(|tab| *tab == self)
+            .unwrap_or_default()
+    }
+
+    fn next(self) -> Tab {
+        Self::ORDER[(self.index() + 1) % Self::ORDER.len()]
+    }
+
+    fn previous(self) -> Tab {
+        Self::ORDER[(self.index() + Self::ORDER.len() - 1) % Self::ORDER.len()]
+    }
+}
+
 fn tab_needs_entries(tab: Tab) -> bool {
     matches!(tab, Tab::Store)
 }
@@ -93,10 +118,44 @@ impl Viewport {
     }
 }
 
+/// The help bar for a tab, given its own key list.
+///
+/// Typing a filter is modal, so the input line replaces the keys. Once a
+/// filter is committed the tab's keys come back and only gain `Esc: clear` —
+/// the panel title already carries the filter, so repeating it here would cost
+/// the row's remaining width for nothing, and dropping the tab's own keys
+/// (`s: sort` while filtering the store) would trade one confusion for
+/// another.
+fn help_line(state: &AppState, keys: &str) -> String {
+    if state.filter_active {
+        return format!("  filter: {}_   Enter: apply   Esc: cancel", state.filter());
+    }
+    if state.filter().is_empty() {
+        format!("  {keys}")
+    } else {
+        format!("  {keys}  Esc: clear filter")
+    }
+}
+
+/// Panel title carrying the active filter, so a narrowed view always says so.
+/// Without this a committed filter left no trace on screen: rows were simply
+/// missing and nothing explained why.
+fn filtered_title(base: &str, filter: &str) -> String {
+    if filter.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}[filter: {filter}] ", base)
+    }
+}
+
+/// Filters are per-tab, so editing one only invalidates its own viewport.
 fn reset_filtered_viewports(state: &mut AppState) {
-    state.build_scroll.reset();
-    state.store_scroll.reset();
-    state.passthrough_scroll.reset();
+    match state.active_tab {
+        Tab::Build => state.build_scroll.reset(),
+        Tab::Store => state.store_scroll.reset(),
+        Tab::Passthrough => state.passthrough_scroll.reset(),
+        Tab::Projects | Tab::Transfer => {}
+    }
 }
 
 // ── Sort mode (shared between tabs) ────────────────────────────────────────
@@ -262,7 +321,13 @@ struct AppState {
     /// BuildEvent arrives.
     live_heartbeats: std::collections::HashMap<u32, (Instant, HeartbeatEvent)>,
     build_scroll: Viewport,
-    filter: String,
+    /// Crate-name filters, one per filterable tab. A single shared string made
+    /// the three tabs filter each other: typing `serde` on Build and pressing
+    /// `3` left the Store table silently narrowed to `serde`, with the title
+    /// and help bar showing nothing about it.
+    build_filter: String,
+    store_filter: String,
+    passthrough_filter: String,
     filter_active: bool,
 
     // Store tab
@@ -300,6 +365,27 @@ struct AppState {
 }
 
 impl AppState {
+    /// The active tab's filter, empty for tabs that do not filter.
+    fn filter(&self) -> &str {
+        match self.active_tab {
+            Tab::Build => &self.build_filter,
+            Tab::Store => &self.store_filter,
+            Tab::Passthrough => &self.passthrough_filter,
+            Tab::Projects | Tab::Transfer => "",
+        }
+    }
+
+    /// Mutable handle to the active tab's filter; `None` on tabs that do not
+    /// filter, which is what makes `f` and `Esc` no-ops there.
+    fn filter_mut(&mut self) -> Option<&mut String> {
+        match self.active_tab {
+            Tab::Build => Some(&mut self.build_filter),
+            Tab::Store => Some(&mut self.store_filter),
+            Tab::Passthrough => Some(&mut self.passthrough_filter),
+            Tab::Projects | Tab::Transfer => None,
+        }
+    }
+
     /// In-flight compiles for the panel: the daemon registry when available,
     /// else derived from tailed heartbeat lines (daemonless builds still get
     /// the panel; kunobi-ninja/kache#131). Entries sorted oldest-first.
@@ -390,7 +476,9 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         events: initial_events,
         live_heartbeats: std::collections::HashMap::new(),
         build_scroll: Viewport::new(ScrollAnchor::Bottom),
-        filter: String::new(),
+        build_filter: String::new(),
+        store_filter: String::new(),
+        passthrough_filter: String::new(),
         filter_active: false,
         sort_mode: SortMode::Size,
         store_scroll: Viewport::new(ScrollAnchor::Top),
@@ -605,19 +693,43 @@ fn spawn_project_scan(
 
 // ── Key handling ───────────────────────────────────────────────────────────
 
+/// Move to `tab`, forcing the refresh that tab's data needs. One place for it,
+/// so the number keys and both Tab directions cannot drift apart.
+fn switch_tab(state: &mut AppState, tab: Tab) {
+    state.active_tab = tab;
+    match tab {
+        Tab::Projects => state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL,
+        Tab::Store => state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL,
+        Tab::Build | Tab::Transfer | Tab::Passthrough => {}
+    }
+}
+
 fn handle_key(state: &mut AppState, key: KeyCode) {
     // Filter input mode
     if state.filter_active {
         match key {
-            KeyCode::Esc | KeyCode::Enter => state.filter_active = false,
+            KeyCode::Enter => state.filter_active = false,
+            // Cancel: drop the filter being typed rather than committing it.
+            // Leaving it applied is how an invisible filter used to survive.
+            KeyCode::Esc => {
+                state.filter_active = false;
+                if let Some(filter) = state.filter_mut()
+                    && !filter.is_empty()
+                {
+                    filter.clear();
+                    reset_filtered_viewports(state);
+                }
+            }
             KeyCode::Backspace => {
-                if state.filter.pop().is_some() {
+                if state.filter_mut().and_then(|f| f.pop()).is_some() {
                     reset_filtered_viewports(state);
                 }
             }
             KeyCode::Char(c) => {
-                state.filter.push(c);
-                reset_filtered_viewports(state);
+                if let Some(filter) = state.filter_mut() {
+                    filter.push(c);
+                    reset_filtered_viewports(state);
+                }
             }
             _ => {}
         }
@@ -625,32 +737,31 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
     }
 
     match key {
-        KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
+        // `q` alone quits. Esc is the universal back-out key, so binding it to
+        // quit meant dismissing a filter and then pressing it once more out of
+        // reflex tore down the session.
+        KeyCode::Char('q') => state.should_quit = true,
+        // Esc outside input mode clears the current tab's filter, which is
+        // otherwise only removable by re-entering the filter and holding
+        // backspace.
+        KeyCode::Esc => {
+            if let Some(filter) = state.filter_mut()
+                && !filter.is_empty()
+            {
+                filter.clear();
+                reset_filtered_viewports(state);
+            }
+        }
         // Tab switching
-        KeyCode::Char('1') => state.active_tab = Tab::Build,
-        KeyCode::Char('2') => {
-            state.active_tab = Tab::Projects;
-            state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL;
-        }
-        KeyCode::Char('3') => {
-            state.active_tab = Tab::Store;
-            state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
-        }
-        KeyCode::Char('4') => state.active_tab = Tab::Transfer,
-        KeyCode::Char('5') => state.active_tab = Tab::Passthrough,
-        KeyCode::BackTab | KeyCode::Tab => match state.active_tab {
-            Tab::Build => {
-                state.active_tab = Tab::Projects;
-                state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL;
-            }
-            Tab::Projects => {
-                state.active_tab = Tab::Store;
-                state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
-            }
-            Tab::Store => state.active_tab = Tab::Transfer,
-            Tab::Transfer => state.active_tab = Tab::Passthrough,
-            Tab::Passthrough => state.active_tab = Tab::Build,
-        },
+        KeyCode::Char('1') => switch_tab(state, Tab::Build),
+        KeyCode::Char('2') => switch_tab(state, Tab::Projects),
+        KeyCode::Char('3') => switch_tab(state, Tab::Store),
+        KeyCode::Char('4') => switch_tab(state, Tab::Transfer),
+        KeyCode::Char('5') => switch_tab(state, Tab::Passthrough),
+        KeyCode::Tab => switch_tab(state, state.active_tab.next()),
+        // Shift+Tab used to share an arm with Tab and cycle forward too, so
+        // there was no way back except by number.
+        KeyCode::BackTab => switch_tab(state, state.active_tab.previous()),
         // Scrolling
         KeyCode::Up => match state.active_tab {
             Tab::Build => state.build_scroll.scroll_up(),
@@ -667,7 +778,10 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             Tab::Passthrough => state.passthrough_scroll.scroll_down(),
         },
         // Build tab
-        KeyCode::Char('f') if state.active_tab == Tab::Build => {
+        // One arm for every filterable tab: `filter_mut` already encodes which
+        // those are, so `f` is inert on Projects and Transfer instead of
+        // opening an input that edits nothing.
+        KeyCode::Char('f') if state.filter_mut().is_some() => {
             state.filter_active = true;
         }
         KeyCode::Char('c') if state.active_tab == Tab::Build => {
@@ -679,12 +793,6 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
             state.sort_mode = state.sort_mode.next();
             state.store_scroll.reset();
             state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
-        }
-        KeyCode::Char('f') if state.active_tab == Tab::Store => {
-            state.filter_active = true;
-        }
-        KeyCode::Char('f') if state.active_tab == Tab::Passthrough => {
-            state.filter_active = true;
         }
         // Projects tab: force refresh
         KeyCode::Char('r') if state.active_tab == Tab::Projects => {
@@ -1014,11 +1122,11 @@ fn fmt_duration_ms(ms: u64) -> String {
 
 fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let block = Block::bordered()
-        .title(" Live Build ")
+        .title(filtered_title(" Live Build ", state.filter()))
         .border_style(Style::default().fg(Color::Cyan));
 
-    let filter_empty = state.filter.is_empty();
-    let filter_label = state.filter.clone();
+    let filter_empty = state.filter().is_empty();
+    let filter_label = state.filter().to_string();
     let filtered_events: Vec<&BuildEvent> = state
         .events
         .iter()
@@ -1137,11 +1245,10 @@ fn draw_sparkline(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_build_help(frame: &mut Frame, state: &AppState, area: Rect) {
-    let help = if state.filter_active {
-        format!("  filter: {}_ (Esc to close)", state.filter)
-    } else {
-        "  q: quit  f: filter  ↑↓: scroll  Tab: next  c: clear  1-5: tabs".to_string()
-    };
+    let help = help_line(
+        state,
+        "q: quit  f: filter  ↑↓: scroll  ⇥/⇧⇥: tabs  c: clear",
+    );
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
@@ -1186,7 +1293,7 @@ fn draw_store_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
         state.sort_mode.label()
     );
     let block = Block::bordered()
-        .title(title)
+        .title(filtered_title(&title, state.filter()))
         .border_style(Style::default().fg(Color::Cyan));
 
     let entries = &state.stats_snapshot.entries;
@@ -1205,8 +1312,8 @@ fn draw_store_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
     .style(Style::default().add_modifier(Modifier::BOLD))
     .bottom_margin(0);
 
-    let filter_empty = state.filter.is_empty();
-    let filter_label = state.filter.clone();
+    let filter_empty = state.filter().is_empty();
+    let filter_label = state.filter().to_string();
     let filtered: Vec<&daemon::StatsEntry> = entries
         .iter()
         .filter(|e| {
@@ -1295,11 +1402,7 @@ fn draw_store_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
 }
 
 fn draw_store_help(frame: &mut Frame, state: &AppState, area: Rect) {
-    let help = if state.filter_active {
-        format!("  filter: {}_ (Esc to close)", state.filter)
-    } else {
-        "  q: quit  s: sort  f: filter  ↑↓: scroll  Tab: next  1-5: tabs".to_string()
-    };
+    let help = help_line(state, "q: quit  s: sort  f: filter  ↑↓: scroll  ⇥/⇧⇥: tabs");
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
@@ -1869,8 +1972,8 @@ fn draw_passthrough_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
 }
 
 fn draw_passthrough_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
-    let filter_empty = state.filter.is_empty();
-    let filter_label = state.filter.clone();
+    let filter_empty = state.filter().is_empty();
+    let filter_label = state.filter().to_string();
     let events: Vec<&BuildEvent> = state
         .events
         .iter()
@@ -1883,11 +1986,14 @@ fn draw_passthrough_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
         .collect();
 
     let block = Block::bordered()
-        .title(format!(" Passthroughs ({}) ", events.len()))
+        .title(filtered_title(
+            &format!(" Passthroughs ({}) ", events.len()),
+            state.filter(),
+        ))
         .border_style(Style::default().fg(Color::Cyan));
 
     if events.is_empty() {
-        let msg = if state.filter.is_empty() {
+        let msg = if state.filter().is_empty() {
             "  No passthroughs yet"
         } else {
             "  No passthroughs match the filter"
@@ -1966,11 +2072,7 @@ fn passthrough_reason_parts(reason: &str) -> (&str, &str) {
 }
 
 fn draw_passthrough_help(frame: &mut Frame, state: &AppState, area: Rect) {
-    let help = if state.filter_active {
-        format!("  filter: {}_ (Esc to close)", state.filter)
-    } else {
-        "  q: quit  f: filter  ↑↓: scroll  Tab: next  1-5: tabs".to_string()
-    };
+    let help = help_line(state, "q: quit  f: filter  ↑↓: scroll  ⇥/⇧⇥: tabs");
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
 }
@@ -2119,7 +2221,9 @@ mod tests {
             events: Vec::new(),
             live_heartbeats: std::collections::HashMap::new(),
             build_scroll: Viewport::new(ScrollAnchor::Bottom),
-            filter: String::new(),
+            build_filter: String::new(),
+            store_filter: String::new(),
+            passthrough_filter: String::new(),
             filter_active: false,
             sort_mode: SortMode::Size,
             store_scroll: Viewport::new(ScrollAnchor::Top),
@@ -2297,10 +2401,43 @@ mod tests {
         assert_eq!(s.active_tab, Tab::Projects);
         handle_key(&mut s, KeyCode::Char('3'));
         assert_eq!(s.active_tab, Tab::Store);
+        handle_key(&mut s, KeyCode::Char('4'));
+        assert_eq!(s.active_tab, Tab::Transfer);
         handle_key(&mut s, KeyCode::Char('5'));
         assert_eq!(s.active_tab, Tab::Passthrough);
         handle_key(&mut s, KeyCode::Char('1'));
         assert_eq!(s.active_tab, Tab::Build);
+    }
+
+    /// Landing on Projects or Store backdates that tab's refresh clock so its
+    /// data is fetched immediately rather than at the next interval. Getting
+    /// the sign wrong would postpone the fetch instead, which reads as a tab
+    /// that renders stale numbers on arrival.
+    #[test]
+    fn switching_to_a_fetching_tab_forces_an_immediate_refresh() {
+        let mut s = test_state();
+        let fresh = Instant::now();
+        s.last_project_refresh = fresh;
+        s.last_stats_fetch = fresh;
+
+        switch_tab(&mut s, Tab::Projects);
+        assert!(
+            s.last_project_refresh.elapsed() >= PROJECT_REFRESH_INTERVAL,
+            "Projects must be due for refresh on arrival"
+        );
+
+        switch_tab(&mut s, Tab::Store);
+        assert!(
+            s.last_stats_fetch.elapsed() >= SNAPSHOT_REFRESH_INTERVAL,
+            "Store must be due for a stats fetch on arrival"
+        );
+
+        // Tabs without their own fetch leave both clocks alone.
+        let before_project = s.last_project_refresh;
+        let before_stats = s.last_stats_fetch;
+        switch_tab(&mut s, Tab::Transfer);
+        assert_eq!(s.last_project_refresh, before_project);
+        assert_eq!(s.last_stats_fetch, before_stats);
     }
 
     #[test]
@@ -2335,14 +2472,203 @@ mod tests {
         for c in "abc".chars() {
             handle_key(&mut s, KeyCode::Char(c));
         }
-        assert_eq!(s.filter, "abc");
+        assert_eq!(s.filter(), "abc");
         handle_key(&mut s, KeyCode::Backspace);
-        assert_eq!(s.filter, "ab");
-        handle_key(&mut s, KeyCode::Esc);
+        assert_eq!(s.filter(), "ab");
+        // Enter commits and leaves input mode; the filter stays applied.
+        handle_key(&mut s, KeyCode::Enter);
         assert!(!s.filter_active);
+        assert_eq!(s.filter(), "ab");
         // 'q' no longer types into the filter; it quits.
         handle_key(&mut s, KeyCode::Char('q'));
         assert!(s.should_quit);
+    }
+
+    /// Esc used to be bound to quit, so dismissing a filter and pressing it
+    /// once more out of reflex tore down the session.
+    #[test]
+    fn esc_clears_the_filter_instead_of_quitting() {
+        let mut s = test_state();
+        s.active_tab = Tab::Build;
+
+        // Esc while typing cancels the filter outright.
+        handle_key(&mut s, KeyCode::Char('f'));
+        for c in "serde".chars() {
+            handle_key(&mut s, KeyCode::Char(c));
+        }
+        handle_key(&mut s, KeyCode::Esc);
+        assert!(!s.filter_active);
+        assert_eq!(s.filter(), "", "Esc cancels rather than committing");
+        assert!(!s.should_quit, "Esc must never quit");
+
+        // Esc on a committed filter clears it, still without quitting.
+        handle_key(&mut s, KeyCode::Char('f'));
+        for c in "tokio".chars() {
+            handle_key(&mut s, KeyCode::Char(c));
+        }
+        handle_key(&mut s, KeyCode::Enter);
+        assert_eq!(s.filter(), "tokio");
+        handle_key(&mut s, KeyCode::Esc);
+        assert_eq!(s.filter(), "");
+        assert!(!s.should_quit);
+
+        // Esc with nothing to clear is inert, not fatal.
+        handle_key(&mut s, KeyCode::Esc);
+        assert!(!s.should_quit);
+    }
+
+    /// One shared filter meant Build's text silently narrowed Store and
+    /// Passthrough, with no title or help text admitting it.
+    #[test]
+    fn filters_do_not_leak_between_tabs() {
+        let mut s = test_state();
+
+        s.active_tab = Tab::Build;
+        handle_key(&mut s, KeyCode::Char('f'));
+        for c in "serde".chars() {
+            handle_key(&mut s, KeyCode::Char(c));
+        }
+        handle_key(&mut s, KeyCode::Enter);
+
+        s.active_tab = Tab::Store;
+        assert_eq!(s.filter(), "", "Store keeps its own filter");
+        s.active_tab = Tab::Passthrough;
+        assert_eq!(s.filter(), "", "Passthrough keeps its own filter");
+
+        // Tabs that cannot filter report no filter and ignore `f`.
+        s.active_tab = Tab::Projects;
+        assert_eq!(s.filter(), "");
+        handle_key(&mut s, KeyCode::Char('f'));
+        assert!(!s.filter_active, "`f` is inert where nothing is filterable");
+
+        s.active_tab = Tab::Build;
+        assert_eq!(
+            s.filter(),
+            "serde",
+            "Build's filter survived the round trip"
+        );
+    }
+
+    /// Shift+Tab shared an arm with Tab, so both cycled forward and there was
+    /// no way back except by number.
+    #[test]
+    fn shift_tab_walks_backwards() {
+        let mut s = test_state();
+        s.active_tab = Tab::Build;
+
+        handle_key(&mut s, KeyCode::Tab);
+        assert_eq!(s.active_tab, Tab::Projects);
+        handle_key(&mut s, KeyCode::BackTab);
+        assert_eq!(s.active_tab, Tab::Build);
+        // And it wraps to the last tab rather than sticking.
+        handle_key(&mut s, KeyCode::BackTab);
+        assert_eq!(s.active_tab, Tab::Passthrough);
+        handle_key(&mut s, KeyCode::Tab);
+        assert_eq!(s.active_tab, Tab::Build);
+    }
+
+    /// Render `tab` and return everything on screen as one string.
+    fn rendered_tab(state: &mut AppState, tab: Tab) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        state.active_tab = tab;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_ui(frame, state))
+            .expect("draw should succeed");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// The help bar is the only place the per-tab keys are documented, so it
+    /// has to actually reach the screen. Rendering "without panicking" did not
+    /// prove that: dropping the help bar entirely still drew a full tab.
+    #[test]
+    fn every_tab_renders_its_help_keys() {
+        for (tab, expected) in [
+            (Tab::Build, "c: clear"),
+            (Tab::Store, "s: sort"),
+            (Tab::Passthrough, "f: filter"),
+        ] {
+            let mut state = test_state();
+            let rendered = rendered_tab(&mut state, tab);
+            assert!(
+                rendered.contains("q: quit"),
+                "tab {tab:?} must show how to quit"
+            );
+            assert!(
+                rendered.contains(expected),
+                "tab {tab:?} must show its own key {expected:?}"
+            );
+        }
+    }
+
+    /// The clear hint only appears once there is a filter to clear, and it
+    /// appears on screen rather than only in the returned string.
+    #[test]
+    fn help_bar_offers_the_way_out_of_a_filter() {
+        let mut state = test_state();
+        assert!(
+            !rendered_tab(&mut state, Tab::Build).contains("Esc: clear filter"),
+            "no filter, no clear hint"
+        );
+
+        state.active_tab = Tab::Build;
+        handle_key(&mut state, KeyCode::Char('f'));
+        for c in "serde".chars() {
+            handle_key(&mut state, KeyCode::Char(c));
+        }
+        handle_key(&mut state, KeyCode::Enter);
+
+        let rendered = rendered_tab(&mut state, Tab::Build);
+        assert!(
+            rendered.contains("Esc: clear filter"),
+            "a committed filter must advertise how to clear it"
+        );
+        assert!(
+            rendered.contains("[filter: serde]"),
+            "and the title must name it"
+        );
+    }
+
+    /// A committed filter has to be visible somewhere, or rows just go missing.
+    #[test]
+    fn committed_filter_is_announced_in_title_and_help() {
+        let mut s = test_state();
+        s.active_tab = Tab::Build;
+        assert_eq!(filtered_title(" Live Build ", s.filter()), " Live Build ");
+        assert!(
+            !help_line(&s, "q: quit").contains("Esc"),
+            "nothing to clear, so no clear hint"
+        );
+
+        handle_key(&mut s, KeyCode::Char('f'));
+        for c in "serde".chars() {
+            handle_key(&mut s, KeyCode::Char(c));
+        }
+        handle_key(&mut s, KeyCode::Enter);
+
+        assert_eq!(
+            filtered_title(" Live Build ", s.filter()),
+            " Live Build [filter: serde] "
+        );
+        // The title names the filter; the help bar keeps the tab's own keys
+        // and only adds the way out.
+        let help = help_line(&s, "q: quit  s: sort");
+        assert!(
+            help.contains("s: sort"),
+            "tab keys survive a filter: {help}"
+        );
+        assert!(
+            help.contains("Esc: clear"),
+            "and it says how to clear: {help}"
+        );
     }
 
     #[test]

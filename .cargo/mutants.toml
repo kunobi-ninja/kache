@@ -133,22 +133,6 @@ gitignore = true
 # `parse_keytrace` (which crate and field a trace line names),
 # `render_key_divergence` (which fields count as diverged), and
 # `key_divergence_report` (reading both phase logs off disk).
-#
-# `depinfo_next_char_boundary` is the step that advances `replace_depinfo_text`
-# past a match it rejected, so every mutant of it — the two return replacements
-# and the two arithmetic operators — leaves the search index where it was and
-# the scan loops forever. The lane cannot distinguish those from each other or
-# report them as caught: the run has no result until the 300s timeout expires,
-# and cargo-mutants scores a timeout as a failure rather than a kill, which is
-# the `touch_mtime_write_clock` O_NONBLOCK situation above. Confirmed by
-# measurement, not assumed: all four time out at 300s.
-#
-# The function exists to make that exclusion narrow. Folded back into the loop
-# the same mutants would force excluding arithmetic in `replace_depinfo_text`
-# by line number, which would also suppress the `+`, `!=` and boundary mutants
-# there that the lane does kill today. `depinfo_next_char_boundary_always_
-# advances_past_the_current_char` asserts the strict-advance property directly
-# and fails fast, so the behavior stays enforced by the test suite.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -179,5 +163,4 @@ exclude_re = [
     "observe_storage_unsupported",
     "run_cargo_non_unix",
     "replace report_key_divergence with \\(\\)",
-    "depinfo_next_char_boundary",
 ]

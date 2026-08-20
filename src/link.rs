@@ -1578,6 +1578,14 @@ fn replace_depinfo_text(
     let mut copied = 0;
     let mut search = 0;
     while search + needle_bytes.len() <= input_bytes.len() {
+        // Every path out of this iteration must leave `search` past where it
+        // started. Both do: a rejected match steps to the next char boundary,
+        // and an accepted one resumes after the replacement. Checked rather
+        // than assumed because the failure is not a wrong answer — the scan
+        // re-matches the same offset forever while `output` keeps growing, so
+        // an index slip here exhausts memory instead of returning. Debug-only,
+        // so the release scan is unchanged.
+        let scan_start = search;
         let offset = if ascii_case_insensitive {
             input_bytes[search..]
                 .windows(needle_bytes.len())
@@ -1595,12 +1603,14 @@ fn replace_depinfo_text(
         // the ASCII-insensitive byte scan changes only ASCII case.
         if !depinfo_path_prefix_has_left_boundary(input, found, context) {
             search = depinfo_next_char_boundary(input, found);
+            debug_assert!(scan_start < search, "rejected match must advance");
             continue;
         }
         output.push_str(&input[copied..found]);
         output.push_str(replacement);
         copied = end;
         search = copied;
+        debug_assert!(scan_start < search, "replaced match must advance");
     }
     output.push_str(&input[copied..]);
     output
@@ -1611,15 +1621,13 @@ fn replace_depinfo_text(
 ///
 /// This is `replace_depinfo_text`'s progress guarantee: the loop calls it to
 /// step past a match it has rejected, so the result must be strictly greater
-/// than `start` or the search cannot terminate. Split out of the loop so that
-/// every mutant which breaks the guarantee lands in one narrowly-nameable
-/// function: each one hangs the suite instead of failing an assertion, and the
-/// mutation lane can only report a hang as a 300s timeout, never as a catch.
-/// Isolating them here keeps `replace_depinfo_text`'s other arithmetic — which
-/// the lane does kill — fully in scope. See `.cargo/mutants.toml`.
+/// than `start` or the search cannot terminate. Named rather than inlined so
+/// the guarantee can be asserted directly, by
+/// `depinfo_next_char_boundary_always_advances_past_the_current_char`, instead
+/// of only showing up as the caller looping.
 ///
-/// `depinfo_next_char_boundary_always_advances_past_the_current_char` is the
-/// real enforcement, and it is a normal fast-failing test.
+/// The name is prefixed because `config_tui` has an unrelated
+/// `next_char_boundary`, and mutation excludes match on function name.
 fn depinfo_next_char_boundary(input: &str, start: usize) -> usize {
     input[start..]
         .char_indices()

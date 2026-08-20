@@ -1594,10 +1594,7 @@ fn replace_depinfo_text(
         // across code-point boundaries. `str::find` guarantees this directly;
         // the ASCII-insensitive byte scan changes only ASCII case.
         if !depinfo_path_prefix_has_left_boundary(input, found, context) {
-            search = input[found..]
-                .char_indices()
-                .nth(1)
-                .map_or(input.len(), |(next, _)| found + next);
+            search = depinfo_next_char_boundary(input, found);
             continue;
         }
         output.push_str(&input[copied..found]);
@@ -1607,6 +1604,27 @@ fn replace_depinfo_text(
     }
     output.push_str(&input[copied..]);
     output
+}
+
+/// Byte index of the char boundary after the one starting at `start`, or the
+/// end of `input` when `start` holds the last char.
+///
+/// This is `replace_depinfo_text`'s progress guarantee: the loop calls it to
+/// step past a match it has rejected, so the result must be strictly greater
+/// than `start` or the search cannot terminate. Split out of the loop so that
+/// every mutant which breaks the guarantee lands in one narrowly-nameable
+/// function: each one hangs the suite instead of failing an assertion, and the
+/// mutation lane can only report a hang as a 300s timeout, never as a catch.
+/// Isolating them here keeps `replace_depinfo_text`'s other arithmetic — which
+/// the lane does kill — fully in scope. See `.cargo/mutants.toml`.
+///
+/// `depinfo_next_char_boundary_always_advances_past_the_current_char` is the
+/// real enforcement, and it is a normal fast-failing test.
+fn depinfo_next_char_boundary(input: &str, start: usize) -> usize {
+    input[start..]
+        .char_indices()
+        .nth(1)
+        .map_or(input.len(), |(next, _)| start + next)
 }
 
 fn depinfo_path_prefix_has_left_boundary(
@@ -2457,6 +2475,30 @@ __kache_target_rule__/debug/build/demo/out/generated.rs\n"
         );
     }
 
+    /// `replace_depinfo_text`'s search loop terminates only because this step
+    /// strictly advances. Asserted here rather than left to the loop, where a
+    /// slip shows up as a hang instead of a failure.
+    #[test]
+    fn depinfo_next_char_boundary_always_advances_past_the_current_char() {
+        // Single-byte, mid-string: the plain case the loop hits most.
+        assert_eq!(depinfo_next_char_boundary("abcd", 1), 2);
+        // Multi-byte: advancing lands on the next boundary, not the next byte.
+        assert_eq!(depinfo_next_char_boundary("aéb", 1), 3);
+        // Last char: clamps to the end rather than reporting no progress.
+        assert_eq!(depinfo_next_char_boundary("abc", 2), 3);
+        assert_eq!(depinfo_next_char_boundary("aé", 1), 3);
+
+        // The property the loop actually depends on, over every boundary of a
+        // mixed-width string.
+        let input = "a/é/b/日/c";
+        for (start, _) in input.char_indices() {
+            assert!(
+                depinfo_next_char_boundary(input, start) > start,
+                "must advance past byte {start} of {input:?}"
+            );
+        }
+    }
+
     #[test]
     fn windows_depinfo_prefixes_retain_drive_and_unc_verbatim_aliases() {
         let drive = depinfo_prefixes_for_display(r"\\?\C:\Work", true, true);
@@ -2472,6 +2514,23 @@ __kache_target_rule__/debug/build/demo/out/generated.rs\n"
         let expand = depinfo_prefixes_for_display(r"\\?\C:\Work", false, true);
         assert!(!expand.iter().any(|prefix| prefix.starts_with(r"\\?\")));
         assert!(expand.iter().all(|prefix| prefix.starts_with(r"C:\Work")));
+    }
+
+    /// The opposite-separator alias is contributed by the stripped display
+    /// only. A verbatim `\\?\` display is backslash-only to Windows, so
+    /// slash-expanding it would invent a spelling no dep-info ever carries.
+    #[test]
+    fn windows_depinfo_alternate_alias_is_expanded_only_for_non_verbatim_displays() {
+        let prefixes = depinfo_prefixes_for_display(r"\\?\C:\Work", true, true);
+
+        assert!(
+            prefixes.contains(&"C:/Work/".to_string()),
+            "stripped display contributes its slash alternate: {prefixes:?}"
+        );
+        assert!(
+            !prefixes.iter().any(|prefix| prefix.starts_with("//?/")),
+            "verbatim display must not be slash-expanded: {prefixes:?}"
+        );
     }
 
     #[test]

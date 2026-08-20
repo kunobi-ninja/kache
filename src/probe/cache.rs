@@ -24,10 +24,21 @@ const PROBE_SUBDIR: &str = "probes";
 /// compiler change `mtime` alone would miss. Deriving the key is a
 /// `stat`, not a process fork.
 pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
+    probe_key_with_env(prober_id, req, std::env::vars())
+}
+
+/// Content-addressed key for a probe evaluated against an explicit
+/// environment. Split from [`probe_key`] so key stability and variance
+/// are testable without racing against concurrent environment mutations.
+pub(crate) fn probe_key_with_env(
+    prober_id: &str,
+    req: &ProbeRequest<'_>,
+    env_vars: impl Iterator<Item = (String, String)>,
+) -> Option<String> {
     let resolved = resolve_program(req.compiler)?;
     let meta = std::fs::metadata(&resolved).ok()?;
     let fingerprint = compiler_fingerprint(&meta);
-    let env_fp = env_fingerprint();
+    let env_fp = fingerprint_env(env_vars);
 
     let mut h = blake3::Hasher::new();
     h.update(b"probe_schema:");
@@ -71,21 +82,15 @@ pub fn probe_key_isolated(prober_id: &str, program: &str) -> Option<String> {
     Some(h.finalize().to_hex().to_string())
 }
 
-/// Hash of the process environment — see [`fingerprint_env`].
+/// Hash every `VAR=value` pair in `vars`, sorted for determinism, after
+/// dropping the volatile pseudo-variables [`is_volatile_env_name`]
+/// rejects.
 ///
 /// `cc -###` inherits this environment, so a change to it (a different
 /// `SDKROOT`, `CPATH`, …) can change the resolved invocation. Hashing
 /// the whole environment is the conservative choice: an unrelated
 /// change at worst forces one extra, cheap re-probe, while a relevant
 /// one can never be served a stale record.
-fn env_fingerprint() -> String {
-    fingerprint_env(std::env::vars())
-}
-
-/// Hash every `VAR=value` pair in `vars`, sorted for determinism, after
-/// dropping the volatile pseudo-variables [`is_volatile_env_name`]
-/// rejects. Split from [`env_fingerprint`] so the filtering is testable
-/// without mutating the real process environment.
 fn fingerprint_env(vars: impl Iterator<Item = (String, String)>) -> String {
     let mut vars: Vec<(String, String)> = vars.filter(|(k, _)| !is_volatile_env_name(k)).collect();
     vars.sort();
@@ -299,8 +304,9 @@ mod tests {
     fn probe_key_is_stable_for_the_same_binary() {
         let compiler = NamedTempFile::new().unwrap();
         let request = req(compiler.path().to_str().unwrap());
-        let k1 = probe_key("cc", &request).unwrap();
-        let k2 = probe_key("cc", &request).unwrap();
+        let env = [("PATH".to_string(), "/bin".to_string())];
+        let k1 = probe_key_with_env("cc", &request, env.iter().cloned()).unwrap();
+        let k2 = probe_key_with_env("cc", &request, env.iter().cloned()).unwrap();
         assert_eq!(k1, k2);
     }
 
@@ -309,14 +315,15 @@ mod tests {
         let mut compiler = NamedTempFile::new().unwrap();
         let path = compiler.path().to_path_buf();
         let path_str = path.to_str().unwrap();
+        let env = [("PATH".to_string(), "/bin".to_string())];
 
-        let k1 = probe_key("cc", &req(path_str)).unwrap();
+        let k1 = probe_key_with_env("cc", &req(path_str), env.iter().cloned()).unwrap();
 
         // Rewrite the "binary": size (and mtime/ctime) all move.
         compiler.write_all(b"new compiler bytes").unwrap();
         compiler.flush().unwrap();
 
-        let k2 = probe_key("cc", &req(path_str)).unwrap();
+        let k2 = probe_key_with_env("cc", &req(path_str), env.iter().cloned()).unwrap();
         assert_ne!(k1, k2, "a changed compiler binary must change the key");
     }
 
@@ -393,9 +400,10 @@ mod tests {
     fn probe_key_changes_when_key_args_change() {
         let compiler = NamedTempFile::new().unwrap();
         let path = compiler.path().to_str().unwrap();
-        let plain = probe_key("cc", &req(path)).unwrap();
+        let env = [("PATH".to_string(), "/bin".to_string())];
+        let plain = probe_key_with_env("cc", &req(path), env.iter().cloned()).unwrap();
         let flags = ["-O2".to_string()];
-        let with_flags = probe_key(
+        let with_flags = probe_key_with_env(
             "cc",
             &ProbeRequest {
                 compiler: path,
@@ -404,6 +412,7 @@ mod tests {
                 per_tu_paths: &[],
                 windows_aware: true,
             },
+            env.iter().cloned(),
         )
         .unwrap();
         assert_ne!(plain, with_flags, "key_args must be part of the probe key");
@@ -413,9 +422,29 @@ mod tests {
     fn probe_key_differs_per_prober_id() {
         let compiler = NamedTempFile::new().unwrap();
         let path_str = compiler.path().to_str().unwrap();
-        let a = probe_key("cc", &req(path_str)).unwrap();
-        let b = probe_key("rustc", &req(path_str)).unwrap();
+        let env = [("PATH".to_string(), "/bin".to_string())];
+        let a = probe_key_with_env("cc", &req(path_str), env.iter().cloned()).unwrap();
+        let b = probe_key_with_env("rustc", &req(path_str), env.iter().cloned()).unwrap();
         assert_ne!(a, b, "prober id must be part of the key");
+    }
+
+    #[test]
+    fn probe_key_changes_when_env_changes() {
+        let compiler = NamedTempFile::new().unwrap();
+        let path_str = compiler.path().to_str().unwrap();
+        let a = probe_key_with_env(
+            "cc",
+            &req(path_str),
+            [("SDKROOT".to_string(), "/sdk1".to_string())].into_iter(),
+        )
+        .unwrap();
+        let b = probe_key_with_env(
+            "cc",
+            &req(path_str),
+            [("SDKROOT".to_string(), "/sdk2".to_string())].into_iter(),
+        )
+        .unwrap();
+        assert_ne!(a, b, "a real env change must change the probe key");
     }
 
     #[test]

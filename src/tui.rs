@@ -2401,10 +2401,43 @@ mod tests {
         assert_eq!(s.active_tab, Tab::Projects);
         handle_key(&mut s, KeyCode::Char('3'));
         assert_eq!(s.active_tab, Tab::Store);
+        handle_key(&mut s, KeyCode::Char('4'));
+        assert_eq!(s.active_tab, Tab::Transfer);
         handle_key(&mut s, KeyCode::Char('5'));
         assert_eq!(s.active_tab, Tab::Passthrough);
         handle_key(&mut s, KeyCode::Char('1'));
         assert_eq!(s.active_tab, Tab::Build);
+    }
+
+    /// Landing on Projects or Store backdates that tab's refresh clock so its
+    /// data is fetched immediately rather than at the next interval. Getting
+    /// the sign wrong would postpone the fetch instead, which reads as a tab
+    /// that renders stale numbers on arrival.
+    #[test]
+    fn switching_to_a_fetching_tab_forces_an_immediate_refresh() {
+        let mut s = test_state();
+        let fresh = Instant::now();
+        s.last_project_refresh = fresh;
+        s.last_stats_fetch = fresh;
+
+        switch_tab(&mut s, Tab::Projects);
+        assert!(
+            s.last_project_refresh.elapsed() >= PROJECT_REFRESH_INTERVAL,
+            "Projects must be due for refresh on arrival"
+        );
+
+        switch_tab(&mut s, Tab::Store);
+        assert!(
+            s.last_stats_fetch.elapsed() >= SNAPSHOT_REFRESH_INTERVAL,
+            "Store must be due for a stats fetch on arrival"
+        );
+
+        // Tabs without their own fetch leave both clocks alone.
+        let before_project = s.last_project_refresh;
+        let before_stats = s.last_stats_fetch;
+        switch_tab(&mut s, Tab::Transfer);
+        assert_eq!(s.last_project_refresh, before_project);
+        assert_eq!(s.last_stats_fetch, before_stats);
     }
 
     #[test]
@@ -2532,6 +2565,76 @@ mod tests {
         assert_eq!(s.active_tab, Tab::Passthrough);
         handle_key(&mut s, KeyCode::Tab);
         assert_eq!(s.active_tab, Tab::Build);
+    }
+
+    /// Render `tab` and return everything on screen as one string.
+    fn rendered_tab(state: &mut AppState, tab: Tab) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        state.active_tab = tab;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_ui(frame, state))
+            .expect("draw should succeed");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// The help bar is the only place the per-tab keys are documented, so it
+    /// has to actually reach the screen. Rendering "without panicking" did not
+    /// prove that: dropping the help bar entirely still drew a full tab.
+    #[test]
+    fn every_tab_renders_its_help_keys() {
+        for (tab, expected) in [
+            (Tab::Build, "c: clear"),
+            (Tab::Store, "s: sort"),
+            (Tab::Passthrough, "f: filter"),
+        ] {
+            let mut state = test_state();
+            let rendered = rendered_tab(&mut state, tab);
+            assert!(
+                rendered.contains("q: quit"),
+                "tab {tab:?} must show how to quit"
+            );
+            assert!(
+                rendered.contains(expected),
+                "tab {tab:?} must show its own key {expected:?}"
+            );
+        }
+    }
+
+    /// The clear hint only appears once there is a filter to clear, and it
+    /// appears on screen rather than only in the returned string.
+    #[test]
+    fn help_bar_offers_the_way_out_of_a_filter() {
+        let mut state = test_state();
+        assert!(
+            !rendered_tab(&mut state, Tab::Build).contains("Esc: clear filter"),
+            "no filter, no clear hint"
+        );
+
+        state.active_tab = Tab::Build;
+        handle_key(&mut state, KeyCode::Char('f'));
+        for c in "serde".chars() {
+            handle_key(&mut state, KeyCode::Char(c));
+        }
+        handle_key(&mut state, KeyCode::Enter);
+
+        let rendered = rendered_tab(&mut state, Tab::Build);
+        assert!(
+            rendered.contains("Esc: clear filter"),
+            "a committed filter must advertise how to clear it"
+        );
+        assert!(
+            rendered.contains("[filter: serde]"),
+            "and the title must name it"
+        );
     }
 
     /// A committed filter has to be visible somewhere, or rows just go missing.

@@ -1806,11 +1806,12 @@ impl Store {
         //
         // `meta.json` is written INSIDE this transaction (#670), after the
         // write lock is held, so its appearance on disk is serialized against
-        // `remove_entry_guarded`'s critical section. Written before the lock,
-        // a fresh meta could land between a racing removal's in-transaction
-        // re-read and its directory cleanup and be deleted with the old
-        // generation's directory — stranding this put's committed row with no
-        // artifacts and leaking its refcounts until doctor or an index rebuild.
+        // `remove_entry_guarded`'s locked cleanup pass. Written before the
+        // lock, a fresh meta could land between a racing removal's committed
+        // row delete and its cleanup pass — whose republication check sees no
+        // row for this key yet and deletes the directory, fresh meta included
+        // — stranding this put's committed row with no artifacts and leaking
+        // its refcounts until doctor or an index rebuild.
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
         let tx = self.db.unchecked_transaction()?;
@@ -1835,14 +1836,17 @@ impl Store {
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         // The write lock is held from the statements above (record_entry_blobs
         // always issues at least the DELETE). Materialize meta.json under it:
-        // a concurrent removal is either entirely before this transaction (its
-        // re-read guard then sees this meta and rolls back) or entirely after
-        // it (it removes this generation whole, row and meta together). The
-        // directory is re-created because a removal that won the previous
-        // generation deleted it.
+        // a concurrent removal's cleanup pass takes the same lock before it
+        // deletes anything, so it runs either entirely before this write (this
+        // put then re-creates the directory) or entirely after this
+        // transaction commits (its republication check then sees this row and
+        // leaves the directory alone). The staged write + atomic rename means
+        // no reader — locked or not — can ever observe a truncated or
+        // partially written meta.json, and the rename's parent-directory
+        // fsync makes the new name durable alongside the contents.
         fs::create_dir_all(&entry_dir).context("creating entry directory")?;
-        fs::write(&meta_path, meta_json)?;
-        crate::atomic::fsync_file(&meta_path).context("flushing entry metadata")?;
+        crate::atomic::atomic_replace(&meta_path, meta_json.as_bytes())
+            .context("writing entry metadata")?;
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
             params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, crate::cache_key::CACHE_KEY_VERSION],
@@ -3167,10 +3171,11 @@ impl Store {
     }
 
     /// [`Self::remove_entry_guarded_with_hook`] with a second seam:
-    /// `before_dir_cleanup` runs inside the write transaction, after the row
-    /// delete and refcount decrements, immediately before the entry directory
-    /// is removed — the residual #670 window where a publisher's fresh
-    /// `meta.json` used to be deleted out from under its registration.
+    /// `before_dir_cleanup` runs inside the cleanup transaction — after the
+    /// logical removal has committed, holding the write lock, immediately
+    /// before the republication check and directory removal. That is the
+    /// residual #670 window where a publisher's fresh `meta.json` used to be
+    /// deleted out from under its registration.
     fn remove_entry_guarded_with_hooks(
         &self,
         cache_key: &str,
@@ -3232,13 +3237,18 @@ impl Store {
                 meta.files.iter().map(|f| f.hash.clone()).collect()
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // No meta.json. A same-key removal may be mid-transaction: its
-                // directory cleanup runs under the write lock BEFORE its row
-                // delete commits (#670), so "meta missing, row present" is a
-                // transient of a healthy concurrent removal, not only the
-                // stranded-entry shape. Bounce off the write lock — the no-op
-                // write statement waits (busy_timeout) until any in-flight
-                // writer commits or rolls back — then judge the settled state.
+                // No meta.json. A same-key operation may be mid-flight: a
+                // publisher materializes meta inside its registration
+                // transaction, and a removal's cleanup pass runs in its own
+                // locked transaction (#670) — so "meta missing, row present"
+                // can be a healthy transient, not only the stranded-entry
+                // shape. Bounce off the write lock — the no-op write statement
+                // waits (busy_timeout) until any in-flight writer commits or
+                // rolls back — then judge the settled state. Both the row and
+                // the meta are checked while the lock is still held: after
+                // dropping it another writer could move the pairing again and
+                // a healthy already-absent state would misreport as #276
+                // corruption.
                 let tx = self.db.unchecked_transaction()?;
                 tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
                 let row_exists: i64 = tx.query_row(
@@ -3246,13 +3256,28 @@ impl Store {
                     params![cache_key],
                     |row| row.get(0),
                 )?;
+                // fs::metadata, not Path::exists: exists() swallows every
+                // error as false, and a permission failure must refuse like
+                // the unreadable-meta arm below, not report already-absent.
+                let meta_is_back = match fs::metadata(&meta_path) {
+                    Ok(_) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "entry {cache_key}: checking republished meta.json — refusing \
+                                 removal so blob refcounts are not leaked (#276)"
+                            )
+                        });
+                    }
+                };
                 drop(tx);
                 if row_exists == 0 {
                     // The concurrent removal won (or the key never existed);
                     // nothing left to remove.
                     return Ok(RemovalAttempt::Done(None));
                 }
-                if meta_path.exists() {
+                if meta_is_back {
                     // A republication landed while we waited: the row belongs
                     // to a fresh generation whose meta is back. The caller
                     // asked to remove whatever is currently published, so
@@ -3340,10 +3365,9 @@ impl Store {
             "DELETE FROM entry_blobs WHERE cache_key = ?1",
             params![cache_key],
         )?;
-        // Decrement in the DB first, but defer every physical unlink until
-        // the directory cleanup below has succeeded: cleanup failure rolls
-        // this transaction back, and refcounts can only be restored if the
-        // blob files they count are still on disk.
+        // Decrement in the DB but defer every physical unlink to the cleanup
+        // pass after commit: while this transaction can still roll back, the
+        // blob files its refcounts describe must remain on disk.
         let mut reclaim = RemovalReclaim::default();
         let mut unlink = Vec::new();
         for hash in &hashes {
@@ -3366,66 +3390,102 @@ impl Store {
             }
         }
 
+        // Commit the LOGICAL removal before touching the filesystem (#670).
+        // SQLite can roll back SQL; it cannot restore a deleted meta.json or
+        // an unlinked blob — so any structure that deletes files inside this
+        // transaction turns a crash or commit failure after the deletions
+        // into a committed row whose artifacts are gone, the exact phantom
+        // this function exists to prevent. Committing first inverts every
+        // crash window into the recoverable direction: a crash from here on
+        // leaves at worst an unindexed directory (a later put or index
+        // rebuild reclaims it) or orphaned blob files (the orphan sweep
+        // reclaims those), never a live row without its files.
+        tx.commit()?;
+
+        // Cleanup pass: a second short transaction whose only purpose is the
+        // write lock. Serializing the filesystem deletions against same-key
+        // writers is what closes the original #670 window — an unlocked
+        // cleanup could delete a meta.json that a publisher materialized
+        // (inside its own registration transaction) between our commit above
+        // and this pass.
+        let cleanup_tx = self.db.unchecked_transaction()?;
+        cleanup_tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
+
         if let Some(hook) = before_dir_cleanup {
             hook();
         }
 
-        // Remove the entry directory (just meta.json in new format, may have
-        // artifacts in legacy entries) INSIDE the transaction, while the
-        // write lock is still held (#670): after commit the lock is gone,
-        // and a same-key publisher could materialize its fresh meta.json in
-        // the gap before an unlocked cleanup — which would then delete it,
-        // stranding the publisher's committed row with no artifacts. Under
-        // the lock, a publisher is either entirely before this transaction
-        // (caught by the re-read guard above) or entirely after it (it
-        // re-creates the directory). Windows can still surface external
-        // interference as delete-pending errors (sharing violations from
-        // readers mid-hardlink), so on any error re-check whether the
-        // directory is actually gone, with a brief bounded retry (worst case
-        // 50ms of extra lock hold). A directory that persists past the
-        // retries is a real failure (permissions, open handles): it
-        // propagates (#510) and rolls the whole removal back, leaving row,
-        // refcounts, and blobs exactly as they were.
-        if let Ok(entries) = fs::read_dir(&entry_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Ok(meta) = fs::metadata(&path) {
-                    let mut perms = meta.permissions();
-                    perms.set_readonly(false);
-                    let _ = fs::set_permissions(&path, perms);
-                }
-            }
-        }
-        let mut result = Ok(());
-        for _ in 0..5 {
-            result = match fs::remove_dir_all(&entry_dir) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    // Benign exactly when the directory is gone: NotFound is
-                    // the Unix shape of losing the race, and Windows surfaces
-                    // a competitor's in-flight delete as delete-pending
-                    // errors instead.
-                    if !entry_dir.exists() { Ok(()) } else { Err(e) }
-                }
-            };
-            if result.is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        result.with_context(|| format!("entry {cache_key}: removing entry directory"))?;
+        // A publisher may have republished this key between the commit above
+        // and this lock. The directory then belongs to the new generation:
+        // leave it untouched. Its blob adoption also re-inserted any of our
+        // zero-ref rows it needed, which the per-blob guard below observes.
+        let republished: i64 = cleanup_tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1)",
+            params![cache_key],
+            |row| row.get(0),
+        )?;
 
-        // Point of no return: unlink dead blobs under the write lock so a
-        // concurrent adopter can't commit a reference to a file we're
-        // deleting. Only bytes whose last reference went away are physically
-        // freed — that, not the entry's logical size, is what eviction
-        // budgets on (#608).
-        for (hash, size) in unlink {
-            unlink_blob(&self.blob_path(&hash));
-            reclaim.freed_bytes += size.max(0) as u64;
-            reclaim.blobs_unlinked += 1;
+        if republished == 0 {
+            // Remove the entry directory (just meta.json in new format, may
+            // have artifacts in legacy entries). Windows can surface external
+            // interference as delete-pending errors (sharing violations from
+            // readers mid-hardlink), so on any error re-check whether the
+            // directory is actually gone, with a brief bounded retry (worst
+            // case 50ms of extra lock hold). A directory that persists past
+            // the retries is a real failure (permissions, open handles): it
+            // propagates (#510). The logical removal is already committed, so
+            // the failure leaves only an unindexed directory — recoverable —
+            // never a live row whose files are gone.
+            if let Ok(entries) = fs::read_dir(&entry_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Ok(meta) = fs::metadata(&path) {
+                        let mut perms = meta.permissions();
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(&path, perms);
+                    }
+                }
+            }
+            let mut result = Ok(());
+            for _ in 0..5 {
+                result = match fs::remove_dir_all(&entry_dir) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // Benign exactly when the directory is gone: NotFound
+                        // is the Unix shape of losing the race, and Windows
+                        // surfaces a competitor's in-flight delete as
+                        // delete-pending errors instead.
+                        if !entry_dir.exists() { Ok(()) } else { Err(e) }
+                    }
+                };
+                if result.is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result.with_context(|| format!("entry {cache_key}: removing entry directory"))?;
         }
-        tx.commit()?;
+
+        // Unlink dead blobs under the write lock so a concurrent adopter
+        // can't commit a reference to a file we're deleting — re-checked
+        // per blob, because a publisher that won the lock between our two
+        // transactions may have re-inserted some of the rows the first
+        // transaction deleted. Only bytes whose last reference went away are
+        // physically freed — that, not the entry's logical size, is what
+        // eviction budgets on (#608).
+        for (hash, size) in unlink {
+            let readopted: i64 = cleanup_tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE hash = ?1)",
+                params![hash],
+                |row| row.get(0),
+            )?;
+            if readopted == 0 {
+                unlink_blob(&self.blob_path(&hash));
+                reclaim.freed_bytes += size.max(0) as u64;
+                reclaim.blobs_unlinked += 1;
+            }
+        }
+        cleanup_tx.commit()?;
         Ok(RemovalAttempt::Done(Some(reclaim)))
     }
 
@@ -7840,13 +7900,14 @@ mod tests {
     /// committed row with no artifacts and leaks its refcounts until doctor
     /// or an index rebuild.
     ///
-    /// Cleanup now runs inside the removal's write transaction and `put`
-    /// materializes meta.json inside its registration transaction, so the
-    /// publisher is serialized to entirely-before (caught by the re-read
-    /// guard) or entirely-after (it re-creates the directory). The publisher
-    /// below is released exactly in the old danger window; on the old
-    /// structure (cleanup after commit) it finishes inside the window and
-    /// its meta.json is destroyed.
+    /// Cleanup now runs in its own locked transaction after the logical
+    /// removal commits, guarded by a republication check, and `put`
+    /// materializes meta.json inside its registration transaction — so the
+    /// publisher is serialized to entirely-before the cleanup (the check then
+    /// sees its row and leaves the directory alone) or entirely-after (it
+    /// re-creates the directory). The publisher below is released exactly in
+    /// the old danger window; on the old structure (unlocked, unchecked
+    /// cleanup) it finishes inside the window and its meta.json is destroyed.
     #[test]
     fn republication_during_removal_cleanup_is_never_stranded() {
         let dir = tempfile::tempdir().unwrap();
@@ -7882,6 +7943,10 @@ mod tests {
         // is what lets the mutation lane kill mutants of the removal instead
         // of timing out on them.
         let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Proves the interleaving actually happened: without it the test can
+        // pass vacuously when the publisher thread is scheduled so late that
+        // its put simply runs after the whole removal.
+        let attempting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wait_for = |flag: &std::sync::atomic::AtomicBool, cap: Duration| {
             let deadline = std::time::Instant::now() + cap;
@@ -7895,6 +7960,7 @@ mod tests {
             let config = config.clone();
             let dir_path = dir.path().to_path_buf();
             let released = std::sync::Arc::clone(&released);
+            let attempting = std::sync::Arc::clone(&attempting);
             let published = std::sync::Arc::clone(&published);
             std::thread::spawn(move || {
                 let store = Store::open(&config).unwrap();
@@ -7910,6 +7976,7 @@ mod tests {
                 {
                     std::thread::sleep(Duration::from_millis(5));
                 }
+                attempting.store(true, std::sync::atomic::Ordering::Release);
                 store
                     .put(
                         "key",
@@ -7934,6 +8001,14 @@ mod tests {
                 || {},
                 || {
                     released.store(true, std::sync::atomic::Ordering::Release);
+                    // The publisher must have reached its put before cleanup
+                    // continues, or the "race" never happened and the test
+                    // proves nothing.
+                    wait_for(&attempting, Duration::from_secs(5));
+                    assert!(
+                        attempting.load(std::sync::atomic::Ordering::Acquire),
+                        "publisher never reached put; the interleaving was not exercised"
+                    );
                     // Give the publisher a real chance to race: on the fixed
                     // structure it blocks on the write lock and this expires;
                     // on the old structure it completes inside the window.
@@ -8014,6 +8089,24 @@ mod tests {
         assert!(
             err.is_err(),
             "a persistent cleanup failure must not be swallowed as a lost race"
+        );
+        // The failure direction matters (#670): the logical removal commits
+        // BEFORE cleanup, so a cleanup failure leaves a deleted row plus an
+        // unindexed directory — recoverable residue. Rolling the row back
+        // after files were already deleted would manufacture a committed row
+        // without artifacts, which is the phantom this function must never
+        // produce.
+        assert!(
+            !store.contains("stuck"),
+            "the logical removal must stay committed across a cleanup failure"
+        );
+        let meta: EntryMeta =
+            serde_json::from_str(&std::fs::read_to_string(entry_dir.join("meta.json")).unwrap())
+                .unwrap();
+        assert!(
+            store.blob_path(&meta.files[0].hash).is_file(),
+            "blob unlinks run only after directory cleanup succeeds; a failed \
+             cleanup leaves the file for the orphan sweep"
         );
     }
 

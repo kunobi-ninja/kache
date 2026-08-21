@@ -117,9 +117,7 @@ The `if: always()` on the push step stores newly built artifacts even when the b
 
 Both sync subcommands require a configured remote. Without one they error with `No remote configured`. By default `kache sync --pull` is filtered to the crates in the current workspace's `Cargo.lock`, so an ephemeral runner only fetches what this build needs. Use `kache sync --pull --all` to pull every artifact in the remote regardless of the local lockfile.
 
-<Callout type="warn">
-`kache sync` reports failed transfers as `(N failed)` on its progress line but still exits `0`, so CI cannot detect partial transfer failures from the exit code alone. If that matters, scan the step's stderr for `failed`.
-</Callout>
+By default, `kache sync` exits non-zero if any transfer or import fails, allowing CI jobs to detect synchronization errors directly from the command exit status. All scheduled transfers continue to drain to completion before exiting. If you want best-effort synchronization where transfer or import failures do not fail the CI step, pass `--allow-partial`.
 
 ## CI progress output
 

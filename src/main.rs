@@ -204,6 +204,9 @@ enum Commands {
         /// back to a full remote scan.
         #[arg(long, conflicts_with = "all")]
         workspace: bool,
+        /// Allow partial synchronization and exit successfully (code 0) even if some transfers or imports fail
+        #[arg(long)]
+        allow_partial: bool,
     },
 
     /// Save a build manifest for future prefetch warming
@@ -546,6 +549,7 @@ fn main() -> Result<()> {
             dry_run,
             all,
             workspace,
+            allow_partial,
         }) => cli::sync(
             &config,
             manifest_path.as_deref(),
@@ -554,6 +558,7 @@ fn main() -> Result<()> {
             dry_run,
             all,
             workspace,
+            allow_partial,
         ),
         Some(Commands::SaveManifest {
             manifest_key,

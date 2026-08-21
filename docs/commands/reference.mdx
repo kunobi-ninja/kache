@@ -345,19 +345,22 @@ On macOS, the scan skips TCC-protected locations (`/System`, `/Library`, `/priva
 ## `kache sync`
 
 ```sh
-kache sync [--pull] [--push] [--all] [--workspace] [--dry-run] [--manifest-path <path>]
+kache sync [--pull] [--push] [--all] [--workspace] [--allow-partial] [--dry-run] [--manifest-path <path>]
 ```
 
 Synchronizes the local cache with the configured S3 or filesystem remote. See
 [Sync](/docs/remote-cache/sync) for a full walkthrough.
 
 ```sh
-kache sync               # pull missing + push new artifacts
-kache sync --pull        # download only, filtered to current workspace
-kache sync --pull --all  # download everything in the remote
-kache sync --push        # upload only
-kache sync --dry-run     # preview transfers, make no changes
+kache sync                 # pull missing + push new artifacts
+kache sync --pull          # download only, filtered to current workspace
+kache sync --pull --all    # download everything in the remote
+kache sync --push          # upload only
+kache sync --allow-partial # ignore transfer/import failures and exit 0
+kache sync --dry-run       # preview transfers, make no changes
 ```
+
+**Exit status.** By default, `kache sync` exits non-zero if any transfer, store-open, or entry import fails. All scheduled operations drain to completion before returning. When `--allow-partial` is passed, `kache sync` exits `0` even if some transfers or imports fail.
 
 ---
 

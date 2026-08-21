@@ -13,12 +13,13 @@ cache population timing.
 ## Basic usage
 
 ```sh
-kache sync              # pull missing artifacts + push new local artifacts
-kache sync --pull       # download only
-kache sync --push       # upload only
-kache sync --all        # pull all artifacts, ignoring Cargo.lock filtering
-kache sync --workspace  # pull scope = workspace members only (one LIST per member)
-kache sync --dry-run    # preview what would transfer, make no changes
+kache sync                 # pull missing artifacts + push new local artifacts
+kache sync --pull          # download only
+kache sync --push          # upload only
+kache sync --all           # pull all artifacts, ignoring Cargo.lock filtering
+kache sync --workspace     # pull scope = workspace members only (one LIST per member)
+kache sync --allow-partial # exit 0 even if some transfers or imports fail
+kache sync --dry-run       # preview what would transfer, make no changes
 ```
 
 ## Workspace filtering
@@ -143,4 +144,14 @@ requests or your shared filesystem performs better with less parallelism:
 
 ```sh
 KACHE_S3_CONCURRENCY=4 kache sync --push
+```
+
+## Exit status and error handling
+
+By default, `kache sync` exits with a non-zero status code if any transfer (download or upload) or entry import fails. All scheduled operations still drain to completion so you get a full summary of succeeded and failed transfers.
+
+If you are running `kache sync` in a best-effort workflow where partial failure should not fail the job or script, pass the `--allow-partial` flag:
+
+```sh
+kache sync --pull --allow-partial
 ```

@@ -4167,6 +4167,7 @@ pub fn sync(
     dry_run: bool,
     pull_all: bool,
     pull_workspace: bool,
+    allow_partial: bool,
 ) -> Result<()> {
     let remote = config.require_remote()?;
 
@@ -4198,6 +4199,7 @@ pub fn sync(
         pull_all,
         lock_crates.as_ref(),
         pull_workspace,
+        allow_partial,
     ))
 }
 
@@ -4213,6 +4215,7 @@ async fn sync_inner(
     pull_all: bool,
     lock_crates: Option<&std::collections::HashSet<String>>,
     pull_workspace: bool,
+    allow_partial: bool,
 ) -> Result<()> {
     // Validate `--workspace` BEFORE connecting: `create_backend` resolves
     // credentials, which can launch a `credential_process` or block on an SSO
@@ -4220,8 +4223,7 @@ async fn sync_inner(
     // time and can leave an interactive prompt hanging.
     if pull_workspace && workspace_crates.is_none_or(|crates| crates.is_empty()) {
         anyhow::bail!(
-            "--workspace: no workspace members resolved (cargo metadata failed or this is not \
-             a Cargo workspace); refusing to fall back to a full remote scan"
+            "--workspace: no workspace members resolved (cargo metadata failed or this is not              a Cargo workspace); refusing to fall back to a full remote scan"
         );
     }
 
@@ -4240,6 +4242,7 @@ async fn sync_inner(
         pull_all,
         lock_crates,
         pull_workspace,
+        allow_partial,
     )
     .await
 }
@@ -4260,6 +4263,7 @@ async fn sync_with_client(
     pull_all: bool,
     lock_crates: Option<&std::collections::HashSet<String>>,
     pull_workspace: bool,
+    allow_partial: bool,
 ) -> Result<()> {
     let planner = crate::remote_plan::RemotePlanner::new(config);
 
@@ -4276,9 +4280,7 @@ async fn sync_with_client(
             // can't catch it either).
             let crates = workspace_crates.filter(|c| !c.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--workspace: no workspace members resolved (cargo metadata \
-                     failed or this is not a Cargo workspace); refusing to fall \
-                     back to a full remote scan"
+                    "--workspace: no workspace members resolved (cargo metadata                      failed or this is not a Cargo workspace); refusing to fall                      back to a full remote scan"
                 )
             })?;
             eprint!(
@@ -4392,6 +4394,7 @@ async fn sync_with_client(
     }
 
     let max_concurrent = (config.s3_concurrency as usize).max(1);
+    let mut total_failed = 0;
 
     // ── Pull phase ──────────────────────────────────────────────
     if !to_pull.is_empty() {
@@ -4438,12 +4441,31 @@ async fn sync_with_client(
                     Ok(_bytes) => {
                         // Import into index — opens a fresh Store (cheap with WAL).
                         // INSERT OR REPLACE is idempotent if daemon also imported.
-                        if let Ok(s) = Store::open(&cfg)
-                            && let Err(e) = s.import_restored_entry(&key)
-                        {
-                            eprintln!("\n  warn: import {}...: {e}", &key[..16.min(key.len())]);
+                        let mut imported = false;
+                        match Store::open(&cfg) {
+                            Ok(s) => match s.import_restored_entry(&key) {
+                                Ok(_) => {
+                                    imported = true;
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "\n  error: import {}...: {e}",
+                                        &key[..16.min(key.len())]
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!(
+                                    "\n  error: open store for import {}...: {e}",
+                                    &key[..16.min(key.len())]
+                                );
+                            }
                         }
-                        ok_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if imported {
+                            ok_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            fail_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     Err(e) => {
                         eprintln!("\n  error: pull {}...: {e}", &key[..16.min(key.len())]);
@@ -4465,6 +4487,7 @@ async fn sync_with_client(
         }
         let ok_count = ok.load(std::sync::atomic::Ordering::Relaxed);
         let fail_count = fail.load(std::sync::atomic::Ordering::Relaxed);
+        total_failed += fail_count;
         eprintln!(
             "\r  Downloaded:  {ok_count}/{total}{}",
             if fail_count > 0 {
@@ -4503,7 +4526,11 @@ async fn sync_with_client(
             in_flight.push(async move {
                 let entry_dir = cfg.store_dir().join(&key);
                 if !entry_dir.exists() {
-                    // Entry disappeared (GC or purge) — skip
+                    // Entry disappeared (GC or purge) — record failure
+                    eprintln!(
+                        "\n  error: push {}...: local entry disappeared before upload",
+                        &key[..16.min(key.len())]
+                    );
                     fail_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
@@ -4542,6 +4569,7 @@ async fn sync_with_client(
         }
         let ok_count = ok.load(std::sync::atomic::Ordering::Relaxed);
         let fail_count = fail.load(std::sync::atomic::Ordering::Relaxed);
+        total_failed += fail_count;
         eprintln!(
             "\r  Uploaded:  {ok_count}/{total}{}",
             if fail_count > 0 {
@@ -4550,6 +4578,10 @@ async fn sync_with_client(
                 String::new()
             },
         );
+    }
+
+    if total_failed > 0 && !allow_partial {
+        anyhow::bail!("{total_failed} transfer(s) or import(s) failed during sync");
     }
 
     Ok(())
@@ -7910,7 +7942,7 @@ mod tests {
         // remote is configured. Covers sync()'s no-remote guard.
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), None);
-        let err = sync(&config, None, false, false, false, false, false)
+        let err = sync(&config, None, false, false, false, false, false, false)
             .expect_err("sync without a remote must error");
         assert!(
             err.to_string().contains("No remote configured"),
@@ -8408,6 +8440,7 @@ mod tests {
             false,
             None,
             false,
+            false,
         )
         .await
         .expect("dry-run sync over empty remote should succeed");
@@ -8442,6 +8475,7 @@ mod tests {
             false,            // pull_all
             Some(&lock),      // lock_crates — must be ignored under --workspace
             true,             // pull_workspace
+            false,            // allow_partial
         )
         .await
         .expect("workspace-scoped pull should list only the workspace member(s)");
@@ -8474,6 +8508,7 @@ mod tests {
                 false,            // pull_all
                 None,             // lock_crates (always None under --workspace)
                 true,             // pull_workspace
+                false,            // allow_partial
             )
             .await
             .expect_err("--workspace with no resolved members must error, not scan the bucket");
@@ -8531,6 +8566,7 @@ mod tests {
             false,
             None,
             false,
+            false,
         )
         .await
         .expect("push sync should succeed");
@@ -8584,6 +8620,7 @@ mod tests {
             false,
             None,
             false,
+            false,
         )
         .await
         .expect("throttled push sync should succeed");
@@ -8619,6 +8656,7 @@ mod tests {
             false,
             None,
             false,
+            false,
         )
         .await
         .expect("dry-run sync planning a pull should succeed");
@@ -8629,16 +8667,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_with_client_pull_loop_tolerates_a_failed_download() {
+    async fn sync_with_client_pull_loop_records_failure_and_returns_err_by_default() {
         // A remote-only key drives a real (non-dry-run) pull. The served pack is
         // garbage, so download_entry errors — the pull loop must record the
-        // failure and still complete Ok (per-item errors don't abort the sync).
-        // Exercises the pull orchestration + download path + error handling.
+        // failure and return Err by default.
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
         let remote = test_remote_cfg();
         let key = sync_test_cache_key("failed-pull");
+
+        let backend = TestBackend::memory();
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/serde/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(
+                &format!("prefix/v3/packs/serde/{key}.tar.zst"),
+                b"not a valid pack".to_vec(),
+            )
+            .await;
+
+        let err = sync_with_client(
+            backend.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect_err("pull sync should return Err when a download fails by default");
+        assert!(
+            err.to_string()
+                .contains("1 transfer(s) or import(s) failed")
+        );
+        assert_eq!(
+            backend.get_calls(),
+            vec![format!("prefix/v3/packs/serde/{key}.tar.zst")]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_pull_allows_partial_when_flag_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+        let key = sync_test_cache_key("failed-pull-partial");
 
         let backend = TestBackend::memory();
         backend
@@ -8666,9 +8751,10 @@ mod tests {
             false,
             None,
             false,
+            true,
         )
         .await
-        .expect("pull sync should complete Ok even when a download fails");
+        .expect("pull sync with allow_partial should complete Ok despite failed download");
         assert_eq!(
             backend.get_calls(),
             vec![format!("prefix/v3/packs/serde/{key}.tar.zst")]
@@ -8676,10 +8762,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_with_client_push_reports_failed_uploads() {
+    async fn sync_with_client_push_reports_failed_uploads_and_returns_err_by_default() {
         // A local-only entry is scheduled for push, but the backend rejects
         // uploads, so upload_entry errors and the loop records a failure.
-        // Per-item errors do not abort the sync, so it still returns Ok.
+        // Returns Err by default.
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let artifact = src_dir.join("foo.rlib");
+        std::fs::write(&artifact, b"foo bytes").unwrap();
+        store
+            .put(
+                "pushfail1aaaa",
+                "foo",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(artifact, "foo.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let backend = TestBackend::failing_put();
+
+        let err = sync_with_client(
+            backend.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            false,
+            true,
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect_err("push sync should return Err when an upload fails by default");
+        assert!(
+            err.to_string()
+                .contains("1 transfer(s) or import(s) failed")
+        );
+        assert_eq!(
+            backend.put_calls(),
+            vec!["prefix/v3/packs/foo/pushfail1aaaa.tar.zst"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_push_allows_partial_when_flag_set() {
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         let store = Store::open(&config).unwrap();
@@ -8717,9 +8856,10 @@ mod tests {
             false,
             None,
             false,
+            true,
         )
         .await
-        .expect("push sync should complete Ok even when an upload fails");
+        .expect("push sync with allow_partial should complete Ok even when an upload fails");
         assert_eq!(
             backend.put_calls(),
             vec!["prefix/v3/packs/foo/pushfail1aaaa.tar.zst"]
@@ -8731,7 +8871,7 @@ mod tests {
         // Two remote-only keys with concurrency=1 force the pull loop's
         // max-concurrency wait branch (the second download waits for the first
         // to drain a slot). Packs are garbage so each download fails fast, but
-        // the throttle path is still exercised; the sync completes Ok.
+        // the throttle path is still exercised; with allow_partial, the sync completes Ok.
         let dir = tempfile::tempdir().unwrap();
         let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
         config.s3_concurrency = 1;
@@ -8769,9 +8909,10 @@ mod tests {
             false,
             None,
             false,
+            true,
         )
         .await
-        .expect("throttled pull sync should complete Ok");
+        .expect("throttled pull sync should complete Ok with allow_partial");
         assert_eq!(backend.get_calls().len(), 2);
     }
 
@@ -8843,6 +8984,7 @@ mod tests {
             false,
             None,
             false,
+            false,
         )
         .await
         .expect("pull sync should succeed");
@@ -8855,6 +8997,320 @@ mod tests {
         assert_eq!(
             backend.get_calls(),
             vec![format!("prefix/v3/packs/serde/{key}.tar.zst")]
+        );
+    }
+
+    struct DisappearingBackend {
+        inner: Arc<TestBackend>,
+        on_put_delete: std::path::PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for DisappearingBackend {
+        async fn head(&self, key: &str) -> Result<bool> {
+            self.inner.as_ref().head(key).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+            max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            self.inner.as_ref().get(key, max_bytes).await
+        }
+        async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+            if self.on_put_delete.exists() {
+                let _ = std::fs::remove_dir_all(&self.on_put_delete);
+            }
+            self.inner.as_ref().put(key, body, content_type).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.as_ref().list(prefix).await
+        }
+        fn describe(&self, key: &str) -> String {
+            self.inner.as_ref().describe(key)
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_push_fails_when_local_entry_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        config.s3_concurrency = 1;
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        // Materialize two entries ("aaa" sorts before "zzz")
+        for (k, cn) in [("keep_first", "aaa"), ("disappear_second", "zzz")] {
+            let artifact = src_dir.join(format!("{cn}.rlib"));
+            std::fs::write(&artifact, format!("{cn} bytes")).unwrap();
+            store
+                .put(
+                    k,
+                    cn,
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "debug",
+                    &[(artifact, format!("{cn}.rlib"))],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+
+        let disappear_dir = config.store_dir().join("disappear_second");
+        let backend = DisappearingBackend {
+            inner: TestBackend::memory(),
+            on_put_delete: disappear_dir,
+        };
+
+        let err = sync_with_client(
+            &backend, &config, &store, &remote, None, false, true, false, false, None, false, false,
+        )
+        .await
+        .expect_err("disappeared local entry must cause non-zero exit by default");
+        assert!(
+            err.to_string()
+                .contains("1 transfer(s) or import(s) failed")
+        );
+    }
+
+    /// Build a tar.zst pack containing an invalid meta.json to test import failure.
+    fn build_invalid_meta_pack() -> Vec<u8> {
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        let meta_bytes = b"{\"not\": \"valid meta\"}";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("meta.json").unwrap();
+        header.set_size(meta_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder.append(&header, &meta_bytes[..]).unwrap();
+        let tar_data = tar_builder.into_inner().unwrap();
+        zstd::encode_all(&tar_data[..], 3).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_pull_fails_when_import_fails_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let key = sync_test_cache_key("invalid-meta-pull");
+        let pack = build_invalid_meta_pack();
+
+        let backend = TestBackend::memory();
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/foo/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(&format!("prefix/v3/packs/foo/{key}.tar.zst"), pack)
+            .await;
+
+        let err = sync_with_client(
+            backend.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect_err("pull sync should return Err when import fails by default");
+        assert!(
+            err.to_string()
+                .contains("1 transfer(s) or import(s) failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_pull_allows_partial_when_import_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let key = sync_test_cache_key("invalid-meta-pull-allow");
+        let pack = build_invalid_meta_pack();
+
+        let backend = TestBackend::memory();
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/foo/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(&format!("prefix/v3/packs/foo/{key}.tar.zst"), pack)
+            .await;
+
+        sync_with_client(
+            backend.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("pull sync with allow_partial should return Ok even when import fails");
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_mixed_success_and_failure_completes_all_and_fails_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let key_good = sync_test_cache_key("mixed-good");
+        let key_bad = sync_test_cache_key("mixed-bad");
+        let pack_good = build_entry_pack(&key_good, "serde");
+
+        let backend = TestBackend::memory();
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/serde/{key_good}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(
+                &format!("prefix/v3/packs/serde/{key_good}.tar.zst"),
+                pack_good,
+            )
+            .await;
+
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/tokio/{key_bad}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(
+                &format!("prefix/v3/packs/tokio/{key_bad}.tar.zst"),
+                b"corrupted bytes".to_vec(),
+            )
+            .await;
+
+        // Default behavior: completes all transfers, but returns Err
+        let err = sync_with_client(
+            backend.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect_err("mixed sync should complete all transfers and return Err by default");
+        assert!(
+            err.to_string()
+                .contains("1 transfer(s) or import(s) failed")
+        );
+
+        // Both GET calls were executed (no fail-fast abort)
+        assert_eq!(backend.get_calls().len(), 2);
+        // The good pack was successfully imported
+        assert!(
+            config
+                .store_dir()
+                .join(&key_good)
+                .join("meta.json")
+                .exists(),
+            "good entry should be materialized"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_with_client_mixed_success_and_failure_with_allow_partial_returns_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+        let store = Store::open(&config).unwrap();
+        let remote = test_remote_cfg();
+
+        let key_good = sync_test_cache_key("mixed-good-2");
+        let key_bad = sync_test_cache_key("mixed-bad-2");
+        let pack_good = build_entry_pack(&key_good, "serde");
+
+        let backend = TestBackend::memory();
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/serde/{key_good}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(
+                &format!("prefix/v3/packs/serde/{key_good}.tar.zst"),
+                pack_good,
+            )
+            .await;
+
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/tokio/{key_bad}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        backend
+            .seed(
+                &format!("prefix/v3/packs/tokio/{key_bad}.tar.zst"),
+                b"corrupted bytes".to_vec(),
+            )
+            .await;
+
+        // With allow_partial: completes all transfers and returns Ok
+        sync_with_client(
+            backend.as_ref(),
+            &config,
+            &store,
+            &remote,
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("mixed sync with allow_partial should complete Ok");
+
+        assert_eq!(backend.get_calls().len(), 2);
+        assert!(
+            config
+                .store_dir()
+                .join(&key_good)
+                .join("meta.json")
+                .exists(),
+            "good entry should be materialized"
         );
     }
 
@@ -9185,6 +9641,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
         )
         .await

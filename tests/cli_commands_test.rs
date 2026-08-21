@@ -1566,3 +1566,13 @@ fn workspace_wrapper_via_cargo_config_and_path() {
         String::from_utf8_lossy(&build.stderr)
     );
 }
+
+#[test]
+fn sync_help_includes_allow_partial() {
+    let e = env();
+    e.cmd()
+        .args(["sync", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--allow-partial"));
+}

@@ -288,9 +288,11 @@ jobs:
         timeout-minutes: 10
 
       # Fail fast with an explicit checklist if a Firefox build prerequisite is
-      # missing. MozillaBuild provides mach's bash/python env; clang-cl (cc/c++),
-      # nasm, and MSVC + Windows SDK back the compile. clang/rust are pulled by
-      # `./mach bootstrap`, so they are NOT pre-required here. Keep in sync with
+      # missing. MozillaBuild provides mach's bash/python env; clang-cl, nasm,
+      # and MSVC + Windows SDK back the compile. Mirrors the pull job (#728):
+      # check clang-cl by absolute path — it is NOT on the default PATH, and
+      # `cc`/`c++` are MinGW gcc/g++ on this runner, the wrong compiler for
+      # Firefox, so their presence proves nothing. Keep in sync with
       # ans-runners/tasks/windows/setup_packages.yml.
       - name: Verify Firefox/Windows build prerequisites
         run: |
@@ -299,14 +301,20 @@ jobs:
             echo "MISSING: MozillaBuild (set MOZILLABUILD or install to C:\\mozilla-build) — provision it (ans-runners/tasks/windows/setup_packages.yml)"
             missing=1
           fi
-          for t in cc c++ nasm; do
-            if ! command -v "$t" >/dev/null 2>&1; then
-              echo "MISSING on runner PATH: $t — provision it (ans-runners/tasks/windows/setup_packages.yml)"
-              missing=1
-            fi
-          done
+          if [ ! -f "$CLANG_CL_BIN/clang-cl.exe" ]; then
+            echo "MISSING: clang-cl at $CLANG_CL_BIN — provision it (ans-runners/tasks/windows/setup_packages.yml)"
+            missing=1
+          fi
+          if ! command -v nasm >/dev/null 2>&1; then
+            echo "MISSING on runner PATH: nasm — provision it (ans-runners/tasks/windows/setup_packages.yml)"
+            missing=1
+          fi
           [ -z "$missing" ] || exit 1
           echo "all Firefox/Windows prerequisites present"
+        env:
+          # VS-integrated clang-cl dir (ans-runners installs the VC.Llvm.Clang
+          # component into VS Build Tools). Kept in sync with the run step.
+          CLANG_CL_BIN: "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin"
 
       # Disk-full mid-build is the worst failure mode. One ref clone + two
       # worktrees + two objdirs + the cache is large.
@@ -346,7 +354,10 @@ jobs:
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
-          install_args: --force rust github:casey/just
+          # node@lts: Firefox's build needs Node.js (bundling / some codegen). It
+          # is normally provided by `mach bootstrap`, which the no-update
+          # bootstrap skips, so install it here (user-level, no elevation).
+          install_args: --force rust github:casey/just node@lts
           cache: false
           reshim: false
 
@@ -367,23 +378,56 @@ jobs:
         # slashes so the value survives the just/sh layers (see the pull job).
         run: |
           rustc --version && cargo --version && just --version
+          # Firefox needs clang-cl, which ans-runners installs into VS Build Tools
+          # but is NOT on the default PATH. Prepend its dir so mach discovers it
+          # (mach finds the MSVC toolchain + Windows SDK itself via vswhere, so no
+          # vcvars is needed). The scenario's `--enable-bootstrap=no-update`
+          # mozconfig stops mach from trying to fetch its OWN clang/VS (the fetch
+          # needs an elevated msiexec the NETWORK SERVICE account can't run —
+          # exit 1601). Mirrors the pull job (#728).
+          export PATH="$CLANG_CL_BIN:$PATH"
+          clang-cl --version | head -1 || { echo "clang-cl not on PATH"; exit 1; }
+          # cbindgen (Rust->C header generator): another user-level Firefox build
+          # tool `mach bootstrap` would install and the no-update bootstrap skips.
+          # Install it into the isolated CARGO_HOME (already on PATH) if absent.
+          command -v cbindgen >/dev/null 2>&1 || cargo install cbindgen --locked
+          cbindgen --version || { echo "cbindgen install failed"; exit 1; }
+          # node is installed by mise (node@lts), but mach invokes `node` as a
+          # deep subprocess where mise isn't activated, so the mise SHIM fails
+          # ("cannot find binary path"). Worse, node isn't pinned as the ACTIVE
+          # version, so `mise which node` returns nothing either. Pin it global,
+          # then resolve the REAL binary; fall back to globbing the install dir.
+          mise use -g node@lts >/dev/null 2>&1 || true
+          node_real="$(mise which node 2>/dev/null || true)"
+          if [ -z "$node_real" ]; then
+            mdd="$(cygpath -u "$MISE_DATA_DIR" 2>/dev/null || printf '%s' "$MISE_DATA_DIR")"
+            node_real="$(find "$mdd/installs/node" -name node.exe 2>/dev/null | head -1)"
+          fi
+          [ -n "$node_real" ] || { echo "could not resolve node binary"; exit 1; }
+          # Prepend the real node dir to PATH and set NODEJS (mach's documented
+          # override) so mach uses the binary directly, not the failing shim.
+          export PATH="$(dirname "$node_real"):$PATH"
+          export NODEJS="$(cygpath -w "$node_real" 2>/dev/null || printf '%s' "$node_real")"
+          node --version || { echo "node not resolvable"; exit 1; }
+          echo "[bench] node: $node_real"
           work="$(printf '%s' "$RUNNER_TEMP" | tr '\\' '/')/f"
           mkdir -p "$work"
           echo "[bench] work dir: $work"
           just bench firefox-windows --work-dir "$work"
         env:
+          # Shared mach toolchain pre-provisioned (elevated) by ans-runners
+          # (tag: firefox-toolchain). Pointing MOZBUILD_STATE_PATH here makes the
+          # no-update-bootstrap build consume the fetched VS / Win SDK / Windows
+          # App SDK / clang / cbindgen / node instead of trying (and failing) to
+          # acquire them as the non-elevated runner service.
+          MOZBUILD_STATE_PATH: 'C:\mozbuild-shared'
+          # VS-integrated clang-cl dir (ans-runners installs the VC.Llvm.Clang
+          # component). Prepended to PATH above; kept in sync with the prereq step.
+          CLANG_CL_BIN: "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin"
           # The bench measures kache itself; it must not run under a wrapper.
           RUSTC_WRAPPER: ""
           # Let each tree honour its own rust-toolchain.toml (see Linux arm).
           RUSTUP_TOOLCHAIN: ""
-          # Append `--no-system-changes` to the scenario's `./mach bootstrap`
-          # (see scenarios/bench-firefox-windows/scenario.toml). The runner runs
-          # as NT AUTHORITY\NETWORK SERVICE (non-elevated), so mach's own Windows
-          # SDK acquisition via `msiexec /a` fails with exit 1601; the runner
-          # already has MSVC + the Windows SDK (provisioned by ans-runners), so
-          # bootstrap must not try to install them. A local run leaves this unset
-          # and gets a full, dependency-installing bootstrap.
-          MACH_BOOTSTRAP_FLAGS: "--no-system-changes"
 
       - name: Upload bench reports
         if: always()

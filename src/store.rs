@@ -7871,21 +7871,45 @@ mod tests {
 
         // The publisher runs on its own connection and is released inside
         // the removal's cleanup window. With cleanup inside the transaction
-        // it blocks on the write lock, the bounded wait times out, and the
-        // removal finishes first; the publisher then lands cleanly after.
+        // it blocks on the write lock, the seam's bounded wait expires, and
+        // the removal finishes first; the publisher then lands cleanly after.
         // With the old post-commit cleanup the lock is already free, the put
         // completes inside the window, and the cleanup destroys its meta.
-        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        //
+        // Synchronization is deadline-bounded atomics, not channels: every
+        // wait has a hard cap, so a broken removal path that never reaches
+        // the seam degrades into assertion failures instead of a hang — which
+        // is what lets the mutation lane kill mutants of the removal instead
+        // of timing out on them.
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wait_for = |flag: &std::sync::atomic::AtomicBool, cap: Duration| {
+            let deadline = std::time::Instant::now() + cap;
+            while !flag.load(std::sync::atomic::Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
         let publisher = {
             let config = config.clone();
             let dir_path = dir.path().to_path_buf();
+            let released = std::sync::Arc::clone(&released);
+            let published = std::sync::Arc::clone(&published);
             std::thread::spawn(move || {
                 let store = Store::open(&config).unwrap();
                 store.db.busy_timeout(Duration::from_secs(30)).unwrap();
                 let src_b = dir_path.join("b.rlib");
                 std::fs::write(&src_b, b"generation B, republished").unwrap();
-                start_rx.recv().unwrap();
+                // Bounded: if the removal never reaches the seam (a broken
+                // removal path), publish anyway so the join terminates and
+                // the assertions report the breakage.
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !released.load(std::sync::atomic::Ordering::Acquire)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 store
                     .put(
                         "key",
@@ -7899,7 +7923,7 @@ mod tests {
                         "",
                     )
                     .unwrap();
-                let _ = done_tx.send(());
+                published.store(true, std::sync::atomic::Ordering::Release);
             })
         };
 
@@ -7909,8 +7933,11 @@ mod tests {
                 None,
                 || {},
                 || {
-                    start_tx.send(()).unwrap();
-                    let _ = done_rx.recv_timeout(Duration::from_millis(1500));
+                    released.store(true, std::sync::atomic::Ordering::Release);
+                    // Give the publisher a real chance to race: on the fixed
+                    // structure it blocks on the write lock and this expires;
+                    // on the old structure it completes inside the window.
+                    wait_for(&published, Duration::from_millis(1500));
                 },
             )
             .unwrap();

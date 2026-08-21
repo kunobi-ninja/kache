@@ -67,6 +67,15 @@ buildRustPackage {
     "--skip=store::tests::test_exclude_from_indexing_sets_tmutil_xattr"
   ];
 
+  # The suite runs ~2000 tests at full parallelism; nix-daemon's default soft
+  # descriptor limit (often 1024) is low enough for the parallel run to hit
+  # EMFILE, which surfaced as spurious single-test failures in flake builds
+  # (#756). Raise the soft limit toward the hard limit; best-effort so a
+  # builder with a lower hard cap still runs.
+  preCheck = ''
+    ulimit -n 4096 2>/dev/null || true
+  '';
+
   # Avoid bootstrapping loop: don't let kache wrap itself during build
   env.RUSTC_WRAPPER = "";
 

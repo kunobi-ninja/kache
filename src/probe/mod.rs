@@ -127,6 +127,7 @@ impl Prober for CcProber {
     fn probe(&self, req: &ProbeRequest<'_>) -> Result<ResolvedConfig> {
         // Compiler identity — `cc --version`.
         let output = Command::new(req.compiler)
+            .env("LC_ALL", "C")
             .arg("--version")
             .output()
             .with_context(|| format!("running `{} --version`", req.compiler))?;
@@ -265,6 +266,7 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
     child_cmd
         .args(["-E", "-P", "-x", "c"])
         .arg(source_file.path())
+        .env("LC_ALL", "C")
         .env("KACHE_FAMILY_PROBE_ACTIVE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -376,6 +378,7 @@ fn resolve_invocation(
     per_tu_paths: &[String],
 ) -> Option<Vec<String>> {
     let output = Command::new(compiler)
+        .env("LC_ALL", "C")
         .arg("-###")
         .args(args)
         .output()
@@ -466,7 +469,11 @@ pub fn live_probe_diagnostic() -> LiveProbeDiagnostic {
 fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
     // Absence is the one informational state; every other failure below is a
     // diagnostic that could not run and must surface as such.
-    match Command::new(compiler).arg("--version").output() {
+    match Command::new(compiler)
+        .env("LC_ALL", "C")
+        .arg("--version")
+        .output()
+    {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return LiveProbeDiagnostic::NoCompiler;
         }
@@ -524,6 +531,7 @@ fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
     // The prober discards the raw `-###` output; re-run it for the head,
     // which is the one fact an "unresolvable probe" report needs.
     let stderr_head = Command::new(compiler)
+        .env("LC_ALL", "C")
         .arg("-###")
         .args(&args)
         .output()
@@ -795,6 +803,7 @@ mod tests {
         };
         let Some(tokens) = config.resolved_tokens else {
             let head = Command::new("cc")
+                .env("LC_ALL", "C")
                 .arg("-###")
                 .args(&args)
                 .output()
@@ -1143,5 +1152,60 @@ mod tests {
             res = run_family_probe(script.to_str().unwrap());
         }
         assert_eq!(res, Ok(Some(ProbedFamily::Gnu)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_spawns_pin_lc_all_c() {
+        let temp = TempDir::new().unwrap();
+        let log_file = temp.path().join("lc_all.log");
+        let script_body = format!(
+            r#"printf '%s\n' "$LC_ALL" >> "{log}"
+if [ "$1" = "--version" ]; then
+    echo "mock-cc 1.0"
+    exit 0
+fi
+if [ "$1" = "-###" ]; then
+    echo ' /usr/lib/gcc/cc1 -quiet -O2 foo.c -o foo.s' >&2
+    exit 0
+fi
+if [ "$1" = "-E" ]; then
+    echo 'KACHE_PROBE_GNU'
+    exit 0
+fi
+exit 0"#,
+            log = log_file.display()
+        );
+        let script = create_mock_probe_script(temp.path(), "mock_cc", &script_body);
+        let compiler = script.to_str().unwrap();
+
+        let req = ProbeRequest {
+            compiler,
+            args: &["-O2".to_string()],
+            key_args: &["-O2".to_string()],
+            per_tu_paths: &[],
+            windows_aware: false,
+        };
+        let config = CcProber.probe(&req).expect("probe succeeds");
+        assert_eq!(config.version_line, "mock-cc 1.0");
+        assert!(config.resolved_tokens.is_some());
+
+        let family = run_family_probe(compiler).expect("family probe succeeds");
+        assert_eq!(family, Some(ProbedFamily::Gnu));
+
+        let diag = live_probe_diagnostic_for(compiler);
+        match diag {
+            LiveProbeDiagnostic::Resolved { version_line } => {
+                assert_eq!(version_line, "mock-cc 1.0");
+            }
+            other => panic!("expected Resolved diagnostic, got: {other:?}"),
+        }
+
+        let recorded = std::fs::read_to_string(&log_file).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert!(!lines.is_empty(), "expected compiler to be spawned");
+        for line in &lines {
+            assert_eq!(*line, "C", "expected LC_ALL=C, got: {line}");
+        }
     }
 }

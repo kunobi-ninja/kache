@@ -19,7 +19,7 @@ When invoked without arguments, kache prints `--help` and exits — it does not 
 | `kache list [<crate>] [--sort <field>] [--no-pager]` | List cache entries or show details for one crate |
 | `kache why-miss <crate>` | Diagnose why a crate keeps missing the cache |
 | `kache report [--format <fmt>] [--since <dur>] [--root <path>] [--output <path>] [--top <n>]` | Build report in text / json / trace / markdown / github format |
-| `kache gc [--max-age <dur>]` | Evict entries by LRU or age |
+| `kache gc [--max-age <dur> \| --stale-schema]` | Evict entries by LRU, age, or obsolete key schema |
 | `kache purge [--crate-name <name>]` | Wipe entire cache or entries for one crate |
 | `kache clean [-n \| --dry-run] [-y \| --yes]` | Find and remove `target/` directories (interactive; `-n` previews, `-y` removes all non-interactively) |
 | `kache sync [flags]` | Sync local cache with a configured remote |
@@ -60,7 +60,16 @@ kache cargo -- build --workspace
 ```
 
 Runs Cargo's built-in `build` or `check` from the current directory with its
-arguments unchanged. If Cargo's
+arguments unchanged. It also keeps Cargo's intermediate build state under
+`{workspace-root}/target` while leaving final artifacts in the selected target
+directory. Cargo 1.91 introduced this `build-dir` split. It prevents a shared
+`CARGO_TARGET_DIR` from carrying fingerprints between worktrees and declaring
+the wrong unit `Fresh` before `RUSTC_WRAPPER` can run. Each worktree owns its
+freshness state, while Kache still shares compiled artifacts. Set
+`CARGO_BUILD_BUILD_DIR` explicitly, or configure `[build] build-dir`, to retain
+a different build-dir policy; Kache does not override either form.
+
+If Cargo's
 ancestor search finds a symlink to the selected Cargo-home config, Cargo would
 normally merge the same array-valued `build.rustflags` twice and re-key every
 unit. This front-end identifies that duplicate by canonical path, contributes
@@ -75,8 +84,9 @@ with a warning rather than risk reproducing Cargo's selection rules
 incorrectly. Cargo `-C`/`--config`, unstable flags, `install`, aliases, and
 external subcommands pass through unchanged. Config paths and contents are
 revalidated immediately before Cargo starts; concurrent config editing should
-still be avoided. Ordinary `cargo` remains supported; this command is needed
-only for the canonical-config alias case.
+still be avoided. Ordinary `cargo` remains supported. Use this front-end for
+the canonical-config alias case or when final artifacts intentionally share a
+target directory across worktrees.
 
 The command prevents Cargo's spurious rebuild in an existing target directory.
 It does not alias Kache entries across different rustflags transport sources;
@@ -210,17 +220,20 @@ Saving a manifest is cheap; it is safe to run at the end of a CI build alongside
 ## `kache gc`
 
 ```sh
-kache gc [--max-age <duration>]
+kache gc [--max-age <duration> | --stale-schema]
 ```
 
-Runs garbage collection. Without `--max-age`, applies the automatic policy: opt-in age retention from `KACHE_GC_MAX_AGE_HOURS` (default `0`, disabled) first, then duplicate and size-pressure eviction against the recomputed physical store size. Size pressure fires above `KACHE_MAX_SIZE` and evicts down to 90% of that cap. Duplicate cleanup is bounded by the same target and removes an entry only when backfilled metadata proves positive physical reclaim; unknown legacy entries are kept. The command reports each policy separately. With `--max-age`, runs only the requested age policy regardless of store size.
+Runs garbage collection. Without an option, applies the automatic policy: opt-in age retention from `KACHE_GC_MAX_AGE_HOURS` (default `0`, disabled) first, then duplicate and size-pressure eviction against the recomputed physical store size. Size pressure fires above `KACHE_MAX_SIZE` and evicts down to 90% of that cap. Duplicate cleanup is bounded by the same target and removes an entry only when backfilled metadata proves positive physical reclaim; unknown legacy entries are kept. The command reports each policy separately. With `--max-age`, runs only the requested age policy regardless of store size.
 
-During a rolling upgrade, both modes verify GC policy v2 before mutation and use a `gc_v2` command that older daemons reject without evicting. If the daemon cannot provide v2 semantics and per-policy reporting, the command reruns the requested policy locally under the same cross-process GC lock.
+`--stale-schema` is an explicit key-upgrade cleanup. It retains entries created by the running cache-key recipe and removes entries from older recipes, including legacy entries whose recipe was not recorded. Ordinary upgrades and automatic GC do not remove those legacy entries. This mode runs locally under the cross-process GC lock and cannot be combined with `--max-age`.
+
+During a rolling upgrade, the automatic and `--max-age` modes verify GC policy v2 before mutation and use a `gc_v2` command that older daemons reject without evicting. If the daemon cannot provide v2 semantics and per-policy reporting, the command reruns the requested policy locally under the same cross-process GC lock. The stale-schema mode always runs locally because older daemons do not know the running binary's key recipe.
 
 ```sh
 kache gc                  # automatic configured policy (age first, then pressure)
 kache gc --max-age 30d    # remove anything unused for 30 days
 kache gc --max-age 7d     # aggressive cleanup before a release build
+kache gc --stale-schema   # reclaim entries orphaned by cache-key recipe changes
 ```
 
 If `clean_incremental` is enabled (the default), GC removes tracked incremental compilation directories that previous wrapper invocations registered. Normal cached invocations also remove the current Cargo incremental dir eagerly. Adaptive and forced preserve-incremental compiles use separate state that kache never registers for GC; `cargo clean` still removes it with the target profile.

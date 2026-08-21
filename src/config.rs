@@ -805,6 +805,12 @@ fn normalize_base_dirs(raw: impl IntoIterator<Item = String>) -> Result<Vec<Stri
         if value.is_empty() {
             anyhow::bail!("[paths].base_dirs[{index}] must not be empty");
         }
+        if value.starts_with(r"\\?\") || value.starts_with("//?/") {
+            anyhow::bail!(
+                "[paths].base_dirs[{index}] must not use a Windows verbatim prefix, got \
+                 {value:?}"
+            );
+        }
 
         let bytes = value.as_bytes();
         let windows_drive = bytes.len() >= 3
@@ -860,6 +866,12 @@ fn normalize_base_dirs(raw: impl IntoIterator<Item = String>) -> Result<Vec<Stri
         } else {
             format!("/{}", components.join("/"))
         };
+        if crate::path_normalizer::is_filesystem_root_prefix(&normalized) {
+            anyhow::bail!(
+                "[paths].base_dirs[{index}] must be narrower than a filesystem root, got \
+                 {value:?}"
+            );
+        }
         out.push(normalized);
     }
 
@@ -2752,6 +2764,27 @@ remote_key_cache_refresh_secs = 900
 
         let windows_parent = normalize_base_dirs([r"C:\work\..\other".to_string()]).unwrap_err();
         assert!(windows_parent.to_string().contains("must not contain `..`"));
+
+        for root in [
+            "/",
+            "C:/",
+            r"C:\",
+            "//server/share",
+            "//server/share/",
+            r"\\server\share",
+            r"\\server\share\",
+        ] {
+            let error = normalize_base_dirs([root.to_string()]).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("narrower than a filesystem root")
+            );
+        }
+        for verbatim in [r"\\?\C:\work", "//?/C:/work"] {
+            let error = normalize_base_dirs([verbatim.to_string()]).unwrap_err();
+            assert!(error.to_string().contains("Windows verbatim prefix"));
+        }
     }
 
     #[test]

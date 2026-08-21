@@ -320,13 +320,6 @@ impl ArtifactSet {
         &self.outputs
     }
 
-    pub fn store_files(&self) -> Vec<(PathBuf, String)> {
-        self.outputs
-            .iter()
-            .map(|artifact| (artifact.path.clone(), artifact.store_name.clone()))
-            .collect()
-    }
-
     pub fn total_size(&self) -> u64 {
         self.outputs
             .iter()

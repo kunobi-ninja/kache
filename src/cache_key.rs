@@ -203,7 +203,14 @@ use std::path::{Path, PathBuf};
 // old unescaped `Expand` and re-corrupts it. Both directions share key v24, so
 // only a bump makes them unreachable. Cost is one cold rebuild, which v0.13.0
 // users (key v22) already pay crossing to this release regardless.
-pub(crate) const CACHE_KEY_VERSION: u32 = 25;
+//
+// v26 (kunobi-ninja/kache#760): source identity now folds each normalized path
+// together with its content hash. v25 retained only the sorted multiset of
+// contents, so swapping two module bodies (or renaming an include_dir asset)
+// could preserve the key while changing the compiled program. The same bump
+// also makes old dep-info blobs that retain donor-worktree absolute paths
+// unreachable; v26 stores separate target/cwd sentinels and re-roots both.
+pub(crate) const CACHE_KEY_VERSION: u32 = 26;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -657,43 +664,60 @@ impl GroupedHasher {
     }
 }
 
-/// Per-group digests of the most recent [`compute_cache_key`] run in this
-/// process, for the wrapper's event logging (one compile per wrapper process,
-/// same stash pattern as `link.rs`'s toggles). `None` until a key is computed
-/// (cc compiles, passthroughs).
-static LAST_KEY_FIELDS: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    /// Per-group digests of the most recent [`compute_cache_key`] run on this
+    /// thread, for the wrapper's event logging (one compile per wrapper
+    /// process, same stash pattern as `link.rs`'s toggles). `None` until a key
+    /// is computed (cc compiles, passthroughs).
+    ///
+    /// Thread-local rather than process-global (kunobi-ninja/kache#777): the
+    /// write and every read are one wrapper invocation on one thread, so
+    /// per-thread storage costs the production path nothing and makes the
+    /// take-once contract hold under `cargo test`, where libtest runs each test
+    /// on its own thread and a concurrent key computation would otherwise
+    /// consume or overwrite another test's stash.
+    static LAST_KEY_FIELDS: std::cell::RefCell<Option<std::collections::BTreeMap<String, String>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Clone the per-group key digests without consuming them.
 ///
 /// Adaptive incremental policy needs the same input-group evidence as miss
-/// diagnostics before event logging takes the process-local stash.
+/// diagnostics before event logging takes the thread-local stash.
 pub fn peek_last_key_fields() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_FIELDS.lock().ok().and_then(|g| g.clone())
+    LAST_KEY_FIELDS
+        .try_with(|stash| stash.borrow().clone())
+        .ok()
+        .flatten()
 }
 
 /// Take (consume) the per-group key digests of the last computed rustc key.
 pub fn take_last_key_fields() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_FIELDS.lock().ok().and_then(|mut g| g.take())
+    LAST_KEY_FIELDS
+        .try_with(|stash| stash.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
-/// Per-EXTERN artifact digests of the most recent [`compute_cache_key`] run
-/// (kunobi-ninja/kache#609), stashed like [`LAST_KEY_FIELDS`].
-///
-/// The `externs` group digest says only THAT some dependency's artifact
-/// changed. In an `extern:` cascade — one native `-sys` crate's `.a` diverging
-/// and re-keying everything above it — every downstream crate reports the same
-/// undifferentiated "externs changed", which is exactly the case that has to
-/// be diagnosed by hand today. Keeping the per-dependency hashes lets
-/// `why-miss` name WHICH dependency moved, then follow that dependency's own
-/// events to the root of the chain.
-///
-/// The value is the dependency artifact's own content hash (the same bytes
-/// folded into the key), truncated to [`KEY_FIELD_HEX`] — not a digest of the
-/// folded segment. Same discriminating power, and it can be compared against
-/// hashes recorded elsewhere.
-static LAST_KEY_EXTERNS: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    /// Per-EXTERN artifact digests of the most recent [`compute_cache_key`] run
+    /// (kunobi-ninja/kache#609), stashed like [`LAST_KEY_FIELDS`].
+    ///
+    /// The `externs` group digest says only THAT some dependency's artifact
+    /// changed. In an `extern:` cascade — one native `-sys` crate's `.a`
+    /// diverging and re-keying everything above it — every downstream crate
+    /// reports the same undifferentiated "externs changed", which is exactly
+    /// the case that has to be diagnosed by hand today. Keeping the
+    /// per-dependency hashes lets `why-miss` name WHICH dependency moved, then
+    /// follow that dependency's own events to the root of the chain.
+    ///
+    /// The value is the dependency artifact's own content hash (the same bytes
+    /// folded into the key), truncated to [`KEY_FIELD_HEX`] — not a digest of
+    /// the folded segment. Same discriminating power, and it can be compared
+    /// against hashes recorded elsewhere.
+    static LAST_KEY_EXTERNS: std::cell::RefCell<Option<std::collections::BTreeMap<String, String>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Marker recorded for an extern whose artifact could not be hashed — a
 /// sysroot crate (`std`, `core`), whose identity rides on rustc version + name
@@ -703,40 +727,77 @@ pub const EXTERN_UNREADABLE: &str = "(sysroot)";
 /// Take (consume) the per-extern artifact digests of the last computed rustc
 /// key. `None` for cc compiles and passthroughs, which compute no rustc key.
 pub fn take_last_key_externs() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_EXTERNS.lock().ok().and_then(|mut g| g.take())
+    LAST_KEY_EXTERNS
+        .try_with(|stash| stash.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
-/// Producing-unit identity per extern, teed off the same loop that computes
-/// [`LAST_KEY_EXTERNS`] (kunobi-ninja/kache#627).
-///
-/// Keyed by the name the CONSUMER used, which under Cargo's `package = "..."`
-/// renaming is an alias (`foo_old` for a crate whose own events say `foo`). The
-/// value is the producer's `-C extra-filename`, recovered from the artifact path
-/// — the one identity visible from both sides, so `why-miss` can join a changed
-/// dependency to the exact unit that produced it instead of guessing by name.
-///
-/// Absent for an extern whose path carries no such suffix (sysroot crates,
-/// non-cargo invocations); the walk then falls back to matching by name.
-static LAST_KEY_EXTERN_UNITS: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    /// Producing-unit identity per extern, teed off the same loop that computes
+    /// [`LAST_KEY_EXTERNS`] (kunobi-ninja/kache#627).
+    ///
+    /// Keyed by the name the CONSUMER used, which under Cargo's
+    /// `package = "..."` renaming is an alias (`foo_old` for a crate whose own
+    /// events say `foo`). The value is the producer's `-C extra-filename`,
+    /// recovered from the artifact path — the one identity visible from both
+    /// sides, so `why-miss` can join a changed dependency to the exact unit
+    /// that produced it instead of guessing by name.
+    ///
+    /// Absent for an extern whose path carries no such suffix (sysroot crates,
+    /// non-cargo invocations); the walk then falls back to matching by name.
+    static LAST_KEY_EXTERN_UNITS: std::cell::RefCell<
+        Option<std::collections::BTreeMap<String, String>>,
+    > = const { std::cell::RefCell::new(None) };
+}
 
 /// Take (consume) the per-extern producing-unit ids of the last computed rustc
 /// key. Always taken alongside [`take_last_key_externs`] so a stale map cannot
 /// outlive its digests.
 pub fn take_last_key_extern_units() -> Option<std::collections::BTreeMap<String, String>> {
-    LAST_KEY_EXTERN_UNITS.lock().ok().and_then(|mut g| g.take())
+    LAST_KEY_EXTERN_UNITS
+        .try_with(|stash| stash.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
-/// The compiling unit's own identity, stashed at key computation so the event
-/// writer needs no extra plumbing — the same pattern the per-group digests use
-/// (kunobi-ninja/kache#131). Set unconditionally at the top of
-/// [`compute_cache_key`], including to `None` when cargo passed no
-/// `-C extra-filename`, so it can never carry over from a previous compile.
-static LAST_KEY_UNIT_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+thread_local! {
+    /// The compiling unit's own identity, stashed at key computation so the
+    /// event writer needs no extra plumbing — the same pattern the per-group
+    /// digests use (kunobi-ninja/kache#131). Set unconditionally at the top of
+    /// [`compute_cache_key`], including to `None` when cargo passed no
+    /// `-C extra-filename`, so it can never carry over from a previous compile.
+    static LAST_KEY_UNIT_ID: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Take (consume) the unit id of the last computed rustc key.
 pub fn take_last_key_unit_id() -> Option<String> {
-    LAST_KEY_UNIT_ID.lock().ok().and_then(|mut g| g.take())
+    LAST_KEY_UNIT_ID
+        .try_with(|stash| stash.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+/// Stable identity for one dep-info source path.
+///
+/// Cargo/worktree-local roots use the same rule rustc receives through
+/// `--remap-path-prefix`. Keep the dep-info spelling intact: canonicalizing a
+/// symlink would merge two spellings even though rustc may embed them
+/// differently through `file!()` or debug info. An unmodeled spelling stays
+/// deliberately path-local through an opaque, lossless-OS-byte digest.
+fn source_path_identity(file: &Path, path_normalizer: &PathNormalizer) -> Result<Vec<u8>> {
+    if let Some(identity) = path_normalizer.source_path_identity(file) {
+        return Ok(identity);
+    }
+
+    // Preserve the exact dep-info OS representation before hashing. Lossy
+    // UTF-8, NFC normalization, or canonicalization can merge distinct source
+    // spellings and recreate #760.
+    let mut opaque = blake3::Hasher::new();
+    opaque.update(b"kache-source-path-v1\0");
+    opaque.update(&env_os_key_bytes(file.as_os_str()));
+    Ok(format!("<OPAQUE_PATH>/{}", opaque.finalize().to_hex()).into_bytes())
 }
 
 /// Compute the blake3 cache key for a rustc invocation.
@@ -767,18 +828,12 @@ pub fn compute_cache_key(
     // or one that never reaches the event writer — would otherwise leave a
     // previous invocation's dependency digests to be picked up as if they
     // belonged to this compile.
-    if let Ok(mut stash) = LAST_KEY_EXTERNS.lock() {
-        *stash = None;
-    }
+    let _ = LAST_KEY_EXTERNS.try_with(|stash| *stash.borrow_mut() = None);
     // Same reasoning for the unit ids (#627); both are cleared and written
     // together so the walk can never pair one compile's digests with another's
     // identities.
-    if let Ok(mut stash) = LAST_KEY_EXTERN_UNITS.lock() {
-        *stash = None;
-    }
-    if let Ok(mut stash) = LAST_KEY_UNIT_ID.lock() {
-        *stash = args.unit_id();
-    }
+    let _ = LAST_KEY_EXTERN_UNITS.try_with(|stash| *stash.borrow_mut() = None);
+    let _ = LAST_KEY_UNIT_ID.try_with(|stash| *stash.borrow_mut() = args.unit_id());
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
     hasher.update(b"key_version:");
@@ -999,40 +1054,27 @@ pub fn compute_cache_key(
     // ── Group A: source files + env deps (from dep-info pre-pass) ──
     hasher.set_group("sources");
     if let Some(dep_info) = &dep_info {
-        // Hash source files in CONTENT-HASH order, not path order. Only
-        // the content hash enters the key (not the path), so the set of
-        // contents is what matters — and `dep_info.source_files` is
-        // sorted by absolute path, which is NOT path-independent: a
-        // build-script-generated file under `OUT_DIR` sorts among the
-        // registry sources differently once the build tree moves (e.g.
-        // `C:\Windows\...\tmp\...` vs `C:\actions-runner\...`), flipping
-        // the update order and changing the key — so a relocated build
-        // missed (kunobi-ninja/kache#201). Sorting by hash makes the
-        // order depend only on contents.
-        let mut hashed: Vec<(String, &std::path::Path)> =
-            Vec::with_capacity(dep_info.source_files.len());
+        // A source is identified by its stable normalized path and bytes.
+        // Hashing only a sorted content multiset lets swapping modules/assets
+        // preserve the key while changing semantics (#760). Matched paths use
+        // stable sentinels for relocation (#201); unmatched paths stay local
+        // rather than risk a false hit.
+        let mut hashed: Vec<(Vec<u8>, String)> = Vec::with_capacity(dep_info.source_files.len());
         for file in &dep_info.source_files {
-            match file_hasher.hash(file) {
-                Ok(file_hash) => hashed.push((file_hash, file.as_path())),
-                Err(e) => {
-                    tracing::warn!(
-                        "[key:{}] failed to hash source {}: {}",
-                        crate_name,
-                        file.display(),
-                        e
-                    );
-                }
-            }
+            let file_hash = file_hasher
+                .hash(file)
+                .with_context(|| format!("hashing source identity {}", file.display()))?;
+            let normalized_path = source_path_identity(file, path_normalizer)?;
+            hashed.push((normalized_path, file_hash));
         }
         hashed.sort();
-        for (file_hash, file) in &hashed {
-            hasher.update(b"source:");
-            hasher.update(file_hash.as_bytes());
-            hasher.update(b"\n");
+        for (normalized_path, file_hash) in &hashed {
+            fold_field(&mut hasher, b"source_path:", normalized_path);
+            fold_field(&mut hasher, b"source_hash:", file_hash.as_bytes());
             tracing::trace!(
                 "[key:{}] source:{}={}",
                 crate_name,
-                file.display(),
+                String::from_utf8_lossy(normalized_path),
                 &file_hash[..16]
             );
         }
@@ -1113,12 +1155,8 @@ pub fn compute_cache_key(
             }
         }
     }
-    if let Ok(mut stash) = LAST_KEY_EXTERNS.lock() {
-        *stash = Some(extern_digests);
-    }
-    if let Ok(mut stash) = LAST_KEY_EXTERN_UNITS.lock() {
-        *stash = Some(extern_units);
-    }
+    let _ = LAST_KEY_EXTERNS.try_with(|stash| *stash.borrow_mut() = Some(extern_digests));
+    let _ = LAST_KEY_EXTERN_UNITS.try_with(|stash| *stash.borrow_mut() = Some(extern_units));
 
     // RUSTFLAGS — normalize via PathNormalizer (canonical-prefix
     // sentinel substitution; supersedes the older CWD-only
@@ -1461,9 +1499,7 @@ pub fn compute_cache_key(
     tracing::trace!("[key:{}] remap={}", crate_name, remap);
 
     let (hash, fields) = hasher.finalize_with_fields();
-    if let Ok(mut stash) = LAST_KEY_FIELDS.lock() {
-        *stash = Some(fields);
-    }
+    let _ = LAST_KEY_FIELDS.try_with(|stash| *stash.borrow_mut() = Some(fields));
     let key = hash.to_hex().to_string();
     tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
     Ok(key)
@@ -1477,7 +1513,7 @@ pub fn compute_cache_key(
 /// working directory; `decl_file`s under the workspace / `$CARGO_TARGET_DIR` /
 /// `$CARGO_HOME` / `$RUSTUP_HOME` / `$HOME` / the tempdir / a build-script
 /// `OUT_DIR`). Without this fold the rest of `compute_cache_key` normalizes
-/// those path inputs to sentinels and hashes source by content, leaving the
+/// those path inputs to sentinels and hashes source by normalized path/content,
 /// `remap:none` key path-independent and letting a shared cache hand one
 /// checkout's real-path artifact to another (kunobi-ninja/kache#480 for the
 /// opt-out; the same hazard for coverage).
@@ -3483,6 +3519,89 @@ mod tests {
 
     const GNU_RUSTC_VERSION: &str =
         "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
+
+    #[test]
+    fn source_identity_uses_a_stable_configured_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        let source = checkout.join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub fn value() {}\n").unwrap();
+        let normalizer =
+            PathNormalizer::empty().with_base_dirs(&[checkout.to_string_lossy().into_owned()]);
+
+        let mut expected = b"<BASE_DIR_0>/".to_vec();
+        expected.extend_from_slice(
+            source
+                .strip_prefix(&checkout)
+                .unwrap()
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        assert_eq!(
+            source_path_identity(&source, &normalizer).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn source_identity_uses_a_configured_external_root_losslessly() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = dir.path().join("external");
+        let source = external.join("generated/value.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub const VALUE: u8 = 1;\n").unwrap();
+        let normalizer =
+            PathNormalizer::empty().with_base_dirs(&[external.to_string_lossy().into_owned()]);
+
+        let mut expected = b"<BASE_DIR_0>/".to_vec();
+        expected.extend_from_slice(
+            source
+                .strip_prefix(&external)
+                .unwrap()
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        assert_eq!(
+            source_path_identity(&source, &normalizer).unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_identity_keeps_distinct_symlink_spellings_of_one_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.rs");
+        let alias = dir.path().join("alias.rs");
+        std::fs::write(&real, "pub const VALUE: u8 = 1;\n").unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let real_identity = source_path_identity(&real, &PathNormalizer::empty()).unwrap();
+        let alias_identity = source_path_identity(&alias, &PathNormalizer::empty()).unwrap();
+        assert_ne!(real_identity, alias_identity);
+        assert!(real_identity.starts_with(b"<OPAQUE_PATH>/"));
+        assert!(alias_identity.starts_with(b"<OPAQUE_PATH>/"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_identity_opaque_fallback_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let external = dir.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let path_a = external.join(std::ffi::OsString::from_vec(vec![b'a', 0x80]));
+        let path_b = external.join(std::ffi::OsString::from_vec(vec![b'a', 0x81]));
+        std::fs::write(&path_a, b"same").unwrap();
+        std::fs::write(&path_b, b"same").unwrap();
+        let identity_a = source_path_identity(&path_a, &PathNormalizer::empty()).unwrap();
+        let identity_b = source_path_identity(&path_b, &PathNormalizer::empty()).unwrap();
+        assert_ne!(identity_a, identity_b);
+        assert!(identity_a.starts_with(b"<OPAQUE_PATH>/"));
+        assert!(identity_b.starts_with(b"<OPAQUE_PATH>/"));
+    }
 
     /// #131 load-bearing invariant: the grouped tee must produce EXACTLY the
     /// digest a plain blake3 hasher produces over the same update sequence —
@@ -6659,6 +6778,78 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert_eq!(take_last_key_extern_units(), None, "taken, not copied");
     }
 
+    /// The key stashes are per-thread, so a concurrent key computation can
+    /// neither overwrite nor consume another's (kunobi-ninja/kache#777).
+    ///
+    /// Before the stashes were thread-local this was the shape that made
+    /// `key_computation_stashes_unit_identity_and_yields_it_once` flaky under
+    /// the default `cargo test` parallelism: any other thread computing a key
+    /// between a compute and its take would win the race. The outer
+    /// `key_test_lock` still serializes this group against the env-mutating
+    /// matrix; what runs concurrently here is the stash access itself.
+    #[test]
+    fn key_stashes_do_not_leak_across_threads() {
+        let _lock = key_test_lock();
+
+        // Distinct unit ids per thread, so a leak shows up as another thread's
+        // value rather than as an absence.
+        let units = ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"];
+        std::thread::scope(|scope| {
+            for unit in units {
+                scope.spawn(move || {
+                    let extra = format!("extra-filename=-{unit}");
+                    let extern_arg = format!("dep_{unit}=/w/target/debug/deps/libdep-{unit}.rlib");
+                    let args: Vec<String> = [
+                        "rustc",
+                        "--crate-name",
+                        "app",
+                        "src/lib.rs",
+                        "-C",
+                        &extra,
+                        "--extern",
+                        &extern_arg,
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                    let mut parsed = RustcArgs::parse(&args).unwrap();
+                    // Skip the dep-info pre-pass, as above: forking rustc from
+                    // every thread would swamp the point being made.
+                    parsed.source_file = None;
+
+                    // Loop so the interleaving windows overlap rather than each
+                    // thread racing through its compute/take once.
+                    for _ in 0..16 {
+                        compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty())
+                            .unwrap();
+
+                        assert_eq!(
+                            take_last_key_unit_id().as_deref(),
+                            Some(unit),
+                            "each thread sees its own unit id"
+                        );
+                        assert_eq!(take_last_key_unit_id(), None, "taken, not copied");
+
+                        let recorded =
+                            take_last_key_extern_units().expect("recorded with the digests");
+                        assert_eq!(
+                            recorded.get(&format!("dep_{unit}")).map(String::as_str),
+                            Some(unit),
+                            "each thread sees its own extern units"
+                        );
+                        assert_eq!(take_last_key_extern_units(), None, "taken, not copied");
+
+                        assert!(
+                            take_last_key_externs().is_some(),
+                            "digests ride the same thread as their identities"
+                        );
+                        assert!(take_last_key_fields().is_some(), "per-group digests too");
+                    }
+                });
+            }
+        });
+    }
+
     /// True if a bare `rustc` is invocable. `compute_cache_key` forks
     /// rustc for the version probe and dep-info pre-pass; without it
     /// the key still computes (the pre-pass falls back) but the
@@ -7141,6 +7332,7 @@ exec {} \"$@\"\n",
         }
 
         let old_out_dir = std::env::var_os("OUT_DIR");
+        let old_manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
         let dir = tempfile::tempdir().unwrap();
         let workspace_a = dir.path().join("checkout-a");
         let workspace_b = dir.path().join("checkout-b");
@@ -7175,6 +7367,7 @@ pub fn value() -> u8 {
         let out_a = out_a.canonicalize().unwrap();
         unsafe {
             std::env::set_var("OUT_DIR", &out_a);
+            std::env::set_var("CARGO_MANIFEST_DIR", &workspace_a);
         }
         let parsed_a = RustcArgs::parse(&base_args(&source_a)).unwrap();
         let pn_a = PathNormalizer::from_env(Some(&workspace_a));
@@ -7183,12 +7376,14 @@ pub fn value() -> u8 {
         let out_b = out_b.canonicalize().unwrap();
         unsafe {
             std::env::set_var("OUT_DIR", &out_b);
+            std::env::set_var("CARGO_MANIFEST_DIR", &workspace_b);
         }
         let parsed_b = RustcArgs::parse(&base_args(&source_b)).unwrap();
         let pn_b = PathNormalizer::from_env(Some(&workspace_b));
         let key_b = compute_cache_key(&parsed_b, &fh, &pn_b).unwrap();
 
         restore_env_var("OUT_DIR", old_out_dir);
+        restore_env_var("CARGO_MANIFEST_DIR", old_manifest_dir);
 
         assert_eq!(
             key_a, key_b,

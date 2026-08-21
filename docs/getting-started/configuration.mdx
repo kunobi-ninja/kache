@@ -328,7 +328,7 @@ AppImage mount, or a custom toolchain root:
 base_dirs = ["/snap", "/var/lib/flatpak", "/work"]
 ```
 
-Entries must be absolute and contain no `..`. They need not exist on every
+Entries must be absolute, narrower than a filesystem root, and contain no `..`. They need not exist on every
 machine, so a shared project config remains usable outside the container or
 sandbox. kache sorts the normalized entries independently of TOML order,
 assigns each one a distinct `<BASE_DIR_N>` key sentinel and

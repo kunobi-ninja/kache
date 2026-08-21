@@ -3261,14 +3261,16 @@ impl Store {
                 // the unreadable-meta arm below, not report already-absent.
                 let meta_is_back = match fs::metadata(&meta_path) {
                     Ok(_) => true,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                     Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!(
-                                "entry {cache_key}: checking republished meta.json — refusing \
-                                 removal so blob refcounts are not leaked (#276)"
-                            )
-                        });
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "entry {cache_key}: checking republished meta.json — \
+                                     refusing removal so blob refcounts are not leaked (#276)"
+                                )
+                            });
+                        }
+                        false
                     }
                 };
                 drop(tx);
@@ -6213,7 +6215,15 @@ mod tests {
             )
             .unwrap();
         std::fs::remove_file(store.entry_dir("m1").join("meta.json")).unwrap();
-        assert!(store.remove_entry("m1").is_err());
+        let err = store.remove_entry("m1").unwrap_err();
+        // The message identifies WHICH state was diagnosed: the settled
+        // missing-meta shape, not the transient-recheck refusal — a removal
+        // that misclassifies the settled state would route corrupt entries
+        // through the wrong recovery advice.
+        assert!(
+            format!("{err:#}").contains("meta.json missing but DB row present"),
+            "wrong refusal shape: {err:#}"
+        );
         let still_there: i64 = store
             .db
             .query_row(
@@ -6223,6 +6233,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(still_there, 1, "entry row must survive a refused removal");
+    }
+
+    /// An unreadable meta.json (EACCES, not NotFound) must refuse through the
+    /// unreadable-meta arm — "reading meta.json" — not be misread as missing
+    /// and routed into the missing-meta bounce, whose diagnostics describe a
+    /// different state (#276, #670). The distinction is the arm's NotFound
+    /// guard; this pins it against being widened to every error.
+    #[cfg(unix)]
+    #[test]
+    fn remove_entry_refuses_unreadable_meta_as_a_read_error() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, mode 000 does not deny access");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("lib.rlib");
+        std::fs::write(&output, b"x").unwrap();
+        store
+            .put(
+                "locked",
+                "c1",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        let entry_dir = store.entry_dir("locked");
+        std::fs::set_permissions(&entry_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = store.remove_entry("locked").unwrap_err();
+        std::fs::set_permissions(&entry_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            format!("{err:#}").contains("reading meta.json"),
+            "an unreadable meta must refuse as a read error, got: {err:#}"
+        );
+        assert!(
+            store.contains("locked"),
+            "entry row must survive a refused removal"
+        );
     }
 
     /// #211: blob path construction must be panic-safe for a malformed (short)
@@ -8083,6 +8138,17 @@ mod tests {
         std::fs::write(inner.join("artifact"), b"x").unwrap();
         std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
 
+        // Stash the blob hash BEFORE the removal: remove_dir_all deletes
+        // children in unspecified order, so meta.json may or may not survive
+        // the failed cleanup.
+        let stashed_hash = {
+            let meta: EntryMeta = serde_json::from_str(
+                &std::fs::read_to_string(entry_dir.join("meta.json")).unwrap(),
+            )
+            .unwrap();
+            meta.files[0].hash.clone()
+        };
+
         let err = store.remove_entry("stuck");
         // Restore permissions so the tempdir can be dropped regardless.
         std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -8091,20 +8157,17 @@ mod tests {
             "a persistent cleanup failure must not be swallowed as a lost race"
         );
         // The failure direction matters (#670): the logical removal commits
-        // BEFORE cleanup, so a cleanup failure leaves a deleted row plus an
-        // unindexed directory — recoverable residue. Rolling the row back
-        // after files were already deleted would manufacture a committed row
-        // without artifacts, which is the phantom this function must never
-        // produce.
+        // BEFORE cleanup, so a cleanup failure leaves a deleted row plus
+        // partially deleted, unindexed residue — recoverable. Rolling the row
+        // back after files were already deleted would manufacture a committed
+        // row without artifacts, which is the phantom this function must
+        // never produce.
         assert!(
             !store.contains("stuck"),
             "the logical removal must stay committed across a cleanup failure"
         );
-        let meta: EntryMeta =
-            serde_json::from_str(&std::fs::read_to_string(entry_dir.join("meta.json")).unwrap())
-                .unwrap();
         assert!(
-            store.blob_path(&meta.files[0].hash).is_file(),
+            store.blob_path(&stashed_hash).is_file(),
             "blob unlinks run only after directory cleanup succeeds; a failed \
              cleanup leaves the file for the orphan sweep"
         );

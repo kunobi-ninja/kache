@@ -20,24 +20,16 @@
 name = "bench-firefox-windows"
 tags = ["suite:bench", "project:firefox", "backend:kache", "lang:cc", "lang:cpp", "lang:rust", "os:windows"]
 
-# One-time toolchain setup. `./mach bootstrap` runs under MozillaBuild's `sh`
-# and provisions ~/.mozbuild (shared across runs). It pulls its own clang/rust
-# but relies on the runner already having MozillaBuild + Visual Studio Build
-# Tools (MSVC + Windows SDK) — bootstrap cannot install Visual Studio.
-#
-# `$MACH_BOOTSTRAP_FLAGS` lets the caller append flags WITHOUT hardcoding a
-# CI-only choice into the scenario (setup runs via `sh -c`, so the env var is
-# expanded by the shell; the scenario interpolator only touches `{kache}`-style
-# braces). It is unset for a LOCAL run, so a developer gets a full bootstrap
-# that actually installs the system dependencies. In CI the bench workflow sets
-# it to `--no-system-changes`: there the runner service runs as
-# NT AUTHORITY\NETWORK SERVICE (non-elevated), so mach's own SDK acquisition via
-# `msiexec /a` (an administrative install) fails with `exit 1601` ("Windows
-# Installer service could not be accessed"); the flag makes mach use the
-# pre-provisioned MSVC + Windows SDK (installed by ans-runners) and skip the
-# system install, while still fetching user-level clang/rust into ~/.mozbuild.
-setup        = ["./mach bootstrap --application-choice browser ${MACH_BOOTSTRAP_FLAGS:-}"]
-setup_marker = "~/.mozbuild"
+# NO bootstrap setup step. Running `./mach bootstrap` under the runner service
+# (NT AUTHORITY\NETWORK SERVICE, non-elevated) is a dead end this scenario spent
+# its first weeks in: the SDK acquisition via `msiexec /a` fails with exit 1601,
+# and the user-level clang fetch never left a toolchain that configure could
+# find, so every nightly died with "Cannot find the target C compiler" (#728).
+# The pull scenario solved this and this scenario now mirrors it: the full mach
+# toolchain is pre-provisioned (elevated) by ans-runners into the shared
+# MOZBUILD_STATE_PATH, the mozconfig consumes it via
+# `--enable-bootstrap=no-update`, and the workflow puts the VS-integrated
+# clang-cl on PATH.
 
 build = "./mach build"
 
@@ -59,6 +51,20 @@ content = """
 ac_add_options --enable-optimize
 ac_add_options --disable-debug
 ac_add_options --disable-tests
+
+# Bootstrap ENABLED but NO-UPDATE (mirrors bench-firefox-pull-windows, #728).
+# Enabled so mach discovers the pre-fetched toolchain artifacts — most
+# importantly the Windows App SDK, which has no PATH entry and is only findable
+# via the bootstrap toolchain registry — from MOZBUILD_STATE_PATH
+# (= C:/mozbuild-shared, pre-provisioned ELEVATED by ans-runners). no-update so
+# mach never tries to UPDATE/re-fetch a toolchain: the shared dir is read-only
+# to the non-elevated runner service, so an update write is "Access is denied",
+# and a VS re-fetch would hit the elevated msiexec (exit 1601).
+ac_add_options --enable-bootstrap=no-update
+# The VS-integrated clang-cl provisioned on the runner has no wasm32-wasi
+# target, so the wasm-sandboxed RLBox libraries can't build; disable them
+# (a build-env constraint, not a cache-relevant source change).
+ac_add_options --without-wasm-sandboxed-libraries
 
 # Prepend kache as the C/C++ compiler launcher. --with-compiler-wrapper (NOT
 # --with-ccache, which runs `<wrapper> -s` for ccache stats and kache rejects

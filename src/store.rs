@@ -603,6 +603,14 @@ pub(crate) struct RemovalReclaim {
     pub(crate) blobs_unlinked: usize,
 }
 
+/// One pass of `remove_entry_guarded_with_hooks`: either a settled outcome,
+/// or the instruction to run again because a republication replaced the
+/// generation this pass was waiting on.
+enum RemovalAttempt {
+    Done(Option<RemovalReclaim>),
+    Republished,
+}
+
 /// A shadow policy's would-evict set for one size-driven sweep
 /// (kunobi-ninja/kache#594): the keys it would remove for the same byte
 /// budget the live policy is sweeping toward.
@@ -1715,7 +1723,6 @@ impl Store {
         allow_source_hardlinks: bool,
     ) -> Result<StorePutResult> {
         let entry_dir = self.entry_dir(cache_key);
-        fs::create_dir_all(&entry_dir).context("creating entry directory")?;
 
         // Phase 1: hash every output and durably materialize its blob on disk
         // *before* any committed entry can reference it. No DB writes happen
@@ -1791,13 +1798,19 @@ impl Store {
         let meta_json =
             serde_json::to_string_pretty(&meta).context("serializing entry metadata")?;
         let meta_path = entry_dir.join("meta.json");
-        fs::write(&meta_path, meta_json)?;
-        crate::atomic::fsync_file(&meta_path).context("flushing entry metadata")?;
 
         // Phase 2: register the entry and all of its blob references in a single
         // transaction, flipping `committed = 1` only once every blob is durable
         // on disk. Either the whole entry (with correct refcounts) becomes
         // visible, or none of it does — no refcount drift, no half-written row.
+        //
+        // `meta.json` is written INSIDE this transaction (#670), after the
+        // write lock is held, so its appearance on disk is serialized against
+        // `remove_entry_guarded`'s critical section. Written before the lock,
+        // a fresh meta could land between a racing removal's in-transaction
+        // re-read and its directory cleanup and be deleted with the old
+        // generation's directory — stranding this put's committed row with no
+        // artifacts and leaking its refcounts until doctor or an index rebuild.
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
         let tx = self.db.unchecked_transaction()?;
@@ -1820,6 +1833,16 @@ impl Store {
             materialize_blob(source, &self.blob_path(&file.hash), *use_source_hardlink)?;
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
+        // The write lock is held from the statements above (record_entry_blobs
+        // always issues at least the DELETE). Materialize meta.json under it:
+        // a concurrent removal is either entirely before this transaction (its
+        // re-read guard then sees this meta and rolls back) or entirely after
+        // it (it removes this generation whole, row and meta together). The
+        // directory is re-created because a removal that won the previous
+        // generation deleted it.
+        fs::create_dir_all(&entry_dir).context("creating entry directory")?;
+        fs::write(&meta_path, meta_json)?;
+        crate::atomic::fsync_file(&meta_path).context("flushing entry metadata")?;
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
             params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, crate::cache_key::CACHE_KEY_VERSION],
@@ -3140,6 +3163,52 @@ impl Store {
         skip_if_idle_lt: Option<Duration>,
         after_meta_read: impl FnOnce(),
     ) -> Result<Option<RemovalReclaim>> {
+        self.remove_entry_guarded_with_hooks(cache_key, skip_if_idle_lt, after_meta_read, || {})
+    }
+
+    /// [`Self::remove_entry_guarded_with_hook`] with a second seam:
+    /// `before_dir_cleanup` runs inside the write transaction, after the row
+    /// delete and refcount decrements, immediately before the entry directory
+    /// is removed — the residual #670 window where a publisher's fresh
+    /// `meta.json` used to be deleted out from under its registration.
+    fn remove_entry_guarded_with_hooks(
+        &self,
+        cache_key: &str,
+        skip_if_idle_lt: Option<Duration>,
+        after_meta_read: impl FnOnce(),
+        before_dir_cleanup: impl FnOnce(),
+    ) -> Result<Option<RemovalReclaim>> {
+        // Boxed so the republication-retry loop below stays non-generic; the
+        // production closures are zero-sized, so no allocation happens.
+        let mut after_meta_read: Option<Box<dyn FnOnce() + '_>> = Some(Box::new(after_meta_read));
+        let mut before_dir_cleanup: Option<Box<dyn FnOnce() + '_>> =
+            Some(Box::new(before_dir_cleanup));
+        loop {
+            match self.remove_entry_attempt(
+                cache_key,
+                skip_if_idle_lt,
+                after_meta_read.take(),
+                before_dir_cleanup.take(),
+            )? {
+                RemovalAttempt::Done(outcome) => return Ok(outcome),
+                // A republication landed while this attempt waited out a
+                // concurrent removal: the row belongs to a fresh generation
+                // whose meta is back. The caller asked to remove whatever is
+                // currently published, so run again against the new
+                // generation. Each pass requires another full republication
+                // inside the window, so this cannot spin on its own.
+                RemovalAttempt::Republished => {}
+            }
+        }
+    }
+
+    fn remove_entry_attempt(
+        &self,
+        cache_key: &str,
+        skip_if_idle_lt: Option<Duration>,
+        after_meta_read: Option<Box<dyn FnOnce() + '_>>,
+        before_dir_cleanup: Option<Box<dyn FnOnce() + '_>>,
+    ) -> Result<RemovalAttempt> {
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
 
@@ -3163,22 +3232,42 @@ impl Store {
                 meta.files.iter().map(|f| f.hash.clone()).collect()
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // No meta.json. If a DB row still exists, its blob list is
-                // unknown and deleting the row would leak — refuse. If neither
-                // a row nor a dir exists, there is nothing to remove (idempotent
-                // for already-gone / never-existed keys).
-                let row_exists: i64 = self.db.query_row(
+                // No meta.json. A same-key removal may be mid-transaction: its
+                // directory cleanup runs under the write lock BEFORE its row
+                // delete commits (#670), so "meta missing, row present" is a
+                // transient of a healthy concurrent removal, not only the
+                // stranded-entry shape. Bounce off the write lock — the no-op
+                // write statement waits (busy_timeout) until any in-flight
+                // writer commits or rolls back — then judge the settled state.
+                let tx = self.db.unchecked_transaction()?;
+                tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
+                let row_exists: i64 = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1)",
                     params![cache_key],
                     |row| row.get(0),
                 )?;
-                if row_exists != 0 {
-                    anyhow::bail!(
-                        "entry {cache_key}: meta.json missing but DB row present — refusing \
-                         removal so blob refcounts are not leaked (#276)"
-                    );
+                drop(tx);
+                if row_exists == 0 {
+                    // The concurrent removal won (or the key never existed);
+                    // nothing left to remove.
+                    return Ok(RemovalAttempt::Done(None));
                 }
-                return Ok(None);
+                if meta_path.exists() {
+                    // A republication landed while we waited: the row belongs
+                    // to a fresh generation whose meta is back. The caller
+                    // asked to remove whatever is currently published, so
+                    // retry against the new generation. Each retry requires
+                    // another full republication in the window, so this
+                    // cannot spin on its own.
+                    return Ok(RemovalAttempt::Republished);
+                }
+                // Settled: a row with no meta.json. Its blob list is unknown
+                // and deleting the row would leak the refcounts — refuse, so
+                // a corrupt entry never silently leaks (#276).
+                anyhow::bail!(
+                    "entry {cache_key}: meta.json missing but DB row present — refusing \
+                     removal so blob refcounts are not leaked (#276)"
+                );
             }
             Err(e) => {
                 return Err(e).with_context(|| {
@@ -3190,109 +3279,113 @@ impl Store {
             }
         };
 
-        after_meta_read();
+        if let Some(hook) = after_meta_read {
+            hook();
+        }
 
-        let removed = {
-            let tx = self.db.unchecked_transaction()?;
+        let tx = self.db.unchecked_transaction()?;
 
-            // Active-pin guard (kunobi-ninja/kache#326, #182): bail out — under
-            // the write lock, before any decrement or unlink — if the entry was
-            // accessed within the grace window. Serializes against `get`'s
-            // `last_accessed` bump so an in-flight restore is never deleted out
-            // from under itself. Dropping `tx` here rolls back (nothing ran yet).
-            if let Some(grace) = skip_if_idle_lt {
-                let recently_accessed: i64 = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM entries \
+        // Active-pin guard (kunobi-ninja/kache#326, #182): bail out — under
+        // the write lock, before any decrement or unlink — if the entry was
+        // accessed within the grace window. Serializes against `get`'s
+        // `last_accessed` bump so an in-flight restore is never deleted out
+        // from under itself. Dropping `tx` here rolls back (nothing ran yet).
+        if let Some(grace) = skip_if_idle_lt {
+            let recently_accessed: i64 = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries \
                      WHERE cache_key = ?1 AND last_accessed >= datetime('now', ?2))",
-                    params![cache_key, format!("-{} seconds", grace.as_secs())],
-                    |row| row.get(0),
-                )?;
-                if recently_accessed != 0 {
-                    return Ok(None);
-                }
-            }
-
-            // Delete the entry row first. If rows_affected is 0, another remover
-            // already released this entry's references; we skip the decrements so
-            // two removers can never double-decrement a shared blob's refcount
-            // and unlink a blob a live entry still points at (#510). This gate —
-            // not `gc.lock` — is what makes concurrent removal safe; the lock is
-            // defence in depth for bulk sweeps.
-            let rows_affected = tx.execute(
-                "DELETE FROM entries WHERE cache_key = ?1",
-                params![cache_key],
+                params![cache_key, format!("-{} seconds", grace.as_secs())],
+                |row| row.get(0),
             )?;
-
-            let mut reclaim = RemovalReclaim::default();
-            if rows_affected > 0 {
-                // Republication guard (#670): `put` writes meta.json BEFORE
-                // its registration transaction, so the row just deleted may
-                // belong to a NEWER publication than the meta.json this
-                // removal read its hash list from — decrementing the old
-                // hashes against the new row's refcounts corrupts the store.
-                // The write lock this transaction holds excludes the
-                // publisher's own transaction, so re-reading meta.json here
-                // pins the row↔meta pairing: any difference means a
-                // republication won, and the removal rolls back untouched.
-                // A meta.json that vanished or went corrupt in the window
-                // takes the same rollback; the NEXT removal attempt reports
-                // it properly through the #276 guards above.
-                let still_ours =
-                    matches!(fs::read_to_string(&meta_path), Ok(now) if now == meta_content);
-                if !still_ours {
-                    return Ok(None);
-                }
-                tx.execute(
-                    "DELETE FROM entry_blobs WHERE cache_key = ?1",
-                    params![cache_key],
-                )?;
-                for hash in &hashes {
-                    tx.execute(
-                        "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
-                        params![hash],
-                    )?;
-                    let row: Option<(i64, i64)> = tx
-                        .query_row(
-                            "SELECT refcount, size FROM blobs WHERE hash = ?1",
-                            params![hash],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
-                        .ok();
-                    if let Some((rc, size)) = row
-                        && rc <= 0
-                    {
-                        tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
-                        // Unlink under the write lock so a concurrent adopter can't
-                        // commit a reference to a file we're deleting. Only bytes
-                        // whose last reference went away are physically freed —
-                        // that, not the entry's logical size, is what eviction
-                        // budgets on (#608).
-                        unlink_blob(&self.blob_path(hash));
-                        reclaim.freed_bytes += size.max(0) as u64;
-                        reclaim.blobs_unlinked += 1;
-                    }
-                }
+            if recently_accessed != 0 {
+                return Ok(RemovalAttempt::Done(None));
             }
-            tx.commit()?;
-            (rows_affected > 0).then_some(reclaim)
-        };
+        }
+
+        // Delete the entry row first. If rows_affected is 0, another remover
+        // already released this entry's references; we skip the decrements so
+        // two removers can never double-decrement a shared blob's refcount
+        // and unlink a blob a live entry still points at (#510). This gate —
+        // not `gc.lock` — is what makes concurrent removal safe; the lock is
+        // defence in depth for bulk sweeps.
+        let rows_affected = tx.execute(
+            "DELETE FROM entries WHERE cache_key = ?1",
+            params![cache_key],
+        )?;
+
+        // A remover that deleted no row releases nothing and must not touch
+        // the directory either (#670): a fresh `meta.json` there may belong
+        // to a publisher whose registration has not committed yet. Reporting
+        // `None` also keeps callers (eviction stats, tombstones) from
+        // double-counting one entry as two removals (#510).
+        if rows_affected == 0 {
+            return Ok(RemovalAttempt::Done(None));
+        }
+
+        // Republication guard (#670): the row just deleted may belong to a
+        // NEWER publication than the meta.json this removal read its hash
+        // list from — decrementing the old hashes against the new row's
+        // refcounts corrupts the store. `put` materializes meta.json inside
+        // its own registration transaction, so under the write lock this
+        // transaction holds the pairing cannot move: any difference means a
+        // republication won, and the removal rolls back untouched. A
+        // meta.json that vanished or went corrupt in the window takes the
+        // same rollback; the NEXT removal attempt reports it properly
+        // through the #276 guards above.
+        let still_ours = matches!(fs::read_to_string(&meta_path), Ok(now) if now == meta_content);
+        if !still_ours {
+            return Ok(RemovalAttempt::Done(None));
+        }
+        tx.execute(
+            "DELETE FROM entry_blobs WHERE cache_key = ?1",
+            params![cache_key],
+        )?;
+        // Decrement in the DB first, but defer every physical unlink until
+        // the directory cleanup below has succeeded: cleanup failure rolls
+        // this transaction back, and refcounts can only be restored if the
+        // blob files they count are still on disk.
+        let mut reclaim = RemovalReclaim::default();
+        let mut unlink = Vec::new();
+        for hash in &hashes {
+            tx.execute(
+                "UPDATE blobs SET refcount = refcount - 1 WHERE hash = ?1",
+                params![hash],
+            )?;
+            let row: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT refcount, size FROM blobs WHERE hash = ?1",
+                    params![hash],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+            if let Some((rc, size)) = row
+                && rc <= 0
+            {
+                tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash])?;
+                unlink.push((hash.clone(), size));
+            }
+        }
+
+        if let Some(hook) = before_dir_cleanup {
+            hook();
+        }
 
         // Remove the entry directory (just meta.json in new format, may have
-        // artifacts in legacy entries) — but only when THIS call deleted the
-        // row (#670): a remover that deleted nothing must not touch the
-        // directory, because a fresh `meta.json` there may belong to a
-        // publisher whose registration transaction has not committed yet, and
-        // deleting it strands the publisher's row with no artifacts. A
-        // winner-crashed-before-cleanup leftover (meta.json, no row) is
-        // recoverable by design: `rebuild_index_from_store` re-adopts it.
-        if removed.is_none() {
-            return Ok(None);
-        }
-        // Windows can still surface external interference as delete-pending
-        // errors (sharing violations from readers mid-hardlink), so on any
-        // error re-check whether the directory is actually gone, with a brief
-        // bounded retry. A directory that persists past the retries is a real
-        // failure (permissions, open handles) and propagates (#510).
+        // artifacts in legacy entries) INSIDE the transaction, while the
+        // write lock is still held (#670): after commit the lock is gone,
+        // and a same-key publisher could materialize its fresh meta.json in
+        // the gap before an unlocked cleanup — which would then delete it,
+        // stranding the publisher's committed row with no artifacts. Under
+        // the lock, a publisher is either entirely before this transaction
+        // (caught by the re-read guard above) or entirely after it (it
+        // re-creates the directory). Windows can still surface external
+        // interference as delete-pending errors (sharing violations from
+        // readers mid-hardlink), so on any error re-check whether the
+        // directory is actually gone, with a brief bounded retry (worst case
+        // 50ms of extra lock hold). A directory that persists past the
+        // retries is a real failure (permissions, open handles): it
+        // propagates (#510) and rolls the whole removal back, leaving row,
+        // refcounts, and blobs exactly as they were.
         if let Ok(entries) = fs::read_dir(&entry_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -3322,10 +3415,18 @@ impl Store {
         }
         result.with_context(|| format!("entry {cache_key}: removing entry directory"))?;
 
-        // Only the remover that deleted the row released the entry's blob
-        // references; a loser reports `None` so callers (eviction stats,
-        // tombstones) don't double-count one entry as two removals (#510).
-        Ok(removed)
+        // Point of no return: unlink dead blobs under the write lock so a
+        // concurrent adopter can't commit a reference to a file we're
+        // deleting. Only bytes whose last reference went away are physically
+        // freed — that, not the entry's logical size, is what eviction
+        // budgets on (#608).
+        for (hash, size) in unlink {
+            unlink_blob(&self.blob_path(&hash));
+            reclaim.freed_bytes += size.max(0) as u64;
+            reclaim.blobs_unlinked += 1;
+        }
+        tx.commit()?;
+        Ok(RemovalAttempt::Done(Some(reclaim)))
     }
 
     /// Test-only: insert a bare committed entry row, for tests that stage a
@@ -7730,6 +7831,115 @@ mod tests {
             refcount, 1,
             "B's refcounts must be untouched by the rollback"
         );
+    }
+
+    /// kunobi-ninja/kache#670, residual window: a same-key publisher whose
+    /// fresh `meta.json` lands while a removal is between its refcount
+    /// decrements and its directory cleanup must not have that meta deleted
+    /// out from under its registration — that strands the publisher's
+    /// committed row with no artifacts and leaks its refcounts until doctor
+    /// or an index rebuild.
+    ///
+    /// Cleanup now runs inside the removal's write transaction and `put`
+    /// materializes meta.json inside its registration transaction, so the
+    /// publisher is serialized to entirely-before (caught by the re-read
+    /// guard) or entirely-after (it re-creates the directory). The publisher
+    /// below is released exactly in the old danger window; on the old
+    /// structure (cleanup after commit) it finishes inside the window and
+    /// its meta.json is destroyed.
+    #[test]
+    fn republication_during_removal_cleanup_is_never_stranded() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let src_a = dir.path().join("a.rlib");
+        std::fs::write(&src_a, b"generation A").unwrap();
+        store
+            .put(
+                "key",
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src_a, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // The publisher runs on its own connection and is released inside
+        // the removal's cleanup window. With cleanup inside the transaction
+        // it blocks on the write lock, the bounded wait times out, and the
+        // removal finishes first; the publisher then lands cleanly after.
+        // With the old post-commit cleanup the lock is already free, the put
+        // completes inside the window, and the cleanup destroys its meta.
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let publisher = {
+            let config = config.clone();
+            let dir_path = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let store = Store::open(&config).unwrap();
+                store.db.busy_timeout(Duration::from_secs(30)).unwrap();
+                let src_b = dir_path.join("b.rlib");
+                std::fs::write(&src_b, b"generation B, republished").unwrap();
+                start_rx.recv().unwrap();
+                store
+                    .put(
+                        "key",
+                        "c",
+                        &["lib".into()],
+                        &[],
+                        "",
+                        "dev",
+                        &[(src_b, "lib.rlib".into())],
+                        "",
+                        "",
+                    )
+                    .unwrap();
+                let _ = done_tx.send(());
+            })
+        };
+
+        let removed = store
+            .remove_entry_guarded_with_hooks(
+                "key",
+                None,
+                || {},
+                || {
+                    start_tx.send(()).unwrap();
+                    let _ = done_rx.recv_timeout(Duration::from_millis(1500));
+                },
+            )
+            .unwrap();
+        publisher.join().unwrap();
+
+        assert!(removed.is_some(), "the removal owned generation A's row");
+        assert!(
+            store.contains("key"),
+            "generation B's row must be committed"
+        );
+        assert!(
+            store.entry_dir("key").join("meta.json").is_file(),
+            "generation B's meta.json must survive the racing removal's cleanup"
+        );
+        let meta = store.get("key").unwrap().expect("B must be restorable");
+        let hash = meta.files[0].hash.clone();
+        assert!(
+            store.blob_path(&hash).is_file(),
+            "generation B's blob must be on disk"
+        );
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 1, "B's refcounts must be intact");
     }
 
     /// kunobi-ninja/kache#510: directory-cleanup tolerance is for the

@@ -107,7 +107,17 @@ struct DiskState {
 enum LoadedState {
     Missing,
     Valid(DiskState),
+    /// The file is present and readable but its contents are wrong: not a
+    /// regular file, oversized, unparsable, or failing validation. Callers
+    /// reset the unit — the state is evidence of corruption and relearning is
+    /// the only safe response.
     Corrupt,
+    /// The environment refused the read: descriptor exhaustion, permissions,
+    /// I/O errors. Says nothing about the state's contents, so callers must
+    /// decline the current compile WITHOUT resetting — under transient
+    /// pressure (a parallel build hitting EMFILE, #756) destroying learned
+    /// state would turn a momentary refusal into a permanent relearn.
+    Unavailable,
 }
 
 impl AdaptiveUnit {
@@ -220,7 +230,7 @@ impl AdaptiveUnit {
         let lock = self.lock()?;
         let state = match self.load_state() {
             LoadedState::Valid(state) if !state.in_flight => state,
-            LoadedState::Missing => return None,
+            LoadedState::Missing | LoadedState::Unavailable => return None,
             LoadedState::Valid(_) | LoadedState::Corrupt => {
                 reset_locked(self);
                 return None;
@@ -252,6 +262,8 @@ impl AdaptiveUnit {
         let restore = match self.load_state() {
             LoadedState::Missing => None,
             LoadedState::Valid(state) if !state.in_flight => Some(state),
+            // Decline rather than start fresh over a file that may be intact.
+            LoadedState::Unavailable => return None,
             LoadedState::Valid(_) | LoadedState::Corrupt => {
                 reset_locked(self);
                 return None;
@@ -293,7 +305,7 @@ impl AdaptiveUnit {
         let lock = self.lock()?;
         let previous = match self.load_state() {
             LoadedState::Valid(state) if !state.in_flight => state,
-            LoadedState::Missing => return None,
+            LoadedState::Missing | LoadedState::Unavailable => return None,
             LoadedState::Valid(_) | LoadedState::Corrupt => {
                 reset_locked(self);
                 return None;
@@ -418,17 +430,23 @@ impl AdaptiveUnit {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return LoadedState::Missing;
             }
-            Err(_) => return LoadedState::Corrupt,
+            // A metadata error other than NotFound (EMFILE, EACCES, EIO) is
+            // the environment failing, not the file being wrong.
+            Err(_) => return LoadedState::Unavailable,
         };
         if !meta.is_file() || meta.len() > MAX_STATE_BYTES {
             return LoadedState::Corrupt;
         }
-        let state: DiskState = match fs::read(&self.state_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        {
-            Some(state) => state,
-            None => return LoadedState::Corrupt,
+        // Read and parse failures are distinct: a failed read is the
+        // environment (folding it into Corrupt is what let a transient EMFILE
+        // under a parallel test suite destroy learned state, #756); bytes that
+        // do not parse are the file itself being wrong.
+        let Ok(bytes) = fs::read(&self.state_path) else {
+            return LoadedState::Unavailable;
+        };
+        let state: DiskState = match serde_json::from_slice(&bytes) {
+            Ok(state) => state,
+            Err(_) => return LoadedState::Corrupt,
         };
         if !valid_state(&state, &self.unit_key) {
             return LoadedState::Corrupt;
@@ -997,10 +1015,49 @@ mod tests {
     }
 
     #[test]
-    fn state_io_errors_are_corrupt_not_missing() {
+    fn state_io_errors_are_unavailable_not_missing_or_corrupt() {
         let (_temp, _args, mut unit) = fixture();
         unit.state_path = unit.unit_dir.join("invalid\0state");
-        assert!(matches!(unit.load_state(), LoadedState::Corrupt));
+        assert!(matches!(unit.load_state(), LoadedState::Unavailable));
+    }
+
+    /// A state file the environment refuses to read (EMFILE under a parallel
+    /// suite, EACCES) is not corruption evidence: the policy must decline the
+    /// compile and leave the learned state alone. Folding the two together is
+    /// how transient descriptor exhaustion inside the Nix build sandbox reset
+    /// a freshly seeded unit and failed the suite (#756).
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_state_declines_without_destroying_learned_state() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root reads through mode 000, which would void the simulation.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, chmod 000 does not deny reads");
+            return;
+        }
+        let (_temp, _args, unit) = fixture();
+        activate(&unit, 100);
+
+        let readable = fs::metadata(&unit.state_path).unwrap().permissions();
+        fs::set_permissions(&unit.state_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(matches!(unit.load_state(), LoadedState::Unavailable));
+        assert!(
+            unit.try_active_at(103).is_none(),
+            "decline while the state cannot be read"
+        );
+        assert!(
+            path_exists(&unit.state_path),
+            "a refused read must not reset the unit"
+        );
+
+        // Pressure gone: the learned state is intact and still activates.
+        fs::set_permissions(&unit.state_path, readable).unwrap();
+        let lease = unit
+            .try_active_at(104)
+            .expect("learned state survived the transient refusal");
+        assert_eq!(lease.kind(), LeaseKind::Active);
+        assert!(lease.finish_at(true, 105));
     }
 
     #[test]

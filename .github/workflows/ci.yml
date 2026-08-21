@@ -1180,6 +1180,30 @@ jobs:
   # version and fail. `needs: version-consistency` proves Chart.yaml agrees with
   # the tag before anything immutable is pushed.
   #
+  # --- Stable branch (GA tags only) ---
+  # Advance the moving `stable` branch to the released tag once the gated
+  # release has fully succeeded, so Nix flake users can follow real releases
+  # instead of tracking main (#756). Two properties do all the safety work:
+  # the `needs: [release]` edge means only a tag that survived the full
+  # validation-and-release pipeline can advance the branch, and the plain
+  # (non-force) push is fast-forward-only, so an out-of-order or divergent
+  # tag fails this job closed instead of rewinding the branch. Prereleases
+  # (any tag containing `-`) never advance it. GITHUB_TOKEN pushes do not
+  # trigger workflows, so the branch update spawns no runs of its own.
+  # Bootstrap: the branch is first created manually at the latest GA tag.
+  stable-branch:
+    name: Advance stable branch
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    needs: [release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Fast-forward stable to the released tag
+        run: git push origin HEAD:refs/heads/stable
+
   # The chart is named `kache-service`, NOT `kache`, and that is load-bearing:
   # `helm push` derives the OCI repository from the chart name, so a chart named
   # `kache` lands on zondax/kache — the same repository and tag as the service

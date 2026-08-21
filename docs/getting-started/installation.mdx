@@ -155,21 +155,21 @@ kache is also published to Homebrew, APT, winget, Scoop, Chocolatey, and the AUR
 
 ## Nix
 
-The repo is a flake. Unlike the methods above it builds kache from source, with the Rust toolchain pinned in `rust-toolchain.toml` rather than whatever rustc your nixpkgs happens to ship.
+The repo is a flake. Unlike the methods above it builds kache from source, with the Rust toolchain pinned in `rust-toolchain.toml` rather than whatever rustc your nixpkgs happens to ship. Use the `stable` branch: it advances only after a non-prerelease GitHub release has passed the gated release build. The default `main` branch contains unreleased development work.
 
 ```sh
 # Run it once without installing
-nix run github:kunobi-ninja/kache -- --version
+nix run github:kunobi-ninja/kache/stable -- --version
 
 # Install into your profile
-nix profile install github:kunobi-ninja/kache
+nix profile install github:kunobi-ninja/kache/stable
 ```
 
-To consume it from your own flake, add the input and apply the overlay. The overlay provides `pkgs.kache` and `pkgs.kache-rust-toolchain`:
+To consume it from your own flake, add the input and apply the overlay. The overlay provides `pkgs.kache` and `pkgs.kache-rust-toolchain`. Following `stable`, `nix flake update` moves you from one release to the next and never onto unreleased commits:
 
 ```nix
 {
-  inputs.kache.url = "github:kunobi-ninja/kache";
+  inputs.kache.url = "github:kunobi-ninja/kache/stable";
 
   outputs = { nixpkgs, kache, ... }: {
     # ...
@@ -178,6 +178,8 @@ To consume it from your own flake, add the input and apply the overlay. The over
   };
 }
 ```
+
+If you want a version that never moves at all, pin a release tag instead: `github:kunobi-ninja/kache/v0.14.2`. A tag ref is inert under `nix flake update`; bump it yourself when you want a new version.
 
 There is also a NixOS and nix-darwin module that installs kache, writes `config.toml`, optionally sets `RUSTC_WRAPPER` system-wide, and runs the daemon as a systemd user service (Linux) or launchd agent (macOS):
 

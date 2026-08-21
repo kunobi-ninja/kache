@@ -447,8 +447,16 @@ fn report_json_on_empty_cache_is_valid_json() {
         .stdout
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&out).expect("valid json");
+    assert_eq!(v["schema_version"].as_u64(), Some(1));
     assert_eq!(v["summary"]["misses"].as_u64(), Some(0));
     assert_eq!(v["summary"]["local_hits"].as_u64(), Some(0));
+
+    let schema_text = include_str!("../docs/commands/report.schema.json");
+    let schema: serde_json::Value = serde_json::from_str(schema_text).expect("valid schema json");
+    assert_eq!(
+        schema["properties"]["schema_version"]["enum"],
+        serde_json::json!([1])
+    );
 }
 
 #[test]
@@ -979,6 +987,7 @@ fn commands_operate_on_a_populated_cache() {
         .stdout
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&out).expect("valid json");
+    assert_eq!(v["schema_version"].as_u64(), Some(1));
     // The clean+rebuild produced exactly one cache miss (cold) and one local
     // hit (warm) for our crate, with the artifact blobs stored.
     assert_eq!(v["summary"]["local_hits"].as_u64(), Some(1), "report: {v}");

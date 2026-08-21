@@ -185,6 +185,21 @@ For timeline analysis, JSON reports include a `timeline` window plus a top-level
 
 The `github` format is friendly for posting as a PR comment via `gh pr comment --body-file`.
 
+### JSON report schema and compatibility
+
+`kache report --format json` emits structured, machine-readable telemetry adhering to a versioned output contract:
+
+- **`schema_version`**: A top-level integer (currently `1`) defining the contract version. A formal JSON Schema definition is maintained at [`docs/commands/report.schema.json`](./report.schema.json).
+- **Machine codes vs. descriptive text**:
+  - Stable result, route, and bypass codes are separated from freeform human diagnostics.
+  - **`result`**: Stable outcome codes (`"local_hit"`, `"prefetch_hit"`, `"remote_hit"`, `"dup"`, `"miss"`, `"error"`, `"passthrough"`, `"skipped"`).
+  - **`route`**: Stable dispatch routes (`"direct"`, `"fallback"`, `"skipped"`, `"n/a"`).
+  - **`reason` categories**: Structured prefix categories (`"not-a-compile"`, `"unsupported"`, etc.) that separate query/probe invocations from real compile refusals.
+  - Freeform strings (`passthrough_reason`, `store_error`, `lookup_rejection`, `suggestions`) provide diagnostics and should not be relied upon for exact string matching across releases.
+- **Compatibility contract**:
+  - **Additive extensions**: Adding new fields or non-breaking metrics to objects does not increment `schema_version`. Machine readers MUST ignore unrecognized fields.
+  - **Breaking changes**: Removing fields, renaming fields, changing field data types, or altering code semantics increments `schema_version`.
+
 ---
 
 ## `kache save-manifest`

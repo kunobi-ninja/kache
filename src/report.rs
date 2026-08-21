@@ -29,8 +29,16 @@ pub struct GcSummary {
     pub blobs_removed: usize,
 }
 
+/// Schema version of the machine-readable JSON build report.
+///
+/// Incremented when a breaking change is made to the report's JSON structure
+/// or code semantics. Additive fields (such as new optional/default fields or
+/// non-breaking telemetry metrics) do not increment this version.
+pub const REPORT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BuildReport {
+    pub schema_version: u32,
     pub meta: ReportMeta,
     pub summary: ReportSummary,
     #[serde(default)]
@@ -645,6 +653,7 @@ pub fn generate_report_with_filter(
     };
 
     Ok(BuildReport {
+        schema_version: REPORT_SCHEMA_VERSION,
         meta: ReportMeta {
             kache_version: crate::VERSION.to_string(),
             generated_at: Utc::now().to_rfc3339(),
@@ -3313,6 +3322,234 @@ mod tests {
         assert!(summary.contains("1 passthrough"), "got: {summary}");
     }
 
+    const REPORT_SCHEMA_JSON: &str = include_str!("report.schema.json");
+
+    fn check_numeric_bounds(val: &serde_json::Value, schema: &serde_json::Value, path: &str) {
+        if let Some(num) = val.as_f64() {
+            if let Some(min) = schema.get("minimum").and_then(|m| m.as_f64()) {
+                assert!(num >= min, "expected >= {min} at {path}, got {num}");
+            }
+            if let Some(max) = schema.get("maximum").and_then(|m| m.as_f64()) {
+                assert!(num <= max, "expected <= {max} at {path}, got {num}");
+            }
+            if let Some(ex_min) = schema.get("exclusiveMinimum").and_then(|m| m.as_f64()) {
+                assert!(num > ex_min, "expected > {ex_min} at {path}, got {num}");
+            }
+            if let Some(ex_max) = schema.get("exclusiveMaximum").and_then(|m| m.as_f64()) {
+                assert!(num < ex_max, "expected < {ex_max} at {path}, got {num}");
+            }
+        }
+    }
+
+    fn validate_json_value(
+        val: &serde_json::Value,
+        schema: &serde_json::Value,
+        root_schema: &serde_json::Value,
+        path: &str,
+    ) {
+        if let Some(ref_path) = schema.get("$ref").and_then(|r| r.as_str())
+            && let Some(def_name) = ref_path.strip_prefix("#/definitions/")
+        {
+            let target_schema = &root_schema["definitions"][def_name];
+            assert!(
+                !target_schema.is_null(),
+                "schema definition not found for {ref_path} at {path}"
+            );
+            return validate_json_value(val, target_schema, root_schema, path);
+        }
+
+        if let Some(expected_type) = schema.get("type") {
+            if let Some(type_str) = expected_type.as_str() {
+                match type_str {
+                    "object" => {
+                        assert!(val.is_object(), "expected object at {path}, got {val:?}");
+                        let obj = val.as_object().unwrap();
+                        if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+                            for req_key in required {
+                                let key_str = req_key.as_str().unwrap();
+                                assert!(
+                                    obj.contains_key(key_str),
+                                    "missing required key '{key_str}' at {path}"
+                                );
+                            }
+                        }
+                        if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+                            for (prop_name, prop_val) in obj {
+                                if let Some(prop_schema) = props.get(prop_name) {
+                                    validate_json_value(
+                                        prop_val,
+                                        prop_schema,
+                                        root_schema,
+                                        &format!("{path}.{prop_name}"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    "array" => {
+                        assert!(val.is_array(), "expected array at {path}, got {val:?}");
+                        if let Some(item_schema) = schema.get("items") {
+                            for (i, elem) in val.as_array().unwrap().iter().enumerate() {
+                                validate_json_value(
+                                    elem,
+                                    item_schema,
+                                    root_schema,
+                                    &format!("{path}[{i}]"),
+                                );
+                            }
+                        }
+                    }
+                    "string" => {
+                        assert!(val.is_string(), "expected string at {path}, got {val:?}");
+                    }
+                    "integer" => {
+                        assert!(
+                            val.is_i64() || val.is_u64(),
+                            "expected integer at {path}, got {val:?}"
+                        );
+                        check_numeric_bounds(val, schema, path);
+                    }
+                    "number" => {
+                        assert!(val.is_number(), "expected number at {path}, got {val:?}");
+                        check_numeric_bounds(val, schema, path);
+                    }
+                    "boolean" => {
+                        assert!(val.is_boolean(), "expected boolean at {path}, got {val:?}");
+                    }
+                    "null" => {
+                        assert!(val.is_null(), "expected null at {path}, got {val:?}");
+                    }
+                    other => panic!("unhandled schema type '{other}' at {path}"),
+                }
+            } else if let Some(type_arr) = expected_type.as_array() {
+                let allowed_types: Vec<&str> = type_arr.iter().filter_map(|t| t.as_str()).collect();
+                let matches_any = allowed_types.iter().any(|&t| match t {
+                    "object" => val.is_object(),
+                    "array" => val.is_array(),
+                    "string" => val.is_string(),
+                    "integer" => val.is_i64() || val.is_u64(),
+                    "number" => val.is_number(),
+                    "boolean" => val.is_boolean(),
+                    "null" => val.is_null(),
+                    _ => false,
+                });
+                assert!(
+                    matches_any,
+                    "value at {path} ({val:?}) does not match any allowed type in {allowed_types:?}"
+                );
+                if val.is_number() {
+                    check_numeric_bounds(val, schema, path);
+                }
+                if val.is_object() && allowed_types.contains(&"object") {
+                    if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+                        let obj = val.as_object().unwrap();
+                        for req_key in required {
+                            let key_str = req_key.as_str().unwrap();
+                            assert!(
+                                obj.contains_key(key_str),
+                                "missing required key '{key_str}' at {path}"
+                            );
+                        }
+                    }
+                    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+                        let obj = val.as_object().unwrap();
+                        for (prop_name, prop_val) in obj {
+                            if let Some(prop_schema) = props.get(prop_name) {
+                                validate_json_value(
+                                    prop_val,
+                                    prop_schema,
+                                    root_schema,
+                                    &format!("{path}.{prop_name}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(enums) = schema.get("enum").and_then(|e| e.as_array()) {
+            let is_allowed = enums.contains(val);
+            assert!(
+                is_allowed,
+                "value at {path} ({val:?}) not in enum set {enums:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_json_conforms_to_schema_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let report = generate_report(&config, 24, 10).unwrap();
+
+        let json = format_json(&report).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(REPORT_SCHEMA_JSON).unwrap();
+
+        validate_json_value(&val, &schema, &schema, "report");
+    }
+
+    #[test]
+    #[should_panic(expected = "expected <= 100 at report.summary.hit_rate_pct, got 500")]
+    fn test_validator_rejects_out_of_bounds_number_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let report = generate_report(&config, 24, 10).unwrap();
+
+        let json = format_json(&report).unwrap();
+        let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        val["summary"]["hit_rate_pct"] = serde_json::json!(500.0);
+        let schema: serde_json::Value = serde_json::from_str(REPORT_SCHEMA_JSON).unwrap();
+
+        validate_json_value(&val, &schema, &schema, "report");
+    }
+
+    #[test]
+    #[should_panic(expected = "expected >= 0 at report.summary.time_saved_ms, got -10")]
+    fn test_validator_rejects_out_of_bounds_integer_minimum() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let report = generate_report(&config, 24, 10).unwrap();
+
+        let json = format_json(&report).unwrap();
+        let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        val["summary"]["time_saved_ms"] = serde_json::json!(-10);
+        let schema: serde_json::Value = serde_json::from_str(REPORT_SCHEMA_JSON).unwrap();
+
+        validate_json_value(&val, &schema, &schema, "report");
+    }
+
+    #[test]
+    #[should_panic(expected = "not in enum set")]
+    fn test_validator_rejects_invalid_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let report = generate_report(&config, 24, 10).unwrap();
+
+        let json = format_json(&report).unwrap();
+        let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        val["schema_version"] = serde_json::json!(2);
+        let schema: serde_json::Value = serde_json::from_str(REPORT_SCHEMA_JSON).unwrap();
+
+        validate_json_value(&val, &schema, &schema, "report");
+    }
+
+    #[test]
+    #[should_panic(expected = "missing required key 'schema_version' at report")]
+    fn test_validator_rejects_missing_required_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let report = generate_report(&config, 24, 10).unwrap();
+
+        let json = format_json(&report).unwrap();
+        let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        val.as_object_mut().unwrap().remove("schema_version");
+        let schema: serde_json::Value = serde_json::from_str(REPORT_SCHEMA_JSON).unwrap();
+
+        validate_json_value(&val, &schema, &schema, "report");
+    }
+
     #[test]
     fn test_json_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -3321,11 +3558,13 @@ mod tests {
 
         let json = format_json(&report).unwrap();
         let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(raw["schema_version"], 1);
         assert!(raw.get("traceEvents").is_some());
         assert!(raw.get("trace_events").is_none());
         assert_eq!(raw["displayTimeUnit"], "ms");
 
         let parsed: BuildReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.schema_version, REPORT_SCHEMA_VERSION);
 
         assert_eq!(parsed.summary.total_crates, report.summary.total_crates);
         assert_eq!(parsed.summary.misses, report.summary.misses);

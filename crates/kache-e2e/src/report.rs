@@ -10,11 +10,15 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
 
+/// Expected report schema version supported by this E2E reader.
+pub const SUPPORTED_REPORT_SCHEMA_VERSION: u32 = 1;
+
 /// Raw `kache report --format json` document, deserialized with the
 /// summary surface lifted out for assertions and the full body kept as
 /// `serde_json::Value` for verbatim forwarding.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KacheReport {
+    pub schema_version: u32,
     pub summary: ReportSummary,
     /// Time-ordered event list — every cache lookup the wrapper has
     /// recorded inside the report's window. Used for per-crate
@@ -175,6 +179,22 @@ pub fn fetch_since(
     fetch_since_with_root(kache_path, cache_dir, since, None)
 }
 
+/// Parse and validate report JSON bytes against the supported schema version.
+pub fn parse_report_json(bytes: &[u8]) -> Result<(KacheReport, serde_json::Value)> {
+    let raw: serde_json::Value =
+        serde_json::from_slice(bytes).context("parsing kache report JSON")?;
+    let typed: KacheReport =
+        serde_json::from_value(raw.clone()).context("extracting summary from kache report")?;
+    if typed.schema_version != SUPPORTED_REPORT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported report schema_version {} (expected {})",
+            typed.schema_version,
+            SUPPORTED_REPORT_SCHEMA_VERSION
+        );
+    }
+    Ok((typed, raw))
+}
+
 pub fn fetch_since_with_root(
     kache_path: &Path,
     cache_dir: &Path,
@@ -199,11 +219,7 @@ pub fn fetch_since_with_root(
         );
     }
 
-    let raw: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("parsing kache report JSON")?;
-    let typed: KacheReport =
-        serde_json::from_value(raw.clone()).context("extracting summary from kache report")?;
-    Ok((typed, raw))
+    parse_report_json(&output.stdout)
 }
 
 #[cfg(test)]
@@ -238,5 +254,98 @@ mod tests {
         assert_eq!(delta.misses, 0);
         assert_eq!(delta.total_crates, 4);
         assert_eq!(delta.hit_rate_pct, 75.0);
+    }
+
+    #[test]
+    fn kache_report_deserialization_accepts_supported_schema_version_and_additive_fields() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "summary": {
+                "hit_rate_pct": 50.0,
+                "total_crates": 2,
+                "local_hits": 1,
+                "prefetch_hits": 0,
+                "remote_hits": 0,
+                "dups": 0,
+                "misses": 1
+            },
+            "all_events": [
+                {
+                    "crate_name": "foo",
+                    "result": "local_hit",
+                    "compiler_runs": 0,
+                    "preprocessor_runs": 0,
+                    "probe_runs": 0,
+                    "passthrough_reason": ""
+                }
+            ],
+            "future_unrecognized_metric": 42,
+            "future_nested_object": { "new_field": "value" }
+        });
+
+        let typed: KacheReport = serde_json::from_value(json).expect("should deserialize");
+        assert_eq!(typed.schema_version, 1);
+        assert_eq!(typed.summary.total_crates, 2);
+        assert_eq!(typed.all_events.len(), 1);
+        assert_eq!(typed.all_events[0].crate_name, "foo");
+    }
+
+    #[test]
+    fn kache_report_rejects_missing_or_incompatible_schema_version() {
+        // Missing schema_version fails typed deserialization
+        let no_version = serde_json::json!({
+            "summary": {
+                "hit_rate_pct": 0.0,
+                "total_crates": 0,
+                "local_hits": 0,
+                "prefetch_hits": 0,
+                "remote_hits": 0,
+                "dups": 0,
+                "misses": 0
+            }
+        });
+        assert!(serde_json::from_value::<KacheReport>(no_version).is_err());
+    }
+
+    #[test]
+    fn parse_report_json_accepts_supported_version() {
+        let json = serde_json::json!({
+            "schema_version": SUPPORTED_REPORT_SCHEMA_VERSION,
+            "summary": {
+                "hit_rate_pct": 100.0,
+                "total_crates": 1,
+                "local_hits": 1,
+                "prefetch_hits": 0,
+                "remote_hits": 0,
+                "dups": 0,
+                "misses": 0
+            }
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let (typed, raw) = parse_report_json(&bytes).expect("valid supported report");
+        assert_eq!(typed.schema_version, SUPPORTED_REPORT_SCHEMA_VERSION);
+        assert_eq!(raw["schema_version"], SUPPORTED_REPORT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn parse_report_json_rejects_unsupported_version() {
+        let json = serde_json::json!({
+            "schema_version": SUPPORTED_REPORT_SCHEMA_VERSION + 1,
+            "summary": {
+                "hit_rate_pct": 100.0,
+                "total_crates": 1,
+                "local_hits": 1,
+                "prefetch_hits": 0,
+                "remote_hits": 0,
+                "dups": 0,
+                "misses": 0
+            }
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let err = parse_report_json(&bytes).expect_err("should reject unsupported version");
+        assert!(
+            err.to_string()
+                .contains("unsupported report schema_version")
+        );
     }
 }

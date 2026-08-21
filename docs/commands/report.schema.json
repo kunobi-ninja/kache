@@ -1,0 +1,518 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/kunobi-ninja/kache/blob/main/docs/commands/report.schema.json",
+  "title": "KacheBuildReport",
+  "description": "Schema for kache report --format json machine-readable build reports.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "meta",
+    "summary",
+    "timeline",
+    "timing",
+    "storage",
+    "prefetch",
+    "top_misses",
+    "top_hits",
+    "all_events",
+    "traceEvents",
+    "displayTimeUnit",
+    "bypass",
+    "errors_detail",
+    "suggestions"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [1],
+      "description": "Report schema version (currently 1). Incremented on breaking changes."
+    },
+    "meta": {
+      "type": "object",
+      "required": ["kache_version", "generated_at", "since_hours"],
+      "properties": {
+        "kache_version": {
+          "type": "string",
+          "description": "Version of kache that generated this report."
+        },
+        "generated_at": {
+          "type": "string",
+          "description": "UTC timestamp when this report was generated."
+        },
+        "since_hours": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lookback window duration in hours."
+        },
+        "root_filter": {
+          "type": ["string", "null"],
+          "description": "Root path filter if --root was specified."
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "hit_rate_pct",
+        "time_saved_ms",
+        "total_crates",
+        "local_hits",
+        "prefetch_hits",
+        "remote_hits",
+        "dups",
+        "misses",
+        "errors",
+        "passthroughs",
+        "probes",
+        "skipped",
+        "store_failures",
+        "fallbacks",
+        "total_duration_ms",
+        "cache_efficiency_pct"
+      ],
+      "properties": {
+        "hit_rate_pct": { "type": "number", "minimum": 0.0, "maximum": 100.0 },
+        "weighted_hit_rate_pct": { "type": ["number", "null"] },
+        "time_saved_ms": { "type": "integer", "minimum": 0 },
+        "total_crates": { "type": "integer", "minimum": 0 },
+        "local_hits": { "type": "integer", "minimum": 0 },
+        "prefetch_hits": { "type": "integer", "minimum": 0 },
+        "remote_hits": { "type": "integer", "minimum": 0 },
+        "dups": { "type": "integer", "minimum": 0 },
+        "misses": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "passthroughs": { "type": "integer", "minimum": 0 },
+        "probes": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "store_failures": { "type": "integer", "minimum": 0 },
+        "fallbacks": { "type": "integer", "minimum": 0 },
+        "total_duration_ms": { "type": "integer", "minimum": 0 },
+        "cache_efficiency_pct": { "type": "number", "minimum": 0.0, "maximum": 100.0 }
+      }
+    },
+    "timeline": {
+      "type": "object",
+      "required": [
+        "duration_ms",
+        "event_count",
+        "cacheable_count",
+        "hit_count",
+        "compiled_count",
+        "passthrough_count",
+        "probe_count",
+        "skipped_count",
+        "error_count"
+      ],
+      "properties": {
+        "start_time": { "type": ["string", "null"] },
+        "end_time": { "type": ["string", "null"] },
+        "start_unix_ms": { "type": ["integer", "null"] },
+        "end_unix_ms": { "type": ["integer", "null"] },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "event_count": { "type": "integer", "minimum": 0 },
+        "cacheable_count": { "type": "integer", "minimum": 0 },
+        "hit_count": { "type": "integer", "minimum": 0 },
+        "compiled_count": { "type": "integer", "minimum": 0 },
+        "passthrough_count": { "type": "integer", "minimum": 0 },
+        "probe_count": { "type": "integer", "minimum": 0 },
+        "skipped_count": { "type": "integer", "minimum": 0 },
+        "error_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "required": [
+        "hit_time_ms",
+        "miss_time_ms",
+        "avg_hit_ms",
+        "avg_miss_ms",
+        "avg_hit_overhead_ms",
+        "miss_compile_time_ms",
+        "avg_key_ms",
+        "avg_lookup_ms",
+        "avg_restore_ms",
+        "avg_store_ms",
+        "total_key_ms",
+        "total_lookup_ms",
+        "total_restore_ms",
+        "total_store_ms"
+      ],
+      "properties": {
+        "hit_time_ms": { "type": "integer", "minimum": 0 },
+        "miss_time_ms": { "type": "integer", "minimum": 0 },
+        "avg_hit_ms": { "type": "number", "minimum": 0.0 },
+        "avg_miss_ms": { "type": "number", "minimum": 0.0 },
+        "avg_hit_overhead_ms": { "type": "number", "minimum": 0.0 },
+        "miss_compile_time_ms": { "type": "integer", "minimum": 0 },
+        "avg_key_ms": { "type": "number", "minimum": 0.0 },
+        "avg_lookup_ms": { "type": "number", "minimum": 0.0 },
+        "avg_restore_ms": { "type": "number", "minimum": 0.0 },
+        "avg_store_ms": { "type": "number", "minimum": 0.0 },
+        "total_key_ms": { "type": "integer", "minimum": 0 },
+        "total_lookup_ms": { "type": "integer", "minimum": 0 },
+        "total_restore_ms": { "type": "integer", "minimum": 0 },
+        "total_store_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "required": [
+        "reflinked_bytes",
+        "hardlinked_bytes",
+        "copied_bytes",
+        "restored_bytes",
+        "zero_copy_pct",
+        "store_reflinked_bytes",
+        "store_hardlinked_bytes",
+        "store_copied_bytes",
+        "store_blobs",
+        "logical_bytes",
+        "blob_bytes",
+        "dedup_saved_bytes"
+      ],
+      "properties": {
+        "reflinked_bytes": { "type": "integer", "minimum": 0 },
+        "hardlinked_bytes": { "type": "integer", "minimum": 0 },
+        "copied_bytes": { "type": "integer", "minimum": 0 },
+        "restored_bytes": { "type": "integer", "minimum": 0 },
+        "zero_copy_pct": { "type": "number", "minimum": 0.0, "maximum": 100.0 },
+        "store_reflinked_bytes": { "type": "integer", "minimum": 0 },
+        "store_hardlinked_bytes": { "type": "integer", "minimum": 0 },
+        "store_copied_bytes": { "type": "integer", "minimum": 0 },
+        "store_blobs": { "type": "integer", "minimum": 0 },
+        "logical_bytes": { "type": "integer", "minimum": 0 },
+        "blob_bytes": { "type": "integer", "minimum": 0 },
+        "dedup_saved_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "network": {
+      "type": ["object", "null"],
+      "properties": {
+        "bytes_up": { "type": "integer", "minimum": 0 },
+        "bytes_down": { "type": "integer", "minimum": 0 },
+        "uploads_ok": { "type": "integer", "minimum": 0 },
+        "uploads_failed": { "type": "integer", "minimum": 0 },
+        "downloads_ok": { "type": "integer", "minimum": 0 },
+        "downloads_failed": { "type": "integer", "minimum": 0 },
+        "avg_download_ms": { "type": "number", "minimum": 0.0 },
+        "p95_download_ms": { "type": "integer", "minimum": 0 },
+        "max_download_ms": { "type": "integer", "minimum": 0 },
+        "throughput_mbps": { "type": "number", "minimum": 0.0 },
+        "configured_backend": { "type": "string" },
+        "network_throughput_mbps": { "type": "number", "minimum": 0.0 },
+        "body_throughput_mbps": { "type": "number", "minimum": 0.0 },
+        "dominant_download_phase": { "type": "string" },
+        "dominant_download_phase_ms": { "type": "integer", "minimum": 0 },
+        "dominant_download_phase_pct": { "type": "number", "minimum": 0.0, "maximum": 100.0 },
+        "total_request_ms": { "type": "integer", "minimum": 0 },
+        "total_body_ms": { "type": "integer", "minimum": 0 },
+        "total_semaphore_wait_ms": { "type": "integer", "minimum": 0 },
+        "total_head_ms": { "type": "integer", "minimum": 0 },
+        "total_get_requests": { "type": "integer", "minimum": 0 },
+        "compression_ratio": { "type": "number", "minimum": 0.0 },
+        "original_bytes_down": { "type": "integer", "minimum": 0 },
+        "total_decompress_ms": { "type": "integer", "minimum": 0 },
+        "total_extract_ms": { "type": "integer", "minimum": 0 },
+        "total_disk_io_ms": { "type": "integer", "minimum": 0 },
+        "total_import_ms": { "type": "integer", "minimum": 0 },
+        "total_compression_ms": { "type": "integer", "minimum": 0 },
+        "total_head_checks_ms": { "type": "integer", "minimum": 0 },
+        "blobs_skipped": { "type": "integer", "minimum": 0 },
+        "blobs_total": { "type": "integer", "minimum": 0 },
+        "v1_downloads": { "type": "integer", "minimum": 0 },
+        "v2_downloads": { "type": "integer", "minimum": 0 },
+        "v3_downloads": { "type": "integer", "minimum": 0 },
+        "unknown_format_downloads": { "type": "integer", "minimum": 0 },
+        "slowest_downloads": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/TransferDetail" }
+        }
+      }
+    },
+    "prefetch": {
+      "type": "object",
+      "required": ["prefetch_hits", "total_hits", "contribution_pct"],
+      "properties": {
+        "prefetch_hits": { "type": "integer", "minimum": 0 },
+        "total_hits": { "type": "integer", "minimum": 0 },
+        "contribution_pct": { "type": "number", "minimum": 0.0, "maximum": 100.0 }
+      }
+    },
+    "top_misses": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/CrateDetail" }
+    },
+    "top_hits": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/CrateDetail" }
+    },
+    "all_events": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/CrateDetail" }
+    },
+    "traceEvents": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/TraceEvent" }
+    },
+    "displayTimeUnit": {
+      "type": "string",
+      "enum": ["ms", "ns"]
+    },
+    "bypass": {
+      "type": "object",
+      "required": [
+        "passthroughs",
+        "probes",
+        "skipped",
+        "fallbacks",
+        "direct_passthroughs",
+        "reasons",
+        "slowest"
+      ],
+      "properties": {
+        "passthroughs": { "type": "integer", "minimum": 0 },
+        "probes": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "fallbacks": { "type": "integer", "minimum": 0 },
+        "direct_passthroughs": { "type": "integer", "minimum": 0 },
+        "reasons": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/BypassReason" }
+        },
+        "slowest": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/BypassDetail" }
+        }
+      }
+    },
+    "errors_detail": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/ErrorDetail" }
+    },
+    "suggestions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "gc": {
+      "type": ["object", "null"],
+      "properties": {
+        "last_run": { "type": "string" },
+        "entries_evicted": { "type": "integer", "minimum": 0 },
+        "bytes_freed": { "type": "integer", "minimum": 0 },
+        "blobs_removed": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["last_run", "entries_evicted", "bytes_freed", "blobs_removed"]
+    }
+  },
+  "definitions": {
+    "CrateDetail": {
+      "type": "object",
+      "required": [
+        "crate_name",
+        "result",
+        "start_time",
+        "end_time",
+        "start_unix_ms",
+        "end_unix_ms",
+        "elapsed_ms",
+        "compile_time_ms",
+        "overhead_ms",
+        "size",
+        "cache_key",
+        "store_output_blobs",
+        "store_duplicate_blobs",
+        "store_new_blobs",
+        "compiler_runs",
+        "preprocessor_runs",
+        "probe_runs"
+      ],
+      "properties": {
+        "crate_name": { "type": "string" },
+        "root": { "type": "string" },
+        "result": {
+          "type": "string",
+          "enum": [
+            "local_hit",
+            "prefetch_hit",
+            "remote_hit",
+            "dup",
+            "miss",
+            "error",
+            "passthrough",
+            "skipped"
+          ],
+          "description": "Stable machine result code."
+        },
+        "start_time": { "type": "string" },
+        "end_time": { "type": "string" },
+        "start_unix_ms": { "type": "integer" },
+        "end_unix_ms": { "type": "integer" },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "compile_time_ms": { "type": "integer", "minimum": 0 },
+        "overhead_ms": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 0 },
+        "cache_key": { "type": "string" },
+        "store_output_blobs": { "type": "integer", "minimum": 0 },
+        "store_duplicate_blobs": { "type": "integer", "minimum": 0 },
+        "store_new_blobs": { "type": "integer", "minimum": 0 },
+        "compiler_runs": { "type": "integer", "minimum": 0 },
+        "preprocessor_runs": { "type": "integer", "minimum": 0 },
+        "probe_runs": { "type": "integer", "minimum": 0 },
+        "store_error": { "type": "string" }
+      }
+    },
+    "BypassReason": {
+      "type": "object",
+      "required": ["result", "route", "reason", "count", "failures", "max_elapsed_ms"],
+      "properties": {
+        "result": {
+          "type": "string",
+          "enum": [
+            "local_hit",
+            "prefetch_hit",
+            "remote_hit",
+            "dup",
+            "miss",
+            "error",
+            "passthrough",
+            "skipped"
+          ]
+        },
+        "route": {
+          "type": "string",
+          "enum": ["direct", "fallback", "skipped", "n/a"]
+        },
+        "reason": { "type": "string" },
+        "count": { "type": "integer", "minimum": 0 },
+        "failures": { "type": "integer", "minimum": 0 },
+        "max_elapsed_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "BypassDetail": {
+      "type": "object",
+      "required": [
+        "crate_name",
+        "result",
+        "route",
+        "reason",
+        "start_time",
+        "end_time",
+        "start_unix_ms",
+        "end_unix_ms",
+        "elapsed_ms",
+        "timestamp"
+      ],
+      "properties": {
+        "crate_name": { "type": "string" },
+        "root": { "type": "string" },
+        "result": {
+          "type": "string",
+          "enum": [
+            "local_hit",
+            "prefetch_hit",
+            "remote_hit",
+            "dup",
+            "miss",
+            "error",
+            "passthrough",
+            "skipped"
+          ]
+        },
+        "route": {
+          "type": "string",
+          "enum": ["direct", "fallback", "skipped", "n/a"]
+        },
+        "reason": { "type": "string" },
+        "start_time": { "type": "string" },
+        "end_time": { "type": "string" },
+        "start_unix_ms": { "type": "integer" },
+        "end_unix_ms": { "type": "integer" },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "exit_code": { "type": ["integer", "null"] },
+        "timestamp": { "type": "string" }
+      }
+    },
+    "TraceEvent": {
+      "type": "object",
+      "required": ["name", "cat", "ph", "ts", "dur", "pid", "tid", "args"],
+      "properties": {
+        "name": { "type": "string" },
+        "cat": { "type": "string" },
+        "ph": { "type": "string" },
+        "ts": { "type": "integer" },
+        "dur": { "type": "integer", "minimum": 0 },
+        "pid": { "type": "integer", "minimum": 0 },
+        "tid": { "type": "integer", "minimum": 0 },
+        "cname": { "type": "string" },
+        "args": { "$ref": "#/definitions/TraceArgs" }
+      }
+    },
+    "TraceArgs": {
+      "type": "object",
+      "required": [
+        "crate_name",
+        "root",
+        "result",
+        "route",
+        "reason",
+        "cache_key",
+        "elapsed_ms",
+        "compile_time_ms",
+        "overhead_ms",
+        "size",
+        "compiler_runs",
+        "preprocessor_runs",
+        "probe_runs",
+        "store_output_blobs",
+        "store_duplicate_blobs",
+        "store_new_blobs"
+      ],
+      "properties": {
+        "crate_name": { "type": "string" },
+        "root": { "type": "string" },
+        "result": { "type": "string" },
+        "route": { "type": "string" },
+        "reason": { "type": "string" },
+        "cache_key": { "type": "string" },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "compile_time_ms": { "type": "integer", "minimum": 0 },
+        "overhead_ms": { "type": "integer", "minimum": 0 },
+        "size": { "type": "integer", "minimum": 0 },
+        "compiler_runs": { "type": "integer", "minimum": 0 },
+        "preprocessor_runs": { "type": "integer", "minimum": 0 },
+        "probe_runs": { "type": "integer", "minimum": 0 },
+        "store_output_blobs": { "type": "integer", "minimum": 0 },
+        "store_duplicate_blobs": { "type": "integer", "minimum": 0 },
+        "store_new_blobs": { "type": "integer", "minimum": 0 },
+        "exit_code": { "type": ["integer", "null"] }
+      }
+    },
+    "ErrorDetail": {
+      "type": "object",
+      "required": ["crate_name", "cache_key", "timestamp"],
+      "properties": {
+        "crate_name": { "type": "string" },
+        "cache_key": { "type": "string" },
+        "timestamp": { "type": "string" }
+      }
+    },
+    "TransferDetail": {
+      "type": "object",
+      "required": ["crate_name", "direction", "compressed_bytes", "elapsed_ms"],
+      "properties": {
+        "crate_name": { "type": "string" },
+        "direction": { "type": "string" },
+        "format": { "type": "string" },
+        "cache_key": { "type": "string" },
+        "object_key": { "type": "string" },
+        "compressed_bytes": { "type": "integer", "minimum": 0 },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "network_ms": { "type": "integer", "minimum": 0 },
+        "semaphore_wait_ms": { "type": "integer", "minimum": 0 },
+        "head_ms": { "type": "integer", "minimum": 0 },
+        "request_ms": { "type": "integer", "minimum": 0 },
+        "body_ms": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

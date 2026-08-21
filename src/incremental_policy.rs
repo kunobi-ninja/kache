@@ -1042,9 +1042,25 @@ mod tests {
         fs::set_permissions(&unit.state_path, fs::Permissions::from_mode(0o000)).unwrap();
 
         assert!(matches!(unit.load_state(), LoadedState::Unavailable));
+        // Every load_state caller must decline without resetting, not just
+        // the active path: a deleted Unavailable arm in any of them falls
+        // through to the Corrupt arm and destroys the state file.
         assert!(
             unit.try_active_at(103).is_none(),
-            "decline while the state cannot be read"
+            "active: decline while the state cannot be read"
+        );
+        assert!(
+            unit.try_seed_at(
+                &cache_key("third"),
+                &fields("stable", "source-c", "extern-a"),
+                103,
+            )
+            .is_none(),
+            "seed: decline while the state cannot be read"
+        );
+        assert!(
+            unit.try_immediate_at(103).is_none(),
+            "immediate: decline while the state cannot be read"
         );
         assert!(
             path_exists(&unit.state_path),

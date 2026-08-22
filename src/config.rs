@@ -2460,7 +2460,7 @@ pub(crate) fn parse_size_checked(value: &str, source: &str) -> Option<u64> {
 pub(crate) use tests::config_path_lock;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};

@@ -7262,6 +7262,8 @@ pub fn start_daemon_background() -> Result<bool> {
         // (#662), is never. Any tool that captures kache's output hangs:
         // build scripts, CI wrappers, IDE integrations, and the test harness
         // where this was found.
+        warn_if_remote_is_env_only(&config);
+
         let mut child = spawn_detached_daemon(&exe, stderr_target)?;
 
         let ready = wait_for_socket(&socket_path, Some(&mut child))?;
@@ -7334,8 +7336,95 @@ fn run_lock_file_is_held(file: &std::fs::File) -> bool {
     }
 }
 
+/// Environment variables that decide the daemon's REMOTE, stripped from an
+/// auto-spawned daemon's environment (kunobi-ninja/kache#706).
+///
+/// A background daemon outlives the build that happened to start it and serves
+/// every later build on the machine, so inheriting these makes its remote a
+/// lottery decided by whoever won the startup race. In the reported case a
+/// monorepo kept `KACHE_S3_*` in per-checkout `.cargo/config.toml`, present in
+/// some worktrees and absent in others: 2,330 `no remote configured` failures
+/// in six hours, then the remote silently began working after an unrelated
+/// restart. With the default `daemon_idle_timeout_secs = 0` one unlucky first
+/// start pins the machine to remote-off indefinitely.
+///
+/// The deeper reason env cannot be authoritative here: the daemon watches its
+/// config FILE and restarts when it changes, and there is no equivalent for a
+/// parent process's environment. A setting the daemon cannot watch cannot stay
+/// correct for the daemon's lifetime.
+///
+/// Only the auto-spawn path is affected. An operator running `kache daemon
+/// run` directly, or a service manager supplying `Environment=`, does not pass
+/// through here and keeps env precedence — that placement is deliberate, not a
+/// race.
+const AMBIENT_REMOTE_ENV_VARS: &[&str] = &[
+    "KACHE_S3_BUCKET",
+    "KACHE_S3_ENDPOINT",
+    "KACHE_S3_REGION",
+    "KACHE_S3_PREFIX",
+    "KACHE_S3_PROFILE",
+    "KACHE_LOCAL_ONLY",
+    "KACHE_REMOTE_READONLY",
+];
+
+/// Warn when this build's environment is the ONLY place a remote is
+/// configured, because the daemon we are about to start will not use it
+/// (kunobi-ninja/kache#706).
+///
+/// Silence is the failure mode being fixed: before this, such a setup either
+/// worked or did not depending on which build won the startup race, with
+/// nothing said either way. Deterministically not applying it is only an
+/// improvement if the user is told, so this prints the remedy once, at the
+/// moment the decision is made.
+///
+/// Says nothing when the config file already declares a remote (the common
+/// case, where env is redundant or an intentional per-build override of a
+/// remote the daemon has anyway), so the warning stays rare enough to read.
+fn warn_if_remote_is_env_only(config: &Config) {
+    let set: Vec<&str> = AMBIENT_REMOTE_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect();
+    if set.is_empty() {
+        return;
+    }
+    let (file_config, _) = Config::load_raw_file_config();
+    if file_config
+        .cache
+        .as_ref()
+        .is_some_and(|cache| cache.remote.is_some())
+    {
+        return;
+    }
+    let message = format!(
+        "kache: a remote is configured only in this build's environment ({vars}), and the \n         \
+         background daemon does not inherit it — the daemon will run local-only.\n         \
+         A daemon outlives the build that starts it and cannot watch an environment for \n         \
+         changes, so an inherited remote would silently depend on which build happened to \n         \
+         start it (kunobi-ninja/kache#706).\n         \
+         Fix: move the remote into `[cache.remote]` in {path}, or start the daemon \n         \
+         yourself with `kache daemon run` from this environment.",
+        vars = set.join(", "),
+        path = crate::config::resolve_config_path().display(),
+    );
+    let marker = crate::wrapper::warn_marker_path("daemon-remote-env", &config.cache_dir);
+    crate::wrapper::warn_once_per_session(&marker, crate::wrapper::WARN_SESSION_SECS, &message);
+}
+
 /// Spawn `kache daemon run` detached, without leaking this process's
-/// inheritable handles to it (kunobi-ninja/kache#704).
+/// inheritable handles to it (kunobi-ninja/kache#704), and without leaking the
+/// remote configuration of whichever build happened to start it
+/// (kunobi-ninja/kache#706).
+/// Remove the ambient remote settings from a daemon spawn, so the daemon
+/// resolves its remote from its watched config file rather than from whichever
+/// build started it. Split out so the stripping is testable without spawning.
+fn strip_ambient_remote_env(command: &mut std::process::Command) {
+    for name in AMBIENT_REMOTE_ENV_VARS {
+        command.env_remove(name);
+    }
+}
+
 fn spawn_detached_daemon(
     exe: &Path,
     stderr_target: std::process::Stdio,
@@ -7346,6 +7435,8 @@ fn spawn_detached_daemon(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr_target);
+
+    strip_ambient_remote_env(&mut command);
 
     // On Windows, clear the inherit flag on our own std handles across the
     // spawn and restore it after. The daemon's stdio is passed explicitly
@@ -7496,6 +7587,64 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::mpsc;
+
+    /// kunobi-ninja/kache#706: an auto-spawned daemon must not inherit the
+    /// remote of whichever build started it, or its remote becomes a lottery
+    /// decided by the startup race — the reported case logged 2,330
+    /// `no remote configured` failures in six hours, then silently started
+    /// working after an unrelated restart.
+    #[test]
+    fn auto_spawned_daemon_does_not_inherit_ambient_remote_env() {
+        let mut command = std::process::Command::new("kache");
+        strip_ambient_remote_env(&mut command);
+
+        let removed: Vec<&str> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .filter_map(|(name, _)| name.to_str())
+            .collect();
+        for name in AMBIENT_REMOTE_ENV_VARS {
+            assert!(
+                removed.contains(name),
+                "{name} must be cleared from the daemon spawn"
+            );
+        }
+
+        // Nothing else is touched: this fix is about the remote being ambient,
+        // not about sanitising the daemon's environment in general. Stripping
+        // more (PATH, RUSTUP_*, credentials providers) would change unrelated
+        // behaviour and break credential discovery for a file-configured S3
+        // remote, which still needs the ambient AWS_* / HOME to authenticate.
+        assert_eq!(
+            removed.len(),
+            AMBIENT_REMOTE_ENV_VARS.len(),
+            "unexpected extra removals: {removed:?}"
+        );
+        assert!(
+            command.get_envs().all(|(_, value)| value.is_none()),
+            "the spawn should only remove variables, never set them"
+        );
+    }
+
+    /// The stripped list must stay exactly the set of variables that decide a
+    /// remote. A new `KACHE_S3_*` knob added without updating the list would
+    /// silently reintroduce the lottery for that setting.
+    #[test]
+    fn ambient_remote_env_list_covers_every_remote_deciding_var() {
+        let documented = [
+            "KACHE_S3_BUCKET",
+            "KACHE_S3_ENDPOINT",
+            "KACHE_S3_REGION",
+            "KACHE_S3_PREFIX",
+            "KACHE_S3_PROFILE",
+            "KACHE_LOCAL_ONLY",
+            "KACHE_REMOTE_READONLY",
+        ];
+        assert_eq!(
+            AMBIENT_REMOTE_ENV_VARS, &documented,
+            "remote-deciding env vars changed: update the strip list too (#706)"
+        );
+    }
 
     #[test]
     fn remote_check_demand_budget_keeps_legacy_cap_and_only_allows_tightening() {

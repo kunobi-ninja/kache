@@ -106,6 +106,31 @@ rooted in `KACHE_S3_BUCKET` still select S3; the other `KACHE_S3_*` overrides
 remain available. `type = "s3"` is the recommended explicit form for new
 config files. The AWS SDK-specific migration boundaries below still apply.
 
+<Callout type="warning">
+  **A background daemon does not inherit these.** All remote I/O happens
+  daemon-side, and a daemon started automatically by a build outlives that
+  build and serves every later one on the machine. If it inherited the
+  starting build's environment, its remote would depend on which build won the
+  startup race — the failure this prevents logged 2,330 `no remote configured`
+  errors in six hours on a monorepo whose `KACHE_S3_*` lived in per-checkout
+  `.cargo/config.toml`, then silently began working after an unrelated restart.
+
+  So an auto-started daemon resolves its remote from its watched config file
+  only, and kache prints a warning when a remote is configured *only* in the
+  environment. Env overrides still apply to the wrapper and CLI as documented
+  above, and to a daemon you start yourself:
+
+  - **Persistent setup:** put the remote in `[cache.remote]` in the config
+    file. The daemon watches that file and restarts when it changes.
+  - **Env-driven setup (CI, service managers):** start the daemon explicitly
+    from the intended environment with `kache daemon run`, or put the values in
+    the service definition. That placement is deliberate rather than a race, so
+    it is honoured.
+
+  `kache stats` and `kache doctor` report the remote the daemon actually
+  resolved, and warn when it differs from yours.
+</Callout>
+
 ## OpenDAL migration boundaries
 
 The config-file and `KACHE_S3_*` interfaces are retained. Static shared

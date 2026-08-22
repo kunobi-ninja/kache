@@ -33,6 +33,16 @@ RUSTC_WRAPPER = "$KACHE"
 # from a remote tier and never exercise the claim path at all. Local-only
 # pins the cold misses to real compiles (min_misses below backs it).
 KACHE_LOCAL_ONLY = "1"
+# Every count below is "4 units × 2 processes", which requires `app` — a
+# bin, and the only user-facing executable here — to be cacheable. That is
+# the DEFAULT on Linux and macOS but not on Windows, where
+# `default_cache_executables()` is false, so `app` would passthrough there:
+# both processes would compile it every phase, making compiler_runs and the
+# unit arithmetic platform-dependent and failing warm/relocate's
+# `max_compiler_runs = 0`. Pinning it keeps one set of assertions valid
+# everywhere; the same pin is how bench-firefox-windows exercises this path.
+# Coalescing itself is what the fixture gates, and it is executable-agnostic.
+KACHE_CACHE_EXECUTABLES = "1"
 
 [commands]
 # Generates the heavy members (idempotent, mtime-stable for noop), then

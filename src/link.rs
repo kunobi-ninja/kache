@@ -275,32 +275,9 @@ fn hardlink_or_copy_with_prelink_hook(
                 })?;
                 return copy_hardlink_fallback(store_path, target_path, bytes);
             }
-            Err(source_error) => match fs::metadata(target_path) {
-                // The blob was unlinked after hardlink creation, leaving this
-                // target as the inode's sole name. It is already private and
-                // safe to stamp, so retain the successful restore.
-                Ok(meta) if meta.nlink() == 1 => {
-                    tracing::debug!(
-                        %source_error,
-                        "blob disappeared after hardlink; retained private target {}",
-                        target_path.display()
-                    );
-                }
-                Ok(meta) => {
-                    return Err(source_error).with_context(|| {
-                        format!(
-                            "verifying exclusive hardlink {} (target still has {} links)",
-                            target_path.display(),
-                            meta.nlink()
-                        )
-                    });
-                }
-                Err(target_error) => {
-                    return Err(target_error).with_context(|| {
-                        format!("verifying hardlink target {}", target_path.display())
-                    });
-                }
-            },
+            Err(source_error) => {
+                verify_orphaned_hardlink(target_path, fs::metadata(target_path), source_error)?
+            }
         }
     }
 
@@ -317,6 +294,45 @@ fn copy_hardlink_fallback(store_path: &Path, target_path: &Path, bytes: u64) -> 
     copy_file(store_path, target_path, false)?;
     crate::opcounts::record_copied(bytes);
     Ok(())
+}
+
+/// Validate a completed hardlink whose store blob could not be re-stat'ed.
+///
+/// Between creating the link and verifying it, the blob name may vanish (a
+/// concurrent eviction or another restorer's cleanup). Only when this target
+/// became the inode's sole remaining name is the restore provably private and
+/// safe to keep; otherwise exclusivity cannot be shown and the failure
+/// surfaces. Extracted from its caller so tests can inject both observations
+/// instead of racing the validation window (#794).
+#[cfg(unix)]
+fn verify_orphaned_hardlink(
+    target_path: &Path,
+    target_meta: std::io::Result<fs::Metadata>,
+    source_error: std::io::Error,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    match target_meta {
+        // The blob was unlinked after hardlink creation, leaving this
+        // target as the inode's sole name. It is already private and
+        // safe to stamp, so retain the successful restore.
+        Ok(meta) if meta.nlink() == 1 => {
+            tracing::debug!(
+                %source_error,
+                "blob disappeared after hardlink; retained private target {}",
+                target_path.display()
+            );
+            Ok(())
+        }
+        Ok(meta) => Err(source_error).with_context(|| {
+            format!(
+                "verifying exclusive hardlink {} (target still has {} links)",
+                target_path.display(),
+                meta.nlink()
+            )
+        }),
+        Err(target_error) => Err(target_error)
+            .with_context(|| format!("verifying hardlink target {}", target_path.display())),
+    }
 }
 
 /// Why a Windows cache hit was restored by COPY instead of a block-clone.
@@ -2048,6 +2064,56 @@ mod tests {
         );
         assert_eq!(fs::read(&tree_a).unwrap(), b"cached rlib");
         assert_eq!(fs::read(&tree_b).unwrap(), b"cached rlib");
+    }
+
+    /// The blob-vanished recovery arm must keep the restore when the target
+    /// ended up as the inode's sole name; failing there would turn a benign
+    /// eviction race into a lost cache hit (#794).
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_hardlink_with_sole_target_name_is_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tree-a.rlib");
+        fs::write(&target, b"cached rlib").unwrap();
+        let vanished = fs::metadata(dir.path().join("no-such-blob")).unwrap_err();
+
+        verify_orphaned_hardlink(&target, fs::metadata(&target), vanished).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"cached rlib");
+    }
+
+    /// If the blob vanished but this target still shares its inode with
+    /// another name, exclusivity cannot be proven and the restore fails
+    /// loudly rather than letting a shared mtime stamp reach the caller
+    /// (#794).
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_hardlink_with_shared_target_errors() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tree-a.rlib");
+        fs::write(&target, b"cached rlib").unwrap();
+        fs::hard_link(&target, dir.path().join("alias.rlib")).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().nlink(), 2);
+        let vanished = fs::metadata(dir.path().join("no-such-blob")).unwrap_err();
+
+        let error = verify_orphaned_hardlink(&target, fs::metadata(&target), vanished)
+            .expect_err("shared orphaned target must fail");
+        assert!(error.to_string().contains("still has 2 links"));
+    }
+
+    /// A vanished blob plus an unreadable target leaves nothing to validate;
+    /// surface the target-side error instead of retaining blindly.
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_hardlink_with_unreadable_target_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("missing.rlib");
+        let vanished = fs::metadata(dir.path().join("no-such-blob")).unwrap_err();
+
+        let error = verify_orphaned_hardlink(&target, fs::metadata(&target), vanished)
+            .expect_err("unreadable target must fail");
+        assert!(error.to_string().contains("verifying hardlink target"));
     }
 
     #[cfg(windows)]

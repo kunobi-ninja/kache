@@ -90,6 +90,9 @@ for AWS SDK-specific cases that need attention.
 | `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | For eligible Cargo-primary rustc invocations, listed crate names bypass artifact caching and use the adaptive policy's isolated incremental directory and exclusive lease without waiting for its learning heuristic. Unsafe layouts, declared hidden inputs, exclusions, or lease contention retain the normal safe cache/passthrough path with Cargo's original incremental argument stripped. User-facing executables first follow `cache_executables`; an intentional managed passthrough is available only when no fallback owns the compile. Entries match the actual rustc `--crate-name` with `-`/`_` treated as equal; a Cargo package name is not authoritative because its targets may have different names. The env value is comma/whitespace-separated and replaces the file list |
 | `KACHE_VERIFY_RESTORES` | — | `off` | Re-hash restored blobs before serving hits: `off`, `sampled` (~1/16 hits), or `always`. `1`/`true` map to `always` |
 | — | `cache.exclude` | `[]` | Source-path glob patterns that bypass kache and compile normally without lookup, store, or upload |
+| — | `cache.bypass_crates` | `[]` | Exact crate names that bypass kache and compile normally |
+| — | `cache.bypass_argv` | `[]` | Argument substrings that bypass kache and compile normally |
+| — | `cache.bypass_env` | `[]` | `NAME=VALUE` (exact value) or `NAME` (presence) env rules that bypass kache and compile normally |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent remote operations; the legacy S3 name applies to both remote types |
 | `KACHE_PREFETCH_ENABLED` | `cache.prefetch_enabled` | `true` | Enable speculative manifest/advisory/fallback prefetch. Set to `0`/`false` on long-lived warm runners to skip manifest warming, build-start planning, and the whole-remote key index. Exact-key remote checks and background uploads remain enabled. A running daemon cannot see environment changes; prefer the watched config file for persistent or service-managed daemons |
@@ -157,6 +160,34 @@ exclude = [
 Patterns are globs matched against the compiler's primary source path. Relative patterns are matched relative to the current build directory and, when kache can infer it, the Cargo workspace root. Excluded invocations bypass local lookup, remote lookup, store, and upload.
 
 Exclude patterns support `~`, `$VAR`, and `${VAR}` expansion. `$CARGO_HOME` falls back to Cargo's default `~/.cargo` when the environment variable is not set, so registry-source exclusions work on default Cargo installs.
+
+### Bypass rules
+
+`cache.exclude` keys on the source path. When the reason a compile must not be
+cached is the *invocation* rather than the file, three sibling lists match on
+the crate name, the argv, and the environment:
+
+```toml title=".kache.toml"
+[cache]
+# Exact crate names.
+bypass_crates = ["my-mutants-runner"]
+# Substring of any single argument.
+bypass_argv = ["--cfg=live_db"]
+# `NAME=VALUE` for an exact value, or bare `NAME` for presence alone.
+bypass_env = ["SQLX_OFFLINE=false"]
+```
+
+The motivating case is an online `sqlx` build: it validates queries against
+live database state that no environment value captures, so two compiles with
+identical sources and environment can legitimately produce different results.
+Adding the variable to `key_env_vars` only *separates* those compiles into
+distinct keys, and still caches them. Declining to cache is the sound answer.
+
+Rules are evaluated before any cache-key work, so a match costs nothing, and
+they are fail-closed by construction: a rule can only mean "do not cache",
+never "force cache", so a misconfigured rule costs hit rate and can never
+produce a wrong artifact. A bypassed compile is reported as a passthrough
+naming the rule that fired, visible in `kache report`.
 
 ## Pinning config against env
 

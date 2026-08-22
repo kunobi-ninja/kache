@@ -1,0 +1,52 @@
+# kache-e2e fixture: verifies `[cache].bypass_env` declines caching for an
+# invocation the user declared un-cacheable (kunobi-ninja/kache#222).
+#
+# The motivating case is an online sqlx build: it validates queries against
+# live database state that no env value captures, so two compiles with
+# identical sources and env can legitimately differ. Folding the var into
+# `key_env_vars` only SEPARATES those compiles into distinct keys; it still
+# caches them, which is the false-hit shape. Only declining to cache is sound.
+#
+# KACHE_CACHE_EXECUTABLES makes this binary cacheable in the first place, so
+# `max_entries_after = 0` is a real assertion about the rule rather than about
+# executables being skipped anyway (the trap e2e-rust-parallel-coalesce hit).
+
+name = "e2e-bypass-rules"
+tags = ["suite:e2e", "lang:rust", "mode:exclude"]
+
+# Exempt from `--negative-control` for the same reason as e2e-exclude-rust:
+# the contract is a negative ("kache caches nothing here"), which holds
+# whether kache is bypassing, enabled, or disabled, so there is no caching
+# assertion that would flip to fail under KACHE_DISABLED=1.
+negative_control_exempt = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+KACHE_CACHE_EXECUTABLES = "1"
+# Matches the rule in .kache.toml. The VALUE is load-bearing: the rule is
+# `SQLX_OFFLINE=false`, so an offline build (`true`) would cache normally.
+SQLX_OFFLINE = "false"
+
+[commands]
+build = "cargo build --release"
+clean = "rm -rf target"
+
+[verify]
+run = "./target/release/bypass-rules"
+expected_stdout_contains = ["bypass rules ok"]
+
+# Nothing may enter the cache in any phase: the rule fires before key
+# computation, so every compile is a passthrough.
+[assertions.cold]
+max_entries_after = 0
+
+[assertions.warm]
+max_entries_after = 0
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"

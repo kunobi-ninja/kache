@@ -633,6 +633,14 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         };
     }
 
+    // User bypass rules (#222): declared per project, evaluated before any key
+    // work, same fail-closed contract as `exclude` below — a match only ever
+    // means "do not cache".
+    if let Some(reason) = Config::user_bypass_reason(&crate_name, &parsed.rest) {
+        tracing::debug!("cc invocation bypassed by user rule: {reason}");
+        return cc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason);
+    }
+
     let current_dir = std::env::current_dir().ok();
     let exclude_roots: Vec<_> = current_dir.iter().cloned().collect();
     if let Some(source) = parsed.sources.first()
@@ -1560,11 +1568,15 @@ fn run_parsed_rustc(
         .source_file
         .as_ref()
         .filter(|source| Config::source_excluded(source, &exclude_roots));
+    // User bypass rules (#222). Same fail-closed contract as `exclude`, and
+    // gating the incremental fast path on it too: a bypassed unit must not
+    // slip back into caching through the managed-incremental route.
+    let user_bypass = Config::user_bypass_reason(crate_name, &args.all_args);
     let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
 
     if incremental_fast_path_allowed(
         !refuse.is_empty(),
-        excluded_source.is_some(),
+        excluded_source.is_some() || user_bypass.is_some(),
         skip_user_facing,
     ) {
         if force_incremental {
@@ -1657,6 +1669,12 @@ fn run_parsed_rustc(
             start,
             format!("source excluded: {}", source.display()),
         );
+    }
+
+    if let Some(reason) = user_bypass {
+        tracing::debug!("rustc invocation bypassed by user rule: {reason}");
+        reset_adaptive_unit(adaptive_unit.as_ref());
+        return passthrough_with_event(config, args, crate_name, &event_root, start, reason);
     }
 
     // Skip-cache only for *user-facing* executables (`bin` / `--test`).

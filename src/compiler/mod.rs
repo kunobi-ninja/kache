@@ -1916,6 +1916,10 @@ pub(crate) mod shim {
     /// recognize. Versioned and target-prefixed spellings are still handled
     /// when a user creates them by hand, because detection reuses
     /// `CcCompiler::recognizes`.
+    // Only the generator consumes this, and generation is Unix-only (it
+    // creates symlinks). Detection below stays cross-platform, so a hand-made
+    // `gcc.exe` copy of kache still works on Windows.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) const SHIM_NAMES: &[&str] = &["cc", "c++", "gcc", "g++", "clang", "clang++"];
 
     /// Whether `argv[0]` names a compiler, meaning kache is being invoked

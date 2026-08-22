@@ -680,8 +680,7 @@ fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
                 }
                 let command: &[u8; 80] = command.try_into().ok()?;
                 let mut fields = [0_u32; 18];
-                let (chunks, _) = command[8..].as_chunks::<4>();
-                for (field, raw) in fields.iter_mut().zip(chunks) {
+                for (field, raw) in fields.iter_mut().zip(command[8..].as_chunks::<4>().0) {
                     *field = endian.u32(raw, 0)?;
                 }
                 dysymtab = Some(fields);

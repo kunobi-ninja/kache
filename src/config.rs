@@ -3924,6 +3924,47 @@ remote_key_cache_refresh_secs = 900
         );
     }
 
+    /// Drives the real entry point, which reads the rule lists out of the
+    /// active config file. The matcher tests above inject their lists, so they
+    /// leave the loading half unproven: a `user_bypass_reason` that always
+    /// returned `None` would silently stop enforcing every configured rule and
+    /// still pass them.
+    #[test]
+    fn user_bypass_reason_reads_rules_from_the_config_file() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[cache]\n\
+             bypass_crates = [\"mutants-runner\"]\n\
+             bypass_argv = [\"-Zunpretty\"]\n\
+             bypass_env = [\"SQLX_OFFLINE=false\"]\n",
+        )
+        .unwrap();
+        let _config = set_kache_config_for_test(&config_path);
+        let _offline = NamedEnvGuard::remove("SQLX_OFFLINE");
+
+        let plain = vec!["rustc".to_string(), "src/lib.rs".to_string()];
+        assert_eq!(Config::user_bypass_reason("app", &plain), None);
+        assert_eq!(
+            Config::user_bypass_reason("mutants-runner", &plain).as_deref(),
+            Some("bypass rule: crate mutants-runner")
+        );
+
+        let unpretty = vec!["rustc".to_string(), "-Zunpretty=expanded".to_string()];
+        assert_eq!(
+            Config::user_bypass_reason("app", &unpretty).as_deref(),
+            Some("bypass rule: argv contains -Zunpretty")
+        );
+
+        let _online = NamedEnvGuard::set("SQLX_OFFLINE", "false");
+        assert_eq!(
+            Config::user_bypass_reason("app", &plain).as_deref(),
+            Some("bypass rule: env SQLX_OFFLINE=false")
+        );
+    }
+
     /// A blank entry must never become a match-everything rule. An empty argv
     /// rule substring-matches every argument, so one stray blank line in a
     /// config would otherwise disable the entire cache silently.

@@ -29,6 +29,7 @@ came from the second pass.
 | Rust + C FFI (`cc` crate via build.rs) | `e2e-rust-c-ffi` |
 | Cached `--test` executable permission contract (#298) | `e2e-rust-test-exec` |
 | Exclude rules (`.kache.toml [cache].exclude`) | `e2e-exclude-rust`, `e2e-exclude-c` |
+| Bypass rules (`[cache].bypass_env` / `_argv` / `_crates`, #222) | `e2e-bypass-rules` |
 | Fallback wrapper (`KACHE_FALLBACK`, #109) | `e2e-rust-fallback`, `e2e-rust-sccache` |
 | C / C++ object + depfile caching, header invalidation | `e2e-c-hello`, `e2e-cpp-hello`, `e2e-c-depinfo` |
 | Flag modeling (gcc / clang / clang-cl) | `e2e-cc-bench-flags`, `e2e-cc-bench-flags-gnu`, `e2e-cc-cl-debug`, `e2e-cc-cl-xclang-deps` |

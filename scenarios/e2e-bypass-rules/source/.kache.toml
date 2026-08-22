@@ -1,0 +1,4 @@
+[cache]
+# The env rule is the one this fixture drives: the harness exports
+# SQLX_OFFLINE=false, so every compile below must pass through uncached.
+bypass_env = ["SQLX_OFFLINE=false"]

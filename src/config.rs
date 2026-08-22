@@ -581,6 +581,13 @@ pub(crate) struct CacheFileConfig {
     pub(crate) preserve_incremental: Option<bool>,
     pub(crate) adaptive_incremental: Option<bool>,
     pub(crate) exclude: Option<Vec<String>>,
+    /// Declarative bypass rules (kunobi-ninja/kache#222). Siblings of
+    /// `exclude`, which already covers the source-path case; each entry means
+    /// "do not cache a matching invocation", never "force cache", so a
+    /// misconfigured rule can only cost hit rate.
+    pub(crate) bypass_env: Option<Vec<String>>,
+    pub(crate) bypass_argv: Option<Vec<String>>,
+    pub(crate) bypass_crates: Option<Vec<String>>,
     pub(crate) event_log_max_size: Option<String>,
     pub(crate) event_log_keep_lines: Option<usize>,
     pub(crate) compression_level: Option<i32>,
@@ -1954,15 +1961,86 @@ impl Config {
     }
 
     fn load_exclude_patterns() -> Vec<String> {
+        Self::load_rule_list(|c| c.exclude)
+    }
+
+    /// Shared loader for the project-local rule lists: read the active config
+    /// file, take one list, trim, and drop empties so a stray blank entry can
+    /// never become a match-everything rule.
+    fn load_rule_list(pick: impl FnOnce(CacheFileConfig) -> Option<Vec<String>>) -> Vec<String> {
         Self::load_file_config()
             .ok()
             .and_then(|c| c.cache)
-            .and_then(|c| c.exclude)
+            .and_then(pick)
             .unwrap_or_default()
             .into_iter()
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty())
             .collect()
+    }
+
+    /// First matching user bypass rule for this invocation, or `None`.
+    ///
+    /// Fail-closed by construction (kunobi-ninja/kache#222): a rule can only
+    /// decline caching, so a misconfiguration costs hit rate and can never
+    /// produce a wrong artifact. Evaluated before key computation, next to the
+    /// existing `exclude` check, and the returned string becomes the
+    /// passthrough reason so `kache report` names the rule that fired.
+    ///
+    /// `crate_name` is matched exactly; `argv` entries match as substrings of
+    /// any single argument; `env` entries are `NAME=VALUE` for an exact value
+    /// or a bare `NAME` for presence alone.
+    pub fn user_bypass_reason(crate_name: &str, argv: &[String]) -> Option<String> {
+        Self::user_bypass_reason_with(
+            crate_name,
+            argv,
+            &Self::load_rule_list(|c| c.bypass_crates),
+            &Self::load_rule_list(|c| c.bypass_argv),
+            &Self::load_rule_list(|c| c.bypass_env),
+            |name| std::env::var(name).ok(),
+        )
+    }
+
+    /// Pure core of [`Self::user_bypass_reason`], with the rule lists and env
+    /// lookup injected so the matching semantics are testable without touching
+    /// process-global env or the config file.
+    fn user_bypass_reason_with(
+        crate_name: &str,
+        argv: &[String],
+        crates: &[String],
+        argv_rules: &[String],
+        env_rules: &[String],
+        lookup_env: impl Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        // Empty rules are ignored at every layer. The loader already trims and
+        // drops them, but an empty argv rule substring-matches EVERY argument,
+        // so one blank line in a config would silently disable the whole
+        // cache. Belt and braces: refuse them here too.
+        if let Some(rule) = crates
+            .iter()
+            .find(|rule| !rule.is_empty() && *rule == crate_name)
+        {
+            return Some(format!("bypass rule: crate {rule}"));
+        }
+        if let Some(rule) = argv_rules
+            .iter()
+            .filter(|rule| !rule.is_empty())
+            .find(|rule| argv.iter().any(|arg| arg.contains(rule.as_str())))
+        {
+            return Some(format!("bypass rule: argv contains {rule}"));
+        }
+        for rule in env_rules.iter().filter(|rule| !rule.is_empty()) {
+            // `NAME=VALUE` demands that exact value; bare `NAME` matches on
+            // presence, whatever the value.
+            let fired = match rule.split_once('=') {
+                Some((name, want)) => lookup_env(name).is_some_and(|got| got == want),
+                None => lookup_env(rule).is_some(),
+            };
+            if fired {
+                return Some(format!("bypass rule: env {rule}"));
+            }
+        }
+        None
     }
 }
 
@@ -3005,6 +3083,9 @@ remote_key_cache_refresh_secs = 900
             paths: None,
             workspace: None,
             cache: Some(CacheFileConfig {
+                bypass_env: None,
+                bypass_argv: None,
+                bypass_crates: None,
                 local_only: None,
                 remote_readonly: None,
                 modified_input_guard: None,
@@ -3743,6 +3824,166 @@ remote_key_cache_refresh_secs = 900
         }
     }
 
+    /// #222: each rule kind fires, names itself in the reason, and an
+    /// invocation matching nothing stays cacheable.
+    #[test]
+    fn user_bypass_rules_match_crate_argv_and_env() {
+        let argv: Vec<String> = ["rustc", "--crate-name", "app", "-Zunpretty=expanded"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let none = |_: &str| None;
+
+        let by_crate = Config::user_bypass_reason_with(
+            "mutants-runner",
+            &argv,
+            &["mutants-runner".to_string()],
+            &[],
+            &[],
+            none,
+        );
+        assert_eq!(
+            by_crate.as_deref(),
+            Some("bypass rule: crate mutants-runner")
+        );
+
+        // argv rules match a substring of any single argument, so the rule
+        // does not have to spell the whole `-Zunpretty=expanded`.
+        let by_argv = Config::user_bypass_reason_with(
+            "app",
+            &argv,
+            &[],
+            &["-Zunpretty".to_string()],
+            &[],
+            none,
+        );
+        assert_eq!(
+            by_argv.as_deref(),
+            Some("bypass rule: argv contains -Zunpretty")
+        );
+
+        // `NAME=VALUE` demands that exact value; the motivating sqlx case.
+        let sqlx = |name: &str| (name == "SQLX_OFFLINE").then(|| "false".to_string());
+        let by_env = Config::user_bypass_reason_with(
+            "app",
+            &argv,
+            &[],
+            &[],
+            &["SQLX_OFFLINE=false".to_string()],
+            sqlx,
+        );
+        assert_eq!(
+            by_env.as_deref(),
+            Some("bypass rule: env SQLX_OFFLINE=false")
+        );
+        // A different value must NOT fire: this is what makes the rule usable
+        // for "online builds only", rather than disabling caching outright.
+        let offline = |name: &str| (name == "SQLX_OFFLINE").then(|| "true".to_string());
+        assert_eq!(
+            Config::user_bypass_reason_with(
+                "app",
+                &argv,
+                &[],
+                &[],
+                &["SQLX_OFFLINE=false".to_string()],
+                offline,
+            ),
+            None
+        );
+        // A bare NAME matches on presence alone, whatever the value.
+        assert_eq!(
+            Config::user_bypass_reason_with(
+                "app",
+                &argv,
+                &[],
+                &[],
+                &["SQLX_OFFLINE".to_string()],
+                offline,
+            )
+            .as_deref(),
+            Some("bypass rule: env SQLX_OFFLINE")
+        );
+
+        // Crate rules are exact, not substring: a prefix must not bypass an
+        // unrelated crate that merely starts the same way.
+        assert_eq!(
+            Config::user_bypass_reason_with(
+                "mutants-runner-support",
+                &argv,
+                &["mutants-runner".to_string()],
+                &[],
+                &[],
+                none,
+            ),
+            None
+        );
+        // Nothing configured: unchanged, cacheable.
+        assert_eq!(
+            Config::user_bypass_reason_with("app", &argv, &[], &[], &[], none),
+            None
+        );
+    }
+
+    /// Drives the real entry point, which reads the rule lists out of the
+    /// active config file. The matcher tests above inject their lists, so they
+    /// leave the loading half unproven: a `user_bypass_reason` that always
+    /// returned `None` would silently stop enforcing every configured rule and
+    /// still pass them.
+    #[test]
+    fn user_bypass_reason_reads_rules_from_the_config_file() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[cache]\n\
+             bypass_crates = [\"mutants-runner\"]\n\
+             bypass_argv = [\"-Zunpretty\"]\n\
+             bypass_env = [\"SQLX_OFFLINE=false\"]\n",
+        )
+        .unwrap();
+        let _config = set_kache_config_for_test(&config_path);
+        let _offline = NamedEnvGuard::remove("SQLX_OFFLINE");
+
+        let plain = vec!["rustc".to_string(), "src/lib.rs".to_string()];
+        assert_eq!(Config::user_bypass_reason("app", &plain), None);
+        assert_eq!(
+            Config::user_bypass_reason("mutants-runner", &plain).as_deref(),
+            Some("bypass rule: crate mutants-runner")
+        );
+
+        let unpretty = vec!["rustc".to_string(), "-Zunpretty=expanded".to_string()];
+        assert_eq!(
+            Config::user_bypass_reason("app", &unpretty).as_deref(),
+            Some("bypass rule: argv contains -Zunpretty")
+        );
+
+        let _online = NamedEnvGuard::set("SQLX_OFFLINE", "false");
+        assert_eq!(
+            Config::user_bypass_reason("app", &plain).as_deref(),
+            Some("bypass rule: env SQLX_OFFLINE=false")
+        );
+    }
+
+    /// A blank entry must never become a match-everything rule. An empty argv
+    /// rule substring-matches every argument, so one stray blank line in a
+    /// config would otherwise disable the entire cache silently.
+    #[test]
+    fn blank_bypass_entries_never_match() {
+        let argv = vec!["rustc".to_string(), "--crate-name".to_string()];
+        assert_eq!(
+            Config::user_bypass_reason_with(
+                "app",
+                &argv,
+                &["".to_string()],
+                &["".to_string()],
+                &["".to_string()],
+                |_| Some(String::new()),
+            ),
+            None
+        );
+    }
+
     #[test]
     fn test_source_excluded_matches_relative_pattern_against_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -3995,6 +4236,9 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             paths: None,
             workspace: None,
             cache: Some(CacheFileConfig {
+                bypass_env: None,
+                bypass_argv: None,
+                bypass_crates: None,
                 local_only: None,
                 remote_readonly: None,
                 modified_input_guard: None,

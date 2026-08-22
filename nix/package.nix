@@ -2,7 +2,6 @@
   lib,
   rustPlatform,
   fetchurl,
-  apple-sdk_15,
   cacert,
   stdenv,
 }:
@@ -56,10 +55,6 @@ buildRustPackage {
   cargoTestFlags = [
     "-p"
     "kache"
-  ];
-
-  buildInputs = lib.optionals stdenv.hostPlatform.isDarwin [
-    apple-sdk_15
   ];
 
   # The tmutil xattr test shells out to /usr/bin/tmutil which isn't in the sandbox.

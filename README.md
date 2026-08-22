@@ -5,9 +5,9 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
 
-Zero-copy, content-addressed build cache for Rust and C/C++ object compiles. No copies, no wasted disk — reflinks where the filesystem supports them, hardlinks or copies otherwise, plus S3 or shared-filesystem remotes for Rust artifact sharing.
+Content-addressed build cache for Rust and C/C++ object compiles. Local hits use zero-copy restores where safe — reflinks where supported and, on Unix, one exclusive hardlink consumer — plus S3 or shared-filesystem remotes for Rust artifact sharing.
 
-A drop-in `RUSTC_WRAPPER` for Rust and a `cc` / `c++` compiler wrapper for C/C++ object compiles. Cache keys are blake3 hashes of normalized compiler inputs; cache hits restore zero-copy — a reflink (copy-on-write clone) where the filesystem supports it (APFS, btrfs, XFS-with-reflink), and a hardlink or copy otherwise — and identical blobs are stored once and shared. Optional S3 (AWS, Ceph, MinIO, R2) or shared-filesystem sync shares Rust artifacts across machines.
+A drop-in `RUSTC_WRAPPER` for Rust and a `cc` / `c++` compiler wrapper for C/C++ object compiles. Cache keys are blake3 hashes of normalized compiler inputs; cache hits prefer a reflink (copy-on-write clone) where the filesystem supports it (APFS, btrfs, XFS-with-reflink). On Unix without CoW, one immutable target may hardlink to a blob while additional consumers receive private copies. Windows restores copy by default; unrestricted hardlink sharing is an explicit legacy opt-in. Identical blobs are stored once in the cache. Optional S3 (AWS, Ceph, MinIO, R2) or shared-filesystem sync shares Rust artifacts across machines.
 
 Local Rust caching, local C/C++ object caching, and direct S3/shared-filesystem sync are working today. C/C++ artifacts are local-only for now; unsupported compiler shapes pass through to the real compiler.
 
@@ -21,8 +21,8 @@ Local Rust caching, local C/C++ object caching, and direct S3/shared-filesystem 
 
 kache is useful even before remote cache is configured:
 
-- Local hits are restored zero-copy into `target/` — a reflink (copy-on-write clone) where the filesystem supports it, a hardlink or copy otherwise — so artifact bytes are not duplicated.
-- The store is content-addressed by blake3 hash, so identical artifact blobs are stored once and linked many times.
+- Local hits prefer zero-copy restores into `target/`: reflink where supported; on Unix without CoW, one safe hardlink carrier for immutable artifacts and private copies for additional consumers. Windows copies by default.
+- The store is content-addressed by blake3 hash, so identical artifact blobs are stored once in the cache.
 - Misses compile normally, then kache records the outputs for future builds.
 - The daemon is optional for local caching. If it is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
 - Kache normally prefers exact artifact hits, but automatically learns rapidly changing Cargo units and gives them isolated, bounded rustc incremental reuse. This speeds source-churn workloads such as mutation testing without tool-specific setup.
@@ -296,9 +296,9 @@ Configuration is available through `kache config`, environment variables, or con
 
 ## Architecture
 
-- **Wrapper**: `RUSTC_WRAPPER` intercepts rustc calls, computes blake3 cache keys, restores hits zero-copy (reflink where supported, else hardlink or copy)
+- **Wrapper**: `RUSTC_WRAPPER` intercepts rustc calls, computes blake3 cache keys, and restores hits with a reflink where supported, an exclusive Unix hardlink, or a private copy
 - **Daemon**: Background process handles async remote uploads, checks, and prefetch. Auto-restarts when binary is updated
-- **Store**: content-addressed blobs under `{cache_dir}/store/blobs/<prefix>/<hash>`, indexed by a SQLite DB; cache hits reflink or hardlink those blobs into `target/`
+- **Store**: content-addressed blobs under `{cache_dir}/store/blobs/<prefix>/<hash>`, indexed by a SQLite DB; cache hits reflink, exclusively hardlink on Unix, or copy those blobs into `target/`
 - **Cache keys**: Deterministic blake3 hash of rustc version, crate name, source, dependencies, and normalized flags — portable across machines
 
 ## Remote service

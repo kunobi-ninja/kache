@@ -63,7 +63,7 @@ The store lives under your platform cache dir — `~/Library/Caches/kache` on ma
 
 **Content-addressed blobs (`store/blobs/`)** hold the actual compiled files, sharded into 256 subdirectories by the first two hex chars of the hash. Each blob is named after its blake3 hash, so two crates that happen to produce an identical artifact share the same physical file. When kache restores a cache hit it reflinks the blob into the build's output dir on copy-on-write filesystems (APFS, btrfs, XFS-with-reflink): zero-copy, but with an independent inode so a later write never mutates the cache blob.
 
-On filesystems without reflink, kache falls back to a hardlink for immutable artifacts (`.rlib` / `.rmeta`) or a plain copy for files that may be mutated post-build (executables, dylibs, proc-macros).
+On Unix filesystems without reflink, kache permits one target to hardlink each immutable artifact (`.rlib` / `.rmeta`) to its blob. Additional target consumers use private copies so their restore-time mtime stamp cannot affect an active linker in another tree. Files that may be mutated post-build (executables, dylibs, proc-macros) always use the private-copy fallback. Windows defaults to private copies for all non-CoW restores; its legacy hardlink mode is an explicit, concurrency-unsafe opt-in.
 
 ## The daemon
 

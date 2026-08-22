@@ -1,6 +1,6 @@
-/// A plain rlib member: its restored artifact is the hardlink carrier the
-/// cross-tree contract needs (proc-macro dylibs and bins may restore via
-/// copy, which would leave no shared inodes to perturb).
+/// A plain rlib member: tree A's artifact is the hardlink carrier used by
+/// the active-reader contract. Later consumers must restore privately before
+/// applying their mtime stamp (#794).
 pub fn offset() -> u32 {
     0
 }

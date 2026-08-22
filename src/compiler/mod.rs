@@ -2088,6 +2088,101 @@ mod shim_tests {
         assert_eq!(found, Some(PathBuf::from("/usr/bin/cc")));
     }
 
+    /// Guard that restores PATH even if the test panics; process env is
+    /// global and a leaked PATH would corrupt every later test.
+    #[cfg(unix)]
+    struct PathForTest(Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl Drop for PathForTest {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => unsafe { std::env::set_var("PATH", previous) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+        }
+    }
+
+    /// Drives the LIVE wiring against a real PATH, not the injected core.
+    ///
+    /// The tests above inject their own PATH list and resolver, so they leave
+    /// the half that reads the process's actual PATH and `current_exe`
+    /// unproven: a `wrapper_args` that always returned `None` would silently
+    /// stop treating anything as a shim — the whole feature off — and still
+    /// pass them.
+    #[cfg(unix)]
+    #[test]
+    fn live_resolution_finds_the_real_compiler_behind_a_real_shim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = crate::config::tests::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        // A real `cc` that is a genuine executable...
+        let real_cc = real_dir.join("cc");
+        std::fs::write(&real_cc, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&real_cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // ...shadowed on PATH by a `cc` symlink to this binary, exactly as
+        // `kache install-shims` creates.
+        let exe = std::env::current_exe().unwrap();
+        std::os::unix::fs::symlink(&exe, shim_dir.join("cc")).unwrap();
+
+        let _path = PathForTest(std::env::var_os("PATH"));
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", shim_dir.display(), real_dir.display()),
+            )
+        };
+
+        let found = resolve_real_compiler_from_env("cc").expect("the real cc must be found");
+        assert_eq!(
+            std::fs::canonicalize(&found).unwrap(),
+            std::fs::canonicalize(&real_cc).unwrap(),
+            "must skip the shim and select the real compiler"
+        );
+
+        let rewritten = wrapper_args(&["cc".to_string(), "foo.c".to_string()])
+            .expect("a compiler-shaped argv0 is a shim invocation")
+            .expect("resolution succeeds");
+        assert_eq!(
+            std::fs::canonicalize(&rewritten[0]).unwrap(),
+            std::fs::canonicalize(&real_cc).unwrap(),
+            "the rewritten argv must run the real compiler"
+        );
+        assert_eq!(
+            &rewritten[1..],
+            &["foo.c".to_string()],
+            "the original arguments must be preserved verbatim"
+        );
+    }
+
+    /// With only the shim on PATH there is nothing to run, so this must report
+    /// the condition rather than resolve back to itself and recurse.
+    #[cfg(unix)]
+    #[test]
+    fn live_resolution_reports_when_only_the_shim_is_on_path() {
+        let _lock = crate::config::tests::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        std::os::unix::fs::symlink(&exe, shim_dir.join("cc")).unwrap();
+
+        let _path = PathForTest(std::env::var_os("PATH"));
+        unsafe { std::env::set_var("PATH", format!("{}", shim_dir.display())) };
+
+        assert_eq!(resolve_real_compiler_from_env("cc"), None);
+        let err = wrapper_args(&["cc".to_string(), "foo.c".to_string()])
+            .expect("still a shim invocation")
+            .expect_err("but with no compiler to run");
+        assert!(err.contains("no real `cc`"), "unexpected message: {err}");
+    }
+
     #[test]
     fn non_shim_argv_is_left_alone() {
         // Normal `kache <compiler> …` and plain CLI use must not be rewritten.

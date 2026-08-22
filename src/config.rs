@@ -275,8 +275,10 @@ pub struct Config {
     /// always block-clones regardless of this flag — independent AND deduped.
     /// Turn this on ONLY if you accept the risk: your build must never delete or
     /// modify a restored object in place (an in-place strip/objcopy or a later
-    /// overwrite would corrupt the shared store blob). Trades correctness for
-    /// working-tree dedup on NTFS. No effect off Windows. Set via
+    /// overwrite would corrupt the shared store blob), and concurrent builds
+    /// sharing the store may re-date an artifact another process is reading
+    /// (#794). Trades correctness for working-tree dedup on NTFS. No effect off
+    /// Windows. Set via
     /// `KACHE_WINDOWS_HARDLINK=1`/`=true` or `[cache] windows_hardlink`.
     pub windows_hardlink: bool,
     /// Opportunistic size-pressure GC (kunobi-ninja/kache#497): when on (the

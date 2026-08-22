@@ -2799,15 +2799,14 @@ fn materialize_cached_artifact(
             // outputs (permanently dirty again — tried and falsified
             // against cargo's fingerprint log).
             //
-            // Known limitation: with the hardlink strategy this stamp lands
-            // on the shared store inode, so restoring a blob re-dates it in
-            // every other tree holding a hardlink. Once competing restores
-            // quiesce, an affected tree converges after a rebuild or two of
-            // all-hit re-dispatches (verified by alternating two trees to a
-            // stable zero). Eviction does not read these mtimes for ranking
-            // (access tracking lives in SQLite `last_accessed`); the only
-            // side effect is that a blob that later becomes an orphan ages
-            // from its last restore, delaying its sweep by that much.
+            // On a non-CoW Unix filesystem the hardlink fallback retains at
+            // most one named target consumer per blob. Later consumers are
+            // copied before this stamp, so it cannot re-date a still-linked
+            // artifact another process is reading (#794). The first consumer
+            // still shares with the store blob; changing the blob mtime does
+            // not affect SQLite `last_accessed` eviction ranking, though it can
+            // conservatively delay the later orphan-blob age sweep. The Windows
+            // hardlink opt-in deliberately retains its documented legacy risk.
             link::touch_mtime_write_clock(target_path)
                 .with_context(|| format!("{context}: touching {}", target_path.display()))?;
         }

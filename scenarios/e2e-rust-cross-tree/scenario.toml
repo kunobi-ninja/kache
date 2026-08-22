@@ -1,17 +1,14 @@
-# kache-e2e fixture: cross-tree convergence contract (#680).
+# kache-e2e fixture: cross-tree active-reader isolation (#794).
 #
-# Two target dirs share one cache. With the hardlink restore strategy the
-# write-clock stamp (#679) lands on the store blob's shared inode, so one
-# tree's restore re-dates artifacts in the other tree. The accepted
-# semantics (#680) are: bounded transient, then steady-state zero. The
-# contract itself lives in cross-tree.sh, which every phase runs as the
-# build command; the script exits non-zero if tree A fails to reconverge
-# within three rebuilds of tree B's warmup or if steady-state alternation
-# dispatches anything.
+# Two target dirs share one cache. The first target may be the blob's single
+# hardlink carrier on a non-CoW filesystem; later restores must be private
+# before their write-clock stamp. The contract in cross-tree.sh holds tree
+# A's rlib open across tree B's restore and requires stable metadata,
+# distinct consumer inodes, and immediate zero-dispatch convergence.
 #
 # The hardlink case engages where reflink is unavailable (ext4: e2e-docker
-# and Linux CI). On APFS restores reflink to fresh inodes and the contract
-# holds trivially — the fixture still runs there as a lifecycle smoke.
+# and Linux CI). APFS restores reflink to fresh inodes, so the fixture still
+# runs there as a lifecycle smoke without the Linux active-FD assertion.
 
 name = "e2e-rust-cross-tree"
 tags = ["suite:e2e", "lang:rust", "case:concurrency"]
@@ -33,6 +30,8 @@ expected_stdout_contains = ["cross-tree: 42"]
 
 [assertions.cold]
 min_entries_after = 1
+# Tree B is a cache-backed warmup even during the harness's cold phase.
+min_hits = 1
 
 [assertions.warm]
 min_hits = 1

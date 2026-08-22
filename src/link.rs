@@ -63,12 +63,11 @@ fn storage_layout_advice_enabled() -> bool {
 /// `Hardlink` and `Copy` first try reflink (CoW: zero-copy *with* an
 /// independent inode), then use the strategy-specific fallback:
 ///
-/// - `Hardlink`: fall back to a hardlink (zero-copy via shared inode). For
-///   immutable artifacts like `.rlib` / `.rmeta` where the build won't mutate
-///   the restored file. On a non-CoW filesystem, mutations would propagate
-///   into the cache blob — so callers using this strategy must guarantee
-///   the artifact stays untouched (or use `rewrite_depinfo`'s nlink-aware
-///   path).
+/// - `Hardlink`: on Unix, fall back to a hardlink (zero-copy via shared inode)
+///   only while the blob has no existing consumer. Later restores use private
+///   copies so their required mtime stamp cannot mutate a still-linked artifact
+///   another process is reading (#794). This is for immutable artifacts like
+///   `.rlib` / `.rmeta` where the build won't modify the content in place.
 /// - `Copy`: fall back to a plain byte copy (independent file). For
 ///   executables, dylibs, and proc-macros that may be mutated post-build
 ///   (codesigning, stripping, etc.).
@@ -187,13 +186,61 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
 }
 
 /// Hardlink fallback for the `Hardlink` strategy when reflink is unavailable.
-/// Falls back to a plain copy on hardlink failure (cross-filesystem).
+/// On Unix, keep at most one target output linked to the store blob; later
+/// consumers get a private copy so their restore-time mtime stamp cannot
+/// affect a still-linked active reader in another target tree (#794). Falls
+/// back to a plain copy on hardlink failure (including cross-filesystem
+/// restores).
 ///
-/// On Windows this runs only under the `[cache] windows_hardlink` opt-in — the
-/// default restores via copy, because a hardlink to a read-only store blob is
-/// itself read-only (shared MFT attribute) and breaks consumers that delete or
-/// rewrite their output (#429).
+/// On Windows this runs only under the legacy `[cache] windows_hardlink`
+/// opt-in. That explicit tradeoff retains unrestricted hardlink sharing; it is
+/// unsafe for concurrent builds sharing a store as well as for consumers that
+/// delete or rewrite restored outputs (#429, #794). The default copies.
 fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result<()> {
+    hardlink_or_copy_with_prelink_hook(store_path, target_path, bytes, || {})
+}
+
+fn hardlink_or_copy_with_prelink_hook(
+    store_path: &Path,
+    target_path: &Path,
+    bytes: u64,
+    prelink_hook: impl FnOnce(),
+) -> Result<()> {
+    // A restore is stamped after this function returns. On Unix that stamp is
+    // inode metadata, so it is safe to hardlink only when the blob has no
+    // existing target consumer. Metadata failure is handled conservatively:
+    // a copy preserves isolation and lets the ordinary read report any real
+    // source failure.
+    #[cfg(unix)]
+    match fs::metadata(store_path) {
+        Ok(meta) => {
+            use std::os::unix::fs::MetadataExt;
+            if meta.nlink() != 1 {
+                tracing::debug!(
+                    links = meta.nlink(),
+                    "blob already has a hardlink consumer, restoring by copy: {} -> {}",
+                    store_path.display(),
+                    target_path.display()
+                );
+                return copy_hardlink_fallback(store_path, target_path, bytes);
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "could not verify exclusive blob, restoring by copy: {} -> {}",
+                store_path.display(),
+                target_path.display()
+            );
+            return copy_hardlink_fallback(store_path, target_path, bytes);
+        }
+    }
+
+    // Test-only callers use this seam to hold simultaneous restorers after
+    // both prechecks, proving the post-link validation rather than merely the
+    // sequential fast path. Production passes a no-op closure.
+    prelink_hook();
+
     if let Err(e) = fs::hard_link(store_path, target_path) {
         tracing::debug!(
             "hardlink failed ({}), falling back to copy: {} -> {}",
@@ -201,10 +248,39 @@ fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result
             store_path.display(),
             target_path.display()
         );
-        copy_file(store_path, target_path, false)?;
-        crate::opcounts::record_copied(bytes);
-        return Ok(());
+        return copy_hardlink_fallback(store_path, target_path, bytes);
     }
+
+    // Two restorers may both observe nlink == 1 before either creates its
+    // link. Only a contender that observes exactly blob + itself may retain
+    // the link. Others unlink before returning, so no contender can reach its
+    // mtime stamp while sharing an inode with an existing consumer.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match fs::metadata(store_path) {
+            Ok(meta) if meta.nlink() == 2 => {}
+            Ok(meta) => {
+                tracing::debug!(
+                    links = meta.nlink(),
+                    "hardlink was not exclusive, restoring by copy: {} -> {}",
+                    store_path.display(),
+                    target_path.display()
+                );
+                fs::remove_file(target_path).with_context(|| {
+                    format!(
+                        "removing non-exclusive hardlink at {}",
+                        target_path.display()
+                    )
+                })?;
+                return copy_hardlink_fallback(store_path, target_path, bytes);
+            }
+            Err(source_error) => {
+                verify_orphaned_hardlink(target_path, fs::metadata(target_path), source_error)?
+            }
+        }
+    }
+
     tracing::debug!(
         "hardlinked {} -> {}",
         store_path.display(),
@@ -212,6 +288,51 @@ fn hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result
     );
     crate::opcounts::record_hardlinked(bytes);
     Ok(())
+}
+
+fn copy_hardlink_fallback(store_path: &Path, target_path: &Path, bytes: u64) -> Result<()> {
+    copy_file(store_path, target_path, false)?;
+    crate::opcounts::record_copied(bytes);
+    Ok(())
+}
+
+/// Validate a completed hardlink whose store blob could not be re-stat'ed.
+///
+/// Between creating the link and verifying it, the blob name may vanish (a
+/// concurrent eviction or another restorer's cleanup). Only when this target
+/// became the inode's sole remaining name is the restore provably private and
+/// safe to keep; otherwise exclusivity cannot be shown and the failure
+/// surfaces. Extracted from its caller so tests can inject both observations
+/// instead of racing the validation window (#794).
+#[cfg(unix)]
+fn verify_orphaned_hardlink(
+    target_path: &Path,
+    target_meta: std::io::Result<fs::Metadata>,
+    source_error: std::io::Error,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    match target_meta {
+        // The blob was unlinked after hardlink creation, leaving this
+        // target as the inode's sole name. It is already private and
+        // safe to stamp, so retain the successful restore.
+        Ok(meta) if meta.nlink() == 1 => {
+            tracing::debug!(
+                %source_error,
+                "blob disappeared after hardlink; retained private target {}",
+                target_path.display()
+            );
+            Ok(())
+        }
+        Ok(meta) => Err(source_error).with_context(|| {
+            format!(
+                "verifying exclusive hardlink {} (target still has {} links)",
+                target_path.display(),
+                meta.nlink()
+            )
+        }),
+        Err(target_error) => Err(target_error)
+            .with_context(|| format!("verifying hardlink target {}", target_path.display())),
+    }
 }
 
 /// Why a Windows cache hit was restored by COPY instead of a block-clone.
@@ -1847,6 +1968,152 @@ mod tests {
         // independent inode) on APFS/btrfs/XFS-with-reflink, or hardlink
         // (shared inode) as fallback. We don't assert which mechanism was
         // used — either satisfies the contract.
+    }
+
+    /// kunobi-ninja/kache#794: restoring the same blob into another target
+    /// tree must not re-date an artifact that a linker already has open.
+    /// Exercise the fallback directly so APFS reflinks cannot make the test
+    /// pass without covering the hardlink path used by Linux/ext4.
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_restore_does_not_retimestamp_existing_consumer() {
+        use std::fs::File;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        let tree_a = dir.path().join("tree-a.rlib");
+        let tree_b = dir.path().join("tree-b.rlib");
+        fs::write(&blob, b"cached rlib").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+
+        hardlink_or_copy(&blob, &tree_a, bytes).unwrap();
+        let observed = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&tree_a, observed).unwrap();
+
+        let reader = File::open(&tree_a).unwrap();
+        let before = filetime::FileTime::from_last_modification_time(&reader.metadata().unwrap());
+        assert_eq!(
+            reader.metadata().unwrap().nlink(),
+            2,
+            "fixture must engage the hardlink fallback"
+        );
+
+        hardlink_or_copy(&blob, &tree_b, bytes).unwrap();
+        touch_mtime_write_clock(&tree_b).unwrap();
+
+        let after = filetime::FileTime::from_last_modification_time(&reader.metadata().unwrap());
+        assert_eq!(after, before, "restoring tree B re-dated active reader A");
+        assert_ne!(
+            reader.metadata().unwrap().ino(),
+            fs::metadata(&tree_b).unwrap().ino(),
+            "simultaneous consumers must not share an inode"
+        );
+    }
+
+    /// The post-link half of the #794 guard closes the precheck race: even
+    /// when two restorers both observe a fresh blob, at most one may retain a
+    /// shared inode before either caller reaches its mtime stamp.
+    #[cfg(unix)]
+    #[test]
+    fn simultaneous_hardlink_restores_retain_at_most_one_consumer() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        let tree_a = dir.path().join("tree-a.rlib");
+        let tree_b = dir.path().join("tree-b.rlib");
+        fs::write(&blob, b"cached rlib").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let barrier = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let barrier_a = Arc::clone(&barrier);
+            let blob_a = &blob;
+            let target_a = &tree_a;
+            let first = scope.spawn(move || {
+                hardlink_or_copy_with_prelink_hook(blob_a, target_a, bytes, || {
+                    barrier_a.wait();
+                })
+            });
+            let barrier_b = Arc::clone(&barrier);
+            let blob_b = &blob;
+            let target_b = &tree_b;
+            let second = scope.spawn(move || {
+                hardlink_or_copy_with_prelink_hook(blob_b, target_b, bytes, || {
+                    barrier_b.wait();
+                })
+            });
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+
+        let blob_meta = fs::metadata(&blob).unwrap();
+        let shared_consumers = [&tree_a, &tree_b]
+            .into_iter()
+            .filter(|target| fs::metadata(target).unwrap().ino() == blob_meta.ino())
+            .count();
+        assert!(
+            shared_consumers <= 1,
+            "concurrent restorers retained {shared_consumers} blob consumers"
+        );
+        assert!(
+            blob_meta.nlink() <= 2,
+            "blob plus at most one target may remain hardlinked"
+        );
+        assert_eq!(fs::read(&tree_a).unwrap(), b"cached rlib");
+        assert_eq!(fs::read(&tree_b).unwrap(), b"cached rlib");
+    }
+
+    /// The blob-vanished recovery arm must keep the restore when the target
+    /// ended up as the inode's sole name; failing there would turn a benign
+    /// eviction race into a lost cache hit (#794).
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_hardlink_with_sole_target_name_is_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tree-a.rlib");
+        fs::write(&target, b"cached rlib").unwrap();
+        let vanished = fs::metadata(dir.path().join("no-such-blob")).unwrap_err();
+
+        verify_orphaned_hardlink(&target, fs::metadata(&target), vanished).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"cached rlib");
+    }
+
+    /// If the blob vanished but this target still shares its inode with
+    /// another name, exclusivity cannot be proven and the restore fails
+    /// loudly rather than letting a shared mtime stamp reach the caller
+    /// (#794).
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_hardlink_with_shared_target_errors() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tree-a.rlib");
+        fs::write(&target, b"cached rlib").unwrap();
+        fs::hard_link(&target, dir.path().join("alias.rlib")).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().nlink(), 2);
+        let vanished = fs::metadata(dir.path().join("no-such-blob")).unwrap_err();
+
+        let error = verify_orphaned_hardlink(&target, fs::metadata(&target), vanished)
+            .expect_err("shared orphaned target must fail");
+        assert!(error.to_string().contains("still has 2 links"));
+    }
+
+    /// A vanished blob plus an unreadable target leaves nothing to validate;
+    /// surface the target-side error instead of retaining blindly.
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_hardlink_with_unreadable_target_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("missing.rlib");
+        let vanished = fs::metadata(dir.path().join("no-such-blob")).unwrap_err();
+
+        let error = verify_orphaned_hardlink(&target, fs::metadata(&target), vanished)
+            .expect_err("unreadable target must fail");
+        assert!(error.to_string().contains("verifying hardlink target"));
     }
 
     #[cfg(windows)]

@@ -1,15 +1,13 @@
 #!/bin/sh
-# Cross-tree convergence contract (kunobi-ninja/kache#680).
+# Cross-tree active-reader isolation contract (kunobi-ninja/kache#794).
 #
-# With the hardlink restore strategy, the write-clock stamp applied at
-# restore time lands on the store blob's inode, shared by every tree that
-# restored the same blob. A tree whose fingerprints predate the stamp
-# re-dispatches its downstream units on its next build. The accepted
-# semantics (#680) are: that perturbation must be a BOUNDED transient, and
-# steady-state alternation between trees must stay at zero dispatches.
-# This script asserts exactly that contract, self-contained and idempotent,
-# so every harness phase (cold / warm / noop / relocate) can run it as the
-# fixture's `build` command.
+# On a non-CoW filesystem the first target may share an immutable artifact
+# with its store blob. A later restore must get a private inode before its
+# write-clock stamp: otherwise the stamp changes the first target while a
+# linker such as Wild is reading it. This script holds tree A's rlib open
+# while tree B restores and asserts both metadata stability and immediate
+# Cargo convergence. It is self-contained and idempotent so every harness
+# phase (cold / warm / noop / relocate) can run it as `build`.
 #
 # On filesystems where reflink wins (APFS), restores do not share inodes
 # and the contract holds trivially; the hardlink case engages on ext4
@@ -50,56 +48,97 @@ if [ "$n" != "0" ]; then
     exit 1
 fi
 
-# Tree B warms from the same cache: its restores re-date the shared blobs.
-# B itself must converge immediately, same contract.
+# The harness does not clean before its noop phase. Only require a phase-local
+# util hit when tree B is absent and the build below must actually restore it.
+tree_b_needs_restore=0
+if [ ! -d tb ]; then
+    tree_b_needs_restore=1
+fi
+
+# Substrate proof (Linux only): tree A is the initial hardlink carrier. Prove
+# that it shares its inode with an actual content blob (nlink alone can also
+# come from Cargo's profile-level uplift), then hold that exact inode open
+# across tree B's restore just as Wild does. Linux hosts with reflink may set
+# KACHE_E2E_SKIP_HARDLINK_CHECK=1.
+shares_store_blob() {
+    probe_artifact_id=$(stat -Lc '%d:%i' "$1")
+    for probe_blob in "$KACHE_CACHE_DIR"/store/blobs/*/*; do
+        [ -f "$probe_blob" ] || continue
+        if [ "$(stat -Lc '%d:%i' "$probe_blob")" = "$probe_artifact_id" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+carrier=
+if [ "$(uname -s)" = "Linux" ] && [ -z "${KACHE_E2E_SKIP_HARDLINK_CHECK:-}" ]; then
+    for f in ta/release/deps/libutil-*.rlib; do
+        [ -e "$f" ] || continue
+        if shares_store_blob "$f"; then
+            carrier=$f
+            break
+        fi
+    done
+    if [ -z "$carrier" ]; then
+        echo "cross-tree: tree A has no hardlinked util rlib — the active-reader contract would be vacuous on this substrate"
+        exit 1
+    fi
+    exec 3<"$carrier"
+    held_before=$(stat -Lc '%s:%y' "/proc/$$/fd/3")
+    event_log="$KACHE_CACHE_DIR/events.jsonl"
+    event_lines_before=$(wc -l < "$event_log")
+    # Cross even coarse one-second filesystem timestamp resolution.
+    sleep 1
+fi
+
+# Tree B warms from the same cache while A's carrier is held open. Cargo must
+# dispatch its units once to populate a fresh target directory; the Linux check
+# below requires a phase-local util hit rather than relying on aggregate hits.
 run tb >/dev/null
+
+if [ -n "$carrier" ]; then
+    if [ "$tree_b_needs_restore" = "1" ] &&
+        ! tail -n "+$((event_lines_before + 1))" "$event_log" |
+        grep -q '"crate_name":"util".*"result":"local_hit"'; then
+        echo "cross-tree: tree B did not restore util from the local cache"
+        exit 1
+    fi
+
+    held_after=$(stat -Lc '%s:%y' "/proc/$$/fd/3")
+    if [ "$held_after" != "$held_before" ]; then
+        echo "cross-tree: tree B changed tree A's open rlib metadata ($held_before -> $held_after)"
+        exit 1
+    fi
+
+    carrier_name=$(basename "$carrier")
+    tree_b_carrier="tb/release/deps/$carrier_name"
+    if [ ! -e "$tree_b_carrier" ]; then
+        echo "cross-tree: tree B did not restore matching carrier $carrier_name"
+        exit 1
+    fi
+    if [ "$(stat -Lc '%d:%i' "/proc/$$/fd/3")" = "$(stat -Lc '%d:%i' "$tree_b_carrier")" ]; then
+        echo "cross-tree: trees A and B share the active rlib inode"
+        exit 1
+    fi
+    exec 3<&-
+fi
+
+# Both the restored tree and the previously-active tree must be immediate
+# no-ops. A bounded rebuild transient is no longer acceptable: it can abort
+# an in-flight linker (#794).
 n=$(run tb)
 if [ "$n" != "0" ]; then
     echo "cross-tree: tree B did not converge after its warmup ($n dispatches)"
     exit 1
 fi
-
-# Substrate proof (Linux only): the contract is about SHARED INODES, and a
-# copy/reflink fallback would make everything below pass trivially. Tree B
-# is always restored from cache (in every phase — cold populates it from
-# tree A first), so on the Linux legs (ubuntu CI, e2e-docker's ext4
-# volume) at least one of its restored rlibs must share its inode with the
-# store (nlink >= 2). The `util` member exists exactly to be this hardlink
-# carrier — proc-macro dylibs and bins may restore via copy. Skipped
-# elsewhere: APFS restores reflink by design. If a Linux host legitimately
-# reflinks (btrfs/XFS), set KACHE_E2E_SKIP_HARDLINK_CHECK=1 rather than
-# deleting the check.
-if [ "$(uname -s)" = "Linux" ] && [ -z "${KACHE_E2E_SKIP_HARDLINK_CHECK:-}" ]; then
-    linked=0
-    for f in tb/release/deps/*.rlib; do
-        [ -e "$f" ] || continue
-        if [ "$(stat -c %h "$f")" -ge 2 ]; then
-            linked=1
-            break
-        fi
-    done
-    if [ "$linked" != "1" ]; then
-        echo "cross-tree: no restored rlib is hardlinked to the store (nlink < 2) — the cross-tree contract would be vacuous on this substrate"
-        exit 1
-    fi
-fi
-
-# Contract 1: tree A reconverges within three rebuilds of B's warmup.
-i=0
-n=1
-until [ "$i" -ge 3 ]; do
-    n=$(run ta)
-    if [ "$n" = "0" ]; then
-        break
-    fi
-    i=$((i + 1))
-done
+n=$(run ta)
 if [ "$n" != "0" ]; then
-    echo "cross-tree: tree A failed to reconverge after 3 rebuilds (still $n dispatches)"
+    echo "cross-tree: tree B invalidated tree A ($n dispatches)"
     exit 1
 fi
 
-# Contract 2: steady-state alternation stays at zero dispatches.
+# Steady-state alternation stays at zero dispatches.
 for t in tb ta tb ta; do
     n=$(run "$t")
     if [ "$n" != "0" ]; then

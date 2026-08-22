@@ -31,12 +31,13 @@ The SQLite index (`index.db`, a sibling of `store/`, not inside it) tracks which
 
 When kache restores a cache hit, it doesn't copy blob files into `target/` if it can avoid it. On every platform it first tries a **reflink** — a copy-on-write clone that is zero-copy *and* gives the restored file an independent inode — where the filesystem supports it (APFS on macOS, btrfs, XFS with reflink, the common dev case). Mutations to a reflinked file never propagate back to the cache blob.
 
-On filesystems without copy-on-write (e.g. ext4 without `reflink`, tmpfs, NTFS), kache falls back per artifact type:
+On filesystems without copy-on-write (e.g. ext4 without `reflink`, tmpfs, NTFS), kache falls back per platform and artifact type:
 
-- **Hardlink** for immutable artifacts (`.rlib` / `.rmeta` / `.d`): an additional directory entry pointing to the same inode, so the data exists once on disk. A hardlink that fails — for example across mount points — falls back to a plain copy.
+- **Exclusive hardlink on Unix** for immutable artifacts (`.rlib` / `.rmeta`): when the blob has no existing target consumer, one target may share its inode. Additional target trees get private copies so their required restore-time mtime stamp cannot change a file another linker is reading. A hardlink that fails — for example across mount points — also falls back to a plain copy.
 - **Copy** for mutable, OS-loaded outputs (`bin`, `dylib`, `cdylib`, `proc-macro`): the build may modify the file after linking (codesigning, stripping), so kache never hardlinks these. Where reflink is available they are still reflinked (then made executable); only the non-CoW fallback is a byte copy.
+- **Copy on Windows by default** for every non-CoW restore. The `windows_hardlink` legacy opt-in permits unrestricted hardlink sharing, but is unsafe for concurrent builds and consumers that mutate outputs.
 
-The single-physical-copy / shared-inode property only holds for the hardlink fallback. Reflinks already store the data once via copy-on-write but each restore has its own inode.
+Under the default settings, the shared-inode property holds only on Unix and only for the blob plus its single hardlink carrier. Reflinks share physical blocks through copy-on-write while giving every restore its own inode; additional Unix non-CoW consumers trade that storage sharing for active-reader safety.
 
 ## The dedup line in the monitor
 

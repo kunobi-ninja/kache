@@ -4,11 +4,16 @@
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
-rust = { version = "latest", components = "rustfmt,clippy" }
+# Pinned exactly, and this entry — not rust-toolchain.toml — is what CI
+# actually runs: an explicit [tools] version takes precedence over the
+# idiomatic version file, which is how the previous `latest` here silently
+# floated CI to each new stable. Rust 1.98.0 (2026-08-22) then turned
+# `-D warnings` red on every open PR with no code change (#789). Bump
+# deliberately, in a PR that also clears any new lints.
+rust = { version = "1.98.0", components = "rustfmt,clippy" }
 "github:casey/just" = "1.43.1"
 # Versions are pinned (not `latest`) so a tool release can't break CI with no
-# code change. Bump deliberately. (rust is intentionally left to
-# rust-toolchain.toml via idiomatic_version_file_enable_tools above.)
+# code change. Bump deliberately.
 helm = "4.2.0"
 # Drives the out-of-tree CMake e2e scenario (e2e-cmake-out-of-tree, #394) so it
 # runs on the Linux/macOS gate instead of skipping. The scenario itself is

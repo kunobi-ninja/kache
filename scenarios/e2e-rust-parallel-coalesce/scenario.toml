@@ -1,0 +1,102 @@
+# kache-e2e fixture: in-flight build coalescing across SIMULTANEOUS cargo
+# invocations (PR #646) — the "parallel CI jobs, distinct target dirs" story.
+#
+# e2e-cc-parallel covers many wrappers under one `make -j`; e2e-rust-cross-tree
+# covers two target dirs built SEQUENTIALLY. This fixture covers the remaining
+# axis: two cargo processes building the same workspace at the same instant,
+# each with its own CARGO_TARGET_DIR, against one cold cache. The contract is
+# that the shared units compile ONCE across both processes: the first wrapper
+# to reach a unit claims its key (store::claim_build), the other blocks on the
+# claim (wait_for_committed) and restores the winner's artifact. Coalescing
+# happens BEFORE the duplicate compile, not by deduplicating after it.
+#
+# The cold assertions are the contract. Four units (heavy1..3 + app), two
+# processes, eight wrapper compile events: with the claim, compiler_runs is
+# exactly 4 (one per unit) and the other four events are local hits — during
+# the COLD phase, on an empty cache. Without the claim both processes miss
+# and compile every unit: compiler_runs 8, misses 8. The heavy members are
+# generated at seconds-scale compile weight so the second process reliably
+# arrives while the first is mid-compile (the contended path), but the
+# assertions hold under any interleaving — a late arrival is a plain hit,
+# still zero duplicate compiles.
+
+name = "e2e-rust-parallel-coalesce"
+tags = ["suite:e2e", "lang:rust", "case:concurrency"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+# Hermetic: an inherited remote/prefetch config could serve the cold phase
+# from a remote tier and never exercise the claim path at all. Local-only
+# pins the cold misses to real compiles (min_misses below backs it).
+KACHE_LOCAL_ONLY = "1"
+# Every count below is "4 units × 2 processes", which requires `app` — a
+# bin, and the only user-facing executable here — to be cacheable. That is
+# the DEFAULT on Linux and macOS but not on Windows, where
+# `default_cache_executables()` is false, so `app` would passthrough there:
+# both processes would compile it every phase, making compiler_runs and the
+# unit arithmetic platform-dependent and failing warm/relocate's
+# `max_compiler_runs = 0`. Pinning it keeps one set of assertions valid
+# everywhere; the same pin is how bench-firefox-windows exercises this path.
+# Coalescing itself is what the fixture gates, and it is executable-agnostic.
+KACHE_CACHE_EXECUTABLES = "1"
+
+[commands]
+# Generates the heavy members (idempotent, mtime-stable for noop), then
+# launches the two builds and fails loudly if either fails.
+build = "sh parallel-build.sh"
+clean = "rm -rf t1 t2"
+
+[verify]
+# Both trees' binaries must run and AGREE — the coalesced tree executes a
+# restored artifact it never compiled, so the comparison is load-bearing,
+# not just the substring match on one line.
+run = "o1=$(./t1/release/app) && o2=$(./t2/release/app) && [ \"$o1\" = \"$o2\" ] && printf '%s\n' \"$o1\""
+expected_stdout_contains = ["parallel-coalesce ok: 200578625136256"]
+
+[modify]
+file = "app/src/main.rs"
+find = "let x: u64 = 1"
+replace = "let x: u64 = 2"
+
+# Cold, empty cache: 4 units × 2 processes = 8 events. Exactly 4 misses =
+# 4 compiles (a duplicate compile is also a duplicate miss; fewer misses
+# would mean some tier other than a real compile fed the cold phase) and
+# at least 4 in-flight coalesced hits.
+[assertions.cold]
+min_entries_after = 8
+min_hits = 4
+min_misses = 4
+max_misses = 4
+max_compiler_runs = 4
+
+# Warm, cleaned target dirs: both processes restore everything.
+[assertions.warm]
+min_hits = 8
+max_misses = 0
+max_compiler_runs = 0
+
+# Both target dirs are up to date: neither cargo dispatches anything.
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"
+
+# Same workspace from a different absolute path: keys are path-portable,
+# strict zero-miss for both processes.
+[assertions.relocate]
+min_hits = 8
+max_misses = 0
+max_compiler_runs = 0
+
+# Only `app` changed: 8 events again — exactly one miss (the modified unit,
+# compiled once across both processes) and seven hits (its coalesced twin
+# plus both processes' six unchanged heavy units).
+[assertions.relocate-modified]
+min_entries_after = 8
+min_hits = 7
+min_misses = 1
+max_misses = 1
+max_compiler_runs = 1

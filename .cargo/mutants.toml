@@ -133,6 +133,14 @@ gitignore = true
 # `parse_keytrace` (which crate and field a trace line names),
 # `render_key_divergence` (which fields count as diverged), and
 # `key_divergence_report` (reading both phase logs off disk).
+#
+# `install_shims`'s two `!x.is_empty()` guards decide only which summary line
+# prints ("Created N shim(s)" plus the optional created/skipped name lists).
+# Nothing an in-process test can observe changes: the shim set it creates, the
+# entries it preserves, and the errors it reports are all asserted directly by
+# the tests around it. Same shape as the `run_gc_local` progress strings above.
+# The function's behaviour, its `--force` semantics, and its error
+# classification all stay in scope and are killed by those tests.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -163,4 +171,5 @@ exclude_re = [
     "observe_storage_unsupported",
     "run_cargo_non_unix",
     "replace report_key_divergence with \\(\\)",
+    "delete ! in install_shims",
 ]

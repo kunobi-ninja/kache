@@ -273,6 +273,17 @@ enum Commands {
     /// Open the configuration editor
     Config,
 
+    /// Create compiler-name symlinks pointing at kache, for transparent
+    /// interception by prepending the directory to PATH
+    InstallShims {
+        /// Directory to populate (created if missing)
+        dir: PathBuf,
+
+        /// Replace existing entries instead of refusing
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Generate shell completion scripts
     Completions {
         /// Shell to generate completions for
@@ -464,6 +475,23 @@ fn main() -> Result<()> {
             .collect::<Vec<_>>();
         &lossy_args
     };
+    // Compiler-name shim (#310): invoked as `gcc`/`cc`/… through a PATH
+    // symlink, so the compiler is our own argv[0] rather than argv[1]. Checked
+    // BEFORE `detect_log_mode`, which only ever inspects argv[1..] and would
+    // classify `gcc foo.c` as CLI mode and fail parsing `foo.c` as a
+    // subcommand.
+    let shim_args = compiler::shim::wrapper_args(detection_args);
+    if let Some(shim_args) = shim_args {
+        init_logging(LogMode::Wrapper);
+        let shim_args = shim_args.map_err(anyhow::Error::msg)?;
+        if env_args.is_none() {
+            anyhow::bail!(
+                "compiler wrapper arguments contain non-UTF-8 bytes and cannot be cached safely"
+            );
+        }
+        return run_wrapper_mode(&shim_args);
+    }
+
     let log_mode = detect_log_mode(detection_args);
 
     // Detect RUSTC_WRAPPER mode: cargo passes the rustc path as arg[1]
@@ -624,6 +652,14 @@ fn main() -> Result<()> {
             let hours = since.as_deref().and_then(parse_duration_hours);
             tui::run_monitor(&config, hours)
         }
+        #[cfg(unix)]
+        Some(Commands::InstallShims { dir, force }) => cli::install_shims(&dir, force),
+        // Unix-only (symlinks); the Windows `.exe` shim story differs (#310).
+        #[cfg(not(unix))]
+        Some(Commands::InstallShims { .. }) => Err(anyhow::anyhow!(
+            "shim installation is Unix-only for now: it relies on symlinks, and the Windows \
+             `.exe` shim story differs (kunobi-ninja/kache#310). Use `CC`/`CXX` there."
+        )),
         Some(Commands::Cargo { .. }) => unreachable!(),
         Some(Commands::Config) => unreachable!(),
         Some(Commands::Completions { .. }) => unreachable!(),

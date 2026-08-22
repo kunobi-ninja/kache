@@ -1892,3 +1892,302 @@ mod tests {
         }
     }
 }
+
+/// Compiler-name shim support (kunobi-ninja/kache#310).
+///
+/// A directory of symlinks named after the compilers, each pointing at the
+/// `kache` binary, prepended to `PATH`, routes every build's compiler calls
+/// through kache with no `CC`/`CXX` edits and no per-project build-system
+/// changes. That is the lowest-friction way to put kache in front of arbitrary
+/// builds, which matters most for people supporting many differently
+/// structured projects where editing each build's compiler config is not
+/// practical.
+///
+/// kache otherwise decides it is wrapping a compiler purely from `argv[1..]`,
+/// so under a shim (`argv[0] = gcc`, `argv[1] = foo.c`) it would find no
+/// compiler at `argv[1]`, fall through to CLI mode, and fail parsing `foo.c`
+/// as a subcommand.
+pub(crate) mod shim {
+    use std::path::{Path, PathBuf};
+
+    /// The compiler names a generated shim directory populates. Deliberately
+    /// the canonical drivers only: a shim is a `PATH` ambush, so it should
+    /// cover what builds actually invoke rather than every name kache can
+    /// recognize. Versioned and target-prefixed spellings are still handled
+    /// when a user creates them by hand, because detection reuses
+    /// `CcCompiler::recognizes`.
+    // Only the generator consumes this, and generation is Unix-only (it
+    // creates symlinks). Detection below stays cross-platform, so a hand-made
+    // `gcc.exe` copy of kache still works on Windows.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) const SHIM_NAMES: &[&str] = &["cc", "c++", "gcc", "g++", "clang", "clang++"];
+
+    /// Whether `argv[0]` names a compiler, meaning kache is being invoked
+    /// through a shim rather than as itself.
+    pub(crate) fn invoked_as_compiler(arg0: &str) -> bool {
+        // Reuses the full name set (exact, versioned, target-prefixed, MinGW
+        // alternatives), so a hand-made `x86_64-linux-gnu-gcc` shim works
+        // without a second list to keep in sync.
+        super::cc::CcCompiler::recognizes(std::slice::from_ref(&arg0.to_string()))
+    }
+
+    /// The real compiler behind a shim: the first `name` on `PATH` that is not
+    /// kache itself.
+    ///
+    /// Skipping by *resolved identity* rather than by directory is what makes
+    /// this safe. It finds every shim wherever the user put them, tolerates
+    /// several shim directories, and cannot be defeated by a relative or
+    /// symlinked `PATH` entry — all of which would otherwise re-select the
+    /// shim and recurse.
+    pub(crate) fn resolve_real_compiler(
+        name: &str,
+        path_dirs: &[PathBuf],
+        self_exe: Option<&Path>,
+        is_candidate: &dyn Fn(&Path) -> bool,
+        resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        let self_real = self_exe.and_then(resolve);
+        for dir in path_dirs {
+            let candidate = dir.join(name);
+            if !is_candidate(&candidate) {
+                continue;
+            }
+            // A candidate that resolves to our own binary IS the shim.
+            if let (Some(real), Some(mine)) = (resolve(&candidate), self_real.as_deref())
+                && real == mine
+            {
+                continue;
+            }
+            return Some(candidate);
+        }
+        None
+    }
+
+    /// Live wiring for [`resolve_real_compiler`].
+    pub(crate) fn resolve_real_compiler_from_env(name: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        let self_exe = std::env::current_exe().ok();
+        resolve_real_compiler(
+            name,
+            &dirs,
+            self_exe.as_deref(),
+            &|candidate| super::is_executable(candidate),
+            &|path| std::fs::canonicalize(path).ok(),
+        )
+    }
+
+    /// Rewrite a shim invocation into the wrapper-mode argv kache already
+    /// understands: the resolved real compiler followed by the original
+    /// arguments. `None` when this is not a shim invocation.
+    pub(crate) fn wrapper_args(argv: &[String]) -> Option<Result<Vec<String>, String>> {
+        let arg0 = argv.first()?;
+        if !invoked_as_compiler(arg0) {
+            return None;
+        }
+        let name = super::command_basename(arg0)?;
+        let Some(real) = resolve_real_compiler_from_env(name) else {
+            return Some(Err(format!(
+                "kache was invoked through a compiler shim named `{name}`, but no real `{name}` \
+                 was found on PATH behind it. Every `{name}` on PATH resolves to kache itself, \
+                 so there is nothing to run. Check that the real toolchain is still on PATH \
+                 after the shim directory."
+            )));
+        };
+        let Some(real) = real.to_str() else {
+            return Some(Err(format!(
+                "the real `{name}` behind the shim has a non-UTF-8 path and cannot be wrapped \
+                 safely"
+            )));
+        };
+        let mut rewritten = Vec::with_capacity(argv.len());
+        rewritten.push(real.to_string());
+        rewritten.extend_from_slice(&argv[1..]);
+        Some(Ok(rewritten))
+    }
+}
+
+#[cfg(test)]
+mod shim_tests {
+    use super::shim::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn compiler_shaped_argv0_is_recognized_but_kache_itself_is_not() {
+        for name in ["cc", "gcc", "g++", "clang++", "/usr/local/bin/gcc"] {
+            assert!(invoked_as_compiler(name), "{name} should look like a shim");
+        }
+        // Versioned and target-prefixed shims work without a second list.
+        assert!(invoked_as_compiler("x86_64-linux-gnu-gcc"));
+        assert!(invoked_as_compiler("gcc-13"));
+        // kache invoked normally, and companion tools, must NOT be shims:
+        // treating `kache` as a compiler would recurse, and `gcc-ar` is not a
+        // compiler at all.
+        assert!(!invoked_as_compiler("kache"));
+        assert!(!invoked_as_compiler("/usr/local/bin/kache"));
+        assert!(!invoked_as_compiler("gcc-ar"));
+    }
+
+    /// The shim must be skipped by RESOLVED IDENTITY, not by directory: that
+    /// is what survives several shim dirs, relative PATH entries, and a
+    /// symlinked PATH entry, each of which would otherwise re-select the shim
+    /// and recurse forever.
+    #[test]
+    fn resolve_skips_every_path_entry_that_is_kache_itself() {
+        let kache = PathBuf::from("/opt/kache/bin/kache");
+        let shim_a = PathBuf::from("/shims-a");
+        let shim_b = PathBuf::from("/shims-b");
+        let real = PathBuf::from("/usr/bin");
+
+        // Both shim dirs hold a `cc` that resolves to the kache binary.
+        let resolve = |path: &Path| -> Option<PathBuf> {
+            if path.starts_with("/shims-a") || path.starts_with("/shims-b") {
+                Some(kache.clone())
+            } else {
+                Some(path.to_path_buf())
+            }
+        };
+        let exists = |_: &Path| true;
+
+        let found = resolve_real_compiler(
+            "cc",
+            &[shim_a, shim_b, real],
+            Some(&kache),
+            &exists,
+            &resolve,
+        );
+        assert_eq!(found, Some(PathBuf::from("/usr/bin/cc")));
+    }
+
+    #[test]
+    fn resolve_returns_none_when_only_shims_are_on_path() {
+        let kache = PathBuf::from("/opt/kache/bin/kache");
+        let found = resolve_real_compiler(
+            "cc",
+            &[PathBuf::from("/shims")],
+            Some(&kache),
+            &|_| true,
+            &|_| Some(kache.clone()),
+        );
+        assert_eq!(found, None, "must report no real compiler, not recurse");
+    }
+
+    /// A non-executable file with the right name must not be selected as the
+    /// compiler; PATH lookup semantics, and picking one would fail the build
+    /// with a confusing exec error.
+    #[test]
+    fn resolve_skips_non_executable_candidates() {
+        let kache = PathBuf::from("/opt/kache/bin/kache");
+        let found = resolve_real_compiler(
+            "cc",
+            &[PathBuf::from("/not-exec"), PathBuf::from("/usr/bin")],
+            Some(&kache),
+            &|path: &Path| path.starts_with("/usr/bin"),
+            &|path: &Path| Some(path.to_path_buf()),
+        );
+        assert_eq!(found, Some(PathBuf::from("/usr/bin/cc")));
+    }
+
+    /// Guard that restores PATH even if the test panics; process env is
+    /// global and a leaked PATH would corrupt every later test.
+    #[cfg(unix)]
+    struct PathForTest(Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl Drop for PathForTest {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => unsafe { std::env::set_var("PATH", previous) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+        }
+    }
+
+    /// Drives the LIVE wiring against a real PATH, not the injected core.
+    ///
+    /// The tests above inject their own PATH list and resolver, so they leave
+    /// the half that reads the process's actual PATH and `current_exe`
+    /// unproven: a `wrapper_args` that always returned `None` would silently
+    /// stop treating anything as a shim — the whole feature off — and still
+    /// pass them.
+    #[cfg(unix)]
+    #[test]
+    fn live_resolution_finds_the_real_compiler_behind_a_real_shim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = crate::config::tests::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        // A real `cc` that is a genuine executable...
+        let real_cc = real_dir.join("cc");
+        std::fs::write(&real_cc, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&real_cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // ...shadowed on PATH by a `cc` symlink to this binary, exactly as
+        // `kache install-shims` creates.
+        let exe = std::env::current_exe().unwrap();
+        std::os::unix::fs::symlink(&exe, shim_dir.join("cc")).unwrap();
+
+        let _path = PathForTest(std::env::var_os("PATH"));
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", shim_dir.display(), real_dir.display()),
+            )
+        };
+
+        let found = resolve_real_compiler_from_env("cc").expect("the real cc must be found");
+        assert_eq!(
+            std::fs::canonicalize(&found).unwrap(),
+            std::fs::canonicalize(&real_cc).unwrap(),
+            "must skip the shim and select the real compiler"
+        );
+
+        let rewritten = wrapper_args(&["cc".to_string(), "foo.c".to_string()])
+            .expect("a compiler-shaped argv0 is a shim invocation")
+            .expect("resolution succeeds");
+        assert_eq!(
+            std::fs::canonicalize(&rewritten[0]).unwrap(),
+            std::fs::canonicalize(&real_cc).unwrap(),
+            "the rewritten argv must run the real compiler"
+        );
+        assert_eq!(
+            &rewritten[1..],
+            &["foo.c".to_string()],
+            "the original arguments must be preserved verbatim"
+        );
+    }
+
+    /// With only the shim on PATH there is nothing to run, so this must report
+    /// the condition rather than resolve back to itself and recurse.
+    #[cfg(unix)]
+    #[test]
+    fn live_resolution_reports_when_only_the_shim_is_on_path() {
+        let _lock = crate::config::tests::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        std::os::unix::fs::symlink(&exe, shim_dir.join("cc")).unwrap();
+
+        let _path = PathForTest(std::env::var_os("PATH"));
+        unsafe { std::env::set_var("PATH", format!("{}", shim_dir.display())) };
+
+        assert_eq!(resolve_real_compiler_from_env("cc"), None);
+        let err = wrapper_args(&["cc".to_string(), "foo.c".to_string()])
+            .expect("still a shim invocation")
+            .expect_err("but with no compiler to run");
+        assert!(err.contains("no real `cc`"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn non_shim_argv_is_left_alone() {
+        // Normal `kache <compiler> …` and plain CLI use must not be rewritten.
+        assert!(wrapper_args(&["kache".into(), "gcc".into(), "a.c".into()]).is_none());
+        assert!(wrapper_args(&["kache".into(), "stats".into()]).is_none());
+        assert!(wrapper_args(&[]).is_none());
+    }
+}

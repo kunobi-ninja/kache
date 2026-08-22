@@ -2,7 +2,7 @@
 
 A map of kache's user-facing features to the e2e scenarios that exercise them,
 and the gaps where a feature has no end-to-end scenario. The functional suite
-(`just e2e`, `suite:e2e`) currently has **29 scenarios** (the `bench-*` cases are
+(`just e2e`, `suite:e2e`) currently has **43 scenarios** (the `bench-*` cases are
 load benchmarks, not feature tests).
 
 This was produced by a cross-family audit (Claude + codex, independent passes):
@@ -39,6 +39,7 @@ came from the second pass.
 | Refusal by invocation shape (multi-source, response file) | `e2e-cc-multi-source`, `e2e-cc-response-file` |
 | Parallel cache access (`make -j`) race gate | `e2e-cc-parallel` |
 | Restore mtime convergence + cross-tree hardlink contract (#677/#680) | `e2e-rust-cross-tree` |
+| In-flight coalescing across simultaneous cargo invocations (#646) | `e2e-rust-parallel-coalesce` |
 | Restore content correctness (byte-for-byte) | `[diff]` in C/C++/CMake/Rust-FFI/workspace scenarios |
 
 ## Gaps — features with NO e2e scenario

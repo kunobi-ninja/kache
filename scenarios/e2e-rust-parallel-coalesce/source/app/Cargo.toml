@@ -1,0 +1,9 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+heavy1 = { path = "../heavy1" }
+heavy2 = { path = "../heavy2" }
+heavy3 = { path = "../heavy3" }

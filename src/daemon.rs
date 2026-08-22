@@ -7262,7 +7262,7 @@ pub fn start_daemon_background() -> Result<bool> {
         // (#662), is never. Any tool that captures kache's output hangs:
         // build scripts, CI wrappers, IDE integrations, and the test harness
         // where this was found.
-        warn_if_remote_is_env_only(&config);
+        let _warned = warn_if_remote_is_env_only(&config);
 
         let mut child = spawn_detached_daemon(&exe, stderr_target)?;
 
@@ -7380,14 +7380,14 @@ const AMBIENT_REMOTE_ENV_VARS: &[&str] = &[
 /// Says nothing when the config file already declares a remote (the common
 /// case, where env is redundant or an intentional per-build override of a
 /// remote the daemon has anyway), so the warning stays rare enough to read.
-fn warn_if_remote_is_env_only(config: &Config) {
+fn warn_if_remote_is_env_only(config: &Config) -> bool {
     let set: Vec<&str> = AMBIENT_REMOTE_ENV_VARS
         .iter()
         .copied()
         .filter(|name| std::env::var_os(name).is_some())
         .collect();
     if set.is_empty() {
-        return;
+        return false;
     }
     let (file_config, _) = Config::load_raw_file_config();
     if file_config
@@ -7395,7 +7395,7 @@ fn warn_if_remote_is_env_only(config: &Config) {
         .as_ref()
         .is_some_and(|cache| cache.remote.is_some())
     {
-        return;
+        return false;
     }
     let message = format!(
         "kache: a remote is configured only in this build's environment ({vars}), and the \n         \
@@ -7410,6 +7410,7 @@ fn warn_if_remote_is_env_only(config: &Config) {
     );
     let marker = crate::wrapper::warn_marker_path("daemon-remote-env", &config.cache_dir);
     crate::wrapper::warn_once_per_session(&marker, crate::wrapper::WARN_SESSION_SECS, &message);
+    true
 }
 
 /// Spawn `kache daemon run` detached, without leaking this process's
@@ -7624,6 +7625,92 @@ mod tests {
             command.get_envs().all(|(_, value)| value.is_none()),
             "the spawn should only remove variables, never set them"
         );
+    }
+
+    /// Set/remove an env var for one test and restore it on drop. Local to
+    /// these tests; the process-global env is serialized by the shared
+    /// `config_path_lock`.
+    struct EnvVarForTest {
+        name: String,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarForTest {
+        fn set(name: &str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::set_var(name, value) };
+            Self {
+                name: name.to_string(),
+                previous,
+            }
+        }
+
+        fn remove(name: &str) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::remove_var(name) };
+            Self {
+                name: name.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarForTest {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(&self.name, value) },
+                None => unsafe { std::env::remove_var(&self.name) },
+            }
+        }
+    }
+
+    /// The warning is the entire discoverability half of #706: making the
+    /// daemon deterministic turns "sometimes works" into "never works" for an
+    /// env-only setup, which is only an improvement if the user is told. A
+    /// silently-removed warning would restore exactly the silent
+    /// misconfiguration the issue is about, so drive the real entry point.
+    #[test]
+    fn env_only_remote_warns_but_a_file_configured_remote_does_not() {
+        let _lock = crate::config::tests::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Keep the marker out of a shared cache dir so the once-per-session
+        // dedup cannot be satisfied by an unrelated run.
+        let config = test_config(&dir.path().join("cache"));
+
+        let config_path = dir.path().join("config.toml");
+        let restore_config = EnvVarForTest::set("KACHE_CONFIG", config_path.as_os_str());
+
+        // No remote anywhere: nothing to warn about.
+        std::fs::write(&config_path, "[cache]\n").unwrap();
+        let clear: Vec<_> = AMBIENT_REMOTE_ENV_VARS
+            .iter()
+            .map(|name| EnvVarForTest::remove(name))
+            .collect();
+        assert!(!warn_if_remote_is_env_only(&config));
+
+        // Remote ONLY in the environment: the daemon will not use it, so say so.
+        let _bucket = EnvVarForTest::set("KACHE_S3_BUCKET", std::ffi::OsStr::new("some-bucket"));
+        assert!(
+            warn_if_remote_is_env_only(&config),
+            "an env-only remote must warn"
+        );
+
+        // Same environment, but the file declares a remote: the daemon has one,
+        // so the env value is redundant or a deliberate per-build override and
+        // the warning would be noise.
+        std::fs::write(
+            &config_path,
+            "[cache.remote]\ntype = \"s3\"\nbucket = \"from-file\"\n",
+        )
+        .unwrap();
+        assert!(
+            !warn_if_remote_is_env_only(&config),
+            "a file-configured remote must stay quiet"
+        );
+
+        drop(clear);
+        drop(restore_config);
     }
 
     /// The stripped list must stay exactly the set of variables that decide a

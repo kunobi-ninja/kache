@@ -10017,17 +10017,11 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
 /// Prepending the result to `PATH` routes every build's compiler calls through
 /// kache with no `CC`/`CXX` edits and no per-project build-system changes.
 ///
-/// Two cfg'd definitions rather than one function with cfg'd blocks: the
-/// non-unix body must still produce the function's return value, and a single
-/// body whose only remaining statement diverges does not type-check there.
-#[cfg(not(unix))]
-pub(crate) fn install_shims(_dir: &std::path::Path, _force: bool) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "shim installation is Unix-only for now: it relies on symlinks, and the Windows \
-         `.exe` shim story differs (kunobi-ninja/kache#310). Use `CC`/`CXX` there."
-    )
-}
-
+///
+/// Unix-only: it creates symlinks, and the Windows `.exe` shim story differs
+/// (kunobi-ninja/kache#310). The unsupported message lives in the command
+/// dispatch so this stays a single, fully testable definition rather than two
+/// same-named ones the mutation lane cannot tell apart.
 #[cfg(unix)]
 pub(crate) fn install_shims(dir: &std::path::Path, force: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locating the kache binary")?;
@@ -10086,4 +10080,119 @@ pub(crate) fn install_shims(dir: &std::path::Path, force: bool) -> anyhow::Resul
          compilers must remain on PATH behind it — kache runs them."
     );
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod shim_install_tests {
+    use super::install_shims;
+    use crate::compiler::shim::SHIM_NAMES;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn is_symlink(path: &std::path::Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
+    #[test]
+    fn installs_a_symlink_for_every_shim_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        install_shims(&shims, false).unwrap();
+
+        let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        for name in SHIM_NAMES {
+            let link = shims.join(name);
+            assert!(is_symlink(&link), "{name} must be a symlink");
+            assert_eq!(
+                std::fs::read_link(&link).unwrap(),
+                exe,
+                "{name} must point at this binary"
+            );
+        }
+    }
+
+    /// Without `--force` an existing entry is left exactly as it was. Silently
+    /// overwriting whatever sits in the target directory would be a
+    /// destructive default for a command users may point at `~/.local/bin`.
+    #[test]
+    fn existing_entries_are_preserved_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        let occupied = shims.join(SHIM_NAMES[0]);
+        std::fs::write(&occupied, b"a real compiler wrapper").unwrap();
+
+        install_shims(&shims, false).unwrap();
+
+        assert!(
+            !is_symlink(&occupied),
+            "existing entry must not be replaced"
+        );
+        assert_eq!(
+            std::fs::read(&occupied).unwrap(),
+            b"a real compiler wrapper",
+            "existing content must be untouched"
+        );
+        // The rest are still installed: one collision must not abort the run.
+        for name in &SHIM_NAMES[1..] {
+            assert!(is_symlink(&shims.join(name)), "{name} should be installed");
+        }
+    }
+
+    #[test]
+    fn force_replaces_an_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        let occupied = shims.join(SHIM_NAMES[0]);
+        std::fs::write(&occupied, b"stale").unwrap();
+
+        install_shims(&shims, true).unwrap();
+
+        assert!(is_symlink(&occupied), "--force must replace the entry");
+    }
+
+    /// Re-running with `--force` is the "I moved the kache binary" refresh, so
+    /// it must not fail on its own previous output or accumulate entries.
+    #[test]
+    fn forced_reinstall_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        install_shims(&shims, false).unwrap();
+        install_shims(&shims, true).unwrap();
+
+        for name in SHIM_NAMES {
+            assert!(is_symlink(&shims.join(name)));
+        }
+        assert_eq!(
+            std::fs::read_dir(&shims).unwrap().count(),
+            SHIM_NAMES.len(),
+            "reinstall must not accumulate entries"
+        );
+    }
+
+    /// An inspection failure that is NOT "missing" must surface rather than be
+    /// treated as an empty slot.
+    #[test]
+    fn unreadable_target_directory_is_an_error() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, mode 000 does not deny access");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::set_permissions(&shims, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = install_shims(&shims, false);
+        std::fs::set_permissions(&shims, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The MESSAGE matters, not just the failure: treating a
+        // permission error as "nothing there" would fall through to the
+        // symlink call and report the wrong stage.
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("inspecting"),
+            "an inspection failure must be reported as such, got: {err}"
+        );
+    }
 }

@@ -652,7 +652,14 @@ fn main() -> Result<()> {
             let hours = since.as_deref().and_then(parse_duration_hours);
             tui::run_monitor(&config, hours)
         }
+        #[cfg(unix)]
         Some(Commands::InstallShims { dir, force }) => cli::install_shims(&dir, force),
+        // Unix-only (symlinks); the Windows `.exe` shim story differs (#310).
+        #[cfg(not(unix))]
+        Some(Commands::InstallShims { .. }) => Err(anyhow::anyhow!(
+            "shim installation is Unix-only for now: it relies on symlinks, and the Windows \
+             `.exe` shim story differs (kunobi-ninja/kache#310). Use `CC`/`CXX` there."
+        )),
         Some(Commands::Cargo { .. }) => unreachable!(),
         Some(Commands::Config) => unreachable!(),
         Some(Commands::Completions { .. }) => unreachable!(),

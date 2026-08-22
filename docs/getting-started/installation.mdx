@@ -153,6 +153,38 @@ kache is also published to Homebrew, APT, winget, Scoop, Chocolatey, and the AUR
   </Tab>
 </Tabs>
 
+## Compiler shims (transparent interception)
+
+Setting `CC`/`CXX` per project does not scale when you support many
+differently structured builds. A shim directory routes every compiler call on
+the machine through kache with one `PATH` change and no per-project edits:
+
+```sh
+kache install-shims ~/.kache/shims
+export PATH="$HOME/.kache/shims:$PATH"
+```
+
+That creates symlinks named `cc`, `c++`, `gcc`, `g++`, `clang` and `clang++`,
+all pointing at the kache binary. When a build invokes one, kache recognizes
+that it was called under a compiler name, finds the real compiler behind the
+shim, and wraps it.
+
+Two rules make or break it:
+
+- The shim directory must come **before** your real toolchain on `PATH`.
+  Appended, it is never consulted and nothing happens.
+- The real compilers must still be reachable on `PATH` behind it, because
+  kache runs them. If every `cc` on `PATH` is a shim, kache says so and exits
+  rather than recursing.
+
+The real compiler is found by skipping any `PATH` entry that resolves to the
+kache binary, so several shim directories, relative entries, and symlinked
+entries all behave.
+
+Unix only for now: it relies on symlinks, and the Windows `.exe` shim story
+differs. Use `CC`/`CXX` there. C/C++ caching is still experimental, so treat
+machine-wide interception as opt-in.
+
 ## Nix
 
 The repo is a flake. Unlike the methods above it builds kache from source, with the Rust toolchain pinned in `rust-toolchain.toml` rather than whatever rustc your nixpkgs happens to ship. Use the `stable` branch: it advances only after a non-prerelease GitHub release has passed the gated release build. The default `main` branch contains unreleased development work.

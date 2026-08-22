@@ -10010,3 +10010,79 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
         Ok(())
     }
 }
+
+/// Populate `dir` with compiler-name symlinks pointing at this kache binary
+/// (kunobi-ninja/kache#310).
+///
+/// Prepending the result to `PATH` routes every build's compiler calls through
+/// kache with no `CC`/`CXX` edits and no per-project build-system changes.
+pub(crate) fn install_shims(dir: &std::path::Path, force: bool) -> anyhow::Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, force);
+        anyhow::bail!(
+            "shim installation is Unix-only for now: it relies on symlinks, and the Windows \
+             `.exe` shim story differs (kunobi-ninja/kache#310). Use `CC`/`CXX` there."
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let exe = std::env::current_exe().context("locating the kache binary")?;
+        // Resolve so the shims survive kache being invoked through its own
+        // symlink, and so `resolve_real_compiler`'s identity check (which
+        // canonicalizes) reliably recognizes them as kache.
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating shim directory {}", dir.display()))?;
+
+        let mut created = Vec::new();
+        let mut skipped = Vec::new();
+        for name in crate::compiler::shim::SHIM_NAMES {
+            let link = dir.join(name);
+            match std::fs::symlink_metadata(&link) {
+                Ok(_) if !force => {
+                    skipped.push((*name).to_string());
+                    continue;
+                }
+                Ok(_) => std::fs::remove_file(&link)
+                    .with_context(|| format!("replacing existing {}", link.display()))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("inspecting {}", link.display()));
+                }
+            }
+            std::os::unix::fs::symlink(&exe, &link)
+                .with_context(|| format!("creating shim {}", link.display()))?;
+            created.push((*name).to_string());
+        }
+
+        println!(
+            "Created {} shim(s) in {} -> {}",
+            created.len(),
+            dir.display(),
+            exe.display()
+        );
+        if !created.is_empty() {
+            println!("  {}", created.join(", "));
+        }
+        if !skipped.is_empty() {
+            println!(
+                "Skipped {} existing entr(ies): {} (use --force to replace)",
+                skipped.len(),
+                skipped.join(", ")
+            );
+        }
+        println!();
+        println!("Add it to PATH ahead of your toolchain:");
+        println!("  export PATH=\"{}:$PATH\"", dir.display());
+        println!();
+        // The ordering caveat is the one way this silently does nothing: a
+        // shim dir appended rather than prepended is never consulted.
+        println!(
+            "The directory must come BEFORE the real toolchain on PATH, and the real \
+             compilers must remain on PATH behind it — kache runs them."
+        );
+        Ok(())
+    }
+}

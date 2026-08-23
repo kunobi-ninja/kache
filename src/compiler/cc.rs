@@ -1474,13 +1474,13 @@ fn parse_preprocess_dependencies(raw: &str, cwd: &Path) -> Result<Vec<PathBuf>> 
     while index < bytes.len() {
         if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'\n') {
             logical.push(b' ');
-            index += 2;
+            index = index.saturating_add(2);
         } else if bytes[index] == b'\\'
             && bytes.get(index + 1) == Some(&b'\r')
             && bytes.get(index + 2) == Some(&b'\n')
         {
             logical.push(b' ');
-            index += 3;
+            index = index.saturating_add(3);
         } else {
             logical.push(bytes[index]);
             index += 1;
@@ -7956,16 +7956,18 @@ mod tests {
     fn preprocess_dependency_parser_handles_make_escapes_and_continuations() {
         let cwd = Path::new("work/project");
         let raw = concat!(
-            "__kache_preprocess_memo: src/main.c include/a\\ b.h \\\r\n",
+            "__kache_preprocess_memo: src/main.c ab/header.h include/a\\ b.h \\\r\n",
             " include/hash\\#tag.h \\\n",
-            " include/cash$$value.h C:\\sdk\\header.h\n",
+            " include/cash$$value.h include/single$value.h C:\\sdk\\header.h\n",
         );
         let actual = parse_preprocess_dependencies(raw, cwd).unwrap();
         let mut expected = vec![
             PathBuf::from("C:\\sdk\\header.h"),
+            cwd.join("ab/header.h"),
             cwd.join("include/a b.h"),
             cwd.join("include/cash$value.h"),
             cwd.join("include/hash#tag.h"),
+            cwd.join("include/single$value.h"),
             cwd.join("src/main.c"),
         ];
         expected.sort();

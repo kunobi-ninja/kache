@@ -6628,6 +6628,14 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    #[test]
+    fn cc_compiler_constructor_keeps_extra_allowlist_flags() {
+        let expected = flags(&["-fsome-exotic-flag"]);
+        let compiler = CcCompiler::with_extra_allowlist_flags(expected.clone());
+
+        assert_eq!(compiler.extra_allowlist_flags, expected);
+    }
+
     /// A flag the built-in table doesn't model normally refuses, but
     /// listing it in `[cc] extra_allowlist_flags` makes it cacheable.
     #[test]

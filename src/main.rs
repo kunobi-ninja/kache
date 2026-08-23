@@ -46,6 +46,17 @@ mod tui;
 mod wrapper;
 mod wrapper_config;
 
+// macOS local-network privacy attributes a LaunchAgent's network access to
+// responsible code. Kache is a standalone executable rather than an app
+// bundle, so embed the identity and usage description directly in its Mach-O
+// image. The generated LaunchAgent associates itself with the same bundle id
+// in `service::launchd_plist_content` (kunobi-ninja/kache#798).
+#[cfg(target_os = "macos")]
+#[used]
+#[unsafe(link_section = "__TEXT,__info_plist")]
+static MACOS_INFO_PLIST: [u8; include_bytes!("../assets/macos/Info.plist").len()] =
+    *include_bytes!("../assets/macos/Info.plist");
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

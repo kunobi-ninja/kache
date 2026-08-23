@@ -3209,6 +3209,14 @@ fn daemon_needed(remote_configured: bool, planner_configured: bool) -> bool {
     remote_configured || planner_configured
 }
 
+fn daemon_service_check(
+    installed: bool,
+    healthy_daemon_reachable: bool,
+) -> (bool, Option<&'static str>) {
+    let pass = installed || healthy_daemon_reachable;
+    (pass, (!pass).then_some("kache daemon install"))
+}
+
 /// Whether a `doctor` check counts toward the "N issue(s) found" total. Checks
 /// downgraded to informational (`optional`) never count, even when they fail.
 fn is_doctor_issue(pass: bool, optional: bool) -> bool {
@@ -3692,6 +3700,7 @@ pub fn doctor(
     // replacement takes to bind its socket (kunobi-ninja/kache#720). `--fix` opts
     // into that wait below.
     let my_version = crate::VERSION;
+    let mut healthy_daemon_reachable = false;
     if let Some(ref cfg) = config {
         let my_epoch = crate::daemon::build_epoch();
         let mut stats = crate::daemon::send_stats_request_without_restart(cfg, false).ok();
@@ -3715,6 +3724,8 @@ pub fn doctor(
             stats = crate::daemon::send_stats_request_without_restart(cfg, false).ok();
         }
 
+        healthy_daemon_reachable = stats.is_some();
+
         let (pass, detail, fix_hint) = daemon_version_check(
             stats.as_ref().map(|s| (s.version.as_str(), s.build_epoch)),
             crate::daemon::starting_daemon_epoch(cfg),
@@ -3732,19 +3743,18 @@ pub fn doctor(
     // 9. Daemon service installed
     if let Some(service_path) = crate::service::service_file_path() {
         let installed = service_path.exists();
+        let (pass, fix) = daemon_service_check(installed, healthy_daemon_reachable);
         checks.push(Check {
             label: "Daemon service",
-            pass: installed,
+            pass,
             detail: if installed {
                 service_path.display().to_string()
+            } else if healthy_daemon_reachable {
+                "not installed; healthy on-demand daemon is reachable".into()
             } else {
                 "not installed".into()
             },
-            fix: if installed {
-                None
-            } else {
-                Some("kache daemon install".into())
-            },
+            fix: fix.map(str::to_string),
         });
     }
 
@@ -5452,6 +5462,16 @@ mod tests {
         assert!(!doctor_check_is_optional("Compiler probe", true, false));
         // Non-daemon, non-probe labels are never optional.
         assert!(!doctor_check_is_optional("Remote", true, true));
+    }
+
+    #[test]
+    fn daemon_service_is_satisfied_by_install_or_healthy_on_demand_daemon() {
+        assert_eq!(daemon_service_check(true, false), (true, None));
+        assert_eq!(daemon_service_check(false, true), (true, None));
+        assert_eq!(
+            daemon_service_check(false, false),
+            (false, Some("kache daemon install"))
+        );
     }
 
     /// The daemon footnote prints only for a FAILING daemon check under an

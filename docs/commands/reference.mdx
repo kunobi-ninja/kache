@@ -386,6 +386,10 @@ kache doctor [--fix [--purge-sccache]] [--verify] [--checksums] [--repair]
 
 Diagnoses common setup issues: missing `RUSTC_WRAPPER`, conflicting wrappers, config file problems, and daemon connectivity. Without `--fix`, it only reports issues.
 
+An installed daemon service is recommended but not mandatory. If a healthy
+on-demand daemon is already reachable, `doctor` reports the missing service as
+a passing runtime configuration instead of directing you to replace it.
+
 The verify family checks cache integrity:
 
 - `--verify` checks entry, blob, and metadata integrity (orphaned/missing blobs).

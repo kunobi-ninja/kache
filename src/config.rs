@@ -355,6 +355,8 @@ pub struct S3RemoteConfig {
     pub region: String,
     /// AWS profile name for credential lookup (e.g. "ceph").
     pub profile: Option<String>,
+    /// Custom User-Agent header for S3 HTTP requests.
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,6 +424,7 @@ impl RemoteConfig {
                 endpoint: None,
                 region: "us-east-1".to_string(),
                 profile: None,
+                user_agent: None,
             }),
         }
     }
@@ -646,6 +649,8 @@ pub(crate) struct RemoteFileConfig {
     pub(crate) prefix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) profile: Option<String>,
+    #[serde(alias = "user-agent", skip_serializing_if = "Option::is_none")]
+    pub(crate) user_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -677,6 +682,7 @@ pub(crate) struct EnvOverrides {
     pub(crate) s3_region: bool,
     pub(crate) s3_prefix: bool,
     pub(crate) s3_profile: bool,
+    pub(crate) s3_user_agent: bool,
     pub(crate) fallback: bool,
     pub(crate) key_salt: bool,
     pub(crate) cc_extra_allowlist_flags: bool,
@@ -706,6 +712,7 @@ impl EnvOverrides {
             s3_region: env_or_ignored("KACHE_S3_REGION", ignore_env).is_ok(),
             s3_prefix: env_or_ignored("KACHE_S3_PREFIX", ignore_env).is_ok(),
             s3_profile: env_or_ignored("KACHE_S3_PROFILE", ignore_env).is_ok(),
+            s3_user_agent: env_or_ignored("KACHE_S3_USER_AGENT", ignore_env).is_ok(),
             fallback: env_or_ignored("KACHE_FALLBACK", ignore_env).is_ok(),
             key_salt: env_or_ignored("KACHE_KEY_SALT", ignore_env).is_ok(),
             cc_extra_allowlist_flags: env_or_ignored("KACHE_CC_EXTRA_ALLOWLIST_FLAGS", ignore_env)
@@ -928,6 +935,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_S3_REGION",
     "KACHE_S3_PREFIX",
     "KACHE_S3_PROFILE",
+    "KACHE_S3_USER_AGENT",
     "KACHE_LOCAL_ONLY",
     "KACHE_REMOTE_READONLY",
     "KACHE_MODIFIED_INPUT_GUARD",
@@ -1553,7 +1561,7 @@ impl Config {
             .map(str::to_ascii_lowercase);
 
         let file_has_s3_fields = file_remote.is_some_and(|r| {
-            [&r.bucket, &r.endpoint, &r.region, &r.profile]
+            [&r.bucket, &r.endpoint, &r.region, &r.profile, &r.user_agent]
                 .into_iter()
                 .any(|v| v.as_deref().is_some_and(|v| !v.trim().is_empty()))
         });
@@ -1567,7 +1575,7 @@ impl Config {
             Some("filesystem" | "fs") => {
                 if file_has_s3_fields {
                     anyhow::bail!(
-                        "[cache.remote] type = \"filesystem\" cannot include S3 bucket, endpoint, region, or profile"
+                        "[cache.remote] type = \"filesystem\" cannot include S3 bucket, endpoint, region, profile, or user_agent"
                     );
                 }
                 true
@@ -1709,6 +1717,12 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let user_agent = env_or_ignored("KACHE_S3_USER_AGENT", ignore_env)
+            .ok()
+            .or_else(|| file_remote.and_then(|r| r.user_agent.clone()))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Ok(Some(RemoteConfig {
             prefix,
             backend: RemoteBackendConfig::S3(S3RemoteConfig {
@@ -1716,6 +1730,7 @@ impl Config {
                 endpoint,
                 region,
                 profile,
+                user_agent,
             }),
         }))
     }
@@ -3133,6 +3148,7 @@ remote_key_cache_refresh_secs = 900
                     region: Some("eu-west-1".to_string()),
                     prefix: Some("my-prefix".to_string()),
                     profile: None,
+                    user_agent: None,
                     path: None,
                     atomic_write_dir: None,
                 }),
@@ -4159,12 +4175,13 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         GenericEnvGuard { key, previous }
     }
 
-    const S3_ENV_VARS: [&str; 5] = [
+    const S3_ENV_VARS: [&str; 6] = [
         "KACHE_S3_BUCKET",
         "KACHE_S3_ENDPOINT",
         "KACHE_S3_REGION",
         "KACHE_S3_PREFIX",
         "KACHE_S3_PROFILE",
+        "KACHE_S3_USER_AGENT",
     ];
 
     /// Clear every `KACHE_S3_*` override, restoring them on drop.
@@ -4530,6 +4547,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             "KACHE_S3_REGION",
             "KACHE_S3_PREFIX",
             "KACHE_S3_PROFILE",
+            "KACHE_S3_USER_AGENT",
         ] {
             // SAFETY: serialized by config_path_lock; restored implicitly by
             // being absent (these are not set elsewhere in the test suite).
@@ -5029,5 +5047,102 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             vec!["-O2".to_string(), "-fPIC".to_string()]
         );
         assert!(normalize_cc_flags(Vec::<String>::new()).is_empty());
+    }
+
+    #[test]
+    fn s3_user_agent_loaded_from_file_and_env() {
+        let _guard = config_path_lock();
+        let _env_guard = isolate_s3_env();
+
+        // 1. From TOML with `user_agent`
+        let toml_underscore = r#"
+            [cache.remote]
+            type = "s3"
+            bucket = "my-bucket"
+            user_agent = "custom-agent/1.0"
+        "#;
+        let file_cfg: Result<FileConfig> = toml::from_str(toml_underscore).map_err(Into::into);
+        let loaded = Config::load_remote_config(&file_cfg).unwrap().unwrap();
+        match loaded.backend {
+            RemoteBackendConfig::S3(s3) => {
+                assert_eq!(s3.user_agent.as_deref(), Some("custom-agent/1.0"));
+            }
+            _ => panic!("expected S3 backend"),
+        }
+
+        // 2. From TOML with `user-agent` (alias)
+        let toml_hyphen = r#"
+            [cache.remote]
+            type = "s3"
+            bucket = "my-bucket"
+            user-agent = "custom-agent/2.0"
+        "#;
+        let file_cfg: Result<FileConfig> = toml::from_str(toml_hyphen).map_err(Into::into);
+        let loaded = Config::load_remote_config(&file_cfg).unwrap().unwrap();
+        match loaded.backend {
+            RemoteBackendConfig::S3(s3) => {
+                assert_eq!(s3.user_agent.as_deref(), Some("custom-agent/2.0"));
+            }
+            _ => panic!("expected S3 backend"),
+        }
+
+        // 3. Environment variable KACHE_S3_USER_AGENT overrides file config (precedence)
+        unsafe { std::env::set_var("KACHE_S3_USER_AGENT", "env-agent/3.0") };
+        let toml_file_val = r#"
+            [cache.remote]
+            type = "s3"
+            bucket = "my-bucket"
+            user_agent = "file-agent/1.0"
+        "#;
+        let file_cfg: Result<FileConfig> = toml::from_str(toml_file_val).map_err(Into::into);
+        let loaded = Config::load_remote_config(&file_cfg).unwrap().unwrap();
+        match loaded.backend {
+            RemoteBackendConfig::S3(s3) => {
+                assert_eq!(
+                    s3.user_agent.as_deref(),
+                    Some("env-agent/3.0"),
+                    "environment variable override must take precedence over file config"
+                );
+            }
+            _ => panic!("expected S3 backend"),
+        }
+
+        // 4. [cache] ignore_env = true suppresses environment override in favor of file
+        let toml_ignore_env = r#"
+            [cache]
+            ignore_env = true
+
+            [cache.remote]
+            type = "s3"
+            bucket = "my-bucket"
+            user_agent = "file-agent/1.0"
+        "#;
+        let resolved_cfg =
+            Config::load_resolved(toml::from_str(toml_ignore_env).map_err(Into::into)).unwrap();
+        match resolved_cfg.remote.unwrap().backend {
+            RemoteBackendConfig::S3(s3) => {
+                assert_eq!(
+                    s3.user_agent.as_deref(),
+                    Some("file-agent/1.0"),
+                    "ignore_env = true must ignore KACHE_S3_USER_AGENT in favor of file config"
+                );
+            }
+            _ => panic!("expected S3 backend"),
+        }
+        unsafe { std::env::remove_var("KACHE_S3_USER_AGENT") };
+
+        // 5. Reject user_agent when type = "filesystem"
+        let toml_fs = r#"
+            [cache.remote]
+            type = "filesystem"
+            path = "/tmp/cache"
+            user_agent = "invalid-for-fs"
+        "#;
+        let file_cfg: Result<FileConfig> = toml::from_str(toml_fs).map_err(Into::into);
+        let err = Config::load_remote_config(&file_cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot include S3 bucket, endpoint, region, profile, or user_agent")
+        );
     }
 }

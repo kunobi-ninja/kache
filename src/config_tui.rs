@@ -436,6 +436,27 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             env_locked: !filesystem_remote && env.s3_profile,
         },
         FormField {
+            key: "s3_user_agent",
+            label: "User-Agent",
+            kind: FieldKind::Text,
+            value: remote
+                .and_then(|r| r.user_agent.clone())
+                .unwrap_or_default(),
+            env_var: if env.s3_user_agent {
+                "KACHE_S3_USER_AGENT"
+            } else {
+                ""
+            },
+            env_value: if env.s3_user_agent {
+                env_val("KACHE_S3_USER_AGENT")
+            } else {
+                None
+            },
+            default_hint: "(none)",
+            validation_error: None,
+            env_locked: !filesystem_remote && env.s3_user_agent,
+        },
+        FormField {
             key: "fs_path",
             label: "Filesystem path",
             kind: FieldKind::Text,
@@ -517,11 +538,11 @@ fn build_sections() -> Vec<Section> {
         },
         Section {
             label: "Remote",
-            fields: 10..18,
+            fields: 10..19,
         },
         Section {
             label: "Advanced",
-            fields: 18..20,
+            fields: 19..21,
         },
     ]
 }
@@ -579,9 +600,15 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
     let is_configured = |key: &str| configured_value(key).is_some();
 
     let remote_type = value("remote_type").map(str::to_ascii_lowercase);
-    let has_s3_fields = ["s3_bucket", "s3_endpoint", "s3_region", "s3_profile"]
-        .iter()
-        .any(|key| is_set(key));
+    let has_s3_fields = [
+        "s3_bucket",
+        "s3_endpoint",
+        "s3_region",
+        "s3_profile",
+        "s3_user_agent",
+    ]
+    .iter()
+    .any(|key| is_set(key));
     let has_filesystem_fields = ["fs_path", "fs_atomic_write_dir"]
         .iter()
         .any(|key| is_set(key));
@@ -591,6 +618,7 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
         "s3_endpoint",
         "s3_region",
         "s3_profile",
+        "s3_user_agent",
         "fs_path",
         "fs_atomic_write_dir",
         "remote_prefix",
@@ -663,7 +691,13 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
                     ));
                 }
             }
-            for key in ["s3_bucket", "s3_endpoint", "s3_region", "s3_profile"] {
+            for key in [
+                "s3_bucket",
+                "s3_endpoint",
+                "s3_region",
+                "s3_profile",
+                "s3_user_agent",
+            ] {
                 // Legacy S3 environment variables do not apply to an explicitly
                 // selected filesystem backend. Only persisted form values conflict.
                 if is_configured(key)
@@ -704,7 +738,12 @@ fn refresh_remote_env_scope(fields: &mut [FormField]) {
     for field in fields.iter_mut().filter(|field| {
         matches!(
             field.key,
-            "s3_bucket" | "s3_endpoint" | "s3_region" | "s3_profile" | "remote_prefix"
+            "s3_bucket"
+                | "s3_endpoint"
+                | "s3_region"
+                | "s3_profile"
+                | "s3_user_agent"
+                | "remote_prefix"
         )
     }) {
         // An active KACHE_S3_* override is stored in env_var/env_value, but it
@@ -795,6 +834,7 @@ fn fields_to_file_config(
     let region = get("s3_region");
     let prefix = get("remote_prefix");
     let profile = get("s3_profile");
+    let user_agent = get("s3_user_agent");
     let path = get("fs_path");
     let atomic_write_dir = get("fs_atomic_write_dir");
     let remote_type = get("remote_type")
@@ -806,6 +846,7 @@ fn fields_to_file_config(
         || region.is_some()
         || prefix.is_some()
         || profile.is_some()
+        || user_agent.is_some()
         || path.is_some()
         || atomic_write_dir.is_some();
 
@@ -817,6 +858,7 @@ fn fields_to_file_config(
             region,
             prefix,
             profile,
+            user_agent,
             path,
             atomic_write_dir,
         })
@@ -1493,6 +1535,7 @@ mod tests {
             s3_region: false,
             s3_prefix: false,
             s3_profile: false,
+            s3_user_agent: false,
         }
     }
 
@@ -1500,13 +1543,13 @@ mod tests {
     fn test_build_fields_count() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        assert_eq!(fields.len(), 20);
+        assert_eq!(fields.len(), 21);
 
         let sections = build_sections();
         assert_eq!(sections[0].fields, 0..3);
         assert_eq!(sections[1].fields, 3..10);
-        assert_eq!(sections[2].fields, 10..18);
-        assert_eq!(sections[3].fields, 18..20);
+        assert_eq!(sections[2].fields, 10..19);
+        assert_eq!(sections[3].fields, 19..21);
     }
 
     #[test]
@@ -1519,6 +1562,12 @@ mod tests {
                 local_store: Some("~/my/cache".to_string()),
                 local_max_size: Some("100GiB".to_string()),
                 adaptive_incremental: Some(false),
+                remote: Some(RemoteFileConfig {
+                    _type: Some("s3".to_string()),
+                    bucket: Some("my-bucket".to_string()),
+                    user_agent: Some("custom-agent/1.0".to_string()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
         };
@@ -1531,6 +1580,11 @@ mod tests {
             .unwrap();
         assert_eq!(adaptive.value, "false");
         assert_eq!(adaptive.default_hint, "true");
+        let user_agent = fields
+            .iter()
+            .find(|field| field.key == "s3_user_agent")
+            .unwrap();
+        assert_eq!(user_agent.value, "custom-agent/1.0");
     }
 
     #[test]
@@ -1797,6 +1851,7 @@ mod tests {
         env.s3_region = true;
         env.s3_prefix = true;
         env.s3_profile = true;
+        env.s3_user_agent = true;
 
         let fields = build_fields(&config, &env);
         for key in [
@@ -1804,6 +1859,7 @@ mod tests {
             "s3_endpoint",
             "s3_region",
             "s3_profile",
+            "s3_user_agent",
             "remote_prefix",
         ] {
             let field = fields.iter().find(|field| field.key == key).unwrap();
@@ -1831,7 +1887,13 @@ mod tests {
             .find(|field| field.key == "fs_path")
             .unwrap()
             .value = absolute_test_path();
-        for key in ["s3_bucket", "s3_endpoint", "s3_region", "s3_profile"] {
+        for key in [
+            "s3_bucket",
+            "s3_endpoint",
+            "s3_region",
+            "s3_profile",
+            "s3_user_agent",
+        ] {
             let field = fields.iter_mut().find(|field| field.key == key).unwrap();
             field.env_locked = true;
             field.env_value = Some("ambient".to_string());
@@ -2019,6 +2081,7 @@ mod tests {
                     region: Some("eu-west-1".to_string()),
                     prefix: Some("my-project".to_string()),
                     profile: Some("build-account".to_string()),
+                    user_agent: Some("custom-ua/1.0".to_string()),
                     path: None,
                     atomic_write_dir: None,
                 }),
@@ -2239,6 +2302,51 @@ mod tests {
         assert!(remote.endpoint.is_none());
         assert!(remote.region.is_none());
         assert!(remote.profile.is_none());
+    }
+
+    #[test]
+    fn test_fields_to_file_config_only_user_agent_persists_remote() {
+        let config = FileConfig::default();
+        let mut fields = build_fields(&config, &empty_env());
+        let ua_field = fields
+            .iter_mut()
+            .find(|field| field.key == "s3_user_agent")
+            .unwrap();
+        ua_field.value = "custom-agent/1.0".to_string();
+
+        let result = fields_to_file_config(
+            &fields,
+            None,
+            None,
+            None,
+            PreservedAdvancedConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let remote = result
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.remote.as_ref())
+            .expect("remote section must be created when only s3_user_agent is populated");
+        assert_eq!(remote.user_agent.as_deref(), Some("custom-agent/1.0"));
+        assert!(remote._type.is_none());
+        assert!(remote.bucket.is_none());
+        assert!(remote.endpoint.is_none());
+        assert!(remote.region.is_none());
+        assert!(remote.profile.is_none());
+        assert!(remote.path.is_none());
+        assert!(remote.atomic_write_dir.is_none());
     }
 
     #[test]

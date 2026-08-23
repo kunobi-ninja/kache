@@ -1297,6 +1297,7 @@ mod tests {
                 endpoint: None,
                 region: "us-east-1".to_string(),
                 profile: None,
+                user_agent: None,
             }),
         };
         let backend = memory_backend();

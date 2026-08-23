@@ -1346,6 +1346,20 @@ impl Store {
         self.file_hasher().record_cached(fingerprint, hash);
     }
 
+    /// Associate an already-known content hash with the exact fingerprint the
+    /// caller observed it at, avoiding a redundant read when the file becomes a
+    /// compiler input (kunobi-ninja/kache#540). Unlike
+    /// [`Self::record_known_file_hash`] this never re-stats the path, so a file
+    /// overwritten between observation and this call cannot inherit the old
+    /// content's hash.
+    pub fn record_verified_file_hash(
+        &self,
+        fingerprint: &crate::cache_key::FileFingerprint,
+        hash: &str,
+    ) {
+        self.file_hasher().record_verified(fingerprint, hash);
+    }
+
     /// Associate a stable file with its already-known content hash, avoiding a
     /// redundant read when it becomes a compiler input. Call this only after
     /// every store-side operation that may change the file's fingerprint and

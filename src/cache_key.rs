@@ -2630,6 +2630,26 @@ impl<'db> FileHasher<'db> {
         }
     }
 
+    /// Record a hash the caller already knows for `fingerprint` — without
+    /// reading the file (kunobi-ninja/kache#540).
+    ///
+    /// The caller must have established that hash for THAT fingerprint, not
+    /// merely for that path: the row is only ever served back on an exact
+    /// fingerprint match, so a fingerprint captured at the moment the content
+    /// was known stays a true statement even if the file changes a moment
+    /// later — the changed file simply misses and gets hashed. Re-stating the
+    /// path here instead would pair the new file's fingerprint with the old
+    /// file's hash.
+    ///
+    /// Honors the same size floor as [`Self::hash`], which would not consult
+    /// the memo for a smaller file anyway.
+    pub(crate) fn record_verified(&self, fingerprint: &FileFingerprint, hash: &str) {
+        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+            return;
+        }
+        self.record_cached(fingerprint, hash);
+    }
+
     /// Hash a linked `-l static=` archive for the cache key. Clean GNU/BSD
     /// archives use a structural digest that retains exact member identity.
     /// Other non-thin inputs use a path-bound fallback; thin archives error so
@@ -2804,7 +2824,12 @@ pub(crate) fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result
 }
 
 impl FileFingerprint {
-    fn from_path(path: &Path) -> Result<Self> {
+    /// Identity of a file as the memo sees it. Also the cheapest available
+    /// proof that an external tool did NOT rewrite a file across some
+    /// operation: any in-place write bumps `mtime_ns`/`ctime_ns` (and a
+    /// replace-by-rename changes `inode`), so an unchanged fingerprint means
+    /// unchanged bytes. `restore_from_cache` reads it that way (#540).
+    pub(crate) fn from_path(path: &Path) -> Result<Self> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("reading metadata for {}", path.display()))?;
         let absolute_path = absolute_path(path);
@@ -6511,6 +6536,35 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             FileHashLookup::Hit(h) => assert_eq!(h, "cafef00d"),
             _ => panic!("expected Hit after record_cached"),
         }
+    }
+
+    #[test]
+    fn record_verified_honors_the_persistence_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let below = dir.path().join("below.rlib");
+        let at_floor = dir.path().join("at-floor.rlib");
+        std::fs::write(&below, vec![1u8; MIN_PERSISTED_HASH_BYTES as usize - 1]).unwrap();
+        std::fs::write(&at_floor, vec![2u8; MIN_PERSISTED_HASH_BYTES as usize]).unwrap();
+
+        let hasher = FileHasher::persistent(&db_path);
+        hasher.record_verified(&FileFingerprint::from_path(&below).unwrap(), "below");
+        hasher.record_verified(&FileFingerprint::from_path(&at_floor).unwrap(), "at-floor");
+
+        assert!(matches!(
+            hasher.lookup_cached(&below),
+            FileHashLookup::Uncacheable
+        ));
+        assert!(matches!(
+            hasher.lookup_cached(&at_floor),
+            FileHashLookup::Hit(hash) if hash == "at-floor"
+        ));
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_hashes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "sub-threshold fingerprints must not be stored");
     }
 
     #[test]

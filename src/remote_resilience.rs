@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+const MACOS_LOCAL_NETWORK_PRIVACY_HINT: &str = "macOS Local Network privacy may be blocking the installed LaunchAgent; allow kache in System Settings > Privacy & Security > Local Network, or run `kache daemon uninstall` so terminal builds start the daemon on demand";
+
 // ── Error classification ────────────────────────────────────────────────────
 
 /// What a failed remote operation means for the caller.
@@ -255,6 +257,30 @@ pub(crate) fn classify_remote_error(error: &anyhow::Error) -> RemoteErrorClass {
         // arbitrary local error is a remote outage would suppress healthy
         // reads and writes.
         RemoteErrorClass::Local
+    }
+}
+
+fn macos_local_network_privacy_hint(
+    platform: &str,
+    launch_agent_installed: bool,
+    detail: &str,
+) -> Option<&'static str> {
+    let detail = detail.to_ascii_lowercase();
+    (platform == "macos"
+        && launch_agent_installed
+        && (detail.contains("no route to host") || detail.contains("os error 65")))
+    .then_some(MACOS_LOCAL_NETWORK_PRIVACY_HINT)
+}
+
+fn diagnose_remote_failure(detail: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(target_os = "macos")]
+    let launch_agent_installed =
+        crate::service::service_file_path().is_some_and(|path| path.exists());
+    #[cfg(not(target_os = "macos"))]
+    let launch_agent_installed = false;
+    match macos_local_network_privacy_hint(std::env::consts::OS, launch_agent_installed, detail) {
+        Some(hint) => std::borrow::Cow::Owned(format!("{detail}; hint: {hint}")),
+        None => std::borrow::Cow::Borrowed(detail),
     }
 }
 
@@ -568,6 +594,7 @@ impl BreakerPermit {
         }
 
         let class = class.expect("poisoning class checked above");
+        let detail = diagnose_remote_failure(detail);
         state.failures = state.failures.saturating_add(1);
         if self.probe || state.failures >= self.breaker.threshold {
             state.epoch = state.epoch.wrapping_add(1);
@@ -578,7 +605,7 @@ impl BreakerPermit {
                 direction = ?self.breaker.direction,
                 operation = self.operation.label(),
                 ?class,
-                error = detail,
+                error = detail.as_ref(),
                 cooldown_secs = self.breaker.cooldown.as_secs(),
                 "remote direction degraded"
             );
@@ -589,7 +616,7 @@ impl BreakerPermit {
                 ?class,
                 failures = state.failures,
                 threshold = self.breaker.threshold,
-                error = detail,
+                error = detail.as_ref(),
                 "remote operation failed"
             );
         }
@@ -1082,6 +1109,47 @@ mod tests {
             }
             .to_string(),
             "remote deadline elapsed during request queue"
+        );
+    }
+
+    #[test]
+    fn macos_launch_agent_no_route_failure_gets_local_network_privacy_hint() {
+        let hint =
+            macos_local_network_privacy_hint("macos", true, "tcp connect error: No route to host")
+                .expect("service-managed macOS EHOSTUNREACH should be diagnosed");
+        assert!(hint.contains("Local Network privacy"));
+        assert!(hint.contains("kache daemon uninstall"));
+    }
+
+    #[test]
+    fn macos_launch_agent_errno_65_gets_local_network_privacy_hint() {
+        assert!(
+            macos_local_network_privacy_hint("macos", true, "tcp connect error (os error 65)",)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn local_network_privacy_hint_is_narrow_and_qualified() {
+        assert_eq!(
+            macos_local_network_privacy_hint(
+                "linux",
+                true,
+                "tcp connect error: No route to host (os error 65)"
+            ),
+            None
+        );
+        assert_eq!(
+            macos_local_network_privacy_hint(
+                "macos",
+                false,
+                "tcp connect error: No route to host (os error 65)"
+            ),
+            None
+        );
+        assert_eq!(
+            macos_local_network_privacy_hint("macos", true, "connection refused"),
+            None
         );
     }
 

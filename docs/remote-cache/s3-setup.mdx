@@ -67,6 +67,26 @@ With just a bucket name and no endpoint, kache uses AWS S3 with the default cred
   </Tab>
 </Tabs>
 
+### macOS and self-hosted LAN endpoints
+
+macOS 15 and newer protects connections to servers reached directly through a
+local Wi-Fi or Ethernet interface. When kache runs as an installed LaunchAgent,
+allow its **Local Network** prompt; the setting is available later under
+**System Settings > Privacy & Security > Local Network**.
+
+If only the installed daemon fails with `No route to host (os error 65)` while
+the same endpoint works from `kache daemon run` in a terminal, Local Network
+privacy is the likely cause rather than DNS or S3 credentials. Reinstall the
+service with the current kache binary so its responsible-code metadata is up to
+date. If permission still cannot be granted, use:
+
+```sh
+kache daemon uninstall
+```
+
+The next terminal build starts the daemon on demand and inherits the terminal's
+Local Network permission. Kache logs a specific hint for this failure shape.
+
 ## Credential resolution order
 
 When kache needs S3 credentials, it checks these sources in order:

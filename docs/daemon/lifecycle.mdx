@@ -31,6 +31,17 @@ For the daemon to survive reboots and start automatically, install it as a syste
 
     This creates a launchd plist at `~/Library/LaunchAgents/ninja.kunobi.kache.plist` and loads it. The daemon will start on login and restart if it crashes.
 
+    On macOS 15 and newer, the first connection to a cache server on the local
+    network may show a **Local Network** permission prompt for kache. Allow it;
+    you can review the decision later under **System Settings > Privacy &
+    Security > Local Network**. Kache embeds the usage description in its binary
+    and associates the LaunchAgent with that identity.
+
+    If an older installation instead logs `No route to host (os error 65)` for
+    a LAN endpoint, reinstall the service with the current binary. As a safe
+    fallback, `kache daemon uninstall` lets the next terminal build start an
+    on-demand daemon under the terminal's Local Network permission.
+
     To remove it:
 
     ```sh

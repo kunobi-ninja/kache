@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 const LABEL: &str = "ninja.kunobi.kache";
+const MACOS_BUNDLE_IDENTIFIER: &str = LABEL;
 const PLIST_NAME: &str = "ninja.kunobi.kache.plist";
 const LEGACY_LABEL: &str = "com.zondax.kache";
 const LEGACY_PLIST_NAME: &str = "com.zondax.kache.plist";
@@ -141,6 +142,10 @@ fn launchd_plist_content(
         <string>{exe_str}</string>
         <string>daemon</string>
         <string>run</string>
+    </array>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>{MACOS_BUNDLE_IDENTIFIER}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -1073,9 +1078,19 @@ WantedBy=default.target
         assert!(content.contains("/opt/kache/bin/kache"));
         assert!(content.contains("<string>daemon</string>"));
         assert!(content.contains("<string>run</string>"));
+        assert!(content.contains("AssociatedBundleIdentifiers"));
+        assert!(content.contains(&format!("<string>{MACOS_BUNDLE_IDENTIFIER}</string>")));
         assert!(content.contains("/var/log/kache/out.log"));
         assert!(content.contains("/var/log/kache/err.log"));
         assert!(content.contains("RunAtLoad"));
+    }
+
+    #[test]
+    fn test_embedded_macos_info_plist_matches_launchd_identity() {
+        let info = include_str!("../assets/macos/Info.plist");
+        assert!(info.contains(&format!("<string>{MACOS_BUNDLE_IDENTIFIER}</string>")));
+        assert!(info.contains("NSLocalNetworkUsageDescription"));
+        assert!(info.contains("build-cache servers configured on your local network"));
     }
 
     #[test]

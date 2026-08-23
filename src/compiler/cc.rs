@@ -1483,7 +1483,7 @@ fn parse_preprocess_dependencies(raw: &str, cwd: &Path) -> Result<Vec<PathBuf>> 
             index = index.saturating_add(3);
         } else {
             logical.push(bytes[index]);
-            index += 1;
+            index = index.saturating_add(1);
         }
     }
     let logical = std::str::from_utf8(&logical).context("cc dependency file is not UTF-8")?;

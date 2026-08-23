@@ -676,7 +676,7 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
     // direct library/test callers safe; the operation is idempotent when
     // another Kache HTTP client already installed it.
     ensure_rustls_provider();
-    let client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
         // `pool_idle_timeout` only reaps idle pooled connections; without these an
         // endpoint that accepts a connection and then goes silent hangs the
@@ -686,9 +686,17 @@ fn create_s3_operator(config: &S3RemoteConfig, pool_idle_secs: u64) -> Result<Op
         // read-inactivity deadline. Deliberately NOT a total-request timeout,
         // which would cap large artifact transfers on slow links.
         .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_INACTIVITY_TIMEOUT)
-        .build()
-        .context("building S3 HTTP client")?;
+        .read_timeout(READ_INACTIVITY_TIMEOUT);
+
+    if let Some(user_agent) = config
+        .user_agent
+        .as_deref()
+        .filter(|ua| !ua.trim().is_empty())
+    {
+        client_builder = client_builder.user_agent(user_agent);
+    }
+
+    let client = client_builder.build().context("building S3 HTTP client")?;
     let context = OperationContext::new()
         .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
 
@@ -1080,6 +1088,7 @@ mod tests {
             endpoint: Some("http://127.0.0.1:9000".to_string()),
             region: "us-east-1".to_string(),
             profile: Some("team".to_string()),
+            user_agent: Some("custom-ua/1.0".to_string()),
         };
         create_s3_operator(&config, 30).expect("S3 operator builds without network I/O");
     }
@@ -1470,5 +1479,52 @@ mod tests {
         assert_eq!(env.var("AWS_PROFILE").as_deref(), Some("selected"));
         assert_eq!(env.var("AWS_REGION").as_deref(), Some("eu-west-1"));
         assert_eq!(env.home_dir(), Some(PathBuf::from("/home/test")));
+    }
+
+    #[tokio::test]
+    async fn s3_wire_sends_custom_user_agent() {
+        let (endpoint, requests) = mock_http_server(vec![http_response("404 Not Found", "")]).await;
+
+        struct ScopedEnvVar(&'static str);
+        impl ScopedEnvVar {
+            fn set(key: &'static str, val: &str) -> Self {
+                unsafe { std::env::set_var(key, val) };
+                Self(key)
+            }
+        }
+        impl Drop for ScopedEnvVar {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(self.0) };
+            }
+        }
+
+        let _access = ScopedEnvVar::set("KACHE_S3_ACCESS_KEY", "mock-access-key");
+        let _secret = ScopedEnvVar::set("KACHE_S3_SECRET_KEY", "mock-secret-key");
+
+        let config = S3RemoteConfig {
+            bucket: "bucket".to_string(),
+            endpoint: Some(endpoint),
+            region: "us-east-1".to_string(),
+            profile: None,
+            user_agent: Some("kache-custom-agent/9.9".to_string()),
+        };
+        let operator = create_s3_operator(&config, 30).unwrap();
+        let backend = OpenDalBackend::new(operator, "s3://bucket".to_string());
+
+        assert!(
+            backend
+                .get("nested/key", Some(1024))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let requests = requests.await.unwrap();
+        let request_text = &requests[0];
+        assert!(
+            request_text.lines().any(|line| line
+                .to_ascii_lowercase()
+                .starts_with("user-agent: kache-custom-agent/9.9")),
+            "expected custom User-Agent header in request: {request_text}"
+        );
     }
 }

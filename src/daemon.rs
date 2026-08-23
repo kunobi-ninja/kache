@@ -7363,6 +7363,7 @@ const AMBIENT_REMOTE_ENV_VARS: &[&str] = &[
     "KACHE_S3_REGION",
     "KACHE_S3_PREFIX",
     "KACHE_S3_PROFILE",
+    "KACHE_S3_USER_AGENT",
     "KACHE_LOCAL_ONLY",
     "KACHE_REMOTE_READONLY",
 ];
@@ -7724,6 +7725,7 @@ mod tests {
             "KACHE_S3_REGION",
             "KACHE_S3_PREFIX",
             "KACHE_S3_PROFILE",
+            "KACHE_S3_USER_AGENT",
             "KACHE_LOCAL_ONLY",
             "KACHE_REMOTE_READONLY",
         ];

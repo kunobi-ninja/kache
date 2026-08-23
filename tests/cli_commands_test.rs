@@ -1266,6 +1266,14 @@ fn cc_compile_roundtrips_through_cache() {
         v["summary"]["local_hits"].as_u64().unwrap_or(0) >= 1,
         "report should record a local hit after the second compile: {v}"
     );
+    assert_eq!(
+        v["all_events"]
+            .as_array()
+            .and_then(|events| events.last())
+            .and_then(|event| event["preprocessor_runs"].as_u64()),
+        Some(0),
+        "plain warm compiles should reuse the private dependency memo: {v}"
+    );
 }
 
 #[test]

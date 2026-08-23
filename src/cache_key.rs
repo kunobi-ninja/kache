@@ -2352,7 +2352,7 @@ enum FileHashCache<'db> {
     Owned(Connection),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FileFingerprint {
     path: String,
     size: i64,
@@ -2459,6 +2459,127 @@ impl<'db> FileHasher<'db> {
             cache_hits: self.stats.cache_hits.get(),
             cache_misses: self.stats.cache_misses.get(),
             bytes_hashed: self.stats.bytes_hashed.get(),
+        }
+    }
+
+    /// Whether this hasher can persist C/C++ preprocessor memo records.
+    pub(crate) fn supports_cc_preprocess_memo(&self) -> bool {
+        self.cache.is_some()
+    }
+
+    /// Reuse a preprocessor-output hash only when every source/header still
+    /// has the exact metadata fingerprint captured by the successful probe.
+    /// Any database, decoding, metadata, or freshness uncertainty is a miss.
+    pub(crate) fn cc_preprocess_memo_lookup(&self, memo_key: &str) -> Option<String> {
+        let cache = self.cache.as_ref()?;
+        let record = match cache.get_cc_preprocess_memo(memo_key) {
+            Ok(record) => record?,
+            Err(error) => {
+                tracing::debug!("cc preprocess memo lookup failed: {error}");
+                return None;
+            }
+        };
+        if record.0.len() != 64
+            || !record
+                .0
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            tracing::debug!("cc preprocess memo hash is invalid");
+            return None;
+        }
+        let fingerprints: Vec<FileFingerprint> = match serde_json::from_str(&record.1) {
+            Ok(fingerprints) => fingerprints,
+            Err(error) => {
+                tracing::debug!("cc preprocess memo inputs are invalid: {error}");
+                return None;
+            }
+        };
+        if fingerprints.is_empty() {
+            return None;
+        }
+        for expected in &fingerprints {
+            let current = match FileFingerprint::from_path(Path::new(&expected.path)) {
+                Ok(current) => current,
+                Err(error) => {
+                    tracing::debug!(
+                        "cc preprocess memo input {} is unavailable: {error}",
+                        expected.path
+                    );
+                    return None;
+                }
+            };
+            self.note_too_new(&current);
+            if current != *expected || self.too_new() {
+                return None;
+            }
+        }
+        Some(record.0)
+    }
+
+    /// Capture the source/header metadata observed immediately after a full
+    /// preprocess probe. The caller revalidates this snapshot after a
+    /// successful compile or restore before committing it.
+    pub(crate) fn cc_preprocess_fingerprints(
+        &self,
+        paths: &[PathBuf],
+    ) -> Option<Vec<FileFingerprint>> {
+        if paths.is_empty() {
+            return None;
+        }
+        let mut fingerprints = Vec::with_capacity(paths.len());
+        for path in paths {
+            let fingerprint = match FileFingerprint::from_path(path) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    tracing::debug!(
+                        "cc preprocess memo input {} could not be fingerprinted: {error}",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            self.note_too_new(&fingerprint);
+            fingerprints.push(fingerprint);
+        }
+        fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
+        fingerprints.dedup_by(|a, b| a.path == b.path);
+        Some(fingerprints)
+    }
+
+    /// Commit a pending preprocessor memo after proving its inputs remained
+    /// unchanged through the successful compiler/restore boundary.
+    pub(crate) fn cc_preprocess_memo_record_if_unchanged(
+        &self,
+        memo_key: &str,
+        preprocessed_hash: &str,
+        fingerprints: &[FileFingerprint],
+    ) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        if fingerprints.is_empty() {
+            return;
+        }
+        for expected in fingerprints {
+            let Ok(current) = FileFingerprint::from_path(Path::new(&expected.path)) else {
+                return;
+            };
+            self.note_too_new(&current);
+            if current != *expected || self.too_new() {
+                return;
+            }
+        }
+        let inputs_json = match serde_json::to_string(fingerprints) {
+            Ok(inputs_json) => inputs_json,
+            Err(error) => {
+                tracing::debug!("cc preprocess memo inputs could not be encoded: {error}");
+                return;
+            }
+        };
+        if let Err(error) = cache.put_cc_preprocess_memo(memo_key, preprocessed_hash, &inputs_json)
+        {
+            tracing::debug!("cc preprocess memo update failed: {error}");
         }
     }
 
@@ -2796,6 +2917,32 @@ impl<'db> FileHashCache<'db> {
         )?;
         Ok(())
     }
+
+    fn get_cc_preprocess_memo(&self, memo_key: &str) -> rusqlite::Result<Option<(String, String)>> {
+        self.db()
+            .query_row(
+                "SELECT preprocessed_hash, inputs_json FROM cc_preprocess_memos
+                 WHERE memo_key = ?1",
+                params![memo_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+    }
+
+    fn put_cc_preprocess_memo(
+        &self,
+        memo_key: &str,
+        preprocessed_hash: &str,
+        inputs_json: &str,
+    ) -> rusqlite::Result<()> {
+        self.db().execute(
+            "INSERT OR REPLACE INTO cc_preprocess_memos
+             (memo_key, preprocessed_hash, inputs_json, updated_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            params![memo_key, preprocessed_hash, inputs_json],
+        )?;
+        Ok(())
+    }
 }
 
 pub(crate) fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
@@ -2808,6 +2955,12 @@ pub(crate) fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result
             inode      INTEGER NOT NULL DEFAULT 0,
             hash       TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS cc_preprocess_memos (
+            memo_key          TEXT PRIMARY KEY,
+            preprocessed_hash TEXT NOT NULL,
+            inputs_json       TEXT NOT NULL,
+            updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
         );",
     )?;
     for column in [
@@ -6367,6 +6520,15 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
     }
 
     #[test]
+    fn cc_preprocess_memo_support_requires_persistent_cache() {
+        assert!(!FileHasher::new().supports_cc_preprocess_memo());
+
+        let dir = tempfile::tempdir().unwrap();
+        let persistent = FileHasher::persistent(&dir.path().join("idx.sqlite"));
+        assert!(persistent.supports_cc_preprocess_memo());
+    }
+
+    #[test]
     fn file_hash_memo_key_includes_inode() {
         // An in-place swap that preserves path+size+mtime+ctime but changes the
         // inode (and content) must NOT return a stale memoized hash
@@ -6392,6 +6554,75 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             cache.get(&fp(20)).unwrap(),
             None,
             "a different inode (same path/size/mtime/ctime) must miss the memo"
+        );
+    }
+
+    #[test]
+    fn cc_preprocess_memo_requires_every_input_fingerprint_to_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let source = dir.path().join("source.c");
+        let header = dir.path().join("header.h");
+        std::fs::write(&source, "#include \"header.h\"\n").unwrap();
+        std::fs::write(&header, "#define VALUE 1\n").unwrap();
+
+        let hasher = FileHasher::persistent(&db);
+        let inputs = hasher
+            .cc_preprocess_fingerprints(&[source.clone(), header.clone()])
+            .unwrap();
+        let pp_hash = "a".repeat(64);
+        hasher.cc_preprocess_memo_record_if_unchanged("memo-key", &pp_hash, &inputs);
+        assert_eq!(
+            hasher.cc_preprocess_memo_lookup("memo-key").as_deref(),
+            Some(pp_hash.as_str())
+        );
+
+        let inputs_json = serde_json::to_string(&inputs).unwrap();
+        let cache = hasher.cache.as_ref().unwrap();
+        cache
+            .put_cc_preprocess_memo("short-hash", "a", &inputs_json)
+            .unwrap();
+        cache
+            .put_cc_preprocess_memo("non-hex-hash", &"z".repeat(64), &inputs_json)
+            .unwrap();
+        assert_eq!(hasher.cc_preprocess_memo_lookup("short-hash"), None);
+        assert_eq!(hasher.cc_preprocess_memo_lookup("non-hex-hash"), None);
+
+        let mut fresh_hasher = FileHasher::persistent(&db);
+        fresh_hasher.arm_too_new_guard(1, 0);
+        assert_eq!(
+            fresh_hasher.cc_preprocess_memo_lookup("memo-key"),
+            None,
+            "an input too new for the invocation must force preprocessing"
+        );
+        fresh_hasher.cc_preprocess_memo_record_if_unchanged("too-new", &pp_hash, &inputs);
+        assert!(
+            fresh_hasher
+                .cache
+                .as_ref()
+                .unwrap()
+                .get_cc_preprocess_memo("too-new")
+                .unwrap()
+                .is_none(),
+            "too-new inputs must not publish a memo"
+        );
+
+        std::fs::write(&header, "#define VALUE 12345\n").unwrap();
+        assert_eq!(
+            hasher.cc_preprocess_memo_lookup("memo-key"),
+            None,
+            "a changed transitive header must force preprocessing"
+        );
+        hasher.cc_preprocess_memo_record_if_unchanged("changed", &pp_hash, &inputs);
+        assert!(
+            hasher
+                .cache
+                .as_ref()
+                .unwrap()
+                .get_cc_preprocess_memo("changed")
+                .unwrap()
+                .is_none(),
+            "changed inputs must not publish a memo"
         );
     }
 

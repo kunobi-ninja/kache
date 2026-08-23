@@ -587,6 +587,10 @@ fn probe_forward_compiler() -> String {
 /// follow-ups — single-machine caching is the shipped concept.
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
+    let invocation_start_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as i64)
+        .unwrap_or(0);
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
@@ -677,7 +681,10 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // fall back to passthrough, which runs the real compiler and
     // surfaces the real diagnostic.
     let key_start = std::time::Instant::now();
-    let file_hasher = crate::cache_key::FileHasher::new();
+    let mut file_hasher = store.file_hasher();
+    // Memo publication always uses the too-new guard: a header modified while
+    // preprocessing cannot safely describe the captured expansion.
+    file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let key_ctx = KeyCtx {
         file_hasher: &file_hasher,
@@ -795,6 +802,8 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 eprint!("{}", meta.stderr);
             }
 
+            compiler.commit_preprocess_memo(&file_hasher);
+
             return Ok(0);
         }
     }
@@ -848,6 +857,9 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
     let store_candidate = should_store_cc_result(result.exit_code, !result.artifacts.is_empty());
+    if store_candidate {
+        compiler.commit_preprocess_memo(&file_hasher);
+    }
     // The CC path has no remote upload pipeline, so remote configuration must
     // not bypass its local-store admission threshold.
     let admitted = store_admits_compile(config, compile_time_ms, false);

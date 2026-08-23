@@ -45,6 +45,7 @@ max_compiler_runs = 1
 [assertions.warm]
 min_hits = 1
 max_compiler_runs = 0
+max_preprocessor_runs = 0
 
 [assertions.noop]
 should_not_recompile = false

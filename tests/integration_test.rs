@@ -123,6 +123,14 @@ fn assert_last_cc_event(report: &serde_json::Value, result: &str, compiler_runs:
     assert_eq!(last["compiler_runs"].as_u64(), Some(compiler_runs));
 }
 
+fn assert_last_cc_preprocessor_runs(report: &serde_json::Value, preprocessor_runs: u64) {
+    let last = report["all_events"]
+        .as_array()
+        .and_then(|events| events.last())
+        .expect("report should include at least one event");
+    assert_eq!(last["preprocessor_runs"].as_u64(), Some(preprocessor_runs));
+}
+
 fn find_depinfo_containing(root: &Path, needle: &str) -> Option<(PathBuf, String)> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -1882,6 +1890,51 @@ fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     let report = kache_report(pp_cache_dir.path());
     assert_cc_report_counts(&report, 1, 1);
     assert_last_cc_event(&report, "local_hit", 0);
+}
+
+#[test]
+fn test_cc_preprocess_memo_skips_warm_probe_and_invalidates_on_header_change() {
+    build_kache();
+
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::write(project.path().join("value.h"), "#define VALUE 7\n").unwrap();
+    std::fs::write(
+        project.path().join("foo.c"),
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    let args = [
+        "cc", "-O0", "-g0", "-MMD", "-MF", "foo.d", "-c", "foo.c", "-o", "foo.o",
+    ];
+
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "miss", 1);
+    assert_last_cc_preprocessor_runs(&report, 1);
+
+    std::fs::remove_file(project.path().join("foo.o")).unwrap();
+    std::fs::remove_file(project.path().join("foo.d")).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "local_hit", 0);
+    assert_last_cc_preprocessor_runs(&report, 0);
+
+    // Different length guarantees a metadata fingerprint change even on a
+    // coarse-timestamp filesystem. The stale memo must run the preprocessor,
+    // derive a new object key, and compile rather than restore VALUE=7.
+    std::fs::write(project.path().join("value.h"), "#define VALUE 12345\n").unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "miss", 1);
+    assert_last_cc_preprocessor_runs(&report, 1);
+
+    std::fs::remove_file(project.path().join("foo.o")).unwrap();
+    std::fs::remove_file(project.path().join("foo.d")).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "local_hit", 0);
+    assert_last_cc_preprocessor_runs(&report, 0);
 }
 
 #[cfg(unix)]

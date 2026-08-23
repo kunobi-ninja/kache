@@ -6495,6 +6495,15 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
     }
 
     #[test]
+    fn cc_preprocess_memo_support_requires_persistent_cache() {
+        assert!(!FileHasher::new().supports_cc_preprocess_memo());
+
+        let dir = tempfile::tempdir().unwrap();
+        let persistent = FileHasher::persistent(&dir.path().join("idx.sqlite"));
+        assert!(persistent.supports_cc_preprocess_memo());
+    }
+
+    #[test]
     fn file_hash_memo_key_includes_inode() {
         // An in-place swap that preserves path+size+mtime+ctime but changes the
         // inode (and content) must NOT return a stale memoized hash

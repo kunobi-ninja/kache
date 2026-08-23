@@ -7965,6 +7965,31 @@ mod tests {
     }
 
     #[test]
+    fn cc_memo_os_bytes_preserves_distinct_values() {
+        assert_ne!(
+            cc_memo_os_bytes(OsStr::new("compiler-a")),
+            cc_memo_os_bytes(OsStr::new("compiler-b"))
+        );
+    }
+
+    #[test]
+    fn cc_preprocess_memo_key_is_blake3_digest() {
+        let compiler = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let parsed =
+            CcArgs::parse(&[compiler, "-c".to_string(), "memo-source.c".to_string()]).unwrap();
+        let key = cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap();
+
+        assert_eq!(key.len(), 64);
+        assert!(
+            key.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+
+    #[test]
     fn cc_prefix_maps_empty_for_clang_cl() {
         let cwd = std::path::Path::new("/work/proj");
         let cl = CcArgs::parse(&s(&["clang-cl", "-c", "/work/proj/a.c"])).unwrap();

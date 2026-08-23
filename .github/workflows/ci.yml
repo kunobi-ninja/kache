@@ -196,7 +196,7 @@ jobs:
           matrix="$(python3 -c '
           import json, sys
           count = int(sys.argv[1])
-          total = max(1, (count + 14) // 15)
+          total = max(1, (count + 9) // 10)
           if total > 256:
               raise SystemExit(
                   f"changed-line scope needs {total} shards; GitHub permits at most 256"
@@ -346,7 +346,7 @@ jobs:
           path: tmp/mutants/service
           retention-days: 14
 
-  # PR-only workspace mutation is split into round-robin shards. Fifteen
+  # PR-only workspace mutation is split into round-robin shards. Ten
   # serial in-place mutants per runner bounds exposure to slow or pathological
   # mutants, while round-robin avoids concentrating them in one shard.
   mutation-diff:

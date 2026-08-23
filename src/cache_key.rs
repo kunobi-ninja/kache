@@ -1081,11 +1081,12 @@ pub fn compute_cache_key(
 
         hasher.set_group("env_deps");
         for (var, val) in &dep_info.env_deps {
-            let normalized_env_dep = normalize_env_dep_value(
+            let normalized_env_dep = normalize_env_dep_value_with_hasher(
                 crate_name,
                 var,
                 val,
                 &dep_info.source_files,
+                file_hasher,
                 path_normalizer,
             );
             fold_field(&mut hasher, b"env_dep_var:", var.as_bytes());
@@ -1841,11 +1842,12 @@ fn sentinelized_env_dep_value(resolved: &str, normalized: &str) -> String {
     }
 }
 
-fn normalize_env_dep_value(
+fn normalize_env_dep_value_with_hasher(
     crate_name: &str,
     var: &str,
     val: &str,
     source_files: &[std::path::PathBuf],
+    file_hasher: &FileHasher<'_>,
     path_normalizer: &PathNormalizer,
 ) -> NormalizedEnvDep {
     // Resolve the value to the SAME canonical form the rule prefixes use
@@ -1899,6 +1901,7 @@ fn normalize_env_dep_value(
         &resolved,
         source_files,
         path_normalizer.path_only_env_vars(),
+        file_hasher,
     ) {
         // A value under the build's own OUT_DIR normalizes relative to
         // OUT_DIR itself (kunobi-ninja/kache#330): the generic prefix rules
@@ -1927,6 +1930,24 @@ fn normalize_env_dep_value(
     }
 }
 
+#[cfg(test)]
+fn normalize_env_dep_value(
+    crate_name: &str,
+    var: &str,
+    val: &str,
+    source_files: &[std::path::PathBuf],
+    path_normalizer: &PathNormalizer,
+) -> NormalizedEnvDep {
+    normalize_env_dep_value_with_hasher(
+        crate_name,
+        var,
+        val,
+        source_files,
+        &FileHasher::new(),
+        path_normalizer,
+    )
+}
+
 /// Whether `var`'s value may be path-normalized in the cache key. `allowlist`
 /// is the user-configured opt-in set (`KACHE_PATH_ONLY_ENV_VARS` /
 /// `[cache] path_only_env_vars`); OUT_DIR is always included.
@@ -1935,6 +1956,7 @@ fn env_dep_is_safe_to_normalize(
     val: &str,
     source_files: &[std::path::PathBuf],
     allowlist: &[String],
+    file_hasher: &FileHasher<'_>,
 ) -> bool {
     // OUT_DIR is the built-in path-only exception:
     //
@@ -1970,7 +1992,7 @@ fn env_dep_is_safe_to_normalize(
     // value is still kept absolute.
     (var == "OUT_DIR" || allowlist.iter().any(|v| v == var) || value_is_under_out_dir(val))
         && path_is_only_used_for_includes(val, source_files)
-        && !env_dep_has_runtime_value_use(var, source_files)
+        && !env_dep_has_runtime_value_use(var, source_files, file_hasher)
 }
 
 /// True when `val` is an absolute path located under the current build's
@@ -2046,10 +2068,15 @@ fn path_is_only_used_for_includes(
 /// True when source text shows `env!(var)` / `option_env!(var)` outside an
 /// `include*!(...)` path-locator context. Missing files fail closed: if we
 /// cannot prove the env dep is path-only, keep the absolute value in the key.
-fn env_dep_has_runtime_value_use(var: &str, source_files: &[std::path::PathBuf]) -> bool {
+fn env_dep_has_runtime_value_use(
+    var: &str,
+    source_files: &[std::path::PathBuf],
+    file_hasher: &FileHasher<'_>,
+) -> bool {
     for file in source_files {
-        let bytes = match std::fs::read(file) {
-            Ok(bytes) => bytes,
+        match file_hasher.runtime_env_use(file, var) {
+            Ok(false) => {}
+            Ok(true) => return true,
             Err(e) => {
                 tracing::debug!(
                     "keeping env dep {var} absolute: failed to inspect source {}: {}",
@@ -2058,10 +2085,6 @@ fn env_dep_has_runtime_value_use(var: &str, source_files: &[std::path::PathBuf])
                 );
                 return true;
             }
-        };
-        let source = String::from_utf8_lossy(&bytes);
-        if source_has_runtime_env_dep_use(&source, var) {
-            return true;
         }
     }
     false
@@ -2316,6 +2339,8 @@ pub struct FileHasher<'db> {
     cache: Option<FileHashCache<'db>>,
     daemon_socket: Option<PathBuf>,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
+    recent_hashes: RefCell<HashMap<PathBuf, RecentHash>>,
+    runtime_env_uses: RefCell<HashMap<(String, String), bool>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
 }
@@ -2384,12 +2409,20 @@ struct PrefetchedHash {
     bytes_hashed: u64,
 }
 
+#[derive(Clone)]
+struct RecentHash {
+    hash: String,
+    fingerprint: Option<FileFingerprint>,
+}
+
 impl FileHasher<'static> {
     pub fn new() -> Self {
         FileHasher {
             cache: None,
             daemon_socket: None,
             prefetched: RefCell::new(HashMap::new()),
+            recent_hashes: RefCell::new(HashMap::new()),
+            runtime_env_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
         }
@@ -2402,6 +2435,8 @@ impl FileHasher<'static> {
                 cache: Some(cache),
                 daemon_socket: None,
                 prefetched: RefCell::new(HashMap::new()),
+                recent_hashes: RefCell::new(HashMap::new()),
+                runtime_env_uses: RefCell::new(HashMap::new()),
                 stats: FileHashStatsCells::default(),
                 too_new: TooNewGuard::default(),
             },
@@ -2422,6 +2457,8 @@ impl<'db> FileHasher<'db> {
             cache: Some(FileHashCache::Borrowed(db)),
             daemon_socket: None,
             prefetched: RefCell::new(HashMap::new()),
+            recent_hashes: RefCell::new(HashMap::new()),
+            runtime_env_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
         }
@@ -2640,9 +2677,22 @@ impl<'db> FileHasher<'db> {
 
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
+        let (hash, fingerprint) = self.hash_inner(path)?;
+        self.recent_hashes.borrow_mut().insert(
+            absolute_path(path),
+            RecentHash {
+                hash: hash.clone(),
+                fingerprint,
+            },
+        );
+        Ok(hash)
+    }
+
+    fn hash_inner(&self, path: &Path) -> Result<(String, Option<FileFingerprint>)> {
         let Some(cache) = &self.cache else {
             if self.too_new.invocation_start_ns == 0 {
-                return hash_file(path);
+                let hash = hash_file(path)?;
+                return Ok((hash, FileFingerprint::from_path(path).ok()));
             }
             let before = FileFingerprint::from_path(path).ok();
             if let Some(fingerprint) = &before {
@@ -2656,7 +2706,7 @@ impl<'db> FileHasher<'db> {
             if before != after {
                 self.too_new.saw_too_new.set(true);
             }
-            return Ok(hash);
+            return Ok((hash, after));
         };
 
         let fingerprint = match FileFingerprint::from_path(path) {
@@ -2666,7 +2716,7 @@ impl<'db> FileHasher<'db> {
                     "file hash cache metadata lookup failed for {}: {e}",
                     path.display()
                 );
-                return hash_file(path);
+                return hash_file(path).map(|hash| (hash, None));
             }
         };
 
@@ -2675,7 +2725,7 @@ impl<'db> FileHasher<'db> {
         if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
             let hash = hash_file(path)?;
             self.record_miss(fingerprint.size);
-            return Ok(hash);
+            return Ok((hash, Some(fingerprint)));
         }
 
         if let Some(prefetched) = self.prefetched.borrow().get(&fingerprint) {
@@ -2685,13 +2735,13 @@ impl<'db> FileHasher<'db> {
                 self.record_miss_count();
                 self.record_miss_bytes(prefetched.bytes_hashed);
             }
-            return Ok(prefetched.hash.clone());
+            return Ok((prefetched.hash.clone(), Some(fingerprint)));
         }
 
         match cache.get(&fingerprint) {
             Ok(Some(hash)) => {
                 self.record_hit();
-                return Ok(hash);
+                return Ok((hash, Some(fingerprint)));
             }
             Ok(None) => {}
             Err(e) => {
@@ -2704,7 +2754,86 @@ impl<'db> FileHasher<'db> {
         if let Err(e) = cache.put(&fingerprint, &hash) {
             tracing::debug!("file hash cache update failed for {}: {e}", path.display());
         }
-        Ok(hash)
+        Ok((hash, Some(fingerprint)))
+    }
+
+    /// Return whether `var` is used by this source outside an `include*` path.
+    /// Decisions are keyed by the already-computed content hash, so warm key
+    /// construction can reuse them without opening the source again (#557).
+    fn runtime_env_use(&self, path: &Path, var: &str) -> Result<bool> {
+        let absolute = absolute_path(path);
+        let recent = self.recent_hashes.borrow().get(&absolute).cloned();
+        let recent = match recent {
+            Some(recent) => recent,
+            None => {
+                self.hash(path)?;
+                self.recent_hashes
+                    .borrow()
+                    .get(&absolute)
+                    .cloned()
+                    .expect("a successful hash records its fingerprint")
+            }
+        };
+        if let Some(expected) = recent.fingerprint {
+            let current = FileFingerprint::from_path(path)
+                .with_context(|| format!("revalidating {} before env-use scan", path.display()))?;
+            if current != expected {
+                anyhow::bail!(
+                    "source {} changed between content hashing and env-use scan",
+                    path.display()
+                );
+            }
+            return self.runtime_env_use_for_hash(path, var, &recent.hash);
+        }
+
+        // Without a trustworthy fingerprint, bypass memo lookup. The scan
+        // still verifies the content hash before recording a reusable result.
+        self.scan_runtime_env_use(path, var, &recent.hash)
+    }
+
+    fn runtime_env_use_for_hash(&self, path: &Path, var: &str, content_hash: &str) -> Result<bool> {
+        let key = (content_hash.to_string(), var.to_string());
+        if let Some(result) = self.runtime_env_uses.borrow().get(&key) {
+            return Ok(*result);
+        }
+
+        if let Some(cache) = &self.cache {
+            match cache.get_runtime_env_use(content_hash, var) {
+                Ok(Some(result)) => {
+                    self.runtime_env_uses.borrow_mut().insert(key, result);
+                    return Ok(result);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!("runtime env-use cache lookup failed: {error}");
+                }
+            }
+        }
+
+        self.scan_runtime_env_use(path, var, content_hash)
+    }
+
+    fn scan_runtime_env_use(&self, path: &Path, var: &str, content_hash: &str) -> Result<bool> {
+        let key = (content_hash.to_string(), var.to_string());
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading {} for env-use scan", path.display()))?;
+        let observed_hash = blake3::hash(&bytes).to_hex().to_string();
+        if observed_hash != content_hash {
+            anyhow::bail!(
+                "source {} changed between content hashing and env-use scan",
+                path.display()
+            );
+        }
+
+        let source = String::from_utf8_lossy(&bytes);
+        let result = source_has_runtime_env_dep_use(&source, var);
+        if let Some(cache) = &self.cache
+            && let Err(error) = cache.put_runtime_env_use(content_hash, var, result)
+        {
+            tracing::debug!("runtime env-use cache update failed: {error}");
+        }
+        self.runtime_env_uses.borrow_mut().insert(key, result);
+        Ok(result)
     }
 
     /// Cache lookup ONLY — reads the persistent hash cache, never computes a
@@ -2918,6 +3047,32 @@ impl<'db> FileHashCache<'db> {
         Ok(())
     }
 
+    fn get_runtime_env_use(&self, content_hash: &str, var: &str) -> rusqlite::Result<Option<bool>> {
+        self.db()
+            .query_row(
+                "SELECT has_runtime_use FROM source_env_runtime_uses
+                 WHERE content_hash = ?1 AND env_var = ?2",
+                params![content_hash, var],
+                |row| row.get::<_, i64>(0).map(|value| value != 0),
+            )
+            .optional()
+    }
+
+    fn put_runtime_env_use(
+        &self,
+        content_hash: &str,
+        var: &str,
+        has_runtime_use: bool,
+    ) -> rusqlite::Result<()> {
+        self.db().execute(
+            "INSERT OR REPLACE INTO source_env_runtime_uses
+             (content_hash, env_var, has_runtime_use, updated_at)
+             VALUES (?1, ?2, ?3, datetime('now'))",
+            params![content_hash, var, i64::from(has_runtime_use)],
+        )?;
+        Ok(())
+    }
+
     fn get_cc_preprocess_memo(&self, memo_key: &str) -> rusqlite::Result<Option<(String, String)>> {
         self.db()
             .query_row(
@@ -2961,6 +3116,13 @@ pub(crate) fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result
             preprocessed_hash TEXT NOT NULL,
             inputs_json       TEXT NOT NULL,
             updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS source_env_runtime_uses (
+            content_hash    TEXT NOT NULL,
+            env_var         TEXT NOT NULL,
+            has_runtime_use INTEGER NOT NULL,
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (content_hash, env_var)
         );",
     )?;
     for column in [
@@ -6517,6 +6679,59 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let hash1 = hasher.hash(&file).unwrap();
         let hash2 = hasher.hash(&file).unwrap();
         assert_eq!(hash1, hash2, "FileHasher must be deterministic");
+    }
+
+    #[test]
+    fn runtime_env_use_memo_reuses_positive_and_negative_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let source = dir.path().join("lib.rs");
+        std::fs::write(
+            &source,
+            br#"pub const OUT: &str = env!("OUT_DIR"); pub const N: usize = 1;"#,
+        )
+        .unwrap();
+
+        let hasher = FileHasher::persistent(&db);
+        let content_hash = hasher.hash(&source).unwrap();
+        assert!(hasher.runtime_env_use(&source, "OUT_DIR").unwrap());
+        assert!(!hasher.runtime_env_use(&source, "OTHER_DIR").unwrap());
+        drop(hasher);
+
+        // A fresh wrapper can answer both decisions from SQLite using the
+        // content hash it already obtained while building the cache key. The
+        // source is gone, so either attempted reread would fail this test.
+        std::fs::remove_file(&source).unwrap();
+        let fresh = FileHasher::persistent(&db);
+        assert!(
+            fresh
+                .runtime_env_use_for_hash(&source, "OUT_DIR", &content_hash)
+                .unwrap()
+        );
+        assert!(
+            !fresh
+                .runtime_env_use_for_hash(&source, "OTHER_DIR", &content_hash)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_env_use_scan_rejects_content_changed_after_hashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, br#"include!(concat!(env!("OUT_DIR"), "/x.rs"));"#).unwrap();
+
+        let hasher = FileHasher::new();
+        hasher.hash(&source).unwrap();
+        std::fs::write(&source, br#"pub const OUT: &str = env!("OUT_DIR");"#).unwrap();
+
+        let error = hasher.runtime_env_use(&source, "OUT_DIR").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed between content hashing"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

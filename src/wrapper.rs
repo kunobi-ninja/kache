@@ -2677,6 +2677,24 @@ fn restore_link_strategy(kind: ArtifactKind, executable: bool) -> link::LinkStra
     }
 }
 
+/// Whether a restored artifact's bytes are still the store blob's bytes.
+///
+/// Only [`RestoredBytes::ExactBlobCopy`] may be paired with the blob's
+/// recorded digest in the file-hash memo (kunobi-ninja/kache#540) — a rewritten
+/// artifact hashes to something the entry never recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoredBytes {
+    /// Reflinked, hardlinked or copied verbatim: `cached_file.hash` describes
+    /// exactly what was on disk at this fingerprint. The fingerprint is carried
+    /// rather than re-read later, so the claim stays true even if something
+    /// overwrites the artifact right afterwards.
+    ExactBlobCopy(crate::cache_key::FileFingerprint),
+    /// kache transformed the content itself (dep-info re-rooting), an external
+    /// post-restore tool mutated the file in place (codesigning), or the
+    /// artifact could not be fingerprinted at all.
+    Rewritten,
+}
+
 /// Materialize one cached blob at its invocation-specific output path.
 ///
 /// The caller owns target-path resolution because that is compiler-specific
@@ -2711,7 +2729,7 @@ fn materialize_cached_artifact(
     platform: &dyn crate::compiler::Platform,
     context: &str,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
-) -> Result<()> {
+) -> Result<RestoredBytes> {
     let store_path = blobs.blob_path(&cached_file.hash);
     if !store_path.exists() {
         // Blob gone before we could open it — almost always a concurrent GC /
@@ -2773,6 +2791,7 @@ fn materialize_cached_artifact(
     };
 
     let strategy = restore_link_strategy(kind, cached_file.executable);
+    let rewrote_content = transformed.is_some();
     match transformed {
         Some(content) => {
             // Freshly written bytes already carry a write-clock mtime by
@@ -2812,15 +2831,48 @@ fn materialize_cached_artifact(
         }
     }
 
-    for action in &plan {
-        if !action.is_content_transform() {
-            action
-                .apply(target_path, platform)
-                .with_context(|| format!("{context}: applying {action:?}"))?;
-        }
+    // Byte-exactness is decided here, at the one site that knows what the
+    // restore actually did (kunobi-ninja/kache#540). A content transform
+    // already means the bytes are kache's, not the blob's. External actions
+    // are handed a real file and may rewrite it — macOS re-signs an
+    // invalidated binary, the Linux and Windows impls do nothing — so instead
+    // of predicting per platform, fingerprint the artifact across them and let
+    // an unchanged fingerprint prove nothing was touched. Cheap (a stat, or two
+    // when such an action is planned) and it stays honest when a new action or
+    // platform is added.
+    //
+    // The closing fingerprint is returned, not re-read by the caller: it is the
+    // one that was observed to hold the blob's bytes.
+    let external: Vec<_> = plan
+        .iter()
+        .copied()
+        .filter(|action| !action.is_content_transform())
+        .collect();
+    // Content rewrites are already rejected below. Capture the pre-action
+    // fingerprint whenever an external action exists so that action must prove
+    // it left the restored bytes untouched.
+    let before = (!external.is_empty())
+        .then(|| crate::cache_key::FileFingerprint::from_path(target_path).ok())
+        .flatten();
+
+    for action in &external {
+        action
+            .apply(target_path, platform)
+            .with_context(|| format!("{context}: applying {action:?}"))?;
     }
 
-    Ok(())
+    if rewrote_content {
+        return Ok(RestoredBytes::Rewritten);
+    }
+    let Ok(after) = crate::cache_key::FileFingerprint::from_path(target_path) else {
+        return Ok(RestoredBytes::Rewritten);
+    };
+    let untouched = external.is_empty() || before.is_some_and(|before| before == after);
+    Ok(if untouched {
+        RestoredBytes::ExactBlobCopy(after)
+    } else {
+        RestoredBytes::Rewritten
+    })
 }
 
 /// Restore cached artifacts to the target output paths.
@@ -3043,6 +3095,40 @@ impl BlobSource<'_> {
     fn remove_entry(&self, cache_key: &str) {
         if let BlobSource::Store(store) = self {
             let _ = store.remove_entry(cache_key);
+        }
+    }
+
+    /// Tell the file-hash memo what these just-restored artifacts hash to
+    /// (kunobi-ninja/kache#540).
+    ///
+    /// A restored `.rlib`/`.rmeta` is a compiler input for every downstream
+    /// crate in the same build, and hashing it is how those crates' cache keys
+    /// get computed. The entry already carries a verified blake3 for each
+    /// blob, and an [`RestoredBytes::ExactBlobCopy`] restore put exactly those
+    /// bytes on disk, so the read is redundant — this is the restore-side
+    /// counterpart to the seeding `Store::put` already does for
+    /// freshly-compiled outputs. Mis-seeding cannot outlive the file: the memo
+    /// is keyed on size + mtime + ctime + inode, so any later write to the
+    /// artifact retires the row rather than serving it.
+    ///
+    /// Each pair is recorded against the fingerprint that was observed to hold
+    /// the blob's bytes, never against a fresh stat of the path. That is what
+    /// makes a late write harmless rather than dangerous: if anything
+    /// overwrote the artifact after its restore, the row simply stops matching
+    /// and the file gets hashed for real. Recording in order also means the
+    /// last write wins for a path, matching what survives on disk.
+    ///
+    /// Best-effort by construction — `record_verified_file_hash` drops files
+    /// below the memo's size floor, which the hasher would not consult anyway.
+    /// The daemon-assisted local-hit path (`local_hit_daemon`, off by default)
+    /// holds no store handle here and is not seeded; it would need the daemon
+    /// to record on its behalf.
+    fn record_known_file_hashes(&self, restored: &[(crate::cache_key::FileFingerprint, &str)]) {
+        let BlobSource::Store(store) = self else {
+            return;
+        };
+        for (fingerprint, hash) in restored {
+            store.record_verified_file_hash(fingerprint, hash);
         }
     }
 }
@@ -3269,6 +3355,10 @@ fn restore_from_cache(
         platform.name()
     );
 
+    // Artifacts that came back as verbatim blob copies, each paired with the
+    // digest the entry already recorded for it (kunobi-ninja/kache#540).
+    let mut exact_restores: Vec<(crate::cache_key::FileFingerprint, &str)> = Vec::new();
+
     for cached_file in &meta.files {
         // Defense-in-depth trust-boundary check (kunobi-ninja/kache#211):
         // `import_downloaded_entry` already rejects unsafe names, but a name that
@@ -3298,7 +3388,7 @@ fn restore_from_cache(
         // the kind, `plan_post_restore` the actions — no ad-hoc filename
         // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
-        materialize_cached_artifact(
+        let restored = materialize_cached_artifact(
             blobs,
             cached_file,
             &target_path,
@@ -3311,7 +3401,12 @@ fn restore_from_cache(
             "rustc restore",
             extra_inputs,
         )?;
+        if let RestoredBytes::ExactBlobCopy(fingerprint) = restored {
+            exact_restores.push((fingerprint, &cached_file.hash));
+        }
     }
+
+    blobs.record_known_file_hashes(&exact_restores);
 
     Ok(())
 }
@@ -6397,6 +6492,227 @@ mod tests {
         );
     }
 
+    // ── restored-blob digest reuse (kunobi-ninja/kache#540) ──────────
+
+    /// A plain library restore is a verbatim blob copy, so the entry's recorded
+    /// digest still describes the file on disk and may be reused as its hash.
+    #[test]
+    fn materialize_reports_a_plain_library_restore_as_an_exact_blob_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "1111111111111111111111111111111111111111111111111111111111111111";
+        create_blob(&store, hash, b"rlib bytes");
+        let cached = cached_file("libfoo.rlib", hash);
+        let target = dir.path().join("target").join("libfoo.rlib");
+        let platform = platform::current();
+
+        let restored = materialize_cached_artifact(
+            &BlobSource::Store(&store),
+            &cached,
+            &target,
+            ArtifactKind::Library,
+            dir.path(),
+            dir.path(),
+            None,
+            &[],
+            &*platform,
+            "test restore",
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(restored, RestoredBytes::ExactBlobCopy(_)));
+        assert_eq!(std::fs::read(&target).unwrap(), b"rlib bytes");
+    }
+
+    /// Dep-info is re-rooted for this consumer on the way out of the store, so
+    /// what lands on disk is not what the blob's digest describes.
+    #[test]
+    fn materialize_reports_a_rewritten_depinfo_restore_as_not_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "2222222222222222222222222222222222222222222222222222222222222222";
+        create_blob(
+            &store,
+            hash,
+            b"__kache_root__/debug/deps/libfoo.rlib: __kache_cwd__/src/lib.rs\n",
+        );
+        let cached = cached_file("foo.d", hash);
+        let target = dir.path().join("target").join("foo.d");
+        let platform = platform::current();
+
+        let restored = materialize_cached_artifact(
+            &BlobSource::Store(&store),
+            &cached,
+            &target,
+            ArtifactKind::DepInfo,
+            &dir.path().join("target"),
+            dir.path(),
+            None,
+            &[],
+            &*platform,
+            "test restore",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(restored, RestoredBytes::Rewritten);
+    }
+
+    /// An external post-restore action that leaves the file alone — every
+    /// platform but macOS-arm64 signing, plus macOS when the existing signature
+    /// is still valid — keeps the restore exact.
+    #[test]
+    fn materialize_reports_an_untouched_external_action_as_an_exact_blob_copy() {
+        use crate::compiler::platform::tests::CountingPlatform;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "3333333333333333333333333333333333333333333333333333333333333333";
+        create_blob(&store, hash, b"\x7fELF proc-macro");
+        let cached = cached_file("libmac.so", hash);
+        let target = dir.path().join("target").join("libmac.so");
+        let platform = CountingPlatform::new();
+
+        let restored = materialize_cached_artifact(
+            &BlobSource::Store(&store),
+            &cached,
+            &target,
+            ArtifactKind::DynamicLibrary,
+            dir.path(),
+            dir.path(),
+            None,
+            &[],
+            &platform,
+            "test restore",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(platform.ensure_calls(), 1, "signing hook should have run");
+        assert!(matches!(restored, RestoredBytes::ExactBlobCopy(_)));
+    }
+
+    /// A restored artifact that is overwritten before the seed lands must not
+    /// hand the new bytes the old blob's digest. Seeding records the
+    /// fingerprint observed at restore, so the overwritten file misses the memo
+    /// and is hashed for real; re-stating the path at seed time instead would
+    /// pair the new file's fingerprint with the old file's hash.
+    #[test]
+    fn seeding_does_not_attach_the_blobs_digest_to_a_file_overwritten_since_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+
+        let content = vec![b'r'; 128 * 1024];
+        let source = dir.path().join("source.rlib");
+        std::fs::write(&source, &content).unwrap();
+        let hash = crate::cache_key::hash_file(&source).unwrap();
+        create_blob(&store, &hash, &content);
+
+        let cached = cached_file("libfoo.rlib", &hash);
+        let target = dir.path().join("target").join("libfoo.rlib");
+        let platform = platform::current();
+        let blobs = BlobSource::Store(&store);
+
+        let RestoredBytes::ExactBlobCopy(fingerprint) = materialize_cached_artifact(
+            &blobs,
+            &cached,
+            &target,
+            ArtifactKind::Library,
+            dir.path(),
+            dir.path(),
+            None,
+            &[],
+            &*platform,
+            "test restore",
+            None,
+        )
+        .unwrap() else {
+            panic!("a plain library restore should be exact");
+        };
+
+        // Someone else lands on the same output path before we get to record.
+        let replacement = vec![b'z'; 256 * 1024];
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, &replacement).unwrap();
+
+        blobs.record_known_file_hashes(&[(fingerprint, hash.as_str())]);
+
+        assert!(
+            matches!(
+                store.file_hash_lookup(&target),
+                crate::cache_key::FileHashLookup::NeedsHash(_)
+            ),
+            "the overwritten file must not inherit the restored blob's digest"
+        );
+        assert_ne!(
+            store.file_hasher().hash(&target).unwrap(),
+            hash,
+            "hashing the overwritten file must return its own digest"
+        );
+    }
+
+    /// The guard that matters: an external tool that DOES rewrite the artifact
+    /// (macOS re-signing an invalidated binary) leaves bytes the entry's digest
+    /// no longer describes, so the restore must not be reported as exact.
+    #[test]
+    fn materialize_reports_a_mutating_external_action_as_not_exact() {
+        /// Stands in for `codesign` re-signing a restored binary.
+        struct RewritingPlatform;
+        impl crate::compiler::Platform for RewritingPlatform {
+            fn name(&self) -> &'static str {
+                "rewriting"
+            }
+            fn ensure_binary_loadable(&self, path: &Path) -> Result<()> {
+                let mut content = std::fs::read(path)?;
+                content.extend_from_slice(b"signature");
+                std::fs::write(path, content)?;
+                Ok(())
+            }
+            fn package_debug_bundle(
+                &self,
+                _binary: &Path,
+                _staging_dir: &Path,
+            ) -> Result<Option<PathBuf>> {
+                Ok(None)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "4444444444444444444444444444444444444444444444444444444444444444";
+        create_blob(&store, hash, b"\x7fELF unsigned");
+        let cached = cached_file("libmac.so", hash);
+        let target = dir.path().join("target").join("libmac.so");
+
+        let restored = materialize_cached_artifact(
+            &BlobSource::Store(&store),
+            &cached,
+            &target,
+            ArtifactKind::DynamicLibrary,
+            dir.path(),
+            dir.path(),
+            None,
+            &[],
+            &RewritingPlatform,
+            "test restore",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(restored, RestoredBytes::Rewritten);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"\x7fELF unsignedsignature",
+            "the double should have rewritten the restored artifact"
+        );
+    }
+
     // ── debug bundles (kunobi-ninja/kache#319) ───────────────────────
 
     /// The bundle is baked from the EXECUTABLE output, never a sibling
@@ -8027,6 +8343,136 @@ exit 0
         assert!(
             !store.entry_dir(&meta.cache_key).exists(),
             "partial entry directory should be evicted"
+        );
+    }
+
+    /// kunobi-ninja/kache#540: the restored `.rlib` is a compiler input for
+    /// every downstream crate in this build, and the entry already carries its
+    /// verified digest — so the restore must leave that digest in the file-hash
+    /// memo instead of letting the next cache key re-read the whole file.
+    #[test]
+    fn restore_seeds_the_file_hash_memo_with_the_restored_blobs_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let out_dir = dir.path().join("target/debug/deps");
+
+        // Above the memo's persistence floor, or no row would be kept at all.
+        let content = vec![b'r'; 128 * 1024];
+        let source = dir.path().join("source.rlib");
+        std::fs::write(&source, &content).unwrap();
+        let hash = crate::cache_key::hash_file(&source).unwrap();
+        create_blob(&store, &hash, &content);
+
+        let args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--emit",
+            "link",
+            "--out-dir",
+            &out_dir.to_string_lossy(),
+        ]);
+        let meta = entry_meta("seed-key", vec![cached_file("libfoo.rlib", &hash)], &[]);
+
+        restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+            None,
+        )
+        .unwrap();
+
+        let restored = out_dir.join("libfoo.rlib");
+        assert_eq!(std::fs::read(&restored).unwrap(), content);
+
+        match store.file_hash_lookup(&restored) {
+            crate::cache_key::FileHashLookup::Hit(memoized) => assert_eq!(
+                memoized, hash,
+                "the memo must serve the digest the entry recorded"
+            ),
+            _ => panic!("restored artifact was not memoized"),
+        }
+
+        // And the payoff: hashing it as an input reads no bytes.
+        let hasher = store.file_hasher();
+        assert_eq!(hasher.hash(&restored).unwrap(), hash);
+        let stats = hasher.stats();
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(
+            stats.bytes_hashed, 0,
+            "a memoized restore must not re-read the artifact"
+        );
+    }
+
+    /// The converse, and the reason the memo stays sound: a dep-info file is
+    /// re-rooted on restore, so its bytes are not the blob's and its recorded
+    /// digest must never be memoized for the restored path.
+    #[test]
+    fn restore_does_not_memoize_rewritten_dep_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        // `--out-dir` is what the dep-info anchor is derived from: the restored
+        // `.d` is re-rooted at `<tmp>/target`.
+        let out_dir = dir.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let source = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub fn f() {}\n").unwrap();
+
+        // Padded past the memo's size floor so the assertion below can only
+        // fail because seeding was skipped, not because the file was too small.
+        let stored = format!(
+            "__kache_root__/debug/deps/libfoo.rlib: {}\n#{}\n",
+            source.display(),
+            "p".repeat(128 * 1024)
+        );
+        let hash = {
+            let blob = dir.path().join("blob.d");
+            std::fs::write(&blob, &stored).unwrap();
+            crate::cache_key::hash_file(&blob).unwrap()
+        };
+        create_blob(&store, &hash, stored.as_bytes());
+
+        let args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--emit",
+            "dep-info",
+            "--out-dir",
+            &out_dir.to_string_lossy(),
+        ]);
+        let meta = entry_meta("depinfo-key", vec![cached_file("foo.d", &hash)], &[]);
+
+        restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+            None,
+        )
+        .unwrap();
+
+        let restored = out_dir.join("foo.d");
+        assert_ne!(
+            std::fs::read(&restored).unwrap(),
+            stored.as_bytes(),
+            "dep-info should have been re-rooted for this consumer"
+        );
+        assert!(
+            matches!(
+                store.file_hash_lookup(&restored),
+                crate::cache_key::FileHashLookup::NeedsHash(_)
+            ),
+            "a rewritten artifact must not inherit the blob's digest"
         );
     }
 

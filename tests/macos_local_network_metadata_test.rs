@@ -18,7 +18,7 @@ fn kache_binary_embeds_local_network_privacy_metadata() {
     let mut bytes = Vec::new();
     for line in stdout.lines().skip(2) {
         for word in line.split_whitespace().skip(1) {
-            let pairs: Vec<_> = word.as_bytes().chunks_exact(2).collect();
+            let pairs: Vec<_> = word.as_bytes().as_chunks::<2>().0.iter().collect();
             // `otool -s` prints each little-endian 32-bit word as a host-order
             // hex integer, so restore its byte order before parsing the plist.
             for pair in pairs.into_iter().rev() {

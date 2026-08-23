@@ -2254,9 +2254,13 @@ fn is_ident_continue(byte: u8) -> bool {
 
 /// Hash a file using blake3.
 pub fn hash_file(path: &Path) -> Result<String> {
-    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let hash = blake3::hash(&data);
-    Ok(hash.to_hex().to_string())
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} for hashing", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher
+        .update_reader(file)
+        .with_context(|| format!("reading {} for hashing", path.display()))?;
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Compute a linked `static=` archive's cache-key digest. A proven GNU/BSD
@@ -4460,6 +4464,18 @@ mod tests {
         std::fs::write(&file3, b"fn main() { println!(\"hello\"); }").unwrap();
         let hash3 = hash_file(&file3).unwrap();
         assert_ne!(hash, hash3);
+
+        // Larger than blake3's streaming read buffer so the digest spans
+        // multiple reads instead of relying on a single in-memory buffer.
+        let large = dir.path().join("large.rlib");
+        let large_bytes: Vec<u8> = (0..256 * 1024 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&large, &large_bytes).unwrap();
+        assert_eq!(
+            hash_file(&large).unwrap(),
+            blake3::hash(&large_bytes).to_hex().to_string()
+        );
     }
 
     #[test]

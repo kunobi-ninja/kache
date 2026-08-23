@@ -7948,8 +7948,9 @@ mod tests {
     fn preprocess_dependency_parser_handles_make_escapes_and_continuations() {
         let cwd = Path::new("work/project");
         let raw = concat!(
-            "__kache_preprocess_memo: src/main.c include/a\\ b.h \\\n",
-            " include/hash\\#tag.h include/cash$$value.h C:\\sdk\\header.h\n",
+            "__kache_preprocess_memo: src/main.c include/a\\ b.h \\\r\n",
+            " include/hash\\#tag.h \\\n",
+            " include/cash$$value.h C:\\sdk\\header.h\n",
         );
         let actual = parse_preprocess_dependencies(raw, cwd).unwrap();
         let mut expected = vec![

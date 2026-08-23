@@ -10640,7 +10640,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_hash_files_reports_hash_read_error() {
+    fn handle_hash_files_reports_hash_io_error() {
         // Branch: hash_file failure becomes a per-file error result.
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -10668,7 +10668,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("reading"),
+                .contains("hashing"),
             "got {:?}",
             result.error
         );

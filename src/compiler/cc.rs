@@ -10,10 +10,12 @@
 //!   The cache key is the preprocessor expansion (`cc -E -P` with
 //!   `SOURCE_DATE_EPOCH` pinned) plus compiler identity, target
 //!   arch, and codegen flags. The preprocessor hash captures the
-//!   source and every transitively-included header, so any header
-//!   change invalidates the key with no separate dependency
-//!   tracking. `-E -P` strips line markers so header *paths* don't
-//!   leak — the key is portable across machines and worktrees.
+//!   source and every transitively-included header. The cold probe also writes
+//!   a private complete dependency list; a later local invocation can reuse
+//!   the expansion hash only while every source/header fingerprint matches,
+//!   otherwise it preprocesses again. `-E -P` strips line markers so header
+//!   *paths* don't leak — the object key remains portable across machines and
+//!   worktrees, while the optimization itself is deliberately local.
 //!
 //! What passes through (refused, see [`CcArgs::refuse_reasons`]):
 //! - Link mode (whole-program caching is a separate, harder problem)
@@ -39,7 +41,9 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -1420,22 +1424,182 @@ fn build_preprocess_args(parsed: &CcArgs) -> Vec<String> {
 /// header transitively, so any header change invalidates the key
 /// automatically — no separate dependency tracking needed. Bails (→
 /// passthrough) if the preprocessor yields empty stdout.
-fn preprocess_hash(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Result<String> {
-    let pp_args = build_preprocess_args(parsed);
-    crate::opcounts::record_preprocessor_run();
-    let mut pp_command = Command::new(&parsed.program);
-    pp_command.args(&pp_args);
-    // Pin the build timestamp so `__DATE__` / `__TIME__` expand deterministically
-    // (gcc + clang both honor SOURCE_DATE_EPOCH). The SAME effective value is
-    // pinned on the real compile in `execute`, so the key and the object agree on
-    // the baked date — without this symmetry a time-stable key restores an object
-    // stamped at a different wall-clock time (#423).
-    if let Some(epoch) = effective_source_date_epoch() {
-        pp_command.env("SOURCE_DATE_EPOCH", epoch);
+const CC_PREPROCESS_MEMO_TARGET: &str = "__kache_preprocess_memo";
+
+fn add_preprocess_dep_capture(
+    parsed: &CcArgs,
+    pp_args: Vec<String>,
+    dep_path: &Path,
+) -> Vec<String> {
+    let path = dep_path
+        .to_str()
+        .expect("dependency capture is enabled only for UTF-8 temp paths")
+        .to_string();
+    let extra = match parsed.family.dialect() {
+        Dialect::Gnu => vec![
+            "-MD".to_string(),
+            "-MF".to_string(),
+            path,
+            "-MT".to_string(),
+            CC_PREPROCESS_MEMO_TARGET.to_string(),
+        ],
+        Dialect::Cl => vec![
+            "-Xclang".to_string(),
+            "-dependency-file".to_string(),
+            "-Xclang".to_string(),
+            path,
+            "-Xclang".to_string(),
+            "-MT".to_string(),
+            "-Xclang".to_string(),
+            CC_PREPROCESS_MEMO_TARGET.to_string(),
+            // clang-cl excludes system headers from dependency output unless
+            // this cc1 option is present. A partial header set is never safe
+            // for direct-mode reuse.
+            "-Xclang".to_string(),
+            "-sys-header-deps".to_string(),
+        ],
+    };
+    compose_cc_args(&pp_args, extra)
+}
+
+/// Parse the Make dependency rule emitted into the probe's private file.
+/// Continuations, escaped spaces/hash/backslashes, and Make's `$$` spelling
+/// are decoded. The target may remain user-selected under clang-cl when its
+/// earlier forwarded `-MT` wins; only the private output path is authoritative.
+/// Any unfamiliar/malformed shape disables memoization.
+fn parse_preprocess_dependencies(raw: &str, cwd: &Path) -> Result<Vec<PathBuf>> {
+    let bytes = raw.as_bytes();
+    let mut logical = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'\n') {
+            logical.push(b' ');
+            index += 2;
+        } else if bytes[index] == b'\\'
+            && bytes.get(index + 1) == Some(&b'\r')
+            && bytes.get(index + 2) == Some(&b'\n')
+        {
+            logical.push(b' ');
+            index += 3;
+        } else {
+            logical.push(bytes[index]);
+            index += 1;
+        }
     }
-    let output = pp_command
-        .output()
-        .with_context(|| format!("running preprocessor `{}`", parsed.program))?;
+    let logical = std::str::from_utf8(&logical).context("cc dependency file is not UTF-8")?;
+    let (rule, separator) = logical
+        .lines()
+        .find_map(|line| {
+            line.find(": ")
+                .or_else(|| line.find(":\t"))
+                .map(|separator| (line, separator))
+        })
+        .context("cc dependency file has no Make rule")?;
+    let dependencies = &rule[separator + 1..];
+
+    let mut paths = Vec::new();
+    let mut word = String::new();
+    let mut chars = dependencies.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => match chars.peek().copied() {
+                Some(next) if matches!(next, ' ' | '\t' | '#' | '\\' | ':') => {
+                    word.push(next);
+                    chars.next();
+                }
+                Some(_) => word.push('\\'),
+                None => anyhow::bail!("cc dependency rule ends in an escape"),
+            },
+            '$' if chars.peek() == Some(&'$') => {
+                word.push('$');
+                chars.next();
+            }
+            '#' => break,
+            whitespace if whitespace.is_whitespace() => {
+                if !word.is_empty() {
+                    paths.push(PathBuf::from(std::mem::take(&mut word)));
+                }
+            }
+            other => word.push(other),
+        }
+    }
+    if !word.is_empty() {
+        paths.push(PathBuf::from(word));
+    }
+    if paths.is_empty() {
+        anyhow::bail!("cc dependency rule contains no inputs");
+    }
+    for path in &mut paths {
+        let text = path.to_string_lossy();
+        let bytes = text.as_bytes();
+        let windows_absolute = bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\');
+        if path.is_relative() && !windows_absolute && !text.starts_with("\\\\") {
+            *path = cwd.join(&*path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+#[derive(Debug)]
+struct PreprocessHash {
+    hash: String,
+    fingerprints: Option<Vec<crate::cache_key::FileFingerprint>>,
+}
+
+fn preprocess_hash(
+    parsed: &CcArgs,
+    prefix_maps: &[CcPrefixMap],
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    capture_dependencies: bool,
+) -> Result<PreprocessHash> {
+    let pp_args = build_preprocess_args(parsed);
+    let dep_temp = if capture_dependencies {
+        match tempfile::Builder::new()
+            .prefix("kache-cc-preprocess-")
+            .tempdir()
+        {
+            Ok(temp) => Some(temp),
+            Err(error) => {
+                tracing::debug!("cc preprocess dependency tempdir unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let dep_path = dep_temp
+        .as_ref()
+        .map(|dir| dir.path().join("inputs.d"))
+        .filter(|path| path.to_str().is_some());
+    let pp_args = dep_path.as_deref().map_or(pp_args.clone(), |path| {
+        add_preprocess_dep_capture(parsed, pp_args.clone(), path)
+    });
+    let run = |args: &[String]| {
+        crate::opcounts::record_preprocessor_run();
+        let mut command = Command::new(&parsed.program);
+        command.args(args);
+        // Pin the build timestamp so `__DATE__` / `__TIME__` expand
+        // deterministically. The real compile uses the same value.
+        if let Some(epoch) = effective_source_date_epoch() {
+            command.env("SOURCE_DATE_EPOCH", epoch);
+        }
+        command
+            .output()
+            .with_context(|| format!("running preprocessor `{}`", parsed.program))
+    };
+    let mut output = run(&pp_args)?;
+    if !output.status.success() && dep_path.is_some() {
+        // An otherwise supported compiler may not implement the private
+        // dependency flags. Preserve the existing cache-key behavior and just
+        // leave this invocation unmemoized.
+        tracing::debug!("cc preprocess dependency capture failed; retrying without memo capture");
+        output = run(&build_preprocess_args(parsed))?;
+    }
     if !output.status.success() {
         // Preprocess failed — the real compile would also fail.
         // Bail so the wrapper falls back to passthrough, which runs
@@ -1458,7 +1622,23 @@ fn preprocess_hash(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Result<Strin
         anyhow::bail!("cc -E key probe produced no output");
     }
     let stdout = apply_cc_prefix_maps_to_bytes(output.stdout, prefix_maps);
-    Ok(blake3::hash(&stdout).to_hex().to_string())
+    let hash = blake3::hash(&stdout).to_hex().to_string();
+    let fingerprints = dep_path.as_deref().and_then(|path| {
+        let dependencies = std::fs::read_to_string(path)
+            .context("reading cc preprocess dependency file")
+            .and_then(|raw| {
+                let cwd = std::env::current_dir().context("reading cc compiler directory")?;
+                parse_preprocess_dependencies(&raw, &cwd)
+            });
+        match dependencies {
+            Ok(paths) => file_hasher.cc_preprocess_fingerprints(&paths),
+            Err(error) => {
+                tracing::debug!("cc preprocess dependency capture unavailable: {error:#}");
+                None
+            }
+        }
+    });
+    Ok(PreprocessHash { hash, fingerprints })
 }
 
 /// Whether a positional argument looks like a C-family source file
@@ -3449,6 +3629,108 @@ fn source_date_epoch_passthrough() -> bool {
         .unwrap_or(false)
 }
 
+fn cc_memo_os_bytes(value: &OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        value.as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value.encode_wide().flat_map(u16::to_le_bytes).collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        value.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn fold_cc_memo_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
+    hasher.update(&(label.len() as u64).to_le_bytes());
+    hasher.update(label);
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+/// Local identity for a preprocessor invocation. The full environment is
+/// intentionally included: compiler-specific include variables are numerous,
+/// and an extra miss is safer than overlooking one that changes expansion.
+fn cc_preprocess_memo_key(
+    parsed: &CcArgs,
+    prefix_maps: &[CcPrefixMap],
+    compiler_version: &str,
+) -> Option<String> {
+    let epoch = effective_source_date_epoch()?;
+    let cwd = std::env::current_dir().ok()?;
+    let compiler_path = super::resolve_program_on_path(&parsed.program)?;
+    let compiler_metadata = std::fs::metadata(&compiler_path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v1");
+    fold_cc_memo_field(
+        &mut hasher,
+        b"compiler-program",
+        cc_memo_os_bytes(OsStr::new(&parsed.program)).as_slice(),
+    );
+    fold_cc_memo_field(
+        &mut hasher,
+        b"compiler-path",
+        cc_memo_os_bytes(compiler_path.as_os_str()).as_slice(),
+    );
+    fold_cc_memo_field(
+        &mut hasher,
+        b"compiler-size",
+        &compiler_metadata.len().to_le_bytes(),
+    );
+    fold_cc_memo_field(
+        &mut hasher,
+        b"compiler-mtime",
+        &crate::cache_key::metadata_mtime_ns(&compiler_metadata).to_le_bytes(),
+    );
+    fold_cc_memo_field(
+        &mut hasher,
+        b"compiler-ctime",
+        &crate::cache_key::metadata_ctime_ns(&compiler_metadata).to_le_bytes(),
+    );
+    fold_cc_memo_field(
+        &mut hasher,
+        b"compiler-inode",
+        &crate::cache_key::metadata_inode(&compiler_metadata).to_le_bytes(),
+    );
+    fold_cc_memo_field(
+        &mut hasher,
+        b"compiler-version",
+        compiler_version.as_bytes(),
+    );
+    fold_cc_memo_field(
+        &mut hasher,
+        b"cwd",
+        cc_memo_os_bytes(cwd.as_os_str()).as_slice(),
+    );
+    fold_cc_memo_field(
+        &mut hasher,
+        b"source-date-epoch",
+        cc_memo_os_bytes(&epoch).as_slice(),
+    );
+    for arg in build_preprocess_args(parsed) {
+        fold_cc_memo_field(&mut hasher, b"arg", arg.as_bytes());
+    }
+    for map in prefix_maps {
+        fold_cc_memo_field(&mut hasher, b"prefix-from", map.from.as_bytes());
+        fold_cc_memo_field(&mut hasher, b"prefix-to", map.to.as_bytes());
+    }
+
+    let mut environment: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
+        .map(|(name, value)| (cc_memo_os_bytes(&name), cc_memo_os_bytes(&value)))
+        .collect();
+    environment.sort();
+    for (name, value) in environment {
+        fold_cc_memo_field(&mut hasher, b"env-name", &name);
+        fold_cc_memo_field(&mut hasher, b"env-value", &value);
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
 fn cc_prefix_maps_for(parsed: &CcArgs, cwd: &Path) -> Vec<CcPrefixMap> {
     let cwd_abs = absolutize_path(cwd, cwd);
     let Some(source) = parsed.sources.first() else {
@@ -3794,6 +4076,12 @@ fn cc_trace_name(parsed: &CcArgs) -> String {
         .unwrap_or_else(|| "cc".to_string())
 }
 
+struct PendingCcPreprocessMemo {
+    memo_key: String,
+    preprocessed_hash: String,
+    fingerprints: Vec<crate::cache_key::FileFingerprint>,
+}
+
 #[derive(Default)]
 pub struct CcCompiler {
     /// User-declared flags (issue #95) that kache's built-in allow-list
@@ -3804,6 +4092,7 @@ pub struct CcCompiler {
     /// Deterministically ordered `[paths].base_dirs` roots applied to both the
     /// cc key probes and the real compiler invocation.
     base_dirs: Vec<String>,
+    pending_preprocess_memo: RefCell<Option<PendingCcPreprocessMemo>>,
 }
 
 const C_FAMILY_DRIVERS: [(&str, ToolFamily); 7] = [
@@ -3883,6 +4172,7 @@ impl CcCompiler {
         Self {
             extra_allowlist_flags,
             base_dirs: Vec::new(),
+            pending_preprocess_memo: RefCell::new(None),
         }
     }
 
@@ -3891,6 +4181,19 @@ impl CcCompiler {
         self.base_dirs.sort();
         self.base_dirs.dedup();
         self
+    }
+
+    /// Publish the dependency snapshot from a full preprocess only after a
+    /// successful compile or cache restore revalidated every input.
+    pub(crate) fn commit_preprocess_memo(&self, file_hasher: &crate::cache_key::FileHasher<'_>) {
+        let Some(pending) = self.pending_preprocess_memo.borrow_mut().take() else {
+            return;
+        };
+        file_hasher.cc_preprocess_memo_record_if_unchanged(
+            &pending.memo_key,
+            &pending.preprocessed_hash,
+            &pending.fingerprints,
+        );
     }
 
     /// Does this argv invoke a C-family compiler?
@@ -4142,6 +4445,7 @@ impl Compiler for CcCompiler {
     fn cache_key(&self, parsed: &CcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
         // Preconditions (guaranteed by the wrapper checking
         // refuse_reasons first): `-c` mode, exactly one source.
+        self.pending_preprocess_memo.borrow_mut().take();
         let mut hasher = blake3::Hasher::new();
         let trace_name = cc_trace_name(parsed);
         let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
@@ -4468,7 +4772,40 @@ impl Compiler for CcCompiler {
         // macro expansion. `-E -P` strips line markers so header
         // PATHS don't leak (cross-machine portable); SOURCE_DATE_EPOCH
         // pins __DATE__/__TIME__ (stable across builds).
-        let pp_hash = preprocess_hash(parsed, &prefix_maps)?;
+        let memo_key = ctx
+            .file_hasher
+            .supports_cc_preprocess_memo()
+            .then(|| cc_preprocess_memo_key(parsed, &prefix_maps, &resolved.version_line))
+            .flatten();
+        let pp_hash = if let Some(memo_hash) = memo_key
+            .as_ref()
+            .and_then(|key| ctx.file_hasher.cc_preprocess_memo_lookup(key))
+        {
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] preprocessed_memo=hit",
+                trace_name
+            );
+            memo_hash
+        } else {
+            let preprocessed =
+                preprocess_hash(parsed, &prefix_maps, ctx.file_hasher, memo_key.is_some())?;
+            if let (Some(memo_key), Some(fingerprints)) = (memo_key, preprocessed.fingerprints) {
+                self.pending_preprocess_memo
+                    .borrow_mut()
+                    .replace(PendingCcPreprocessMemo {
+                        memo_key,
+                        preprocessed_hash: preprocessed.hash.clone(),
+                        fingerprints,
+                    });
+            }
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] preprocessed_memo=miss",
+                trace_name
+            );
+            preprocessed.hash
+        };
         hasher.update(b"preprocessed:");
         hasher.update(pp_hash.as_bytes());
         hasher.update(b"\n");
@@ -7585,6 +7922,48 @@ mod tests {
     }
 
     #[test]
+    fn preprocess_dep_capture_is_complete_for_both_dialects() {
+        let dep = Path::new("memo inputs.d");
+        let gnu = CcArgs::parse(&s(&["gcc", "-c", "a.c"])).unwrap();
+        let gnu_args = add_preprocess_dep_capture(&gnu, build_preprocess_args(&gnu), dep);
+        assert!(gnu_args.windows(2).any(|args| args == ["-MD", "-MF"]));
+        assert!(gnu_args.iter().any(|arg| arg == "memo inputs.d"));
+
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "a.c"])).unwrap();
+        let cl_args = add_preprocess_dep_capture(&cl, build_preprocess_args(&cl), dep);
+        assert!(
+            cl_args
+                .windows(2)
+                .any(|args| args == ["-Xclang", "-dependency-file"])
+        );
+        assert!(
+            cl_args
+                .windows(2)
+                .any(|args| args == ["-Xclang", "-sys-header-deps"]),
+            "clang-cl memo dependency capture must include system headers"
+        );
+    }
+
+    #[test]
+    fn preprocess_dependency_parser_handles_make_escapes_and_continuations() {
+        let cwd = Path::new("work/project");
+        let raw = concat!(
+            "__kache_preprocess_memo: src/main.c include/a\\ b.h \\\n",
+            " include/hash\\#tag.h include/cash$$value.h C:\\sdk\\header.h\n",
+        );
+        let actual = parse_preprocess_dependencies(raw, cwd).unwrap();
+        let mut expected = vec![
+            PathBuf::from("C:\\sdk\\header.h"),
+            cwd.join("include/a b.h"),
+            cwd.join("include/cash$value.h"),
+            cwd.join("include/hash#tag.h"),
+            cwd.join("src/main.c"),
+        ];
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn cc_prefix_maps_empty_for_clang_cl() {
         let cwd = std::path::Path::new("/work/proj");
         let cl = CcArgs::parse(&s(&["clang-cl", "-c", "/work/proj/a.c"])).unwrap();
@@ -7702,7 +8081,8 @@ mod tests {
         // all comments / all `#if 0` — also lands here; refusing to cache
         // it is a safe non-cache, the conservative trade-off.)
         let parsed = CcArgs::parse(&s(&["true", "-c", "a.c"])).unwrap();
-        let err = preprocess_hash(&parsed, &[]).unwrap_err();
+        let err =
+            preprocess_hash(&parsed, &[], &crate::cache_key::FileHasher::new(), false).unwrap_err();
         assert!(err.to_string().contains("no output"), "got: {err}");
     }
 

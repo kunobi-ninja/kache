@@ -53,12 +53,12 @@ max_probe_runs = 1
 
 # Warm: clean wipes build/, the rebuild's compile hits the cache.
 # `max_compiler_runs = 0` is the deterministic proof the hit skipped
-# the compile entirely. The preprocessor still runs once (it derives
-# the key) — that's the overhead a future direct mode would remove.
+# the compile entirely. The private complete dependency snapshot lets the
+# wrapper reuse the prior expansion hash without running the preprocessor.
 [assertions.warm]
 min_hits = 1
 max_compiler_runs = 0
-max_preprocessor_runs = 1
+max_preprocessor_runs = 0
 # Probe memoized on disk from the cold build — the warm rebuild reads
 # the record instead of re-running `cc --version` / `cc -###`.
 max_probe_runs = 0

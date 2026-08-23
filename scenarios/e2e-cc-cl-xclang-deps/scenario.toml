@@ -50,6 +50,7 @@ max_compiler_runs = 1
 [assertions.warm]
 min_hits = 1
 max_compiler_runs = 0
+max_preprocessor_runs = 0
 
 # Noop: make sees build/a.obj up to date and does nothing. No CC
 # invocation, so no kache event — same as the other compile fixtures.

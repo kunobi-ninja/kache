@@ -7983,6 +7983,18 @@ mod tests {
     }
 
     #[test]
+    fn fold_cc_memo_field_changes_and_separates_hashes() {
+        let mut first = blake3::Hasher::new();
+        fold_cc_memo_field(&mut first, b"arg", b"one");
+
+        let mut second = blake3::Hasher::new();
+        fold_cc_memo_field(&mut second, b"arg", b"two");
+
+        assert_ne!(first.finalize(), blake3::Hasher::new().finalize());
+        assert_ne!(first.finalize(), second.finalize());
+    }
+
+    #[test]
     fn cc_preprocess_memo_key_is_blake3_digest() {
         let compiler = std::env::current_exe()
             .unwrap()

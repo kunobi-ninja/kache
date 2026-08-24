@@ -4995,6 +4995,27 @@ impl VerifyOutcome {
     }
 }
 
+fn reconciled_index_message(drift: crate::store::BlobIndexDrift) -> Option<String> {
+    (drift.total() != 0).then(|| {
+        format!(
+            "Repairing: reconciled {} entry mappings and {} blob rows.",
+            drift.entry_mappings, drift.blobs
+        )
+    })
+}
+
+fn should_print_repair_tip(
+    corrupted_entries: usize,
+    orphaned_blobs: usize,
+    index_drift: usize,
+    repair: bool,
+) -> bool {
+    let findings = corrupted_entries
+        .saturating_add(orphaned_blobs)
+        .saturating_add(index_drift);
+    !repair && findings != 0
+}
+
 /// Hash each unique blob **once**, streaming, across a bounded worker pool,
 /// and return the hashes whose bytes no longer match their content address
 /// (kunobi-ninja/kache#176).
@@ -5279,11 +5300,8 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
     let index_drift = if repair {
         match store.reconcile_blob_index() {
             Ok(drift) => {
-                if drift.total() > 0 {
-                    println!(
-                        "Repairing: reconciled {} entry mappings and {} blob rows.",
-                        drift.entry_mappings, drift.blobs
-                    );
+                if let Some(message) = reconciled_index_message(drift) {
+                    println!("{message}");
                 }
                 0
             }
@@ -5337,7 +5355,7 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
     println!("  Blob index drift: {index_drift}");
     println!("  Store size: {}", ByteSize(store_size));
 
-    if (corrupted_entries > 0 || orphaned_blobs > 0 || index_drift > 0) && !repair {
+    if should_print_repair_tip(corrupted_entries, orphaned_blobs, index_drift, repair) {
         println!();
         println!(
             "Tip: run `kache doctor --repair` to remove corrupted entries, reconcile the blob index, and reclaim orphaned blobs."
@@ -8069,6 +8087,28 @@ mod tests {
         assert!(
             err.to_string().contains("No remote configured"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn repair_tip_and_reconciliation_message_cover_every_boundary() {
+        assert!(!should_print_repair_tip(0, 0, 0, false));
+        assert!(should_print_repair_tip(1, 0, 0, false));
+        assert!(should_print_repair_tip(0, 1, 0, false));
+        assert!(should_print_repair_tip(0, 0, 1, false));
+        assert!(!should_print_repair_tip(1, 1, 1, true));
+
+        assert_eq!(
+            reconciled_index_message(crate::store::BlobIndexDrift::default()),
+            None
+        );
+        assert_eq!(
+            reconciled_index_message(crate::store::BlobIndexDrift {
+                entry_mappings: 1,
+                blobs: 2,
+            })
+            .as_deref(),
+            Some("Repairing: reconciled 1 entry mappings and 2 blob rows.")
         );
     }
 

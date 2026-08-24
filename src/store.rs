@@ -5055,6 +5055,42 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_blob_index_rejects_each_invalid_metadata_dimension() {
+        for invalid_hash in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = test_config(dir.path());
+            let store = Store::open(&config).unwrap();
+            let output = dir.path().join("output.rlib");
+            fs::write(&output, b"valid blob bytes").unwrap();
+            store
+                .put(
+                    "repair_invalid_metadata",
+                    "repairlib",
+                    &["lib".to_string()],
+                    &[],
+                    "host",
+                    "dev",
+                    &[(output, "librepair.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            let meta_path = store.entry_dir("repair_invalid_metadata").join("meta.json");
+            let mut meta: EntryMeta =
+                serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+            if invalid_hash {
+                meta.files[0].hash = "not-a-content-hash".to_string();
+            } else {
+                meta.files[0].name = "../unsafe.rlib".to_string();
+            }
+            fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+            let error = store.reconcile_blob_index().unwrap_err().to_string();
+            assert!(error.contains("invalid blob metadata"), "{error}");
+        }
+    }
+
+    #[test]
     fn store_ingest_accounts_new_blob_bytes_by_mechanism() {
         // A new-blob put must record the artifact's bytes against exactly one
         // store-ingest counter — reflink, hardlink, or copy depending on the

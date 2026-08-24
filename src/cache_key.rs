@@ -210,7 +210,15 @@ use std::path::{Path, PathBuf};
 // could preserve the key while changing the compiled program. The same bump
 // also makes old dep-info blobs that retain donor-worktree absolute paths
 // unreachable; v26 stores separate target/cwd sentinels and re-roots both.
-pub(crate) const CACHE_KEY_VERSION: u32 = 26;
+//
+// v27 (kunobi-ninja/kache#808): generated dep-info sources beneath an
+// in-workspace Cargo target now belong to the effective target before the
+// higher-ranked workspace source root. v26 could store
+// `__kache_workspace__/target_1/.../OUT_DIR/private.rs`; another concurrent
+// Cargo process using target_2 expanded that donor suffix, failed
+// validate-on-hit, evicted the entry, and recompiled. The stored dep-info bytes
+// change, so the bump makes every incorrectly owned v26 blob unreachable.
+pub(crate) const CACHE_KEY_VERSION: u32 = 27;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim

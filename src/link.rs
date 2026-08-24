@@ -1274,6 +1274,7 @@ fn sample_write_clock(path: &Path) -> Result<filetime::FileTime> {
 const DEPINFO_ROOT_SENTINEL: &str = "__kache_root__/";
 const DEPINFO_CWD_SENTINEL: &str = "__kache_cwd__/";
 const DEPINFO_WORKSPACE_SENTINEL: &str = "__kache_workspace__/";
+const DEPINFO_TARGET_SENTINEL: &str = "__kache_target_rule__/";
 
 /// rustc's `# env-dep:NAME=value` records carry their own escape grammar:
 /// backslash is written `\\` (and newline/CR as `\n`/`\r`), and cargo's
@@ -1373,6 +1374,18 @@ pub fn rewrite_rustc_depinfo_content_with_configured_roots(
             ))
         });
         let target_rewritten = rewrite_rustc_depinfo_targets(content, target_dir, mode);
+        // Dependencies generated beneath Cargo's effective target directory
+        // must move with that target even when it lives inside the workspace.
+        // Otherwise the higher-ranked WORKSPACE source rule captures
+        // `target_1/.../OUT_DIR/private.rs`, and a parallel target_2 consumer
+        // restores the donor path (#808). Targets on the left have already
+        // become DEPINFO_ROOT_SENTINEL, so this only claims source inputs.
+        let target_rewritten = rewrite_depinfo_content_with_sentinel(
+            &target_rewritten,
+            target_dir,
+            DEPINFO_TARGET_SENTINEL,
+            mode,
+        );
         return roots.into_iter().fold(
             target_rewritten,
             |rewritten, (root, sentinel, _, _, exact)| {
@@ -1388,7 +1401,11 @@ pub fn rewrite_rustc_depinfo_content_with_configured_roots(
     // A portable owner may have multiple producer aliases, but the first entry
     // for its sentinel is the designated lexical consumer root. Expand each
     // sentinel exactly once so a longer canonical alias cannot steal restore.
-    let mut rewritten = content.to_string();
+    // Expand the effective target before configured roots. A configured root
+    // list can contain the same target sentinel with a stale/relative lexical
+    // spelling; the argv-derived target_dir is the authoritative consumer.
+    let mut rewritten =
+        rewrite_depinfo_content_with_sentinel(content, target_dir, DEPINFO_TARGET_SENTINEL, mode);
     let mut expanded = std::collections::HashSet::new();
     for (root, sentinel, _) in configured_roots {
         if expanded.insert(sentinel) {
@@ -1406,9 +1423,8 @@ pub fn rewrite_rustc_depinfo_content_with_configured_roots(
 }
 
 /// Rebase only Makefile target tokens (left of rustc's `: ` delimiter).
-/// Dependencies on the right are source inputs and must follow PathNormalizer
-/// ownership instead; a generated source beneath `target/` can still belong to
-/// workspace/configured source identity.
+/// Dependencies on the right are source inputs and are handled separately:
+/// effective-target sources first, then PathNormalizer ownership.
 fn rewrite_rustc_depinfo_targets(content: &str, target_dir: &Path, mode: DepInfoMode) -> String {
     content
         .split_inclusive('\n')
@@ -2589,7 +2605,7 @@ mod tests {
     }
 
     #[test]
-    fn target_output_rebases_separately_from_generated_source_ownership() {
+    fn target_generated_source_uses_target_ownership_before_workspace() {
         let stored = rewrite_rustc_depinfo_content_with_configured_roots(
             "/work/target/demo.d: /work/target/generated.rs\n",
             Path::new("/work/target"),
@@ -2601,7 +2617,7 @@ mod tests {
 
         assert_eq!(
             stored,
-            "__kache_root__/demo.d: __kache_cwd__/target/generated.rs\n"
+            "__kache_root__/demo.d: __kache_target_rule__/generated.rs\n"
         );
     }
 
@@ -2639,6 +2655,59 @@ __kache_target_rule__/debug/build/demo/out/generated.rs\n"
             restored,
             "/external-b/target/debug/deps/demo.d: \
 /external-b/target/debug/build/demo/out/generated.rs\n"
+        );
+    }
+
+    /// kunobi-ninja/kache#808: several Cargo processes can share one local
+    /// store while building the same workspace into `target_1`...`target_4`.
+    /// A generated dependency beneath an in-workspace target must follow the
+    /// consuming target, not the stable workspace root, or a hit restores the
+    /// donor worker's `OUT_DIR/private.rs` and validate-on-hit evicts it.
+    #[test]
+    fn in_workspace_target_generated_source_rebases_between_parallel_workers() {
+        let workspace = PathBuf::from("/work");
+        let producer_target = workspace.join("target_1");
+        let consumer_target = workspace.join("target_2");
+        let workspace_sentinel = DEPINFO_WORKSPACE_SENTINEL.to_string();
+        let target_sentinel = "__kache_target_rule__/".to_string();
+        let input = "/work/target_1/debug/deps/serde_core.d: \
+/work/src/lib.rs \
+/work/target_1/debug/build/serde_core-fe75/out/private.rs\n";
+
+        let stored = rewrite_rustc_depinfo_content_with_configured_roots(
+            input,
+            &producer_target,
+            &workspace,
+            Some(&workspace),
+            &[
+                (workspace.clone(), workspace_sentinel.clone(), 4),
+                (producer_target.clone(), target_sentinel.clone(), 3),
+            ],
+            DepInfoMode::Relativize,
+        );
+        assert_eq!(
+            stored,
+            "__kache_root__/debug/deps/serde_core.d: \
+__kache_workspace__/src/lib.rs \
+__kache_target_rule__/debug/build/serde_core-fe75/out/private.rs\n"
+        );
+
+        let restored = rewrite_rustc_depinfo_content_with_configured_roots(
+            &stored,
+            &consumer_target,
+            &workspace,
+            Some(&workspace),
+            &[
+                (workspace.clone(), workspace_sentinel, 4),
+                (consumer_target.clone(), target_sentinel, 3),
+            ],
+            DepInfoMode::Expand,
+        );
+        assert_eq!(
+            restored,
+            "/work/target_2/debug/deps/serde_core.d: \
+/work/src/lib.rs \
+/work/target_2/debug/build/serde_core-fe75/out/private.rs\n"
         );
     }
 

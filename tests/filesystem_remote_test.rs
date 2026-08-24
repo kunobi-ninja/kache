@@ -25,20 +25,40 @@ fn rustc_path() -> String {
     std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string())
 }
 
-/// One independently configured client: its own local cache and config, both
-/// pointing at the shared folder as a filesystem remote.
+/// One independently configured runtime. It normally owns its local cache;
+/// #811 coverage can instead point several runtimes at one node-local store.
 struct Client {
-    _cache: TempDir,
+    _runtime: TempDir,
     cache_dir: PathBuf,
+    runtime_dir: PathBuf,
+    config_path: PathBuf,
     command_seq: AtomicUsize,
 }
 
 impl Client {
     fn new(shared_folder: &Path) -> Self {
-        let cache = TempDir::new().unwrap();
-        let cache_dir = cache.path().to_path_buf();
+        let runtime = TempDir::new().unwrap();
+        let cache_dir = runtime.path().to_path_buf();
+        Self::with_runtime(shared_folder, cache_dir, runtime)
+    }
+
+    /// One CI job runtime backed by a node-local store shared with sibling
+    /// jobs. Only the store/index live under `cache_dir`; daemon state and logs
+    /// remain owned by this client's private temporary runtime.
+    fn for_shared_store(shared_folder: &Path, cache_dir: &Path) -> Self {
+        let runtime = TempDir::new().unwrap();
+        Self::with_runtime(shared_folder, cache_dir.to_path_buf(), runtime)
+    }
+
+    fn with_runtime(shared_folder: &Path, cache_dir: PathBuf, runtime: TempDir) -> Self {
+        let runtime_dir = runtime.path().to_path_buf();
+        let config_path = if runtime_dir == cache_dir {
+            isolated_config_path(&cache_dir)
+        } else {
+            runtime_dir.join("config.toml")
+        };
         std::fs::write(
-            isolated_config_path(&cache_dir),
+            &config_path,
             format!(
                 "[cache.remote]\n\
                  type = \"filesystem\"\n\
@@ -49,8 +69,10 @@ impl Client {
         )
         .unwrap();
         Client {
-            _cache: cache,
+            _runtime: runtime,
             cache_dir,
+            runtime_dir,
+            config_path,
             command_seq: AtomicUsize::new(0),
         }
     }
@@ -58,7 +80,8 @@ impl Client {
     fn kache(&self) -> std::process::Command {
         let mut cmd = std::process::Command::new(kache_binary());
         cmd.env("KACHE_CACHE_DIR", &self.cache_dir)
-            .env("KACHE_CONFIG", isolated_config_path(&self.cache_dir))
+            .env("KACHE_RUNTIME_DIR", &self.runtime_dir)
+            .env("KACHE_CONFIG", &self.config_path)
             .env("KACHE_LOG", "off")
             // A BACKSTOP, not the cleanup mechanism: `Client`'s `Drop` stops
             // the daemon explicitly, which keeps it warm for the whole test
@@ -91,8 +114,8 @@ impl Client {
         // Counter, not the args: an argv carries paths and slashes, which do
         // not belong in a file name.
         let seq = self.command_seq.fetch_add(1, Ordering::Relaxed);
-        let out_path = self.cache_dir.join(format!("cmd-{seq}.out"));
-        let err_path = self.cache_dir.join(format!("cmd-{seq}.err"));
+        let out_path = self.runtime_dir.join(format!("cmd-{seq}.out"));
+        let err_path = self.runtime_dir.join(format!("cmd-{seq}.err"));
         let stdout = std::fs::File::create(&out_path).expect("creating stdout capture");
         let stderr = std::fs::File::create(&err_path).expect("creating stderr capture");
 
@@ -189,7 +212,7 @@ impl Client {
             String::from_utf8_lossy(&output.stderr),
         );
 
-        let run_lock_path = self.cache_dir.join("daemon.run.lock");
+        let run_lock_path = self.runtime_dir.join("daemon.run.lock");
         let run_lock = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -340,6 +363,125 @@ fn two_independent_clients_share_hits_through_one_folder() {
     );
 }
 
+/// #811 acceptance: two job-scoped daemon runtimes may concurrently use one
+/// node-local store. Restarting one daemon must reopen that same durable cache,
+/// not turn the next identical compile into a miss.
+#[test]
+fn two_job_runtimes_share_one_store_across_daemon_restart() {
+    build_kache();
+
+    let remote = TempDir::new().unwrap();
+    let node_cache = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let src = sources.path().join("lib.rs");
+    std::fs::write(&src, "pub fn node_cached() -> u32 { 811 }\n").unwrap();
+
+    let alpha = Client::for_shared_store(remote.path(), node_cache.path());
+    let beta = Client::for_shared_store(remote.path(), node_cache.path());
+    assert_ne!(alpha.runtime_dir, beta.runtime_dir);
+    assert_eq!(alpha.cache_dir, beta.cache_dir);
+
+    alpha.start_daemon();
+    beta.start_daemon();
+    #[cfg(unix)]
+    {
+        assert!(alpha.runtime_dir.join("daemon.sock").exists());
+        assert!(beta.runtime_dir.join("daemon.sock").exists());
+    }
+
+    let out_a = TempDir::new().unwrap();
+    alpha.compile(&src, out_a.path());
+    assert!(
+        alpha
+            .results()
+            .iter()
+            .any(|result| result == "miss" || result == "dup"),
+        "the first job must populate the shared node store: {:?}",
+        alpha.results()
+    );
+
+    let out_b = TempDir::new().unwrap();
+    beta.compile(&src, out_b.path());
+    assert!(
+        beta.results().iter().any(|result| result == "local_hit"),
+        "the second live daemon must consume the first job's entry: {:?}",
+        beta.results()
+    );
+
+    beta.stop_daemon_and_wait();
+    beta.start_daemon();
+    let out_after_restart = TempDir::new().unwrap();
+    beta.compile(&src, out_after_restart.path());
+    let beta_results = beta.results();
+    assert!(
+        beta_results
+            .iter()
+            .filter(|result| result.as_str() == "local_hit")
+            .count()
+            >= 2,
+        "a restarted daemon must replay the same shared cache: {beta_results:?}"
+    );
+    assert!(node_cache.path().join("store").is_dir());
+    assert!(node_cache.path().join("index.db").is_file());
+    assert!(!node_cache.path().join("daemon.sock").exists());
+    assert!(!node_cache.path().join("events.jsonl").exists());
+}
+
+/// A stale SQLite row must never turn a missing node-local blob into a false
+/// local hit. The wrapper falls through its ordinary miss path and the daemon
+/// restores the already-published v3 object before reporting `remote_hit`.
+#[test]
+fn missing_shared_store_blob_falls_through_to_v3_restore() {
+    build_kache();
+
+    let remote = TempDir::new().unwrap();
+    let node_cache = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let src = sources.path().join("lib.rs");
+    std::fs::write(&src, "pub fn restored() -> u32 { 3 }\n").unwrap();
+    let client = Client::for_shared_store(remote.path(), node_cache.path());
+
+    let first_out = TempDir::new().unwrap();
+    client.compile(&src, first_out.path());
+    client.stop_daemon_and_wait();
+    client.sync(&["--push"]);
+
+    let mut blobs = Vec::new();
+    collect_files(&node_cache.path().join("store/blobs"), &mut blobs);
+    let missing_blob = blobs
+        .into_iter()
+        .find(|path| path.is_file())
+        .expect("cold compile must produce a local blob");
+    let expected_digest = missing_blob
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    std::fs::remove_file(&missing_blob).unwrap();
+    assert!(!missing_blob.exists());
+
+    client.start_daemon();
+    let restored_out = TempDir::new().unwrap();
+    client.compile(&src, restored_out.path());
+    let results = client.results();
+    assert!(
+        results.iter().any(|result| result == "remote_hit"),
+        "missing local content must use the v3 restore path: {results:?}"
+    );
+    assert!(
+        !results.iter().any(|result| result == "local_hit"),
+        "the stale local row must never be reported as a hit: {results:?}"
+    );
+    assert!(missing_blob.is_file(), "v3 import must restore the blob");
+    assert_eq!(
+        blake3::hash(&std::fs::read(&missing_blob).unwrap())
+            .to_hex()
+            .as_str(),
+        expected_digest
+    );
+    assert!(restored_out.path().join("libfsremote.rlib").is_file());
+}
+
 /// The same cross-client property through the **explicit sync** path, which
 /// needs no daemon: `kache sync --pull --all` seeds a fresh client's local
 /// store from the shared folder, and the next compile is a plain local hit
@@ -395,6 +537,8 @@ fn capturing_kache_output_through_pipes_does_not_hang() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     let cache_dir = client.cache_dir.clone();
+    let runtime_dir = client.runtime_dir.clone();
+    let config_path = client.config_path.clone();
     let src_path = src.display().to_string();
     let out_path = out_dir.path().display().to_string();
     let rustc = rustc_path();
@@ -403,7 +547,8 @@ fn capturing_kache_output_through_pipes_does_not_hang() {
         // caller writes.
         let result = std::process::Command::new(kache_binary())
             .env("KACHE_CACHE_DIR", &cache_dir)
-            .env("KACHE_CONFIG", cache_dir.join("config.toml"))
+            .env("KACHE_RUNTIME_DIR", &runtime_dir)
+            .env("KACHE_CONFIG", &config_path)
             .env("KACHE_LOG", "off")
             .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
             .env_remove("KACHE_SOCKET_PATH")
@@ -451,7 +596,7 @@ fn dropping_a_client_stops_its_daemon() {
     let socket = {
         let client = Client::new(shared.path());
         client.start_daemon();
-        let socket = client.cache_dir.join("daemon.sock");
+        let socket = client.runtime_dir.join("daemon.sock");
         assert!(
             socket.exists(),
             "the daemon should have published its socket at {}",

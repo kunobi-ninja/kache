@@ -220,8 +220,25 @@ pub struct NetworkAnalysis {
     pub avg_download_ms: f64,
     pub p95_download_ms: u64,
     pub max_download_ms: u64,
-    /// Throughput based on total wall-clock time (includes local restore work).
+    /// Legacy cumulative end-to-end service-time rate. This divides bytes by
+    /// the sum of per-download durations; it is not an observed wall-clock rate.
     pub throughput_mbps: f64,
+    /// Bytes represented by download events carrying exact v3 wall timestamps.
+    #[serde(default)]
+    pub observed_bytes_down: u64,
+    /// Number of successful downloads represented in the observed wall span.
+    #[serde(default)]
+    pub observed_downloads: usize,
+    /// Span from the earliest timed download start to the latest timed download
+    /// finish. It includes overlap and local import work.
+    #[serde(default)]
+    pub observed_span_ms: u64,
+    /// Bytes per observed wall span, accounting for concurrent downloads.
+    #[serde(default)]
+    pub observed_throughput_mbps: f64,
+    /// Peak overlap among successful downloads carrying exact wall timestamps.
+    #[serde(default)]
+    pub max_concurrent_downloads: usize,
     /// The remote backend CONFIGURED WHEN THIS REPORT WAS GENERATED: `"s3"`,
     /// `"filesystem"`, or `""` when no remote is configured.
     ///
@@ -236,12 +253,12 @@ pub struct NetworkAnalysis {
     /// as "how the remote is configured now", not "what produced these bytes".
     #[serde(default)]
     pub configured_backend: String,
-    /// Throughput based on remote-read time only (GET + body collection).
+    /// Legacy cumulative open+read service-time rate.
     pub network_throughput_mbps: f64,
-    /// Throughput based on response body time only.
+    /// Legacy cumulative response-body service-time rate.
     #[serde(default)]
     pub body_throughput_mbps: f64,
-    /// Largest aggregate phase for successful downloads, derived from raw phase totals.
+    /// Largest cumulative phase for successful downloads, derived from raw phase totals.
     #[serde(default)]
     pub dominant_download_phase: String,
     #[serde(default)]
@@ -277,6 +294,9 @@ pub struct NetworkAnalysis {
     /// Total time spent importing downloaded entries into SQLite.
     #[serde(default)]
     pub total_import_ms: u64,
+    /// Total time spent waiting for the SQLite store lock before import.
+    #[serde(default)]
+    pub total_import_lock_wait_ms: u64,
     /// Total upload compression time (ms).
     #[serde(default)]
     pub total_compression_ms: u64,
@@ -445,6 +465,10 @@ pub struct TransferDetail {
     #[serde(default)]
     pub object_key: String,
     pub compressed_bytes: u64,
+    #[serde(default)]
+    pub started_at_unix_ms: u64,
+    #[serde(default)]
+    pub finished_at_unix_ms: u64,
     pub elapsed_ms: u64,
     #[serde(default)]
     pub network_ms: u64,
@@ -462,6 +486,8 @@ pub struct TransferDetail {
     pub extract_ms: u64,
     #[serde(default)]
     pub disk_io_ms: u64,
+    #[serde(default)]
+    pub import_lock_wait_ms: u64,
     #[serde(default)]
     pub import_ms: u64,
     #[serde(default)]
@@ -1156,6 +1182,10 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let mut total_disk_io_ms_measured = 0u64;
     let mut has_disk_io_measurement = false;
     let mut total_import_ms = 0u64;
+    let mut total_import_lock_wait_ms = 0u64;
+    let mut timed_import_ms = 0u64;
+    let mut timed_import_lock_wait_ms = 0u64;
+    let mut observed_intervals: Vec<(u64, u64, u64)> = Vec::new();
     let mut total_compression_ms = 0u64;
     let mut total_head_checks_ms = 0u64;
     let mut blobs_skipped = 0u32;
@@ -1187,6 +1217,11 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                     total_decompress_ms += t.decompress_ms;
                     total_extract_ms += t.extract_ms;
                     total_import_ms += t.import_ms;
+                    total_import_lock_wait_ms += t.import_lock_wait_ms;
+                    if t.schema >= 3 {
+                        timed_import_ms += t.import_ms;
+                        timed_import_lock_wait_ms += t.import_lock_wait_ms;
+                    }
                     total_semaphore_wait_ms += t.semaphore_wait_ms;
                     total_head_ms += t.head_ms;
                     total_request_ms += t.request_ms;
@@ -1205,6 +1240,13 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                         _ => unknown_format_downloads += 1,
                     }
                     total_download_ms += t.elapsed_ms;
+                    if t.started_at_unix_ms > 0 && t.finished_at_unix_ms > t.started_at_unix_ms {
+                        observed_intervals.push((
+                            t.started_at_unix_ms,
+                            t.finished_at_unix_ms,
+                            t.compressed_bytes,
+                        ));
+                    }
                     // network_ms defaults to 0 for older log entries
                     total_network_ms += if t.network_ms > 0 {
                         t.network_ms
@@ -1235,12 +1277,46 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
 
     let max_download_ms = download_latencies.last().copied().unwrap_or(0);
 
-    // Wall-clock throughput (includes decompression + disk I/O)
+    // Cumulative end-to-end service-time rate. Summing durations serializes
+    // concurrent downloads, so this must not be presented as wall-clock rate.
     let throughput_mbps = if total_download_ms > 0 {
         (total_download_bytes as f64 / (1024.0 * 1024.0)) / (total_download_ms as f64 / 1000.0)
     } else {
         0.0
     };
+
+    let observed_downloads = observed_intervals.len();
+    let observed_bytes_down = observed_intervals
+        .iter()
+        .map(|(_, _, bytes)| *bytes)
+        .sum::<u64>();
+    let observed_span_ms = observed_intervals
+        .iter()
+        .map(|(start, _, _)| *start)
+        .min()
+        .zip(observed_intervals.iter().map(|(_, end, _)| *end).max())
+        .map(|(start, end)| end.saturating_sub(start))
+        .unwrap_or(0);
+    let observed_throughput_mbps = if observed_span_ms > 0 {
+        (observed_bytes_down as f64 / (1024.0 * 1024.0)) / (observed_span_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let mut interval_edges = Vec::with_capacity(observed_intervals.len() * 2);
+    for (start, end, _) in &observed_intervals {
+        interval_edges.push((*start, 1i32));
+        interval_edges.push((*end, -1i32));
+    }
+    // At a shared timestamp, process finishes before starts so adjacent
+    // half-open intervals do not count as overlapping.
+    interval_edges.sort_unstable_by_key(|(at, delta)| (*at, *delta));
+    let mut concurrent_downloads = 0i32;
+    let mut max_concurrent_downloads = 0usize;
+    for (_, delta) in interval_edges {
+        concurrent_downloads += delta;
+        max_concurrent_downloads =
+            max_concurrent_downloads.max(concurrent_downloads.max(0) as usize);
+    }
 
     // Remote-read throughput (request + body, excludes decompress/disk).
     let network_throughput_mbps = if total_network_ms > 0 {
@@ -1273,6 +1349,8 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                 cache_key: t.cache_key.clone(),
                 object_key: t.object_key.clone(),
                 compressed_bytes: t.compressed_bytes,
+                started_at_unix_ms: t.started_at_unix_ms,
+                finished_at_unix_ms: t.finished_at_unix_ms,
                 elapsed_ms: t.elapsed_ms,
                 network_ms: t.network_ms,
                 semaphore_wait_ms: t.semaphore_wait_ms,
@@ -1282,6 +1360,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                 decompress_ms: t.decompress_ms,
                 extract_ms: t.extract_ms,
                 disk_io_ms: t.disk_io_ms,
+                import_lock_wait_ms: t.import_lock_wait_ms,
                 import_ms: t.import_ms,
                 request_count: t.request_count,
                 blobs_skipped: t.blobs_skipped,
@@ -1303,7 +1382,13 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let total_disk_io_ms = if has_disk_io_measurement {
         total_disk_io_ms_measured
     } else {
-        total_download_ms.saturating_sub(total_network_ms + total_decompress_ms + total_extract_ms)
+        total_download_ms.saturating_sub(
+            total_network_ms
+                + total_decompress_ms
+                + total_extract_ms
+                + timed_import_lock_wait_ms
+                + timed_import_ms,
+        )
     };
     let phase_totals = [
         ("wait", total_semaphore_wait_ms),
@@ -1312,6 +1397,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         ("body", total_body_ms),
         ("decompress", total_decompress_ms),
         ("extract", total_extract_ms),
+        ("import lock wait", total_import_lock_wait_ms),
         ("import", total_import_ms),
         ("disk", total_disk_io_ms),
     ];
@@ -1339,6 +1425,11 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         p95_download_ms,
         max_download_ms,
         throughput_mbps: (throughput_mbps * 10.0).round() / 10.0,
+        observed_bytes_down,
+        observed_downloads,
+        observed_span_ms,
+        observed_throughput_mbps: (observed_throughput_mbps * 10.0).round() / 10.0,
+        max_concurrent_downloads,
         network_throughput_mbps: (network_throughput_mbps * 10.0).round() / 10.0,
         body_throughput_mbps: (body_throughput_mbps * 10.0).round() / 10.0,
         dominant_download_phase: dominant_phase.to_string(),
@@ -1355,6 +1446,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
         total_extract_ms,
         total_disk_io_ms,
         total_import_ms,
+        total_import_lock_wait_ms,
         total_compression_ms,
         total_head_checks_ms,
         blobs_skipped,
@@ -1882,21 +1974,27 @@ pub fn format_markdown(report: &BuildReport) -> String {
             net.avg_download_ms
         ));
         lines.push(format!("| P95 download time | {}ms |", net.p95_download_ms));
+        if net.observed_span_ms > 0 {
+            lines.push(format!(
+                "| Observed wall-span throughput | {:.1} MB/s over {} ({} timed downloads, peak {} concurrent) |",
+                net.observed_throughput_mbps,
+                format_duration_ms(net.observed_span_ms),
+                net.observed_downloads,
+                net.max_concurrent_downloads
+            ));
+        } else if net.downloads_ok > 0 {
+            lines.push(
+                "| Observed wall-span throughput | unavailable (legacy transfer events) |"
+                    .to_string(),
+            );
+        }
         lines.push(format!(
-            "| Throughput (open + read) | {:.1} MB/s |",
-            net.network_throughput_mbps
-        ));
-        lines.push(format!(
-            "| Throughput (read only) | {:.1} MB/s |",
-            net.body_throughput_mbps
-        ));
-        lines.push(format!(
-            "| Throughput (incl. restore) | {:.1} MB/s |",
-            net.throughput_mbps
+            "| Cumulative service-time rates | read {:.1} MB/s, open+read {:.1} MB/s, end-to-end {:.1} MB/s |",
+            net.body_throughput_mbps, net.network_throughput_mbps, net.throughput_mbps
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
             lines.push(format!(
-                "| Dominant aggregate download phase | {} — {} ({:.1}%) |",
+                "| Dominant cumulative download phase | {} — {} ({:.1}%) |",
                 human_download_phase(&net.dominant_download_phase),
                 format_duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
@@ -1914,17 +2012,19 @@ pub fn format_markdown(report: &BuildReport) -> String {
             || net.total_head_ms > 0
             || net.total_decompress_ms > 0
             || net.total_extract_ms > 0
+            || net.total_import_lock_wait_ms > 0
             || net.total_import_ms > 0
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "| Aggregate download phase time | queue wait {}ms, existence check {}ms, open/setup {}ms, read/transfer {}ms, decompress {}ms, extract {}ms, import {}ms, local disk I/O {}ms |",
+                "| Cumulative download phase time | queue wait {}ms, existence check {}ms, open/setup {}ms, read/transfer {}ms, decompress {}ms, extract {}ms, import lock wait {}ms, import execution {}ms, local disk I/O {}ms |",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
                 net.total_body_ms,
                 net.total_decompress_ms,
                 net.total_extract_ms,
+                net.total_import_lock_wait_ms,
                 net.total_import_ms,
                 net.total_disk_io_ms
             ));
@@ -1953,7 +2053,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
         if !net.slowest_downloads.is_empty() {
             lines.push("#### Slowest Downloads".to_string());
             lines.push(
-                "| Crate | Size | Time | Key | Wait/Check | Open/Read | Extract/Import |"
+                "| Crate | Size | Time | Key | Wait/Check | Open/Read | Extract/Lock/Import |"
                     .to_string(),
             );
             lines.push("|---|---|---|---|---|---|---|".to_string());
@@ -1964,7 +2064,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
                     &d.cache_key[..d.cache_key.len().min(12)]
                 };
                 lines.push(format!(
-                    "| `{}` | {} | {}ms | `{}` | {}/{}ms | {}/{}ms | {}/{}ms |",
+                    "| `{}` | {} | {}ms | `{}` | {}/{}ms | {}/{}ms | {}/{}/{}ms |",
                     d.crate_name,
                     format_bytes(d.compressed_bytes),
                     d.elapsed_ms,
@@ -1974,6 +2074,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
                     d.request_ms,
                     d.body_ms,
                     d.extract_ms.max(d.decompress_ms),
+                    d.import_lock_wait_ms,
                     d.import_ms,
                 ));
             }
@@ -2265,10 +2366,10 @@ pub fn format_github(report: &BuildReport) -> String {
 
     // ── Remote transfer (collapsed) ──
     if let Some(net) = &report.network {
-        let net_tp = if net.network_throughput_mbps > 0.0 {
-            net.network_throughput_mbps
+        let (summary_rate, summary_rate_label) = if net.observed_span_ms > 0 {
+            (net.observed_throughput_mbps, "observed wall span")
         } else {
-            net.throughput_mbps
+            (net.body_throughput_mbps, "cumulative read service")
         };
 
         lines.push(String::new());
@@ -2276,16 +2377,17 @@ pub fn format_github(report: &BuildReport) -> String {
         let dominant_summary =
             if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
                 format!(
-                    ", dominant aggregate {}",
+                    ", dominant cumulative {}",
                     human_download_phase(&net.dominant_download_phase)
                 )
             } else {
                 String::new()
             };
         lines.push(format!(
-            "<summary><strong>Remote transfer</strong> — {} downloaded, {:.0} MB/s read{}</summary>",
+            "<summary><strong>Remote transfer</strong> — {} downloaded, {:.0} MB/s {}{}</summary>",
             format_bytes(net.bytes_down),
-            net.body_throughput_mbps,
+            summary_rate,
+            summary_rate_label,
             dominant_summary
         ));
         lines.push(String::new());
@@ -2330,13 +2432,27 @@ pub fn format_github(report: &BuildReport) -> String {
                 net.total_get_requests, req_per_download
             ));
         }
+        if net.observed_span_ms > 0 {
+            lines.push(format!(
+                "| Observed wall-span throughput | {:.1} MB/s over {} · {} timed downloads · peak {} concurrent |",
+                net.observed_throughput_mbps,
+                format_duration_ms(net.observed_span_ms),
+                net.observed_downloads,
+                net.max_concurrent_downloads
+            ));
+        } else if net.downloads_ok > 0 {
+            lines.push(
+                "| Observed wall-span throughput | unavailable (legacy transfer events) |"
+                    .to_string(),
+            );
+        }
         lines.push(format!(
-            "| Throughput | {:.1} MB/s read · {:.1} MB/s open+read · {:.1} MB/s end-to-end |",
-            net.body_throughput_mbps, net_tp, net.throughput_mbps
+            "| Cumulative service-time rates | {:.1} MB/s read · {:.1} MB/s open+read · {:.1} MB/s end-to-end |",
+            net.body_throughput_mbps, net.network_throughput_mbps, net.throughput_mbps
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
             lines.push(format!(
-                "| Dominant aggregate download phase | {} — {} ({:.1}%) |",
+                "| Dominant cumulative download phase | {} — {} ({:.1}%) |",
                 human_download_phase(&net.dominant_download_phase),
                 format_duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
@@ -2354,17 +2470,19 @@ pub fn format_github(report: &BuildReport) -> String {
             || net.total_head_ms > 0
             || net.total_decompress_ms > 0
             || net.total_extract_ms > 0
+            || net.total_import_lock_wait_ms > 0
             || net.total_import_ms > 0
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "| Aggregate download phase time | queue wait {}ms · existence check {}ms · open/setup {}ms · read/transfer {}ms · decompress {}ms · extract {}ms · import {}ms · local disk {}ms |",
+                "| Cumulative download phase time | queue wait {}ms · existence check {}ms · open/setup {}ms · read/transfer {}ms · decompress {}ms · extract {}ms · import lock wait {}ms · import execution {}ms · local disk {}ms |",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
                 net.total_body_ms,
                 net.total_decompress_ms,
                 net.total_extract_ms,
+                net.total_import_lock_wait_ms,
                 net.total_import_ms,
                 net.total_disk_io_ms
             ));
@@ -2393,7 +2511,7 @@ pub fn format_github(report: &BuildReport) -> String {
             lines.push("**Slowest downloads:**".to_string());
             lines.push(String::new());
             lines.push(
-                "| Crate | Fmt | Size | Time | Reads | Key | Wait/Check | Open/Read | Extract/Import |"
+                "| Crate | Fmt | Size | Time | Reads | Key | Wait/Check | Open/Read | Extract/Lock/Import |"
                     .to_string(),
             );
             lines.push(
@@ -2407,7 +2525,7 @@ pub fn format_github(report: &BuildReport) -> String {
                     &d.cache_key[..d.cache_key.len().min(12)]
                 };
                 lines.push(format!(
-                    "| `{}` | {} | {} | {}ms | {} | `{}` | {}/{}ms | {}/{}ms | {}/{}ms |",
+                    "| `{}` | {} | {} | {}ms | {} | `{}` | {}/{}ms | {}/{}ms | {}/{}/{}ms |",
                     d.crate_name,
                     if d.format.is_empty() { "?" } else { &d.format },
                     format_bytes(d.compressed_bytes),
@@ -2419,6 +2537,7 @@ pub fn format_github(report: &BuildReport) -> String {
                     d.request_ms,
                     d.body_ms,
                     d.extract_ms.max(d.decompress_ms),
+                    d.import_lock_wait_ms,
                     d.import_ms,
                 ));
             }
@@ -2655,13 +2774,26 @@ pub fn format_text(report: &BuildReport) -> String {
             "  Latency: avg {:.0}ms, p95 {}ms, max {}ms",
             net.avg_download_ms, net.p95_download_ms, net.max_download_ms
         ));
+        if net.observed_span_ms > 0 {
+            lines.push(format!(
+                "  Observed wall-span throughput: {:.1} MB/s over {} ({} timed downloads, peak {} concurrent)",
+                net.observed_throughput_mbps,
+                format_duration_ms(net.observed_span_ms),
+                net.observed_downloads,
+                net.max_concurrent_downloads
+            ));
+        } else if net.downloads_ok > 0 {
+            lines.push(
+                "  Observed wall-span throughput: unavailable (legacy transfer events)".to_string(),
+            );
+        }
         lines.push(format!(
-            "  Throughput: {:.1} MB/s read, {:.1} MB/s open+read, {:.1} MB/s incl. restore",
+            "  Cumulative service-time rates: {:.1} MB/s read, {:.1} MB/s open+read, {:.1} MB/s end-to-end",
             net.body_throughput_mbps, net.network_throughput_mbps, net.throughput_mbps
         ));
         if !net.dominant_download_phase.is_empty() && net.dominant_download_phase_ms > 0 {
             lines.push(format!(
-                "  Dominant aggregate phase: {} — {} ({:.1}%)",
+                "  Dominant cumulative phase: {} — {} ({:.1}%)",
                 human_download_phase(&net.dominant_download_phase),
                 format_duration_ms(net.dominant_download_phase_ms),
                 net.dominant_download_phase_pct
@@ -2679,17 +2811,19 @@ pub fn format_text(report: &BuildReport) -> String {
             || net.total_head_ms > 0
             || net.total_decompress_ms > 0
             || net.total_extract_ms > 0
+            || net.total_import_lock_wait_ms > 0
             || net.total_import_ms > 0
             || net.total_disk_io_ms > 0
         {
             lines.push(format!(
-                "  Aggregate phase time: queue wait {}ms, existence check {}ms, open/setup {}ms, read/transfer {}ms, decompress {}ms, extract {}ms, import {}ms, local disk I/O {}ms",
+                "  Cumulative phase time: queue wait {}ms, existence check {}ms, open/setup {}ms, read/transfer {}ms, decompress {}ms, extract {}ms, import lock wait {}ms, import execution {}ms, local disk I/O {}ms",
                 net.total_semaphore_wait_ms,
                 net.total_head_ms,
                 net.total_request_ms,
                 net.total_body_ms,
                 net.total_decompress_ms,
                 net.total_extract_ms,
+                net.total_import_lock_wait_ms,
                 net.total_import_ms,
                 net.total_disk_io_ms
             ));
@@ -2951,13 +3085,15 @@ mod tests {
         ok: bool,
     ) -> TransferEvent {
         TransferEvent {
-            schema: 2,
+            schema: 3,
             crate_name: crate_name.to_string(),
             direction,
             format: format.to_string(),
             cache_key: format!("{crate_name}-key"),
             object_key: format!("prefix/v3/packs/{crate_name}/{crate_name}-key.tar.zst"),
             compressed_bytes,
+            started_at_unix_ms: 0,
+            finished_at_unix_ms: 0,
             elapsed_ms,
             network_ms: elapsed_ms / 2, // simulate network = half of total
             semaphore_wait_ms: 0,
@@ -2969,6 +3105,7 @@ mod tests {
             decompress_ms: elapsed_ms / 4,        // simulate decompress = quarter of total
             extract_ms: 0,
             disk_io_ms: 0,
+            import_lock_wait_ms: 0,
             import_ms: 0,
             compression_ms: 0,
             head_checks_ms: 0,
@@ -4044,13 +4181,15 @@ mod tests {
         };
 
         let slow = TransferEvent {
-            schema: 2,
+            schema: 3,
             crate_name: "slow".to_string(),
             direction: TransferDirection::Download,
             format: "v3".to_string(),
             cache_key: "slow-key".to_string(),
             object_key: "prefix/v3/packs/slow/slow-key.tar.zst".to_string(),
             compressed_bytes: 1000,
+            started_at_unix_ms: 0,
+            finished_at_unix_ms: 0,
             elapsed_ms: 80_000,
             network_ms: 40_000,
             semaphore_wait_ms: 11_000, // > 10s -> semaphore-wait suggestion
@@ -4062,6 +4201,7 @@ mod tests {
             decompress_ms: 0,
             extract_ms: 31_000, // > 30s AND > body_ms -> extract-time suggestion
             disk_io_ms: 0,
+            import_lock_wait_ms: 0,
             import_ms: 0,
             compression_ms: 0,
             head_checks_ms: 0,
@@ -4190,11 +4330,11 @@ mod tests {
     fn render_network_and_error_sections_with_all_optional_fields() {
         // Synthetic events from write_test_events yield a network section
         // without uploads, compression, blob-dedup, failures, the dominant
-        // aggregate phase, or an error table — so those optional rows stay
+        // cumulative phase, or an error table — so those optional rows stay
         // cold in all three renderers. Populate a fully-loaded NetworkAnalysis
         // plus an errors_detail list on a generated report and confirm every
         // format surfaces the upload, compression, dedup, failure, dominant-
-        // phase, aggregate-phase, GET-fan-out, and error-table branches.
+        // phase, cumulative-phase, GET-fan-out, and error-table branches.
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
         let mut report = generate_report(&config, 24, 10).unwrap();
@@ -4211,6 +4351,11 @@ mod tests {
             p95_download_ms: 90,
             max_download_ms: 120,
             throughput_mbps: 50.0,
+            observed_bytes_down: 20 * 1024 * 1024,
+            observed_downloads: 10,
+            observed_span_ms: 300,
+            observed_throughput_mbps: 66.7,
+            max_concurrent_downloads: 4,
             network_throughput_mbps: 60.0,
             body_throughput_mbps: 70.0,
             dominant_download_phase: "body".to_string(),
@@ -4227,6 +4372,7 @@ mod tests {
             total_extract_ms: 60,
             total_disk_io_ms: 70,
             total_import_ms: 80,
+            total_import_lock_wait_ms: 35,
             total_compression_ms: 15,
             total_head_checks_ms: 25,
             blobs_skipped: 6,
@@ -4242,6 +4388,8 @@ mod tests {
                 cache_key: "abcdef0123456789deadbeef".to_string(),
                 object_key: "rust/abc/serde".to_string(),
                 compressed_bytes: 2 * 1024 * 1024,
+                started_at_unix_ms: 1_000,
+                finished_at_unix_ms: 1_120,
                 elapsed_ms: 120,
                 network_ms: 100,
                 semaphore_wait_ms: 5,
@@ -4251,6 +4399,7 @@ mod tests {
                 decompress_ms: 9,
                 extract_ms: 10,
                 disk_io_ms: 11,
+                import_lock_wait_ms: 4,
                 import_ms: 12,
                 request_count: 4,
                 blobs_skipped: 2,
@@ -4265,11 +4414,14 @@ mod tests {
             timestamp: "2026-06-19T12:00:00+00:00".to_string(),
         }];
 
-        for rendered in [
-            format_markdown(&report),
-            format_github(&report),
-            format_text(&report),
-        ] {
+        let positive_markdown = format_markdown(&report);
+        let positive_github = format_github(&report);
+        let positive_text = format_text(&report);
+        assert!(
+            positive_github.contains("67 MB/s observed wall span"),
+            "GitHub summary must prefer the observed wall-span rate: {positive_github}"
+        );
+        for rendered in [positive_markdown, positive_github, positive_text] {
             let lower = rendered.to_lowercase();
             // Upload row (uploads_ok > 0) and its compression/existence split.
             assert!(
@@ -4293,6 +4445,85 @@ mod tests {
             );
             // The error table lists the failing crate.
             assert!(lower.contains("boom"), "missing error entry: {rendered}");
+            assert!(
+                lower.contains("observed wall-span"),
+                "missing observed throughput label: {rendered}"
+            );
+            assert!(
+                lower.contains("66.7 mb/s") && !lower.contains("unavailable"),
+                "nonzero observed span must render the measured rate: {rendered}"
+            );
+            assert!(
+                lower.contains("cumulative service-time"),
+                "missing cumulative-rate label: {rendered}"
+            );
+            assert!(
+                lower.contains("import lock"),
+                "missing separate import lock timing: {rendered}"
+            );
+            assert!(
+                !lower.contains("dominant aggregate")
+                    && !lower.contains("aggregate download phase"),
+                "remote service-time totals must not be labeled aggregate: {rendered}"
+            );
+        }
+
+        let network = report.network.as_mut().unwrap();
+        network.observed_bytes_down = 0;
+        network.observed_downloads = 0;
+        network.observed_span_ms = 0;
+        network.observed_throughput_mbps = 0.0;
+        network.max_concurrent_downloads = 0;
+        network.dominant_download_phase.clear();
+        network.dominant_download_phase_ms = 0;
+        network.dominant_download_phase_pct = 0.0;
+        network.total_request_ms = 0;
+        network.total_body_ms = 0;
+        network.total_semaphore_wait_ms = 0;
+        network.total_head_ms = 0;
+        network.total_decompress_ms = 0;
+        network.total_extract_ms = 0;
+        network.total_disk_io_ms = 0;
+        network.total_import_ms = 0;
+        network.total_import_lock_wait_ms = 35;
+
+        let legacy_markdown = format_markdown(&report);
+        let legacy_github = format_github(&report);
+        let legacy_text = format_text(&report);
+        assert!(
+            legacy_github.contains("70 MB/s cumulative read service"),
+            "GitHub summary must label the legacy fallback as cumulative: {legacy_github}"
+        );
+        for rendered in [legacy_markdown, legacy_github, legacy_text] {
+            let lower = rendered.to_lowercase();
+            assert!(
+                lower.contains("observed wall-span throughput") && lower.contains("unavailable"),
+                "zero observed span must render the legacy-event fallback: {rendered}"
+            );
+            assert!(
+                lower.contains("import lock wait 35ms"),
+                "isolated import-lock timing must render the phase row: {rendered}"
+            );
+        }
+
+        let network = report.network.as_mut().unwrap();
+        network.downloads_ok = 0;
+        network.total_import_lock_wait_ms = 0;
+        for rendered in [
+            format_markdown(&report),
+            format_github(&report),
+            format_text(&report),
+        ] {
+            let lower = rendered.to_lowercase();
+            assert!(
+                !lower.contains("unavailable (legacy transfer events)"),
+                "no downloads must not claim a legacy throughput fallback: {rendered}"
+            );
+            assert!(
+                !lower.contains("cumulative download phase time")
+                    && !lower.contains("cumulative phase time:"),
+                "all-zero phase totals must omit the phase row: {rendered}"
+            );
         }
     }
 
@@ -4473,6 +4704,127 @@ mod tests {
         assert_eq!(na.bytes_up, 1_000);
         assert_eq!(na.bytes_down, 2_000);
         assert!(na.max_download_ms >= 80);
+    }
+
+    #[test]
+    fn network_analysis_distinguishes_observed_span_from_cumulative_service_time() {
+        let mib = 1024 * 1024;
+        let mut first = test_transfer(
+            "first",
+            TransferDirection::Download,
+            "v3",
+            10 * mib,
+            2_000,
+            true,
+        );
+        first.started_at_unix_ms = 1_000;
+        first.finished_at_unix_ms = 3_000;
+        first.import_lock_wait_ms = 125;
+        first.import_ms = 250;
+
+        let mut second = test_transfer(
+            "second",
+            TransferDirection::Download,
+            "v3",
+            20 * mib,
+            2_000,
+            true,
+        );
+        second.started_at_unix_ms = 2_000;
+        second.finished_at_unix_ms = 4_000;
+        second.import_lock_wait_ms = 375;
+        second.import_ms = 500;
+
+        let analysis = build_network_analysis(&[first, second], 10);
+
+        assert_eq!(analysis.observed_span_ms, 3_000);
+        assert_eq!(analysis.observed_throughput_mbps, 10.0);
+        assert_eq!(analysis.max_concurrent_downloads, 2);
+        assert_eq!(analysis.throughput_mbps, 7.5);
+        assert_eq!(analysis.total_import_lock_wait_ms, 500);
+        assert_eq!(analysis.total_import_ms, 750);
+    }
+
+    #[test]
+    fn network_analysis_rejects_invalid_wall_intervals() {
+        let mib = 1024 * 1024;
+        let mut valid = test_transfer(
+            "valid",
+            TransferDirection::Download,
+            "v3",
+            4 * mib,
+            1_000,
+            true,
+        );
+        valid.started_at_unix_ms = 2_000;
+        valid.finished_at_unix_ms = 3_000;
+
+        let mut zero_start = valid.clone();
+        zero_start.crate_name = "zero-start".to_string();
+        zero_start.started_at_unix_ms = 0;
+
+        let mut zero_length = valid.clone();
+        zero_length.crate_name = "zero-length".to_string();
+        zero_length.finished_at_unix_ms = zero_length.started_at_unix_ms;
+
+        let mut reversed = valid.clone();
+        reversed.crate_name = "reversed".to_string();
+        reversed.finished_at_unix_ms = reversed.started_at_unix_ms - 1;
+
+        let analysis = build_network_analysis(&[valid, zero_start, zero_length, reversed], 10);
+
+        assert_eq!(analysis.observed_downloads, 1);
+        assert_eq!(analysis.observed_bytes_down, 4 * mib);
+        assert_eq!(analysis.observed_span_ms, 1_000);
+        assert_eq!(analysis.observed_throughput_mbps, 4.0);
+        assert_eq!(analysis.max_concurrent_downloads, 1);
+    }
+
+    #[test]
+    fn network_analysis_disk_fallback_subtracts_only_v3_import_timing() {
+        let mut timed = test_transfer(
+            "timed",
+            TransferDirection::Download,
+            "v3",
+            1024,
+            1_000,
+            true,
+        );
+        timed.network_ms = 400;
+        timed.decompress_ms = 100;
+        timed.extract_ms = 75;
+        timed.import_lock_wait_ms = 50;
+        timed.import_ms = 25;
+        timed.disk_io_ms = 0;
+
+        let timed_analysis = build_network_analysis(&[timed.clone()], 10);
+        assert_eq!(timed_analysis.total_disk_io_ms, 350);
+        assert_eq!(timed_analysis.total_import_lock_wait_ms, 50);
+        assert_eq!(timed_analysis.total_import_ms, 25);
+
+        timed.schema = 2;
+        let legacy_analysis = build_network_analysis(&[timed], 10);
+        assert_eq!(legacy_analysis.total_disk_io_ms, 425);
+        assert_eq!(legacy_analysis.total_import_lock_wait_ms, 50);
+        assert_eq!(legacy_analysis.total_import_ms, 25);
+    }
+
+    #[test]
+    fn transfer_event_v2_deserializes_without_v3_timing_fields() {
+        let event: TransferEvent = serde_json::from_value(serde_json::json!({
+            "schema": 2,
+            "crate_name": "legacy",
+            "direction": "download",
+            "compressed_bytes": 1024,
+            "elapsed_ms": 10,
+            "ok": true,
+            "timestamp": 123
+        }))
+        .unwrap();
+
+        assert_eq!(event.started_at_unix_ms, 0);
+        assert_eq!(event.finished_at_unix_ms, 0);
+        assert_eq!(event.import_lock_wait_ms, 0);
     }
 
     #[test]

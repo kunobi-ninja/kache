@@ -195,6 +195,8 @@ For timeline analysis, JSON reports include a `timeline` window plus a top-level
 
 The `github` format is friendly for posting as a PR comment via `gh pr comment --body-file`.
 
+Remote-transfer reports distinguish actual elapsed throughput from diagnostic service-time rates. `observed_throughput_mbps` divides the bytes covered by exact transfer timestamps by `observed_span_ms` (earliest start through latest finish), so overlapping downloads are counted once in wall time; `max_concurrent_downloads` reports their peak overlap. The legacy `throughput_mbps`, `network_throughput_mbps`, and `body_throughput_mbps` fields remain for compatibility, but divide by cumulative per-transfer service time and are not wall-clock throughput. Transfer-event schema v3 includes SQLite import in end-to-end elapsed time and reports import lock wait separately from import execution.
+
 ### JSON report schema and compatibility
 
 `kache report --format json` emits structured, machine-readable telemetry adhering to a versioned output contract:

@@ -372,6 +372,11 @@ impl RustcArgs {
             path_normalize_disabled: !crate::path_normalizer::rustc_path_normalize_enabled(),
             path_normalization_root: None,
         };
+        // Some rustc queries accept a crate name and source path but only print
+        // information to stdout; they deliberately emit no cacheable artifacts.
+        // Keep this separate from ignored-key flags so source-bearing queries
+        // cannot be mistaken for primary compilations.
+        let mut is_query = false;
 
         let mut i = 0;
         while i < rustc_args.len() {
@@ -533,6 +538,16 @@ impl RustcArgs {
                         .remap_path_prefixes
                         .push(arg["--remap-path-prefix=".len()..].to_string());
                 }
+                "--print" | "--explain" => {
+                    is_query = true;
+                    i = i.saturating_add(1); // skip the value argument
+                }
+                _ if arg.starts_with("--print=") || arg.starts_with("--explain=") => {
+                    is_query = true;
+                }
+                "-V" | "--version" | "-h" | "--help" | "-vV" => {
+                    is_query = true;
+                }
                 // Diagnostics / lint / query flags: never change the artifact,
                 // so drop them (and their separated value) before the residual
                 // catch-all (kunobi-ninja/kache#324).
@@ -560,7 +575,8 @@ impl RustcArgs {
         }
 
         parsed.features.sort();
-        parsed.is_primary = parsed.crate_name.is_some() && parsed.source_file.is_some();
+        parsed.is_primary =
+            !is_query && parsed.crate_name.is_some() && parsed.source_file.is_some();
         parsed.path_normalization_root = std::env::current_dir()
             .ok()
             .map(|cwd| parsed.select_path_normalization_root(&cwd));

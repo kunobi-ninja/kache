@@ -5096,6 +5096,15 @@ mod tests {
             "{github}"
         );
 
+        let mut restored = generate_report(&config, 24, 10).unwrap();
+        restored.storage.restored_bytes = 1024;
+        restored.storage.logical_bytes = 1;
+        restored.storage.blob_bytes = 1;
+        restored.storage.accounting_consistent = true;
+        let github = format_github(&restored);
+        assert!(github.contains("zero-copy restores"), "{github}");
+        assert!(github.contains("KB restored"), "{github}");
+
         assert!(blob_accounting_consistent(0, 0));
         assert!(blob_accounting_consistent(5, 5));
         assert!(blob_accounting_consistent(5, 4));

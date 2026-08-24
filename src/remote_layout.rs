@@ -725,8 +725,8 @@ fn copy_dir_all_until(src: &Path, dst: &Path, deadline: Option<Instant>) -> Resu
 mod tests {
     use super::{
         DeadlineReader, DeadlineWriter, HashingWriter, RemoteLayout, V3Manifest, blob_path,
-        copy_dir_all, create_entry_pack_zstd, extract_entry_pack, is_blob_hash, is_rooted_path,
-        is_safe_artifact_name, v3_manifest_key, v3_pack_key,
+        copy_dir_all, create_entry_pack_zstd, extract_entry_pack, extract_verified_prefetch_entry,
+        is_blob_hash, is_rooted_path, is_safe_artifact_name, v3_manifest_key, v3_pack_key,
     };
     use crate::config::{
         Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
@@ -996,6 +996,88 @@ mod tests {
         assert_eq!(std::fs::read(blob).unwrap(), b"hello world");
         assert!(restore_entry_dir.join("meta.json").exists());
         assert!(!restore_entry_dir.join("libfoo.rlib").exists());
+    }
+
+    #[test]
+    fn packed_prefetch_checks_each_outer_and_inner_binding_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = min_config(tmp.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"packed-binding-key").to_hex().to_string();
+        let other_key = blake3::hash(b"other-packed-binding-key")
+            .to_hex()
+            .to_string();
+        let source = tmp.path().join("source.rlib");
+        std::fs::write(&source, b"packed binding artifact").unwrap();
+        store
+            .put(
+                &key,
+                "serde",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(source, "libserde.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let entry_dir = store.entry_dir(&key);
+        let meta: EntryMeta =
+            serde_json::from_slice(&std::fs::read(entry_dir.join("meta.json")).unwrap()).unwrap();
+        let meta_digest = blake3::hash(&std::fs::read(entry_dir.join("meta.json")).unwrap())
+            .to_hex()
+            .to_string();
+        let packed = create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3).unwrap();
+
+        for (cache_key, crate_name, expected_error) in [
+            ("invalid", "serde", "invalid packed-prefetch entry binding"),
+            (
+                key.as_str(),
+                "../unsafe",
+                "invalid packed-prefetch entry binding",
+            ),
+            (
+                other_key.as_str(),
+                "serde",
+                "packed-prefetch cache-key or crate binding mismatch",
+            ),
+            (
+                key.as_str(),
+                "tokio",
+                "packed-prefetch cache-key or crate binding mismatch",
+            ),
+        ] {
+            let restored = tmp
+                .path()
+                .join(format!("restored-{}", blake3::hash(cache_key.as_bytes())));
+            let err = extract_verified_prefetch_entry(
+                cache_key,
+                crate_name,
+                &meta_digest,
+                &packed,
+                &restored,
+                None,
+            )
+            .err()
+            .expect("a mismatched binding must be rejected");
+            assert!(
+                err.to_string().contains(expected_error),
+                "expected {expected_error:?}, got {err}"
+            );
+            assert!(!restored.exists());
+        }
+
+        let restored = tmp.path().join("restored-invalid-meta-digest");
+        let err =
+            extract_verified_prefetch_entry(&key, "serde", "invalid", &packed, &restored, None)
+                .err()
+                .expect("a malformed metadata digest must be rejected at the outer binding gate");
+        assert!(
+            err.to_string()
+                .contains("invalid packed-prefetch entry binding")
+        );
+        assert!(!restored.exists());
     }
 
     #[test]

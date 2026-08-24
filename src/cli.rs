@@ -7630,6 +7630,23 @@ mod tests {
             "zero listed keys must not render a LIST status line: {out}"
         );
         snap.prefetch.last_list_key_count = 250_000;
+
+        // Transport activity is the sum of two independent counters.  Neither
+        // a zero total nor a zero wall clock sample should render a line.
+        snap.prefetch.pack_requests_total = 0;
+        snap.prefetch.v3_requests_total = 0;
+        snap.prefetch.last_plan_wall_ms = 0;
+        let out = render_stats(&snap, &config, 24).join("\n");
+        assert!(!out.contains("Transport:"));
+        assert!(!out.contains("Plan wall:"));
+
+        snap.prefetch.pack_requests_total = 1;
+        let out = render_stats(&snap, &config, 24).join("\n");
+        assert!(out.contains("Transport:  pack 1 requests"));
+        snap.prefetch.pack_requests_total = 0;
+        snap.prefetch.v3_requests_total = 1;
+        let out = render_stats(&snap, &config, 24).join("\n");
+        assert!(out.contains("v3 1 requests"));
     }
 
     /// A daemon-shaped [`crate::daemon::EffectiveConfig`] mirroring `config`,

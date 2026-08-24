@@ -367,15 +367,10 @@ impl RemoteBackend for OpenDalBackend {
         };
         match result {
             Ok(_) => Ok(PutIfAbsentResult::Created),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists
-                ) =>
-            {
-                Ok(PutIfAbsentResult::AlreadyExists)
-            }
-            Err(error) => Err(self.contextual_error("CREATE", key, error)),
+            Err(error) => match classify_create_error(error.kind()) {
+                Some(outcome) => Ok(outcome),
+                None => Err(self.contextual_error("CREATE", key, error)),
+            },
         }
     }
 
@@ -479,6 +474,18 @@ fn verify_complete_body(advertised: Option<u64>, read: u64, description: &str) -
         anyhow::bail!("{description} truncated: read {read} bytes, expected {advertised}");
     }
     Ok(())
+}
+
+/// Only failed create preconditions mean that an immutable object already won
+/// the publication race. Authentication, transport, and storage failures must
+/// remain errors rather than being reported as a harmless duplicate.
+fn classify_create_error(kind: ErrorKind) -> Option<PutIfAbsentResult> {
+    match kind {
+        ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists => {
+            Some(PutIfAbsentResult::AlreadyExists)
+        }
+        _ => None,
+    }
 }
 
 fn without_retry_layer(operator: Operator) -> Operator {
@@ -992,6 +999,20 @@ mod tests {
                 .body,
             "first"
         );
+    }
+
+    #[test]
+    fn create_only_error_classification_is_exact() {
+        assert_eq!(
+            classify_create_error(ErrorKind::ConditionNotMatch),
+            Some(PutIfAbsentResult::AlreadyExists)
+        );
+        assert_eq!(
+            classify_create_error(ErrorKind::AlreadyExists),
+            Some(PutIfAbsentResult::AlreadyExists)
+        );
+        assert_eq!(classify_create_error(ErrorKind::PermissionDenied), None);
+        assert_eq!(classify_create_error(ErrorKind::Unexpected), None);
     }
 
     #[tokio::test]

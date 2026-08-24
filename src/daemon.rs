@@ -4074,7 +4074,7 @@ impl Daemon {
             for entry in decoded.entries {
                 let key = &entry.descriptor.cache_key;
                 let entry_dir = self.entry_dir_for(key);
-                if entry_dir.exists() || claim_download(&self.downloading, key).await.is_some() {
+                if !try_claim_packed_download(&self.downloading, key, &entry_dir).await {
                     continue;
                 }
                 let guard = DownloadingGuard::new(self.downloading.clone(), key.clone());
@@ -5858,6 +5858,20 @@ async fn claim_download(
             None
         }
     }
+}
+
+/// Claim a packed entry only when it is absent on disk and no other download
+/// already owns the key. Keeping both rejection cases behind this seam makes
+/// the short-circuit contract deterministic to test.
+async fn try_claim_packed_download(
+    downloading: &RwLock<HashMap<String, Arc<Notify>>>,
+    key: &str,
+    entry_dir: &Path,
+) -> bool {
+    if entry_dir.exists() {
+        return false;
+    }
+    claim_download(downloading, key).await.is_none()
 }
 
 /// Releases a download claim when dropped: removes the key from the
@@ -12670,6 +12684,20 @@ mod tests {
         build_entry_pack_with_meta(key, crate_name).0
     }
 
+    #[test]
+    fn packed_prefetch_context_is_derived_from_a_complete_build_intent() {
+        let intent = kache_core::BuildIntent {
+            crate_names: vec!["serde".into()],
+            namespace: Some("linux/toolchain/release".into()),
+            cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+        };
+        let context = PackPrefetchContext::from_intent(&intent)
+            .expect("a namespaced lockfile intent must enable catalog discovery");
+        assert_eq!(context.namespace, "linux/toolchain/release");
+        assert_eq!(context.shard_hashes.len(), 1);
+        assert!(crate::cache_key::is_valid_cache_key(&context.selector));
+    }
+
     async fn seed_packed_catalog(
         backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
         context: &PackPrefetchContext,
@@ -12756,6 +12784,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
+        config.prefetch_max_bytes = 0;
         let backend = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
         assert!(daemon.remote_backend.set(backend.clone()).is_ok());
@@ -12790,6 +12819,13 @@ mod tests {
             None,
         )
         .await;
+
+        let sentinel = test_cache_key("existing-prefetched-key");
+        daemon
+            .prefetched_keys
+            .write()
+            .await
+            .insert(sentinel.clone());
 
         let response = daemon
             .handle_prefetch_with_context(
@@ -12831,6 +12867,10 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+        let prefetched = daemon.prefetched_keys.read().await;
+        assert!(prefetched.contains(&sentinel));
+        assert!(prefetched.contains(&key_a));
+        assert!(prefetched.contains(&key_b));
     }
 
     #[tokio::test]
@@ -13020,6 +13060,101 @@ mod tests {
             Some(b"corrupt immutable pack".to_vec()),
         )
         .await;
+        put_test_object(&backend, &test_pack_object_key(&key, "serde"), &payload).await;
+
+        let response = daemon
+            .handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(key.clone(), "serde".into())],
+                    warm_all: false,
+                },
+                Some(context),
+                Instant::now(),
+            )
+            .await;
+        assert!(response.ok);
+        wait_for_store_entry(&daemon, &key).await;
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .v3_requests_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .pack_fallback_entries
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            daemon
+                .prefetch_stats
+                .pack_validation_failures
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_filename_timestamp_mismatch_rejects_context_and_uses_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let context = PackPrefetchContext::from_deps(
+            crate::cli::default_manifest_key(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let key = test_cache_key("catalog-created-at-mismatch");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        let built = crate::remote_pack::build_pack(
+            "prefix",
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest: meta_digest.clone(),
+                payload: payload.clone(),
+            }],
+            crate::remote_pack::DEFAULT_MAX_PACK_BYTES,
+        )
+        .unwrap();
+        put_test_object(&backend, &built.object_key, &built.bytes).await;
+        let created_at_ms = epoch_ms();
+        let catalog = crate::remote_pack::PackCatalog {
+            version: crate::remote_pack::CATALOG_VERSION,
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            manifest_key: context.manifest_key.clone(),
+            namespace: context.namespace.clone(),
+            selector_hash: context.selector.clone(),
+            shard_hashes: context.shard_hashes.clone(),
+            created_at_ms,
+            expires_at_ms: created_at_ms + 60_000,
+            packs: vec![crate::remote_pack::CatalogPackRef {
+                digest: built.digest,
+                pack_bytes: built.bytes.len() as u64,
+                entries: vec![crate::remote_pack::CatalogEntry {
+                    cache_key: key.clone(),
+                    crate_name: "serde".into(),
+                    meta_digest,
+                }],
+            }],
+            fallback_entries: Vec::new(),
+        };
+        let encoded = crate::remote_pack::encode_catalog("prefix", catalog).unwrap();
+        let mismatched_key = crate::remote_pack::catalog_object_key(
+            "prefix",
+            &context.selector,
+            created_at_ms + 1,
+            &encoded.digest,
+        )
+        .unwrap();
+        put_test_object(&backend, &mismatched_key, &encoded.bytes).await;
         put_test_object(&backend, &test_pack_object_key(&key, "serde"), &payload).await;
 
         let response = daemon
@@ -15570,6 +15705,37 @@ mod tests {
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
         assert!(daemon.downloading.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn packed_download_claim_rejects_disk_and_inflight_entries_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let map = RwLock::new(HashMap::new());
+
+        let existing_key = test_cache_key("packed-existing-on-disk");
+        let existing_dir = tmp.path().join("existing");
+        std::fs::create_dir_all(&existing_dir).unwrap();
+        assert!(
+            !try_claim_packed_download(&map, &existing_key, &existing_dir).await,
+            "an on-disk entry must not be claimed again"
+        );
+        assert!(map.read().await.is_empty());
+
+        let inflight_key = test_cache_key("packed-inflight");
+        assert!(claim_download(&map, &inflight_key).await.is_none());
+        assert!(
+            !try_claim_packed_download(&map, &inflight_key, &tmp.path().join("absent")).await,
+            "an in-flight entry must not acquire a second claim"
+        );
+
+        let fresh_key = test_cache_key("packed-fresh");
+        assert!(
+            try_claim_packed_download(&map, &fresh_key, &tmp.path().join("fresh")).await,
+            "an absent unclaimed entry must become the download leader"
+        );
+        let claims = map.read().await;
+        assert!(claims.contains_key(&inflight_key));
+        assert!(claims.contains_key(&fresh_key));
     }
 
     /// Waiter-side wait, mirroring the pattern in `handle_remote_check`:

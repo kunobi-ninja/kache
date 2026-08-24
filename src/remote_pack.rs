@@ -672,6 +672,68 @@ mod tests {
         }
     }
 
+    fn catalog_entry(index: usize) -> CatalogEntry {
+        CatalogEntry {
+            cache_key: digest(&format!("entry-{index:05}")),
+            crate_name: "x".to_string(),
+            meta_digest: digest(&format!("meta-{index:05}")),
+        }
+    }
+
+    fn catalog_with(
+        packs: Vec<CatalogPackRef>,
+        fallback_entries: Vec<CatalogEntry>,
+    ) -> PackCatalog {
+        let shard = digest("boundary-shard");
+        PackCatalog {
+            version: CATALOG_VERSION,
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            manifest_key: "target".to_string(),
+            namespace: "namespace".to_string(),
+            selector_hash: selector_hash(
+                "target",
+                "namespace",
+                std::slice::from_ref(&shard),
+                crate::cache_key::CACHE_KEY_VERSION,
+            )
+            .unwrap(),
+            shard_hashes: vec![shard],
+            created_at_ms: 100,
+            expires_at_ms: 200,
+            packs,
+            fallback_entries,
+        }
+    }
+
+    fn index_entries(count: usize) -> Vec<PackIndexEntry> {
+        let mut entries = (0..count)
+            .map(|index| PackIndexEntry {
+                cache_key: digest(&format!("index-{index:05}")),
+                crate_name: "x".to_string(),
+                meta_digest: digest(&format!("index-meta-{index:05}")),
+                offset: 0,
+                length: 1,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.cache_key.cmp(&right.cache_key));
+        for (offset, entry) in entries.iter_mut().enumerate() {
+            entry.offset = offset as u64;
+        }
+        entries
+    }
+
+    fn framed_index(index: &PackIndex, padded_index_len: usize) -> Vec<u8> {
+        let mut json = serde_json::to_vec(index).unwrap();
+        assert!(json.len() <= padded_index_len);
+        json.resize(padded_index_len, b' ');
+        let mut bytes = Vec::with_capacity(PACK_HEADER_BYTES + json.len() + 1);
+        bytes.extend_from_slice(PACK_MAGIC);
+        bytes.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&json);
+        bytes.push(b'x');
+        bytes
+    }
+
     #[test]
     fn pack_encoding_is_deterministic_and_round_trips() {
         let one = input("one", "serde", b"first-v3-pack");
@@ -750,6 +812,348 @@ mod tests {
         wrong_recipe[16..16 + index_len].copy_from_slice(&changed);
         let wrong_recipe_digest = blake3::hash(&wrong_recipe).to_hex().to_string();
         assert!(decode_pack(&wrong_recipe, &wrong_recipe_digest, 4096).is_err());
+    }
+
+    #[test]
+    fn protocol_limits_and_inclusive_boundaries_are_exact() {
+        assert_eq!(DEFAULT_MAX_PACK_BYTES, 256 * 1024 * 1024);
+        assert_eq!(MAX_PACK_INDEX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(MAX_CATALOG_BYTES, 64 * 1024 * 1024);
+
+        assert!(validate_pack_cap(0).is_err());
+        assert!(validate_pack_cap(DEFAULT_MAX_PACK_BYTES).is_ok());
+        assert!(validate_pack_cap(DEFAULT_MAX_PACK_BYTES + 1).is_err());
+
+        let shard = digest("selector-boundary");
+        assert!(
+            selector_hash(
+                &"a".repeat(MAX_SELECTOR_TEXT_BYTES),
+                "n",
+                std::slice::from_ref(&shard),
+                crate::cache_key::CACHE_KEY_VERSION,
+            )
+            .is_ok()
+        );
+        assert!(
+            selector_hash(
+                &"a".repeat(MAX_SELECTOR_TEXT_BYTES + 1),
+                "n",
+                std::slice::from_ref(&shard),
+                crate::cache_key::CACHE_KEY_VERSION,
+            )
+            .is_err()
+        );
+        assert!(
+            selector_hash(
+                "target",
+                "bad\nnamespace",
+                std::slice::from_ref(&shard),
+                crate::cache_key::CACHE_KEY_VERSION,
+            )
+            .is_err()
+        );
+        assert!(
+            selector_hash(
+                "",
+                "namespace",
+                &[shard],
+                crate::cache_key::CACHE_KEY_VERSION,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn length_prefixes_keep_selector_fields_unambiguous() {
+        let without_shards = Vec::new();
+        let ab_c = selector_hash(
+            "ab",
+            "c",
+            &without_shards,
+            crate::cache_key::CACHE_KEY_VERSION,
+        )
+        .unwrap();
+        let a_bc = selector_hash(
+            "a",
+            "bc",
+            &without_shards,
+            crate::cache_key::CACHE_KEY_VERSION,
+        )
+        .unwrap();
+        assert_ne!(ab_c, a_bc);
+    }
+
+    #[test]
+    fn pack_size_caps_accept_the_limit_and_reject_real_overshoot() {
+        let entry = input("cap-boundary", "serde", b"payload");
+        let built = build_pack("", vec![entry.clone()], 4096).unwrap();
+        let exact = built.bytes.len() as u64;
+        assert!(build_pack("", vec![entry.clone()], exact).is_ok());
+        assert!(build_pack("", vec![entry], exact - 2).is_err());
+        assert!(decode_pack(&built.bytes, &built.digest, exact).is_ok());
+        assert!(decode_pack(&built.bytes, &built.digest, exact - 2).is_err());
+    }
+
+    #[test]
+    fn decoder_checks_magic_index_span_and_index_byte_boundaries_independently() {
+        let built = build_pack("", vec![input("magic", "serde", b"x")], 4096).unwrap();
+        let mut bad_magic = built.bytes.clone();
+        bad_magic[0] ^= 1;
+        let digest = blake3::hash(&bad_magic).to_hex().to_string();
+        assert!(decode_pack(&bad_magic, &digest, 4096).is_err());
+
+        let mut short_index = Vec::from(PACK_MAGIC.as_slice());
+        short_index.extend_from_slice(&1_u64.to_le_bytes());
+        let digest = blake3::hash(&short_index).to_hex().to_string();
+        assert!(decode_pack(&short_index, &digest, 4096).is_err());
+        let truncated_header = &short_index[..PACK_HEADER_BYTES - 1];
+        let digest = blake3::hash(truncated_header).to_hex().to_string();
+        assert!(decode_pack(truncated_header, &digest, 4096).is_err());
+
+        let index = PackIndex {
+            version: PACK_VERSION,
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            entries: index_entries(1),
+        };
+        let at_limit = framed_index(&index, MAX_PACK_INDEX_BYTES);
+        let digest = blake3::hash(&at_limit).to_hex().to_string();
+        assert!(decode_pack(&at_limit, &digest, DEFAULT_MAX_PACK_BYTES).is_ok());
+
+        let over_limit = framed_index(&index, MAX_PACK_INDEX_BYTES + 2);
+        let digest = blake3::hash(&over_limit).to_hex().to_string();
+        assert!(decode_pack(&over_limit, &digest, DEFAULT_MAX_PACK_BYTES).is_err());
+    }
+
+    #[test]
+    fn pack_index_entry_count_accepts_exact_limit_only() {
+        let exact = PackIndex {
+            version: PACK_VERSION,
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            entries: index_entries(MAX_PACK_ENTRIES),
+        };
+        assert!(validate_pack_index(&exact, MAX_PACK_ENTRIES).is_ok());
+
+        let over = PackIndex {
+            entries: index_entries(MAX_PACK_ENTRIES + 1),
+            ..exact
+        };
+        assert!(validate_pack_index(&over, MAX_PACK_ENTRIES + 1).is_err());
+        let empty = PackIndex {
+            version: PACK_VERSION,
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            entries: Vec::new(),
+        };
+        assert!(validate_pack_index(&empty, 0).is_err());
+    }
+
+    #[test]
+    fn pack_builder_entry_count_accepts_exact_limit_only() {
+        let inputs = |count| {
+            (0..count)
+                .map(|index| PackInputEntry {
+                    cache_key: digest(&format!("build-{index:05}")),
+                    crate_name: "x".to_string(),
+                    meta_digest: digest(&format!("build-meta-{index:05}")),
+                    payload: vec![b'x'],
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut exact_index_inputs = inputs(MAX_PACK_ENTRIES);
+        let base_index = PackIndex {
+            version: PACK_VERSION,
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            entries: exact_index_inputs
+                .iter()
+                .enumerate()
+                .map(|(offset, entry)| PackIndexEntry {
+                    cache_key: entry.cache_key.clone(),
+                    crate_name: entry.crate_name.clone(),
+                    meta_digest: entry.meta_digest.clone(),
+                    offset: offset as u64,
+                    length: 1,
+                })
+                .collect(),
+        };
+        let mut remaining = MAX_PACK_INDEX_BYTES - serde_json::to_vec(&base_index).unwrap().len();
+        for entry in &mut exact_index_inputs {
+            let extra = remaining.min(127);
+            entry.crate_name.push_str(&"x".repeat(extra));
+            remaining -= extra;
+            if remaining == 0 {
+                break;
+            }
+        }
+        assert_eq!(remaining, 0, "entry fields must span the exact index cap");
+        let exact = build_pack("", exact_index_inputs.clone(), DEFAULT_MAX_PACK_BYTES).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&exact.index).unwrap().len(),
+            MAX_PACK_INDEX_BYTES
+        );
+        let expandable = exact_index_inputs
+            .iter_mut()
+            .find(|entry| entry.crate_name.len() < 128)
+            .expect("at least one crate field remains expandable");
+        expandable.crate_name.push('x');
+        assert!(
+            build_pack("", exact_index_inputs, DEFAULT_MAX_PACK_BYTES).is_err(),
+            "one byte above the index cap must be rejected"
+        );
+        assert!(build_pack("", inputs(MAX_PACK_ENTRIES + 1), DEFAULT_MAX_PACK_BYTES,).is_err());
+        assert!(build_pack("", inputs(MAX_PACK_ENTRIES + 2), DEFAULT_MAX_PACK_BYTES,).is_err());
+    }
+
+    #[test]
+    fn catalog_pack_size_and_entry_limits_are_independent() {
+        let entry = catalog_entry(0);
+        let valid_pack = |pack_bytes, entries| CatalogPackRef {
+            digest: digest("boundary-pack"),
+            pack_bytes,
+            entries,
+        };
+        assert!(
+            encode_catalog(
+                "",
+                catalog_with(
+                    vec![valid_pack(DEFAULT_MAX_PACK_BYTES, vec![entry.clone()])],
+                    Vec::new(),
+                ),
+            )
+            .is_ok()
+        );
+        assert!(
+            encode_catalog(
+                "",
+                catalog_with(vec![valid_pack(0, vec![entry.clone()])], Vec::new()),
+            )
+            .is_err()
+        );
+        assert!(
+            encode_catalog(
+                "",
+                catalog_with(
+                    vec![valid_pack(DEFAULT_MAX_PACK_BYTES + 1, vec![entry])],
+                    Vec::new(),
+                ),
+            )
+            .is_err()
+        );
+
+        let exact_entries = (0..MAX_PACK_ENTRIES).map(catalog_entry).collect();
+        assert!(
+            encode_catalog(
+                "",
+                catalog_with(vec![valid_pack(1, exact_entries)], Vec::new()),
+            )
+            .is_ok()
+        );
+        let over_entries = (0..=MAX_PACK_ENTRIES).map(catalog_entry).collect();
+        assert!(
+            encode_catalog(
+                "",
+                catalog_with(vec![valid_pack(1, over_entries)], Vec::new()),
+            )
+            .is_err()
+        );
+        assert!(
+            encode_catalog(
+                "",
+                catalog_with(vec![valid_pack(1, Vec::new())], Vec::new()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn catalog_total_entry_and_pack_count_limits_are_inclusive() {
+        let exact_fallback = (0..MAX_PACK_ENTRIES).map(catalog_entry).collect();
+        assert!(encode_catalog("", catalog_with(Vec::new(), exact_fallback)).is_ok());
+        let over_fallback = (0..=MAX_PACK_ENTRIES).map(catalog_entry).collect();
+        assert!(encode_catalog("", catalog_with(Vec::new(), over_fallback)).is_err());
+
+        let packs = (0..MAX_CATALOG_PACKS)
+            .map(|index| CatalogPackRef {
+                digest: digest(&format!("pack-{index}")),
+                pack_bytes: 1,
+                entries: vec![catalog_entry(index)],
+            })
+            .collect::<Vec<_>>();
+        assert!(encode_catalog("", catalog_with(packs.clone(), Vec::new())).is_ok());
+        let mut over = packs;
+        over.push(CatalogPackRef {
+            digest: digest("pack-over-limit"),
+            pack_bytes: 1,
+            entries: vec![catalog_entry(MAX_CATALOG_PACKS)],
+        });
+        assert!(encode_catalog("", catalog_with(over, Vec::new())).is_err());
+    }
+
+    #[test]
+    fn catalog_decoder_accepts_exact_byte_limit_and_rejects_overshoot() {
+        let encoded = encode_catalog("", catalog_with(Vec::new(), vec![catalog_entry(0)])).unwrap();
+        let mut bytes = encoded.bytes;
+        bytes.resize(MAX_CATALOG_BYTES, b' ');
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        assert!(decode_catalog(&bytes, &digest).is_ok());
+
+        bytes.push(b' ');
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        assert!(decode_catalog(&bytes, &digest).is_err());
+    }
+
+    #[test]
+    fn catalog_pack_binding_rejects_each_mismatch_independently() {
+        let built = build_pack("", vec![input("binding", "serde", b"payload")], 4096).unwrap();
+        let descriptor = &built.index.entries[0];
+        let base = CatalogPackRef {
+            digest: built.digest.clone(),
+            pack_bytes: built.bytes.len() as u64,
+            entries: vec![CatalogEntry {
+                cache_key: descriptor.cache_key.clone(),
+                crate_name: descriptor.crate_name.clone(),
+                meta_digest: descriptor.meta_digest.clone(),
+            }],
+        };
+        assert!(decode_catalog_pack(&built.bytes, &base, 4096).is_ok());
+
+        let mut wrong_crate = base.clone();
+        wrong_crate.entries[0].crate_name = "tokio".to_string();
+        assert!(decode_catalog_pack(&built.bytes, &wrong_crate, 4096).is_err());
+        let mut wrong_meta = base.clone();
+        wrong_meta.entries[0].meta_digest = digest("wrong-meta");
+        assert!(decode_catalog_pack(&built.bytes, &wrong_meta, 4096).is_err());
+        let mut wrong_key = base.clone();
+        wrong_key.entries[0].cache_key = digest("wrong-key");
+        assert!(decode_catalog_pack(&built.bytes, &wrong_key, 4096).is_err());
+        let mut wrong_count = base.clone();
+        wrong_count.entries.push(catalog_entry(99));
+        assert!(decode_catalog_pack(&built.bytes, &wrong_count, 4096).is_err());
+        let mut wrong_size = base;
+        wrong_size.pack_bytes += 1;
+        assert!(decode_catalog_pack(&built.bytes, &wrong_size, 4096).is_err());
+    }
+
+    #[test]
+    fn catalog_rejects_an_individually_unsafe_fallback_entry() {
+        let mut unsafe_entry = catalog_entry(0);
+        unsafe_entry.crate_name = "../escape".to_string();
+        assert!(encode_catalog("", catalog_with(Vec::new(), vec![unsafe_entry])).is_err());
+    }
+
+    #[test]
+    fn catalog_discovery_filters_bad_timestamp_shape_and_digits_separately() {
+        let selector = digest("discovery-selector");
+        let prefix = catalog_prefix("root", &selector).unwrap();
+        let valid_digest = digest("catalog");
+        let valid = format!("{prefix}{:020}-{valid_digest}.json", 7);
+        let bad_width = format!("{prefix}7-{valid_digest}.json");
+        let bad_digits = format!("{prefix}0000000000000000000x-{valid_digest}.json");
+        assert!(parse_catalog_object_ref(&prefix, &bad_width).is_none());
+        assert!(parse_catalog_object_ref(&prefix, &bad_digits).is_none());
+        let latest =
+            latest_catalog_object("root", &selector, &[bad_width, bad_digits, valid.clone()])
+                .unwrap()
+                .unwrap();
+        assert_eq!(latest.object_key, valid);
     }
 
     #[test]

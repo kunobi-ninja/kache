@@ -655,6 +655,28 @@ pub struct OrphanSweepStats {
     pub bytes_reclaimed: u64,
 }
 
+/// Difference between the derived SQLite blob index and committed entry
+/// metadata, which is the store's authoritative reference graph (#819).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlobIndexDrift {
+    /// `entry_blobs` rows that are missing, stale, or have the wrong count.
+    pub entry_mappings: usize,
+    /// `blobs` rows that are missing, stale, or have the wrong size/refcount.
+    pub blobs: usize,
+}
+
+impl BlobIndexDrift {
+    pub fn total(self) -> usize {
+        self.entry_mappings + self.blobs
+    }
+}
+
+#[derive(Default)]
+struct AuthoritativeBlobIndex {
+    entry_mappings: std::collections::BTreeMap<(String, String), i64>,
+    blobs: std::collections::BTreeMap<String, (i64, i64)>,
+}
+
 /// The local content-addressed store.
 pub struct Store {
     config: Config,
@@ -2265,6 +2287,171 @@ impl Store {
             }
         }
         Ok(imported)
+    }
+
+    /// Read the authoritative blob reference graph from committed entry
+    /// metadata. The caller must hold SQLite's write lock so a publisher or
+    /// remover cannot change the row/meta pairing during the scan (#819).
+    fn authoritative_blob_index(&self, conn: &Connection) -> Result<AuthoritativeBlobIndex> {
+        let keys: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT cache_key FROM entries WHERE committed = 1 ORDER BY cache_key")?;
+            stmt.query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut index = AuthoritativeBlobIndex::default();
+        for key in keys {
+            let meta_path = self.entry_dir(&key).join("meta.json");
+            let content = fs::read_to_string(&meta_path)
+                .with_context(|| format!("entry {key}: reading authoritative meta.json"))?;
+            let meta: EntryMeta = serde_json::from_str(&content)
+                .with_context(|| format!("entry {key}: parsing authoritative meta.json"))?;
+            for file in &meta.files {
+                if !crate::remote_layout::is_blob_hash(&file.hash)
+                    || !crate::remote_layout::is_safe_artifact_name(&file.name)
+                {
+                    anyhow::bail!("entry {key}: invalid blob metadata");
+                }
+                let blob_path = self.blob_path(&file.hash);
+                let actual_size = fs::metadata(&blob_path)
+                    .with_context(|| format!("entry {key}: reading blob {}", file.hash))?
+                    .len();
+                if actual_size != file.size {
+                    anyhow::bail!(
+                        "entry {key}: blob {} size mismatch (expected {}, got {})",
+                        file.hash,
+                        file.size,
+                        actual_size
+                    );
+                }
+
+                *index
+                    .entry_mappings
+                    .entry((key.clone(), file.hash.clone()))
+                    .or_insert(0) += 1;
+                match index.blobs.entry(file.hash.clone()) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert((file.size as i64, 1));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut slot) => {
+                        let (size, refs) = slot.get_mut();
+                        if *size != file.size as i64 {
+                            anyhow::bail!(
+                                "blob {} has conflicting sizes in committed metadata",
+                                file.hash
+                            );
+                        }
+                        *refs += 1;
+                    }
+                }
+            }
+        }
+        Ok(index)
+    }
+
+    fn indexed_blob_graph(&self, conn: &Connection) -> Result<AuthoritativeBlobIndex> {
+        let entry_mappings = {
+            let mut stmt = conn.prepare("SELECT cache_key, hash, refs FROM entry_blobs")?;
+            stmt.query_map([], |row| Ok(((row.get(0)?, row.get(1)?), row.get(2)?)))?
+                .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?
+        };
+        let blobs = {
+            let mut stmt = conn.prepare("SELECT hash, size, refcount FROM blobs")?;
+            stmt.query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+                .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?
+        };
+        Ok(AuthoritativeBlobIndex {
+            entry_mappings,
+            blobs,
+        })
+    }
+
+    fn compare_blob_indexes(
+        expected: &AuthoritativeBlobIndex,
+        actual: &AuthoritativeBlobIndex,
+    ) -> BlobIndexDrift {
+        let entry_mappings = expected
+            .entry_mappings
+            .keys()
+            .chain(actual.entry_mappings.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|key| expected.entry_mappings.get(*key) != actual.entry_mappings.get(*key))
+            .count();
+        let blobs = expected
+            .blobs
+            .keys()
+            .chain(actual.blobs.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|hash| expected.blobs.get(*hash) != actual.blobs.get(*hash))
+            .count();
+        BlobIndexDrift {
+            entry_mappings,
+            blobs,
+        }
+    }
+
+    /// Verify that `entry_blobs` and `blobs` exactly match committed entry
+    /// metadata. The write lock makes the filesystem/SQLite comparison stable.
+    pub fn blob_index_drift(&self) -> Result<BlobIndexDrift> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let expected = self.authoritative_blob_index(&self.db)?;
+            let actual = self.indexed_blob_graph(&self.db)?;
+            Ok(Self::compare_blob_indexes(&expected, &actual))
+        })();
+        match result {
+            Ok(drift) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(drift)
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Rebuild only the derived blob graph from committed entry metadata.
+    /// Physical orphan reclamation deliberately happens after this transaction
+    /// through [`Self::sweep_orphan_blobs`], never while SQL can roll back.
+    pub fn reconcile_blob_index(&self) -> Result<BlobIndexDrift> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<BlobIndexDrift> {
+            let expected = self.authoritative_blob_index(&self.db)?;
+            let actual = self.indexed_blob_graph(&self.db)?;
+            let drift = Self::compare_blob_indexes(&expected, &actual);
+            if drift.total() == 0 {
+                return Ok(drift);
+            }
+
+            self.db.execute("DELETE FROM entry_blobs", [])?;
+            self.db.execute("DELETE FROM blobs", [])?;
+            for ((cache_key, hash), refs) in &expected.entry_mappings {
+                self.db.execute(
+                    "INSERT INTO entry_blobs (cache_key, hash, refs) VALUES (?1, ?2, ?3)",
+                    params![cache_key, hash, refs],
+                )?;
+            }
+            for (hash, (size, refcount)) in &expected.blobs {
+                self.db.execute(
+                    "INSERT INTO blobs (hash, size, refcount) VALUES (?1, ?2, ?3)",
+                    params![hash, size, refcount],
+                )?;
+            }
+            Ok(drift)
+        })();
+        match result {
+            Ok(drift) => {
+                self.db.execute_batch("COMMIT")?;
+                Ok(drift)
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     /// Rebuild the `entries` and `blobs` rows by scanning the store's per-entry
@@ -4717,6 +4904,190 @@ mod tests {
             .unwrap();
         assert_eq!(stats.removed, 0);
         assert!(orphan_path.exists());
+    }
+
+    #[test]
+    fn reconcile_blob_index_repairs_refcounts_and_stale_rows_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let payload = b"shared authoritative blob";
+
+        for key in ["repair_a", "repair_b"] {
+            let output = dir.path().join(format!("{key}.rlib"));
+            fs::write(&output, payload).unwrap();
+            store
+                .put(
+                    key,
+                    "repairlib",
+                    &["lib".to_string()],
+                    &[],
+                    "host",
+                    "dev",
+                    &[(output, format!("lib{key}.rlib"))],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        let hash = store.get("repair_a").unwrap().unwrap().files[0]
+            .hash
+            .clone();
+        let stale_hash = "f".repeat(64);
+        let stale_path = store.blob_path(&stale_hash);
+        fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        fs::write(&stale_path, b"stale indexed blob").unwrap();
+
+        store
+            .db
+            .execute(
+                "UPDATE blobs SET refcount = 41 WHERE hash = ?1",
+                params![hash],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE entry_blobs SET refs = 7 WHERE cache_key = 'repair_a'",
+                [],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO blobs (hash, size, refcount) VALUES (?1, ?2, 9)",
+                params![stale_hash, b"stale indexed blob".len() as i64],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.blob_index_drift().unwrap(),
+            BlobIndexDrift {
+                entry_mappings: 1,
+                blobs: 2,
+            }
+        );
+        assert_eq!(
+            store.reconcile_blob_index().unwrap(),
+            BlobIndexDrift {
+                entry_mappings: 1,
+                blobs: 2,
+            }
+        );
+        assert_eq!(store.blob_index_drift().unwrap(), BlobIndexDrift::default());
+        assert_eq!(
+            store.reconcile_blob_index().unwrap(),
+            BlobIndexDrift::default()
+        );
+
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 2);
+        assert_eq!(
+            store
+                .db
+                .query_row(
+                    "SELECT COUNT(*) FROM blobs WHERE hash = ?1",
+                    params![stale_hash],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let swept = store.sweep_orphan_blobs(Duration::ZERO).unwrap();
+        assert_eq!(swept.removed, 1);
+        assert!(!stale_path.exists());
+    }
+
+    #[test]
+    fn reconcile_blob_index_fails_closed_on_unreadable_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("output.rlib");
+        fs::write(&output, b"authoritative bytes").unwrap();
+        store
+            .put(
+                "repair_bad_meta",
+                "repairlib",
+                &["lib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(output, "librepair.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let hash = store.get("repair_bad_meta").unwrap().unwrap().files[0]
+            .hash
+            .clone();
+        store
+            .db
+            .execute(
+                "UPDATE blobs SET refcount = 9 WHERE hash = ?1",
+                params![hash],
+            )
+            .unwrap();
+        fs::write(
+            store.entry_dir("repair_bad_meta").join("meta.json"),
+            b"not json",
+        )
+        .unwrap();
+
+        let error = store.reconcile_blob_index().unwrap_err().to_string();
+        assert!(error.contains("parsing authoritative meta.json"), "{error}");
+        let refcount: i64 = store
+            .db
+            .query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refcount, 9, "failed repair must leave the index untouched");
+    }
+
+    #[test]
+    fn reconcile_blob_index_rejects_each_invalid_metadata_dimension() {
+        for invalid_hash in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = test_config(dir.path());
+            let store = Store::open(&config).unwrap();
+            let output = dir.path().join("output.rlib");
+            fs::write(&output, b"valid blob bytes").unwrap();
+            store
+                .put(
+                    "repair_invalid_metadata",
+                    "repairlib",
+                    &["lib".to_string()],
+                    &[],
+                    "host",
+                    "dev",
+                    &[(output, "librepair.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            let meta_path = store.entry_dir("repair_invalid_metadata").join("meta.json");
+            let mut meta: EntryMeta =
+                serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+            if invalid_hash {
+                meta.files[0].hash = "not-a-content-hash".to_string();
+            } else {
+                meta.files[0].name = "../unsafe.rlib".to_string();
+            }
+            fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+            let error = store.reconcile_blob_index().unwrap_err().to_string();
+            assert!(error.contains("invalid blob metadata"), "{error}");
+        }
     }
 
     #[test]

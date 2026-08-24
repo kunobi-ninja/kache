@@ -540,7 +540,7 @@ impl RustcArgs {
                 }
                 "--print" | "--explain" => {
                     is_query = true;
-                    i += 1; // skip the value argument
+                    i = i.saturating_add(1); // skip the value argument
                 }
                 _ if arg.starts_with("--print=") || arg.starts_with("--explain=") => {
                     is_query = true;

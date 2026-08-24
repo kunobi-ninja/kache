@@ -207,6 +207,15 @@ pub struct StorageBreakdown {
     pub blob_bytes: u64,
     /// Bytes saved by content-addressed dedup (`logical_bytes - blob_bytes`).
     pub dedup_saved_bytes: u64,
+    /// Whether indexed unique blob bytes fit within the logical bytes held by
+    /// live entries. False means the store index needs repair; in that state a
+    /// dedup saving cannot be reported truthfully.
+    #[serde(default = "default_true")]
+    pub accounting_consistent: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -676,6 +685,7 @@ pub fn generate_report_with_filter(
         logical_bytes: blob_stats.total_logical_size,
         blob_bytes: blob_stats.total_blob_size,
         dedup_saved_bytes: blob_stats.savings,
+        accounting_consistent: blob_stats.total_blob_size <= blob_stats.total_logical_size,
     };
 
     Ok(BuildReport {
@@ -1706,12 +1716,19 @@ fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
             storage.zero_copy_pct
         ));
     }
-    if storage.logical_bytes > 0 || storage.blob_bytes > 0 {
+    if (storage.logical_bytes > 0 || storage.blob_bytes > 0) && storage.accounting_consistent {
         lines.push(format!(
             "| Store footprint | {} logical -> {} blobs, {} dedup saved |",
             format_bytes(storage.logical_bytes),
             format_bytes(storage.blob_bytes),
             format_bytes(storage.dedup_saved_bytes),
+        ));
+        lines.push(format!("| Store blobs | {} |", storage.store_blobs));
+    } else if storage.logical_bytes > 0 || storage.blob_bytes > 0 {
+        lines.push(format!(
+            "| Store accounting | **Inconsistent:** {} logical entry bytes, {} indexed blob bytes; the store index needs repair |",
+            format_bytes(storage.logical_bytes),
+            format_bytes(storage.blob_bytes),
         ));
         lines.push(format!("| Store blobs | {} |", storage.store_blobs));
     }
@@ -2563,7 +2580,13 @@ pub fn format_github(report: &BuildReport) -> String {
     if has_storage_data(&report.storage) {
         lines.push(String::new());
         lines.push("<details>".to_string());
-        let storage_summary = if report.storage.restored_bytes > 0 {
+        let storage_summary = if !report.storage.accounting_consistent {
+            format!(
+                "accounting inconsistent: {} logical, {} indexed blobs",
+                format_bytes(report.storage.logical_bytes),
+                format_bytes(report.storage.blob_bytes)
+            )
+        } else if report.storage.restored_bytes > 0 {
             format!(
                 "{:.1}% zero-copy restores, {} restored",
                 report.storage.zero_copy_pct,
@@ -2849,12 +2872,20 @@ pub fn format_text(report: &BuildReport) -> String {
                 format_bytes(report.storage.copied_bytes)
             ));
         }
-        if report.storage.logical_bytes > 0 || report.storage.blob_bytes > 0 {
+        if (report.storage.logical_bytes > 0 || report.storage.blob_bytes > 0)
+            && report.storage.accounting_consistent
+        {
             lines.push(format!(
                 "  Store: {} logical -> {} blobs ({} dedup saved)",
                 format_bytes(report.storage.logical_bytes),
                 format_bytes(report.storage.blob_bytes),
                 format_bytes(report.storage.dedup_saved_bytes)
+            ));
+        } else if report.storage.logical_bytes > 0 || report.storage.blob_bytes > 0 {
+            lines.push(format!(
+                "  Store accounting inconsistent: {} logical entry bytes, {} indexed blob bytes; the store index needs repair",
+                format_bytes(report.storage.logical_bytes),
+                format_bytes(report.storage.blob_bytes)
             ));
         }
         lines.push(String::new());
@@ -4302,6 +4333,7 @@ mod tests {
             logical_bytes: 4096,
             blob_bytes: 2048,
             dedup_saved_bytes: 2048,
+            accounting_consistent: true,
             store_reflinked_bytes: 0,
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
@@ -4846,6 +4878,7 @@ mod tests {
             logical_bytes: 5000,
             blob_bytes: 3000,
             dedup_saved_bytes: 2000,
+            accounting_consistent: true,
             store_reflinked_bytes: 0,
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
@@ -4938,6 +4971,7 @@ mod tests {
             logical_bytes: 4096,
             blob_bytes: 2048,
             dedup_saved_bytes: 0,
+            accounting_consistent: true,
             store_reflinked_bytes: 2000,
             store_hardlinked_bytes: 1000,
             store_copied_bytes: 1000,
@@ -4971,6 +5005,7 @@ mod tests {
             logical_bytes: 9000,
             blob_bytes: 5000,
             dedup_saved_bytes: 4000,
+            accounting_consistent: true,
             store_reflinked_bytes: 0,
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
@@ -4980,6 +5015,26 @@ mod tests {
             gh.contains("logical") && gh.contains("blobs"),
             "summary: {gh}"
         );
+    }
+
+    #[test]
+    fn storage_render_flags_impossible_dedup_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let mut report = generate_report(&config, 24, 10).unwrap();
+        report.storage.logical_bytes = 29;
+        report.storage.blob_bytes = 56;
+        report.storage.dedup_saved_bytes = 0;
+        report.storage.accounting_consistent = false;
+
+        let github = format_github(&report);
+        assert!(github.contains("accounting inconsistent"), "{github}");
+        assert!(github.contains("store index needs repair"), "{github}");
+        assert!(!github.contains("0 B dedup saved"), "{github}");
+
+        let text = format_text(&report);
+        assert!(text.contains("Store accounting inconsistent"), "{text}");
+        assert!(text.contains("store index needs repair"), "{text}");
     }
 
     #[test]

@@ -182,7 +182,8 @@
         "store_blobs": { "type": "integer", "minimum": 0 },
         "logical_bytes": { "type": "integer", "minimum": 0 },
         "blob_bytes": { "type": "integer", "minimum": 0 },
-        "dedup_saved_bytes": { "type": "integer", "minimum": 0 }
+        "dedup_saved_bytes": { "type": "integer", "minimum": 0 },
+        "accounting_consistent": { "type": "boolean" }
       }
     },
     "network": {

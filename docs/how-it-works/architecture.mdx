@@ -69,7 +69,7 @@ On Unix filesystems without reflink, kache permits one target to hardlink each i
 
 The daemon is a long-running background process that handles everything async: uploading new artifacts to the configured remote, checking it before a build starts, and prefetching artifacts for upcoming crates.
 
-The wrapper communicates with the daemon over a Unix socket (`daemon.sock` inside the cache dir — see [The local store](#the-local-store) for the platform path; a named pipe on Windows) using lightweight RPC calls. Local-only calls — queuing an upload, a cached remote-check answer — return in well under a millisecond; a remote check that reaches the configured backend takes as long as that round-trip. If the daemon is down, the wrapper continues without it — local caching works normally, remote features degrade gracefully.
+The wrapper communicates with the daemon over a Unix socket (`daemon.sock` inside the runtime dir, which defaults to the cache dir; a named pipe on Windows) using lightweight RPC calls. Local-only calls — queuing an upload, a cached remote-check answer — return in well under a millisecond; a remote check that reaches the configured backend takes as long as that round-trip. If the daemon is down, the wrapper continues without it — local caching works normally, remote features degrade gracefully.
 
 The daemon runs as a separate binary invocation (`kache daemon run`) and can be managed as a system service via launchd (macOS) or systemd (Linux). See [Daemon lifecycle](/docs/daemon/lifecycle) for details.
 

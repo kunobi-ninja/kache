@@ -97,7 +97,7 @@ You can also set `KACHE_DAEMON_IDLE_TIMEOUT` (seconds). **The default is `0`, wh
 A few behaviors worth knowing about:
 
 - **Single instance**: a second `kache daemon run` exits cleanly (code 0) if another process holds the run lock or the socket is already live, so launchd/systemd `KeepAlive` won't loop. Stale socket files are removed on startup when nothing is listening.
-- **Background log file**: auto-started daemons write stderr to `<socket>.log` next to the daemon socket (Linux `~/.cache/kache/daemon.log`, macOS `~/Library/Caches/kache/daemon.log`). It is reset to a `--- log rotated ---` marker once it grows past 2 MiB. `kache daemon log` tails this file.
+- **Background log file**: auto-started daemons write stderr to `<socket>.log` next to the daemon socket (under `KACHE_RUNTIME_DIR` unless `KACHE_SOCKET_PATH` overrides it). It is reset to a `--- log rotated ---` marker once it grows past 2 MiB. `kache daemon log` tails this file.
 - **Graceful drain**: on shutdown the daemon closes its upload queue and waits up to 30 s for in-flight remote uploads to finish before aborting workers.
 
 ## Offline behavior

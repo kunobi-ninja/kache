@@ -141,6 +141,14 @@ gitignore = true
 # the tests around it. Same shape as the `run_gc_local` progress strings above.
 # The function's behaviour, its `--force` semantics, and its error
 # classification all stay in scope and are killed by those tests.
+#
+# Replacing `Config::socket_path` with an empty `PathBuf` is not a survivor:
+# `test_config_socket_path` and the runtime-isolation tests reject it directly.
+# Other daemon lifecycle tests then try to bind/connect the empty path and block
+# until cargo-mutants' 180s process timeout, so the lane reports a timeout rather
+# than the already-observed assertion failure. Exclude only that whole-body
+# replacement; the override resolver and every branch inside the real method
+# remain mutation-tested.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -172,4 +180,5 @@ exclude_re = [
     "run_cargo_non_unix",
     "replace report_key_divergence with \\(\\)",
     "delete ! in install_shims",
+    "replace Config::socket_path .* with Default::default",
 ]

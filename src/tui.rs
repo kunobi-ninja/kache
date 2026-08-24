@@ -2185,6 +2185,7 @@ mod tests {
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: std::env::temp_dir().join("kache-tui-test"),
+            runtime_dir: std::env::temp_dir().join("kache-tui-test"),
             max_size: 1024 * 1024,
             remote: None,
             remote_error: None,
@@ -2270,6 +2271,7 @@ mod tests {
             daemon_effective_config: Some(crate::daemon::EffectiveConfig {
                 max_size: config.max_size,
                 cache_dir: daemon_cache_dir.to_string_lossy().into_owned(),
+                runtime_dir: "/shared/runtime".to_string(),
                 config_path: "/daemon-a/config.toml".to_string(),
                 config_fingerprint: Some("daemon-a-fingerprint".to_string()),
                 prefetch_enabled: true,

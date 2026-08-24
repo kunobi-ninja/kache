@@ -1065,6 +1065,10 @@ pub struct EffectiveConfig {
     pub max_size: u64,
     /// The store directory the daemon's numbers describe.
     pub cache_dir: String,
+    /// The job/process-lifetime state directory the daemon resolved.
+    /// Empty when reported by a daemon that predates runtime-dir support.
+    #[serde(default)]
+    pub runtime_dir: String,
     /// The config-file path the daemon resolved at startup (the file its
     /// fingerprint watcher tracks). The file may not exist — defaults then
     /// applied — but the path still names where the daemon would read one.
@@ -1115,6 +1119,7 @@ impl EffectiveConfig {
         Self {
             max_size: config.max_size,
             cache_dir: config.cache_dir.display().to_string(),
+            runtime_dir: config.runtime_dir.display().to_string(),
             config_path: provenance.path.display().to_string(),
             config_fingerprint: Some(provenance.fingerprint.clone()),
             prefetch_enabled: config.prefetch_enabled,
@@ -8205,6 +8210,7 @@ mod tests {
             effective_config: Some(EffectiveConfig {
                 max_size: 1,
                 cache_dir: "/c".into(),
+                runtime_dir: "/c".into(),
                 config_path: "/c/config.toml".into(),
                 config_fingerprint: Some("fingerprint".into()),
                 prefetch_enabled: true,
@@ -8225,16 +8231,16 @@ mod tests {
             old_obj.remove("gc_policy_version");
         }
         let mut old_effective = old.get("effective_config").unwrap().clone();
-        old_effective
-            .as_object_mut()
-            .unwrap()
-            .remove("remote_key_cache_refresh_secs");
+        let old_effective_obj = old_effective.as_object_mut().unwrap();
+        old_effective_obj.remove("remote_key_cache_refresh_secs");
+        old_effective_obj.remove("runtime_dir");
         let parsed_effective: EffectiveConfig = serde_json::from_value(old_effective).unwrap();
         assert_eq!(
             parsed_effective.remote_key_cache_refresh_secs,
             crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
             "an older daemon report must deserialize with the historical cadence"
         );
+        assert!(parsed_effective.runtime_dir.is_empty());
         // A pre-#689 daemon reports no effective config either; the CLI must
         // see `None` (and fall back to labeled client-config values), not a
         // parse error or a zeroed report.
@@ -8456,6 +8462,7 @@ mod tests {
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: dir.to_path_buf(),
+            runtime_dir: dir.to_path_buf(),
             socket_path_override: None,
             max_size: 50 * 1024 * 1024, // 50 MiB
             remote: None,

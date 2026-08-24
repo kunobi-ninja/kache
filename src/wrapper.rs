@@ -4304,7 +4304,7 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let marker = if root.is_empty() {
-        config.cache_dir.join(".build-session")
+        config.runtime_dir.join(".build-session")
     } else {
         session_marker_path(config, &root)
     };
@@ -4445,7 +4445,7 @@ fn open_marker_for_lock(marker: &Path) -> Option<std::fs::File> {
 /// Returns `false` if the marker does not exist, contains a stale/corrupt
 /// timestamp, or is a symlink/non-regular file.
 /// Root-scoped session-marker path: `.build-sessions/<hash(root)>` under the
-/// cache dir (kunobi-ninja/kache#583 P0.5).
+/// runtime dir (kunobi-ninja/kache#583 P0.5).
 ///
 /// Scoping by build root (not one cache-global `.build-session`) stops
 /// parallel repositories sharing a cache dir from suppressing each other's
@@ -4455,7 +4455,7 @@ fn open_marker_for_lock(marker: &Path) -> Option<std::fs::File> {
 pub(crate) fn session_marker_path(config: &Config, root: &str) -> std::path::PathBuf {
     let hash = blake3::hash(root.as_bytes()).to_hex();
     config
-        .cache_dir
+        .runtime_dir
         .join(".build-sessions")
         .join(&hash.as_str()[..16])
 }
@@ -5127,6 +5127,7 @@ mod tests {
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
+            runtime_dir: cache_dir.clone(),
             cache_dir,
             max_size: 1024 * 1024,
             remote: None,
@@ -8626,6 +8627,65 @@ exit 0
         let b = session_marker_path(&config, "/repo/b");
         assert_ne!(a, b);
         assert!(a.parent().unwrap().ends_with(".build-sessions"));
+    }
+
+    #[test]
+    fn session_markers_are_job_scoped_when_store_is_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared_cache = dir.path().join("shared-cache");
+        let mut a = test_config(shared_cache.clone());
+        let mut b = test_config(shared_cache);
+        a.runtime_dir = dir.path().join("job-a");
+        b.runtime_dir = dir.path().join("job-b");
+
+        assert_eq!(a.store_dir(), b.store_dir());
+        assert_ne!(
+            session_marker_path(&a, "/repo"),
+            session_marker_path(&b, "/repo")
+        );
+        assert!(session_marker_path(&a, "/repo").starts_with(&a.runtime_dir));
+        assert!(session_marker_path(&b, "/repo").starts_with(&b.runtime_dir));
+    }
+
+    #[test]
+    fn remote_prefetch_creates_a_fresh_marker_in_the_job_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let source = workspace.join("src/lib.rs");
+        let out_dir = workspace.join("target/debug/deps");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = 'runtime-prefetch-test'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(&source, "pub fn value() -> u8 { 1 }\n").unwrap();
+
+        let mut config = test_config(dir.path().join("shared-cache"));
+        config.runtime_dir = dir.path().join("job-runtime");
+        config.remote = Some(crate::config::RemoteConfig::test_s3(
+            "test-bucket",
+            "artifacts",
+        ));
+        let args = rustc_args(&[
+            "rustc",
+            source.to_str().unwrap(),
+            "--crate-name",
+            "runtime_prefetch_test",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ]);
+
+        maybe_trigger_prefetch(&config, &args);
+
+        let marker = session_marker_path(&config, workspace.to_str().unwrap());
+        assert!(marker.starts_with(&config.runtime_dir));
+        let content = std::fs::read_to_string(&marker).expect("prefetch marker created");
+        let (_, session_id) = parse_session_marker(&content).expect("valid v1 marker");
+        assert!(!session_id.is_empty());
+        assert!(timestamp_is_fresh(&content, BUILD_SESSION_SECS));
+        assert!(!config.cache_dir.join(".build-sessions").exists());
     }
 
     #[test]

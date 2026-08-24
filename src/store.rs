@@ -4264,6 +4264,7 @@ mod tests {
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: dir.to_path_buf(),
+            runtime_dir: dir.to_path_buf(),
             max_size: 1024 * 1024, // 1 MiB
             remote: None,
             remote_error: None,

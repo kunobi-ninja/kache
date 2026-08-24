@@ -7,8 +7,8 @@
 //!
 //! # Naming
 //!
-//! kache addresses the daemon by a filesystem path (e.g.
-//! `~/.cache/kache/kache-daemon.sock`). On Unix that becomes the literal
+//! kache addresses the daemon by a filesystem path (by default
+//! `<runtime_dir>/daemon.sock`). On Unix that becomes the literal
 //! UDS path. On Windows the path is translated to a named pipe under
 //! `\\.\pipe\` by `interprocess`.
 

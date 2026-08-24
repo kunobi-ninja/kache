@@ -218,6 +218,29 @@ fn default_true() -> bool {
     true
 }
 
+fn blob_accounting_consistent(logical_bytes: u64, blob_bytes: u64) -> bool {
+    blob_bytes <= logical_bytes
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageAccountingState {
+    Absent,
+    Consistent,
+    Inconsistent,
+}
+
+fn storage_accounting_state(storage: &StorageBreakdown) -> StorageAccountingState {
+    match (
+        storage.logical_bytes,
+        storage.blob_bytes,
+        storage.accounting_consistent,
+    ) {
+        (0, 0, _) => StorageAccountingState::Absent,
+        (_, _, true) => StorageAccountingState::Consistent,
+        (_, _, false) => StorageAccountingState::Inconsistent,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkAnalysis {
     pub bytes_up: u64,
@@ -685,7 +708,10 @@ pub fn generate_report_with_filter(
         logical_bytes: blob_stats.total_logical_size,
         blob_bytes: blob_stats.total_blob_size,
         dedup_saved_bytes: blob_stats.savings,
-        accounting_consistent: blob_stats.total_blob_size <= blob_stats.total_logical_size,
+        accounting_consistent: blob_accounting_consistent(
+            blob_stats.total_logical_size,
+            blob_stats.total_blob_size,
+        ),
     };
 
     Ok(BuildReport {
@@ -1716,21 +1742,25 @@ fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
             storage.zero_copy_pct
         ));
     }
-    if (storage.logical_bytes > 0 || storage.blob_bytes > 0) && storage.accounting_consistent {
-        lines.push(format!(
-            "| Store footprint | {} logical -> {} blobs, {} dedup saved |",
-            format_bytes(storage.logical_bytes),
-            format_bytes(storage.blob_bytes),
-            format_bytes(storage.dedup_saved_bytes),
-        ));
-        lines.push(format!("| Store blobs | {} |", storage.store_blobs));
-    } else if storage.logical_bytes > 0 || storage.blob_bytes > 0 {
-        lines.push(format!(
-            "| Store accounting | **Inconsistent:** {} logical entry bytes, {} indexed blob bytes; the store index needs repair |",
-            format_bytes(storage.logical_bytes),
-            format_bytes(storage.blob_bytes),
-        ));
-        lines.push(format!("| Store blobs | {} |", storage.store_blobs));
+    match storage_accounting_state(storage) {
+        StorageAccountingState::Consistent => {
+            lines.push(format!(
+                "| Store footprint | {} logical -> {} blobs, {} dedup saved |",
+                format_bytes(storage.logical_bytes),
+                format_bytes(storage.blob_bytes),
+                format_bytes(storage.dedup_saved_bytes),
+            ));
+            lines.push(format!("| Store blobs | {} |", storage.store_blobs));
+        }
+        StorageAccountingState::Inconsistent => {
+            lines.push(format!(
+                "| Store accounting | **Inconsistent:** {} logical entry bytes, {} indexed blob bytes; the store index needs repair |",
+                format_bytes(storage.logical_bytes),
+                format_bytes(storage.blob_bytes),
+            ));
+            lines.push(format!("| Store blobs | {} |", storage.store_blobs));
+        }
+        StorageAccountingState::Absent => {}
     }
     let ingested =
         storage.store_reflinked_bytes + storage.store_hardlinked_bytes + storage.store_copied_bytes;
@@ -2872,21 +2902,19 @@ pub fn format_text(report: &BuildReport) -> String {
                 format_bytes(report.storage.copied_bytes)
             ));
         }
-        if (report.storage.logical_bytes > 0 || report.storage.blob_bytes > 0)
-            && report.storage.accounting_consistent
-        {
-            lines.push(format!(
+        match storage_accounting_state(&report.storage) {
+            StorageAccountingState::Consistent => lines.push(format!(
                 "  Store: {} logical -> {} blobs ({} dedup saved)",
                 format_bytes(report.storage.logical_bytes),
                 format_bytes(report.storage.blob_bytes),
                 format_bytes(report.storage.dedup_saved_bytes)
-            ));
-        } else if report.storage.logical_bytes > 0 || report.storage.blob_bytes > 0 {
-            lines.push(format!(
+            )),
+            StorageAccountingState::Inconsistent => lines.push(format!(
                 "  Store accounting inconsistent: {} logical entry bytes, {} indexed blob bytes; the store index needs repair",
                 format_bytes(report.storage.logical_bytes),
                 format_bytes(report.storage.blob_bytes)
-            ));
+            )),
+            StorageAccountingState::Absent => {}
         }
         lines.push(String::new());
     }
@@ -5066,6 +5094,36 @@ mod tests {
         assert!(
             !github.contains("zero-copy restores, 0 B restored"),
             "{github}"
+        );
+
+        assert!(blob_accounting_consistent(0, 0));
+        assert!(blob_accounting_consistent(5, 5));
+        assert!(blob_accounting_consistent(5, 4));
+        assert!(!blob_accounting_consistent(4, 5));
+
+        let state = |logical_bytes, blob_bytes, accounting_consistent| {
+            let mut report = generate_report(&config, 24, 10).unwrap();
+            report.storage.logical_bytes = logical_bytes;
+            report.storage.blob_bytes = blob_bytes;
+            report.storage.accounting_consistent = accounting_consistent;
+            storage_accounting_state(&report.storage)
+        };
+        assert_eq!(state(0, 0, false), StorageAccountingState::Absent);
+        assert_eq!(state(1, 0, true), StorageAccountingState::Consistent);
+        assert_eq!(state(0, 1, true), StorageAccountingState::Consistent);
+        assert_eq!(state(1, 0, false), StorageAccountingState::Inconsistent);
+        assert_eq!(state(0, 1, false), StorageAccountingState::Inconsistent);
+
+        let report = generate_report(&config, 24, 10).unwrap();
+        let mut old_json = serde_json::to_value(&report.storage).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("accounting_consistent");
+        let decoded: StorageBreakdown = serde_json::from_value(old_json).unwrap();
+        assert!(
+            decoded.accounting_consistent,
+            "old JSON must stay consistent"
         );
     }
 

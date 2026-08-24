@@ -88,18 +88,33 @@ pub fn restrict_socket_permissions(path: &Path) -> Result<()> {
 #[cfg(unix)]
 pub fn ensure_same_user_peer(stream: &TokioStream) -> std::io::Result<()> {
     use interprocess::local_socket::traits::StreamCommon as _;
-    let self_uid = unsafe { libc::geteuid() };
     match stream.peer_creds().ok().and_then(|creds| creds.euid()) {
-        Some(peer_uid) if peer_uid == self_uid => Ok(()),
+        Some(peer_uid) if peer_uid_is_self(peer_uid) => Ok(()),
         Some(peer_uid) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("peer uid {peer_uid} does not match daemon uid {self_uid}"),
+            format!(
+                "peer uid {peer_uid} does not match daemon uid {}",
+                self_uid()
+            ),
         )),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("peer credentials unavailable (daemon uid {self_uid})"),
+            format!("peer credentials unavailable (daemon uid {})", self_uid()),
         )),
     }
+}
+
+/// The daemon's effective UID (test seam: the comparison lives here so the
+/// accept/reject decision is assertable without a foreign-UID connection).
+#[cfg(unix)]
+fn self_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+/// Does a peer's effective UID belong to the daemon's own user?
+#[cfg(unix)]
+fn peer_uid_is_self(peer_uid: u32) -> bool {
+    peer_uid == self_uid()
 }
 
 /// True if a daemon socket / named pipe at `path` accepts a connection
@@ -221,6 +236,19 @@ mod tests {
             0o600,
             "socket must be owner-only after hardening"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_uid_is_self_rejects_foreign_uids() {
+        // The accept direction (own connection) is covered end-to-end by
+        // `same_user_peer_check_accepts_own_connections`; this pins the
+        // comparison itself, including the reject direction that cannot be
+        // produced by a real foreign-UID connection in CI.
+        let mine = self_uid();
+        assert!(peer_uid_is_self(mine));
+        assert!(!peer_uid_is_self(mine.wrapping_add(1)));
+        assert!(!peer_uid_is_self(mine.wrapping_add(0xdead_beef)));
     }
 
     #[cfg(unix)]

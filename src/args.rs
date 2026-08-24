@@ -960,6 +960,51 @@ fn record_codegen_opt(parsed: &mut RustcArgs, value: &str) {
 mod tests {
     use super::*;
 
+    /// Outcome-affecting lint gates must be captured exactly — flag AND
+    /// value, separated and attached spellings — and must not leak into the
+    /// residual catch-all. Asserting the captured tokens directly (not just
+    /// "the key changed") pins the parse indices: a wrong skip or a wrong
+    /// `get(i ± 1)` would capture the wrong token pair.
+    #[test]
+    fn outcome_lint_gates_capture_flag_and_value() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "rustc".to_string(),
+                "--crate-name".to_string(),
+                "m".to_string(),
+            ];
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            RustcArgs::parse(&argv).unwrap()
+        };
+
+        let separated = parse(&["-D", "warnings"]);
+        assert_eq!(
+            separated.outcome_lint_flags,
+            ["-D", "warnings"],
+            "separated gate must capture flag then value"
+        );
+        assert!(
+            separated.residual_args.is_empty(),
+            "gate tokens must not leak into residual: {:?}",
+            separated.residual_args
+        );
+
+        let attached = parse(&["-Dwarnings"]);
+        assert_eq!(attached.outcome_lint_flags, ["-Dwarnings"]);
+
+        let long = parse(&["--cap-lints", "allow"]);
+        assert_eq!(long.outcome_lint_flags, ["--cap-lints", "allow"]);
+        assert!(long.residual_args.is_empty());
+
+        let long_attached = parse(&["--forbid=unused"]);
+        assert_eq!(long_attached.outcome_lint_flags, ["--forbid=unused"]);
+
+        // Diagnostics-only levels stay out of the capture (#324).
+        let warn = parse(&["-W", "unused"]);
+        assert!(warn.outcome_lint_flags.is_empty());
+        assert!(warn.residual_args.is_empty());
+    }
+
     /// The two sides of the #627 join have to agree: what a producer records
     /// for itself (`-C extra-filename`) must equal what a consumer recovers
     /// from the artifact filename cargo built with that flag.

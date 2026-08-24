@@ -8648,6 +8648,47 @@ exit 0
     }
 
     #[test]
+    fn remote_prefetch_creates_a_fresh_marker_in_the_job_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let source = workspace.join("src/lib.rs");
+        let out_dir = workspace.join("target/debug/deps");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = 'runtime-prefetch-test'\nversion = '0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(&source, "pub fn value() -> u8 { 1 }\n").unwrap();
+
+        let mut config = test_config(dir.path().join("shared-cache"));
+        config.runtime_dir = dir.path().join("job-runtime");
+        config.remote = Some(crate::config::RemoteConfig::test_s3(
+            "test-bucket",
+            "artifacts",
+        ));
+        let args = rustc_args(&[
+            "rustc",
+            source.to_str().unwrap(),
+            "--crate-name",
+            "runtime_prefetch_test",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ]);
+
+        maybe_trigger_prefetch(&config, &args);
+
+        let marker = session_marker_path(&config, workspace.to_str().unwrap());
+        assert!(marker.starts_with(&config.runtime_dir));
+        let content = std::fs::read_to_string(&marker).expect("prefetch marker created");
+        let (_, session_id) = parse_session_marker(&content).expect("valid v1 marker");
+        assert!(!session_id.is_empty());
+        assert!(timestamp_is_fresh(&content, BUILD_SESSION_SECS));
+        assert!(!config.cache_dir.join(".build-sessions").exists());
+    }
+
+    #[test]
     fn current_session_id_reads_marker_regardless_of_age() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = test_config(dir.path().to_path_buf());

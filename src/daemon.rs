@@ -4324,31 +4324,6 @@ impl Daemon {
             );
         }
 
-        if let Some(context) = pack_context.as_ref() {
-            let packed = self
-                .try_packed_prefetch(
-                    context,
-                    &backend,
-                    remote,
-                    &keys_to_fetch,
-                    bytes_at_plan_start,
-                )
-                .await;
-            keys_to_fetch.retain(|(key, _, _)| !packed.contains(key));
-        }
-        let count = keys_to_fetch.len();
-        if count == 0 {
-            let wall_ms = plan_started_at.elapsed().as_millis() as u64;
-            self.prefetch_stats
-                .last_plan_wall_ms
-                .store(wall_ms, Ordering::Relaxed);
-            self.prefetch_stats
-                .plan_wall_ms_total
-                .fetch_add(wall_ms, Ordering::Relaxed);
-            tracing::info!(wall_ms, "prefetch: packed plan complete");
-            return Response::ok();
-        }
-
         // Candidates are deliberately NOT claimed here (kunobi-ninja/kache#613).
         // Claiming the whole plan up front put every candidate in `downloading`
         // before any of them was being downloaded, so a wrapper demanding a key
@@ -4364,6 +4339,19 @@ impl Daemon {
         let remote_config = (*remote).clone();
         let cancel_rx = self.prefetch_cancel.subscribe();
         tokio::spawn(async move {
+            if let Some(context) = pack_context.as_ref() {
+                let packed = daemon
+                    .try_packed_prefetch(
+                        context,
+                        &backend,
+                        &remote_config,
+                        &keys_to_fetch,
+                        bytes_at_plan_start,
+                    )
+                    .await;
+                keys_to_fetch.retain(|(key, _, _)| !packed.contains(key));
+            }
+
             let mut in_flight = futures::stream::FuturesUnordered::new();
             // Speculative prefetch is capped BELOW the S3 permit pool so an
             // interactive RemoteCheck can always acquire a permit without
@@ -12817,6 +12805,8 @@ mod tests {
             )
             .await;
         assert!(response.ok);
+        wait_for_store_entry(&daemon, &key_a).await;
+        wait_for_store_entry(&daemon, &key_b).await;
         assert!(
             daemon
                 .with_store(|store| Ok(store.get(&key_a)?.is_some()))
@@ -12841,6 +12831,70 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn packed_prefetch_response_returns_before_blocked_pack_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let inner = test_remote_backend();
+        let context = PackPrefetchContext::from_deps(
+            crate::cli::default_manifest_key(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let key = test_cache_key("nonblocking-prefetch-pack");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        seed_packed_catalog(
+            &inner,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest,
+                payload,
+            }],
+            None,
+        )
+        .await;
+
+        let pack_started = Arc::new(Notify::new());
+        let release_pack = Arc::new(Notify::new());
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(BlockingPackBackend {
+                inner,
+                pack_started: pack_started.clone(),
+                release_pack: release_pack.clone(),
+            });
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend).is_ok());
+
+        let started = pack_started.notified();
+        tokio::pin!(started);
+        started.as_mut().enable();
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            daemon.handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(key.clone(), "serde".into())],
+                    warm_all: false,
+                },
+                Some(context),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("prefetch acknowledgement must not await the pack GET");
+        assert!(response.ok);
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .expect("background coordinator should start the pack GET");
+        assert!(!daemon.entry_dir_for(&key).exists());
+
+        release_pack.notify_waiters();
+        wait_for_store_entry(&daemon, &key).await;
     }
 
     #[tokio::test]

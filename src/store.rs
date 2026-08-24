@@ -2165,6 +2165,37 @@ impl Store {
             let total_size: u64 = meta.files.iter().map(|file| file.size).sum();
             let crate_type = meta.crate_types.join(",");
             let content_hash = compute_content_hash(&meta.files);
+            // A crash or legacy importer may have left an uncommitted row.
+            // It is not a cache hit and must not permanently block a verified
+            // replacement through INSERT OR IGNORE. Undo any partial mapping
+            // bookkeeping in this same transaction before replacing it.
+            tx.execute(
+                "UPDATE blobs
+                 SET refcount = MAX(0, refcount - COALESCE((
+                     SELECT refs FROM entry_blobs
+                     WHERE cache_key = ?1 AND hash = blobs.hash
+                 ), 0))
+                 WHERE hash IN (
+                     SELECT hash FROM entry_blobs WHERE cache_key = ?1
+                 ) AND EXISTS (
+                     SELECT 1 FROM entries
+                     WHERE cache_key = ?1 AND committed = 0
+                 )",
+                params![entry.cache_key],
+            )?;
+            tx.execute(
+                "DELETE FROM entry_blobs
+                 WHERE cache_key = ?1 AND EXISTS (
+                     SELECT 1 FROM entries
+                     WHERE cache_key = ?1 AND committed = 0
+                 )",
+                params![entry.cache_key],
+            )?;
+            tx.execute(
+                "DELETE FROM entries WHERE cache_key = ?1 AND committed = 0",
+                params![entry.cache_key],
+            )?;
+            tx.execute("DELETE FROM blobs WHERE refcount <= 0", [])?;
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
                 params![
@@ -10163,6 +10194,13 @@ mod tests {
         assert_eq!(rows, 0, "a failed preflight must register no batch rows");
 
         verified[1].meta.files[0].size = original_size;
+        store
+            .db
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, 'stale', 'lib', 'dev', 0, 0, 'stale', 0, ?2, 0)",
+                params![keys[0], crate::cache_key::CACHE_KEY_VERSION],
+            )
+            .unwrap();
         let imported = store.import_verified_restored_entries(&verified).unwrap();
         assert_eq!(imported, 2);
         let rows: i64 = store

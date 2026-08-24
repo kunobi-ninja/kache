@@ -48,8 +48,12 @@ pub(crate) const UPLOAD_SPOOL_MAX_JOBS: usize = 65_536;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
+    /// Job/process-lifetime state root. Defaults to [`Self::cache_dir`] for
+    /// compatibility, but can be separated from a persistent node-local store
+    /// with `KACHE_RUNTIME_DIR` / `[cache] runtime_dir`.
+    pub runtime_dir: PathBuf,
     /// Optional daemon IPC endpoint resolved once by [`Config::load`].
-    /// `None` keeps the default `<cache_dir>/daemon.sock` placement.
+    /// `None` keeps the default `<runtime_dir>/daemon.sock` placement.
     pub socket_path_override: Option<PathBuf>,
     pub max_size: u64,
     pub remote: Option<RemoteConfig>,
@@ -557,6 +561,8 @@ pub(crate) struct CcFileConfig {
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub(crate) struct CacheFileConfig {
     pub(crate) local_store: Option<String>,
+    /// Job/process-lifetime state, separate from the persistent local store.
+    pub(crate) runtime_dir: Option<String>,
     pub(crate) local_max_size: Option<String>,
     pub(crate) remote: Option<RemoteFileConfig>,
     pub(crate) planner: Option<PlannerFileConfig>,
@@ -909,6 +915,7 @@ fn normalize_base_dirs(raw: impl IntoIterator<Item = String>) -> Result<Vec<Stri
 /// done inline via [`env_or_ignored`].
 const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_CACHE_DIR",
+    "KACHE_RUNTIME_DIR",
     "KACHE_MAX_SIZE",
     "KACHE_CACHE_EXECUTABLES",
     "KACHE_CLEAN_INCREMENTAL",
@@ -1027,6 +1034,22 @@ impl Config {
                     .ok_or(())
             })
             .unwrap_or_else(|_| default_cache_dir());
+
+        // Keep the historical single-directory layout unless explicitly split.
+        // Resolve this once alongside `cache_dir`: wrappers and their daemon must
+        // agree on every runtime path even if ambient env changes later.
+        let runtime_dir = env_or_ignored("KACHE_RUNTIME_DIR", ignore_env)
+            .map(|s| shellexpand(&s))
+            .or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.runtime_dir.as_ref())
+                    .map(|s| shellexpand(s))
+                    .ok_or(())
+            })
+            .unwrap_or_else(|_| cache_dir.clone());
 
         // Operational rather than file-backed, so `ignore_env` deliberately
         // does not gate it. Snapshot once so ambient env cannot redirect a
@@ -1431,6 +1454,7 @@ impl Config {
 
         Ok(Config {
             cache_dir,
+            runtime_dir,
             socket_path_override,
             max_size,
             remote,
@@ -1950,24 +1974,24 @@ impl Config {
     }
 
     pub fn event_log_path(&self) -> PathBuf {
-        self.cache_dir.join("events.jsonl")
+        self.runtime_dir.join("events.jsonl")
     }
 
     pub fn transfer_log_path(&self) -> PathBuf {
-        self.cache_dir.join("transfers.jsonl")
+        self.runtime_dir.join("transfers.jsonl")
     }
 
     /// Per-session prefetch summaries appended by the daemon on session
     /// finalization (kunobi-ninja/kache#583 P0.5).
     pub fn summary_log_path(&self) -> PathBuf {
-        self.cache_dir.join("summaries.jsonl")
+        self.runtime_dir.join("summaries.jsonl")
     }
 
     pub fn socket_path(&self) -> PathBuf {
         self.socket_path_override
             .as_ref()
             .and_then(|path| resolve_socket_path_override(Some(path.as_os_str().to_owned())))
-            .unwrap_or_else(|| self.cache_dir.join("daemon.sock"))
+            .unwrap_or_else(|| self.runtime_dir.join("daemon.sock"))
     }
 
     /// Return true when `source_path` matches one of `[cache].exclude`'s glob
@@ -2258,7 +2282,9 @@ pub(crate) fn config_file_path() -> PathBuf {
 fn resolve_socket_path_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let raw = raw?;
     if raw.is_empty() {
-        tracing::warn!("ignoring empty KACHE_SOCKET_PATH; falling back to <cache_dir>/daemon.sock");
+        tracing::warn!(
+            "ignoring empty KACHE_SOCKET_PATH; falling back to <runtime_dir>/daemon.sock"
+        );
         return None;
     }
 
@@ -3119,6 +3145,7 @@ remote_key_cache_refresh_secs = 900
                 incremental_crates: None,
                 key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 local_store: Some("~/my/cache".to_string()),
+                runtime_dir: Some("~/my/runtime".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: None,
                 cache_executables: Some(true),
@@ -3159,6 +3186,10 @@ remote_key_cache_refresh_secs = 900
         assert_eq!(
             deserialized.cache.as_ref().unwrap().local_store.as_deref(),
             Some("~/my/cache")
+        );
+        assert_eq!(
+            deserialized.cache.as_ref().unwrap().runtime_dir.as_deref(),
+            Some("~/my/runtime")
         );
         assert_eq!(
             deserialized.cache.as_ref().unwrap().exclude.as_deref(),
@@ -3575,6 +3606,7 @@ remote_key_cache_refresh_secs = 900
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
+            runtime_dir: PathBuf::from("/tmp/kache"),
             socket_path_override: None,
             max_size: 1024,
             remote: None,
@@ -3627,6 +3659,7 @@ remote_key_cache_refresh_secs = 900
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
+            runtime_dir: PathBuf::from("/tmp/kache"),
             socket_path_override: None,
             max_size: 1024,
             remote: None,
@@ -3675,6 +3708,7 @@ remote_key_cache_refresh_secs = 900
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
+            runtime_dir: PathBuf::from("/tmp/kache-runtime"),
             socket_path_override: None,
             max_size: 1024,
             remote: None,
@@ -3702,7 +3736,21 @@ remote_key_cache_refresh_secs = 900
         };
         assert_eq!(
             config.event_log_path(),
-            PathBuf::from("/tmp/kache/events.jsonl")
+            PathBuf::from("/tmp/kache-runtime/events.jsonl")
+        );
+        assert_eq!(
+            config.transfer_log_path(),
+            PathBuf::from("/tmp/kache-runtime/transfers.jsonl")
+        );
+        assert_eq!(
+            config.summary_log_path(),
+            PathBuf::from("/tmp/kache-runtime/summaries.jsonl")
+        );
+        assert_eq!(config.store_dir(), PathBuf::from("/tmp/kache/store"));
+        assert_eq!(config.index_db_path(), PathBuf::from("/tmp/kache/index.db"));
+        assert_eq!(
+            config.upload_spool_dir(),
+            PathBuf::from("/tmp/kache/upload-queue")
         );
     }
 
@@ -3728,6 +3776,7 @@ remote_key_cache_refresh_secs = 900
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache"),
+            runtime_dir: PathBuf::from("/tmp/kache-runtime"),
             socket_path_override: None,
             max_size: 1024,
             remote: None,
@@ -3755,7 +3804,7 @@ remote_key_cache_refresh_secs = 900
         };
         assert_eq!(
             config.socket_path(),
-            PathBuf::from("/tmp/kache/daemon.sock")
+            PathBuf::from("/tmp/kache-runtime/daemon.sock")
         );
 
         let socket_dir = tempfile::tempdir().unwrap();
@@ -3775,9 +3824,117 @@ remote_key_cache_refresh_secs = 900
             };
             assert_eq!(
                 invalid_config.socket_path(),
-                PathBuf::from("/tmp/kache/daemon.sock")
+                PathBuf::from("/tmp/kache-runtime/daemon.sock")
             );
         }
+    }
+
+    #[test]
+    fn runtime_dir_resolves_env_file_default_and_ignore_env() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let cache_dir = dir.path().join("cache");
+        let file_runtime = dir.path().join("file-runtime");
+        let env_runtime = dir.path().join("env-runtime");
+        let _config = set_kache_config_for_test(&config_path);
+        let _cache_env = set_env_for_test("KACHE_CACHE_DIR", None);
+        let _runtime_env = set_env_for_test("KACHE_RUNTIME_DIR", None);
+        let _socket_env = set_env_for_test("KACHE_SOCKET_PATH", None);
+
+        std::fs::write(
+            &config_path,
+            format!(
+                "[cache]\nlocal_store = {:?}\nruntime_dir = {:?}\n",
+                cache_dir.to_string_lossy(),
+                file_runtime.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let from_file = Config::load().unwrap();
+        assert_eq!(from_file.cache_dir, cache_dir);
+        assert_eq!(from_file.runtime_dir, file_runtime);
+
+        unsafe { std::env::set_var("KACHE_RUNTIME_DIR", &env_runtime) };
+        assert_eq!(Config::load().unwrap().runtime_dir, env_runtime);
+
+        std::fs::write(
+            &config_path,
+            format!(
+                "[cache]\nlocal_store = {:?}\nruntime_dir = {:?}\nignore_env = true\n",
+                cache_dir.to_string_lossy(),
+                file_runtime.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        assert_eq!(Config::load().unwrap().runtime_dir, file_runtime);
+
+        unsafe { std::env::remove_var("KACHE_RUNTIME_DIR") };
+        std::fs::write(
+            &config_path,
+            format!("[cache]\nlocal_store = {:?}\n", cache_dir.to_string_lossy()),
+        )
+        .unwrap();
+        let compatible_default = Config::load().unwrap();
+        assert_eq!(compatible_default.runtime_dir, compatible_default.cache_dir);
+    }
+
+    #[test]
+    fn concurrent_runtime_dirs_isolate_job_state_while_sharing_store() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared-cache");
+        let runtime_a = dir.path().join("job-a");
+        let runtime_b = dir.path().join("job-b");
+        let _cache_env = set_env_for_test("KACHE_CACHE_DIR", None);
+        let _runtime_env = set_env_for_test("KACHE_RUNTIME_DIR", None);
+        let _socket_env = set_env_for_test("KACHE_SOCKET_PATH", None);
+        let make = |runtime: &Path| {
+            Config::load_resolved(Ok(FileConfig {
+                cache: Some(CacheFileConfig {
+                    local_store: Some(shared.to_string_lossy().into_owned()),
+                    runtime_dir: Some(runtime.to_string_lossy().into_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .unwrap()
+        };
+        let a = make(&runtime_a);
+        let b = make(&runtime_b);
+
+        assert_eq!(a.store_dir(), b.store_dir());
+        assert_eq!(a.index_db_path(), b.index_db_path());
+        assert_eq!(a.upload_spool_dir(), b.upload_spool_dir());
+        assert_ne!(a.socket_path(), b.socket_path());
+        for extension in ["lock", "run.lock", "state.json", "log"] {
+            let a_path = a.socket_path().with_extension(extension);
+            let b_path = b.socket_path().with_extension(extension);
+            assert_ne!(a_path, b_path);
+            assert!(a_path.starts_with(&runtime_a));
+            assert!(b_path.starts_with(&runtime_b));
+        }
+        assert_ne!(a.event_log_path(), b.event_log_path());
+        assert_ne!(a.transfer_log_path(), b.transfer_log_path());
+        assert_ne!(a.summary_log_path(), b.summary_log_path());
+
+        let writers = [(a, "job-a"), (b, "job-b")].map(|(config, contents)| {
+            std::thread::spawn(move || {
+                std::fs::create_dir_all(&config.runtime_dir).unwrap();
+                std::fs::write(config.event_log_path(), contents).unwrap();
+                config
+            })
+        });
+        let [a, b] = writers.map(|writer| writer.join().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(a.event_log_path()).unwrap(),
+            "job-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(b.event_log_path()).unwrap(),
+            "job-b"
+        );
+        assert!(!shared.join("events.jsonl").exists());
     }
 
     #[test]
@@ -4274,6 +4431,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 incremental_crates: None,
                 key_env_vars: None,
                 local_store: Some("/tmp/my-cache".to_string()),
+                runtime_dir: Some("/tmp/my-runtime".to_string()),
                 local_max_size: Some("10GiB".to_string()),
                 planner: None,
                 cache_executables: Some(true),
@@ -4310,6 +4468,10 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             Some("/tmp/my-cache")
         );
         assert_eq!(loaded.cache.as_ref().unwrap().compression_level, Some(5));
+        assert_eq!(
+            loaded.cache.as_ref().unwrap().runtime_dir.as_deref(),
+            Some("/tmp/my-runtime")
+        );
     }
 
     #[test]

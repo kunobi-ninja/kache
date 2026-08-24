@@ -199,6 +199,7 @@ mod tests {
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
+            runtime_dir: cache_dir.clone(),
             cache_dir,
             max_size: 1024 * 1024,
             remote,

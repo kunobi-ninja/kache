@@ -26,6 +26,7 @@ use crate::config::{
 #[derive(Debug, Clone, Default)]
 struct PreservedAdvancedConfig {
     workspace: Option<toml::Value>,
+    runtime_dir: Option<String>,
     path_only_env_vars: Option<Vec<String>>,
     incremental_crates: Option<Vec<String>>,
     key_env_vars: Option<Vec<String>>,
@@ -48,6 +49,7 @@ impl PreservedAdvancedConfig {
         let cache = file_config.cache.as_ref();
         Self {
             workspace: file_config.workspace.clone(),
+            runtime_dir: cache.and_then(|c| c.runtime_dir.clone()),
             path_only_env_vars: cache.and_then(|c| c.path_only_env_vars.clone()),
             incremental_crates: cache.and_then(|c| c.incremental_crates.clone()),
             key_env_vars: cache.and_then(|c| c.key_env_vars.clone()),
@@ -872,6 +874,7 @@ fn fields_to_file_config(
         workspace: preserved_advanced.workspace.clone(),
         cache: Some(CacheFileConfig {
             local_store: get("cache_dir"),
+            runtime_dir: preserved_advanced.runtime_dir.clone(),
             local_max_size: get("max_size"),
             // The editor exposes no planner fields; preserve the loaded
             // section verbatim so a save never drops it (or its token).
@@ -2045,6 +2048,7 @@ mod tests {
                 incremental_crates: Some(vec!["tap_lib".to_string()]),
                 key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 local_store: Some("~/cache".to_string()),
+                runtime_dir: Some("~/runtime".to_string()),
                 local_max_size: Some("50GiB".to_string()),
                 planner: Some(PlannerFileConfig {
                     endpoint: Some("https://planner.example.com".to_string()),
@@ -2129,6 +2133,7 @@ mod tests {
             Some(&["/snap".to_string(), "/var/lib/flatpak".to_string()][..])
         );
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
+        assert_eq!(cache.runtime_dir.as_deref(), Some("~/runtime"));
         assert_eq!(cache.prefetch_enabled, Some(false));
         assert_eq!(cache.remote_key_cache_refresh_secs, Some(900));
         assert_eq!(cache.remote_restore_timeout_secs, Some(180));

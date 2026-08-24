@@ -727,6 +727,13 @@ pub(crate) fn config_mismatch_warnings(
             config.cache_dir.display(),
         ));
     }
+    if !eff.runtime_dir.is_empty() && eff.runtime_dir != config.runtime_dir.display().to_string() {
+        warnings.push(format!(
+            "warning: {daemon_side} has runtime_dir={}; {client_side} says {} — {remedy}",
+            eff.runtime_dir,
+            config.runtime_dir.display(),
+        ));
+    }
     if eff.prefetch_enabled != config.prefetch_enabled {
         warnings.push(format!(
             "warning: {daemon_side} has prefetch_enabled={}; {client_side} says {} — {remedy}",
@@ -7069,6 +7076,7 @@ mod tests {
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
+            runtime_dir: cache_dir.clone(),
             cache_dir,
             max_size: 1024 * 1024,
             remote,
@@ -7603,6 +7611,7 @@ mod tests {
         crate::daemon::EffectiveConfig {
             max_size: config.max_size,
             cache_dir: config.cache_dir.display().to_string(),
+            runtime_dir: config.runtime_dir.display().to_string(),
             config_path: "/daemon-home/.config/kache/config.toml".to_string(),
             config_fingerprint: Some("daemon-fingerprint".to_string()),
             prefetch_enabled: config.prefetch_enabled,
@@ -7726,6 +7735,16 @@ mod tests {
         let mut old_eff = eff.clone();
         old_eff.config_fingerprint = None;
         assert!(config_mismatch_warnings(&config, &same, &old_eff).is_empty());
+
+        // Runtime placement is daemon-owned too, but an older daemon that
+        // cannot report it must not create a false mismatch.
+        let mut runtime_eff = effective_config_like(&config);
+        runtime_eff.runtime_dir = "/somewhere/runtime".to_string();
+        let warnings = config_mismatch_warnings(&config, &same, &runtime_eff);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("runtime_dir=/somewhere/runtime"));
+        runtime_eff.runtime_dir.clear();
+        assert!(config_mismatch_warnings(&config, &same, &runtime_eff).is_empty());
 
         // Store cap differs.
         let mut eff = effective_config_like(&config);

@@ -5038,6 +5038,38 @@ mod tests {
     }
 
     #[test]
+    fn storage_render_preserves_zero_boundaries_and_summary_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let render = |logical_bytes, blob_bytes, accounting_consistent| {
+            let mut report = generate_report(&config, 24, 10).unwrap();
+            report.storage.restored_bytes = 0;
+            report.storage.logical_bytes = logical_bytes;
+            report.storage.blob_bytes = blob_bytes;
+            report.storage.accounting_consistent = accounting_consistent;
+            (format_github(&report), format_text(&report))
+        };
+
+        for (logical, blobs) in [(1, 0), (0, 1)] {
+            let (github, text) = render(logical, blobs, true);
+            assert!(github.contains("Store footprint"), "{github}");
+            assert!(text.contains("  Store:"), "{text}");
+        }
+        for (logical, blobs) in [(1, 0), (0, 1)] {
+            let (github, text) = render(logical, blobs, false);
+            assert!(github.contains("accounting inconsistent"), "{github}");
+            assert!(text.contains("Store accounting inconsistent"), "{text}");
+        }
+
+        let (github, _) = render(1, 1, true);
+        assert!(github.contains("1 B logical, 1 B blobs"), "{github}");
+        assert!(
+            !github.contains("zero-copy restores, 0 B restored"),
+            "{github}"
+        );
+    }
+
+    #[test]
     fn test_push_error_table_truncates_at_ten() {
         let errors: Vec<ErrorDetail> = (0..12)
             .map(|i| ErrorDetail {

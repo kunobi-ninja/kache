@@ -1467,6 +1467,16 @@ pub struct TransferEvent {
     #[serde(default)]
     pub object_key: String,
     pub compressed_bytes: u64,
+    /// Wall-clock start of the transfer stage, in Unix epoch milliseconds.
+    /// Zero for transfer-event schemas older than v3.
+    #[serde(default)]
+    pub started_at_unix_ms: u64,
+    /// Wall-clock end of the complete transfer, including local import, in Unix
+    /// epoch milliseconds. Zero for transfer-event schemas older than v3.
+    #[serde(default)]
+    pub finished_at_unix_ms: u64,
+    /// End-to-end monotonic duration. Download events include SQLite import in
+    /// transfer-event schema v3 and later.
     pub elapsed_ms: u64,
     /// Time spent on S3 GET + body collection only (excludes decompression/disk I/O).
     #[serde(default)]
@@ -1498,7 +1508,11 @@ pub struct TransferEvent {
     /// Time spent on disk I/O (fs::write + permissions + atomic rename), ms.
     #[serde(default)]
     pub disk_io_ms: u64,
-    /// Time spent importing downloaded metadata into SQLite.
+    /// Time spent waiting to acquire the SQLite store lock.
+    #[serde(default)]
+    pub import_lock_wait_ms: u64,
+    /// Time spent executing the SQLite import after acquiring the store lock.
+    /// In transfer-event schemas older than v3 this included lock wait.
     #[serde(default)]
     pub import_ms: u64,
     /// Time spent in zstd compression for uploads (ms).
@@ -1518,7 +1532,14 @@ pub struct TransferEvent {
 }
 
 const fn default_transfer_schema() -> u32 {
-    2
+    3
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub(crate) struct TransferCounters {
@@ -2168,6 +2189,29 @@ impl Daemon {
             .lock()
             .map_err(|_| anyhow::anyhow!("daemon store mutex poisoned"))?;
         f(&guard)
+    }
+
+    fn with_store_timed<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> (Result<T>, u64, u64) {
+        let store = match self.store_lock() {
+            Ok(store) => store,
+            Err(error) => return (Err(error), 0, 0),
+        };
+        let wait_started = Instant::now();
+        let guard = match store.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return (
+                    Err(anyhow::anyhow!("daemon store mutex poisoned")),
+                    wait_started.elapsed().as_millis() as u64,
+                    0,
+                );
+            }
+        };
+        let lock_wait_ms = wait_started.elapsed().as_millis() as u64;
+        let import_started = Instant::now();
+        let result = f(&guard);
+        let import_ms = import_started.elapsed().as_millis() as u64;
+        (result, lock_wait_ms, import_ms)
     }
 
     pub(crate) fn entry_dir_for(&self, cache_key: &str) -> PathBuf {
@@ -2941,6 +2985,7 @@ impl Daemon {
 
         let entry_dir = PathBuf::from(&job.entry_dir);
         let blobs_dir = self.config.store_dir().join("blobs");
+        let started_at_unix_ms = unix_time_ms();
         let start = Instant::now();
         let Some(put_breaker) = self.remote_breaker.try_acquire(RemoteOperation::UploadPut) else {
             self.transfer_counters
@@ -2982,6 +3027,7 @@ impl Daemon {
             Ok(ul) => {
                 put_breaker.success();
                 let elapsed_ms = start.elapsed().as_millis() as u64;
+                let finished_at_unix_ms = unix_time_ms();
                 self.transfer_counters
                     .uploads_completed
                     .fetch_add(1, Ordering::Relaxed);
@@ -2996,6 +3042,8 @@ impl Daemon {
                     cache_key: job.key.clone(),
                     object_key: String::new(),
                     compressed_bytes: ul.transfer.compressed_bytes,
+                    started_at_unix_ms,
+                    finished_at_unix_ms,
                     elapsed_ms,
                     network_ms: ul.transfer.network_ms,
                     semaphore_wait_ms: 0,
@@ -3007,16 +3055,14 @@ impl Daemon {
                     decompress_ms: 0,
                     extract_ms: 0,
                     disk_io_ms: 0,
+                    import_lock_wait_ms: 0,
                     import_ms: 0,
                     compression_ms: ul.transfer.compression_ms,
                     head_checks_ms: ul.transfer.head_checks_ms,
                     blobs_skipped: 0,
                     blobs_total: 0,
                     ok: true,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
+                    timestamp: finished_at_unix_ms / 1_000,
                 });
                 // A successful PUT flips the key positive immediately:
                 // key-cache insert + negative-cache invalidation (#564).
@@ -3029,6 +3075,7 @@ impl Daemon {
             }
             Err(e) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
+                let finished_at_unix_ms = unix_time_ms();
                 self.transfer_counters
                     .uploads_failed
                     .fetch_add(1, Ordering::Relaxed);
@@ -3040,6 +3087,8 @@ impl Daemon {
                     cache_key: job.key.clone(),
                     object_key: String::new(),
                     compressed_bytes: 0,
+                    started_at_unix_ms,
+                    finished_at_unix_ms,
                     elapsed_ms,
                     network_ms: 0,
                     semaphore_wait_ms: 0,
@@ -3051,16 +3100,14 @@ impl Daemon {
                     decompress_ms: 0,
                     extract_ms: 0,
                     disk_io_ms: 0,
+                    import_lock_wait_ms: 0,
                     import_ms: 0,
                     compression_ms: 0,
                     head_checks_ms: 0,
                     blobs_skipped: 0,
                     blobs_total: 0,
                     ok: false,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
+                    timestamp: finished_at_unix_ms / 1_000,
                 });
                 let class = classify_remote_error(&e);
                 put_breaker.failure(class, &format!("remote upload failed ({class:?}): {e:#}"));
@@ -3462,6 +3509,7 @@ impl Daemon {
         // mid-download.
         let entry_dir = self.entry_dir_for(&req.key);
         let blobs_dir = self.config.store_dir().join("blobs");
+        let started_at_unix_ms = unix_time_ms();
         let start = Instant::now();
         self.transfer_counters
             .remote_check_roundtrips
@@ -3482,16 +3530,13 @@ impl Daemon {
                         .insert(req.key.clone(), Some(cn.as_str()))
                         .await;
                 }
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                let import_start = Instant::now();
-                let import_ms = if let Err(e) =
-                    self.with_store(|store| store.import_restored_entry(&req.key))
-                {
+                let (import_result, import_lock_wait_ms, import_ms) =
+                    self.with_store_timed(|store| store.import_restored_entry(&req.key));
+                if let Err(e) = import_result {
                     tracing::warn!("failed to import downloaded entry {}: {e}", &req.key);
-                    0
-                } else {
-                    import_start.elapsed().as_millis() as u64
-                };
+                }
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                let finished_at_unix_ms = unix_time_ms();
                 self.transfer_counters
                     .downloads_completed
                     .fetch_add(1, Ordering::Relaxed);
@@ -3506,6 +3551,8 @@ impl Daemon {
                     cache_key: req.key.clone(),
                     object_key: dl.object_key,
                     compressed_bytes: dl.compressed_bytes,
+                    started_at_unix_ms,
+                    finished_at_unix_ms,
                     elapsed_ms,
                     network_ms: dl.network_ms,
                     semaphore_wait_ms,
@@ -3517,16 +3564,14 @@ impl Daemon {
                     decompress_ms: dl.decompress_ms,
                     extract_ms: dl.extract_ms,
                     disk_io_ms: dl.disk_io_ms,
+                    import_lock_wait_ms,
                     import_ms,
                     compression_ms: 0,
                     head_checks_ms: 0,
                     blobs_skipped: dl.blobs_skipped,
                     blobs_total: dl.blobs_total,
                     ok: true,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
+                    timestamp: finished_at_unix_ms / 1_000,
                 });
                 Response::found(true)
             }
@@ -3548,6 +3593,7 @@ impl Daemon {
             }
             Err(e) => {
                 let elapsed_ms = start.elapsed().as_millis() as u64;
+                let finished_at_unix_ms = unix_time_ms();
                 self.transfer_counters
                     .downloads_failed
                     .fetch_add(1, Ordering::Relaxed);
@@ -3559,6 +3605,8 @@ impl Daemon {
                     cache_key: req.key.clone(),
                     object_key: String::new(),
                     compressed_bytes: 0,
+                    started_at_unix_ms,
+                    finished_at_unix_ms,
                     elapsed_ms,
                     network_ms: 0,
                     semaphore_wait_ms,
@@ -3570,16 +3618,14 @@ impl Daemon {
                     decompress_ms: 0,
                     extract_ms: 0,
                     disk_io_ms: 0,
+                    import_lock_wait_ms: 0,
                     import_ms: 0,
                     compression_ms: 0,
                     head_checks_ms: 0,
                     blobs_skipped: 0,
                     blobs_total: 0,
                     ok: false,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
+                    timestamp: finished_at_unix_ms / 1_000,
                 });
                 // Feed the breaker with the failure class (#327) so a dead or
                 // stalling remote degrades and later restores skip S3
@@ -3968,6 +4014,7 @@ impl Daemon {
                         return;
                     }
                     let blobs_dir = d.config.store_dir().join("blobs");
+                    let started_at_unix_ms = unix_time_ms();
                     let start = Instant::now();
                     let download_result = item_deadline
                         .run(
@@ -3994,16 +4041,13 @@ impl Daemon {
                                     .insert(key.clone(), Some(crate_name.as_str()))
                                     .await;
                             }
-                            let elapsed_ms = start.elapsed().as_millis() as u64;
-                            let import_start = Instant::now();
-                            let import_ms = if let Err(e) =
-                                d.with_store(|store| store.import_restored_entry(&key))
-                            {
+                            let (import_result, import_lock_wait_ms, import_ms) =
+                                d.with_store_timed(|store| store.import_restored_entry(&key));
+                            if let Err(e) = import_result {
                                 tracing::warn!("prefetch import failed for {}: {e}", key);
-                                0
-                            } else {
-                                import_start.elapsed().as_millis() as u64
-                            };
+                            }
+                            let elapsed_ms = start.elapsed().as_millis() as u64;
+                            let finished_at_unix_ms = unix_time_ms();
                             d.transfer_counters
                                 .downloads_completed
                                 .fetch_add(1, Ordering::Relaxed);
@@ -4035,6 +4079,8 @@ impl Daemon {
                                 cache_key: key.clone(),
                                 object_key: dl.object_key,
                                 compressed_bytes: dl.compressed_bytes,
+                                started_at_unix_ms,
+                                finished_at_unix_ms,
                                 elapsed_ms,
                                 network_ms: dl.network_ms,
                                 semaphore_wait_ms,
@@ -4046,16 +4092,14 @@ impl Daemon {
                                 decompress_ms: dl.decompress_ms,
                                 extract_ms: dl.extract_ms,
                                 disk_io_ms: dl.disk_io_ms,
+                                import_lock_wait_ms,
                                 import_ms,
                                 compression_ms: 0,
                                 head_checks_ms: 0,
                                 blobs_skipped: dl.blobs_skipped,
                                 blobs_total: dl.blobs_total,
                                 ok: true,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
+                                timestamp: finished_at_unix_ms / 1_000,
                             });
                             // Track as prefetched for PrefetchHit attribution.
                             // Bound the set: a long-lived daemon that
@@ -4091,6 +4135,7 @@ impl Daemon {
                                 &format!("prefetch download failed ({class:?}): {e:#}"),
                             );
                             let elapsed_ms = start.elapsed().as_millis() as u64;
+                            let finished_at_unix_ms = unix_time_ms();
                             d.transfer_counters
                                 .downloads_failed
                                 .fetch_add(1, Ordering::Relaxed);
@@ -4102,6 +4147,8 @@ impl Daemon {
                                 cache_key: key.clone(),
                                 object_key: String::new(),
                                 compressed_bytes: 0,
+                                started_at_unix_ms,
+                                finished_at_unix_ms,
                                 elapsed_ms,
                                 network_ms: 0,
                                 semaphore_wait_ms,
@@ -4113,16 +4160,14 @@ impl Daemon {
                                 decompress_ms: 0,
                                 extract_ms: 0,
                                 disk_io_ms: 0,
+                                import_lock_wait_ms: 0,
                                 import_ms: 0,
                                 compression_ms: 0,
                                 head_checks_ms: 0,
                                 blobs_skipped: 0,
                                 blobs_total: 0,
                                 ok: false,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
+                                timestamp: finished_at_unix_ms / 1_000,
                             });
                             tracing::warn!("prefetch download failed for {}: {e}", key);
                         }
@@ -8442,6 +8487,33 @@ mod tests {
         blake3::hash(label.as_bytes()).to_hex().to_string()
     }
 
+    fn latest_transfer(daemon: &Daemon) -> TransferEvent {
+        daemon
+            .recent_transfers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .back()
+            .cloned()
+            .expect("transfer event")
+    }
+
+    fn assert_v3_transfer_timestamps(transfer: &TransferEvent) {
+        assert_eq!(transfer.schema, 3);
+        assert!(
+            transfer.started_at_unix_ms > 1_000_000_000_000,
+            "transfer start must be Unix epoch milliseconds: {transfer:?}"
+        );
+        assert!(
+            transfer.finished_at_unix_ms >= transfer.started_at_unix_ms,
+            "transfer finish must not precede its start: {transfer:?}"
+        );
+        assert_eq!(
+            transfer.timestamp,
+            transfer.finished_at_unix_ms / 1_000,
+            "legacy seconds timestamp must match the exact millisecond finish"
+        );
+    }
+
     #[test]
     fn key_cache_authoritative_truth_table() {
         assert!(key_cache_miss_is_authoritative(1, Some(Duration::ZERO)));
@@ -11691,7 +11763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_do_upload_uploads_when_not_in_remote() {
+    async fn test_do_upload_uploads_when_not_in_remote_records_v3_transfer_timestamps() {
         // Injected mock 404s the HEAD then 200s the pack + manifest PUTs, so
         // do_upload packs the local entry and uploads it end-to-end. Covers the
         // full upload path: exists_entry(miss) -> upload_entry(pack+manifest) ->
@@ -11733,10 +11805,11 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert_v3_transfer_timestamps(&latest_transfer(&daemon));
     }
 
     #[tokio::test]
-    async fn test_do_upload_records_failure_when_put_errors() {
+    async fn test_do_upload_failure_records_v3_transfer_timestamps() {
         // Mock 404s the HEAD (not present -> proceed) then 403s the pack PUT, so
         // upload_entry errors and do_upload takes its Err branch: uploads_failed++
         // and a failure TransferEvent, returning Response::err (daemon.rs 1459-1500).
@@ -11771,6 +11844,7 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+        assert_v3_transfer_timestamps(&latest_transfer(&daemon));
     }
 
     #[tokio::test]
@@ -11861,7 +11935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remote_check_hit_then_download_failure() {
+    async fn test_remote_check_failure_records_v3_transfer_timestamps() {
         // Injected mock: HEAD 200 (entry exists) then a garbage pack body for the
         // GET, so download_entry fails. Covers handle_remote_check's HIT branch +
         // download claim/semaphore + download_entry attempt + the error path.
@@ -11895,6 +11969,7 @@ mod tests {
             "download failure should surface as an error: {resp:?}"
         );
         assert!(resp.error.is_some());
+        assert_v3_transfer_timestamps(&latest_transfer(&daemon));
     }
 
     /// The prefetch cap must always leave head-room in the permit pool for
@@ -11997,7 +12072,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remote_check_hit_downloads_and_imports() {
+    async fn test_remote_check_success_records_v3_transfer_timestamps() {
         // HEAD 200 then a VALID pack GET: handle_remote_check downloads, extracts,
         // and imports the entry, returning found=true. Covers the HIT SUCCESS
         // path (download_entry + import_restored_entry).
@@ -12035,6 +12110,7 @@ mod tests {
             config.store_dir().join(&key).join("meta.json").exists(),
             "entry should be imported into the local store"
         );
+        assert_v3_transfer_timestamps(&latest_transfer(&daemon));
     }
 
     #[tokio::test]
@@ -12110,7 +12186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_prefetch_explicit_key_downloads_in_background() {
+    async fn test_handle_prefetch_success_records_v3_transfer_timestamps() {
         // handle_prefetch with an explicit key spawns the background download
         // coordinator. With the in-memory backend serving a valid pack, the
         // coordinator downloads + imports the entry. Covers the prefetch
@@ -12153,10 +12229,30 @@ mod tests {
             imported,
             "background prefetch coordinator should download + import the entry"
         );
+
+        let mut transfer = None;
+        for _ in 0..100 {
+            transfer = daemon
+                .recent_transfers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .back()
+                .cloned();
+            if transfer.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let transfer = transfer.expect("completed prefetch should record transfer timing");
+        assert_v3_transfer_timestamps(&transfer);
+        assert!(
+            transfer.elapsed_ms >= transfer.import_lock_wait_ms + transfer.import_ms,
+            "end-to-end elapsed must include lock wait and import execution: {transfer:?}"
+        );
     }
 
     #[tokio::test]
-    async fn test_handle_prefetch_records_a_failed_download() {
+    async fn test_handle_prefetch_failure_records_v3_transfer_timestamps() {
         // The in-memory backend serves garbage for the pack GET, so the coordinator's
         // download_entry fails and the per-key task takes its error branch:
         // downloads_failed++ and a failure TransferEvent, with no import.
@@ -12206,6 +12302,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(failed, "a garbage pack must record a failed download");
+        assert_v3_transfer_timestamps(&latest_transfer(&daemon));
         // Nothing was imported.
         assert!(!config.store_dir().join(key).join("meta.json").exists());
     }

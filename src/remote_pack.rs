@@ -25,7 +25,7 @@ pub(crate) const CATALOG_CONTENT_TYPE: &str = "application/vnd.kache.prefetch-ca
 const PACK_MAGIC: &[u8; 8] = b"KACHPK01";
 const PACK_HEADER_BYTES: usize = PACK_MAGIC.len() + size_of::<u64>();
 const MAX_PACK_INDEX_BYTES: usize = 16 * 1024 * 1024;
-const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PACK_ENTRIES: usize = 65_536;
 const MAX_CATALOG_PACKS: usize = 16_384;
 const MAX_SELECTOR_TEXT_BYTES: usize = 4096;
@@ -127,6 +127,13 @@ pub(crate) struct EncodedCatalog {
     pub digest: String,
     pub object_key: String,
     pub catalog: PackCatalog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogObjectRef {
+    pub object_key: String,
+    pub created_at_ms: u64,
+    pub digest: String,
 }
 
 /// Stable selector for one manifest/build namespace and Cargo.lock shard set.
@@ -375,6 +382,81 @@ pub(crate) fn decode_catalog(bytes: &[u8], expected_digest: &str) -> Result<Pack
         bail!("prefetch pack catalog is not canonically ordered");
     }
     Ok(catalog)
+}
+
+pub(crate) fn decode_catalog_for_selector(
+    bytes: &[u8],
+    expected_digest: &str,
+    expected_selector: &str,
+    now_ms: u64,
+) -> Result<PackCatalog> {
+    let catalog = decode_catalog(bytes, expected_digest)?;
+    if catalog.selector_hash != expected_selector {
+        bail!("prefetch catalog does not match the requested selector");
+    }
+    if catalog.expires_at_ms <= now_ms {
+        bail!("prefetch catalog expired at {}", catalog.expires_at_ms);
+    }
+    Ok(catalog)
+}
+
+/// Choose the newest syntactically valid immutable catalog object. Catalog
+/// contents remain untrusted until [`decode_catalog_for_selector`] succeeds.
+pub(crate) fn latest_catalog_object(
+    prefix: &str,
+    selector: &str,
+    object_keys: &[String],
+) -> Result<Option<CatalogObjectRef>> {
+    let expected_prefix = catalog_prefix(prefix, selector)?;
+    Ok(object_keys
+        .iter()
+        .filter_map(|key| parse_catalog_object_ref(&expected_prefix, key))
+        .max_by(|left, right| {
+            (left.created_at_ms, &left.digest).cmp(&(right.created_at_ms, &right.digest))
+        }))
+}
+
+fn parse_catalog_object_ref(prefix: &str, key: &str) -> Option<CatalogObjectRef> {
+    let filename = key.strip_prefix(prefix)?.strip_suffix(".json")?;
+    let (created_at, digest) = filename.split_once('-')?;
+    if created_at.len() != 20 || !created_at.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if validate_digest("catalog digest", digest).is_err() {
+        return None;
+    }
+    Some(CatalogObjectRef {
+        object_key: key.to_string(),
+        created_at_ms: created_at.parse().ok()?,
+        digest: digest.to_string(),
+    })
+}
+
+pub(crate) fn decode_catalog_pack<'a>(
+    bytes: &'a [u8],
+    pack: &CatalogPackRef,
+    max_bytes: u64,
+) -> Result<DecodedPack<'a>> {
+    if bytes.len() as u64 != pack.pack_bytes {
+        bail!(
+            "prefetch pack size mismatch (catalog {}, object {})",
+            pack.pack_bytes,
+            bytes.len()
+        );
+    }
+    let decoded = decode_pack(bytes, &pack.digest, max_bytes)?;
+    if decoded.entries.len() != pack.entries.len() {
+        bail!("prefetch pack entry count does not match its catalog");
+    }
+    for (decoded, catalog) in decoded.entries.iter().zip(&pack.entries) {
+        if decoded.descriptor.cache_key != catalog.cache_key
+            || decoded.descriptor.crate_name != catalog.crate_name
+            || decoded.descriptor.meta_digest != catalog.meta_digest
+        {
+            bail!("prefetch pack index does not match its catalog binding");
+        }
+    }
+    Ok(decoded)
 }
 
 fn canonicalize_catalog(mut catalog: PackCatalog) -> Result<PackCatalog> {

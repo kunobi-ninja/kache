@@ -602,6 +602,23 @@ pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) ->
             "Planning:   {} advisory / {} fallback plans (last: {} candidates)",
             pf.plans_advisory, pf.plans_fallback, pf.last_plan_candidates,
         ));
+        if pf.pack_requests_total + pf.v3_requests_total > 0 {
+            lines.push(format!(
+                "Transport:  pack {} requests / {}, v3 {} requests / {}; {} validation failures, {} v3 fallbacks",
+                pf.pack_requests_total,
+                ByteSize(pf.pack_bytes_downloaded),
+                pf.v3_requests_total,
+                ByteSize(pf.v3_bytes_downloaded),
+                pf.pack_validation_failures,
+                pf.pack_fallback_entries,
+            ));
+        }
+        if pf.last_plan_wall_ms > 0 {
+            lines.push(format!(
+                "Plan wall:  {} ms last / {} ms total",
+                pf.last_plan_wall_ms, pf.plan_wall_ms_total,
+            ));
+        }
         if pf.last_list_key_count > 0 {
             let (refresh_secs, refresh_source) = match &snap.daemon_effective_config {
                 Some(eff) => (eff.remote_key_cache_refresh_secs, ""),
@@ -7562,6 +7579,14 @@ mod tests {
             list_failures_total: 0,
             list_duration_ms_total: 0,
             list_keys_total: 0,
+            pack_requests_total: 3,
+            pack_bytes_downloaded: 4096,
+            v3_requests_total: 1,
+            v3_bytes_downloaded: 1024,
+            pack_validation_failures: 1,
+            pack_fallback_entries: 1,
+            last_plan_wall_ms: 250,
+            plan_wall_ms_total: 500,
         };
         let mut eff = effective_config_like(&config);
         eff.remote_key_cache_refresh_secs = 7;
@@ -7571,6 +7596,9 @@ mod tests {
         assert!(out.contains("2 used (50%)"));
         assert!(out.contains("CANCELLED"));
         assert!(out.contains("Planning:   1 advisory / 2 fallback plans (last: 7 candidates)"));
+        assert!(out.contains("Transport:  pack 3 requests"));
+        assert!(out.contains("v3 1 requests"));
+        assert!(out.contains("Plan wall:  250 ms last / 500 ms total"));
         assert!(out.contains("Key LIST:   250000 keys in 88 ms (refreshes every 7s)"));
         assert!(!out.contains("daemon did not report its cadence"));
         assert!(out.contains("Join-wait:  5 waits, 1234 ms total"));

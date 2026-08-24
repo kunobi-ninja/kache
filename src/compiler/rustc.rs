@@ -380,10 +380,35 @@ mod tests {
             ]);
             argv.extend(print.iter().map(|arg| (*arg).to_string()));
             let parsed = RustcCompiler::new().parse(&argv).unwrap();
+            assert!(
+                parsed.residual_args.is_empty(),
+                "query value leaked into residual args: {print:?} -> {:?}",
+                parsed.residual_args
+            );
             let reasons = RustcCompiler::new().refuse_reasons(&parsed);
             assert!(
                 matches!(reasons.as_slice(), [RefuseReason::NotPrimary]),
                 "source-bearing print query was treated as a compile: {print:?} -> {reasons:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuse_reasons_returns_not_primary_for_source_bearing_info_query() {
+        for query in ["-V", "--version", "-h", "--help", "-vV"] {
+            let parsed = RustcCompiler::new()
+                .parse(&s(&[
+                    "rustc",
+                    "src/lib.rs",
+                    "--crate-name",
+                    "dummy_crate",
+                    query,
+                ]))
+                .unwrap();
+            let reasons = RustcCompiler::new().refuse_reasons(&parsed);
+            assert!(
+                matches!(reasons.as_slice(), [RefuseReason::NotPrimary]),
+                "source-bearing info query was treated as a compile: {query} -> {reasons:?}"
             );
         }
     }

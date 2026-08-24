@@ -4982,6 +4982,8 @@ pub struct VerifyOutcome {
     pub orphaned_blobs: usize,
     /// Corrupted entries `--repair` actually removed.
     pub corrupted_removed: usize,
+    /// Derived blob-index rows that disagree with committed entry metadata.
+    pub index_drift: usize,
 }
 
 impl VerifyOutcome {
@@ -4989,7 +4991,7 @@ impl VerifyOutcome {
     /// run must fail on. Repair removes corrupted entries, so anything it
     /// could not remove still counts (kunobi-ninja/kache#176).
     pub fn unresolved_integrity_findings(&self) -> usize {
-        self.corrupted_entries - self.corrupted_removed
+        self.corrupted_entries - self.corrupted_removed + self.index_drift
     }
 }
 
@@ -5270,6 +5272,40 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
         }
     }
 
+    // `entries` plus each committed meta.json are authoritative; `blobs` and
+    // `entry_blobs` are derived acceleration structures. Compare them under
+    // the store write lock so a concurrent publisher/remover cannot create a
+    // transient mismatch, and rebuild them atomically when requested (#819).
+    let index_drift = if repair {
+        match store.reconcile_blob_index() {
+            Ok(drift) => {
+                if drift.total() > 0 {
+                    println!(
+                        "Repairing: reconciled {} entry mappings and {} blob rows.",
+                        drift.entry_mappings, drift.blobs
+                    );
+                }
+                0
+            }
+            Err(e) => {
+                tracing::warn!("blob index reconciliation failed: {e:#}");
+                1
+            }
+        }
+    } else if corrupted_entries == 0 {
+        match store.blob_index_drift() {
+            Ok(drift) => drift.total(),
+            Err(e) => {
+                tracing::warn!("blob index verification failed: {e:#}");
+                1
+            }
+        }
+    } else {
+        // Corrupt metadata is already an unresolved integrity finding and
+        // cannot safely serve as the source of truth for a graph comparison.
+        0
+    };
+
     // Repair: reclaim orphaned blob files (counted above). These are never
     // reclaimed by normal GC, so without this they leak invisibly to
     // size-based eviction. A small grace leaves any blob a concurrent build
@@ -5298,12 +5334,13 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
         "  Blobs: {} total, {} orphaned, {} missing, {} scrubbed, {} checksum failures",
         total_blobs_on_disk, orphaned_blobs, missing_blobs, blobs_scrubbed, checksum_failures
     );
+    println!("  Blob index drift: {index_drift}");
     println!("  Store size: {}", ByteSize(store_size));
 
-    if (corrupted_entries > 0 || orphaned_blobs > 0) && !repair {
+    if (corrupted_entries > 0 || orphaned_blobs > 0 || index_drift > 0) && !repair {
         println!();
         println!(
-            "Tip: run `kache doctor --repair` to remove corrupted entries and reclaim orphaned blobs."
+            "Tip: run `kache doctor --repair` to remove corrupted entries, reconcile the blob index, and reclaim orphaned blobs."
         );
     }
 
@@ -5315,6 +5352,7 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
         checksum_failures,
         orphaned_blobs,
         corrupted_removed,
+        index_drift,
     })
 }
 
@@ -8082,6 +8120,37 @@ mod tests {
         assert!(store2.get("validkey").unwrap().is_some());
         assert!(store2.get("missingblobkey").unwrap().is_none());
         verify(&config, false, false).expect("a second verify pass should succeed");
+    }
+
+    #[test]
+    fn verify_reports_and_repairs_blob_index_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        put_entry(&config, "driftkey", "drift", dir.path());
+        let store = Store::open(&config).unwrap();
+        let hash = store.get("driftkey").unwrap().unwrap().files[0]
+            .hash
+            .clone();
+        drop(store);
+
+        let db = crate::store::open_index_db(&config.index_db_path()).unwrap();
+        db.execute(
+            "UPDATE blobs SET refcount = 77 WHERE hash = ?1",
+            rusqlite::params![hash],
+        )
+        .unwrap();
+        drop(db);
+
+        let drifted = verify(&config, false, false).unwrap();
+        assert_eq!(drifted.index_drift, 1, "{drifted:?}");
+        assert_eq!(drifted.unresolved_integrity_findings(), 1, "{drifted:?}");
+
+        let repaired = verify(&config, false, true).unwrap();
+        assert_eq!(repaired.index_drift, 0, "{repaired:?}");
+        assert_eq!(repaired.unresolved_integrity_findings(), 0, "{repaired:?}");
+        let clean = verify(&config, false, false).unwrap();
+        assert_eq!(clean.index_drift, 0, "{clean:?}");
+        assert_eq!(clean.unresolved_integrity_findings(), 0, "{clean:?}");
     }
 
     #[test]

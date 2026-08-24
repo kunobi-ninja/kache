@@ -149,6 +149,16 @@ gitignore = true
 # than the already-observed assertion failure. Exclude only that whole-body
 # replacement; the override resolver and every branch inside the real method
 # remain mutation-tested.
+#
+# The packed-prefetch format has three inclusive-boundary operator mutants
+# that cannot change an observable result. A catalog which passed structural
+# validation cannot approach the 64 MiB encode cap: its 65,536 fixed-shape
+# entries, 16,384 pack wrappers, and two 4 KiB selector fields remain far
+# below it. On decode, an object of exactly the 16-byte header length has no
+# JSON index/payload and is rejected either way; likewise an index ending at
+# EOF has no payload for the required non-empty, non-zero-length entry set.
+# Exact-limit and first-real-overshoot tests retain coverage of every reachable
+# boundary on the corresponding decode/build paths.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -181,4 +191,7 @@ exclude_re = [
     "replace report_key_divergence with \\(\\)",
     "delete ! in install_shims",
     "replace Config::socket_path .* with Default::default",
+    "src/remote_pack.rs:351:20: replace > with (>=|==) in encode_catalog",
+    "src/remote_pack.rs:309:20: replace < with <= in decode_pack",
+    "src/remote_pack.rs:324:22: replace > with >= in decode_pack",
 ]

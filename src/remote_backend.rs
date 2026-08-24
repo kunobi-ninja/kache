@@ -70,6 +70,14 @@ pub struct GetObject {
     pub body_ms: u64,
 }
 
+/// Outcome of an atomic create-only remote publication.
+#[allow(dead_code)] // consumed by the packed-prefetch publisher in the next slice
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutIfAbsentResult {
+    Created,
+    AlreadyExists,
+}
+
 /// Byte-object transport backing the remote cache.
 ///
 /// Absence is not an error: `head` answers `false` and `get` answers `None`, so
@@ -89,6 +97,20 @@ pub trait RemoteBackend: Send + Sync {
 
     /// Store `body` at `key`.
     async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()>;
+
+    /// Store `body` only when `key` is absent, atomically.
+    ///
+    /// Implementations must never emulate this with HEAD followed by PUT: that
+    /// race would let two publishers overwrite an immutable transport object.
+    #[allow(dead_code)] // consumed by the packed-prefetch publisher in the next slice
+    async fn put_if_absent(
+        &self,
+        _key: &str,
+        _body: Vec<u8>,
+        _content_type: Option<&str>,
+    ) -> Result<PutIfAbsentResult> {
+        anyhow::bail!("remote backend does not support atomic create-only publication")
+    }
 
     /// File keys under `prefix`.
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
@@ -330,6 +352,28 @@ impl RemoteBackend for OpenDalBackend {
             .map_err(|error| self.contextual_error("PUT", key, error))
     }
 
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<PutIfAbsentResult> {
+        self.validate_key("CREATE", key, false)?;
+        self.verify_write_containment(key)?;
+        let request = self.operator.write_with(key, body).if_not_exists(true);
+        let result = match content_type {
+            Some(content_type) => request.content_type(content_type).await,
+            None => request.await,
+        };
+        match result {
+            Ok(_) => Ok(PutIfAbsentResult::Created),
+            Err(error) => match classify_create_error(error.kind()) {
+                Some(outcome) => Ok(outcome),
+                None => Err(self.contextual_error("CREATE", key, error)),
+            },
+        }
+    }
+
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.validate_key("LIST", prefix, true)?;
         let mut lister = match self.operator.lister_with(prefix).recursive(true).await {
@@ -430,6 +474,18 @@ fn verify_complete_body(advertised: Option<u64>, read: u64, description: &str) -
         anyhow::bail!("{description} truncated: read {read} bytes, expected {advertised}");
     }
     Ok(())
+}
+
+/// Only failed create preconditions mean that an immutable object already won
+/// the publication race. Authentication, transport, and storage failures must
+/// remain errors rather than being reported as a harmless duplicate.
+fn classify_create_error(kind: ErrorKind) -> Option<PutIfAbsentResult> {
+    match kind {
+        ErrorKind::ConditionNotMatch | ErrorKind::AlreadyExists => {
+            Some(PutIfAbsentResult::AlreadyExists)
+        }
+        _ => None,
+    }
 }
 
 fn without_retry_layer(operator: Operator) -> Operator {
@@ -917,6 +973,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_only_put_preserves_the_first_object() {
+        let backend = memory_backend();
+
+        assert_eq!(
+            backend
+                .put_if_absent("immutable/key", b"first".to_vec(), None)
+                .await
+                .unwrap(),
+            PutIfAbsentResult::Created
+        );
+        assert_eq!(
+            backend
+                .put_if_absent("immutable/key", b"second".to_vec(), None)
+                .await
+                .unwrap(),
+            PutIfAbsentResult::AlreadyExists
+        );
+        assert_eq!(
+            backend
+                .get("immutable/key", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "first"
+        );
+    }
+
+    #[test]
+    fn create_only_error_classification_is_exact() {
+        assert_eq!(
+            classify_create_error(ErrorKind::ConditionNotMatch),
+            Some(PutIfAbsentResult::AlreadyExists)
+        );
+        assert_eq!(
+            classify_create_error(ErrorKind::AlreadyExists),
+            Some(PutIfAbsentResult::AlreadyExists)
+        );
+        assert_eq!(classify_create_error(ErrorKind::PermissionDenied), None);
+        assert_eq!(classify_create_error(ErrorKind::Unexpected), None);
+    }
+
+    #[tokio::test]
     async fn get_refuses_an_object_over_the_cap() {
         let backend = memory_backend();
         backend.put("key", b"hello".to_vec(), None).await.unwrap();
@@ -1191,6 +1290,45 @@ mod tests {
             request.to_ascii_lowercase().contains("\r\ncontent-md5:"),
             "{request}"
         );
+    }
+
+    #[tokio::test]
+    async fn s3_wire_create_only_put_uses_a_conditional_request() {
+        let conflict = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <Error><Code>PreconditionFailed</Code><Message>already exists</Message>\
+            <RequestId>test</RequestId></Error>";
+        let (endpoint, requests) = mock_http_server(vec![
+            http_response("200 OK", ""),
+            http_response("412 Precondition Failed", conflict),
+        ])
+        .await;
+        let backend = anonymous_s3_backend(&endpoint);
+
+        assert_eq!(
+            backend
+                .put_if_absent("immutable", b"first".to_vec(), None)
+                .await
+                .unwrap(),
+            PutIfAbsentResult::Created
+        );
+        assert_eq!(
+            backend
+                .put_if_absent("immutable", b"second".to_vec(), None)
+                .await
+                .unwrap(),
+            PutIfAbsentResult::AlreadyExists
+        );
+
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\nif-none-match: *\r\n"),
+                "{request}"
+            );
+        }
     }
 
     #[tokio::test]

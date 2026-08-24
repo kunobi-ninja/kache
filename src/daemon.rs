@@ -901,6 +901,47 @@ impl PrefetchRequest {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PackPrefetchContext {
+    manifest_key: String,
+    namespace: String,
+    shard_hashes: Vec<String>,
+    selector: String,
+}
+
+impl PackPrefetchContext {
+    fn from_deps(manifest_key: String, namespace: &str, deps: &[(String, String)]) -> Result<Self> {
+        if deps.is_empty() {
+            anyhow::bail!("packed-prefetch requires Cargo.lock dependencies");
+        }
+        let mut shard_hashes = crate::shards::compute_shards(namespace, deps)
+            .shards
+            .into_iter()
+            .map(|(hash, _)| hash)
+            .collect::<Vec<_>>();
+        shard_hashes.sort();
+        let selector = crate::remote_pack::selector_hash(
+            &manifest_key,
+            namespace,
+            &shard_hashes,
+            crate::cache_key::CACHE_KEY_VERSION,
+        )?;
+        Ok(Self {
+            manifest_key,
+            namespace: namespace.to_string(),
+            shard_hashes,
+            selector,
+        })
+    }
+
+    fn from_intent(intent: &kache_core::BuildIntent) -> Option<Self> {
+        let namespace = intent.namespace.as_deref()?;
+        let manifest_key = std::env::var("KACHE_MANIFEST_KEY")
+            .unwrap_or_else(|_| crate::cli::default_manifest_key());
+        Self::from_deps(manifest_key, namespace, &intent.cargo_lock_deps).ok()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BuildStartedRequest {
     #[serde(default)]
@@ -1192,6 +1233,25 @@ pub struct PrefetchStatsSnapshot {
     pub list_duration_ms_total: u64,
     #[serde(default)]
     pub list_keys_total: u64,
+    /// Remote operations used by packed-prefetch discovery and pack GETs.
+    #[serde(default)]
+    pub pack_requests_total: u64,
+    #[serde(default)]
+    pub pack_bytes_downloaded: u64,
+    /// Existing object-by-object v3 GETs started by speculative prefetch.
+    #[serde(default)]
+    pub v3_requests_total: u64,
+    #[serde(default)]
+    pub v3_bytes_downloaded: u64,
+    #[serde(default)]
+    pub pack_validation_failures: u64,
+    #[serde(default)]
+    pub pack_fallback_entries: u64,
+    /// Real wall time from plan dispatch through its final import/fallback.
+    #[serde(default)]
+    pub last_plan_wall_ms: u64,
+    #[serde(default)]
+    pub plan_wall_ms_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1642,6 +1702,14 @@ pub(crate) struct PrefetchStats {
     pub list_failures_total: std::sync::atomic::AtomicU64,
     pub list_duration_ms_total: std::sync::atomic::AtomicU64,
     pub list_keys_total: std::sync::atomic::AtomicU64,
+    pub pack_requests_total: std::sync::atomic::AtomicU64,
+    pub pack_bytes_downloaded: std::sync::atomic::AtomicU64,
+    pub v3_requests_total: std::sync::atomic::AtomicU64,
+    pub v3_bytes_downloaded: std::sync::atomic::AtomicU64,
+    pub pack_validation_failures: std::sync::atomic::AtomicU64,
+    pub pack_fallback_entries: std::sync::atomic::AtomicU64,
+    pub last_plan_wall_ms: std::sync::atomic::AtomicU64,
+    pub plan_wall_ms_total: std::sync::atomic::AtomicU64,
 }
 
 impl PrefetchStats {
@@ -1663,6 +1731,14 @@ impl PrefetchStats {
             list_failures_total: 0.into(),
             list_duration_ms_total: 0.into(),
             list_keys_total: 0.into(),
+            pack_requests_total: 0.into(),
+            pack_bytes_downloaded: 0.into(),
+            v3_requests_total: 0.into(),
+            v3_bytes_downloaded: 0.into(),
+            pack_validation_failures: 0.into(),
+            pack_fallback_entries: 0.into(),
+            last_plan_wall_ms: 0.into(),
+            plan_wall_ms_total: 0.into(),
         }
     }
 }
@@ -2528,6 +2604,14 @@ impl Daemon {
                 list_failures_total: ps.list_failures_total.load(Ordering::Relaxed),
                 list_duration_ms_total: ps.list_duration_ms_total.load(Ordering::Relaxed),
                 list_keys_total: ps.list_keys_total.load(Ordering::Relaxed),
+                pack_requests_total: ps.pack_requests_total.load(Ordering::Relaxed),
+                pack_bytes_downloaded: ps.pack_bytes_downloaded.load(Ordering::Relaxed),
+                v3_requests_total: ps.v3_requests_total.load(Ordering::Relaxed),
+                v3_bytes_downloaded: ps.v3_bytes_downloaded.load(Ordering::Relaxed),
+                pack_validation_failures: ps.pack_validation_failures.load(Ordering::Relaxed),
+                pack_fallback_entries: ps.pack_fallback_entries.load(Ordering::Relaxed),
+                last_plan_wall_ms: ps.last_plan_wall_ms.load(Ordering::Relaxed),
+                plan_wall_ms_total: ps.plan_wall_ms_total.load(Ordering::Relaxed),
             },
             in_flight,
             effective_config: Some(self.effective_config.clone()),
@@ -3680,9 +3764,425 @@ impl Daemon {
         Response::ok_batch(results)
     }
 
+    async fn packed_prefetch_list(
+        &self,
+        backend: &dyn crate::remote_backend::RemoteBackend,
+        prefix: &str,
+    ) -> Result<Vec<String>> {
+        let breaker = self
+            .remote_breaker
+            .try_acquire(RemoteOperation::PrefetchGet)
+            .ok_or_else(|| anyhow::anyhow!("remote read breaker open"))?;
+        let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
+        let gate = deadline
+            .run("pack catalog gate", async {
+                self.prefetch_gate
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("prefetch gate closed"))
+            })
+            .await?;
+        let semaphore = deadline
+            .run("pack catalog LIST queue", async {
+                self.s3_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+            })
+            .await?;
+        self.prefetch_stats
+            .pack_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+        let result = deadline
+            .run("pack catalog LIST", backend.list(prefix))
+            .await;
+        drop(semaphore);
+        drop(gate);
+        match result {
+            Ok(objects) => {
+                breaker.success();
+                Ok(objects)
+            }
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                breaker.failure(class, &format!("packed-prefetch LIST failed: {error:#}"));
+                Err(error)
+            }
+        }
+    }
+
+    async fn packed_prefetch_get(
+        &self,
+        backend: &dyn crate::remote_backend::RemoteBackend,
+        key: &str,
+        max_bytes: u64,
+        stage: &'static str,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        let breaker = self
+            .remote_breaker
+            .try_acquire(RemoteOperation::PrefetchGet)
+            .ok_or_else(|| anyhow::anyhow!("remote read breaker open"))?;
+        let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
+        let gate = deadline
+            .run("packed-prefetch gate", async {
+                self.prefetch_gate
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("prefetch gate closed"))
+            })
+            .await?;
+        let semaphore = deadline
+            .run("packed-prefetch GET queue", async {
+                self.s3_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+            })
+            .await?;
+        self.prefetch_stats
+            .pack_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+        let result = deadline.run(stage, backend.get(key, Some(max_bytes))).await;
+        drop(semaphore);
+        drop(gate);
+        match result {
+            Ok(object) => {
+                breaker.success();
+                if let Some(object) = &object {
+                    self.prefetch_stats
+                        .pack_bytes_downloaded
+                        .fetch_add(object.body.len() as u64, Ordering::Relaxed);
+                }
+                Ok(object)
+            }
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                breaker.failure(class, &format!("{stage} failed: {error:#}"));
+                Err(error)
+            }
+        }
+    }
+
+    /// Try the manifest-level immutable pack catalog, returning candidate keys
+    /// successfully imported. Every other candidate remains eligible for the
+    /// existing v3 coordinator below.
+    async fn try_packed_prefetch(
+        self: &Arc<Self>,
+        context: &PackPrefetchContext,
+        backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
+        remote: &crate::config::RemoteConfig,
+        candidates: &[(String, String, PathBuf)],
+        bytes_at_plan_start: u64,
+    ) -> HashSet<String> {
+        let wanted = candidates
+            .iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<HashSet<_>>();
+        let mut imported = HashSet::new();
+        let catalog_prefix =
+            match crate::remote_pack::catalog_prefix(&remote.prefix, &context.selector) {
+                Ok(prefix) => prefix,
+                Err(error) => {
+                    tracing::warn!("packed-prefetch selector rejected: {error:#}");
+                    return imported;
+                }
+            };
+        let objects = match self
+            .packed_prefetch_list(backend.as_ref(), &catalog_prefix)
+            .await
+        {
+            Ok(objects) => objects,
+            Err(error) => {
+                tracing::debug!("packed-prefetch catalog discovery failed: {error:#}");
+                self.prefetch_stats
+                    .pack_fallback_entries
+                    .fetch_add(wanted.len() as u64, Ordering::Relaxed);
+                return imported;
+            }
+        };
+        let catalog_ref = match crate::remote_pack::latest_catalog_object(
+            &remote.prefix,
+            &context.selector,
+            &objects,
+        ) {
+            Ok(Some(catalog)) => catalog,
+            Ok(None) => {
+                self.prefetch_stats
+                    .pack_fallback_entries
+                    .fetch_add(wanted.len() as u64, Ordering::Relaxed);
+                return imported;
+            }
+            Err(error) => {
+                tracing::warn!("packed-prefetch catalog key rejected: {error:#}");
+                self.prefetch_stats
+                    .pack_validation_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                self.prefetch_stats
+                    .pack_fallback_entries
+                    .fetch_add(wanted.len() as u64, Ordering::Relaxed);
+                return imported;
+            }
+        };
+        let Some(catalog_object) = self
+            .packed_prefetch_get(
+                backend.as_ref(),
+                &catalog_ref.object_key,
+                crate::remote_pack::MAX_CATALOG_BYTES as u64,
+                "packed-prefetch catalog GET",
+            )
+            .await
+            .ok()
+            .flatten()
+        else {
+            self.prefetch_stats
+                .pack_fallback_entries
+                .fetch_add(wanted.len() as u64, Ordering::Relaxed);
+            return imported;
+        };
+        let now_ms = epoch_ms();
+        let catalog = match crate::remote_pack::decode_catalog_for_selector(
+            &catalog_object.body,
+            &catalog_ref.digest,
+            &context.selector,
+            now_ms,
+        ) {
+            Ok(catalog)
+                if catalog.created_at_ms == catalog_ref.created_at_ms
+                    && catalog.manifest_key == context.manifest_key
+                    && catalog.namespace == context.namespace
+                    && catalog.shard_hashes == context.shard_hashes =>
+            {
+                catalog
+            }
+            Ok(_) => {
+                tracing::warn!("packed-prefetch catalog context binding mismatch");
+                self.prefetch_stats
+                    .pack_validation_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                self.prefetch_stats
+                    .pack_fallback_entries
+                    .fetch_add(wanted.len() as u64, Ordering::Relaxed);
+                return imported;
+            }
+            Err(error) => {
+                tracing::warn!("packed-prefetch catalog validation failed: {error:#}");
+                self.prefetch_stats
+                    .pack_validation_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                self.prefetch_stats
+                    .pack_fallback_entries
+                    .fetch_add(wanted.len() as u64, Ordering::Relaxed);
+                return imported;
+            }
+        };
+
+        let selected = catalog
+            .packs
+            .iter()
+            .filter(|pack| {
+                pack.entries
+                    .iter()
+                    .any(|entry| wanted.contains(&entry.cache_key))
+            })
+            .collect::<Vec<_>>();
+        let already_spent = self
+            .prefetch_stats
+            .bytes_downloaded
+            .load(Ordering::Relaxed)
+            .saturating_sub(bytes_at_plan_start);
+        let mut reserved = 0u64;
+        let admitted = selected
+            .into_iter()
+            .filter(|pack| {
+                if self.config.prefetch_max_bytes == 0 {
+                    return true;
+                }
+                let fits = pack.pack_bytes
+                    <= self
+                        .config
+                        .prefetch_max_bytes
+                        .saturating_sub(already_spent.saturating_add(reserved));
+                if fits {
+                    reserved = reserved.saturating_add(pack.pack_bytes);
+                }
+                fits
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        use futures::StreamExt as _;
+        let mut fetched = futures::stream::iter(admitted)
+            .map(|pack_ref| async move {
+                let pack_key =
+                    crate::remote_pack::pack_object_key(&remote.prefix, &pack_ref.digest);
+                let object = match pack_key {
+                    Ok(key) => self
+                        .packed_prefetch_get(
+                            backend.as_ref(),
+                            &key,
+                            crate::remote_pack::DEFAULT_MAX_PACK_BYTES,
+                            "packed-prefetch pack GET",
+                        )
+                        .await
+                        .ok()
+                        .flatten(),
+                    Err(error) => {
+                        tracing::warn!("packed-prefetch pack key rejected: {error:#}");
+                        self.prefetch_stats
+                            .pack_validation_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                };
+                (pack_ref, object)
+            })
+            .buffer_unordered(prefetch_concurrency_cap(self.config.s3_concurrency))
+            .collect::<Vec<_>>()
+            .await;
+        fetched.sort_by(|(left, _), (right, _)| left.digest.cmp(&right.digest));
+
+        let mut verified = Vec::new();
+        for (pack_ref, pack_object) in fetched {
+            let Some(pack_object) = pack_object else {
+                continue;
+            };
+            let decoded = match crate::remote_pack::decode_catalog_pack(
+                &pack_object.body,
+                &pack_ref,
+                crate::remote_pack::DEFAULT_MAX_PACK_BYTES,
+            ) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    tracing::warn!("packed-prefetch pack validation failed: {error:#}");
+                    self.prefetch_stats
+                        .pack_validation_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            self.transfer_counters
+                .downloads_completed
+                .fetch_add(1, Ordering::Relaxed);
+            self.transfer_counters
+                .bytes_downloaded
+                .fetch_add(pack_object.body.len() as u64, Ordering::Relaxed);
+            self.prefetch_stats
+                .bytes_downloaded
+                .fetch_add(pack_object.body.len() as u64, Ordering::Relaxed);
+
+            for entry in decoded.entries {
+                let key = &entry.descriptor.cache_key;
+                let entry_dir = self.entry_dir_for(key);
+                if !try_claim_packed_download(&self.downloading, key, &entry_dir).await {
+                    continue;
+                }
+                let guard = DownloadingGuard::new(self.downloading.clone(), key.clone());
+                match crate::remote_layout::extract_verified_prefetch_entry(
+                    key,
+                    &entry.descriptor.crate_name,
+                    &entry.descriptor.meta_digest,
+                    entry.payload,
+                    &entry_dir,
+                    None,
+                ) {
+                    Ok(extracted) => verified.push((extracted, guard, entry.payload.len() as u64)),
+                    Err(error) => {
+                        tracing::warn!(
+                            key = key_prefix(key),
+                            "packed-prefetch entry validation failed: {error:#}"
+                        );
+                        self.prefetch_stats
+                            .pack_validation_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        let batch = verified
+            .iter()
+            .map(|(entry, _, _)| entry.restored.clone())
+            .collect::<Vec<_>>();
+        if !batch.is_empty() {
+            let import_start = Instant::now();
+            match self.with_store(|store| store.import_verified_restored_entries(&batch)) {
+                Ok(_) => {
+                    let original_bytes = verified
+                        .iter()
+                        .map(|(entry, _, _)| entry.original_bytes)
+                        .sum::<u64>();
+                    let extract_ms = verified
+                        .iter()
+                        .map(|(entry, _, _)| entry.extract_ms)
+                        .sum::<u64>();
+                    for (entry, _, payload_bytes) in &verified {
+                        let key = &entry.restored.cache_key;
+                        imported.insert(key.clone());
+                        self.note_key_present(key, &entry.restored.meta.crate_name)
+                            .await;
+                        {
+                            let mut plan =
+                                self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Some(plan) = plan.as_mut() {
+                                plan.record_download(key, *payload_bytes);
+                            }
+                        }
+                    }
+                    self.prefetch_stats
+                        .downloads_completed
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    tracing::info!(
+                        entries = batch.len(),
+                        original_bytes,
+                        extract_ms,
+                        import_ms = import_start.elapsed().as_millis() as u64,
+                        "packed-prefetch batch imported"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!("packed-prefetch batch import failed: {error:#}");
+                    self.prefetch_stats
+                        .pack_validation_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    for (entry, _, _) in &verified {
+                        let _ =
+                            std::fs::remove_dir_all(self.entry_dir_for(&entry.restored.cache_key));
+                    }
+                }
+            }
+        }
+        drop(verified);
+
+        if !imported.is_empty() {
+            const MAX_PREFETCHED_KEYS: usize = 50_000;
+            let mut prefetched = self.prefetched_keys.write().await;
+            if prefetched.len().saturating_add(imported.len()) >= MAX_PREFETCHED_KEYS {
+                prefetched.clear();
+                self.prefetch_used_keys.write().await.clear();
+            }
+            prefetched.extend(imported.iter().cloned());
+        }
+        self.prefetch_stats.pack_fallback_entries.fetch_add(
+            wanted.difference(&imported).count() as u64,
+            Ordering::Relaxed,
+        );
+        imported
+    }
+
     /// Handle a prefetch request: fire-and-forget background downloads.
     /// Spawns a single coordinator task that processes keys with bounded concurrency.
     pub async fn handle_prefetch(self: &Arc<Self>, req: &PrefetchRequest) -> Response {
+        self.handle_prefetch_with_context(req, None, Instant::now())
+            .await
+    }
+
+    async fn handle_prefetch_with_context(
+        self: &Arc<Self>,
+        req: &PrefetchRequest,
+        pack_context: Option<PackPrefetchContext>,
+        plan_started_at: Instant,
+    ) -> Response {
         if !self.config.prefetch_enabled {
             tracing::debug!("prefetch request ignored: speculative prefetch disabled");
             return Response::ok();
@@ -3700,6 +4200,7 @@ impl Daemon {
             Err(error) => return Response::err(format!("remote backend init failed: {error:#}")),
         };
         let backend = Arc::clone(backend);
+        let bytes_at_plan_start = self.prefetch_stats.bytes_downloaded.load(Ordering::Relaxed);
 
         // Filter to keys that need downloading: (cache_key, crate_name, entry_dir)
         let mut keys_to_fetch: Vec<(String, String, PathBuf)> = Vec::new();
@@ -3838,6 +4339,19 @@ impl Daemon {
         let remote_config = (*remote).clone();
         let cancel_rx = self.prefetch_cancel.subscribe();
         tokio::spawn(async move {
+            if let Some(context) = pack_context.as_ref() {
+                let packed = daemon
+                    .try_packed_prefetch(
+                        context,
+                        &backend,
+                        &remote_config,
+                        &keys_to_fetch,
+                        bytes_at_plan_start,
+                    )
+                    .await;
+                keys_to_fetch.retain(|(key, _, _)| !packed.contains(key));
+            }
+
             let mut in_flight = futures::stream::FuturesUnordered::new();
             // Speculative prefetch is capped BELOW the S3 permit pool so an
             // interactive RemoteCheck can always acquire a permit without
@@ -3857,10 +4371,7 @@ impl Daemon {
             // was in flight when it tripped, at most `max_concurrent` objects.
             // A hard cap needs counted, cancellable reads in the backend.
             let byte_budget = daemon.config.prefetch_max_bytes;
-            let bytes_at_start = daemon
-                .prefetch_stats
-                .bytes_downloaded
-                .load(Ordering::Relaxed);
+            let bytes_at_start = bytes_at_plan_start;
             let deadline = match daemon.config.prefetch_deadline_secs {
                 0 => None,
                 secs => Some(Instant::now() + Duration::from_secs(secs)),
@@ -4021,6 +4532,9 @@ impl Daemon {
                     let blobs_dir = d.config.store_dir().join("blobs");
                     let started_at_unix_ms = unix_time_ms();
                     let start = Instant::now();
+                    d.prefetch_stats
+                        .v3_requests_total
+                        .fetch_add(1, Ordering::Relaxed);
                     let download_result = item_deadline
                         .run(
                             "prefetch GET and extraction",
@@ -4066,6 +4580,9 @@ impl Daemon {
                                 .fetch_add(1, Ordering::Relaxed);
                             d.prefetch_stats
                                 .bytes_downloaded
+                                .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
+                            d.prefetch_stats
+                                .v3_bytes_downloaded
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                             // Per-plan attribution (#583 P0.5): byte-accurate
                             // downloaded set for the session summary.
@@ -4183,7 +4700,16 @@ impl Daemon {
             // Drain remaining
             use futures::StreamExt;
             while in_flight.next().await.is_some() {}
-            tracing::info!("prefetch: completed {} downloads", count);
+            let wall_ms = plan_started_at.elapsed().as_millis() as u64;
+            daemon
+                .prefetch_stats
+                .last_plan_wall_ms
+                .store(wall_ms, Ordering::Relaxed);
+            daemon
+                .prefetch_stats
+                .plan_wall_ms_total
+                .fetch_add(wall_ms, Ordering::Relaxed);
+            tracing::info!(wall_ms, "prefetch: completed {} downloads", count);
         });
 
         tracing::info!("prefetch: queued {} downloads", count);
@@ -4284,6 +4810,8 @@ impl Daemon {
     }
 
     pub async fn handle_build_started(self: &Arc<Self>, req: &BuildStartedRequest) -> Response {
+        let plan_started_at = Instant::now();
+        let pack_context = PackPrefetchContext::from_intent(&req.intent);
         let Some(_remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
@@ -4329,7 +4857,13 @@ impl Daemon {
                             "advisory",
                             prefetch_req.keys.iter().map(|(k, _)| k.clone()),
                         );
-                        let resp = self.handle_prefetch(&prefetch_req).await;
+                        let resp = self
+                            .handle_prefetch_with_context(
+                                &prefetch_req,
+                                pack_context.clone(),
+                                plan_started_at,
+                            )
+                            .await;
                         if resp.ok {
                             self.prefetch_stats
                                 .plans_advisory
@@ -4409,7 +4943,8 @@ impl Daemon {
             "fallback",
             prefetch_req.keys.iter().map(|(k, _)| k.clone()),
         );
-        self.handle_prefetch(&prefetch_req).await
+        self.handle_prefetch_with_context(&prefetch_req, pack_context, plan_started_at)
+            .await
     }
 
     /// After a successful upload, check if store exceeds max_size → LRU eviction.
@@ -5325,6 +5860,20 @@ async fn claim_download(
     }
 }
 
+/// Claim a packed entry only when it is absent on disk and no other download
+/// already owns the key. Keeping both rejection cases behind this seam makes
+/// the short-circuit contract deterministic to test.
+async fn try_claim_packed_download(
+    downloading: &RwLock<HashMap<String, Arc<Notify>>>,
+    key: &str,
+    entry_dir: &Path,
+) -> bool {
+    if entry_dir.exists() {
+        return false;
+    }
+    claim_download(downloading, key).await.is_none()
+}
+
 /// Releases a download claim when dropped: removes the key from the
 /// `downloading` map and wakes every task parked on the key's [`Notify`], so
 /// the claim is released on every exit path of a download — an early return,
@@ -5668,6 +6217,7 @@ async fn shard_prefetch_for_deps(
     namespace: &str,
     deps: &[(String, String)],
 ) -> anyhow::Result<usize> {
+    let plan_started_at = Instant::now();
     let shard_set = crate::shards::compute_shards(namespace, deps);
 
     tracing::info!(
@@ -5755,7 +6305,12 @@ async fn shard_prefetch_for_deps(
         keys: prefetch_keys,
         warm_all: false,
     };
-    let resp = daemon.handle_prefetch(&req).await;
+    let manifest_key =
+        std::env::var("KACHE_MANIFEST_KEY").unwrap_or_else(|_| crate::cli::default_manifest_key());
+    let pack_context = PackPrefetchContext::from_deps(manifest_key, namespace, deps).ok();
+    let resp = daemon
+        .handle_prefetch_with_context(&req, pack_context, plan_started_at)
+        .await;
     if !resp.ok {
         anyhow::bail!(
             "prefetch failed: {}",
@@ -9475,6 +10030,14 @@ mod tests {
             list_failures_total: 1,
             list_duration_ms_total: 900,
             list_keys_total: 63007,
+            pack_requests_total: 5,
+            pack_bytes_downloaded: 4096,
+            v3_requests_total: 2,
+            v3_bytes_downloaded: 1024,
+            pack_validation_failures: 1,
+            pack_fallback_entries: 2,
+            last_plan_wall_ms: 123,
+            plan_wall_ms_total: 456,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: PrefetchStatsSnapshot = serde_json::from_str(&json).unwrap();
@@ -11639,6 +12202,43 @@ mod tests {
         }
     }
 
+    struct BlockingPackBackend {
+        inner: Arc<dyn crate::remote_backend::RemoteBackend>,
+        pack_started: Arc<Notify>,
+        release_pack: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for BlockingPackBackend {
+        async fn head(&self, key: &str) -> Result<bool> {
+            self.inner.head(key).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            if key.contains("/v4/prefetch/packs/") {
+                self.pack_started.notify_waiters();
+                self.release_pack.notified().await;
+            }
+            self.inner.get(key, max_bytes).await
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+            self.inner.put(key, body, content_type).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+
+        fn describe(&self, key: &str) -> String {
+            self.inner.describe(key)
+        }
+    }
+
     #[tokio::test]
     async fn test_socket_remote_check_miss_with_injected_mock_client() {
         // Remote configured + an empty in-memory backend: handle_remote_check
@@ -12050,7 +12650,7 @@ mod tests {
     }
 
     /// Build a valid v3 entry pack for `key` from a throwaway store.
-    fn build_entry_pack(key: &str, crate_name: &str) -> Vec<u8> {
+    fn build_entry_pack_with_meta(key: &str, crate_name: &str) -> (Vec<u8>, String) {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = test_config(tmp.path());
         let store = Store::open(&cfg).unwrap();
@@ -12072,10 +12672,607 @@ mod tests {
             )
             .unwrap();
         let entry_dir = store.entry_dir(key);
-        let meta: crate::store::EntryMeta =
-            serde_json::from_slice(&std::fs::read(entry_dir.join("meta.json")).unwrap()).unwrap();
-        crate::remote_layout::create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3)
-            .unwrap()
+        let meta_bytes = std::fs::read(entry_dir.join("meta.json")).unwrap();
+        let meta: crate::store::EntryMeta = serde_json::from_slice(&meta_bytes).unwrap();
+        let packed =
+            crate::remote_layout::create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3)
+                .unwrap();
+        (packed, blake3::hash(&meta_bytes).to_hex().to_string())
+    }
+
+    fn build_entry_pack(key: &str, crate_name: &str) -> Vec<u8> {
+        build_entry_pack_with_meta(key, crate_name).0
+    }
+
+    #[test]
+    fn packed_prefetch_context_is_derived_from_a_complete_build_intent() {
+        let intent = kache_core::BuildIntent {
+            crate_names: vec!["serde".into()],
+            namespace: Some("linux/toolchain/release".into()),
+            cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+        };
+        let context = PackPrefetchContext::from_intent(&intent)
+            .expect("a namespaced lockfile intent must enable catalog discovery");
+        assert_eq!(context.namespace, "linux/toolchain/release");
+        assert_eq!(context.shard_hashes.len(), 1);
+        assert!(crate::cache_key::is_valid_cache_key(&context.selector));
+    }
+
+    async fn seed_packed_catalog(
+        backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
+        context: &PackPrefetchContext,
+        entries: Vec<crate::remote_pack::PackInputEntry>,
+        object_override: Option<Vec<u8>>,
+    ) -> crate::remote_pack::BuiltPack {
+        let built = crate::remote_pack::build_pack(
+            "prefix",
+            entries,
+            crate::remote_pack::DEFAULT_MAX_PACK_BYTES,
+        )
+        .unwrap();
+        put_test_object(
+            backend,
+            &built.object_key,
+            object_override.as_deref().unwrap_or(&built.bytes),
+        )
+        .await;
+        let created_at_ms = epoch_ms();
+        let catalog = crate::remote_pack::PackCatalog {
+            version: crate::remote_pack::CATALOG_VERSION,
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            manifest_key: context.manifest_key.clone(),
+            namespace: context.namespace.clone(),
+            selector_hash: context.selector.clone(),
+            shard_hashes: context.shard_hashes.clone(),
+            created_at_ms,
+            expires_at_ms: created_at_ms + 60_000,
+            packs: vec![crate::remote_pack::CatalogPackRef {
+                digest: built.digest.clone(),
+                pack_bytes: built.bytes.len() as u64,
+                entries: built
+                    .index
+                    .entries
+                    .iter()
+                    .map(|entry| crate::remote_pack::CatalogEntry {
+                        cache_key: entry.cache_key.clone(),
+                        crate_name: entry.crate_name.clone(),
+                        meta_digest: entry.meta_digest.clone(),
+                    })
+                    .collect(),
+            }],
+            fallback_entries: Vec::new(),
+        };
+        let encoded = crate::remote_pack::encode_catalog("prefix", catalog).unwrap();
+        put_test_object(backend, &encoded.object_key, &encoded.bytes).await;
+        built
+    }
+
+    async fn wait_for_store_entry(daemon: &Arc<Daemon>, key: &str) {
+        for _ in 0..200 {
+            if daemon
+                .with_store(|store| Ok(store.get(key)?.is_some()))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for imported entry {}", key_prefix(key));
+    }
+
+    fn traversal_entry_payload() -> Vec<u8> {
+        let body = b"escape";
+        let mut header = [0u8; 512];
+        header[..13].copy_from_slice(b"../escape.txt");
+        header[100..107].copy_from_slice(b"0000644");
+        let size = format!("{:011o}", body.len());
+        header[124..135].copy_from_slice(size.as_bytes());
+        header[156] = b'0';
+        header[148..156].fill(b' ');
+        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        let mut tar = Vec::new();
+        tar.extend_from_slice(&header);
+        tar.extend_from_slice(body);
+        tar.extend(std::iter::repeat_n(0, 512 - body.len()));
+        tar.extend(std::iter::repeat_n(0, 1024));
+        zstd::stream::encode_all(std::io::Cursor::new(tar), 3).unwrap()
+    }
+
+    #[tokio::test]
+    async fn packed_prefetch_discovers_one_pack_and_batch_imports_all_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_max_bytes = 0;
+        let backend = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let deps = vec![("serde".to_string(), "1.0.0".to_string())];
+        let context = PackPrefetchContext::from_deps(
+            crate::cli::default_manifest_key(),
+            "linux/toolchain/release",
+            &deps,
+        )
+        .unwrap();
+        let key_a = test_cache_key("packed-batch-a");
+        let key_b = test_cache_key("packed-batch-b");
+        let (payload_a, meta_a) = build_entry_pack_with_meta(&key_a, "serde");
+        let (payload_b, meta_b) = build_entry_pack_with_meta(&key_b, "tokio");
+        seed_packed_catalog(
+            &backend,
+            &context,
+            vec![
+                crate::remote_pack::PackInputEntry {
+                    cache_key: key_a.clone(),
+                    crate_name: "serde".into(),
+                    meta_digest: meta_a,
+                    payload: payload_a,
+                },
+                crate::remote_pack::PackInputEntry {
+                    cache_key: key_b.clone(),
+                    crate_name: "tokio".into(),
+                    meta_digest: meta_b,
+                    payload: payload_b,
+                },
+            ],
+            None,
+        )
+        .await;
+
+        let sentinel = test_cache_key("existing-prefetched-key");
+        daemon
+            .prefetched_keys
+            .write()
+            .await
+            .insert(sentinel.clone());
+
+        let response = daemon
+            .handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![
+                        (key_a.clone(), "serde".into()),
+                        (key_b.clone(), "tokio".into()),
+                    ],
+                    warm_all: false,
+                },
+                Some(context),
+                Instant::now(),
+            )
+            .await;
+        assert!(response.ok);
+        wait_for_store_entry(&daemon, &key_a).await;
+        wait_for_store_entry(&daemon, &key_b).await;
+        assert!(
+            daemon
+                .with_store(|store| Ok(store.get(&key_a)?.is_some()))
+                .unwrap()
+        );
+        assert!(
+            daemon
+                .with_store(|store| Ok(store.get(&key_b)?.is_some()))
+                .unwrap()
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .pack_requests_total
+                .load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .v3_requests_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        let prefetched = daemon.prefetched_keys.read().await;
+        assert!(prefetched.contains(&sentinel));
+        assert!(prefetched.contains(&key_a));
+        assert!(prefetched.contains(&key_b));
+    }
+
+    #[tokio::test]
+    async fn packed_prefetch_response_returns_before_blocked_pack_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let inner = test_remote_backend();
+        let context = PackPrefetchContext::from_deps(
+            crate::cli::default_manifest_key(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let key = test_cache_key("nonblocking-prefetch-pack");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        seed_packed_catalog(
+            &inner,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest,
+                payload,
+            }],
+            None,
+        )
+        .await;
+
+        let pack_started = Arc::new(Notify::new());
+        let release_pack = Arc::new(Notify::new());
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(BlockingPackBackend {
+                inner,
+                pack_started: pack_started.clone(),
+                release_pack: release_pack.clone(),
+            });
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend).is_ok());
+
+        let started = pack_started.notified();
+        tokio::pin!(started);
+        started.as_mut().enable();
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            daemon.handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(key.clone(), "serde".into())],
+                    warm_all: false,
+                },
+                Some(context),
+                Instant::now(),
+            ),
+        )
+        .await
+        .expect("prefetch acknowledgement must not await the pack GET");
+        assert!(response.ok);
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .expect("background coordinator should start the pack GET");
+        assert!(!daemon.entry_dir_for(&key).exists());
+
+        release_pack.notify_waiters();
+        wait_for_store_entry(&daemon, &key).await;
+    }
+
+    #[tokio::test]
+    async fn demand_v3_read_completes_while_a_prefetch_pack_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let inner = test_remote_backend();
+        let deps = vec![("serde".to_string(), "1.0.0".to_string())];
+        let context = PackPrefetchContext::from_deps(
+            crate::cli::default_manifest_key(),
+            "linux/toolchain/release",
+            &deps,
+        )
+        .unwrap();
+        let packed_key = test_cache_key("blocked-prefetch-pack");
+        let (packed_payload, packed_meta) = build_entry_pack_with_meta(&packed_key, "serde");
+        seed_packed_catalog(
+            &inner,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: packed_key.clone(),
+                crate_name: "serde".into(),
+                meta_digest: packed_meta,
+                payload: packed_payload,
+            }],
+            None,
+        )
+        .await;
+
+        let demand_key = test_cache_key("demand-during-packed-prefetch");
+        let demand_payload = build_entry_pack(&demand_key, "tokio");
+        put_test_object(
+            &inner,
+            &test_manifest_object_key(&demand_key, "tokio"),
+            b"{}",
+        )
+        .await;
+        put_test_object(
+            &inner,
+            &test_pack_object_key(&demand_key, "tokio"),
+            &demand_payload,
+        )
+        .await;
+
+        let pack_started = Arc::new(Notify::new());
+        let release_pack = Arc::new(Notify::new());
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(BlockingPackBackend {
+                inner,
+                pack_started: pack_started.clone(),
+                release_pack: release_pack.clone(),
+            });
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend).is_ok());
+
+        let started = pack_started.notified();
+        tokio::pin!(started);
+        started.as_mut().enable();
+        let packed_daemon = daemon.clone();
+        let packed = tokio::spawn(async move {
+            packed_daemon
+                .handle_prefetch_with_context(
+                    &PrefetchRequest {
+                        keys: vec![(packed_key, "serde".into())],
+                        warm_all: false,
+                    },
+                    Some(context),
+                    Instant::now(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .expect("pack GET should block in the injected backend");
+
+        let demand = tokio::time::timeout(
+            Duration::from_secs(1),
+            daemon.handle_remote_check(&RemoteCheckRequest {
+                key: demand_key.clone(),
+                entry_dir: daemon
+                    .entry_dir_for(&demand_key)
+                    .to_string_lossy()
+                    .into_owned(),
+                crate_name: "tokio".into(),
+                deadline_ms: None,
+            }),
+        )
+        .await
+        .expect("demand v3 read must not wait for the pack GET");
+        assert_eq!(demand.found, Some(true));
+
+        release_pack.notify_waiters();
+        assert!(packed.await.unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn corrupt_pack_falls_back_only_to_the_existing_v3_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let deps = vec![("serde".to_string(), "1.0.0".to_string())];
+        let context = PackPrefetchContext::from_deps(
+            crate::cli::default_manifest_key(),
+            "linux/toolchain/release",
+            &deps,
+        )
+        .unwrap();
+        let key = test_cache_key("packed-corrupt-fallback");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        seed_packed_catalog(
+            &backend,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest,
+                payload: payload.clone(),
+            }],
+            Some(b"corrupt immutable pack".to_vec()),
+        )
+        .await;
+        put_test_object(&backend, &test_pack_object_key(&key, "serde"), &payload).await;
+
+        let response = daemon
+            .handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(key.clone(), "serde".into())],
+                    warm_all: false,
+                },
+                Some(context),
+                Instant::now(),
+            )
+            .await;
+        assert!(response.ok);
+        wait_for_store_entry(&daemon, &key).await;
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .v3_requests_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .pack_fallback_entries
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            daemon
+                .prefetch_stats
+                .pack_validation_failures
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_filename_timestamp_mismatch_rejects_context_and_uses_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let context = PackPrefetchContext::from_deps(
+            crate::cli::default_manifest_key(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let key = test_cache_key("catalog-created-at-mismatch");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        let built = crate::remote_pack::build_pack(
+            "prefix",
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest: meta_digest.clone(),
+                payload: payload.clone(),
+            }],
+            crate::remote_pack::DEFAULT_MAX_PACK_BYTES,
+        )
+        .unwrap();
+        put_test_object(&backend, &built.object_key, &built.bytes).await;
+        let created_at_ms = epoch_ms();
+        let catalog = crate::remote_pack::PackCatalog {
+            version: crate::remote_pack::CATALOG_VERSION,
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            manifest_key: context.manifest_key.clone(),
+            namespace: context.namespace.clone(),
+            selector_hash: context.selector.clone(),
+            shard_hashes: context.shard_hashes.clone(),
+            created_at_ms,
+            expires_at_ms: created_at_ms + 60_000,
+            packs: vec![crate::remote_pack::CatalogPackRef {
+                digest: built.digest,
+                pack_bytes: built.bytes.len() as u64,
+                entries: vec![crate::remote_pack::CatalogEntry {
+                    cache_key: key.clone(),
+                    crate_name: "serde".into(),
+                    meta_digest,
+                }],
+            }],
+            fallback_entries: Vec::new(),
+        };
+        let encoded = crate::remote_pack::encode_catalog("prefix", catalog).unwrap();
+        let mismatched_key = crate::remote_pack::catalog_object_key(
+            "prefix",
+            &context.selector,
+            created_at_ms + 1,
+            &encoded.digest,
+        )
+        .unwrap();
+        put_test_object(&backend, &mismatched_key, &encoded.bytes).await;
+        put_test_object(&backend, &test_pack_object_key(&key, "serde"), &payload).await;
+
+        let response = daemon
+            .handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(key.clone(), "serde".into())],
+                    warm_all: false,
+                },
+                Some(context),
+                Instant::now(),
+            )
+            .await;
+        assert!(response.ok);
+        wait_for_store_entry(&daemon, &key).await;
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .v3_requests_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .pack_fallback_entries
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            daemon
+                .prefetch_stats
+                .pack_validation_failures
+                .load(Ordering::Relaxed)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn traversal_in_one_pack_entry_preserves_valid_batch_and_falls_back_per_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let deps = vec![("serde".to_string(), "1.0.0".to_string())];
+        let context = PackPrefetchContext::from_deps(
+            crate::cli::default_manifest_key(),
+            "linux/toolchain/release",
+            &deps,
+        )
+        .unwrap();
+        let good_key = test_cache_key("packed-partial-good");
+        let bad_key = test_cache_key("packed-partial-traversal");
+        let (good_payload, good_meta) = build_entry_pack_with_meta(&good_key, "serde");
+        let (fallback_payload, _) = build_entry_pack_with_meta(&bad_key, "tokio");
+        seed_packed_catalog(
+            &backend,
+            &context,
+            vec![
+                crate::remote_pack::PackInputEntry {
+                    cache_key: good_key.clone(),
+                    crate_name: "serde".into(),
+                    meta_digest: good_meta,
+                    payload: good_payload,
+                },
+                crate::remote_pack::PackInputEntry {
+                    cache_key: bad_key.clone(),
+                    crate_name: "tokio".into(),
+                    meta_digest: blake3::hash(b"malicious-meta").to_hex().to_string(),
+                    payload: traversal_entry_payload(),
+                },
+            ],
+            None,
+        )
+        .await;
+        put_test_object(
+            &backend,
+            &test_pack_object_key(&bad_key, "tokio"),
+            &fallback_payload,
+        )
+        .await;
+
+        let response = daemon
+            .handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![
+                        (good_key.clone(), "serde".into()),
+                        (bad_key.clone(), "tokio".into()),
+                    ],
+                    warm_all: false,
+                },
+                Some(context),
+                Instant::now(),
+            )
+            .await;
+        assert!(response.ok);
+        wait_for_store_entry(&daemon, &bad_key).await;
+        assert!(
+            daemon
+                .with_store(|store| Ok(store.get(&good_key)?.is_some()))
+                .unwrap()
+        );
+        assert!(!dir.path().join("escape.txt").exists());
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .v3_requests_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .pack_fallback_entries
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
@@ -14508,6 +15705,37 @@ mod tests {
         let config = test_config(dir.path());
         let daemon = Daemon::new(config);
         assert!(daemon.downloading.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn packed_download_claim_rejects_disk_and_inflight_entries_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let map = RwLock::new(HashMap::new());
+
+        let existing_key = test_cache_key("packed-existing-on-disk");
+        let existing_dir = tmp.path().join("existing");
+        std::fs::create_dir_all(&existing_dir).unwrap();
+        assert!(
+            !try_claim_packed_download(&map, &existing_key, &existing_dir).await,
+            "an on-disk entry must not be claimed again"
+        );
+        assert!(map.read().await.is_empty());
+
+        let inflight_key = test_cache_key("packed-inflight");
+        assert!(claim_download(&map, &inflight_key).await.is_none());
+        assert!(
+            !try_claim_packed_download(&map, &inflight_key, &tmp.path().join("absent")).await,
+            "an in-flight entry must not acquire a second claim"
+        );
+
+        let fresh_key = test_cache_key("packed-fresh");
+        assert!(
+            try_claim_packed_download(&map, &fresh_key, &tmp.path().join("fresh")).await,
+            "an absent unclaimed entry must become the download leader"
+        );
+        let claims = map.read().await;
+        assert!(claims.contains_key(&inflight_key));
+        assert!(claims.contains_key(&fresh_key));
     }
 
     /// Waiter-side wait, mirroring the pattern in `handle_remote_check`:

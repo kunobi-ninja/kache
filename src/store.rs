@@ -15,6 +15,16 @@ pub struct StorePutResult {
     pub new_blobs: u32,
 }
 
+/// An entry whose remote bytes and declared artifact hashes were verified in
+/// the same pass that extracted them. Construction stays inside the remote
+/// transport boundary; the store still re-checks metadata, paths and lengths,
+/// but deliberately does not read every artifact a second time.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedRestoredEntry {
+    pub cache_key: String,
+    pub meta: EntryMeta,
+}
+
 impl StorePutResult {
     pub fn is_full_dup(self) -> bool {
         self.output_blobs > 0 && self.duplicate_blobs == self.output_blobs
@@ -2056,6 +2066,205 @@ impl Store {
     /// Today it is equivalent to `import_downloaded_entry()`.
     pub fn import_restored_entry(&self, cache_key: &str) -> Result<()> {
         self.import_downloaded_entry(cache_key)
+    }
+
+    /// Install one already-verified artifact into the content-addressed blob
+    /// store. A missing source is a distinct integrity race, not a generic
+    /// rename failure, so keep that decision directly testable.
+    fn install_verified_blob(&self, entry_dir: &Path, file: &CachedFile) -> Result<()> {
+        let blob = self.blob_path(&file.hash);
+        if !blob.is_file() {
+            let artifact = entry_dir.join(&file.name);
+            if !artifact.is_file() {
+                anyhow::bail!("verified restored blob vanished during batch import");
+            }
+            fs::create_dir_all(blob.parent().expect("blob path has a parent"))?;
+            fs::rename(&artifact, &blob)?;
+            crate::atomic::fsync_file(&blob)?;
+            set_blob_readonly(&blob);
+        }
+        Ok(())
+    }
+
+    /// Import already stream-verified restored entries with one SQLite
+    /// transaction for the whole batch.
+    ///
+    /// Artifact content is not hashed again: callers may only construct
+    /// [`VerifiedRestoredEntry`] after extraction verified each byte against
+    /// `meta.files[].hash`. This method still performs a complete metadata and
+    /// on-disk length preflight before moving blobs or opening the transaction.
+    pub(crate) fn import_verified_restored_entries(
+        &self,
+        entries: &[VerifiedRestoredEntry],
+    ) -> Result<usize> {
+        let mut cache_keys = std::collections::HashSet::new();
+        for entry in entries {
+            if !crate::cache_key::is_valid_cache_key(&entry.cache_key)
+                || entry.meta.cache_key != entry.cache_key
+            {
+                anyhow::bail!("verified restore has an invalid cache-key binding");
+            }
+            if entry.meta.key_schema != crate::cache_key::CACHE_KEY_VERSION {
+                anyhow::bail!(
+                    "verified restore {} uses incompatible key schema {}",
+                    &entry.cache_key[..16],
+                    entry.meta.key_schema
+                );
+            }
+            if !crate::cache_key::is_valid_crate_name(&entry.meta.crate_name) {
+                anyhow::bail!("verified restore has an unsafe crate name");
+            }
+            if !cache_keys.insert(entry.cache_key.as_str()) {
+                anyhow::bail!("verified restore batch contains a duplicate cache key");
+            }
+
+            let entry_dir = self.entry_dir(&entry.cache_key);
+            let meta_bytes = fs::read(entry_dir.join("meta.json"))
+                .context("reading stream-verified entry metadata")?;
+            let disk_meta: EntryMeta = serde_json::from_slice(&meta_bytes)
+                .context("parsing stream-verified entry metadata")?;
+            if disk_meta != entry.meta {
+                anyhow::bail!("verified restore metadata changed after extraction");
+            }
+
+            let mut artifact_names = std::collections::HashSet::new();
+            for file in &entry.meta.files {
+                if !crate::remote_layout::is_safe_artifact_name(&file.name)
+                    || !crate::cache_key::is_valid_cache_key(&file.hash)
+                    || !artifact_names.insert(file.name.as_str())
+                {
+                    anyhow::bail!(
+                        "verified restore contains unsafe or duplicate artifact metadata"
+                    );
+                }
+                let artifact = entry_dir.join(&file.name);
+                let actual_size = fs::metadata(&artifact)
+                    .with_context(|| format!("stat verified artifact {}", file.name))?
+                    .len();
+                if actual_size != file.size {
+                    anyhow::bail!(
+                        "verified artifact {} size mismatch (expected {}, got {})",
+                        file.name,
+                        file.size,
+                        actual_size
+                    );
+                }
+            }
+        }
+
+        // Make every content-addressed blob durable before the database can
+        // advertise a reference to it. Existing blobs leave the extracted copy
+        // in place as the in-transaction race fallback below.
+        for entry in entries {
+            let entry_dir = self.entry_dir(&entry.cache_key);
+            for file in &entry.meta.files {
+                let blob = self.blob_path(&file.hash);
+                if !blob.is_file() {
+                    let artifact = entry_dir.join(&file.name);
+                    fs::create_dir_all(blob.parent().expect("blob path has a parent"))
+                        .context("creating verified blob shard directory")?;
+                    fs::rename(&artifact, &blob).with_context(|| {
+                        format!(
+                            "moving verified artifact {} to blob store",
+                            artifact.display()
+                        )
+                    })?;
+                    crate::atomic::fsync_file(&blob)
+                        .context("flushing verified restored blob to disk")?;
+                    set_blob_readonly(&blob);
+                }
+            }
+        }
+
+        let tx = self.db.unchecked_transaction()?;
+        let mut imported = 0usize;
+        for entry in entries {
+            let meta = &entry.meta;
+            let total_size: u64 = meta.files.iter().map(|file| file.size).sum();
+            let crate_type = meta.crate_types.join(",");
+            let content_hash = compute_content_hash(&meta.files);
+            // A crash or legacy importer may have left an uncommitted row.
+            // It is not a cache hit and must not permanently block a verified
+            // replacement through INSERT OR IGNORE. Undo any partial mapping
+            // bookkeeping in this same transaction before replacing it.
+            tx.execute(
+                "UPDATE blobs
+                 SET refcount = MAX(0, refcount - COALESCE((
+                     SELECT refs FROM entry_blobs
+                     WHERE cache_key = ?1 AND hash = blobs.hash
+                 ), 0))
+                 WHERE hash IN (
+                     SELECT hash FROM entry_blobs WHERE cache_key = ?1
+                 ) AND EXISTS (
+                     SELECT 1 FROM entries
+                     WHERE cache_key = ?1 AND committed = 0
+                 )",
+                params![entry.cache_key],
+            )?;
+            tx.execute(
+                "DELETE FROM entry_blobs
+                 WHERE cache_key = ?1 AND EXISTS (
+                     SELECT 1 FROM entries
+                     WHERE cache_key = ?1 AND committed = 0
+                 )",
+                params![entry.cache_key],
+            )?;
+            tx.execute(
+                "DELETE FROM entries WHERE cache_key = ?1 AND committed = 0",
+                params![entry.cache_key],
+            )?;
+            tx.execute("DELETE FROM blobs WHERE refcount <= 0", [])?;
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+                params![
+                    entry.cache_key,
+                    meta.crate_name,
+                    crate_type,
+                    meta.profile,
+                    meta.features.len() as i64,
+                    total_size as i64,
+                    content_hash,
+                    meta.compile_time_ms as i64,
+                    meta.key_schema
+                ],
+            )?;
+            if inserted == 0 {
+                continue;
+            }
+
+            let entry_dir = self.entry_dir(&entry.cache_key);
+            for file in &meta.files {
+                let added = tx.execute(
+                    "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
+                    params![file.hash, file.size as i64],
+                )?;
+                if added == 0 {
+                    tx.execute(
+                        "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                        params![file.hash],
+                    )?;
+                }
+                self.install_verified_blob(&entry_dir, file)?;
+            }
+            record_entry_blobs(&tx, &entry.cache_key, &meta.files)?;
+            tx.execute(
+                "UPDATE entries SET committed = 1 WHERE cache_key = ?1",
+                params![entry.cache_key],
+            )?;
+            imported += 1;
+        }
+        tx.commit()?;
+
+        for entry in entries {
+            let entry_dir = self.entry_dir(&entry.cache_key);
+            for file in &entry.meta.files {
+                let artifact = entry_dir.join(&file.name);
+                if artifact.is_file() {
+                    let _ = fs::remove_file(artifact);
+                }
+            }
+        }
+        Ok(imported)
     }
 
     /// Rebuild the `entries` and `blobs` rows by scanning the store's per-entry
@@ -9934,6 +10143,222 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ch.len(), 64);
+    }
+
+    #[test]
+    fn verified_batch_import_is_atomic_and_registers_every_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let store = Store::open(&config).unwrap();
+        let keys = [
+            blake3::hash(b"packed-batch-a").to_hex().to_string(),
+            blake3::hash(b"packed-batch-b").to_hex().to_string(),
+        ];
+
+        let mut verified = Vec::new();
+        for (index, key) in keys.iter().enumerate() {
+            let entry_dir = store.entry_dir(key);
+            std::fs::create_dir_all(&entry_dir).unwrap();
+            let artifact = entry_dir.join(format!("lib{index}.rlib"));
+            let contents = format!("verified packed artifact {index}");
+            std::fs::write(&artifact, contents.as_bytes()).unwrap();
+            let meta = EntryMeta {
+                cache_key: key.clone(),
+                key_schema: crate::cache_key::CACHE_KEY_VERSION,
+                crate_name: format!("crate{index}"),
+                crate_types: vec!["lib".to_string()],
+                files: vec![CachedFile {
+                    name: format!("lib{index}.rlib"),
+                    size: contents.len() as u64,
+                    hash: blake3::hash(contents.as_bytes()).to_hex().to_string(),
+                    executable: false,
+                }],
+                stdout: String::new(),
+                stderr: String::new(),
+                features: vec![],
+                target: "x86_64-unknown-linux-gnu".to_string(),
+                profile: "dev".to_string(),
+                compile_time_ms: 1,
+                emit_kinds: Vec::new(),
+            };
+            std::fs::write(
+                entry_dir.join("meta.json"),
+                serde_json::to_vec_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+            verified.push(VerifiedRestoredEntry {
+                cache_key: key.clone(),
+                meta,
+            });
+        }
+
+        let original_size = verified[1].meta.files[0].size;
+        verified[1].meta.files[0].size += 1;
+        assert!(store.import_verified_restored_entries(&verified).is_err());
+        let rows: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "a failed preflight must register no batch rows");
+
+        verified[1].meta.files[0].size = original_size;
+        store
+            .db
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, 'stale', 'lib', 'dev', 0, 0, 'stale', 0, ?2, 0)",
+                params![keys[0], crate::cache_key::CACHE_KEY_VERSION],
+            )
+            .unwrap();
+        let imported = store.import_verified_restored_entries(&verified).unwrap();
+        assert_eq!(imported, 2);
+        let rows: i64 = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE committed = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+        for key in keys {
+            assert!(store.get(&key).unwrap().is_some());
+        }
+        let refcounts: Vec<i64> = store
+            .db
+            .prepare("SELECT refcount FROM blobs ORDER BY hash")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(refcounts, vec![1, 1]);
+    }
+
+    fn write_verified_fixture(
+        store: &Store,
+        key: &str,
+        meta_key: &str,
+        artifact_name: &str,
+        hash_override: Option<String>,
+    ) -> VerifiedRestoredEntry {
+        let contents = b"verified fixture artifact";
+        let entry_dir = store.entry_dir(key);
+        let artifact = entry_dir.join(artifact_name);
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, contents).unwrap();
+        let meta = EntryMeta {
+            cache_key: meta_key.to_string(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            crate_name: "fixture".to_string(),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: artifact_name.to_string(),
+                size: contents.len() as u64,
+                hash: hash_override.unwrap_or_else(|| blake3::hash(contents).to_hex().to_string()),
+                executable: false,
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: Vec::new(),
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            profile: "dev".to_string(),
+            compile_time_ms: 1,
+            emit_kinds: Vec::new(),
+        };
+        std::fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        VerifiedRestoredEntry {
+            cache_key: key.to_string(),
+            meta,
+        }
+    }
+
+    #[test]
+    fn verified_batch_import_checks_each_cache_key_binding_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&test_config(tmp.path())).unwrap();
+        let invalid = write_verified_fixture(&store, "invalid", "invalid", "lib.rlib", None);
+        assert!(store.import_verified_restored_entries(&[invalid]).is_err());
+
+        let key = blake3::hash(b"valid-outer-key").to_hex().to_string();
+        let other = blake3::hash(b"different-meta-key").to_hex().to_string();
+        let mismatched = write_verified_fixture(&store, &key, &other, "lib.rlib", None);
+        assert!(
+            store
+                .import_verified_restored_entries(&[mismatched])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verified_batch_import_checks_each_artifact_field_independently() {
+        for (label, name, hash_override) in [
+            ("unsafe-name", "nested/lib.rlib", None),
+            ("invalid-hash", "lib.rlib", Some("g".repeat(64))),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Store::open(&test_config(tmp.path())).unwrap();
+            let key = blake3::hash(label.as_bytes()).to_hex().to_string();
+            let entry = write_verified_fixture(&store, &key, &key, name, hash_override);
+            assert!(
+                store.import_verified_restored_entries(&[entry]).is_err(),
+                "{label} must be rejected independently"
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&test_config(tmp.path())).unwrap();
+        let key = blake3::hash(b"duplicate-artifact").to_hex().to_string();
+        let mut entry = write_verified_fixture(&store, &key, &key, "lib.rlib", None);
+        entry.meta.files.push(entry.meta.files[0].clone());
+        std::fs::write(
+            store.entry_dir(&key).join("meta.json"),
+            serde_json::to_vec_pretty(&entry.meta).unwrap(),
+        )
+        .unwrap();
+        assert!(store.import_verified_restored_entries(&[entry]).is_err());
+    }
+
+    #[test]
+    fn verified_batch_import_never_rewrites_an_existing_content_addressed_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&test_config(tmp.path())).unwrap();
+        let key = blake3::hash(b"existing-immutable-blob")
+            .to_hex()
+            .to_string();
+        let entry = write_verified_fixture(&store, &key, &key, "lib.rlib", None);
+        let blob = store.blob_path(&entry.meta.files[0].hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"pre-existing immutable blob").unwrap();
+
+        assert_eq!(store.import_verified_restored_entries(&[entry]).unwrap(), 1);
+        assert_eq!(std::fs::read(blob).unwrap(), b"pre-existing immutable blob");
+    }
+
+    #[test]
+    fn verified_blob_install_reports_a_vanished_source_before_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&test_config(tmp.path())).unwrap();
+        let file = CachedFile {
+            name: "lib.rlib".to_string(),
+            size: 7,
+            hash: blake3::hash(b"missing verified artifact")
+                .to_hex()
+                .to_string(),
+            executable: false,
+        };
+
+        let error = store
+            .install_verified_blob(&tmp.path().join("missing-entry"), &file)
+            .expect_err("a vanished verified source must fail")
+            .to_string();
+        assert!(
+            error.contains("verified restored blob vanished during batch import"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

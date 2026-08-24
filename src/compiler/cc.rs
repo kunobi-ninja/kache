@@ -2313,10 +2313,39 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     // ── NoObjectEffect: diagnostics / dep-info / build mechanics ──
+    //
+    // Outcome gates come FIRST: classification is first-match, so the
+    // `-Werror` / `-pedantic-errors` rows below must precede the general
+    // diagnostics rows they would otherwise be shadowed by.
     FlagSpec {
-        // `-W*` warnings — `-Werror` is included (it changes success/
-        // failure of the compile, not the resulting object bytes).
-        // The regex EXCLUDES `-Wl,*` / `-Wa,*` / `-Wp,*` (linker /
+        // `-Werror[=spec]` and `-Wno-error[=spec]`: escalate (or de-escalate)
+        // warnings into/out of hard errors. They cannot change the object
+        // bytes of a *successful* compile, but they change whether the
+        // compile succeeds at all — and a hit replays success. Two
+        // invocations differing only here must not share a key: an entry
+        // stored under `-Wno-error=foo` must not serve green to a `-Werror`
+        // build that `foo` should have failed (review finding #2). Both
+        // spellings are RawKeyed so any combination keys distinctly.
+        matcher: Matcher::Regex(r"-W(no-)?error(=[^,]*)?"),
+        class: FlagClass::RawKeyed,
+        source: "review #2 — outcome gate: -Werror/-Wno-error change success vs failure; keyed verbatim.",
+        dialect: None,
+    },
+    FlagSpec {
+        // `-pedantic-errors` is the error-flavored member of the -pedantic
+        // family: unlike plain `-pedantic` (diagnostics-only) it makes
+        // non-conforming code fail to compile. Keyed for the same reason as
+        // `-Werror` above; the plain `-pedantic` prefix row further down
+        // keeps its NoObjectEffect treatment.
+        matcher: Matcher::Exact("-pedantic-errors"),
+        class: FlagClass::RawKeyed,
+        source: "review #2 — outcome gate: -pedantic-errors changes success vs failure.",
+        dialect: None,
+    },
+    FlagSpec {
+        // `-W*` warnings — the remaining, genuinely diagnostics-only
+        // warning flags (`-Werror`/`-Wno-error` are keyed above). The
+        // regex EXCLUDES `-Wl,*` / `-Wa,*` / `-Wp,*` (linker /
         // assembler / preprocessor passthrough forms that change the
         // resulting object); they need separate handling and aren't
         // covered here.
@@ -6895,6 +6924,54 @@ mod tests {
         let mut summary = FlagClassificationSummary::default();
         summary.record(Some(FlagClass::RawKeyed));
         assert_eq!(summary.raw_keyed, 1);
+    }
+
+    /// Review finding #2: `-Werror` / `-Wno-error` / `-pedantic-errors`
+    /// escalate warnings into hard errors — they change whether the compile
+    /// SUCCEEDS even though a successful compile's object bytes are
+    /// unchanged. Since hits replay success, they must be folded into the
+    /// key (RawKeyed), not silently dropped like the diagnostics-only
+    /// warning flags.
+    #[test]
+    fn outcome_gates_are_raw_keyed() {
+        for flag in &[
+            "-Werror",
+            "-Werror=unused-variable",
+            "-Wno-error",
+            "-Wno-error=unused-variable",
+            "-pedantic-errors",
+        ] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                Some(FlagClass::RawKeyed),
+                "{flag} is an outcome gate and must be keyed directly"
+            );
+            let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", flag])).unwrap();
+            assert!(
+                parsed.refuse_reasons(&[]).is_empty(),
+                "{flag} should be cacheable: {:?}",
+                parsed.refuse_reasons(&[])
+            );
+        }
+        // Distinct gate combinations must produce distinct raw-key folds:
+        // an entry stored under `-Wno-error=foo` must not serve green to a
+        // `-Werror` build that `foo` should have failed.
+        let parse = |args: &[&str]| cc_raw_flags_for_key(&CcArgs::parse(&s(args)).unwrap(), &[]);
+        let plain = parse(&["cc", "-c", "foo.c", "-o", "foo.o"]);
+        let err = parse(&["cc", "-c", "foo.c", "-o", "foo.o", "-Werror"]);
+        let no_err = parse(&["cc", "-c", "foo.c", "-o", "foo.o", "-Wno-error=foo"]);
+        let both = parse(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-Werror",
+            "-Wno-error=foo",
+        ]);
+        assert_ne!(plain, err, "-Werror must change the keyed flags");
+        assert_ne!(err, both, "-Wno-error must distinguish from bare -Werror");
+        assert_ne!(no_err, both);
     }
 
     #[test]

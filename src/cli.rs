@@ -5339,6 +5339,19 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
         }
     }
 
+    // Repair: reclaim put-phase staging snapshots abandoned by a crash
+    // between staging and publish (review finding #3).
+    if repair {
+        let swept_staging = store.sweep_stale_staging(std::time::Duration::from_secs(60));
+        if swept_staging.removed > 0 {
+            println!(
+                "Repairing: reclaimed {} stale staging files ({})",
+                swept_staging.removed,
+                ByteSize(swept_staging.bytes_reclaimed)
+            );
+        }
+    }
+
     // Compute store size
     let store_size = store.total_size().unwrap_or(0);
 

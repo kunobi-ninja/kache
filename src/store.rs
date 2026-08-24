@@ -152,9 +152,11 @@ enum StoreIngest {
 /// account for disk honestly, mirroring the restore side in `link.rs`.
 /// Counters are best-effort under concurrent put/remove: a phase-2
 /// rematerialize after a reclaim may count the same logical ingest again.
-fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<()> {
+/// Returns `Ok(true)` when this call published the blob (the caller may then
+/// want to verify its digest), `Ok(false)` when it was already present.
+fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<bool> {
     if blob.is_file() {
-        return Ok(());
+        return Ok(false);
     }
     fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
     let bytes = fs::metadata(source).map(|m| m.len()).unwrap_or(0);
@@ -241,9 +243,8 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
             restore_source_writable_if_unshared(source, blob);
         }
     }
-    Ok(())
+    Ok(published)
 }
-
 /// Whether `a` and `b` name the same inode (hardlinked). Used after a lost
 /// hardlink publish race to decide if the build output still shares the
 /// store blob (keep RO) or is an independent file we marked RO by mistake
@@ -1770,27 +1771,49 @@ impl Store {
     ) -> Result<StorePutResult> {
         let entry_dir = self.entry_dir(cache_key);
 
-        // Phase 1: hash every output and durably materialize its blob on disk
-        // *before* any committed entry can reference it. No DB writes happen
-        // here, so a crash leaves at most orphan blob files (reclaimed by
-        // `sweep_orphan_blobs`, run from GC and `doctor --repair`), never a
-        // half-registered entry. `sources` is kept so Phase 2 can
-        // re-materialize a blob if a concurrent remove unlinks it.
+        // Phase 1: stage every output into a private snapshot and hash THE
+        // SNAPSHOT — never the live build output — before any committed entry
+        // can reference it. The digest is computed over exactly the bytes
+        // that will be published under it, so a post-build mutator (strip,
+        // codesign, wasm post-processing) changing the file between staging
+        // and hashing cannot store content X under address H(Y) (review
+        // finding #3). No DB writes happen here, so a crash leaves at most an
+        // unpublished staging file (`sweep_stale_staging`) or orphan blob
+        // files (`sweep_orphan_blobs`), never a half-registered entry.
+        // `sources` is kept so Phase 2 can re-materialize a blob if a
+        // concurrent remove unlinks it.
         let mut cached_files = Vec::new();
         let mut sources: Vec<(PathBuf, bool)> = Vec::new();
         let mut seen_output_blobs = std::collections::HashSet::new();
         let mut put_result = StorePutResult::default();
         let mut total_size = 0u64;
         for (source_path, store_name) in output_files {
-            let hash = crate::cache_key::hash_file(source_path)?;
-            let metadata = fs::metadata(source_path)?;
-            let size = metadata.len();
-            let executable = is_executable(&metadata);
+            // Eligibility decision only; the staged snapshot's own metadata
+            // is authoritative for what gets recorded below.
+            let source_executable = fs::metadata(source_path)
+                .map(|meta| is_executable(&meta))
+                .unwrap_or(false);
+            let use_source_hardlink =
+                source_hardlink_allowed(allow_source_hardlinks, store_name, source_executable);
+
+            let (staged, ingest) = self.stage_blob_from_source(source_path, use_source_hardlink)?;
+            let staged_meta = match fs::metadata(&staged) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    Self::discard_staged_blob(&staged);
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("stating staged blob for {store_name}")));
+                }
+            };
+            let size = staged_meta.len();
+            let executable = is_executable(&staged_meta);
             if size == 0 && !zero_byte_is_valid_output(store_name, crate_types) {
+                Self::discard_staged_blob(&staged);
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
             total_size += size;
 
+            let hash = crate::cache_key::hash_file(&staged)?;
             if seen_output_blobs.insert(hash.clone()) {
                 put_result.output_blobs += 1;
                 if self.blob_path(&hash).is_file() {
@@ -1800,9 +1823,7 @@ impl Store {
                 }
             }
 
-            let use_source_hardlink =
-                source_hardlink_allowed(allow_source_hardlinks, store_name, executable);
-            materialize_blob(source_path, &self.blob_path(&hash), use_source_hardlink)?;
+            self.publish_staged_blob(&staged, ingest, &hash, size)?;
 
             cached_files.push(CachedFile {
                 name: store_name.clone(),
@@ -1875,9 +1896,25 @@ impl Store {
             // Race guard: the INSERT/UPDATE above holds the write lock, and
             // `remove_entry` only unlinks a blob while holding that same lock,
             // so a concurrent reclaim cannot interleave here. If a remove
-            // unlinked this blob between Phase 1 and now, re-materialize it from
-            // the source before we commit a reference to it.
-            materialize_blob(source, &self.blob_path(&file.hash), *use_source_hardlink)?;
+            // unlinked this blob between Phase 1 and now, re-materialize it
+            // before we commit a reference to it. The re-ingest reads the
+            // LIVE source, so verify its digest against the recorded hash:
+            // a source mutated after Phase 1's snapshot must never be stored
+            // under Phase 1's address (review finding #3). Bailing rolls the
+            // transaction back; any blob written is reclaimed as an orphan.
+            let blob_path = self.blob_path(&file.hash);
+            if materialize_blob(source, &blob_path, *use_source_hardlink)? {
+                let actual = crate::cache_key::hash_file(&blob_path)?;
+                if actual != file.hash {
+                    anyhow::bail!(
+                        "re-materialized blob for {} hashes to {} but entry records {}; \
+                         refusing to commit",
+                        file.name,
+                        actual,
+                        file.hash
+                    );
+                }
+            }
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         // The write lock is held from the statements above (record_entry_blobs
@@ -2699,6 +2736,209 @@ impl Store {
     #[allow(dead_code)] // used in tests
     pub fn blobs_dir(&self) -> PathBuf {
         self.config.store_dir().join("blobs")
+    }
+
+    /// Directory holding in-progress put-phase staging files
+    /// ([`Store::stage_blob_from_source`]). Lives under the store root but
+    /// outside `blobs/`, so [`Self::sweep_orphan_blobs`] (which only considers
+    /// hash-named files inside blob shards) never sees it; stale entries are
+    /// reclaimed by [`Store::sweep_stale_staging`].
+    fn staging_dir(&self) -> PathBuf {
+        self.config.store_dir().join("staging")
+    }
+
+    /// Stage one put-phase artifact into a private snapshot under the store.
+    ///
+    /// The snapshot — not the live build output — is what gets hashed and
+    /// published, which is what upholds the content-address invariant: a file
+    /// that changes after this point cannot end up stored under another file's
+    /// digest (review finding #3). Ingest order mirrors [`materialize_blob`]:
+    /// reflink first, then hardlink where the kind allows inode sharing, then a
+    /// real copy. The returned path must be consumed by
+    /// [`Self::publish_staged_blob`] or removed by [`discard_staged_blob`].
+    ///
+    /// Hardlink read-only semantics match `materialize_blob`: the guard is
+    /// applied only after the fsync (Windows needs a writable handle to flush,
+    /// #196), and a failed demotes to a full copy rather than publishing a
+    /// writable shared inode.
+    fn stage_blob_from_source(
+        &self,
+        source: &Path,
+        allow_hardlink: bool,
+    ) -> Result<(PathBuf, StoreIngest)> {
+        let dir = self.staging_dir();
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("creating staging directory {}", dir.display()))?;
+
+        // Unique-by-construction name; `create_new` closes any nonce race.
+        static STAGE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pid = std::process::id();
+        let tmp = loop {
+            let nonce = STAGE_NONCE.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let candidate = dir.join(format!("stage-{pid}-{nonce}-{nanos}.tmp"));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(_) => break candidate,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("creating staging file in {}", dir.display()));
+                }
+            }
+        };
+
+        let stage = |tmp: &Path, allow_hardlink: bool| -> Result<(StoreIngest, bool)> {
+            let ingest = if crate::link::try_reflink(source, tmp).is_ok() {
+                StoreIngest::Reflink
+            } else if allow_hardlink
+                && fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file())
+                && fs::hard_link(source, tmp).is_ok()
+            {
+                // Refused for symlink sources: hashing followed the link, but a
+                // hardlink would link the symlink itself — a pointer into mutable
+                // external state, never valid for a blob (same rule as
+                // `materialize_blob`).
+                StoreIngest::Hardlink
+            } else {
+                fs::copy(source, tmp)
+                    .with_context(|| format!("copying {} into store staging", source.display()))?;
+                StoreIngest::Copy
+            };
+            crate::atomic::fsync_file(tmp).context("flushing staged blob")?;
+            let mut ro_guard_failed = false;
+            if matches!(ingest, StoreIngest::Hardlink) && set_blob_readonly_checked(tmp).is_err() {
+                // The guard is a correctness requirement on a shared inode; a
+                // failure demotes to a full copy rather than publishing a
+                // writable shared blob (same recovery as `materialize_blob`).
+                ro_guard_failed = true;
+            }
+            Ok((ingest, ro_guard_failed))
+        };
+
+        match stage(&tmp, allow_hardlink) {
+            Ok((ingest, false)) => Ok((tmp, ingest)),
+            Ok((_ingest, true)) => {
+                // Hardlink succeeded but the read-only guard did not. The temp
+                // shares the source inode and we may have flipped it read-only:
+                // discard the temp (clearing the shared RO bit), restore the
+                // source writable if the blob never got published under it, and
+                // restage as an independent copy.
+                Self::drop_tmp_restore_source(source, &tmp);
+                self.stage_blob_from_source(source, false).map_err(|_| {
+                    anyhow::anyhow!("read-only guard failed on hardlinked staging temp")
+                })
+            }
+            Err(first_err) => {
+                unlink_blob(&tmp);
+                Err(first_err)
+            }
+        }
+    }
+
+    /// Discard a hardlinked staging temp and undo any read-only bit it may have
+    /// left on the shared source inode.
+    fn drop_tmp_restore_source(source: &Path, tmp: &Path) {
+        unlink_blob(tmp);
+        if !paths_share_inode(source, tmp) {
+            restore_source_writable_if_unshared(source, tmp);
+        }
+    }
+
+    /// Publish a staged snapshot onto its content-addressed path. Idempotent:
+    /// when the blob already exists the staged file is discarded and `Ok(false)`
+    /// is returned. The staged bytes are exactly what was hashed, so a rename
+    /// onto `blob_path(hash)` can never contradict the recorded digest.
+    fn publish_staged_blob(
+        &self,
+        staged: &Path,
+        ingest: StoreIngest,
+        hash: &str,
+        size_bytes: u64,
+    ) -> Result<bool> {
+        let blob = self.blob_path(hash);
+        if blob.is_file() {
+            Self::discard_staged_blob(staged);
+            return Ok(false);
+        }
+        fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
+        match fs::rename(staged, &blob) {
+            Ok(()) => {}
+            Err(e) if blob.is_file() => {
+                // Concurrent winner published the identical-content blob first;
+                // same digest means same bytes, so losing the race is benign.
+                Self::discard_staged_blob(staged);
+                let _ = e;
+                return Ok(false);
+            }
+            Err(e) => {
+                Self::discard_staged_blob(staged);
+                return Err(e).context("publishing staged blob");
+            }
+        }
+        let _ = crate::atomic::fsync_dir(blob.parent().unwrap());
+        match ingest {
+            StoreIngest::Reflink => crate::opcounts::record_store_reflinked(size_bytes),
+            StoreIngest::Hardlink => crate::opcounts::record_store_hardlinked(size_bytes),
+            StoreIngest::Copy => crate::opcounts::record_store_copied(size_bytes),
+        }
+        set_blob_readonly(&blob);
+        Ok(true)
+    }
+
+    /// Remove a staging snapshot (best effort; the staging sweep reclaims any
+    /// file this fails on).
+    fn discard_staged_blob(staged: &Path) {
+        unlink_blob(staged);
+    }
+
+    /// Reclaim crash-orphaned staging files older than `min_age`. A put killed
+    /// between staging and publish leaves its snapshot here; unlike an orphaned
+    /// blob it has no DB row to consult, so age is the only liveness signal.
+    pub fn sweep_stale_staging(&self, min_age: Duration) -> OrphanSweepStats {
+        let mut stats = OrphanSweepStats::default();
+        let dir = self.staging_dir();
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return stats;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let age_ok = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= min_age);
+            if !age_ok {
+                continue;
+            }
+            stats.scanned += 1;
+            let size = meta.len();
+            // Staging temps may be hardlinked (and therefore read-only); clear
+            // that before unlinking. Counted only when the file is really gone,
+            // so Windows sharing violations don't over-claim reclaimed bytes.
+            let removed = (|| -> std::io::Result<()> {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                fs::set_permissions(entry.path(), perms)?;
+                fs::remove_file(entry.path())
+            })()
+            .is_ok();
+            if removed {
+                stats.removed += 1;
+                stats.bytes_reclaimed += size;
+            }
+        }
+        stats
     }
 
     /// Get the directory for a cache entry.
@@ -4561,6 +4801,180 @@ mod tests {
             !fs::metadata(&source).unwrap().permissions().readonly(),
             "failed hardlink ingest must restore a writable build output"
         );
+    }
+
+    // ── stage → hash → publish (review finding #3) ──────────────────────
+
+    /// The put path must hash the STAGED snapshot, not the live build
+    /// output: the bytes published under a digest must be exactly the bytes
+    /// that were hashed, so a post-build mutator changing the file after the
+    /// snapshot can never store content X under address H(Y).
+    #[test]
+    fn put_stores_snapshot_bytes_matching_recorded_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output_file = dir.path().join("out.rlib");
+        let original = b"artifact-bytes-v1";
+        fs::write(&output_file, original).unwrap();
+
+        store
+            .put(
+                "snapshot_key",
+                "snapshot_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file.clone(), "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        // Simulate a post-put mutator (strip / codesign / wasm tooling):
+        // rewrite the build output in place with different content.
+        fs::write(
+            &output_file,
+            b"mutated-after-put-with-a-much-longer-payload",
+        )
+        .unwrap();
+
+        let meta = store.get("snapshot_key").unwrap().unwrap();
+        assert_eq!(meta.files.len(), 1);
+        let blob = store.blob_path(&meta.files[0].hash);
+        let stored = fs::read(&blob).unwrap();
+        assert_eq!(
+            stored, original,
+            "stored blob must be byte-identical to what was hashed at put time"
+        );
+        assert_eq!(meta.files[0].size, original.len() as u64);
+    }
+
+    /// A completed put must leave nothing behind in the staging area.
+    #[test]
+    fn successful_put_leaves_staging_dir_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output_file = dir.path().join("out.rlib");
+        fs::write(&output_file, b"artifact").unwrap();
+        store
+            .put(
+                "staging_clean_key",
+                "crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file, "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let staging = dir.path().join("staging");
+        if staging.exists() {
+            let leftovers: Vec<_> = fs::read_dir(&staging).unwrap().flatten().collect();
+            assert!(leftovers.is_empty(), "staging litter: {leftovers:?}");
+        }
+    }
+
+    /// A refused zero-byte artifact must clean up its staged snapshot; a
+    /// crash-refusal that leaked it would otherwise sit until GC.
+    #[test]
+    fn zero_byte_refusal_cleans_up_staged_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // A zero-byte `.rlib` is never valid output for a lib crate.
+        let output_file = dir.path().join("empty.rlib");
+        fs::write(&output_file, b"").unwrap();
+
+        let result = store.put(
+            "zero_key",
+            "crate",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(output_file, "libout.rlib".to_string())],
+            "",
+            "",
+        );
+        assert!(result.is_err(), "zero-byte rlib must be refused");
+        let staging = dir.path().join("staging");
+        if staging.exists() {
+            let leftovers: Vec<_> = fs::read_dir(&staging).unwrap().flatten().collect();
+            assert!(leftovers.is_empty(), "refused put left staging litter");
+        }
+    }
+
+    /// Publishing onto an already-present blob discards the staged snapshot
+    /// and reports `false` — same-digest means same-bytes, so losing the
+    /// publish race is benign and must not double-count ingest.
+    #[test]
+    fn publish_staged_blob_is_idempotent_when_blob_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"identical-content").unwrap();
+
+        let (staged_a, ingest_a) = store.stage_blob_from_source(&source, false).unwrap();
+        let hash = crate::cache_key::hash_file(&staged_a).unwrap();
+        assert!(
+            store
+                .publish_staged_blob(&staged_a, ingest_a, &hash, 17)
+                .unwrap(),
+            "first publish should win"
+        );
+
+        let (staged_b, _ingest_b) = store.stage_blob_from_source(&source, false).unwrap();
+        assert_ne!(staged_a, staged_b, "each stage gets its own temp");
+        assert!(
+            !store
+                .publish_staged_blob(&staged_b, ingest_a, &hash, 17)
+                .unwrap(),
+            "second publish of the same digest must be a no-op"
+        );
+
+        let staging_leftovers = fs::read_dir(store.staging_dir()).unwrap().flatten().count();
+        assert_eq!(staging_leftovers, 0, "discarded stage must not linger");
+    }
+
+    /// Crash-orphaned staging files are reclaimed only once older than the
+    /// grace period — a concurrent put's fresh snapshot is never touched.
+    #[test]
+    fn sweep_stale_staging_respects_min_age() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let stale = store.staging_dir().join("stage-old-1.tmp");
+        let fresh = store.staging_dir().join("stage-new-1.tmp");
+        fs::create_dir_all(store.staging_dir()).unwrap();
+        fs::write(&stale, b"abandoned").unwrap();
+        fs::write(&fresh, b"in-flight").unwrap();
+        let old = filetime::FileTime::from_unix_time(0, 0);
+        filetime::set_file_mtime(&stale, old).unwrap();
+        filetime::set_file_atime(&stale, old).unwrap();
+
+        let stats = store.sweep_stale_staging(Duration::from_secs(3600));
+        assert_eq!(stats.removed, 1, "only the aged-out file is swept");
+        assert!(!stale.exists());
+        assert!(fresh.exists(), "fresh staging file must survive the sweep");
+
+        // Once it ages out, it goes too.
+        let stats = store.sweep_stale_staging(Duration::ZERO);
+        assert_eq!(stats.removed, 1);
+        assert!(!fresh.exists());
     }
 
     /// The read-only probe (#565) must mirror `Store::get`'s servable/hit

@@ -1394,6 +1394,32 @@ pub fn compute_cache_key(
         );
     }
 
+    // Outcome-affecting lint gates (-D/--deny/--forbid/-F/--force-warn/
+    // --cap-lints, review finding #2): deny-level lints turn warnings into
+    // hard errors, so two invocations differing only here can disagree about
+    // whether the compile succeeded while producing identical object bytes.
+    // A hit replays success, which would flip a build that `-D warnings`
+    // should have failed to green. The flags are captured during parsing
+    // (see `OUTCOME_AFFECTING_VALUE_FLAGS` in args.rs) and folded here
+    // normalized + sorted, only when non-empty — the common case (no lint
+    // gates) is byte-identical to prior keys, so no CACHE_KEY_VERSION bump is
+    // required (same precedent as residual_args above). Entries stored before
+    // this change simply miss once gates appear.
+    if !args.outcome_lint_flags.is_empty() {
+        let mut outcome_lints: Vec<String> = args
+            .outcome_lint_flags
+            .iter()
+            .map(|tok| path_normalizer.normalize(tok))
+            .collect();
+        outcome_lints.sort();
+        hasher.set_group("outcome_lints");
+        for tok in &outcome_lints {
+            check_for_path_leak(tok, "outcome_lint");
+            fold_field(&mut hasher, b"outcome_lint.v1:", tok.as_bytes());
+            tracing::trace!("[key:{}] outcome_lint:{}", crate_name, tok);
+        }
+    }
+
     // Relevant CARGO_CFG_* env vars (sorted for determinism —
     // std::env::vars() iteration order is platform-defined and not stable)
     hasher.set_group("env_cfg");
@@ -5390,6 +5416,10 @@ mod tests {
     /// flags are stripped during parsing, so they must NOT reach the residual
     /// fold and over-key the result. Guards the same invariant as the
     /// `key_matrix_*_does_not_change_key` tests for flags cargo passes routinely.
+    ///
+    /// Outcome-affecting lint gates (`--cap-lints`, `--force-warn`, deny-level
+    /// flags) are deliberately NOT in this list: they must change the key —
+    /// see `key_matrix_outcome_lint_gate_changes_key`.
     #[test]
     fn residual_strips_diagnostic_and_query_flags() {
         let _lock = key_test_lock();
@@ -5402,11 +5432,9 @@ mod tests {
             vec!["--check-cfg", "cfg(foo)"],
             vec!["--diagnostic-width=80"],
             vec!["--json=artifacts"],
-            vec!["--cap-lints", "allow"],
             vec!["--color", "always"],
             vec!["-W", "unused"],
             vec!["-Wunused"],
-            vec!["--force-warn", "deprecated"],
             vec!["--verbose"],
         ] {
             assert_eq!(
@@ -8453,14 +8481,20 @@ pub fn value() -> (&'static str, u8) {
     // artifact bytes. If the key changes for one of them, that is
     // over-keying (a missed hit) — the test will fail and surface it
     // rather than silently weakening the key.
+    //
+    // Deny-level lint gates are deliberately absent from this section:
+    // they also cannot change a successful compile's bytes, but they
+    // change whether the compile FAILS, and a hit replays success — so
+    // they must change the key. See the "outcome lint" tests below.
 
     #[test]
-    fn key_matrix_lint_level_does_not_change_key() {
-        // `-D warnings` promotes warnings to errors: it can make a
-        // build *fail*, but a build that *succeeds* emits byte-
-        // identical output with or without it. rustc does not parse
-        // `-D`/`-W`/`-A` into anything kache keys, so the key must be
-        // stable across this flag.
+    fn key_matrix_outcome_lint_gate_changes_key() {
+        // `-D warnings` promotes warnings to hard errors: two builds
+        // differing only here can disagree about whether the compile
+        // succeeded while emitting byte-identical objects on success.
+        // Since a hit replays success, the key MUST move (review
+        // finding #2) — otherwise an entry stored without the gate
+        // serves green to a build the gate should have failed.
         if !rustc_available() {
             return;
         }
@@ -8472,12 +8506,50 @@ pub fn value() -> (&'static str, u8) {
         let base = base_args(&source);
         let mut with_lint = base_args(&source);
         with_lint.extend(["-D".to_string(), "warnings".to_string()]);
+        let mut with_forbid = base_args(&source);
+        with_forbid.extend(["--forbid".to_string(), "warnings".to_string()]);
+        let mut with_cap = base_args(&source);
+        with_cap.extend(["--cap-lints".to_string(), "allow".to_string()]);
+        let mut with_attached = base_args(&source);
+        with_attached.push("-Dwarnings".to_string());
 
-        assert_eq!(
+        assert_ne!(
             key_for(&base),
             key_for(&with_lint),
-            "a lint-level flag (`-D warnings`) is diagnostics-only and \
-             must NOT change the key — a change here is over-keying"
+            "an outcome-affecting lint gate (`-D warnings`) changes whether \
+             the compile fails and MUST change the key"
+        );
+        assert_ne!(
+            key_for(&base),
+            key_for(&with_forbid),
+            "`--forbid` is outcome-affecting and must change the key"
+        );
+        assert_ne!(
+            key_for(&base),
+            key_for(&with_cap),
+            "`--cap-lints` re-levels every lint and must change the key"
+        );
+        assert_ne!(
+            key_for(&with_lint),
+            key_for(&with_attached),
+            "separated (`-D warnings`) and attached (`-Dwarnings`) spellings \
+             carry different tokens; each keys distinctly by design"
+        );
+        // Diagnostics-only levels stay out of the key (#324): -W/-A never
+        // flip the outcome, so keying them would only cost hits.
+        let mut with_warn = base_args(&source);
+        with_warn.extend(["-W".to_string(), "unused".to_string()]);
+        let mut with_allow = base_args(&source);
+        with_allow.extend(["-A".to_string(), "dead_code".to_string()]);
+        assert_eq!(
+            key_for(&base),
+            key_for(&with_warn),
+            "-W stays diagnostics-only: it cannot flip the outcome"
+        );
+        assert_eq!(
+            key_for(&base),
+            key_for(&with_allow),
+            "-A stays diagnostics-only: it cannot flip the outcome"
         );
     }
 

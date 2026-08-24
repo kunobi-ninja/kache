@@ -4809,6 +4809,13 @@ mod tests {
     /// output: the bytes published under a digest must be exactly the bytes
     /// that were hashed, so a post-build mutator changing the file after the
     /// snapshot can never store content X under address H(Y).
+    ///
+    /// Uses independent (never-hardlink) storage deliberately: on a
+    /// non-CoW filesystem the hardlink ingest shares the output's inode
+    /// with the blob, so mutating the output afterwards would both hit the
+    /// read-only guard and legitimately move the shared blob. Independent
+    /// storage (reflink/copy) gives the snapshot byte-isolation on every
+    /// filesystem, which is the property under test.
     #[test]
     fn put_stores_snapshot_bytes_matching_recorded_digest() {
         let dir = tempfile::tempdir().unwrap();
@@ -4820,7 +4827,7 @@ mod tests {
         fs::write(&output_file, original).unwrap();
 
         store
-            .put(
+            .put_with_compile_time_independent(
                 "snapshot_key",
                 "snapshot_crate",
                 &["lib".to_string()],
@@ -4830,6 +4837,7 @@ mod tests {
                 &[(output_file.clone(), "libout.rlib".to_string())],
                 "",
                 "",
+                0,
             )
             .unwrap();
 

@@ -12365,6 +12365,69 @@ mod tests {
         }
     }
 
+    struct BlockingV3Backend {
+        inner: Arc<dyn crate::remote_backend::RemoteBackend>,
+        v3_get_started: tokio::sync::mpsc::UnboundedSender<u64>,
+        release_v3_get: Arc<tokio::sync::Semaphore>,
+        v3_gets: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for BlockingV3Backend {
+        async fn head(&self, key: &str) -> Result<bool> {
+            self.inner.head(key).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            if key.contains("/v3/packs/") {
+                let ordinal = self.v3_gets.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = self.v3_get_started.send(ordinal);
+                let permit = self
+                    .release_v3_get
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("v3 GET test gate closed"))?;
+                permit.forget();
+            }
+            self.inner.get(key, max_bytes).await
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+            self.inner.put(key, body, content_type).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+
+        fn describe(&self, key: &str) -> String {
+            self.inner.describe(key)
+        }
+    }
+
+    async fn wait_for_download_waiter(daemon: &Daemon, key: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let attached = {
+                    let downloading = daemon.downloading.read().await;
+                    downloading
+                        .get(key)
+                        .is_some_and(|notify| Arc::strong_count(notify) > 1)
+                };
+                if attached {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-key request must attach to the active download claim");
+    }
+
     #[tokio::test]
     async fn test_socket_remote_check_miss_with_injected_mock_client() {
         // Remote configured + an empty in-memory backend: handle_remote_check
@@ -13524,6 +13587,159 @@ mod tests {
             "failed extraction must not leave meta.json that a waiter can mistake for a hit"
         );
         assert!(!Store::open(&config).unwrap().contains(&key));
+    }
+
+    #[tokio::test]
+    async fn concurrent_remote_check_waiter_retries_after_leader_import_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let key = test_cache_key("concurrent-import-failure");
+        let pack = build_entry_pack(&key, "serde");
+        let entry_dir = config.store_dir().join(&key);
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        std::fs::write(config.store_dir().join("blobs"), b"not a directory").unwrap();
+
+        let inner = test_remote_backend();
+        put_test_object(&inner, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(&inner, &test_pack_object_key(&key, "serde"), &pack).await;
+        let (v3_started_tx, mut v3_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release_v3_get = Arc::new(tokio::sync::Semaphore::new(0));
+        let gated = Arc::new(BlockingV3Backend {
+            inner,
+            v3_get_started: v3_started_tx,
+            release_v3_get: release_v3_get.clone(),
+            v3_gets: AtomicU64::new(0),
+        });
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> = gated.clone();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend).is_ok());
+        daemon.signal_warming_complete();
+
+        let request = RemoteCheckRequest {
+            key: key.clone(),
+            entry_dir: entry_dir.to_string_lossy().into_owned(),
+            crate_name: "serde".into(),
+            deadline_ms: None,
+        };
+        let leader = {
+            let daemon = daemon.clone();
+            let request = request.clone();
+            tokio::spawn(async move {
+                daemon
+                    .handle_remote_check_leader(&request, RemoteDeadline::from_secs(10))
+                    .await
+            })
+        };
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), v3_started_rx.recv())
+                .await
+                .expect("leader must reach its gated v3 GET"),
+            Some(1)
+        );
+
+        let waiter = {
+            let daemon = daemon.clone();
+            tokio::spawn(async move {
+                daemon
+                    .handle_remote_check_leader(&request, RemoteDeadline::from_secs(10))
+                    .await
+            })
+        };
+        wait_for_download_waiter(&daemon, &key).await;
+
+        // Let the first valid pack finish. Its local import fails, releases the
+        // claim, and wakes the attached waiter. The waiter must re-claim and
+        // start a second GET; returning a hit from stale meta would skip it.
+        release_v3_get.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), v3_started_rx.recv())
+                .await
+                .expect("waiter must retry rather than report the failed leader as a hit"),
+            Some(2)
+        );
+        let leader_response = tokio::time::timeout(Duration::from_secs(5), leader)
+            .await
+            .expect("leader must finish after its GET is released")
+            .expect("leader task must not panic");
+        assert_eq!(leader_response.found, Some(false));
+
+        release_v3_get.add_permits(1);
+        let waiter_response = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must finish after its retry is released")
+            .expect("waiter task must not panic");
+        assert_eq!(waiter_response.found, Some(false));
+        assert_eq!(gated.v3_gets.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_failed
+                .load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_check_waiter_rejects_uncommitted_meta_after_leader_import_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let key = test_cache_key("waiter-uncommitted-meta");
+        let entry_dir = config.store_dir().join(&key);
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> = Arc::new(PanicOnGetBackend);
+        assert!(daemon.remote_backend.set(backend).is_ok());
+        daemon.signal_warming_complete();
+
+        // Model a leader that has the download claim and lands meta.json, but
+        // whose Store import fails before publishing a row. Keeping the residue
+        // deliberately exercises the committed-state check independently of
+        // best-effort cleanup.
+        assert!(claim_download(&daemon.downloading, &key).await.is_none());
+        let failed_leader = DownloadingGuard::new(daemon.downloading.clone(), key.clone());
+        let request = RemoteCheckRequest {
+            key: key.clone(),
+            entry_dir: entry_dir.to_string_lossy().into_owned(),
+            crate_name: "serde".into(),
+            deadline_ms: None,
+        };
+        let waiter = {
+            let daemon = daemon.clone();
+            tokio::spawn(async move {
+                daemon
+                    .handle_remote_check_leader(&request, RemoteDeadline::from_secs(10))
+                    .await
+            })
+        };
+        wait_for_download_waiter(&daemon, &key).await;
+
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(entry_dir.join("meta.json"), b"{}").unwrap();
+        let store = Store::open(&config).unwrap();
+        assert!(store.import_downloaded_entry(&key).is_err());
+        assert!(entry_dir.join("meta.json").exists());
+        assert!(!store.contains(&key));
+        drop(failed_leader);
+
+        let response = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("failed leader must wake the waiter")
+            .expect("waiter task must not panic");
+        assert_eq!(
+            response.found,
+            Some(false),
+            "meta.json without a committed Store row is never a hit"
+        );
     }
 
     #[tokio::test]

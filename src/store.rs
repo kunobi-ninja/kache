@@ -2230,11 +2230,22 @@ impl Store {
     /// therefore either commits first (and is preserved) or publishes after the
     /// stale directory is gone.
     fn discard_uncommitted_restored_entry(&self, cache_key: &str) -> Result<()> {
+        self.discard_uncommitted_restored_entry_inner(cache_key, || {})
+    }
+
+    fn discard_uncommitted_restored_entry_inner(
+        &self,
+        cache_key: &str,
+        before_write_lock: impl FnOnce(),
+    ) -> Result<()> {
         if !crate::cache_key::is_valid_cache_key(cache_key) {
             anyhow::bail!("refusing to discard invalid restored cache key");
         }
 
         let tx = self.db.unchecked_transaction()?;
+        // The test hook makes the publication ordering observable without
+        // weakening the production lock or relying on scheduler sleeps.
+        before_write_lock();
         tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
         let committed: i64 = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1 AND committed = 1)",
@@ -8231,6 +8242,83 @@ mod tests {
             "expected 'missing file' error, got: {err}"
         );
         assert!(!store.contains("incomplete_key"));
+    }
+
+    #[test]
+    fn failed_restore_cleanup_preserves_a_concurrent_committed_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let publisher_store = Store::open(&config).unwrap();
+        let cleanup_store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"restore-cleanup-publication-race")
+            .to_hex()
+            .to_string();
+        let entry_dir = config.store_dir().join(&key);
+        let meta_json = serde_json::to_string_pretty(&EntryMeta {
+            cache_key: key.clone(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            crate_name: "published".into(),
+            crate_types: vec!["lib".into()],
+            files: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            features: Vec::new(),
+            target: String::new(),
+            profile: "dev".into(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        })
+        .unwrap();
+
+        // Hold a publisher's SQLite write transaction after materializing its
+        // meta.json but before commit. The cleanup announces the exact point at
+        // which it is about to request the same writer lock; only then does the
+        // publisher commit. This fixes the ordering without scheduler sleeps.
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(0);
+        let (cleanup_attempt_tx, cleanup_attempt_rx) = std::sync::mpsc::sync_channel(0);
+        let publisher_key = key.clone();
+        let publisher_entry_dir = entry_dir.clone();
+        let publisher_meta = meta_json.clone();
+        let publisher = std::thread::spawn(move || {
+            let tx = publisher_store.db.unchecked_transaction().unwrap();
+            tx.execute(
+                "INSERT INTO entries (cache_key, crate_name, size, committed) \
+                 VALUES (?1, 'published', 0, 1)",
+                params![publisher_key],
+            )
+            .unwrap();
+            fs::create_dir_all(&publisher_entry_dir).unwrap();
+            fs::write(publisher_entry_dir.join("meta.json"), publisher_meta).unwrap();
+            published_tx.send(()).unwrap();
+            cleanup_attempt_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("cleanup must attempt the writer lock");
+            tx.commit().unwrap();
+        });
+
+        published_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("publisher must reach its pre-commit point");
+        let cleanup_key = key.clone();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_store.discard_uncommitted_restored_entry_inner(&cleanup_key, || {
+                cleanup_attempt_tx.send(()).unwrap();
+            })
+        });
+
+        publisher.join().unwrap();
+        cleanup
+            .join()
+            .unwrap()
+            .expect("cleanup should observe and preserve the committed winner");
+
+        let store = Store::open(&config).unwrap();
+        assert!(store.contains(&key));
+        assert_eq!(
+            fs::read_to_string(entry_dir.join("meta.json")).unwrap(),
+            meta_json,
+            "cleanup must not remove or replace the generation that committed first"
+        );
     }
 
     #[test]

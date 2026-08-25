@@ -110,10 +110,11 @@ jobs:
           fi
         env:
           RUSTC_WRAPPER: ""
-      - name: Check coverage threshold (88%)
+      - name: Check coverage scope and threshold (88%)
         # Enforced on PRs too, not just push: in a trunk-based model a PR that
         # drops coverage must fail before merge, not after on the main push.
         run: |
+          just coverage-scope-check
           python3 -c "
           import json, sys
           data = json.load(open('tmp/llvm-cov/coverage.json'))

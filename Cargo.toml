@@ -24,16 +24,16 @@ bytes = "1"
 # OpenDAL 0.58 publishes its modules as separate crates. Depending on only the
 # core, S3, filesystem, retry, and reqwest transport modules keeps Kache's
 # supported backend set explicit and avoids compiling unused services.
-opendal = { package = "opendal-core", version = "=0.58.0", default-features = false, features = ["executors-tokio"] }
-opendal-http-transport-reqwest = { version = "=0.58.0", default-features = false, features = ["rustls-no-provider"] }
-opendal-layer-retry = { version = "=0.58.0", default-features = false }
-opendal-service-fs = { version = "=0.58.0", default-features = false }
-opendal-service-s3 = { version = "=0.58.0", default-features = false }
+opendal = { package = "opendal-core", version = "=0.58.2", default-features = false, features = ["executors-tokio"] }
+opendal-http-transport-reqwest = { version = "=0.58.2", default-features = false, features = ["rustls-no-provider"] }
+opendal-layer-retry = { version = "=0.58.2", default-features = false }
+opendal-service-fs = { version = "=0.58.2", default-features = false }
+opendal-service-s3 = { version = "=0.58.2", default-features = false }
 # OpenDAL exposes a custom credential chain but not a profile-name shortcut.
 # These published reqsign APIs preserve Kache's explicit profile selection
 # (including SSO and credential_process) without a git-only patch.
-reqsign-aws-v4 = { version = "=3.0.2", default-features = false }
-reqsign-core = { version = "=3.1.0", default-features = false }
+reqsign-aws-v4 = { version = "=3.3.0", default-features = false }
+reqsign-core = { version = "=3.3.1", default-features = false }
 # Direct dep so OpenDAL/reqwest can use ring without reintroducing aws-lc.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 kache-core = { version = "0.16.0", path = "crates/kache-core", default-features = false, features = ["planning"] }

@@ -3552,8 +3552,17 @@ impl Daemon {
                 .fetch_add(join_start.elapsed().as_millis() as u64, Ordering::Relaxed);
             match outcome {
                 JoinOutcome::Found => {
-                    let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
-                    return Response::found_prefetched(true, was_prefetched);
+                    // `meta.json` is only a wake-up hint: extraction writes it
+                    // before Store publication, and an import failure may leave
+                    // residue. Only a committed Store row is a cache hit.
+                    let committed = self
+                        .with_store(|store| Ok(store.contains(&req.key)))
+                        .unwrap_or(false);
+                    if committed {
+                        let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
+                        return Response::found_prefetched(true, was_prefetched);
+                    }
+                    return Response::found(false);
                 }
                 JoinOutcome::Reclaimed => reclaimed = true,
                 JoinOutcome::GaveUp => {
@@ -3582,7 +3591,11 @@ impl Daemon {
         // the claim we now hold so we don't destructively re-download over
         // the freshly published entry (#620, cross-family review finding —
         // the same re-check-under-claim defence the prefetch path uses).
-        if reclaimed && self.entry_dir_for(&req.key).join("meta.json").exists() {
+        if reclaimed
+            && self
+                .with_store(|store| Ok(store.contains(&req.key)))
+                .unwrap_or(false)
+        {
             let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
             return Response::found_prefetched(true, was_prefetched);
         }
@@ -3655,14 +3668,25 @@ impl Daemon {
                 }
                 let (import_result, import_lock_wait_ms, import_ms) =
                     self.with_store_timed(|store| store.import_restored_entry(&req.key));
-                if let Err(e) = import_result {
-                    tracing::warn!("failed to import downloaded entry {}: {e}", &req.key);
-                }
+                let import_ok = match import_result {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("failed to import downloaded entry {}: {e:#}", &req.key);
+                        false
+                    }
+                };
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 let finished_at_unix_ms = unix_time_ms();
-                self.transfer_counters
-                    .downloads_completed
-                    .fetch_add(1, Ordering::Relaxed);
+                if import_ok {
+                    self.transfer_counters
+                        .downloads_completed
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.transfer_counters
+                        .downloads_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                // The pack crossed the wire even when local publication failed.
                 self.transfer_counters
                     .bytes_downloaded
                     .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
@@ -3693,11 +3717,11 @@ impl Daemon {
                     head_checks_ms: 0,
                     blobs_skipped: dl.blobs_skipped,
                     blobs_total: dl.blobs_total,
-                    ok: true,
+                    ok: import_ok,
                     timestamp: finished_at_unix_ms / 1_000,
                 })
                 .await;
-                Response::found(true)
+                Response::found(import_ok)
             }
             Err(e) if classify_remote_error(&e) == RemoteErrorClass::Miss => {
                 // GET 404 = clean miss (#485 Phase 0). Reached when a
@@ -4598,22 +4622,34 @@ impl Daemon {
                             }
                             let (import_result, import_lock_wait_ms, import_ms) =
                                 d.with_store_timed(|store| store.import_restored_entry(&key));
-                            if let Err(e) = import_result {
-                                tracing::warn!("prefetch import failed for {}: {e}", key);
-                            }
+                            let import_ok = match import_result {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    tracing::warn!("prefetch import failed for {}: {e:#}", key);
+                                    false
+                                }
+                            };
                             let elapsed_ms = start.elapsed().as_millis() as u64;
                             let finished_at_unix_ms = unix_time_ms();
-                            d.transfer_counters
-                                .downloads_completed
-                                .fetch_add(1, Ordering::Relaxed);
+                            if import_ok {
+                                d.transfer_counters
+                                    .downloads_completed
+                                    .fetch_add(1, Ordering::Relaxed);
+                                d.prefetch_stats
+                                    .downloads_completed
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                d.transfer_counters
+                                    .downloads_failed
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            // The pack crossed the wire even when local
+                            // publication failed, so preserve byte telemetry.
                             d.transfer_counters
                                 .bytes_downloaded
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                             // Phase-0 telemetry: the prefetch-attributed subset
                             // of the transfer counters above.
-                            d.prefetch_stats
-                                .downloads_completed
-                                .fetch_add(1, Ordering::Relaxed);
                             d.prefetch_stats
                                 .bytes_downloaded
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
@@ -4622,7 +4658,7 @@ impl Daemon {
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                             // Per-plan attribution (#583 P0.5): byte-accurate
                             // downloaded set for the session summary.
-                            {
+                            if import_ok {
                                 let mut plan =
                                     d.active_plan.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Some(p) = plan.as_mut() {
@@ -4656,10 +4692,13 @@ impl Daemon {
                                 head_checks_ms: 0,
                                 blobs_skipped: dl.blobs_skipped,
                                 blobs_total: dl.blobs_total,
-                                ok: true,
+                                ok: import_ok,
                                 timestamp: finished_at_unix_ms / 1_000,
                             })
                             .await;
+                            if !import_ok {
+                                return;
+                            }
                             // Track as prefetched for PrefetchHit attribution.
                             // Bound the set: a long-lived daemon that
                             // prefetches many distinct keys would otherwise
@@ -5779,7 +5818,7 @@ fn download_join_deadline(
 /// Outcome of waiting behind another task's in-flight download of a key.
 #[derive(Debug, PartialEq, Eq)]
 enum JoinOutcome {
-    /// The leader landed the entry (meta.json exists); use it.
+    /// The leader left `meta.json`; the caller must verify committed Store state.
     Found,
     /// The leader failed and this task won the atomic re-claim: it is now
     /// the leader and MUST release the claim via [`DownloadingGuard`].
@@ -13420,6 +13459,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_check_import_failure_is_not_reported_as_hit() {
+        // The v3 GET/extraction can succeed while local publication fails. A
+        // regular file at `store/blobs` deterministically makes the import's
+        // `create_dir_all(store/blobs/<shard>)` fail on every platform, without
+        // weakening or corrupting the otherwise-valid remote pack.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let key = test_cache_key("download-import-failure");
+        let pack = build_entry_pack(&key, "serde");
+        let entry_dir = config.store_dir().join(&key);
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        std::fs::write(config.store_dir().join("blobs"), b"not a directory").unwrap();
+
+        let client = test_remote_backend();
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(&client, &test_pack_object_key(&key, "serde"), &pack).await;
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(daemon.remote_backend.set(client).is_ok());
+
+        let response = daemon
+            .handle_remote_check(&RemoteCheckRequest {
+                key: key.clone(),
+                entry_dir: entry_dir.to_string_lossy().into_owned(),
+                crate_name: "serde".into(),
+                deadline_ms: None,
+            })
+            .await;
+
+        assert!(
+            response.ok,
+            "a cache fault must degrade to a miss: {response:?}"
+        );
+        assert_eq!(response.found, Some(false));
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_failed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .bytes_downloaded
+                .load(Ordering::Relaxed),
+            pack.len() as u64,
+            "a local import failure must not hide bytes already transferred"
+        );
+        let transfer = latest_transfer(&daemon);
+        assert!(!transfer.ok);
+        assert_eq!(transfer.compressed_bytes, pack.len() as u64);
+        assert!(
+            !entry_dir.exists(),
+            "failed extraction must not leave meta.json that a waiter can mistake for a hit"
+        );
+        assert!(!Store::open(&config).unwrap().contains(&key));
+    }
+
+    #[tokio::test]
     async fn stale_meta_json_does_not_short_circuit_a_first_claim_leader() {
         // The under-claim meta.json re-check (#620) applies ONLY to a waiter
         // that won the re-claim after a failed leader; a first-claim leader
@@ -13611,6 +13718,94 @@ mod tests {
         assert_v3_transfer_timestamps(&latest_transfer(&daemon));
         // Nothing was imported.
         assert!(!config.store_dir().join(key).join("meta.json").exists());
+    }
+
+    #[tokio::test]
+    async fn prefetch_import_failure_is_counted_as_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let key = test_cache_key("prefetch-import-failure");
+        let pack = build_entry_pack(&key, "serde");
+        let entry_dir = config.store_dir().join(&key);
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        std::fs::write(config.store_dir().join("blobs"), b"not a directory").unwrap();
+
+        let client = test_remote_backend();
+        put_test_object(&client, &test_pack_object_key(&key, "serde"), &pack).await;
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(daemon.remote_backend.set(client).is_ok());
+
+        let response = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: vec![(key.clone(), "serde".into())],
+                warm_all: false,
+            })
+            .await;
+        assert!(
+            response.ok,
+            "prefetch dispatch should remain fire-and-forget"
+        );
+
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let failed = daemon
+                    .transfer_counters
+                    .downloads_failed
+                    .load(Ordering::Relaxed);
+                let has_event = daemon
+                    .recent_transfers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .back()
+                    .is_some();
+                if failed == 1 && has_event {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "prefetch import failure was not recorded"
+        );
+
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .bytes_downloaded
+                .load(Ordering::Relaxed),
+            pack.len() as u64,
+            "a local import failure must not hide bytes already transferred"
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .bytes_downloaded
+                .load(Ordering::Relaxed),
+            pack.len() as u64
+        );
+        let transfer = latest_transfer(&daemon);
+        assert!(!transfer.ok);
+        assert_eq!(transfer.compressed_bytes, pack.len() as u64);
+        assert!(!daemon.prefetched_keys.read().await.contains(&key));
+        assert!(!entry_dir.exists());
+        assert!(!Store::open(&config).unwrap().contains(&key));
     }
 
     #[tokio::test]

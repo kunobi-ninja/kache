@@ -2206,9 +2206,58 @@ impl Store {
     /// Import a restored entry into the local store.
     ///
     /// This is the format-agnostic seam future remote layouts should call.
-    /// Today it is equivalent to `import_downloaded_entry()`.
+    /// A failed import must not leave an uncommitted `meta.json` behind: daemon
+    /// download waiters use the extracted directory as a wake-up hint, and the
+    /// residue could otherwise be mistaken for a published entry. Cleanup is
+    /// serialized with Store publishers and preserves any committed generation
+    /// that won the race.
     pub fn import_restored_entry(&self, cache_key: &str) -> Result<()> {
-        self.import_downloaded_entry(cache_key)
+        match self.import_downloaded_entry(cache_key) {
+            Ok(()) => Ok(()),
+            Err(import_error) => match self.discard_uncommitted_restored_entry(cache_key) {
+                Ok(()) => Err(import_error),
+                Err(cleanup_error) => Err(import_error.context(format!(
+                    "also failed to discard uncommitted restored entry: {cleanup_error:#}"
+                ))),
+            },
+        }
+    }
+
+    /// Remove extraction residue only when no committed row owns this key.
+    ///
+    /// The no-op write acquires SQLite's cross-process writer lock before the
+    /// row check and keeps it through directory removal. A concurrent publisher
+    /// therefore either commits first (and is preserved) or publishes after the
+    /// stale directory is gone.
+    fn discard_uncommitted_restored_entry(&self, cache_key: &str) -> Result<()> {
+        if !crate::cache_key::is_valid_cache_key(cache_key) {
+            anyhow::bail!("refusing to discard invalid restored cache key");
+        }
+
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
+        let committed: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1 AND committed = 1)",
+            params![cache_key],
+            |row| row.get(0),
+        )?;
+        if committed == 0 {
+            let entry_dir = self.entry_dir(cache_key);
+            match fs::remove_dir_all(&entry_dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "removing uncommitted restored entry {}",
+                            entry_dir.display()
+                        )
+                    });
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Install one already-verified artifact into the content-addressed blob

@@ -17,6 +17,8 @@
 //!   - `-O` / `-g` — shorthand codegen flags whose order relative to explicit
 //!     `-C` overrides is last-wins.
 //!   - direct `--remap-path-prefix` — changes embedded source/debug paths.
+//!   - lint configuration / `--check-cfg` — can change a compile from success
+//!     to failure, which a cache hit must never replay as success.
 //!
 //! `-L dependency=` (cargo's rlib search, redundant with the content-hashed
 //! `--extern`) must NOT affect the key, or every target-dir move would bust
@@ -48,6 +50,10 @@ fn rustc_sysroot() -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
+fn toml_path(path: &Path) -> String {
+    toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
 /// Compile a trivial rlib through kache-as-RUSTC_WRAPPER with `extra` flags
 /// appended to the rustc argv. Asserts the compile succeeds.
 fn run_kache_rustc(cache_dir: &Path, out_dir: &Path, src: &Path, extra: &[&str]) {
@@ -61,6 +67,22 @@ fn run_kache_rustc_from(
     extra: &[&str],
     cwd: Option<&Path>,
 ) {
+    let (args, output) = kache_rustc_output_from(cache_dir, out_dir, src, extra, cwd);
+
+    assert!(
+        output.status.success(),
+        "kache rustc failed.\nargs: {args:?}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn kache_rustc_output_from(
+    cache_dir: &Path,
+    out_dir: &Path,
+    src: &Path,
+    extra: &[&str],
+    cwd: Option<&Path>,
+) -> (Vec<String>, std::process::Output) {
     let mut args: Vec<String> = vec![
         rustc_path(),
         "--crate-name".into(),
@@ -76,24 +98,35 @@ fn run_kache_rustc_from(
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
 
+    let config_path = isolated_config_path(cache_dir);
+    std::fs::write(
+        &config_path,
+        format!(
+            "[cache]\nlocal_only = true\nignore_env = true\nlocal_store = {}\nruntime_dir = {}\n",
+            toml_path(cache_dir),
+            toml_path(cache_dir)
+        ),
+    )
+    .unwrap();
     let mut command = std::process::Command::new(kache_binary());
     command
         .args(&args)
         .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
+        .env("KACHE_CONFIG", config_path)
         .env("KACHE_LOG", "kache=info")
+        .env_remove("KACHE_DISABLED")
+        .env_remove("KACHE_NAMESPACE")
+        .env_remove("KACHE_BASE_DIR")
+        .env_remove("KACHE_SOCKET_PATH")
+        .env_remove("KACHE_ACTIVE")
+        .env_remove("KACHE_FAMILY_PROBE_ACTIVE")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     let output = command.output().expect("failed to run kache rustc");
-
-    assert!(
-        output.status.success(),
-        "kache rustc failed.\nargs: {args:?}\nstderr: {}",
-        String::from_utf8_lossy(&output.stderr),
-    );
+    (args, output)
 }
 
 /// `(compiled, local_hits)` from `kache report` over this isolated cache dir.
@@ -106,6 +139,12 @@ fn compiled_hit_counts(cache_dir: &Path) -> (u64, u64) {
         .args(["report", "--format", "json", "--since", "1h"])
         .env("KACHE_CACHE_DIR", cache_dir)
         .env("KACHE_CONFIG", isolated_config_path(cache_dir))
+        .env_remove("KACHE_DISABLED")
+        .env_remove("KACHE_NAMESPACE")
+        .env_remove("KACHE_BASE_DIR")
+        .env_remove("KACHE_SOCKET_PATH")
+        .env_remove("KACHE_ACTIVE")
+        .env_remove("KACHE_FAMILY_PROBE_ACTIVE")
         .output()
         .expect("failed to run kache report");
     assert!(output.status.success(), "kache report failed");
@@ -121,6 +160,76 @@ fn fresh_src() -> (TempDir, PathBuf) {
     let src = dir.path().join("lib.rs");
     std::fs::write(&src, b"pub fn f() -> u32 { 42 }\n").unwrap();
     (dir, src)
+}
+
+/// `--check-cfg` defines the accepted cfg names and values. Tightening that
+/// set under `-D unexpected_cfgs` must run rustc and fail, never replay the
+/// success cached under the earlier accepted set.
+#[test]
+fn check_cfg_change_cannot_replay_cached_success() {
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let src_dir = TempDir::new().unwrap();
+    let src = src_dir.path().join("lib.rs");
+    std::fs::write(
+        &src,
+        b"#[cfg(accepted)]\npub fn accepted() -> bool { true }\n",
+    )
+    .unwrap();
+
+    let accepted = ["-D", "unexpected_cfgs", "--check-cfg", "cfg(accepted)"];
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &accepted); // miss
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &accepted); // hit
+    assert_eq!(
+        compiled_hit_counts(cache_dir.path()),
+        (1, 1),
+        "the accepted invocation must prove a real cache hit before the negative control"
+    );
+
+    let rejected = ["-D", "unexpected_cfgs", "--check-cfg", "cfg(other)"];
+    let (args, output) =
+        kache_rustc_output_from(cache_dir.path(), out.path(), &src, &rejected, None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr.contains("unexpected `cfg` condition name")
+            && stderr.contains("accepted"),
+        "tightened --check-cfg must execute rustc and reject the source, not replay success.\n\
+         args: {args:?}\nstderr: {stderr}"
+    );
+}
+
+/// Allow/warn levels are outcome-affecting when they interact with deny
+/// groups. Removing an allow that made a compile green must not hit that entry.
+#[test]
+fn allow_override_change_cannot_replay_cached_success() {
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let src_dir = TempDir::new().unwrap();
+    let src = src_dir.path().join("lib.rs");
+    std::fs::write(&src, b"fn intentionally_unused() {}\n").unwrap();
+
+    let allowed = ["-D", "warnings", "-A", "dead_code"];
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &allowed); // miss
+    run_kache_rustc(cache_dir.path(), out.path(), &src, &allowed); // hit
+    assert_eq!(
+        compiled_hit_counts(cache_dir.path()),
+        (1, 1),
+        "the allowed invocation must prove a real cache hit before the negative control"
+    );
+
+    let denied = ["-D", "warnings"];
+    let (args, output) = kache_rustc_output_from(cache_dir.path(), out.path(), &src, &denied, None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr.contains("intentionally_unused")
+            && stderr.contains("never used"),
+        "removing -A dead_code must execute rustc and fail, not replay success.\n\
+         args: {args:?}\nstderr: {stderr}"
+    );
 }
 
 /// Rustc applies `-O` and `-Copt-level` in argv order. Reversing them must

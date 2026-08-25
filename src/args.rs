@@ -4,76 +4,71 @@ use std::path::{Path, PathBuf};
 
 use crate::compiler::rustc::RustcCompiler;
 
-/// rustc flags that affect only diagnostics, lint levels, or queries — never
+/// rustc flags that affect only diagnostics formatting or queries — never
 /// the emitted artifact bytes. Their separated value (`--flag value`) is
 /// skipped during parsing so neither the flag nor its value reaches the
 /// `residual_args` catch-all and over-keys the result (kunobi-ninja/kache#324).
 ///
-/// Deny-level lint gates (`-D`, `--deny`, `-F`, `--forbid`) are deliberately
-/// NOT listed here even though they cannot change a successful compile's
-/// object bytes: they change whether the compilation *fails*, and a cache hit
-/// replays success — see [`OUTCOME_AFFECTING_VALUE_FLAGS`].
+/// Lint configuration is deliberately NOT listed here even when it cannot
+/// change a successful compile's object bytes: lint levels and `--check-cfg`
+/// can change whether compilation fails, and a cache hit replays success — see
+/// [`OUTCOME_AFFECTING_VALUE_FLAGS`].
 const IGNORED_VALUE_FLAGS: &[&str] = &[
     "--error-format",
     "--json",
     "--color",
     "--diagnostic-width",
-    "--check-cfg",
     "--print",
     "--explain",
-    "-W",
-    "--warn",
-    "-A",
-    "--allow",
 ];
 
-/// Attached (`--flag=value` / `-Xvalue`) forms of the diagnostics / lint flags
-/// above, plus the single-letter lint prefixes (`-Wunused`, `-Dwarnings`). Used
-/// to drop the attached spellings from the cache key alongside their separated
-/// counterparts in [`IGNORED_VALUE_FLAGS`].
-///
-/// The `-D` / `-F` prefixes are intentionally absent: those spellings are
-/// outcome-affecting and captured by [`OUTCOME_LINT_ATTACHED_PREFIXES`] before
-/// this list is consulted.
+/// Attached (`--flag=value`) forms of the diagnostics/query flags above.
 const IGNORED_ATTACHED_PREFIXES: &[&str] = &[
     "--error-format=",
     "--json=",
     "--color=",
     "--diagnostic-width=",
-    "--check-cfg=",
     "--print=",
     "--explain=",
-    "--warn=",
-    "--allow=",
-    "-W",
-    "-A",
 ];
 
-/// rustc flags that can flip the compile's *outcome* from failure to success
+/// rustc flags that can flip the compile's *outcome* between failure and success
 /// without changing the object bytes of the successful compile. A cache hit
 /// replays success, so two invocations differing only here MUST NOT share a
-/// key — otherwise one stored under "warnings allowed" would serve green to a
-/// build that `-D warnings` should have failed (review finding #2). Each is
+/// key. Every lint level is included: `-A dead_code` can override
+/// `-D warnings`, while `-W missing_docs` can become fatal under that same
+/// group gate. `--check-cfg` controls which cfg names/values trigger the
+/// `unexpected_cfgs` lint. Each flag is
 /// captured with its value into [`RustcArgs::outcome_lint_flags`] and folded
 /// into the cache key.
 const OUTCOME_AFFECTING_VALUE_FLAGS: &[&str] = &[
+    "-W",           // warn: can become fatal under a deny-level group
+    "--warn",       // long form of -W
+    "-A",           // allow: can relax an otherwise fatal lint
+    "--allow",      // long form of -A
     "-D",           // deny: warnings of the named lint become hard errors
     "--deny",       // long form of -D
     "-F",           // forbid: like deny, cannot be re-allowed downstream
     "--forbid",     // long form of -F
     "--force-warn", // forces warn level; overrides attribute-level deny/allow
     "--cap-lints", // caps every lint level; changes effective levels (cargo passes --cap-lints allow)
+    "--check-cfg", // changes which cfg names/values unexpected_cfgs accepts
 ];
 
-/// Attached forms (`--deny=warnings`, `-Dwarnings`, …) of
+/// Attached forms (`--deny=warnings`, `-Dwarnings`, `--check-cfg=cfg(...)`, …) of
 /// [`OUTCOME_AFFECTING_VALUE_FLAGS`]. Bare `-D` / `-F` prefixes match any
-/// attached value (`-Dwarnings`, `-Funused`) because rustc defines no other
-/// flag beginning with those spellings; the long forms use explicit `=`.
+/// attached value because rustc defines no other flag beginning with those
+/// spellings; the same applies to `-W` / `-A`.
 const OUTCOME_LINT_ATTACHED_PREFIXES: &[&str] = &[
+    "--warn=",
+    "--allow=",
     "--deny=",
     "--forbid=",
     "--force-warn=",
     "--cap-lints=",
+    "--check-cfg=",
+    "-W",
+    "-A",
     "-D",
     "-F",
 ];
@@ -294,12 +289,12 @@ pub struct RustcArgs {
     /// future rustc flag) yet were previously invisible to the cache key, so
     /// they are folded in under a versioned tag (kunobi-ninja/kache#324).
     pub residual_args: Vec<String>,
-    /// Outcome-affecting lint gates (`-D`/`--deny`/`--forbid`/`-F`,
-    /// `--force-warn`, `--cap-lints`) captured as flag+value token pairs in
-    /// argv order, including attached spellings (`-Dwarnings`). These cannot
-    /// change a successful compile's object bytes but DO change whether the
+    /// Outcome-affecting lint configuration (`-A`/`-W`/`-D`/`-F`, their long
+    /// forms, `--force-warn`, `--cap-lints`, and `--check-cfg`) captured as
+    /// flag+value token pairs in argv order, including attached spellings.
+    /// These cannot change successful object bytes but DO change whether the
     /// compile fails, and hits replay success — so they are folded into the
-    /// cache key (see `cache_key.rs`; review finding #2).
+    /// cache key.
     pub outcome_lint_flags: Vec<String>,
     /// Whether this is a `--test` compilation (test harness binary)
     pub is_test: bool,
@@ -583,7 +578,7 @@ impl RustcArgs {
                 "-V" | "--version" | "-h" | "--help" | "-vV" => {
                     is_query = true;
                 }
-                // Outcome-affecting lint gates: capture flag + value for the
+                // Outcome-affecting lint configuration: capture flag + value for the
                 // cache key before the generic diagnostics drop below. Must
                 // precede the IGNORED_* arms — classification is first-match
                 // (review finding #2).
@@ -971,7 +966,7 @@ fn record_codegen_opt(parsed: &mut RustcArgs, value: &str) {
 mod tests {
     use super::*;
 
-    /// Outcome-affecting lint gates must be captured exactly — flag AND
+    /// Outcome-affecting lint configuration must be captured exactly — flag AND
     /// value, separated and attached spellings — and must not leak into the
     /// residual catch-all. Asserting the captured tokens directly (not just
     /// "the key changed") pins the parse indices: a wrong skip or a wrong
@@ -1010,10 +1005,33 @@ mod tests {
         let long_attached = parse(&["--forbid=unused"]);
         assert_eq!(long_attached.outcome_lint_flags, ["--forbid=unused"]);
 
-        // Diagnostics-only levels stay out of the capture (#324).
-        let warn = parse(&["-W", "unused"]);
-        assert!(warn.outcome_lint_flags.is_empty());
-        assert!(warn.residual_args.is_empty());
+        let remaining_forms: &[(&[&str], &[&str])] = &[
+            (&["-W", "unused"], &["-W", "unused"]),
+            (&["-Wunused"], &["-Wunused"]),
+            (&["--warn", "unused"], &["--warn", "unused"]),
+            (&["--warn=unused"], &["--warn=unused"]),
+            (&["-A", "dead_code"], &["-A", "dead_code"]),
+            (&["-Adead_code"], &["-Adead_code"]),
+            (&["--allow", "dead_code"], &["--allow", "dead_code"]),
+            (&["--allow=dead_code"], &["--allow=dead_code"]),
+            (
+                &["--check-cfg", "cfg(feature, values(\"extra\"))"],
+                &["--check-cfg", "cfg(feature, values(\"extra\"))"],
+            ),
+            (&["--check-cfg=cfg(test)"], &["--check-cfg=cfg(test)"]),
+        ];
+        for (argv, expected) in remaining_forms {
+            let parsed = parse(argv);
+            assert_eq!(
+                parsed.outcome_lint_flags, *expected,
+                "wrong outcome capture for {argv:?}"
+            );
+            assert!(
+                parsed.residual_args.is_empty(),
+                "outcome flags leaked into residual for {argv:?}: {:?}",
+                parsed.residual_args
+            );
+        }
     }
 
     /// The two sides of the #627 join have to agree: what a producer records

@@ -218,7 +218,14 @@ use std::path::{Path, PathBuf};
 // Cargo process using target_2 expanded that donor suffix, failed
 // validate-on-hit, evicted the entry, and recompiled. The stored dep-info bytes
 // change, so the bump makes every incorrectly owned v26 blob unreachable.
-pub(crate) const CACHE_KEY_VERSION: u32 = 27;
+//
+// v28: every rustc lint-setting flag and `--check-cfg` now participates in
+// the outcome key. v27 ignored `-W`/`-A` and check-cfg expectation sets, so a
+// successful compile could be replayed after an allow was removed, a warning
+// was enabled beneath a deny group, or accepted cfg values were tightened.
+// v0.16.0 shipped v27, so the bump also protects mixed fleets from consuming
+// already-persisted false-success entries.
+pub(crate) const CACHE_KEY_VERSION: u32 = 28;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -1394,17 +1401,16 @@ pub fn compute_cache_key(
         );
     }
 
-    // Outcome-affecting lint gates (-D/--deny/--forbid/-F/--force-warn/
-    // --cap-lints, review finding #2): deny-level lints turn warnings into
-    // hard errors, so two invocations differing only here can disagree about
-    // whether the compile succeeded while producing identical object bytes.
+    // Outcome-affecting lint configuration (-A/-W/-D/-F, their long forms,
+    // --force-warn, --cap-lints, and --check-cfg): two invocations differing
+    // only here can disagree about whether compilation succeeded while
+    // producing identical object bytes on success. In particular, allow/warn
+    // levels interact with deny groups, and --check-cfg feeds unexpected_cfgs.
     // A hit replays success, which would flip a build that `-D warnings`
     // should have failed to green. The flags are captured during parsing
-    // (see `OUTCOME_AFFECTING_VALUE_FLAGS` in args.rs) and folded here
-    // normalized, only when non-empty — the common case (no lint gates) is
-    // byte-identical to prior keys, so no CACHE_KEY_VERSION bump is required
-    // (same precedent as residual_args above). Entries stored before this
-    // change simply miss once gates appear.
+    // (see `OUTCOME_AFFECTING_VALUE_FLAGS` in args.rs) and folded here. v28
+    // invalidates prior entries because v27 was released with these inputs
+    // missing and old clients can still populate that shared schema.
     //
     // Folded in ARGV ORDER, deliberately unsorted. The captured vector is a
     // flat token stream (`-D`, `warnings`, `--force-warn`, `deprecated`), so
@@ -1414,13 +1420,12 @@ pub fn compute_cache_key(
     // meaningful (the last level named for a lint wins). A stable argv order
     // for a given build config means keeping it costs no hits.
     if !args.outcome_lint_flags.is_empty() {
-        let outcome_lints: Vec<String> = args
-            .outcome_lint_flags
-            .iter()
-            .map(|tok| path_normalizer.normalize(tok))
-            .collect();
         hasher.set_group("outcome_lints");
-        for tok in &outcome_lints {
+        for tok in &args.outcome_lint_flags {
+            // Fold raw: check-cfg accepts arbitrary string values, including
+            // path-looking text. Path normalization could collapse two
+            // distinct accepted-value sets and reopen a false hit.
+            // The leak check is observability-only; it never rewrites the key.
             check_for_path_leak(tok, "outcome_lint");
             fold_field(&mut hasher, b"outcome_lint.v1:", tok.as_bytes());
             tracing::trace!("[key:{}] outcome_lint:{}", crate_name, tok);
@@ -5424,9 +5429,9 @@ mod tests {
     /// fold and over-key the result. Guards the same invariant as the
     /// `key_matrix_*_does_not_change_key` tests for flags cargo passes routinely.
     ///
-    /// Outcome-affecting lint gates (`--cap-lints`, `--force-warn`, deny-level
-    /// flags) are deliberately NOT in this list: they must change the key —
-    /// see `key_matrix_outcome_lint_gate_changes_key`.
+    /// Outcome-affecting lint configuration is deliberately NOT in this list:
+    /// every lint level and `--check-cfg` must change the key —
+    /// see `key_matrix_outcome_lint_configuration_changes_key`.
     #[test]
     fn residual_strips_diagnostic_and_query_flags() {
         let _lock = key_test_lock();
@@ -5436,12 +5441,9 @@ mod tests {
 
         let base = key_of_flags(&flag_base(&source, &[]));
         for extra in [
-            vec!["--check-cfg", "cfg(foo)"],
             vec!["--diagnostic-width=80"],
             vec!["--json=artifacts"],
             vec!["--color", "always"],
-            vec!["-W", "unused"],
-            vec!["-Wunused"],
             vec!["--verbose"],
         ] {
             assert_eq!(
@@ -8489,13 +8491,12 @@ pub fn value() -> (&'static str, u8) {
     // over-keying (a missed hit) — the test will fail and surface it
     // rather than silently weakening the key.
     //
-    // Deny-level lint gates are deliberately absent from this section:
-    // they also cannot change a successful compile's bytes, but they
-    // change whether the compile FAILS, and a hit replays success — so
-    // they must change the key. See the "outcome lint" tests below.
+    // All lint configuration is deliberately absent from this section: it
+    // cannot change successful artifact bytes, but it can change whether the
+    // compile FAILS, and a hit replays success. See the tests below.
 
     #[test]
-    fn key_matrix_outcome_lint_gate_changes_key() {
+    fn key_matrix_outcome_lint_configuration_changes_key() {
         // `-D warnings` promotes warnings to hard errors: two builds
         // differing only here can disagree about whether the compile
         // succeeded while emitting byte-identical objects on success.
@@ -8519,6 +8520,14 @@ pub fn value() -> (&'static str, u8) {
         with_cap.extend(["--cap-lints".to_string(), "allow".to_string()]);
         let mut with_attached = base_args(&source);
         with_attached.push("-Dwarnings".to_string());
+        let mut with_warn = base_args(&source);
+        with_warn.extend(["-W".to_string(), "unused".to_string()]);
+        let mut with_allow = base_args(&source);
+        with_allow.extend(["-A".to_string(), "dead_code".to_string()]);
+        let mut with_check_cfg = base_args(&source);
+        with_check_cfg.extend(["--check-cfg".to_string(), "cfg(foo)".to_string()]);
+        let mut with_other_check_cfg = base_args(&source);
+        with_other_check_cfg.push("--check-cfg=cfg(bar)".to_string());
 
         assert_ne!(
             key_for(&base),
@@ -8542,21 +8551,70 @@ pub fn value() -> (&'static str, u8) {
             "separated (`-D warnings`) and attached (`-Dwarnings`) spellings \
              carry different tokens; each keys distinctly by design"
         );
-        // Diagnostics-only levels stay out of the key (#324): -W/-A never
-        // flip the outcome, so keying them would only cost hits.
-        let mut with_warn = base_args(&source);
-        with_warn.extend(["-W".to_string(), "unused".to_string()]);
-        let mut with_allow = base_args(&source);
-        with_allow.extend(["-A".to_string(), "dead_code".to_string()]);
-        assert_eq!(
+        assert_ne!(
             key_for(&base),
             key_for(&with_warn),
-            "-W stays diagnostics-only: it cannot flip the outcome"
+            "-W can activate a lint that a deny group makes fatal"
         );
-        assert_eq!(
+        assert_ne!(
             key_for(&base),
             key_for(&with_allow),
-            "-A stays diagnostics-only: it cannot flip the outcome"
+            "-A can relax an otherwise fatal lint"
+        );
+        assert_ne!(
+            key_for(&base),
+            key_for(&with_check_cfg),
+            "--check-cfg controls the unexpected_cfgs outcome"
+        );
+        assert_ne!(
+            key_for(&with_check_cfg),
+            key_for(&with_other_check_cfg),
+            "different accepted cfg sets must not share a key"
+        );
+    }
+
+    #[test]
+    fn check_cfg_values_are_not_path_normalized() {
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let root = tempfile::tempdir().unwrap();
+        let key_at = |workspace: &Path, with_check_cfg: bool| {
+            std::fs::create_dir_all(workspace).unwrap();
+            let source = workspace.join("lib.rs");
+            std::fs::write(&source, b"pub fn hello() {}").unwrap();
+            let mut args = base_args(&source);
+            if with_check_cfg {
+                let semantic_path = workspace
+                    .join("generated")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                args.extend([
+                    "--check-cfg".to_string(),
+                    format!("cfg(build_path, values(\"{semantic_path}\"))"),
+                ]);
+            }
+            let parsed = RustcArgs::parse(&args).unwrap();
+            compute_cache_key(
+                &parsed,
+                &FileHasher::new(),
+                &PathNormalizer::from_env(Some(workspace)),
+            )
+            .unwrap()
+        };
+
+        let workspace_a = root.path().join("checkout-a");
+        let workspace_b = root.path().join("checkout-b");
+        assert_eq!(
+            key_at(&workspace_a, false),
+            key_at(&workspace_b, false),
+            "the control must prove ordinary workspace paths normalize portably"
+        );
+        assert_ne!(
+            key_at(&workspace_a, true),
+            key_at(&workspace_b, true),
+            "path-looking check-cfg values are semantic strings and must stay raw"
         );
     }
 

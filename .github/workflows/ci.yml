@@ -86,7 +86,11 @@ jobs:
           version: 2026.6.9
           cache: false
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-      - uses: kunobi-ninja/kache-action@eeafa81c39bb1b268304fd144523de074e0f793b # v1
+      # Held at a pre-runtime-dir revision: newer kache-action exports
+      # KACHE_RUNTIME_DIR into the job env, and the test suite is not yet
+      # hermetic against it (integration tests read events.jsonl from the
+      # cache dir; daemon unit tests would share one runtime dir).
+      - uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
         with:
           github-cache: "true"
           cache-executables: "false"

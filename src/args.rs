@@ -414,6 +414,7 @@ impl RustcArgs {
 
         let mut i = 0;
         while i < rustc_args.len() {
+            let i_before = i;
             let arg = &rustc_args[i];
 
             match arg.as_str() {
@@ -591,7 +592,7 @@ impl RustcArgs {
                     if let Some(value) = rustc_args.get(i + 1) {
                         parsed.outcome_lint_flags.push(value.clone());
                     }
-                    i += 1; // skip the value argument
+                    i = i.saturating_add(1); // skip the value argument
                 }
                 _ if OUTCOME_LINT_ATTACHED_PREFIXES
                     .iter()
@@ -623,6 +624,16 @@ impl RustcArgs {
                 }
             }
             i += 1;
+            // Every iteration must consume at least the token it just
+            // classified. An arm that moves `i` backwards instead of forward
+            // would spin here forever, growing whatever vector it pushes to
+            // until the machine runs out of memory — a failure mode no test
+            // can catch, since there is nothing to fail. Debug-only, so the
+            // release parse is unchanged.
+            debug_assert!(
+                i > i_before,
+                "argv parse must advance past index {i_before}"
+            );
         }
 
         parsed.features.sort();

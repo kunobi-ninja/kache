@@ -5173,21 +5173,26 @@ mod tests {
         // Windows reports it with the same shape as a free name.
         let not_a_dir = dir.path().join("not-a-dir");
         fs::write(&not_a_dir, b"").unwrap();
-        match free_staging_path(|n| not_a_dir.join(format!("x-{n}"))) {
-            Err(err) => assert_ne!(
+        let result = free_staging_path(|n| not_a_dir.join(format!("x-{n}")));
+
+        #[cfg(unix)]
+        {
+            // ENOTDIR: a real fault must surface as itself, never as an
+            // exhausted-name collision, and never be skipped past.
+            let err = result.unwrap_err();
+            assert_ne!(
                 err.kind(),
                 std::io::ErrorKind::AlreadyExists,
-                "a real fault must surface as itself, not as a name collision: {err}"
-            ),
-            // Where the platform cannot tell the fault from a free name, the
-            // search hands the candidate back and the ingest is what fails —
-            // what must never happen either way is spinning through every
-            // attempt and calling it a collision.
-            Ok(candidate) => assert!(
-                candidate.starts_with(&not_a_dir),
-                "expected the first candidate, got {}",
-                candidate.display()
-            ),
+                "a real fault must not be reported as a name collision: {err}"
+            );
+        }
+        #[cfg(windows)]
+        {
+            // Windows cannot tell this fault from a free name, so the search
+            // hands the candidate back and the ingest is what fails. What
+            // must not happen either way is spinning through every attempt.
+            let candidate = result.expect("windows reports the parent as absent");
+            assert!(candidate.starts_with(&not_a_dir));
         }
     }
 

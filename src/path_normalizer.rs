@@ -1204,17 +1204,31 @@ pub(crate) fn check_for_path_leak(value: &str, context: &str) {
             // Show a small window around the leak to make it easier
             // to identify (env var name etc.) without dumping the
             // whole value, which could be huge.
-            let start = idx.saturating_sub(40);
-            let end = (idx + prefix.len() + 40).min(value.len());
             tracing::warn!(
                 "residual absolute path detected in `{}` (prefix `{}`): ...{}...",
                 context,
                 prefix,
-                &value[start..end]
+                leak_window(value, idx, prefix.len())
             );
             return;
         }
     }
+}
+
+/// The ±40-byte window of `value` around the leak found at byte `idx`,
+/// widened outward to char boundaries: `find` returns a byte offset, so
+/// either edge of the raw window can land inside a multi-byte character
+/// and slicing there would panic.
+fn leak_window(value: &str, idx: usize, prefix_len: usize) -> &str {
+    let mut start = idx.saturating_sub(40);
+    while !value.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (idx + prefix_len + 40).min(value.len());
+    while !value.is_char_boundary(end) {
+        end += 1;
+    }
+    &value[start..end]
 }
 
 /// Back-compat shim retained for `PathNormalizer::normalize` callers.
@@ -1641,6 +1655,31 @@ mod tests {
                 "{off:?} should disable it"
             );
         }
+    }
+
+    /// A leaked path surrounded by multi-byte characters puts both raw
+    /// window edges (`idx - 40`, `idx + prefix_len + 40`) inside a
+    /// character; the window must widen to boundaries instead of
+    /// panicking (kache review finding: char-boundary slice panic).
+    #[test]
+    fn leak_window_widens_to_char_boundaries() {
+        // 20 three-byte chars on each side; the 8-byte leak in the
+        // middle makes both `60 - 40 = 20` and `60 + 6 + 40 = 106`
+        // land mid-character.
+        let value = format!("{}{}{}", "日".repeat(20), "/home/us", "本".repeat(20));
+        let idx = value.find("/home/").expect("leak present");
+        assert!(!value.is_char_boundary(idx.saturating_sub(40)));
+        assert!(!value.is_char_boundary(idx + "/home/".len() + 40));
+
+        let window = leak_window(&value, idx, "/home/".len());
+        assert!(window.contains("/home/us"));
+
+        // Degenerate shapes stay in-bounds: leak at the very start,
+        // at the very end, and a value shorter than the window.
+        assert_eq!(leak_window("/home/x", 0, "/home/".len()), "/home/x");
+        let tail = format!("{}{}", "あ".repeat(30), "/home/y");
+        let idx = tail.find("/home/").expect("leak present");
+        assert!(leak_window(&tail, idx, "/home/".len()).ends_with("/home/y"));
     }
 
     #[test]

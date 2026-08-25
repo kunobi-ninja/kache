@@ -527,6 +527,49 @@ fn env_name_key_bytes(name: &std::ffi::OsStr) -> Vec<u8> {
     env_os_key_bytes(name)
 }
 
+/// Env text as key bytes: the exact UTF-8 bytes when the text is valid
+/// UTF-8, or `0xFF`-tagged lossless OS bytes when it isn't.
+///
+/// The valid arm is byte-identical to hashing the `String` that
+/// `std::env::vars()` used to yield, so keys for all-UTF-8 environments
+/// (every one cargo itself constructs) are unchanged. The tag byte never
+/// occurs in valid UTF-8, so the two arms cannot collide — and unlike
+/// `to_string_lossy`, distinct invalid sequences stay distinct instead
+/// of merging under U+FFFD (see [`env_os_key_bytes`]).
+fn env_text_key_bytes(text: &std::ffi::OsStr) -> Vec<u8> {
+    match text.to_str() {
+        Some(utf8) => utf8.as_bytes().to_vec(),
+        None => {
+            let mut bytes = vec![0xff];
+            bytes.extend(env_os_key_bytes(text));
+            bytes
+        }
+    }
+}
+
+/// The `CARGO_CFG_*` pairs of an environment, sorted by name.
+///
+/// Takes `vars_os` pairs rather than `vars()`, which panics if *any*
+/// environment variable holds non-UTF-8 — even one this filter would
+/// discard. Pairs stay `OsString` so the hasher can fold them
+/// losslessly via [`env_text_key_bytes`].
+///
+/// The primary sort key is the lossy name — the same order the old
+/// `String` sort produced for every valid-UTF-8 environment. The
+/// lossless tiebreak pins two names that collide under U+FFFD to a
+/// deterministic order instead of platform iteration order.
+fn cargo_cfg_pairs(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut pairs: Vec<(std::ffi::OsString, std::ffi::OsString)> = vars
+        .filter(|(name, _)| name.to_string_lossy().starts_with("CARGO_CFG_"))
+        .collect();
+    pairs.sort_by_cached_key(|(name, _)| {
+        (name.to_string_lossy().into_owned(), env_os_key_bytes(name))
+    });
+    pairs
+}
+
 /// Does any `key_env_vars` pattern select the env var `name`?
 ///
 /// Exact match, or prefix match when the pattern ends in `*`. ASCII
@@ -1433,22 +1476,21 @@ pub fn compute_cache_key(
     }
 
     // Relevant CARGO_CFG_* env vars (sorted for determinism —
-    // std::env::vars() iteration order is platform-defined and not stable)
+    // environment iteration order is platform-defined and not stable)
     hasher.set_group("env_cfg");
-    let mut cargo_cfgs: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("CARGO_CFG_"))
-        .collect();
-    cargo_cfgs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let cargo_cfgs = cargo_cfg_pairs(std::env::vars_os());
     tracing::trace!("[key:{}] cargo_cfg_count={}", crate_name, cargo_cfgs.len());
     for (key, value) in &cargo_cfgs {
         // Cargo derives CARGO_CFG_* from `--cfg` flags. Build scripts (and
         // mozbuild specifically) emit cfgs that can embed absolute paths;
         // those land here uncensored. Flag leaks so the offending var
-        // name is visible in the warn.
-        check_for_path_leak(value, &format!("cargo_cfg:{key}"));
-        hasher.update(key.as_bytes());
+        // name is visible in the warn. The lossy forms are diagnostic
+        // only; the hash folds the lossless bytes.
+        let key_lossy = key.to_string_lossy();
+        check_for_path_leak(&value.to_string_lossy(), &format!("cargo_cfg:{key_lossy}"));
+        hasher.update(&env_text_key_bytes(key));
         hasher.update(b"=");
-        hasher.update(value.as_bytes());
+        hasher.update(&env_text_key_bytes(value));
         hasher.update(b"\n");
     }
 
@@ -4528,6 +4570,68 @@ mod tests {
             env_os_key_bytes(OsStr::new("normal"))
         );
         assert!(env_os_key_bytes(OsStr::new("")).is_empty());
+    }
+
+    #[test]
+    fn cargo_cfg_pairs_filters_and_sorts() {
+        use std::ffi::OsString;
+        let pairs = cargo_cfg_pairs(
+            [
+                (OsString::from("CARGO_CFG_ZED"), OsString::from("1")),
+                (OsString::from("PATH"), OsString::from("/usr/bin")),
+                (OsString::from("CARGO_CFG_ABI"), OsString::from("eabi")),
+                (OsString::from("CARGO_PKG_NAME"), OsString::from("x")),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                (OsString::from("CARGO_CFG_ABI"), OsString::from("eabi")),
+                (OsString::from("CARGO_CFG_ZED"), OsString::from("1")),
+            ]
+        );
+    }
+
+    /// A non-UTF-8 variable anywhere in the environment used to panic the
+    /// whole key computation via `std::env::vars()`; now the unrelated
+    /// variable is filtered out and a `CARGO_CFG_*` pair survives with its
+    /// exact bytes.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_cfg_pairs_tolerates_non_utf8_environments() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = OsString::from_vec(vec![b'a', 0xff, b'b']);
+        let pairs = cargo_cfg_pairs(
+            [
+                (OsString::from_vec(vec![0xff, 0xfe]), invalid.clone()),
+                (OsString::from("CARGO_CFG_RAW"), invalid.clone()),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(pairs, vec![(OsString::from("CARGO_CFG_RAW"), invalid)]);
+    }
+
+    /// Valid UTF-8 folds byte-identically to the old `vars()`-string
+    /// hashing (no key change without a version bump); invalid sequences
+    /// fold losslessly and distinctly instead of merging under U+FFFD.
+    #[test]
+    fn env_text_key_bytes_preserves_utf8_and_distinguishes_invalid() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            env_text_key_bytes(OsStr::new("target_os=\"linux\"")),
+            b"target_os=\"linux\"".to_vec()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let a = env_text_key_bytes(OsStr::from_bytes(&[b'x', 0xff]));
+            let b = env_text_key_bytes(OsStr::from_bytes(&[b'x', 0xfe]));
+            assert_ne!(a, b);
+            // Tagged: cannot collide with any valid-UTF-8 value's bytes.
+            assert_eq!(a[0], 0xff);
+        }
     }
 
     #[test]

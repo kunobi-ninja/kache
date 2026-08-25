@@ -245,24 +245,43 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
     }
     Ok(published)
 }
-/// Create a file that does not yet exist under `dir`, retrying with
-/// successive nonces if a candidate name is taken. Returns the opened file
-/// (held open only to keep the name reserved) and its path.
+/// Process-wide monotonic counter behind staging file names. Paired with the
+/// pid it makes every in-flight staging path unique *by construction*: two
+/// threads never draw the same nonce, and two live processes never share a
+/// pid. That is what lets [`free_staging_path`] hand the ingest a path that
+/// does not exist yet — see the warning there.
+static STAGE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many nonces to try before giving up on finding a free staging name.
+/// Only stale leftovers from a crashed process whose pid has since been
+/// recycled can occupy one, so a handful of attempts is already generous;
+/// the bound keeps a pathological staging directory failing fast instead of
+/// spinning forever.
+const STAGING_NAME_ATTEMPTS: u32 = 16;
+
+/// Pick a staging path that does not exist yet, skipping past any stale
+/// leftover, and return it WITHOUT creating it.
 ///
-/// Extracted from [`Store::stage_blob_from_source`] so the collision-retry
+/// Not creating it is the whole point: `clonefile(2)` (macOS) and `link(2)`
+/// (everywhere) both fail with `EEXIST` when their destination already
+/// exists, so reserving the name with a placeholder file would make both
+/// zero-copy ingests fail and silently demote every put to a full byte copy.
+/// Uniqueness comes from pid + [`STAGE_NONCE`] instead of from `create_new`,
+/// which is stronger than a placeholder anyway: no live stager can draw this
+/// name, so there is nothing to reserve it against.
+///
+/// Extracted from [`Store::stage_blob_from_source`] so the skip-and-retry
 /// branch is unit-testable with injected names.
-fn open_unique_staging_file(
-    mut name_for_nonce: impl FnMut(u64) -> PathBuf,
-) -> std::io::Result<(fs::File, PathBuf)> {
-    for nonce in 0..u64::MAX {
-        let candidate = name_for_nonce(nonce);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => return Ok((file, candidate)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+fn free_staging_path(mut name_for_nonce: impl FnMut(u64) -> PathBuf) -> std::io::Result<PathBuf> {
+    for _ in 0..STAGING_NAME_ATTEMPTS {
+        let candidate = name_for_nonce(STAGE_NONCE.fetch_add(1, Ordering::Relaxed));
+        match fs::symlink_metadata(&candidate) {
+            // Occupied by a crash leftover: leave it for the staging sweep
+            // and take the next nonce.
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            // Anything else (unreadable or missing staging directory) is a
+            // real fault, not a collision: surface it instead of spinning.
             Err(e) => return Err(e),
         }
     }
@@ -2773,6 +2792,11 @@ impl Store {
     /// applied only after the fsync (Windows needs a writable handle to flush,
     /// #196), and a failed demotes to a full copy rather than publishing a
     /// writable shared inode.
+    ///
+    /// The staging path is chosen but NOT created ([`free_staging_path`]): the
+    /// reflink and hardlink ingests can only write to a destination that does
+    /// not exist yet, so pre-creating it would cost a full byte copy per
+    /// artifact on every filesystem.
     fn stage_blob_from_source(
         &self,
         source: &Path,
@@ -2782,16 +2806,11 @@ impl Store {
         fs::create_dir_all(&dir)
             .with_context(|| format!("creating staging directory {}", dir.display()))?;
 
-        // Unique-by-construction name; `create_new` closes any nonce race.
+        // Unique by construction (pid + process-wide nonce), so the path can
+        // be left free for the zero-copy ingests below.
         let pid = std::process::id();
-        let (_reserved, tmp) = open_unique_staging_file(|nonce| {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            dir.join(format!("stage-{pid}-{nonce}-{nanos}.tmp"))
-        })
-        .with_context(|| format!("creating staging file in {}", dir.display()))?;
+        let tmp = free_staging_path(|nonce| dir.join(format!("stage-{pid}-{nonce}.tmp")))
+            .with_context(|| format!("reserving a staging name in {}", dir.display()))?;
 
         let stage = |tmp: &Path, allow_hardlink: bool| -> Result<(StoreIngest, bool)> {
             let ingest = if crate::link::try_reflink(source, tmp).is_ok() {
@@ -5016,11 +5035,11 @@ mod tests {
         assert!(!fresh.exists());
     }
 
-    /// The staging name loop must RETRY on a taken candidate (not fail and
-    /// not treat a real error as a collision): with the second name
-    /// pre-created, staging lands on the third.
+    /// The staging name search must SKIP an occupied candidate (a crash
+    /// leftover) and hand back the next free one — and hand it back
+    /// uncreated, which is what keeps the zero-copy ingests usable.
     #[test]
-    fn open_unique_staging_file_retries_taken_names() {
+    fn free_staging_path_skips_occupied_names() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("cand-a");
         let second = dir.path().join("cand-b");
@@ -5029,27 +5048,85 @@ mod tests {
         // First candidate always collides; the next one is free.
         let names: Vec<PathBuf> = vec![first.clone(), second.clone()];
         let mut calls = 0usize;
-        let (file, got) = open_unique_staging_file(|_| {
+        let got = free_staging_path(|_| {
             let p = names[calls].clone();
             calls += 1;
             p
         })
         .unwrap();
-        drop(file);
         assert_eq!(got, second, "must skip the taken candidate");
+        assert!(
+            !got.exists(),
+            "the chosen path must NOT exist: clonefile(2)/link(2) fail with \
+             EEXIST on an existing destination, which would demote every put \
+             to a full byte copy"
+        );
     }
 
-    /// A non-collision open error must propagate as an error, not be
-    /// swallowed by the retry branch.
+    /// A non-collision error must propagate as itself, not be swallowed by
+    /// the skip branch and reported as an exhausted name search.
     #[test]
-    fn open_unique_staging_file_propagates_real_errors() {
+    fn free_staging_path_propagates_real_errors() {
         let dir = tempfile::tempdir().unwrap();
-        // A FILE used as the parent path: create_new under it must fail with
+        // A FILE used as the parent path: stat under it must fail with
         // ENOTDIR, and that error must surface rather than be retried away.
         let not_a_dir = dir.path().join("not-a-dir");
         fs::write(&not_a_dir, b"").unwrap();
-        let err = open_unique_staging_file(|n| not_a_dir.join(format!("x-{n}")));
-        assert!(err.is_err(), "opening under a file-path parent must fail");
+        let err = free_staging_path(|n| not_a_dir.join(format!("x-{n}"))).unwrap_err();
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "a real fault must surface as itself, not as a name collision: {err}"
+        );
+    }
+
+    /// Exhausting every candidate reports a bounded failure rather than
+    /// spinning: an unbounded search is a hang no test can kill.
+    #[test]
+    fn free_staging_path_gives_up_after_bounded_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = dir.path().join("always-taken");
+        fs::write(&taken, b"taken").unwrap();
+
+        let mut calls = 0u32;
+        let err = free_staging_path(|_| {
+            calls += 1;
+            taken.clone()
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(calls, STAGING_NAME_ATTEMPTS, "search must be bounded");
+    }
+
+    /// Staging must reach the store by reflink or hardlink, never by writing
+    /// the artifact's bytes a second time.
+    ///
+    /// The ingest destination has to be a path that does not exist yet:
+    /// `clonefile(2)` and `link(2)` both fail with `EEXIST` otherwise, so a
+    /// staging file that is pre-created (to reserve its name, say) turns a
+    /// metadata-only clone into a full copy of every artifact — still
+    /// correct, but it doubles put I/O and stops store blobs from sharing
+    /// blocks with the build output they came from.
+    #[cfg(unix)]
+    #[test]
+    fn staging_ingests_zero_copy_not_a_byte_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"artifact-bytes").unwrap();
+
+        // Same filesystem as the store, so a hardlink is always available
+        // even where the filesystem has no reflink support (ext4, tmpfs).
+        let (staged, ingest) = store.stage_blob_from_source(&source, true).unwrap();
+        assert!(
+            !matches!(ingest, StoreIngest::Copy),
+            "staging fell back to a byte copy where a reflink or hardlink \
+             was available — the ingest destination must not exist yet"
+        );
+        assert_eq!(fs::read(&staged).unwrap(), b"artifact-bytes");
+        Store::drop_tmp_restore_source(&source, &staged);
     }
 
     /// A symlinked source must never be hardlinked into the store: hashing

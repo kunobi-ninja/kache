@@ -1401,17 +1401,24 @@ pub fn compute_cache_key(
     // A hit replays success, which would flip a build that `-D warnings`
     // should have failed to green. The flags are captured during parsing
     // (see `OUTCOME_AFFECTING_VALUE_FLAGS` in args.rs) and folded here
-    // normalized + sorted, only when non-empty — the common case (no lint
-    // gates) is byte-identical to prior keys, so no CACHE_KEY_VERSION bump is
-    // required (same precedent as residual_args above). Entries stored before
-    // this change simply miss once gates appear.
+    // normalized, only when non-empty — the common case (no lint gates) is
+    // byte-identical to prior keys, so no CACHE_KEY_VERSION bump is required
+    // (same precedent as residual_args above). Entries stored before this
+    // change simply miss once gates appear.
+    //
+    // Folded in ARGV ORDER, deliberately unsorted. The captured vector is a
+    // flat token stream (`-D`, `warnings`, `--force-warn`, `deprecated`), so
+    // sorting would both break the flag↔value pairing — `-D unsafe_code -F
+    // warnings` and `-F unsafe_code -D warnings` share a sorted multiset but
+    // not an outcome — and erase order, which rustc itself treats as
+    // meaningful (the last level named for a lint wins). A stable argv order
+    // for a given build config means keeping it costs no hits.
     if !args.outcome_lint_flags.is_empty() {
-        let mut outcome_lints: Vec<String> = args
+        let outcome_lints: Vec<String> = args
             .outcome_lint_flags
             .iter()
             .map(|tok| path_normalizer.normalize(tok))
             .collect();
-        outcome_lints.sort();
         hasher.set_group("outcome_lints");
         for tok in &outcome_lints {
             check_for_path_leak(tok, "outcome_lint");
@@ -8550,6 +8557,54 @@ pub fn value() -> (&'static str, u8) {
             key_for(&base),
             key_for(&with_allow),
             "-A stays diagnostics-only: it cannot flip the outcome"
+        );
+    }
+
+    #[test]
+    fn key_matrix_outcome_lint_gates_key_by_pairing_not_multiset() {
+        // The gates are captured as a flat token stream, so folding them
+        // sorted would collapse permutations that mean different things:
+        // `-D unsafe_code -F warnings` denies unsafe_code (a `#[allow]` in
+        // the crate can still re-allow it) and forbids warnings, while the
+        // swap forbids unsafe_code (no `#[allow]` escape) and denies
+        // warnings. Same token multiset, different outcomes — so the key
+        // must distinguish them.
+        if !rustc_available() {
+            return;
+        }
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let gated = |gates: &[&str]| {
+            let mut args = base_args(&source);
+            args.extend(gates.iter().map(|s| s.to_string()));
+            key_for(&args)
+        };
+
+        assert_ne!(
+            gated(&["-D", "unsafe_code", "-F", "warnings"]),
+            gated(&["-F", "unsafe_code", "-D", "warnings"]),
+            "swapping which lint is denied and which is forbidden changes \
+             the outcome and MUST change the key"
+        );
+        // (`--force-warn` takes a single lint, never a group, so both sides
+        // name concrete lints.)
+        assert_ne!(
+            gated(&["-D", "unused_mut", "--force-warn", "deprecated"]),
+            gated(&["-D", "deprecated", "--force-warn", "unused_mut"]),
+            "swapping the deny and force-warn targets changes the outcome \
+             and MUST change the key"
+        );
+        // Argv order is kept as the conservative choice: rustc resolves
+        // repeated levels for the same lint last-wins, so a reordered gate
+        // list can be a different build. A given build config emits a stable
+        // order, so preserving it costs no hits.
+        assert_ne!(
+            gated(&["-D", "warnings", "-A", "unused", "-D", "unused"]),
+            gated(&["-D", "unused", "-A", "unused", "-D", "warnings"]),
+            "gate order is preserved in the key"
         );
     }
 

@@ -12268,7 +12268,8 @@ mod tests {
     struct BlockingPackBackend {
         inner: Arc<dyn crate::remote_backend::RemoteBackend>,
         pack_started: Arc<Notify>,
-        release_pack: Arc<Notify>,
+        release_pack: Arc<tokio::sync::Semaphore>,
+        v3_get_started: Option<Arc<Notify>>,
     }
 
     #[async_trait::async_trait]
@@ -12284,7 +12285,15 @@ mod tests {
         ) -> Result<Option<crate::remote_backend::GetObject>> {
             if key.contains("/v4/prefetch/packs/") {
                 self.pack_started.notify_waiters();
-                self.release_pack.notified().await;
+                let _release = self
+                    .release_pack
+                    .acquire()
+                    .await
+                    .expect("test release semaphore stays open");
+            } else if key.contains("/v3/packs/")
+                && let Some(started) = &self.v3_get_started
+            {
+                started.notify_waiters();
             }
             self.inner.get(key, max_bytes).await
         }
@@ -12964,12 +12973,13 @@ mod tests {
         .await;
 
         let pack_started = Arc::new(Notify::new());
-        let release_pack = Arc::new(Notify::new());
+        let release_pack = Arc::new(tokio::sync::Semaphore::new(0));
         let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
             Arc::new(BlockingPackBackend {
                 inner,
                 pack_started: pack_started.clone(),
                 release_pack: release_pack.clone(),
+                v3_get_started: None,
             });
         let daemon = Arc::new(Daemon::new(config));
         assert!(daemon.remote_backend.set(backend).is_ok());
@@ -12978,7 +12988,7 @@ mod tests {
         tokio::pin!(started);
         started.as_mut().enable();
         let response = tokio::time::timeout(
-            Duration::from_millis(250),
+            Duration::from_secs(10),
             daemon.handle_prefetch_with_context(
                 &PrefetchRequest {
                     keys: vec![(key.clone(), "serde".into())],
@@ -12991,12 +13001,12 @@ mod tests {
         .await
         .expect("prefetch acknowledgement must not await the pack GET");
         assert!(response.ok);
-        tokio::time::timeout(Duration::from_secs(1), started)
+        tokio::time::timeout(Duration::from_secs(10), started)
             .await
             .expect("background coordinator should start the pack GET");
         assert!(!daemon.entry_dir_for(&key).exists());
 
-        release_pack.notify_waiters();
+        release_pack.add_permits(1);
         wait_for_store_entry(&daemon, &key).await;
     }
 
@@ -13044,15 +13054,18 @@ mod tests {
         .await;
 
         let pack_started = Arc::new(Notify::new());
-        let release_pack = Arc::new(Notify::new());
+        let release_pack = Arc::new(tokio::sync::Semaphore::new(0));
+        let v3_get_started = Arc::new(Notify::new());
         let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
             Arc::new(BlockingPackBackend {
                 inner,
                 pack_started: pack_started.clone(),
                 release_pack: release_pack.clone(),
+                v3_get_started: Some(v3_get_started.clone()),
             });
         let daemon = Arc::new(Daemon::new(config));
         assert!(daemon.remote_backend.set(backend).is_ok());
+        daemon.signal_warming_complete();
 
         let started = pack_started.notified();
         tokio::pin!(started);
@@ -13070,27 +13083,38 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(1), started)
+        tokio::time::timeout(Duration::from_secs(10), started)
             .await
             .expect("pack GET should block in the injected backend");
 
-        let demand = tokio::time::timeout(
-            Duration::from_secs(1),
-            daemon.handle_remote_check(&RemoteCheckRequest {
-                key: demand_key.clone(),
-                entry_dir: daemon
-                    .entry_dir_for(&demand_key)
-                    .to_string_lossy()
-                    .into_owned(),
-                crate_name: "tokio".into(),
-                deadline_ms: None,
-            }),
-        )
-        .await
-        .expect("demand v3 read must not wait for the pack GET");
+        let v3_started = v3_get_started.notified();
+        tokio::pin!(v3_started);
+        v3_started.as_mut().enable();
+        let demand_daemon = daemon.clone();
+        let demand_entry_dir = daemon
+            .entry_dir_for(&demand_key)
+            .to_string_lossy()
+            .into_owned();
+        let demand_task = tokio::spawn(async move {
+            demand_daemon
+                .handle_remote_check(&RemoteCheckRequest {
+                    key: demand_key.clone(),
+                    entry_dir: demand_entry_dir,
+                    crate_name: "tokio".into(),
+                    deadline_ms: None,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), v3_started)
+            .await
+            .expect("demand v3 GET must start while the pack GET remains blocked");
+        let demand = tokio::time::timeout(Duration::from_secs(10), demand_task)
+            .await
+            .expect("demand v3 read must complete while the pack GET remains blocked")
+            .expect("demand task must not panic");
         assert_eq!(demand.found, Some(true));
 
-        release_pack.notify_waiters();
+        release_pack.add_permits(1);
         assert!(packed.await.unwrap().ok);
     }
 

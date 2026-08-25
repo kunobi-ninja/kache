@@ -4260,7 +4260,22 @@ impl Store {
     }
 
     /// Clear the entire store.
+    ///
+    /// Index rows drop first, in one transaction: once it commits no
+    /// reader can begin a restore from a purged entry, and a racing
+    /// publisher's registration serializes wholly before it (purged with
+    /// the rest) or wholly after (its rows survive; a later re-put heals
+    /// its files). The filesystem wipe then runs against a store the
+    /// index no longer references, so a crash mid-wipe strands at worst
+    /// orphan files for the sweep — never index rows pointing at deleted
+    /// blobs, which the old wipe-then-delete order could leave.
     pub fn clear(&self) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("DELETE FROM entries", [])?;
+        tx.execute("DELETE FROM entry_blobs", [])?;
+        tx.execute("DELETE FROM blobs", [])?;
+        tx.execute("DELETE FROM incremental_dirs", [])?;
+        tx.commit()?;
         let store_dir = self.config.store_dir();
         if store_dir.exists() {
             // Make everything writable recursively, then remove all subdirs
@@ -4272,10 +4287,6 @@ impl Store {
                 }
             }
         }
-        self.db.execute("DELETE FROM entries", [])?;
-        self.db.execute("DELETE FROM entry_blobs", [])?;
-        self.db.execute("DELETE FROM blobs", [])?;
-        self.db.execute("DELETE FROM incremental_dirs", [])?;
         Ok(())
     }
 

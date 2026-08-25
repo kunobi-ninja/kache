@@ -2620,6 +2620,13 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>, stale_schema: bool) -> Re
 pub fn purge(config: &Config, crate_filter: Option<&str>) -> Result<()> {
     let store = Store::open(config)?;
 
+    // Purge is a bulk mutation like a GC sweep, so it holds the same
+    // cross-process lock every GC driver takes: a sweep either finishes
+    // before the purge starts or sees the store only after the purge is
+    // done, never a half-wiped one. Per-blob safety against concurrent
+    // builds still comes from the delete-row-first transactional gates.
+    let _gc_lock = store.acquire_gc_lock().context("locking GC for purge")?;
+
     if let Some(name) = crate_filter {
         let entries = store.list_entries("name")?;
         let mut removed = 0;
@@ -7479,6 +7486,45 @@ mod tests {
                 .exists(),
             "corrupt entry remains accounted-for after skipped purge"
         );
+    }
+
+    /// Purge is a bulk mutation and must serialize behind the same
+    /// cross-process lock every GC driver takes; unlocked, a purge can
+    /// interleave with a live sweep and each observes the other's
+    /// half-removed state.
+    #[test]
+    fn purge_waits_for_the_gc_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        put_entry(&config, "purgelockkey", "locked", dir.path());
+
+        let store = crate::store::Store::open(&config).unwrap();
+        let gc_lock = store.try_gc_lock().unwrap().expect("uncontended lock");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let cfg = config.clone();
+        let worker = std::thread::spawn(move || {
+            let result = purge(&cfg, None);
+            let _ = done_tx.send(());
+            result
+        });
+
+        // While the "sweep" holds gc.lock the purge must not complete.
+        // (A scheduling hiccup can only delay the mutant's completion
+        // signal, never produce a false failure for the real code.)
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "purge completed while the GC lock was held"
+        );
+        drop(gc_lock);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("purge proceeds once the GC lock is released");
+        worker.join().unwrap().expect("purge succeeds");
+        let store = crate::store::Store::open(&config).unwrap();
+        assert_eq!(store.entry_count().unwrap(), 0, "store cleared");
     }
 
     #[test]

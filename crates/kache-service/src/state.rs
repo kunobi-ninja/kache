@@ -139,10 +139,12 @@ DEFINE INDEX IF NOT EXISTS crate_cache ON crate_artifact FIELDS crate_name, cach
         dep_key: &str,
         candidate: &PrefetchCandidate,
     ) -> Result<()> {
+        // Let the unique index own logical identity. Derived record ids can
+        // collide, while index-based upserts also update legacy-id rows.
         self.db
             .query(
                 r#"
-UPSERT type::record("namespace_artifact", $id) CONTENT {
+UPSERT namespace_artifact CONTENT {
     namespace: $namespace,
     dep_key: $dep_key,
     cache_key: $cache_key,
@@ -151,10 +153,6 @@ UPSERT type::record("namespace_artifact", $id) CONTENT {
 };
 "#,
             )
-            .bind((
-                "id",
-                composite_id(&[namespace, dep_key, &candidate.cache_key]),
-            ))
             .bind(("namespace", namespace.to_string()))
             .bind(("dep_key", dep_key.to_string()))
             .bind(("cache_key", candidate.cache_key.clone()))
@@ -172,17 +170,17 @@ UPSERT type::record("namespace_artifact", $id) CONTENT {
         crate_name: &str,
         candidate: &PrefetchCandidate,
     ) -> Result<()> {
+        // See `upsert_namespace_artifact`: record ids are deliberately opaque.
         self.db
             .query(
                 r#"
-UPSERT type::record("crate_artifact", $id) CONTENT {
+UPSERT crate_artifact CONTENT {
     crate_name: $crate_name,
     cache_key: $cache_key,
     last_seen_at: time::now()
 };
 "#,
             )
-            .bind(("id", composite_id(&[crate_name, &candidate.cache_key])))
             .bind(("crate_name", crate_name.to_string()))
             .bind(("cache_key", candidate.cache_key.clone()))
             .await
@@ -311,21 +309,6 @@ fn dep_key(name: &str, version: &str) -> String {
     format!("{name}@{version}")
 }
 
-fn composite_id(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(|part| {
-            part.chars()
-                .map(|ch| match ch {
-                    'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
-                    _ => '_',
-                })
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("__")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,26 +347,115 @@ mod tests {
         assert_eq!(dep_key("", ""), "@");
     }
 
-    #[test]
-    fn composite_id_preserves_safe_chars() {
-        // Alphanumerics plus `-` and `_` survive untouched; parts are joined
-        // with a double underscore.
-        assert_eq!(composite_id(&["serde", "key-1_2"]), "serde__key-1_2");
+    #[tokio::test]
+    async fn namespace_upsert_preserves_legacy_row_and_colliding_tuple() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
+            .await
+            .unwrap();
+
+        // v0.16 generated this lossy id for both `linux/hash/debug` and
+        // `linux_hash_debug`. Keep it literal so this test guards compatibility
+        // with databases written by that release, independent of new code.
+        repo.db
+            .query(
+                r#"
+UPSERT type::record("namespace_artifact", $id) CONTENT {
+    namespace: "linux/hash/debug",
+    dep_key: "serde@1.0.0",
+    cache_key: "shared-key",
+    crate_name: "legacy-value",
+    last_seen_at: time::now()
+};
+"#,
+            )
+            .bind((
+                "id",
+                "linux_hash_debug__serde_1_0_0__shared-key".to_string(),
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        repo.upsert_namespace_artifact(
+            "linux/hash/debug",
+            "serde@1.0.0",
+            &PrefetchCandidate::new("shared-key".to_string(), "slash-value".to_string()),
+        )
+        .await
+        .unwrap();
+        repo.upsert_namespace_artifact(
+            "linux_hash_debug",
+            "serde@1.0.0",
+            &PrefetchCandidate::new("shared-key".to_string(), "underscore-value".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let deps = [("serde".to_string(), "1.0.0".to_string())];
+        let slash = repo
+            .shard_candidates("linux/hash/debug", &deps)
+            .await
+            .unwrap();
+        let underscore = repo
+            .shard_candidates("linux_hash_debug", &deps)
+            .await
+            .unwrap();
+
+        assert_eq!(slash.len(), 1);
+        assert_eq!(slash[0].cache_key, "shared-key");
+        assert_eq!(slash[0].crate_name, "slash-value");
+        assert_eq!(underscore.len(), 1);
+        assert_eq!(underscore[0].cache_key, "shared-key");
+        assert_eq!(underscore[0].crate_name, "underscore-value");
     }
 
-    #[test]
-    fn composite_id_sanitizes_unsafe_chars() {
-        // Anything outside [A-Za-z0-9_-] becomes `_` so the value is a legal
-        // SurrealDB record id component.
+    #[tokio::test]
+    async fn crate_upsert_preserves_legacy_row_and_colliding_tuple() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
+            .await
+            .unwrap();
+
+        // v0.16 generated this same lossy id for `serde/json` and `serde_json`.
+        repo.db
+            .query(
+                r#"
+UPSERT type::record("crate_artifact", $id) CONTENT {
+    crate_name: "serde/json",
+    cache_key: "shared-key",
+    last_seen_at: time::now()
+};
+"#,
+            )
+            .bind(("id", "serde_json__shared-key".to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        repo.upsert_crate_artifact(
+            "serde/json",
+            &PrefetchCandidate::new("shared-key".to_string(), "serde/json".to_string()),
+        )
+        .await
+        .unwrap();
+        repo.upsert_crate_artifact(
+            "serde_json",
+            &PrefetchCandidate::new("shared-key".to_string(), "serde_json".to_string()),
+        )
+        .await
+        .unwrap();
+
         assert_eq!(
-            composite_id(&["linux/hash/debug", "serde@1.0.0"]),
-            "linux_hash_debug__serde_1_0_0"
+            repo.key_cache_keys_for_crate("serde/json").await.unwrap(),
+            ["shared-key"]
         );
-    }
-
-    #[test]
-    fn composite_id_single_part_has_no_separator() {
-        assert_eq!(composite_id(&["alone"]), "alone");
+        assert_eq!(
+            repo.key_cache_keys_for_crate("serde_json").await.unwrap(),
+            ["shared-key"]
+        );
     }
 
     #[tokio::test]

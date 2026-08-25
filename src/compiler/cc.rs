@@ -2142,6 +2142,28 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // `-mabi=` selects the target ABI: `lp64d`/`lp64`/`ilp32` on riscv,
+        // `ms`/`sysv` on x86-64, `aapcs-linux` on arm. It changes the object
+        // materially — a cross build refused to cache without it — and the
+        // value is a closed enumeration with no host-relative member (there
+        // is no `-mabi=native`, unlike `-mtune=`/`-mcpu=`), so the flag text
+        // alone determines the effect. That makes `RawKeyed` exact here.
+        //
+        // Deliberately NOT `CapturedByProbe` like its `-march=` neighbour.
+        // Clang does lower it into the resolved cc1 line (verified:
+        // `-### --target=riscv64-unknown-linux-gnu -mabi=lp64d` yields
+        // `"-target-abi" "lp64d"` against `"lp64"` for `-mabi=lp64`), so the
+        // probe would key it on clang. But probe-captured soundness would
+        // then rest on every supported driver spelling the ABI into that
+        // line, and a driver that omitted it would serve one ABI's object to
+        // the other — a broken binary, not a missed hit. Folding the flag
+        // verbatim costs only exact-spelling keying and cannot do that.
+        matcher: Matcher::Prefix("-mabi="),
+        class: FlagClass::RawKeyed,
+        source: "Issue #823 — target ABI selection. Closed value set with no host-relative member, so the argument text is exact; keyed verbatim rather than via the probe so soundness does not depend on driver-specific cc1 spelling.",
+        dialect: None,
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-msimd128"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — WASM SIMD128 enable.",
@@ -2156,8 +2178,9 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         // The nightly Firefox bench passed media/codec TUs through on
         // `-mavx -mbmi2 -mf16c`; the set below covers the x86 codec ISA family
         // (libvpx/dav1d/aom). Enumerated explicitly (with optional `no-`)
-        // rather than opening `-m*`, so value-taking knobs (`-mtune=`,
-        // `-mcmodel=`, `-mabi=`) and unmodeled `-m` flags still refuse.
+        // rather than opening `-m*`, so the remaining value-taking knobs
+        // (`-mtune=`, `-mcpu=`, `-mcmodel=`) and unmodeled `-m` flags still
+        // refuse. `-mabi=` is modeled separately above.
         matcher: Matcher::Regex(
             r"^-m(?:no-)?(?:32|64|mmx|sse|sse2|sse3|ssse3|sse4|sse4\.1|sse4\.2|sse4a|avx|avx2|avx512[a-z0-9]+|fma|fma4|f16c|bmi|bmi2|abm|popcnt|lzcnt|aes|vaes|pclmul|vpclmulqdq|gfni|sha|movbe|rdrnd|rdseed|adx|fsgsbase|xsave|xsaveopt|xsavec|xsaves|prfchw|clflushopt|clwb|cldemote|fxsr)$",
         ),
@@ -6984,6 +7007,124 @@ mod tests {
         assert_ne!(plain, err, "-Werror must change the keyed flags");
         assert_ne!(err, both, "-Wno-error must distinguish from bare -Werror");
         assert_ne!(no_err, both);
+    }
+
+    /// Issue #823: `-mabi=` selects the target ABI, so it must be keyed.
+    /// It refused before, which is why a cross-compiled C TU never cached;
+    /// it now folds verbatim, and each ABI keys distinctly.
+    #[test]
+    fn mabi_is_raw_keyed_and_cacheable_issue_823() {
+        for flag in &[
+            "-mabi=lp64d", // riscv64 hard-float — the issue #823 invocation
+            "-mabi=lp64",  // riscv64 soft-float: a different object
+            "-mabi=ilp32",
+            "-mabi=sysv", // x86-64
+            "-mabi=ms",
+            "-mabi=aapcs-linux", // arm
+        ] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                Some(FlagClass::RawKeyed),
+                "{flag} selects the ABI and must be folded into the key verbatim"
+            );
+            let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", flag])).unwrap();
+            assert!(
+                parsed.refuse_reasons(&[]).is_empty(),
+                "{flag} should be cacheable: {:?}",
+                parsed.refuse_reasons(&[])
+            );
+        }
+        // Distinct ABIs must fold to distinct raw keys: serving an lp64d
+        // object to an lp64 build is a broken binary, not a missed hit.
+        let raw = |abi: &str| {
+            cc_raw_flags_for_key(
+                &CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", abi])).unwrap(),
+                &[],
+            )
+        };
+        let plain = cc_raw_flags_for_key(
+            &CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o"])).unwrap(),
+            &[],
+        );
+        assert_ne!(raw("-mabi=lp64d"), raw("-mabi=lp64"));
+        assert_ne!(raw("-mabi=sysv"), raw("-mabi=ms"));
+        assert_ne!(plain, raw("-mabi=lp64d"), "an ABI gate must move the key");
+    }
+
+    /// The exact `ring` invocation from issue #823. Every flag in it has to
+    /// be modeled for the TU to cache at all; `-mabi=lp64d` was the one that
+    /// refused, so this pins the whole argv rather than the flag alone.
+    #[test]
+    fn ring_cross_compile_invocation_is_cacheable_issue_823() {
+        let argv = s(&[
+            "cc",
+            "-O0",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-fPIC",
+            "-g",
+            "-gdwarf-4",
+            "-fno-omit-frame-pointer",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-I",
+            "/cargo/registry/ring-0.17.14/include",
+            "-I",
+            "/cargo/registry/ring-0.17.14/pregenerated",
+            "-Wall",
+            "-Wextra",
+            "-fvisibility=hidden",
+            "-std=c1x",
+            "-Wbad-function-cast",
+            "-Wcast-align",
+            "-Wcast-qual",
+            "-Wconversion",
+            "-Wmissing-field-initializers",
+            "-Wmissing-include-dirs",
+            "-Wnested-externs",
+            "-Wredundant-decls",
+            "-Wshadow",
+            "-Wsign-compare",
+            "-Wsign-conversion",
+            "-Wstrict-prototypes",
+            "-Wundef",
+            "-Wuninitialized",
+            "-g3",
+            "-DNDEBUG",
+            "-o",
+            "/build/out/25ac62e5b3c53843-curve25519.o",
+            "-c",
+            "/cargo/registry/ring-0.17.14/crypto/curve25519/curve25519.c",
+        ]);
+        let parsed = CcArgs::parse(&argv).unwrap();
+        assert!(
+            parsed.refuse_reasons(&[]).is_empty(),
+            "the #823 invocation must cache: {:?}",
+            parsed.refuse_reasons(&[])
+        );
+        // `-march=` is probe-captured, so this argv must resolve `-###`
+        // before it can key — the ABI fold does not replace that.
+        assert!(cc_flags_need_resolved_invocation(&parsed));
+    }
+
+    /// The `-mabi=` row must not widen into the neighbouring value-taking
+    /// `-m` knobs. `-mtune=`/`-mcpu=` accept `native`, whose meaning depends
+    /// on the host rather than the flag, so they stay refused until they are
+    /// modeled deliberately.
+    #[test]
+    fn other_value_taking_m_knobs_still_refuse_issue_823() {
+        for flag in &[
+            "-mtune=native",
+            "-mtune=skylake",
+            "-mcpu=native",
+            "-mcmodel=medany",
+        ] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                None,
+                "{flag} is not modeled and must keep refusing"
+            );
+        }
     }
 
     #[test]

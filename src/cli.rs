@@ -2848,11 +2848,7 @@ fn draw_clean(
 
 /// Recursively find and remove target/ directories (TUI selector).
 pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
-    use crossterm::ExecutableCommand;
     use crossterm::event::{self, Event, KeyEventKind};
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
     use ratatui::prelude::*;
     use std::io::stdout;
 
@@ -2894,37 +2890,36 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
     let mut selected: Vec<bool> = vec![false; targets.len()];
     let mut cursor: usize = 0;
 
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
+    // Scoped so the guard restores the terminal before the post-TUI
+    // summary prints to the real screen.
+    let result = {
+        let _terminal_mode = crate::tui::TerminalModeGuard::enter()?;
+        let backend = CrosstermBackend::new(stdout());
+        let mut terminal = Terminal::new(backend)?;
 
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
+        loop {
+            terminal.draw(|frame| draw_clean(frame, &targets, &selected, cursor, &root))?;
 
-    let result = loop {
-        terminal.draw(|frame| draw_clean(frame, &targets, &selected, cursor, &root))?;
-
-        if event::poll(std::time::Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match clean_handle_key(key.code, &mut selected, &mut cursor, targets.len()) {
-                CleanStep::Cancel => break None,
-                CleanStep::Confirm => {
-                    let to_remove: Vec<_> = targets
-                        .iter()
-                        .zip(selected.iter())
-                        .filter(|(_, s)| **s)
-                        .map(|(t, _)| RemovalTarget::from_entry(t))
-                        .collect();
-                    break Some(to_remove);
+            if event::poll(std::time::Duration::from_millis(100))?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                match clean_handle_key(key.code, &mut selected, &mut cursor, targets.len()) {
+                    CleanStep::Cancel => break None,
+                    CleanStep::Confirm => {
+                        let to_remove: Vec<_> = targets
+                            .iter()
+                            .zip(selected.iter())
+                            .filter(|(_, s)| **s)
+                            .map(|(t, _)| RemovalTarget::from_entry(t))
+                            .collect();
+                        break Some(to_remove);
+                    }
+                    CleanStep::Continue => {}
                 }
-                CleanStep::Continue => {}
             }
         }
     };
-
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
 
     // Process deletions outside TUI
     match result {

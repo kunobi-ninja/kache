@@ -1,9 +1,5 @@
 use anyhow::Result;
-use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::io::stdout;
@@ -934,16 +930,10 @@ pub fn run_config_editor() -> Result<()> {
     // Run initial validation
     run_all_validation(&mut state.fields);
 
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
+    let _terminal_mode = crate::tui::TerminalModeGuard::enter()?;
     let mut terminal = ratatui::Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let result = run_event_loop(&mut terminal, &mut state);
-
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-
-    result
+    run_event_loop(&mut terminal, &mut state)
 }
 
 /// Build the editor's starting state from a loaded config.

@@ -2326,7 +2326,14 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         // stored under `-Wno-error=foo` must not serve green to a `-Werror`
         // build that `foo` should have failed (review finding #2). Both
         // spellings are RawKeyed so any combination keys distinctly.
-        matcher: Matcher::Regex(r"-W(no-)?error(=[^,]*)?"),
+        //
+        // The tail is deliberately open-ended: every spelling that starts
+        // `-Werror` / `-Wno-error` is about turning diagnostics into errors,
+        // including the dashed legacy aliases GCC and clang still accept
+        // (`-Werror-implicit-function-declaration`). Keying one of these
+        // unnecessarily would only cost a hit; missing one serves a green
+        // hit to a build that should have failed, so the row errs wide.
+        matcher: Matcher::Regex(r"-W(no-)?error.*"),
         class: FlagClass::RawKeyed,
         source: "review #2 — outcome gate: -Werror/-Wno-error change success vs failure; keyed verbatim.",
         dialect: None,
@@ -6940,6 +6947,11 @@ mod tests {
             "-Wno-error",
             "-Wno-error=unused-variable",
             "-pedantic-errors",
+            // Dashed legacy alias for `-Werror=implicit-function-declaration`,
+            // still accepted by GCC and clang: same outcome effect, so it must
+            // not slip through to the diagnostics-only `-W*` row below it.
+            "-Werror-implicit-function-declaration",
+            "-Wno-error-implicit-function-declaration",
         ] {
             assert_eq!(
                 classify_cc_flag(flag, Dialect::Gnu),

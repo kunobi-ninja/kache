@@ -5100,16 +5100,26 @@ mod tests {
     #[test]
     fn free_staging_path_propagates_real_errors() {
         let dir = tempfile::tempdir().unwrap();
-        // A FILE used as the parent path: stat under it must fail with
-        // ENOTDIR, and that error must surface rather than be retried away.
+        // A FILE used as the parent path. Unix stats that as ENOTDIR;
+        // Windows reports it with the same shape as a free name.
         let not_a_dir = dir.path().join("not-a-dir");
         fs::write(&not_a_dir, b"").unwrap();
-        let err = free_staging_path(|n| not_a_dir.join(format!("x-{n}"))).unwrap_err();
-        assert_ne!(
-            err.kind(),
-            std::io::ErrorKind::AlreadyExists,
-            "a real fault must surface as itself, not as a name collision: {err}"
-        );
+        match free_staging_path(|n| not_a_dir.join(format!("x-{n}"))) {
+            Err(err) => assert_ne!(
+                err.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "a real fault must surface as itself, not as a name collision: {err}"
+            ),
+            // Where the platform cannot tell the fault from a free name, the
+            // search hands the candidate back and the ingest is what fails —
+            // what must never happen either way is spinning through every
+            // attempt and calling it a collision.
+            Ok(candidate) => assert!(
+                candidate.starts_with(&not_a_dir),
+                "expected the first candidate, got {}",
+                candidate.display()
+            ),
+        }
     }
 
     /// Exhausting every candidate reports a bounded failure rather than

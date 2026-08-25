@@ -85,10 +85,13 @@ pub fn restrict_socket_permissions(path: &Path) -> Result<()> {
 /// authenticate is a peer we refuse. Windows named pipes carry peer identity
 /// in the kernel object ACL rather than creds messages, so the check is
 /// Unix-only.
+///
+/// The decision is taken over an `Option<u32>` rather than a live stream so
+/// every branch is assertable: CI cannot open a connection from a foreign
+/// UID, and cannot make the platform withhold credentials.
 #[cfg(unix)]
-pub fn ensure_same_user_peer(stream: &TokioStream) -> std::io::Result<()> {
-    use interprocess::local_socket::traits::StreamCommon as _;
-    match stream.peer_creds().ok().and_then(|creds| creds.euid()) {
+pub fn require_self_peer(peer_euid: Option<u32>) -> std::io::Result<()> {
+    match peer_euid {
         Some(peer_uid) if peer_uid_is_self(peer_uid) => Ok(()),
         Some(peer_uid) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -102,6 +105,15 @@ pub fn ensure_same_user_peer(stream: &TokioStream) -> std::io::Result<()> {
             format!("peer credentials unavailable (daemon uid {})", self_uid()),
         )),
     }
+}
+
+/// The peer's effective UID, where the platform exposes it: `SO_PEERCRED` on
+/// Linux, `getpeereid` on macOS and the BSDs. `None` means we could not
+/// authenticate the peer, which [`require_self_peer`] treats as a refusal.
+#[cfg(unix)]
+pub fn peer_euid(stream: &TokioStream) -> Option<u32> {
+    use interprocess::local_socket::traits::StreamCommon as _;
+    stream.peer_creds().ok().and_then(|creds| creds.euid())
 }
 
 /// The daemon's effective UID (test seam: the comparison lives here so the
@@ -240,14 +252,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn peer_uid_is_self_rejects_foreign_uids() {
-        // The accept direction (own connection) is covered end-to-end by
-        // `same_user_peer_check_accepts_own_connections`; this pins the
-        // comparison itself, including the reject direction that cannot be
-        // produced by a real foreign-UID connection in CI.
+    fn require_self_peer_rejects_foreign_and_unauthenticated_peers() {
+        // The accept direction is also covered end-to-end by
+        // `same_user_peer_check_accepts_own_connections`; this pins every
+        // branch, including the two CI cannot produce with a real
+        // connection: a foreign UID, and a platform that withholds creds.
         let mine = self_uid();
+        assert!(require_self_peer(Some(mine)).is_ok());
+
+        let foreign = require_self_peer(Some(mine.wrapping_add(1))).unwrap_err();
+        assert_eq!(foreign.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(foreign.to_string().contains("does not match daemon uid"));
+
+        // Fail closed: a peer we cannot authenticate is a peer we refuse.
+        let unknown = require_self_peer(None).unwrap_err();
+        assert_eq!(unknown.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(unknown.to_string().contains("credentials unavailable"));
+
         assert!(peer_uid_is_self(mine));
-        assert!(!peer_uid_is_self(mine.wrapping_add(1)));
         assert!(!peer_uid_is_self(mine.wrapping_add(0xdead_beef)));
     }
 
@@ -273,6 +295,7 @@ mod tests {
         // The test client runs under the same effective UID as the "daemon",
         // so the credential gate must accept it. Rejection of foreign UIDs is
         // not unit-testable without privilege switching.
-        ensure_same_user_peer(&stream.expect("accept")).expect("same-user peer accepted");
+        let stream = stream.expect("accept");
+        require_self_peer(peer_euid(&stream)).expect("same-user peer accepted");
     }
 }

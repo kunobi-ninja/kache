@@ -299,6 +299,22 @@ fn free_staging_path(mut name_for_nonce: impl FnMut(u64) -> PathBuf) -> std::io:
     ))
 }
 
+/// Classify a failed publish rename.
+///
+/// A destination that exists now, having been absent when the publish
+/// started, is a concurrent winner: it was published under the same digest,
+/// so it holds the same bytes and losing the race changes nothing. Anything
+/// else is a genuine publish failure and must surface. Split out from
+/// [`Store::publish_staged_blob`] because the race itself cannot be staged
+/// in a test, but the decision it feeds can.
+fn publish_rename_outcome(err: std::io::Error, blob_present: bool) -> Result<bool> {
+    if blob_present {
+        Ok(false)
+    } else {
+        Err(err).context("publishing staged blob")
+    }
+}
+
 /// Whether `a` and `b` name the same inode (hardlinked). Used after a lost
 /// hardlink publish race to decide if the build output still shares the
 /// store blob (keep RO) or is an independent file we marked RO by mistake
@@ -2895,19 +2911,11 @@ impl Store {
             return Ok(false);
         }
         fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
-        match fs::rename(staged, &blob) {
-            Ok(()) => {}
-            Err(e) if blob.is_file() => {
-                // Concurrent winner published the identical-content blob first;
-                // same digest means same bytes, so losing the race is benign.
-                Self::discard_staged_blob(staged);
-                let _ = e;
-                return Ok(false);
-            }
-            Err(e) => {
-                Self::discard_staged_blob(staged);
-                return Err(e).context("publishing staged blob");
-            }
+        if let Err(e) = fs::rename(staged, &blob) {
+            Self::discard_staged_blob(staged);
+            // Re-stat: only a publish that lost a race finds the destination
+            // occupied *now* having found it free above.
+            return publish_rename_outcome(e, blob.is_file());
         }
         let _ = crate::atomic::fsync_dir(blob.parent().unwrap());
         match ingest {
@@ -5033,6 +5041,10 @@ mod tests {
 
         let stats = store.sweep_stale_staging(Duration::from_secs(3600));
         assert_eq!(stats.removed, 1, "only the aged-out file is swept");
+        assert_eq!(
+            stats.scanned, 1,
+            "the in-flight file is skipped before it is ever counted"
+        );
         assert_eq!(stats.bytes_reclaimed, b"abandoned".len() as u64);
         assert!(!stale.exists());
         assert!(fresh.exists(), "fresh staging file must survive the sweep");
@@ -5040,8 +5052,65 @@ mod tests {
         // Once it ages out, it goes too.
         let stats = store.sweep_stale_staging(Duration::ZERO);
         assert_eq!(stats.removed, 1);
+        assert_eq!(stats.scanned, 1);
         assert_eq!(stats.bytes_reclaimed, b"in-flight".len() as u64);
         assert!(!fresh.exists());
+    }
+
+    /// Discarding a hardlinked staging temp has to hand the source back
+    /// writable. The temp shares the build output's inode, so the read-only
+    /// guard the store applies lands on the build's own file too — leaving
+    /// it read-only would break the next write to that output.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_hardlinked_temp_restores_the_source_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"shared-inode-bytes").unwrap();
+        let tmp = dir.path().join("stage.tmp");
+        fs::hard_link(&source, &tmp).unwrap();
+        set_blob_readonly(&tmp);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o200,
+            0,
+            "precondition: the shared inode is read-only through both names"
+        );
+
+        Store::drop_tmp_restore_source(&source, &tmp);
+
+        assert!(!tmp.exists(), "the staging temp must be gone");
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o200,
+            0o200,
+            "the build output must be writable again once the temp is gone"
+        );
+    }
+
+    /// A failed publish rename is a lost race only when the destination is
+    /// there now, having been absent when the publish started: same digest
+    /// means same bytes, so the winner's blob is as good as ours. Every
+    /// other rename failure is real and must propagate.
+    #[test]
+    fn publish_rename_outcome_distinguishes_a_lost_race_from_a_failure() {
+        let raced = publish_rename_outcome(
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "boom"),
+            true,
+        );
+        assert!(
+            !raced.expect("a lost race is benign"),
+            "losing the race must report `false`: we published nothing"
+        );
+
+        let failed = publish_rename_outcome(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "boom"),
+            false,
+        );
+        assert!(
+            failed.is_err(),
+            "a rename failure with no destination in place is a real failure"
+        );
     }
 
     /// The grace both sweepers share (daemon GC and `doctor --repair`) must

@@ -5337,7 +5337,7 @@ async fn server_main(
         .context("binding local IPC socket")?;
     // The IPC socket drives destructive operations (Shutdown, GC, uploads),
     // so it must never be reachable by other local users. Restrict the file
-    // mode regardless of umask, and see `ensure_same_user_peer` for the
+    // mode regardless of umask, and see `require_self_peer` for the
     // per-connection credential check on accepted sockets.
     #[cfg(unix)]
     crate::transport::restrict_socket_permissions(&socket_path)
@@ -6512,7 +6512,7 @@ async fn handle_connection_after_queue(
     // syscall, so unauthenticated peers are dropped before they can park on
     // the connection limiter or read a single request frame.
     #[cfg(unix)]
-    if let Err(error) = crate::transport::ensure_same_user_peer(&stream) {
+    if let Err(error) = crate::transport::require_self_peer(crate::transport::peer_euid(&stream)) {
         tracing::warn!(%error, "rejected IPC connection from another local user");
         return Ok(());
     }

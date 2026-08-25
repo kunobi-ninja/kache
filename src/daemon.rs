@@ -9579,6 +9579,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "spawned by the daemon PID-discovery regression"]
+    fn fake_daemon_process_fixture() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn find_daemon_pids_finds_a_process_running_the_kache_executable() {
         // The negative test below cannot tell "correctly excluded the
         // bystander" from "found nothing at all", which is what a broken
@@ -9591,24 +9598,32 @@ mod tests {
         // `pgrep -f` sees.
         //
         // Needs the same tools find_daemon_pids does. The Nix build sandbox
-        // has neither `pgrep` nor `ps` (nor a `/bin/sleep` to copy), and
-        // asserting there would only pin the sandbox, not the behaviour.
-        let (Some(sleep_bin), Some(_pgrep), Some(_ps)) = (
-            find_in_path("sleep"),
-            find_in_path("pgrep"),
-            find_in_path("ps"),
-        ) else {
+        // has neither `pgrep` nor `ps`, and asserting there would only pin the
+        // sandbox, not the behaviour.
+        let (Some(_pgrep), Some(_ps)) = (find_in_path("pgrep"), find_in_path("ps")) else {
             return;
         };
 
-        let dir = tempfile::tempdir().unwrap();
+        // Reuse this test executable as the sleeping fixture. Keeping the
+        // temporary hard link beside it guarantees one filesystem and avoids
+        // Linux's copy-then-exec ETXTBSY race under coverage.
+        let current_exe = std::env::current_exe().expect("resolve test executable");
+        let dir = tempfile::tempdir_in(current_exe.parent().expect("test executable parent"))
+            .expect("create fake daemon directory");
         let bin_dir = dir.path().join("kache daemon run");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let fake = bin_dir.join("kache");
-        std::fs::copy(&sleep_bin, &fake).unwrap();
+        std::fs::hard_link(&current_exe, &fake).expect("hard-link test executable as kache");
 
         let mut child = std::process::Command::new(&fake)
-            .arg("30")
+            .args([
+                "--ignored",
+                "--exact",
+                "daemon::tests::fake_daemon_process_fixture",
+                "--test-threads=1",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn fake daemon");
         let fake_pid = child.id();

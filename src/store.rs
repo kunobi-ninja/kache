@@ -7715,8 +7715,13 @@ mod tests {
             })
             .unwrap()
         };
-        let put = |s: &Store, content: &[u8]| {
-            let output = dir.path().join("lib.rlib");
+        // Each generation compiles to a fresh source path: put ingests by
+        // hardlink where reflinks are unavailable (ext4), sharing the
+        // store blob's read-only inode with the source, so rewriting one
+        // path across generations would EACCES on Linux while APFS
+        // reflinks mask it (the #822 snapshot-test lesson).
+        let put = |s: &Store, generation: &str, content: &[u8]| {
+            let output = dir.path().join(format!("lib-{generation}.rlib"));
             std::fs::write(&output, content).unwrap();
             s.put(
                 "strand1",
@@ -7732,7 +7737,7 @@ mod tests {
             .unwrap();
         };
 
-        put(&store, b"generation one");
+        put(&store, "one", b"generation one");
         assert_eq!(refcount_sum(&store), 1);
 
         // Strand the row: meta.json gone, DB row present. Removal
@@ -7740,7 +7745,7 @@ mod tests {
         // a miss, a recompile, and this re-put over the surviving row.
         std::fs::remove_file(store.entry_dir("strand1").join("meta.json")).unwrap();
         assert!(store.remove_entry("strand1").is_err());
-        put(&store, b"generation two");
+        put(&store, "two", b"generation two");
 
         assert_eq!(
             refcount_sum(&store),
@@ -7764,7 +7769,7 @@ mod tests {
 
         // Same-content re-put: the shared hash must stay at one
         // reference, not accumulate one per generation.
-        put(&store, b"generation two");
+        put(&store, "two-again", b"generation two");
         assert_eq!(refcount_sum(&store), 1, "shared hash must not double-count");
         assert_eq!(store.blob_index_drift().unwrap().total(), 0);
     }

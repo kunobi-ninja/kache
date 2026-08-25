@@ -2141,26 +2141,75 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #115 — architecture selection. `Prefix` is safe because the probe resolves the value into target-cpu/target-feature tokens.",
         dialect: None,
     },
+    // ── Cross-target ABI / ISA-state selectors (issue #823) ──
+    //
+    // The Rust `cc` crate injects these on its own for cross targets:
+    // `-mabi=` (riscv), `-mfloat-abi=` + `-mfpu=` (arm), `-mthumb` (thumbv*)
+    // — so refusing any one of them makes every cross-compiled C TU on that
+    // architecture uncacheable, not just hand-written invocations.
+    //
+    // Each is `RawKeyed`, deliberately NOT `CapturedByProbe` like their
+    // `-march=` neighbour. Every value in these sets is a closed enumeration
+    // with no host-relative member (there is no `-mabi=native` the way
+    // `-mtune=`/`-mcpu=` have one), so the flag text alone determines the
+    // object — the exact property a verbatim fold keys. Clang does lower
+    // them into the resolved cc1 line (verified: `-### --target=
+    // riscv64-unknown-linux-gnu -mabi=lp64d` yields `"-target-abi" "lp64d"`
+    // against `"lp64"` for `-mabi=lp64`), so the probe would key them on
+    // clang — but probe-captured soundness would rest on every supported
+    // driver spelling the effect into that line, and a driver that omitted
+    // it would serve one ABI's object to the other: a broken binary, not a
+    // missed hit. The verbatim fold cannot do that.
     FlagSpec {
-        // `-mabi=` selects the target ABI: `lp64d`/`lp64`/`ilp32` on riscv,
-        // `ms`/`sysv` on x86-64, `aapcs-linux` on arm. It changes the object
-        // materially — a cross build refused to cache without it — and the
-        // value is a closed enumeration with no host-relative member (there
-        // is no `-mabi=native`, unlike `-mtune=`/`-mcpu=`), so the flag text
-        // alone determines the effect. That makes `RawKeyed` exact here.
-        //
-        // Deliberately NOT `CapturedByProbe` like its `-march=` neighbour.
-        // Clang does lower it into the resolved cc1 line (verified:
-        // `-### --target=riscv64-unknown-linux-gnu -mabi=lp64d` yields
-        // `"-target-abi" "lp64d"` against `"lp64"` for `-mabi=lp64`), so the
-        // probe would key it on clang. But probe-captured soundness would
-        // then rest on every supported driver spelling the ABI into that
-        // line, and a driver that omitted it would serve one ABI's object to
-        // the other — a broken binary, not a missed hit. Folding the flag
-        // verbatim costs only exact-spelling keying and cannot do that.
+        // Target ABI: `lp64d`/`lp64`/`ilp32` on riscv, `ms`/`sysv` on
+        // x86-64, `aapcs-linux` on arm.
         matcher: Matcher::Prefix("-mabi="),
         class: FlagClass::RawKeyed,
-        source: "Issue #823 — target ABI selection. Closed value set with no host-relative member, so the argument text is exact; keyed verbatim rather than via the probe so soundness does not depend on driver-specific cc1 spelling.",
+        source: "Issue #823 — target ABI selection; closed value set, keyed verbatim.",
+        dialect: None,
+    },
+    FlagSpec {
+        // Float ABI: `soft` / `softfp` / `hard`. cc-rs injects
+        // `-mfloat-abi=hard` for every *eabihf target.
+        matcher: Matcher::Prefix("-mfloat-abi="),
+        class: FlagClass::RawKeyed,
+        source: "Issue #823 — arm float ABI; closed value set (soft/softfp/hard), keyed verbatim.",
+        dialect: None,
+    },
+    FlagSpec {
+        // Code model: `tiny`/`small`/`kernel`/`medium`/`large` (x86,
+        // aarch64), `medlow`/`medany` (riscv). Common in riscv firmware
+        // and kernel builds.
+        matcher: Matcher::Prefix("-mcmodel="),
+        class: FlagClass::RawKeyed,
+        source: "Issue #823 — code model; closed value set, keyed verbatim.",
+        dialect: None,
+    },
+    FlagSpec {
+        // Concrete arm FPU names — the standardized set gcc and clang
+        // both document. cc-rs injects `vfpv3-d16` / `vfp` / `neon`.
+        //
+        // `-mfpu=auto` is DELIBERATELY not matched and keeps refusing: it
+        // resolves from `-march`/`-mcpu` (and the toolchain's configured
+        // default when those are absent) inside cc1, so its text does not
+        // determine the object, and gcc's driver passes the literal `auto`
+        // to cc1 — the probe cannot capture the resolution either.
+        matcher: Matcher::Regex(
+            r"-mfpu=(?:none|vfp|vfpv2|vfpv3(?:-fp16|-d16(?:-fp16)?|xd(?:-fp16)?)?|vfpv4(?:-d16)?|fpv4-sp-d16|fpv5-(?:sp-)?d16|fp-armv8(?:-fullfp16)?|neon(?:-fp16|-vfpv3|-vfpv4|-fp-armv8)?|crypto-neon-fp-armv8)",
+        ),
+        class: FlagClass::RawKeyed,
+        source: "Issue #823 — concrete arm FPU selection; enumerated so `-mfpu=auto` (resolved inside cc1, not text-deterministic) still refuses.",
+        dialect: None,
+    },
+    FlagSpec {
+        // Instruction-set state: Thumb vs ARM encoding, both polarities —
+        // conflicting occurrences are last-one-wins, which the raw fold
+        // preserves because it hashes in argv order with duplicates kept.
+        // Valueless and text-deterministic; cc-rs injects `-mthumb` for
+        // thumbv* targets.
+        matcher: Matcher::Regex(r"-m(?:(?:no-)?thumb|arm)"),
+        class: FlagClass::RawKeyed,
+        source: "Issue #823 — arm/thumb instruction-set state, keyed verbatim in argv order.",
         dialect: None,
     },
     FlagSpec {
@@ -7021,6 +7070,18 @@ mod tests {
             "-mabi=sysv", // x86-64
             "-mabi=ms",
             "-mabi=aapcs-linux", // arm
+            // The rest of the class the `cc` crate injects for cross targets:
+            "-mfloat-abi=hard",
+            "-mfloat-abi=softfp",
+            "-mfloat-abi=soft",
+            "-mfpu=vfpv3-d16", // cc-rs armv7-eabihf default
+            "-mfpu=neon",
+            "-mfpu=vfp",
+            "-mfpu=crypto-neon-fp-armv8",
+            "-mthumb",
+            "-marm",
+            "-mcmodel=medany", // riscv firmware/kernel staple
+            "-mcmodel=large",
         ] {
             assert_eq!(
                 classify_cc_flag(flag, Dialect::Gnu),
@@ -7049,6 +7110,25 @@ mod tests {
         assert_ne!(raw("-mabi=lp64d"), raw("-mabi=lp64"));
         assert_ne!(raw("-mabi=sysv"), raw("-mabi=ms"));
         assert_ne!(plain, raw("-mabi=lp64d"), "an ABI gate must move the key");
+        assert_ne!(raw("-mfloat-abi=hard"), raw("-mfloat-abi=soft"));
+        assert_ne!(raw("-mfpu=neon"), raw("-mfpu=vfpv3-d16"));
+        assert_ne!(raw("-mthumb"), raw("-marm"));
+        assert_ne!(raw("-mcmodel=medany"), raw("-mcmodel=medlow"));
+        // Conflicting occurrences are last-one-wins for the compiler, so the
+        // fold must preserve argv ORDER (and duplicates): `-mthumb -marm`
+        // ends in ARM state, the reverse in Thumb state.
+        let raw2 = |a: &str, b: &str| {
+            cc_raw_flags_for_key(
+                &CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", a, b])).unwrap(),
+                &[],
+            )
+        };
+        assert_ne!(
+            raw2("-mthumb", "-marm"),
+            raw2("-marm", "-mthumb"),
+            "conflicting ISA-state flags are last-one-wins; order must key"
+        );
+        assert_ne!(raw("-mthumb"), raw("-mno-thumb"));
     }
 
     /// The exact `ring` invocation from issue #823. Every flag in it has to
@@ -7107,17 +7187,49 @@ mod tests {
         assert!(cc_flags_need_resolved_invocation(&parsed));
     }
 
-    /// The `-mabi=` row must not widen into the neighbouring value-taking
-    /// `-m` knobs. `-mtune=`/`-mcpu=` accept `native`, whose meaning depends
-    /// on the host rather than the flag, so they stay refused until they are
-    /// modeled deliberately.
+    /// The flags the `cc` crate injects on its own for
+    /// `armv7-unknown-linux-gnueabihf` (cc-rs `lib.rs`: `-march=armv7-a
+    /// -mfpu=vfpv3-d16 -mfloat-abi=hard`), plus `-mthumb` for the thumbv7
+    /// variants. No hand-written build file mentions these — refusing any
+    /// one of them silently uncaches every arm cross build.
     #[test]
-    fn other_value_taking_m_knobs_still_refuse_issue_823() {
+    fn cc_rs_armv7_injected_flags_are_cacheable_issue_823() {
+        let argv = s(&[
+            "arm-linux-gnueabihf-gcc",
+            "-O2",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-fPIC",
+            "-march=armv7-a",
+            "-mthumb",
+            "-mfpu=vfpv3-d16",
+            "-mfloat-abi=hard",
+            "-o",
+            "/build/out/foo.o",
+            "-c",
+            "foo.c",
+        ]);
+        let parsed = CcArgs::parse(&argv).unwrap();
+        assert!(
+            parsed.refuse_reasons(&[]).is_empty(),
+            "the cc-rs armv7 invocation must cache: {:?}",
+            parsed.refuse_reasons(&[])
+        );
+        assert!(cc_flags_need_resolved_invocation(&parsed));
+    }
+
+    /// The #823 rows must not widen into the host-relative `-m` knobs.
+    /// `-mtune=`/`-mcpu=` accept `native` and `-mfpu=` accepts `auto` —
+    /// values whose meaning depends on the host or the toolchain's
+    /// configured defaults rather than on the flag text — so they stay
+    /// refused until modeled deliberately.
+    #[test]
+    fn host_relative_m_knobs_still_refuse_issue_823() {
         for flag in &[
             "-mtune=native",
             "-mtune=skylake",
             "-mcpu=native",
-            "-mcmodel=medany",
+            "-mfpu=auto",
         ] {
             assert_eq!(
                 classify_cc_flag(flag, Dialect::Gnu),
@@ -7526,7 +7638,9 @@ mod tests {
             // and tuning knobs the SIMD regex must NOT swallow.
             "-mtune=skylake",
             "-mfpmath=sse",
-            "-mcmodel=large",
+            // (`-mcmodel=` moved to the modeled #823 class; `-mfpu=auto`
+            // resolves inside cc1 so its text is not the object.)
+            "-mfpu=auto",
         ] {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
             assert!(

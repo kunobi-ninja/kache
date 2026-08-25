@@ -1952,6 +1952,32 @@ impl Store {
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
         let tx = self.db.unchecked_transaction()?;
+        // A prior generation of this cache_key may still hold blob
+        // references — most commonly a stranded row whose removal was
+        // refused (#276) and that this put is about to overwrite via
+        // INSERT OR REPLACE. Release them inside this same transaction,
+        // before this generation's increments and before
+        // `record_entry_blobs` drops the old mapping: skipped, the old
+        // generation's hashes keep a refcount no mapping accounts for
+        // (never reaching zero, never reclaimed), and hashes shared by
+        // both generations double-count. Unconditional on `committed`,
+        // unlike the import path's variant: a committed-but-stranded row
+        // is exactly the shape that funnels back into put.
+        tx.execute(
+            "UPDATE blobs
+             SET refcount = MAX(0, refcount - COALESCE((
+                 SELECT refs FROM entry_blobs
+                 WHERE cache_key = ?1 AND hash = blobs.hash
+             ), 0))
+             WHERE hash IN (
+                 SELECT hash FROM entry_blobs WHERE cache_key = ?1
+             )",
+            params![cache_key],
+        )?;
+        // Rows released to zero would otherwise read as index drift; the
+        // blob files themselves stay for the orphan sweep (or an
+        // immediate re-reference by the loop below).
+        tx.execute("DELETE FROM blobs WHERE refcount <= 0", [])?;
         for (file, (source, use_source_hardlink)) in meta.files.iter().zip(sources.iter()) {
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
@@ -7645,6 +7671,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(still_there, 1, "entry row must survive a refused removal");
+    }
+
+    /// The resolution path the #276 comments promise: a refused removal
+    /// leaves the row "until a fresh put (INSERT OR REPLACE) overwrites
+    /// it". That re-put must also release the stranded generation's blob
+    /// references — stacking new increments on top leaks the old hashes
+    /// (a refcount no mapping accounts for never reaches zero) and
+    /// double-counts hashes shared by both generations.
+    #[test]
+    fn reput_over_refused_removal_releases_stale_refcounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let refcount_sum = |s: &Store| -> i64 {
+            s.db.query_row("SELECT COALESCE(SUM(refcount), 0) FROM blobs", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let put = |s: &Store, content: &[u8]| {
+            let output = dir.path().join("lib.rlib");
+            std::fs::write(&output, content).unwrap();
+            s.put(
+                "strand1",
+                "c1",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        };
+
+        put(&store, b"generation one");
+        assert_eq!(refcount_sum(&store), 1);
+
+        // Strand the row: meta.json gone, DB row present. Removal
+        // refuses (#276), and lookup's discarded-error path then drives
+        // a miss, a recompile, and this re-put over the surviving row.
+        std::fs::remove_file(store.entry_dir("strand1").join("meta.json")).unwrap();
+        assert!(store.remove_entry("strand1").is_err());
+        put(&store, b"generation two");
+
+        assert_eq!(
+            refcount_sum(&store),
+            1,
+            "re-put must release the stranded generation's references"
+        );
+        let mapped: i64 = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM entry_blobs WHERE cache_key = 'strand1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mapped, 1, "exactly the new generation's mapping remains");
+        assert_eq!(
+            store.blob_index_drift().unwrap().total(),
+            0,
+            "index must match the committed meta with no doctor repair"
+        );
+
+        // Same-content re-put: the shared hash must stay at one
+        // reference, not accumulate one per generation.
+        put(&store, b"generation two");
+        assert_eq!(refcount_sum(&store), 1, "shared hash must not double-count");
+        assert_eq!(store.blob_index_drift().unwrap().total(), 0);
     }
 
     /// An unreadable meta.json (EACCES, not NotFound) must refuse through the

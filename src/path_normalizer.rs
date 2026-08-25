@@ -1672,14 +1672,18 @@ mod tests {
         assert!(!value.is_char_boundary(idx + "/home/".len() + 40));
 
         let window = leak_window(&value, idx, "/home/".len());
-        assert!(window.contains("/home/us"));
+        // Exact edges, not just containment: the start must widen
+        // BACKWARD to byte 18 (a `+= 1` walk forward to 21 still yields
+        // a valid window) and the end forward only to byte 107 (a
+        // miscomputed raw end clamps to `len` and still slices fine).
+        assert_eq!(window, &value[18..107]);
 
         // Degenerate shapes stay in-bounds: leak at the very start,
         // at the very end, and a value shorter than the window.
         assert_eq!(leak_window("/home/x", 0, "/home/".len()), "/home/x");
         let tail = format!("{}{}", "あ".repeat(30), "/home/y");
         let idx = tail.find("/home/").expect("leak present");
-        assert!(leak_window(&tail, idx, "/home/".len()).ends_with("/home/y"));
+        assert_eq!(leak_window(&tail, idx, "/home/".len()), &tail[48..]);
     }
 
     #[test]

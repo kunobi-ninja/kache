@@ -2400,11 +2400,30 @@ impl Daemon {
         self.warming_tx.send_replace(true);
     }
 
-    fn push_transfer_event(&self, event: TransferEvent) {
-        // Persist to JSONL — warn on failure but never fail the transfer
-        if let Err(e) = events::log_transfer(&self.config.transfer_log_path(), &event) {
-            tracing::warn!("failed to log transfer event: {e}");
-        }
+    async fn push_transfer_event(&self, event: TransferEvent) {
+        // Persist to JSONL — warn on failure but never fail the transfer.
+        // The append takes a cross-process file lock on the sidecar log,
+        // so it runs on the blocking pool: every caller is an async
+        // upload/download path, and a contended or stalled log must not
+        // park an async worker thread (#281).
+        let path = self.config.transfer_log_path();
+        let event = match tokio::task::spawn_blocking(move || {
+            let logged = events::log_transfer(&path, &event);
+            (event, logged)
+        })
+        .await
+        {
+            Ok((event, logged)) => {
+                if let Err(e) = logged {
+                    tracing::warn!("failed to log transfer event: {e}");
+                }
+                event
+            }
+            Err(e) => {
+                tracing::warn!("transfer log task failed: {e}");
+                return;
+            }
+        };
         if let Ok(mut q) = self.recent_transfers.lock() {
             if q.len() >= RECENT_TRANSFERS_CAP {
                 q.pop_front();
@@ -2908,10 +2927,23 @@ impl Daemon {
         if self.config.remote.is_none() {
             return Response::err("no remote configured");
         }
-        let normalized_job = match persist_upload_job(&self.config, job) {
-            Ok(job) => job,
-            Err(error) => {
+        // Intent publication blocks on the cross-process GC lock (a
+        // concurrent sweep can hold it for seconds) plus store open and
+        // `std::fs` work — park it on the blocking pool like the other
+        // store-touching handlers (#281) instead of an async worker.
+        let persist_config = self.config.clone();
+        let persist_job = job.clone();
+        let normalized_job = match tokio::task::spawn_blocking(move || {
+            persist_upload_job(&persist_config, &persist_job)
+        })
+        .await
+        {
+            Ok(Ok(job)) => job,
+            Ok(Err(error)) => {
                 return Response::err(format!("persisting upload intent failed: {error:#}"));
+            }
+            Err(error) => {
+                return Response::err(format!("persisting upload intent failed: {error}"));
             }
         };
 
@@ -3152,7 +3184,8 @@ impl Daemon {
                     blobs_total: 0,
                     ok: true,
                     timestamp: finished_at_unix_ms / 1_000,
-                });
+                })
+                .await;
                 // A successful PUT flips the key positive immediately:
                 // key-cache insert + negative-cache invalidation (#564).
                 self.note_key_present(&job.key, &job.crate_name).await;
@@ -3197,7 +3230,8 @@ impl Daemon {
                     blobs_total: 0,
                     ok: false,
                     timestamp: finished_at_unix_ms / 1_000,
-                });
+                })
+                .await;
                 let class = classify_remote_error(&e);
                 put_breaker.failure(class, &format!("remote upload failed ({class:?}): {e:#}"));
                 tracing::warn!(
@@ -3661,7 +3695,8 @@ impl Daemon {
                     blobs_total: dl.blobs_total,
                     ok: true,
                     timestamp: finished_at_unix_ms / 1_000,
-                });
+                })
+                .await;
                 Response::found(true)
             }
             Err(e) if classify_remote_error(&e) == RemoteErrorClass::Miss => {
@@ -3715,7 +3750,8 @@ impl Daemon {
                     blobs_total: 0,
                     ok: false,
                     timestamp: finished_at_unix_ms / 1_000,
-                });
+                })
+                .await;
                 // Feed the breaker with the failure class (#327) so a dead or
                 // stalling remote degrades and later restores skip S3
                 // entirely. A Timeout (transport deadline or the restore
@@ -4622,7 +4658,8 @@ impl Daemon {
                                 blobs_total: dl.blobs_total,
                                 ok: true,
                                 timestamp: finished_at_unix_ms / 1_000,
-                            });
+                            })
+                            .await;
                             // Track as prefetched for PrefetchHit attribution.
                             // Bound the set: a long-lived daemon that
                             // prefetches many distinct keys would otherwise
@@ -4690,7 +4727,8 @@ impl Daemon {
                                 blobs_total: 0,
                                 ok: false,
                                 timestamp: finished_at_unix_ms / 1_000,
-                            });
+                            })
+                            .await;
                             tracing::warn!("prefetch download failed for {}: {e}", key);
                         }
                     }

@@ -12,7 +12,7 @@ came from the second pass.
 
 ## Well covered (feature → scenario)
 
-| Feature / capability | Scenario(s) |
+| Feature / capability | Scenario(s) / process test |
 |---|---|
 | Rust lifecycle (cold/warm/noop) | `e2e-multi-dep`, `e2e-rust-debug` |
 | `cargo check` / `.rmeta`-only output | `e2e-rust-check` |
@@ -42,15 +42,16 @@ came from the second pass.
 | Restore mtime convergence + cross-tree active-reader isolation (#677/#680/#794) | `e2e-rust-cross-tree` |
 | In-flight coalescing across simultaneous cargo invocations (#646) | `e2e-rust-parallel-coalesce` |
 | Restore content correctness (byte-for-byte) | `[diff]` in C/C++/CMake/Rust-FFI/workspace scenarios |
+| S3 v3 sync across isolated caches (#695) | `tests/s3_remote_test.rs` (signed OpenDAL requests against a deterministic local wire store) |
 
 ## Gaps — features with NO e2e scenario
 
 | Feature / capability | Notes |
 |---|---|
-| **Remote / S3 cache** | upload/download round-trip, sigv4a auth, v1/v2/v3 pack formats, zstd compression, blob dedup, HEAD checks — *entirely untested e2e* |
-| **`sync` / `save-manifest`** | user-facing remote population without a compiler invocation |
+| **S3 provider/auth variants** | The required process test covers signed v3 manifest/pack upload, list, download, import, zstd, and restore. Live AWS/R2/Ceph/MinIO credentials and legacy v1/v2 layouts remain outside the hermetic PR gate; SigV4a is not supported. |
+| **`save-manifest`** | `sync --push/--pull --all` is process-tested; build-manifest and shard publication is not. |
 | **Daemon path** | prefetch/warming (shards), hash-files cache, remote-check HIT, upload queue |
-| **Cross-machine dedup** | scenarios test cross-*path* (same host); nothing tests cross-*machine* via remote — kache's headline value prop |
+| **Daemon-driven cross-machine reuse** | Explicit sync across isolated caches/source trees is covered by `tests/s3_remote_test.rs`; asynchronous upload and on-demand remote HIT across clients remains #696. |
 | **Config behaviors as toggles** | `key_salt`, `ignore_env`, `path_only_env_vars`, `cc_extra_allowlist_flags`, `local_only`, `modified_input_guard` (#324) — none asserted to flip hit/miss e2e |
 | **Refusal classes** | multi-source and response files now covered (`e2e-cc-multi-source`, `e2e-cc-response-file`); still open: `-E`/`-S`, PCH/modules, multi-arch fat binaries, stdout output |
 | **Platform restore modes** | reflink vs hardlink vs copy; Windows NTFS hardlink / ReFS block-clone (#435); macOS codesign of restored executables — restores happen but the *mode* is never asserted |
@@ -76,13 +77,13 @@ the originally-listed gaps do **not** fit and should stay where they are:
 
 ## Prioritized missing scenarios
 
-1. **Remote S3 round-trip** (local MinIO/localstack, or the existing wire-mock): cold miss → upload → fresh clone → remote HIT → download + restore. Largest load-bearing untested surface; covers pack format, compression, hash validation.
-2. **Cross-machine / clone dedup via remote** — the product's core promise; closest existing test only does cross-path.
-3. **Daemon prefetch + remote-check HIT** — the production async path (batching, upload queue, warmed cache).
-4. **Platform restore** — Windows hardlink/ReFS (#435) and macOS codesign-after-restore.
-5. **Rust edge-key** — custom target JSON + native search paths, to catch under-keying.
-6. **Remaining refusal classes** — `-E`/`-S`, PCH/modules, multi-arch, stdout output → passthrough, no cache entry (extends `e2e-cc-multi-source` / `e2e-cc-response-file`).
+1. **Daemon upload + remote-check HIT across clients** — the remaining production async path (upload queue, on-demand remote check, batching, warmed cache), tracked by #696.
+2. **Platform restore** — Windows hardlink/ReFS (#435) and macOS codesign-after-restore.
+3. **Rust edge-key** — custom target JSON + native search paths, to catch under-keying.
+4. **Remaining refusal classes** — `-E`/`-S`, PCH/modules, multi-arch, stdout output → passthrough, no cache entry (extends `e2e-cc-multi-source` / `e2e-cc-response-file`).
+5. **Optional live-provider qualification** — scheduled/non-blocking AWS, R2, Ceph, or MinIO smoke coverage for provider-specific credentials and behavior; the required PR gate stays hermetic.
 
 ### Done (this branch)
 
 - ✅ **Refusal: multi-source + response file** — `e2e-cc-multi-source`, `e2e-cc-response-file` (verified green via the gate harness).
+- ✅ **S3 v3 sync round-trip across isolated caches** — `tests/s3_remote_test.rs` drives cold compile → signed push → fresh-cache pull/import → compiler-free restore and verifies the manifest, compressed pack, and artifact bytes (#695).

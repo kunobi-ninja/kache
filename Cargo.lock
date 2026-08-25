@@ -2930,6 +2930,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "async-trait",
+ "axum",
  "blake3",
  "bytes",
  "bytesize",

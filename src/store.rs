@@ -1962,7 +1962,10 @@ impl Store {
         // (never reaching zero, never reclaimed), and hashes shared by
         // both generations double-count. Unconditional on `committed`,
         // unlike the import path's variant: a committed-but-stranded row
-        // is exactly the shape that funnels back into put.
+        // is exactly the shape that funnels back into put. Pre-#608 rows
+        // whose mapping the GC backfill hasn't materialized yet still
+        // slip through (there is nothing to decrement by); those remain
+        // `doctor --repair` / reconcile territory.
         tx.execute(
             "UPDATE blobs
              SET refcount = MAX(0, refcount - COALESCE((
@@ -4262,20 +4265,30 @@ impl Store {
     /// Clear the entire store.
     ///
     /// Index rows drop first, in one transaction: once it commits no
-    /// reader can begin a restore from a purged entry, and a racing
-    /// publisher's registration serializes wholly before it (purged with
-    /// the rest) or wholly after (its rows survive; a later re-put heals
-    /// its files). The filesystem wipe then runs against a store the
-    /// index no longer references, so a crash mid-wipe strands at worst
-    /// orphan files for the sweep — never index rows pointing at deleted
-    /// blobs, which the old wipe-then-delete order could leave.
+    /// reader can begin a restore from a purged entry, and the
+    /// filesystem wipe then runs against a store the index no longer
+    /// references — a crash mid-wipe strands at worst orphan files for
+    /// the sweep, never the pre-existing rows dangling over deleted
+    /// blobs that the old wipe-then-delete order could leave.
+    ///
+    /// Publishers don't take `gc.lock`, so a put can still commit a
+    /// fresh row while the wipe is deleting the files it just staged.
+    /// The second row-deletion pass reduces that to the store's
+    /// tolerated shapes: a row committed before the pass is dropped
+    /// (its files become sweepable orphans), and one committed after it
+    /// at worst lands stranded — the refuse-removal / miss / re-put
+    /// path that already recovers it.
     pub fn clear(&self) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
-        tx.execute("DELETE FROM entries", [])?;
-        tx.execute("DELETE FROM entry_blobs", [])?;
-        tx.execute("DELETE FROM blobs", [])?;
-        tx.execute("DELETE FROM incremental_dirs", [])?;
-        tx.commit()?;
+        let drop_index_rows = || -> Result<()> {
+            let tx = self.db.unchecked_transaction()?;
+            tx.execute("DELETE FROM entries", [])?;
+            tx.execute("DELETE FROM entry_blobs", [])?;
+            tx.execute("DELETE FROM blobs", [])?;
+            tx.execute("DELETE FROM incremental_dirs", [])?;
+            tx.commit()?;
+            Ok(())
+        };
+        drop_index_rows()?;
         let store_dir = self.config.store_dir();
         if store_dir.exists() {
             // Make everything writable recursively, then remove all subdirs
@@ -4287,7 +4300,7 @@ impl Store {
                 }
             }
         }
-        Ok(())
+        drop_index_rows()
     }
 
     /// Recursively make all files in a directory writable so they can be deleted.

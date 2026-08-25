@@ -41,8 +41,10 @@ impl TerminalModeGuard {
         });
         enable_raw_mode()?;
         if let Err(e) = stdout().execute(EnterAlternateScreen) {
-            // No guard exists yet to undo the half-entered state.
-            let _ = disable_raw_mode();
+            // No guard exists yet to undo the half-entered state — and
+            // the escape sequence may have been written before the error
+            // surfaced, so leave the alternate screen too.
+            restore_terminal();
             return Err(e.into());
         }
         Ok(Self)

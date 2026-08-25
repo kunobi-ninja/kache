@@ -1,6 +1,6 @@
 [package]
 name = "kache"
-version = "0.15.1"
+version = "0.16.0"
 edition = "2024"
 description = "Zero-copy, content-addressed build cache for Rust, C/C++ and more, with S3 and shared-filesystem remotes."
 license = "Apache-2.0"
@@ -36,7 +36,7 @@ reqsign-aws-v4 = { version = "=3.0.2", default-features = false }
 reqsign-core = { version = "=3.1.0", default-features = false }
 # Direct dep so OpenDAL/reqwest can use ring without reintroducing aws-lc.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-kache-core = { version = "0.15.1", path = "crates/kache-core", default-features = false, features = ["planning"] }
+kache-core = { version = "0.16.0", path = "crates/kache-core", default-features = false, features = ["planning"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "fs", "io-util", "net", "time", "signal", "sync"] }
 serde = { version = "1", features = ["derive"] }

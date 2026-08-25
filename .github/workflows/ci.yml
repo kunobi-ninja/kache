@@ -86,7 +86,7 @@ jobs:
           version: 2026.6.9
           cache: false
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-      - uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
+      - uses: kunobi-ninja/kache-action@eeafa81c39bb1b268304fd144523de074e0f793b # v1
         with:
           github-cache: "true"
           cache-executables: "false"
@@ -1227,7 +1227,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
 
       - name: Package & push Helm chart
         env:

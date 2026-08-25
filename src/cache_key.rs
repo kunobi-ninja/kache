@@ -3612,10 +3612,10 @@ pub(crate) fn get_rustc_commit_hash(rustc: &Path) -> Option<String> {
 ///
 /// Prefers an explicit `--sysroot` (already parsed into [`RustcArgs::sysroot`]);
 /// otherwise runs `rustc --print sysroot` once and file-caches it like the
-/// version probe. NOTE: the cache key is the binary path + mtime, matching
-/// [`get_rustc_version`]; it does not fold `RUSTUP_TOOLCHAIN`, so a rustup shim
-/// pointed at different toolchains via that env var could serve a stale sysroot.
-/// Pre-existing limitation shared with `get_rustc_version`; out of scope here.
+/// version probe. The cache key folds the binary path + mtime plus the rustup
+/// toolchain-selection state, so a shim redirected to another toolchain
+/// re-probes instead of serving a stale sysroot (see
+/// [`toolchain_selector_fingerprint`]).
 pub(crate) fn get_rustc_sysroot(args: &RustcArgs) -> Option<PathBuf> {
     if let Some(sysroot) = &args.sysroot {
         return Some(sysroot.clone());
@@ -3659,7 +3659,8 @@ fn write_tool_version_cache(binary: &Path, prefix: &str, version: &str) {
 
 /// Build the cache-file path: `<cache_dir>/<prefix>-<hash>.txt` where the hash
 /// is derived from the binary's canonical path + mtime so it auto-invalidates
-/// when the toolchain is updated.
+/// when the toolchain is updated, plus the rustup toolchain-selection state
+/// (see [`toolchain_selector_fingerprint`]).
 fn tool_version_cache_path(binary: &Path, prefix: &str) -> Option<std::path::PathBuf> {
     let canon = std::fs::canonicalize(binary).ok()?;
     let mtime = std::fs::metadata(&canon)
@@ -3669,9 +3670,85 @@ fn tool_version_cache_path(binary: &Path, prefix: &str) -> Option<std::path::Pat
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    let key = format!("{}:{}", canon.display(), mtime);
+    let key = format!(
+        "{}:{}:{}",
+        canon.display(),
+        mtime,
+        toolchain_selector_fingerprint(
+            std::env::var_os("RUSTUP_TOOLCHAIN").as_deref(),
+            std::env::current_dir().ok().as_deref(),
+            rustup_settings_path().as_deref(),
+        )
+    );
     let hash = blake3::hash(key.as_bytes()).to_hex();
     Some(crate::config::default_cache_dir().join(format!("{}-{}.txt", prefix, &hash[..16])))
+}
+
+/// The rustup toolchain-selection state that can redirect an unchanged shim
+/// binary (`~/.cargo/bin/rustc` is rustup itself) to a different toolchain:
+/// path + mtime alone then serve a stale version, sysroot, or linker string
+/// across a `RUSTUP_TOOLCHAIN` change, an edited `rust-toolchain{,.toml}`,
+/// or a `rustup default` switch (which rewrites `settings.toml`).
+///
+/// Selector files fold by content digest, not mtime: these are tiny files,
+/// and a digest catches an edit within one mtime second or under a
+/// preserved timestamp. The nearest directory with either toolchain-file
+/// spelling contributes BOTH spellings, sidestepping rustup's precedence
+/// rules entirely — whichever file actually wins, changing it changes the
+/// fingerprint. For a non-shim binary all this costs is a cheap re-probe
+/// on the rare occasions the selection state changes.
+fn toolchain_selector_fingerprint(
+    rustup_toolchain: Option<&std::ffi::OsStr>,
+    cwd: Option<&Path>,
+    rustup_settings: Option<&Path>,
+) -> String {
+    let mut fp = String::new();
+    if let Some(toolchain) = rustup_toolchain {
+        fp.push_str("env:");
+        fp.push_str(&toolchain.to_string_lossy());
+    }
+    // Rustup resolves toolchain files from the cwd upward; the nearest
+    // directory holding one ends the search.
+    if let Some(cwd) = cwd {
+        'search: for dir in cwd.ancestors() {
+            let mut found = false;
+            for name in ["rust-toolchain", "rust-toolchain.toml"] {
+                let candidate = dir.join(name);
+                if let Some(digest) = file_digest(&candidate) {
+                    fp.push_str(";file:");
+                    fp.push_str(&candidate.to_string_lossy());
+                    fp.push(':');
+                    fp.push_str(&digest);
+                    found = true;
+                }
+            }
+            if found {
+                break 'search;
+            }
+        }
+    }
+    if let Some(settings) = rustup_settings
+        && let Some(digest) = file_digest(settings)
+    {
+        fp.push_str(";default:");
+        fp.push_str(&digest);
+    }
+    fp
+}
+
+/// `$RUSTUP_HOME/settings.toml` (or its `~/.rustup` default), which records
+/// the `rustup default` toolchain.
+fn rustup_settings_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("RUSTUP_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".rustup")))?;
+    Some(home.join("settings.toml"))
+}
+
+/// Content digest of a small selector file, or `None` if unreadable.
+fn file_digest(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(blake3::hash(&bytes).to_hex()[..16].to_string())
 }
 
 /// Get the host target triple.
@@ -4570,6 +4647,61 @@ mod tests {
             env_os_key_bytes(OsStr::new("normal"))
         );
         assert!(env_os_key_bytes(OsStr::new("")).is_empty());
+    }
+
+    /// Every rustup mechanism that can redirect an unchanged shim binary
+    /// must move the tool-version memo key: `RUSTUP_TOOLCHAIN`, the
+    /// nearest `rust-toolchain{,.toml}` up from the cwd, and the
+    /// `settings.toml` behind `rustup default`.
+    #[test]
+    fn toolchain_selector_fingerprint_tracks_every_selection_source() {
+        use std::ffi::OsStr;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("workspace").join("member");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let base = toolchain_selector_fingerprint(None, Some(&project), None);
+        assert_eq!(base, "", "no selection state folds to a stable empty");
+
+        let pinned =
+            toolchain_selector_fingerprint(Some(OsStr::new("1.93.0")), Some(&project), None);
+        assert_ne!(pinned, base);
+        assert_ne!(
+            toolchain_selector_fingerprint(Some(OsStr::new("nightly")), Some(&project), None),
+            pinned,
+            "different overrides must fingerprint differently"
+        );
+
+        // The nearest directory with a toolchain file ends the ancestor
+        // walk, and BOTH spellings fold so rustup's precedence between
+        // them never matters: editing either one moves the fingerprint.
+        std::fs::write(dir.path().join("workspace").join("rust-toolchain"), "1.88").unwrap();
+        std::fs::write(
+            dir.path().join("workspace").join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.90\"\n",
+        )
+        .unwrap();
+        let with_files = toolchain_selector_fingerprint(None, Some(&project), None);
+        assert_eq!(with_files.matches(";file:").count(), 2, "{with_files}");
+        std::fs::write(dir.path().join("workspace").join("rust-toolchain"), "1.89").unwrap();
+        let with_edited = toolchain_selector_fingerprint(None, Some(&project), None);
+        assert_ne!(
+            with_edited, with_files,
+            "editing the bare file must move the fingerprint even though \
+             the .toml sibling is untouched"
+        );
+
+        let settings = dir.path().join("settings.toml");
+        std::fs::write(&settings, "default_toolchain = \"stable\"").unwrap();
+        let with_default = toolchain_selector_fingerprint(None, Some(&project), Some(&settings));
+        assert!(with_default.contains("default:"), "{with_default}");
+        assert_ne!(with_default, base);
+        std::fs::write(&settings, "default_toolchain = \"beta\"").unwrap();
+        assert_ne!(
+            toolchain_selector_fingerprint(None, Some(&project), Some(&settings)),
+            with_default,
+            "a rustup default switch must move the fingerprint"
+        );
     }
 
     #[test]

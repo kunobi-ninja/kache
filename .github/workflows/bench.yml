@@ -469,7 +469,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
 
       # Fail fast with an explicit checklist if a Firefox build prerequisite is
@@ -540,7 +540,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Install tools via mise
-        uses: jdx/mise-action@v4
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
@@ -635,7 +635,7 @@ jobs:
 
       - name: Upload bench reports
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-firefox-pull-windows
           # Reports live under the SHORT work dir (`$RUNNER_TEMP/b`), not

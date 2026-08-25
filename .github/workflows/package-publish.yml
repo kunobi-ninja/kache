@@ -435,7 +435,7 @@ jobs:
     outputs:
       pkgs: ${{ steps.list.outputs.pkgs }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: list
         run: |
           set -euo pipefail
@@ -456,7 +456,7 @@ jobs:
       # fetch-depth: 0 is load-bearing for the -git packages below: their
       # pkgver embeds `git rev-list --count HEAD`, and the default depth-1
       # checkout would count 1 commit no matter the real history.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 

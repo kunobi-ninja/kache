@@ -8,12 +8,16 @@ use crate::compiler::rustc::RustcCompiler;
 /// the emitted artifact bytes. Their separated value (`--flag value`) is
 /// skipped during parsing so neither the flag nor its value reaches the
 /// `residual_args` catch-all and over-keys the result (kunobi-ninja/kache#324).
+///
+/// Deny-level lint gates (`-D`, `--deny`, `-F`, `--forbid`) are deliberately
+/// NOT listed here even though they cannot change a successful compile's
+/// object bytes: they change whether the compilation *fails*, and a cache hit
+/// replays success — see [`OUTCOME_AFFECTING_VALUE_FLAGS`].
 const IGNORED_VALUE_FLAGS: &[&str] = &[
     "--error-format",
     "--json",
     "--color",
     "--diagnostic-width",
-    "--cap-lints",
     "--check-cfg",
     "--print",
     "--explain",
@@ -21,33 +25,55 @@ const IGNORED_VALUE_FLAGS: &[&str] = &[
     "--warn",
     "-A",
     "--allow",
-    "-D",
-    "--deny",
-    "-F",
-    "--forbid",
-    "--force-warn",
 ];
 
 /// Attached (`--flag=value` / `-Xvalue`) forms of the diagnostics / lint flags
 /// above, plus the single-letter lint prefixes (`-Wunused`, `-Dwarnings`). Used
 /// to drop the attached spellings from the cache key alongside their separated
 /// counterparts in [`IGNORED_VALUE_FLAGS`].
+///
+/// The `-D` / `-F` prefixes are intentionally absent: those spellings are
+/// outcome-affecting and captured by [`OUTCOME_LINT_ATTACHED_PREFIXES`] before
+/// this list is consulted.
 const IGNORED_ATTACHED_PREFIXES: &[&str] = &[
     "--error-format=",
     "--json=",
     "--color=",
     "--diagnostic-width=",
-    "--cap-lints=",
     "--check-cfg=",
     "--print=",
     "--explain=",
     "--warn=",
     "--allow=",
+    "-W",
+    "-A",
+];
+
+/// rustc flags that can flip the compile's *outcome* from failure to success
+/// without changing the object bytes of the successful compile. A cache hit
+/// replays success, so two invocations differing only here MUST NOT share a
+/// key — otherwise one stored under "warnings allowed" would serve green to a
+/// build that `-D warnings` should have failed (review finding #2). Each is
+/// captured with its value into [`RustcArgs::outcome_lint_flags`] and folded
+/// into the cache key.
+const OUTCOME_AFFECTING_VALUE_FLAGS: &[&str] = &[
+    "-D",           // deny: warnings of the named lint become hard errors
+    "--deny",       // long form of -D
+    "-F",           // forbid: like deny, cannot be re-allowed downstream
+    "--forbid",     // long form of -F
+    "--force-warn", // forces warn level; overrides attribute-level deny/allow
+    "--cap-lints", // caps every lint level; changes effective levels (cargo passes --cap-lints allow)
+];
+
+/// Attached forms (`--deny=warnings`, `-Dwarnings`, …) of
+/// [`OUTCOME_AFFECTING_VALUE_FLAGS`]. Bare `-D` / `-F` prefixes match any
+/// attached value (`-Dwarnings`, `-Funused`) because rustc defines no other
+/// flag beginning with those spellings; the long forms use explicit `=`.
+const OUTCOME_LINT_ATTACHED_PREFIXES: &[&str] = &[
     "--deny=",
     "--forbid=",
     "--force-warn=",
-    "-W",
-    "-A",
+    "--cap-lints=",
     "-D",
     "-F",
 ];
@@ -268,6 +294,13 @@ pub struct RustcArgs {
     /// future rustc flag) yet were previously invisible to the cache key, so
     /// they are folded in under a versioned tag (kunobi-ninja/kache#324).
     pub residual_args: Vec<String>,
+    /// Outcome-affecting lint gates (`-D`/`--deny`/`--forbid`/`-F`,
+    /// `--force-warn`, `--cap-lints`) captured as flag+value token pairs in
+    /// argv order, including attached spellings (`-Dwarnings`). These cannot
+    /// change a successful compile's object bytes but DO change whether the
+    /// compile fails, and hits replay success — so they are folded into the
+    /// cache key (see `cache_key.rs`; review finding #2).
+    pub outcome_lint_flags: Vec<String>,
     /// Whether this is a `--test` compilation (test harness binary)
     pub is_test: bool,
     /// Whether this looks like a primary compilation (has source file + crate name)
@@ -367,6 +400,7 @@ impl RustcArgs {
             raw_args,
             argfile_state,
             residual_args: Vec::new(),
+            outcome_lint_flags: Vec::new(),
             is_test: false,
             is_primary: false,
             path_normalize_disabled: !crate::path_normalizer::rustc_path_normalize_enabled(),
@@ -380,6 +414,7 @@ impl RustcArgs {
 
         let mut i = 0;
         while i < rustc_args.len() {
+            let i_before = i;
             let arg = &rustc_args[i];
 
             match arg.as_str() {
@@ -548,6 +583,23 @@ impl RustcArgs {
                 "-V" | "--version" | "-h" | "--help" | "-vV" => {
                     is_query = true;
                 }
+                // Outcome-affecting lint gates: capture flag + value for the
+                // cache key before the generic diagnostics drop below. Must
+                // precede the IGNORED_* arms — classification is first-match
+                // (review finding #2).
+                _ if OUTCOME_AFFECTING_VALUE_FLAGS.contains(&arg.as_str()) => {
+                    parsed.outcome_lint_flags.push(arg.clone());
+                    if let Some(value) = rustc_args.get(i + 1) {
+                        parsed.outcome_lint_flags.push(value.clone());
+                    }
+                    i = i.saturating_add(1); // skip the value argument
+                }
+                _ if OUTCOME_LINT_ATTACHED_PREFIXES
+                    .iter()
+                    .any(|p| arg.starts_with(p)) =>
+                {
+                    parsed.outcome_lint_flags.push(arg.clone());
+                }
                 // Diagnostics / lint / query flags: never change the artifact,
                 // so drop them (and their separated value) before the residual
                 // catch-all (kunobi-ninja/kache#324).
@@ -572,6 +624,16 @@ impl RustcArgs {
                 }
             }
             i += 1;
+            // Every iteration must consume at least the token it just
+            // classified. An arm that moves `i` backwards instead of forward
+            // would spin here forever, growing whatever vector it pushes to
+            // until the machine runs out of memory — a failure mode no test
+            // can catch, since there is nothing to fail. Debug-only, so the
+            // release parse is unchanged.
+            debug_assert!(
+                i > i_before,
+                "argv parse must advance past index {i_before}"
+            );
         }
 
         parsed.features.sort();
@@ -908,6 +970,51 @@ fn record_codegen_opt(parsed: &mut RustcArgs, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Outcome-affecting lint gates must be captured exactly — flag AND
+    /// value, separated and attached spellings — and must not leak into the
+    /// residual catch-all. Asserting the captured tokens directly (not just
+    /// "the key changed") pins the parse indices: a wrong skip or a wrong
+    /// `get(i ± 1)` would capture the wrong token pair.
+    #[test]
+    fn outcome_lint_gates_capture_flag_and_value() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "rustc".to_string(),
+                "--crate-name".to_string(),
+                "m".to_string(),
+            ];
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            RustcArgs::parse(&argv).unwrap()
+        };
+
+        let separated = parse(&["-D", "warnings"]);
+        assert_eq!(
+            separated.outcome_lint_flags,
+            ["-D", "warnings"],
+            "separated gate must capture flag then value"
+        );
+        assert!(
+            separated.residual_args.is_empty(),
+            "gate tokens must not leak into residual: {:?}",
+            separated.residual_args
+        );
+
+        let attached = parse(&["-Dwarnings"]);
+        assert_eq!(attached.outcome_lint_flags, ["-Dwarnings"]);
+
+        let long = parse(&["--cap-lints", "allow"]);
+        assert_eq!(long.outcome_lint_flags, ["--cap-lints", "allow"]);
+        assert!(long.residual_args.is_empty());
+
+        let long_attached = parse(&["--forbid=unused"]);
+        assert_eq!(long_attached.outcome_lint_flags, ["--forbid=unused"]);
+
+        // Diagnostics-only levels stay out of the capture (#324).
+        let warn = parse(&["-W", "unused"]);
+        assert!(warn.outcome_lint_flags.is_empty());
+        assert!(warn.residual_args.is_empty());
+    }
 
     /// The two sides of the #627 join have to agree: what a producer records
     /// for itself (`-C extra-filename`) must equal what a consumer recovers

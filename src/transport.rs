@@ -59,6 +59,76 @@ pub fn socket_name(path: &Path) -> Result<Name<'static>> {
     }
 }
 
+/// Restrict a freshly bound Unix socket file to its owning user (`0600`).
+///
+/// Sockets are created with the process umask applied (typically leaving them
+/// group/world-traversable), which lets any local user attempt `connect(2)`
+/// unless the socket happens to live inside an already-private directory.
+/// Calling this right after binding makes the guarantee independent of the
+/// umask: only the daemon's own user can reach the socket file at all.
+/// Windows named pipes scope access through the kernel object DACL instead of
+/// file permissions, so this is Unix-only.
+#[cfg(unix)]
+pub fn restrict_socket_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting permissions on {}", path.display()))
+}
+
+/// Reject a connection whose peer is not the daemon's own user.
+///
+/// Defense-in-depth behind [`restrict_socket_permissions`]: even if the socket
+/// file ends up reachable by others (nonstandard umask, relinked path, shared
+/// cache dir), every accepted connection is checked against the peer's
+/// effective UID via `SO_PEERCRED` (Linux) / `getpeereid` (macOS, BSDs).
+/// Fails closed when credentials cannot be determined — a peer we cannot
+/// authenticate is a peer we refuse. Windows named pipes carry peer identity
+/// in the kernel object ACL rather than creds messages, so the check is
+/// Unix-only.
+///
+/// The decision is taken over an `Option<u32>` rather than a live stream so
+/// every branch is assertable: CI cannot open a connection from a foreign
+/// UID, and cannot make the platform withhold credentials.
+#[cfg(unix)]
+pub fn require_self_peer(peer_euid: Option<u32>) -> std::io::Result<()> {
+    match peer_euid {
+        Some(peer_uid) if peer_uid_is_self(peer_uid) => Ok(()),
+        Some(peer_uid) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "peer uid {peer_uid} does not match daemon uid {}",
+                self_uid()
+            ),
+        )),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("peer credentials unavailable (daemon uid {})", self_uid()),
+        )),
+    }
+}
+
+/// The peer's effective UID, where the platform exposes it: `SO_PEERCRED` on
+/// Linux, `getpeereid` on macOS and the BSDs. `None` means we could not
+/// authenticate the peer, which [`require_self_peer`] treats as a refusal.
+#[cfg(unix)]
+pub fn peer_euid(stream: &TokioStream) -> Option<u32> {
+    use interprocess::local_socket::traits::StreamCommon as _;
+    stream.peer_creds().ok().and_then(|creds| creds.euid())
+}
+
+/// The daemon's effective UID (test seam: the comparison lives here so the
+/// accept/reject decision is assertable without a foreign-UID connection).
+#[cfg(unix)]
+fn self_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+/// Does a peer's effective UID belong to the daemon's own user?
+#[cfg(unix)]
+fn peer_uid_is_self(peer_uid: u32) -> bool {
+    peer_uid == self_uid()
+}
+
 /// True if a daemon socket / named pipe at `path` accepts a connection
 /// right now. Used by liveness probes — does not check whether the daemon
 /// is responsive, only whether *something* is listening.
@@ -155,5 +225,77 @@ mod tests {
                 "{kind:?} should not be treated as a peer disconnect"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_socket_permissions_sets_owner_only_mode() {
+        // Bind a real listener (socket file created with the ambient umask),
+        // then verify the hardening helper pins the mode to 0600 regardless.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restricted.sock");
+        let name = socket_name(&path).unwrap();
+        let _listener = ListenerOptions::new()
+            .name(name)
+            .create_sync()
+            .expect("bind listener");
+        restrict_socket_permissions(&path).expect("restrict permissions");
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&path).unwrap().permissions(),
+        );
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "socket must be owner-only after hardening"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_self_peer_rejects_foreign_and_unauthenticated_peers() {
+        // The accept direction is also covered end-to-end by
+        // `same_user_peer_check_accepts_own_connections`; this pins every
+        // branch, including the two CI cannot produce with a real
+        // connection: a foreign UID, and a platform that withholds creds.
+        let mine = self_uid();
+        assert!(require_self_peer(Some(mine)).is_ok());
+
+        let foreign = require_self_peer(Some(mine.wrapping_add(1))).unwrap_err();
+        assert_eq!(foreign.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(foreign.to_string().contains("does not match daemon uid"));
+
+        // Fail closed: a peer we cannot authenticate is a peer we refuse.
+        let unknown = require_self_peer(None).unwrap_err();
+        assert_eq!(unknown.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(unknown.to_string().contains("credentials unavailable"));
+
+        assert!(peer_uid_is_self(mine));
+        assert!(!peer_uid_is_self(mine.wrapping_add(0xdead_beef)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn same_user_peer_check_accepts_own_connections() {
+        use crate::transport::prelude::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.sock");
+        let name = socket_name(&path).unwrap();
+        let listener = ListenerOptions::new()
+            .name(name)
+            .create_tokio()
+            .expect("bind listener");
+
+        let client = tokio::spawn(async move {
+            TokioStream::connect(socket_name(&path).unwrap())
+                .await
+                .expect("connect")
+        });
+        let (stream, _client) = tokio::join!(listener.accept(), client);
+
+        // The test client runs under the same effective UID as the "daemon",
+        // so the credential gate must accept it. Rejection of foreign UIDs is
+        // not unit-testable without privilege switching.
+        let stream = stream.expect("accept");
+        require_self_peer(peer_euid(&stream)).expect("same-user peer accepted");
     }
 }

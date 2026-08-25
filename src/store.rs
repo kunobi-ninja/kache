@@ -152,9 +152,11 @@ enum StoreIngest {
 /// account for disk honestly, mirroring the restore side in `link.rs`.
 /// Counters are best-effort under concurrent put/remove: a phase-2
 /// rematerialize after a reclaim may count the same logical ingest again.
-fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<()> {
+/// Returns `Ok(true)` when this call published the blob (the caller may then
+/// want to verify its digest), `Ok(false)` when it was already present.
+fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<bool> {
     if blob.is_file() {
-        return Ok(());
+        return Ok(false);
     }
     fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
     let bytes = fs::metadata(source).map(|m| m.len()).unwrap_or(0);
@@ -241,7 +243,76 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
             restore_source_writable_if_unshared(source, blob);
         }
     }
-    Ok(())
+    Ok(published)
+}
+/// Process-wide monotonic counter behind staging file names. Paired with the
+/// pid it makes every in-flight staging path unique *by construction*: two
+/// threads never draw the same nonce, and two live processes never share a
+/// pid. That is what lets [`free_staging_path`] hand the ingest a path that
+/// does not exist yet — see the warning there.
+static STAGE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many nonces to try before giving up on finding a free staging name.
+/// Only stale leftovers from a crashed process whose pid has since been
+/// recycled can occupy one, so a handful of attempts is already generous;
+/// the bound keeps a pathological staging directory failing fast instead of
+/// spinning forever.
+const STAGING_NAME_ATTEMPTS: u32 = 16;
+
+/// How long a staging snapshot must sit untouched before a sweep may reclaim
+/// it. A snapshot belonging to a put running in another process is
+/// indistinguishable from a crash leftover, and unlinking one fails that put
+/// at publish time — so the grace has to outlast any plausible in-flight put.
+/// Shared by the daemon's GC sweep and `doctor --repair` so neither can
+/// undercut the other.
+pub const STAGING_SWEEP_GRACE: Duration = Duration::from_secs(3600);
+
+/// Pick a staging path that does not exist yet, skipping past any stale
+/// leftover, and return it WITHOUT creating it.
+///
+/// Not creating it is the whole point: `clonefile(2)` (macOS) and `link(2)`
+/// (everywhere) both fail with `EEXIST` when their destination already
+/// exists, so reserving the name with a placeholder file would make both
+/// zero-copy ingests fail and silently demote every put to a full byte copy.
+/// Uniqueness comes from pid + [`STAGE_NONCE`] instead of from `create_new`,
+/// which is stronger than a placeholder anyway: no live stager can draw this
+/// name, so there is nothing to reserve it against.
+///
+/// Extracted from [`Store::stage_blob_from_source`] so the skip-and-retry
+/// branch is unit-testable with injected names.
+fn free_staging_path(mut name_for_nonce: impl FnMut(u64) -> PathBuf) -> std::io::Result<PathBuf> {
+    for _ in 0..STAGING_NAME_ATTEMPTS {
+        let candidate = name_for_nonce(STAGE_NONCE.fetch_add(1, Ordering::Relaxed));
+        match fs::symlink_metadata(&candidate) {
+            // Occupied by a crash leftover: leave it for the staging sweep
+            // and take the next nonce.
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            // Anything else (unreadable or missing staging directory) is a
+            // real fault, not a collision: surface it instead of spinning.
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free staging name",
+    ))
+}
+
+/// Classify a failed publish rename.
+///
+/// A destination that exists now, having been absent when the publish
+/// started, is a concurrent winner: it was published under the same digest,
+/// so it holds the same bytes and losing the race changes nothing. Anything
+/// else is a genuine publish failure and must surface. Split out from
+/// [`Store::publish_staged_blob`] because the race itself cannot be staged
+/// in a test, but the decision it feeds can.
+fn publish_rename_outcome(err: std::io::Error, blob_present: bool) -> Result<bool> {
+    if blob_present {
+        Ok(false)
+    } else {
+        Err(err).context("publishing staged blob")
+    }
 }
 
 /// Whether `a` and `b` name the same inode (hardlinked). Used after a lost
@@ -1770,27 +1841,49 @@ impl Store {
     ) -> Result<StorePutResult> {
         let entry_dir = self.entry_dir(cache_key);
 
-        // Phase 1: hash every output and durably materialize its blob on disk
-        // *before* any committed entry can reference it. No DB writes happen
-        // here, so a crash leaves at most orphan blob files (reclaimed by
-        // `sweep_orphan_blobs`, run from GC and `doctor --repair`), never a
-        // half-registered entry. `sources` is kept so Phase 2 can
-        // re-materialize a blob if a concurrent remove unlinks it.
+        // Phase 1: stage every output into a private snapshot and hash THE
+        // SNAPSHOT — never the live build output — before any committed entry
+        // can reference it. The digest is computed over exactly the bytes
+        // that will be published under it, so a post-build mutator (strip,
+        // codesign, wasm post-processing) changing the file between staging
+        // and hashing cannot store content X under address H(Y) (review
+        // finding #3). No DB writes happen here, so a crash leaves at most an
+        // unpublished staging file (`sweep_stale_staging`) or orphan blob
+        // files (`sweep_orphan_blobs`), never a half-registered entry.
+        // `sources` is kept so Phase 2 can re-materialize a blob if a
+        // concurrent remove unlinks it.
         let mut cached_files = Vec::new();
         let mut sources: Vec<(PathBuf, bool)> = Vec::new();
         let mut seen_output_blobs = std::collections::HashSet::new();
         let mut put_result = StorePutResult::default();
         let mut total_size = 0u64;
         for (source_path, store_name) in output_files {
-            let hash = crate::cache_key::hash_file(source_path)?;
-            let metadata = fs::metadata(source_path)?;
-            let size = metadata.len();
-            let executable = is_executable(&metadata);
+            // Eligibility decision only; the staged snapshot's own metadata
+            // is authoritative for what gets recorded below.
+            let source_executable = fs::metadata(source_path)
+                .map(|meta| is_executable(&meta))
+                .unwrap_or(false);
+            let use_source_hardlink =
+                source_hardlink_allowed(allow_source_hardlinks, store_name, source_executable);
+
+            let (staged, ingest) = self.stage_blob_from_source(source_path, use_source_hardlink)?;
+            let staged_meta = match fs::metadata(&staged) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    Self::discard_staged_blob(&staged);
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("stating staged blob for {store_name}")));
+                }
+            };
+            let size = staged_meta.len();
+            let executable = is_executable(&staged_meta);
             if size == 0 && !zero_byte_is_valid_output(store_name, crate_types) {
+                Self::discard_staged_blob(&staged);
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
             total_size += size;
 
+            let hash = crate::cache_key::hash_file(&staged)?;
             if seen_output_blobs.insert(hash.clone()) {
                 put_result.output_blobs += 1;
                 if self.blob_path(&hash).is_file() {
@@ -1800,9 +1893,7 @@ impl Store {
                 }
             }
 
-            let use_source_hardlink =
-                source_hardlink_allowed(allow_source_hardlinks, store_name, executable);
-            materialize_blob(source_path, &self.blob_path(&hash), use_source_hardlink)?;
+            self.publish_staged_blob(&staged, ingest, &hash, size)?;
 
             cached_files.push(CachedFile {
                 name: store_name.clone(),
@@ -1875,9 +1966,10 @@ impl Store {
             // Race guard: the INSERT/UPDATE above holds the write lock, and
             // `remove_entry` only unlinks a blob while holding that same lock,
             // so a concurrent reclaim cannot interleave here. If a remove
-            // unlinked this blob between Phase 1 and now, re-materialize it from
-            // the source before we commit a reference to it.
-            materialize_blob(source, &self.blob_path(&file.hash), *use_source_hardlink)?;
+            // unlinked this blob between Phase 1 and now, re-materialize it
+            // before we commit a reference to it — and verify the digest,
+            // since the re-ingest reads the LIVE source (review finding #3).
+            self.rematerialize_and_verify(source, &file.hash, &file.name, *use_source_hardlink)?;
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         // The write lock is held from the statements above (record_entry_blobs
@@ -2699,6 +2791,219 @@ impl Store {
     #[allow(dead_code)] // used in tests
     pub fn blobs_dir(&self) -> PathBuf {
         self.config.store_dir().join("blobs")
+    }
+
+    /// Directory holding in-progress put-phase staging files
+    /// ([`Store::stage_blob_from_source`]). Lives under the store root but
+    /// outside `blobs/`, so [`Self::sweep_orphan_blobs`] (which only considers
+    /// hash-named files inside blob shards) never sees it; stale entries are
+    /// reclaimed by [`Store::sweep_stale_staging`].
+    fn staging_dir(&self) -> PathBuf {
+        self.config.store_dir().join("staging")
+    }
+
+    /// Stage one put-phase artifact into a private snapshot under the store.
+    ///
+    /// The snapshot — not the live build output — is what gets hashed and
+    /// published, which is what upholds the content-address invariant: a file
+    /// that changes after this point cannot end up stored under another file's
+    /// digest (review finding #3). Ingest order mirrors [`materialize_blob`]:
+    /// reflink first, then hardlink where the kind allows inode sharing, then a
+    /// real copy. The returned path must be consumed by
+    /// [`Self::publish_staged_blob`] or removed by [`discard_staged_blob`].
+    ///
+    /// Hardlink read-only semantics match `materialize_blob`: the guard is
+    /// applied only after the fsync (Windows needs a writable handle to flush,
+    /// #196), and a failed demotes to a full copy rather than publishing a
+    /// writable shared inode.
+    ///
+    /// The staging path is chosen but NOT created ([`free_staging_path`]): the
+    /// reflink and hardlink ingests can only write to a destination that does
+    /// not exist yet, so pre-creating it would cost a full byte copy per
+    /// artifact on every filesystem.
+    fn stage_blob_from_source(
+        &self,
+        source: &Path,
+        allow_hardlink: bool,
+    ) -> Result<(PathBuf, StoreIngest)> {
+        let dir = self.staging_dir();
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("creating staging directory {}", dir.display()))?;
+
+        // Unique by construction (pid + process-wide nonce), so the path can
+        // be left free for the zero-copy ingests below.
+        let pid = std::process::id();
+        let tmp = free_staging_path(|nonce| dir.join(format!("stage-{pid}-{nonce}.tmp")))
+            .with_context(|| format!("reserving a staging name in {}", dir.display()))?;
+
+        let stage = |tmp: &Path, allow_hardlink: bool| -> Result<(StoreIngest, bool)> {
+            let ingest = if crate::link::try_reflink(source, tmp).is_ok() {
+                StoreIngest::Reflink
+            } else if allow_hardlink
+                && fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file())
+                && fs::hard_link(source, tmp).is_ok()
+            {
+                // Refused for symlink sources: hashing followed the link, but a
+                // hardlink would link the symlink itself — a pointer into mutable
+                // external state, never valid for a blob (same rule as
+                // `materialize_blob`).
+                StoreIngest::Hardlink
+            } else {
+                fs::copy(source, tmp)
+                    .with_context(|| format!("copying {} into store staging", source.display()))?;
+                StoreIngest::Copy
+            };
+            crate::atomic::fsync_file(tmp).context("flushing staged blob")?;
+            let mut ro_guard_failed = false;
+            if matches!(ingest, StoreIngest::Hardlink) && set_blob_readonly_checked(tmp).is_err() {
+                // The guard is a correctness requirement on a shared inode; a
+                // failure demotes to a full copy rather than publishing a
+                // writable shared blob (same recovery as `materialize_blob`).
+                ro_guard_failed = true;
+            }
+            Ok((ingest, ro_guard_failed))
+        };
+
+        match stage(&tmp, allow_hardlink) {
+            Ok((ingest, false)) => Ok((tmp, ingest)),
+            Ok((_ingest, true)) => {
+                // Hardlink succeeded but the read-only guard did not. The temp
+                // shares the source inode and we may have flipped it read-only:
+                // discard the temp (clearing the shared RO bit), restore the
+                // source writable if the blob never got published under it, and
+                // restage as an independent copy.
+                Self::drop_tmp_restore_source(source, &tmp);
+                self.stage_blob_from_source(source, false).map_err(|_| {
+                    anyhow::anyhow!("read-only guard failed on hardlinked staging temp")
+                })
+            }
+            Err(first_err) => {
+                unlink_blob(&tmp);
+                Err(first_err)
+            }
+        }
+    }
+
+    /// Discard a hardlinked staging temp and undo any read-only bit it may have
+    /// left on the shared source inode.
+    fn drop_tmp_restore_source(source: &Path, tmp: &Path) {
+        unlink_blob(tmp);
+        // `restore_source_writable_if_unshared` already no-ops when the two
+        // paths still share an inode; after the unlink they never do, so the
+        // call is unconditional by construction.
+        restore_source_writable_if_unshared(source, tmp);
+    }
+
+    /// Publish a staged snapshot onto its content-addressed path. Idempotent:
+    /// when the blob already exists the staged file is discarded and `Ok(false)`
+    /// is returned. The staged bytes are exactly what was hashed, so a rename
+    /// onto `blob_path(hash)` can never contradict the recorded digest.
+    fn publish_staged_blob(
+        &self,
+        staged: &Path,
+        ingest: StoreIngest,
+        hash: &str,
+        size_bytes: u64,
+    ) -> Result<bool> {
+        let blob = self.blob_path(hash);
+        if blob.is_file() {
+            Self::discard_staged_blob(staged);
+            return Ok(false);
+        }
+        fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
+        if let Err(e) = fs::rename(staged, &blob) {
+            Self::discard_staged_blob(staged);
+            // Re-stat: only a publish that lost a race finds the destination
+            // occupied *now* having found it free above.
+            return publish_rename_outcome(e, blob.is_file());
+        }
+        let _ = crate::atomic::fsync_dir(blob.parent().unwrap());
+        match ingest {
+            StoreIngest::Reflink => crate::opcounts::record_store_reflinked(size_bytes),
+            StoreIngest::Hardlink => crate::opcounts::record_store_hardlinked(size_bytes),
+            StoreIngest::Copy => crate::opcounts::record_store_copied(size_bytes),
+        }
+        set_blob_readonly(&blob);
+        Ok(true)
+    }
+
+    /// Discard a staging snapshot (best effort; the staging sweep reclaims any
+    /// file this fails on).
+    fn discard_staged_blob(staged: &Path) {
+        unlink_blob(staged);
+    }
+
+    /// Phase-2 race recovery: if a concurrent remove unlinked this blob after
+    /// phase 1, re-materialize it from the live source — but only under its
+    /// recorded digest. The re-ingest reads the source, which may have been
+    /// mutated since phase 1's snapshot; storing those bytes under the old
+    /// address would poison the store, so a mismatch bails (rolling back the
+    /// transaction) instead.
+    fn rematerialize_and_verify(
+        &self,
+        source: &Path,
+        hash: &str,
+        store_name: &str,
+        allow_hardlink: bool,
+    ) -> Result<()> {
+        let blob_path = self.blob_path(hash);
+        if materialize_blob(source, &blob_path, allow_hardlink)? {
+            let actual = crate::cache_key::hash_file(&blob_path)?;
+            if actual != hash {
+                anyhow::bail!(
+                    "re-materialized blob for {} hashes to {} but entry records {}; \
+                     refusing to commit",
+                    store_name,
+                    actual,
+                    hash
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Reclaim crash-orphaned staging files older than `min_age`. A put killed
+    /// between staging and publish leaves its snapshot here; unlike an orphaned
+    /// blob it has no DB row to consult, so age is the only liveness signal —
+    /// see [`STAGING_SWEEP_GRACE`] for why every caller wants the same one.
+    pub fn sweep_stale_staging(&self, min_age: Duration) -> OrphanSweepStats {
+        let mut stats = OrphanSweepStats::default();
+        let dir = self.staging_dir();
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return stats;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let age_ok = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= min_age);
+            if !age_ok {
+                continue;
+            }
+            stats.scanned += 1;
+            let size = meta.len();
+            // Staging temps may be hardlinked (and therefore read-only); clear
+            // that before unlinking. Counted only when the file is really gone,
+            // so Windows sharing violations don't over-claim reclaimed bytes.
+            let removed = (|| -> std::io::Result<()> {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                fs::set_permissions(entry.path(), perms)?;
+                fs::remove_file(entry.path())
+            })()
+            .is_ok();
+            if removed {
+                stats.removed += 1;
+                stats.bytes_reclaimed += size;
+            }
+        }
+        stats
     }
 
     /// Get the directory for a cache entry.
@@ -4560,6 +4865,518 @@ mod tests {
         assert!(
             !fs::metadata(&source).unwrap().permissions().readonly(),
             "failed hardlink ingest must restore a writable build output"
+        );
+    }
+
+    // ── stage → hash → publish (review finding #3) ──────────────────────
+
+    /// The put path must hash the STAGED snapshot, not the live build
+    /// output: the bytes published under a digest must be exactly the bytes
+    /// that were hashed, so a post-build mutator changing the file after the
+    /// snapshot can never store content X under address H(Y).
+    ///
+    /// Uses independent (never-hardlink) storage deliberately: on a
+    /// non-CoW filesystem the hardlink ingest shares the output's inode
+    /// with the blob, so mutating the output afterwards would both hit the
+    /// read-only guard and legitimately move the shared blob. Independent
+    /// storage (reflink/copy) gives the snapshot byte-isolation on every
+    /// filesystem, which is the property under test.
+    #[test]
+    fn put_stores_snapshot_bytes_matching_recorded_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output_file = dir.path().join("out.rlib");
+        let original = b"artifact-bytes-v1";
+        fs::write(&output_file, original).unwrap();
+
+        store
+            .put_with_compile_time_independent(
+                "snapshot_key",
+                "snapshot_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file.clone(), "libout.rlib".to_string())],
+                "",
+                "",
+                0,
+            )
+            .unwrap();
+
+        // Simulate a post-put mutator (strip / codesign / wasm tooling):
+        // rewrite the build output in place with different content.
+        fs::write(
+            &output_file,
+            b"mutated-after-put-with-a-much-longer-payload",
+        )
+        .unwrap();
+
+        let meta = store.get("snapshot_key").unwrap().unwrap();
+        assert_eq!(meta.files.len(), 1);
+        let blob = store.blob_path(&meta.files[0].hash);
+        let stored = fs::read(&blob).unwrap();
+        assert_eq!(
+            stored, original,
+            "stored blob must be byte-identical to what was hashed at put time"
+        );
+        assert_eq!(meta.files[0].size, original.len() as u64);
+    }
+
+    /// A completed put must leave nothing behind in the staging area.
+    #[test]
+    fn successful_put_leaves_staging_dir_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let output_file = dir.path().join("out.rlib");
+        fs::write(&output_file, b"artifact").unwrap();
+        store
+            .put(
+                "staging_clean_key",
+                "crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file, "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+
+        let staging = dir.path().join("staging");
+        if staging.exists() {
+            let leftovers: Vec<_> = fs::read_dir(&staging).unwrap().flatten().collect();
+            assert!(leftovers.is_empty(), "staging litter: {leftovers:?}");
+        }
+    }
+
+    /// A refused zero-byte artifact must clean up its staged snapshot; a
+    /// crash-refusal that leaked it would otherwise sit until GC.
+    #[test]
+    fn zero_byte_refusal_cleans_up_staged_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // A zero-byte `.rlib` is never valid output for a lib crate.
+        let output_file = dir.path().join("empty.rlib");
+        fs::write(&output_file, b"").unwrap();
+
+        let result = store.put(
+            "zero_key",
+            "crate",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(output_file, "libout.rlib".to_string())],
+            "",
+            "",
+        );
+        assert!(result.is_err(), "zero-byte rlib must be refused");
+        let staging = dir.path().join("staging");
+        if staging.exists() {
+            let leftovers: Vec<_> = fs::read_dir(&staging).unwrap().flatten().collect();
+            assert!(leftovers.is_empty(), "refused put left staging litter");
+        }
+    }
+
+    /// Publishing onto an already-present blob discards the staged snapshot
+    /// and reports `false` — same-digest means same-bytes, so losing the
+    /// publish race is benign and must not double-count ingest.
+    #[test]
+    fn publish_staged_blob_is_idempotent_when_blob_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"identical-content").unwrap();
+
+        let (staged_a, ingest_a) = store.stage_blob_from_source(&source, false).unwrap();
+        let hash = crate::cache_key::hash_file(&staged_a).unwrap();
+        assert!(
+            store
+                .publish_staged_blob(&staged_a, ingest_a, &hash, 17)
+                .unwrap(),
+            "first publish should win"
+        );
+
+        let (staged_b, _ingest_b) = store.stage_blob_from_source(&source, false).unwrap();
+        assert_ne!(staged_a, staged_b, "each stage gets its own temp");
+        assert!(
+            !store
+                .publish_staged_blob(&staged_b, ingest_a, &hash, 17)
+                .unwrap(),
+            "second publish of the same digest must be a no-op"
+        );
+
+        let staging_leftovers = fs::read_dir(store.staging_dir()).unwrap().flatten().count();
+        assert_eq!(staging_leftovers, 0, "discarded stage must not linger");
+    }
+
+    /// Crash-orphaned staging files are reclaimed only once older than the
+    /// grace period — a concurrent put's fresh snapshot is never touched.
+    #[test]
+    fn sweep_stale_staging_respects_min_age() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let stale = store.staging_dir().join("stage-old-1.tmp");
+        let fresh = store.staging_dir().join("stage-new-1.tmp");
+        fs::create_dir_all(store.staging_dir()).unwrap();
+        fs::write(&stale, b"abandoned").unwrap();
+        fs::write(&fresh, b"in-flight").unwrap();
+        let old = filetime::FileTime::from_unix_time(0, 0);
+        filetime::set_file_mtime(&stale, old).unwrap();
+        filetime::set_file_atime(&stale, old).unwrap();
+
+        let stats = store.sweep_stale_staging(Duration::from_secs(3600));
+        assert_eq!(stats.removed, 1, "only the aged-out file is swept");
+        assert_eq!(
+            stats.scanned, 1,
+            "the in-flight file is skipped before it is ever counted"
+        );
+        assert_eq!(stats.bytes_reclaimed, b"abandoned".len() as u64);
+        assert!(!stale.exists());
+        assert!(fresh.exists(), "fresh staging file must survive the sweep");
+
+        // Once it ages out, it goes too.
+        let stats = store.sweep_stale_staging(Duration::ZERO);
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.scanned, 1);
+        assert_eq!(stats.bytes_reclaimed, b"in-flight".len() as u64);
+        assert!(!fresh.exists());
+    }
+
+    /// Discarding a hardlinked staging temp has to hand the source back
+    /// writable. The temp shares the build output's inode, so the read-only
+    /// guard the store applies lands on the build's own file too — leaving
+    /// it read-only would break the next write to that output.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_hardlinked_temp_restores_the_source_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"shared-inode-bytes").unwrap();
+        let tmp = dir.path().join("stage.tmp");
+        fs::hard_link(&source, &tmp).unwrap();
+        set_blob_readonly(&tmp);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o200,
+            0,
+            "precondition: the shared inode is read-only through both names"
+        );
+
+        Store::drop_tmp_restore_source(&source, &tmp);
+
+        assert!(!tmp.exists(), "the staging temp must be gone");
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o200,
+            0o200,
+            "the build output must be writable again once the temp is gone"
+        );
+    }
+
+    /// A failed publish rename is a lost race only when the destination is
+    /// there now, having been absent when the publish started: same digest
+    /// means same bytes, so the winner's blob is as good as ours. Every
+    /// other rename failure is real and must propagate.
+    #[test]
+    fn publish_rename_outcome_distinguishes_a_lost_race_from_a_failure() {
+        let raced = publish_rename_outcome(
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "boom"),
+            true,
+        );
+        assert!(
+            !raced.expect("a lost race is benign"),
+            "losing the race must report `false`: we published nothing"
+        );
+
+        let failed = publish_rename_outcome(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "boom"),
+            false,
+        );
+        assert!(
+            failed.is_err(),
+            "a rename failure with no destination in place is a real failure"
+        );
+    }
+
+    /// The grace both sweepers share (daemon GC and `doctor --repair`) must
+    /// outlast an in-flight put. A snapshot another process is still filling
+    /// is indistinguishable from a crash leftover, and reclaiming it fails
+    /// that put at publish time — so a fresh snapshot has to survive.
+    #[test]
+    fn staging_sweep_grace_spares_an_in_flight_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        fs::create_dir_all(store.staging_dir()).unwrap();
+        let in_flight = store.staging_dir().join("stage-1-0.tmp");
+        fs::write(&in_flight, b"mid-put").unwrap();
+
+        let stats = store.sweep_stale_staging(STAGING_SWEEP_GRACE);
+        assert_eq!(stats.removed, 0, "no sweeper may reclaim a live snapshot");
+        assert!(in_flight.exists());
+        assert!(
+            STAGING_SWEEP_GRACE >= Duration::from_secs(3600),
+            "the grace must stay long enough to outlast a slow put"
+        );
+    }
+
+    /// The staging name search must SKIP an occupied candidate (a crash
+    /// leftover) and hand back the next free one — and hand it back
+    /// uncreated, which is what keeps the zero-copy ingests usable.
+    #[test]
+    fn free_staging_path_skips_occupied_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("cand-a");
+        let second = dir.path().join("cand-b");
+        fs::write(&first, b"taken").unwrap();
+
+        // First candidate always collides; the next one is free.
+        let names: Vec<PathBuf> = vec![first.clone(), second.clone()];
+        let mut calls = 0usize;
+        let got = free_staging_path(|_| {
+            let p = names[calls].clone();
+            calls += 1;
+            p
+        })
+        .unwrap();
+        assert_eq!(got, second, "must skip the taken candidate");
+        assert!(
+            !got.exists(),
+            "the chosen path must NOT exist: clonefile(2)/link(2) fail with \
+             EEXIST on an existing destination, which would demote every put \
+             to a full byte copy"
+        );
+    }
+
+    /// A non-collision error must propagate as itself, not be swallowed by
+    /// the skip branch and reported as an exhausted name search.
+    #[test]
+    fn free_staging_path_propagates_real_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // A FILE used as the parent path. Unix stats that as ENOTDIR;
+        // Windows reports it with the same shape as a free name.
+        let not_a_dir = dir.path().join("not-a-dir");
+        fs::write(&not_a_dir, b"").unwrap();
+        let result = free_staging_path(|n| not_a_dir.join(format!("x-{n}")));
+
+        #[cfg(unix)]
+        {
+            // ENOTDIR: a real fault must surface as itself, never as an
+            // exhausted-name collision, and never be skipped past.
+            let err = result.unwrap_err();
+            assert_ne!(
+                err.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "a real fault must not be reported as a name collision: {err}"
+            );
+        }
+        #[cfg(windows)]
+        {
+            // Windows cannot tell this fault from a free name, so the search
+            // hands the candidate back and the ingest is what fails. What
+            // must not happen either way is spinning through every attempt.
+            let candidate = result.expect("windows reports the parent as absent");
+            assert!(candidate.starts_with(&not_a_dir));
+        }
+    }
+
+    /// Exhausting every candidate reports a bounded failure rather than
+    /// spinning: an unbounded search is a hang no test can kill.
+    #[test]
+    fn free_staging_path_gives_up_after_bounded_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = dir.path().join("always-taken");
+        fs::write(&taken, b"taken").unwrap();
+
+        let mut calls = 0u32;
+        let err = free_staging_path(|_| {
+            calls += 1;
+            taken.clone()
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(calls, STAGING_NAME_ATTEMPTS, "search must be bounded");
+    }
+
+    /// Staging must reach the store by reflink or hardlink, never by writing
+    /// the artifact's bytes a second time.
+    ///
+    /// The ingest destination has to be a path that does not exist yet:
+    /// `clonefile(2)` and `link(2)` both fail with `EEXIST` otherwise, so a
+    /// staging file that is pre-created (to reserve its name, say) turns a
+    /// metadata-only clone into a full copy of every artifact — still
+    /// correct, but it doubles put I/O and stops store blobs from sharing
+    /// blocks with the build output they came from.
+    #[cfg(unix)]
+    #[test]
+    fn staging_ingests_zero_copy_not_a_byte_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"artifact-bytes").unwrap();
+
+        // Same filesystem as the store, so a hardlink is always available
+        // even where the filesystem has no reflink support (ext4, tmpfs).
+        let (staged, ingest) = store.stage_blob_from_source(&source, true).unwrap();
+        assert!(
+            !matches!(ingest, StoreIngest::Copy),
+            "staging fell back to a byte copy where a reflink or hardlink \
+             was available — the ingest destination must not exist yet"
+        );
+        assert_eq!(fs::read(&staged).unwrap(), b"artifact-bytes");
+        Store::drop_tmp_restore_source(&source, &staged);
+    }
+
+    /// A symlinked source must never be hardlinked into the store: hashing
+    /// follows the link, but a hardlink would publish a pointer to mutable
+    /// external state. The staged snapshot must be a regular file carrying
+    /// the target's content.
+    #[cfg(unix)]
+    #[test]
+    fn staging_refuses_to_hardlink_a_symlink_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let target = dir.path().join("real.rlib");
+        fs::write(&target, b"target-bytes").unwrap();
+        let link = dir.path().join("link.rlib");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // allow_hardlink=true is the interesting case: only the symlink check
+        // stands between the link and an inode-sharing blob.
+        let (staged, _ingest) = store.stage_blob_from_source(&link, true).unwrap();
+        let meta = fs::symlink_metadata(&staged).unwrap();
+        assert!(
+            meta.is_file(),
+            "staged snapshot must be a regular file, never a symlink"
+        );
+        assert_eq!(fs::read(&staged).unwrap(), b"target-bytes");
+        // Whatever ingest was chosen, the store side of the deal is read-only;
+        // the symlink TARGET itself must stay owner-writable when the
+        // snapshot did not share its inode (copy/reflink).
+        if !paths_share_inode(&target, &staged) {
+            let mode = fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o200,
+                0o200,
+                "an isolated snapshot must not flip the symlink target read-only"
+            );
+        }
+    }
+
+    /// Lost-race semantics of `publish_staged_blob`: a rename failure while
+    /// the destination already exists as a file is the benign
+    /// concurrent-winner case and must report `Ok(false)`.
+    #[test]
+    fn publish_reports_false_when_rename_fails_on_existing_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let hash = "d".repeat(64);
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"content").unwrap();
+
+        // Publish the winner so the destination exists as a file...
+        let (staged_a, ingest_a) = store.stage_blob_from_source(&source, false).unwrap();
+        assert!(
+            store
+                .publish_staged_blob(&staged_a, ingest_a, &hash, 7)
+                .unwrap()
+        );
+
+        // ...then force the rename to fail: a DIRECTORY cannot be renamed
+        // onto an existing regular file. The staged argument being a
+        // directory guarantees the error without touching permissions.
+        let bogus_staged = store.staging_dir().join("not-a-file");
+        fs::create_dir_all(&bogus_staged).unwrap();
+        let result = store.publish_staged_blob(&bogus_staged, ingest_a, &hash, 7);
+        assert!(!result.unwrap(), "lost race must report Ok(false)");
+    }
+
+    /// A rename failure with NO existing destination is a genuine error, not
+    /// a lost race, and must propagate.
+    #[test]
+    fn publish_errors_when_rename_fails_without_existing_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let hash = "e".repeat(64);
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"content").unwrap();
+        let (staged, ingest) = store.stage_blob_from_source(&source, false).unwrap();
+
+        // Put a directory in the way of the destination: renaming a file
+        // onto a directory fails even though `blob.is_file()` is false.
+        let blob = store.blob_path(&hash);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::create_dir_all(&blob).unwrap();
+
+        let result = store.publish_staged_blob(&staged, ingest, &hash, 7);
+        assert!(result.is_err(), "genuine rename errors must propagate");
+    }
+
+    /// Phase-2 recovery re-materializes from the LIVE source; a source that
+    /// still hashes to the recorded digest commits cleanly.
+    #[test]
+    fn rematerialize_accepts_untouched_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"stable-content").unwrap();
+        let hash = crate::cache_key::hash_file(&source).unwrap();
+
+        store
+            .rematerialize_and_verify(&source, &hash, "out.rlib", false)
+            .unwrap();
+        assert_eq!(fs::read(store.blob_path(&hash)).unwrap(), b"stable-content");
+    }
+
+    /// ...but a source mutated after phase 1 must NEVER be stored under the
+    /// recorded address: the verification must refuse the commit.
+    #[test]
+    fn rematerialize_refuses_mutated_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"original").unwrap();
+        let hash = crate::cache_key::hash_file(&source).unwrap();
+
+        // Simulate a post-build mutator racing between phase 1 and recovery.
+        fs::write(&source, b"mutated-after-snapshot").unwrap();
+
+        let err = store
+            .rematerialize_and_verify(&source, &hash, "out.rlib", false)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to commit"),
+            "expected digest-mismatch refusal, got: {err:#}"
         );
     }
 

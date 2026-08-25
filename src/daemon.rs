@@ -5088,6 +5088,16 @@ impl Daemon {
                 let orphan_stats = store
                     .sweep_orphan_blobs(std::time::Duration::from_secs(3600))
                     .unwrap_or_default();
+                // Same grace for put-phase staging snapshots abandoned by a
+                // crash between staging and publish (review finding #3).
+                let staging_stats = store.sweep_stale_staging(crate::store::STAGING_SWEEP_GRACE);
+                if staging_stats.removed > 0 {
+                    tracing::info!(
+                        "swept {} stale staging files ({})",
+                        staging_stats.removed,
+                        crate::report::format_bytes(staging_stats.bytes_reclaimed)
+                    );
+                }
                 if orphan_stats.removed > 0 {
                     tracing::info!(
                         "swept {} of {} blobs as orphans ({} reclaimed)",
@@ -5325,6 +5335,13 @@ async fn server_main(
         .name(bind_name)
         .create_tokio()
         .context("binding local IPC socket")?;
+    // The IPC socket drives destructive operations (Shutdown, GC, uploads),
+    // so it must never be reachable by other local users. Restrict the file
+    // mode regardless of umask, and see `require_self_peer` for the
+    // per-connection credential check on accepted sockets.
+    #[cfg(unix)]
+    crate::transport::restrict_socket_permissions(&socket_path)
+        .context("hardening local IPC socket permissions")?;
     let _socket_guard = SocketCleanupGuard {
         path: socket_path.clone(),
     };
@@ -6491,6 +6508,14 @@ async fn handle_connection_after_queue(
     limiter: Arc<tokio::sync::Semaphore>,
     request_started_at: Instant,
 ) -> Result<()> {
+    // Peer-credential gate before anything else: the check is a cheap
+    // syscall, so unauthenticated peers are dropped before they can park on
+    // the connection limiter or read a single request frame.
+    #[cfg(unix)]
+    if let Err(error) = crate::transport::require_self_peer(crate::transport::peer_euid(&stream)) {
+        tracing::warn!(%error, "rejected IPC connection from another local user");
+        return Ok(());
+    }
     let _permit = limiter.acquire_owned().await.ok();
     handle_connection_started_at(
         stream,

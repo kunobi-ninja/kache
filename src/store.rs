@@ -259,6 +259,14 @@ static STAGE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// spinning forever.
 const STAGING_NAME_ATTEMPTS: u32 = 16;
 
+/// How long a staging snapshot must sit untouched before a sweep may reclaim
+/// it. A snapshot belonging to a put running in another process is
+/// indistinguishable from a crash leftover, and unlinking one fails that put
+/// at publish time — so the grace has to outlast any plausible in-flight put.
+/// Shared by the daemon's GC sweep and `doctor --repair` so neither can
+/// undercut the other.
+pub const STAGING_SWEEP_GRACE: Duration = Duration::from_secs(3600);
+
 /// Pick a staging path that does not exist yet, skipping past any stale
 /// leftover, and return it WITHOUT creating it.
 ///
@@ -2948,7 +2956,8 @@ impl Store {
 
     /// Reclaim crash-orphaned staging files older than `min_age`. A put killed
     /// between staging and publish leaves its snapshot here; unlike an orphaned
-    /// blob it has no DB row to consult, so age is the only liveness signal.
+    /// blob it has no DB row to consult, so age is the only liveness signal —
+    /// see [`STAGING_SWEEP_GRACE`] for why every caller wants the same one.
     pub fn sweep_stale_staging(&self, min_age: Duration) -> OrphanSweepStats {
         let mut stats = OrphanSweepStats::default();
         let dir = self.staging_dir();
@@ -5033,6 +5042,29 @@ mod tests {
         assert_eq!(stats.removed, 1);
         assert_eq!(stats.bytes_reclaimed, b"in-flight".len() as u64);
         assert!(!fresh.exists());
+    }
+
+    /// The grace both sweepers share (daemon GC and `doctor --repair`) must
+    /// outlast an in-flight put. A snapshot another process is still filling
+    /// is indistinguishable from a crash leftover, and reclaiming it fails
+    /// that put at publish time — so a fresh snapshot has to survive.
+    #[test]
+    fn staging_sweep_grace_spares_an_in_flight_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        fs::create_dir_all(store.staging_dir()).unwrap();
+        let in_flight = store.staging_dir().join("stage-1-0.tmp");
+        fs::write(&in_flight, b"mid-put").unwrap();
+
+        let stats = store.sweep_stale_staging(STAGING_SWEEP_GRACE);
+        assert_eq!(stats.removed, 0, "no sweeper may reclaim a live snapshot");
+        assert!(in_flight.exists());
+        assert!(
+            STAGING_SWEEP_GRACE >= Duration::from_secs(3600),
+            "the grace must stay long enough to outlast a slow put"
+        );
     }
 
     /// The staging name search must SKIP an occupied candidate (a crash

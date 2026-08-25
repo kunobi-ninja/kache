@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::daemon;
 use crate::events;
-use crate::store::Store;
+use crate::store::{STAGING_SWEEP_GRACE, Store};
 
 // ── Stats snapshot (daemon-first, fallback to direct) ──────────────────────
 
@@ -5342,8 +5342,14 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
     // Repair: reclaim put-phase staging snapshots abandoned by a crash
     // between staging and publish (review finding #3). Reported even when
     // empty so the repair narrative always accounts for every reclaim pass.
+    //
+    // The grace matches the daemon's GC sweep deliberately: a staging file
+    // belonging to a put running in ANOTHER process is indistinguishable
+    // from a crash leftover, and unlinking one fails that put at publish
+    // time. An hour is long enough that only a dead process's snapshot is
+    // ever old enough to reclaim.
     if repair {
-        let swept_staging = store.sweep_stale_staging(std::time::Duration::from_secs(60));
+        let swept_staging = store.sweep_stale_staging(STAGING_SWEEP_GRACE);
         println!(
             "Repairing: reclaimed {} stale staging files ({})",
             swept_staging.removed,

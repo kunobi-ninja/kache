@@ -5090,7 +5090,7 @@ impl Daemon {
                     .unwrap_or_default();
                 // Same grace for put-phase staging snapshots abandoned by a
                 // crash between staging and publish (review finding #3).
-                let staging_stats = store.sweep_stale_staging(std::time::Duration::from_secs(3600));
+                let staging_stats = store.sweep_stale_staging(crate::store::STAGING_SWEEP_GRACE);
                 if staging_stats.removed > 0 {
                     tracing::info!(
                         "swept {} stale staging files ({})",

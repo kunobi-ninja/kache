@@ -1190,7 +1190,7 @@ fn parse_rustc_normalize_toggle(value: Option<&str>) -> bool {
 /// `"codegen:link-arg"`, `"cargo_cfg:MOZ_OBJ_DIR"`). It surfaces in the
 /// warn so the offending field is identifiable without re-running with
 /// trace-level logging.
-pub(crate) fn check_for_path_leak(value: &str, context: &str) {
+pub(crate) fn check_for_path_leak(value: &str, context: &str) -> bool {
     const SUSPICIOUS_PREFIXES: &[&str] = &[
         "/Users/",       // macOS home
         "/home/",        // Linux home
@@ -1210,9 +1210,10 @@ pub(crate) fn check_for_path_leak(value: &str, context: &str) {
                 prefix,
                 leak_window(value, idx, prefix.len())
             );
-            return;
+            return true;
         }
     }
+    false
 }
 
 /// The ±40-byte window of `value` around the leak found at byte `idx`,
@@ -1220,14 +1221,23 @@ pub(crate) fn check_for_path_leak(value: &str, context: &str) {
 /// either edge of the raw window can land inside a multi-byte character
 /// and slicing there would panic.
 fn leak_window(value: &str, idx: usize, prefix_len: usize) -> &str {
-    let mut start = idx.saturating_sub(40);
-    while !value.is_char_boundary(start) {
-        start -= 1;
-    }
-    let mut end = (idx + prefix_len + 40).min(value.len());
-    while !value.is_char_boundary(end) {
-        end += 1;
-    }
+    let raw_start = idx.saturating_sub(40);
+    let start = value
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .take_while(|&offset| offset <= raw_start)
+        .last()
+        .unwrap_or(0);
+    let raw_end = idx
+        .saturating_add(prefix_len)
+        .saturating_add(40)
+        .min(value.len());
+    let end = value
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(value.len()))
+        .find(|&offset| offset >= raw_end)
+        .expect("the string length always bounds the requested window");
     &value[start..end]
 }
 
@@ -1684,6 +1694,18 @@ mod tests {
         let tail = format!("{}{}", "あ".repeat(30), "/home/y");
         let idx = tail.find("/home/").expect("leak present");
         assert_eq!(leak_window(&tail, idx, "/home/".len()), &tail[48..]);
+    }
+
+    #[test]
+    fn path_leak_check_reports_presence_and_absence() {
+        assert!(check_for_path_leak(
+            "prefix /home/example/project suffix",
+            "test"
+        ));
+        assert!(!check_for_path_leak(
+            "a relative/path with no machine-local prefix",
+            "test"
+        ));
     }
 
     #[test]

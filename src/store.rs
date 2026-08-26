@@ -7428,6 +7428,26 @@ mod tests {
     }
 
     #[test]
+    fn dropping_store_lock_unlocks_even_with_a_duplicated_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let lock = store
+            .try_lock("duplicated-handle")
+            .unwrap()
+            .expect("owner lock");
+        let duplicate = lock.file.try_clone().unwrap();
+
+        drop(lock);
+
+        assert!(
+            store.try_lock("duplicated-handle").unwrap().is_some(),
+            "explicit unlock must release duplicate descriptors of the lock"
+        );
+        drop(duplicate);
+    }
+
+    #[test]
     fn process_exit_releases_advisory_key_lock() {
         let dir = tempfile::tempdir().unwrap();
         let ready = dir.path().join("lock-ready");

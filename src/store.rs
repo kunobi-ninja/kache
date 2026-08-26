@@ -786,9 +786,84 @@ const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 /// megabytes.
 pub(crate) const TOMBSTONE_RETENTION_DAYS: u64 = 14;
 
-/// Lock guard for a cache key. Dropping it releases the lock.
-pub struct KeyLock {
-    path: PathBuf,
+const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
+const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Cross-process advisory lock held through an open file handle.
+///
+/// Lock files deliberately persist after release. Unlinking an advisory lock
+/// file can split contenders across the unlinked inode and a newly-created
+/// inode, allowing two processes to both believe they hold the same lock. This
+/// trades one small persistent file per encountered key for stable ownership.
+pub struct StoreLock {
+    file: fs::File,
+}
+
+/// Lock guard for a cache key. Dropping it releases the OS lock.
+pub type KeyLock = StoreLock;
+
+/// Lock guard for store-wide GC. Dropping it releases the OS lock.
+pub type GcLock = StoreLock;
+
+impl StoreLock {
+    fn open(path: &Path) -> Result<fs::File> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("lock file has no parent: {}", path.display()))?;
+        fs::create_dir_all(parent)?;
+        Ok(fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?)
+    }
+
+    fn finish(mut file: fs::File) -> Result<Self> {
+        // Diagnostic only: lock ownership is determined exclusively by the OS.
+        use std::io::{Seek, SeekFrom, Write};
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        write!(file, "{}", std::process::id())?;
+        Ok(Self { file })
+    }
+
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = Self::open(path)?;
+        file.lock()?;
+        Self::finish(file)
+    }
+
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let file = Self::open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self::finish(file)?)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
+
+    fn wait_until_available(path: &Path, timeout: Duration) -> Result<bool> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(lock) = Self::try_acquire(path)? {
+                drop(lock);
+                return Ok(true);
+            }
+            if start.elapsed() >= timeout {
+                return Ok(false);
+            }
+            std::thread::sleep(
+                BUILD_LOCK_POLL_INTERVAL.min(timeout.saturating_sub(start.elapsed())),
+            );
+        }
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 /// Result of claiming responsibility for a cache miss.
@@ -799,56 +874,6 @@ pub enum BuildClaim {
     Committed(Box<EntryMeta>),
     /// Another process currently owns the key.
     Contended,
-}
-
-/// A fully-written key lock waiting to be published at its canonical path.
-/// Keeping preparation separate from publication prevents contenders from
-/// observing an empty lock file and mistaking an in-progress owner for stale.
-struct PreparedKeyLock {
-    path: PathBuf,
-    temp: tempfile::NamedTempFile,
-}
-
-impl PreparedKeyLock {
-    fn new(path: PathBuf) -> Result<Self> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("key lock has no parent: {}", path.display()))?;
-        fs::create_dir_all(parent)?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        use std::io::Write;
-        write!(temp, "{}", std::process::id())?;
-        Ok(Self { path, temp })
-    }
-
-    /// Atomically publish without replacing an existing owner.
-    fn publish(self) -> Result<Option<KeyLock>> {
-        match self.temp.persist_noclobber(&self.path) {
-            Ok(_) => Ok(Some(KeyLock { path: self.path })),
-            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-            Err(e) => Err(e.error.into()),
-        }
-    }
-}
-
-/// Lock guard for store-wide GC. Dropping it releases the OS lock.
-pub struct GcLock {
-    file: Option<fs::File>,
-}
-
-impl Drop for KeyLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-impl Drop for GcLock {
-    fn drop(&mut self) {
-        if let Some(file) = self.file.take() {
-            let _ = file.unlock();
-            drop(file);
-        }
-    }
 }
 
 /// How aggressively a local cache hit re-hashes its blobs against their content
@@ -1600,7 +1625,7 @@ impl Store {
 
     /// Acquire a build lock for a cache key. Returns None if another process holds it.
     pub fn try_lock(&self, cache_key: &str) -> Result<Option<KeyLock>> {
-        self.try_acquire_lock(self.entry_dir(cache_key).with_extension("lock"))
+        StoreLock::try_acquire(&self.entry_dir(cache_key).with_extension("lock"))
     }
 
     /// Claim a cache miss, re-checking the store after acquiring the key lock.
@@ -1627,7 +1652,7 @@ impl Store {
     /// second daemon — don't double-scan and contend. Returns `None` if another
     /// GC already holds it (the caller should skip).
     pub fn try_gc_lock(&self) -> Result<Option<GcLock>> {
-        self.try_acquire_file_lock(self.config.store_dir().join("gc.lock"))
+        StoreLock::try_acquire(&self.config.store_dir().join("gc.lock"))
     }
 
     /// Block until the cross-process GC lock is held.
@@ -1637,98 +1662,20 @@ impl Store {
     /// revalidates that the payload survived, or the intent becomes durable
     /// before GC snapshots its protected keys.
     pub(crate) fn acquire_gc_lock(&self) -> Result<GcLock> {
-        self.acquire_file_lock(self.config.store_dir().join("gc.lock"))
-    }
-
-    /// Publish a fully-written `lock_path` exclusively, stale-recovering a lock
-    /// left by a dead process. `None` means another live process holds it.
-    fn try_acquire_lock(&self, lock_path: PathBuf) -> Result<Option<KeyLock>> {
-        if let Some(lock) = PreparedKeyLock::new(lock_path.clone())?.publish()? {
-            return Ok(Some(lock));
-        }
-
-        // Avoid the recovery lock on the ordinary live-owner contention path.
-        if !self.is_lock_stale(&lock_path)? {
-            return Ok(None);
-        }
-
-        // Serialize the rare stale check/remove/publish sequence. Without this,
-        // two reclaimers can both approve removal of the old marker; the second
-        // can then delete the first reclaimer's newly-published live marker.
-        // The per-key build lock itself remains PID-file based.
-        let _recovery_guard =
-            self.acquire_file_lock(self.config.store_dir().join("build-lock-recovery.lock"))?;
-
-        // The previous owner may have exited while we waited. Acquire directly
-        // if the canonical path is now free, or re-check the current marker so
-        // a reclaimer that won before us cannot be mistaken for the stale one.
-        if let Some(lock) = PreparedKeyLock::new(lock_path.clone())?.publish()? {
-            return Ok(Some(lock));
-        }
-        if !self.is_lock_stale(&lock_path)? {
-            return Ok(None);
-        }
-
-        match fs::remove_file(&lock_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        PreparedKeyLock::new(lock_path)?.publish()
-    }
-
-    /// Block until an OS-backed coordination lock is held.
-    fn acquire_file_lock(&self, lock_path: PathBuf) -> Result<GcLock> {
-        fs::create_dir_all(lock_path.parent().unwrap())?;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        file.lock()?;
-
-        use std::io::{Seek, SeekFrom, Write};
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        write!(file, "{}", std::process::id())?;
-        Ok(GcLock { file: Some(file) })
-    }
-
-    /// Acquire an exclusive OS lock on `lock_path` and write the holder PID for
-    /// debugging. The OS releases this lock if the process exits, so no PID
-    /// stale-recovery or age timeout is needed.
-    fn try_acquire_file_lock(&self, lock_path: PathBuf) -> Result<Option<GcLock>> {
-        fs::create_dir_all(lock_path.parent().unwrap())?;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-
-        match file.try_lock() {
-            Ok(()) => {
-                use std::io::{Seek, SeekFrom, Write};
-                file.set_len(0)?;
-                file.seek(SeekFrom::Start(0))?;
-                let _ = write!(file, "{}", std::process::id());
-                Ok(Some(GcLock { file: Some(file) }))
-            }
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
-        }
+        StoreLock::acquire(&self.config.store_dir().join("gc.lock"))
     }
 
     /// Wait for a cache key to become committed (another process is building it).
     pub fn wait_for_committed(&self, cache_key: &str) -> Result<bool> {
-        let lock_path = self.entry_dir(cache_key).with_extension("lock");
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(600); // 10 min max
-
-        while lock_path.exists() && start.elapsed() < timeout {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        if self.contains(cache_key) {
+            return Ok(true);
         }
+        self.wait_for_committed_with_timeout(cache_key, BUILD_LOCK_TIMEOUT)
+    }
 
-        // After the lock is gone, check if it was committed
+    fn wait_for_committed_with_timeout(&self, cache_key: &str, timeout: Duration) -> Result<bool> {
+        let lock_path = self.entry_dir(cache_key).with_extension("lock");
+        let _ = StoreLock::wait_until_available(&lock_path, timeout)?;
         Ok(self.contains(cache_key))
     }
 
@@ -4529,26 +4476,6 @@ impl Store {
 
         progress(total, total);
         Ok(stats)
-    }
-
-    fn is_lock_stale(&self, lock_path: &Path) -> Result<bool> {
-        let content = fs::read_to_string(lock_path).unwrap_or_default();
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            // Check if the process is still alive
-            if !crate::platform::is_process_alive(pid) {
-                return Ok(true); // Process doesn't exist
-            }
-            // Check if lock file is older than 1 hour (safety net)
-            if let Ok(meta) = fs::metadata(lock_path)
-                && let Ok(age) = meta.modified()?.elapsed()
-                && age > std::time::Duration::from_secs(3600)
-            {
-                return Ok(true);
-            }
-            Ok(false)
-        } else {
-            Ok(true) // Can't parse PID, consider stale
-        }
     }
 
     /// Return content-dedup statistics: unique blobs, physical vs logical size.
@@ -7417,47 +7344,52 @@ mod tests {
     }
 
     #[test]
-    fn prepared_key_lock_is_complete_before_atomic_publication() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("entry.lock");
-        let first = PreparedKeyLock::new(lock_path.clone()).unwrap();
-
-        assert!(
-            !lock_path.exists(),
-            "the canonical path must stay absent while PID metadata is prepared"
-        );
-        assert_eq!(
-            fs::read_to_string(first.temp.path()).unwrap(),
-            std::process::id().to_string()
-        );
-
-        let winner = PreparedKeyLock::new(lock_path.clone())?
-            .publish()?
-            .expect("one prepared contender should publish");
-        assert_eq!(
-            fs::read_to_string(&lock_path).unwrap(),
-            std::process::id().to_string(),
-            "a visible lock must already contain a complete PID"
-        );
-        assert!(
-            first.publish()?.is_none(),
-            "noclobber publication must preserve the existing owner"
-        );
-
-        drop(winner);
-        assert!(!lock_path.exists());
-        Ok(())
-    }
-
-    #[test]
-    fn concurrent_stale_lock_recovery_has_one_winner() {
-        const CONTENDERS: usize = 16;
+    fn unlocked_pid_marker_does_not_claim_the_key() {
+        // Regression for #821: PID contents are diagnostic only. A PID from a
+        // different namespace must not decide whether the key is available.
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config).unwrap();
-        let lock_path = store.entry_dir("stale-race").with_extension("lock");
-        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        fs::write(&lock_path, b"not-a-pid").unwrap();
+        let lock_path = store.entry_dir("pid-marker").with_extension("lock");
+        fs::write(&lock_path, std::process::id().to_string()).unwrap();
+
+        let lock = store.try_lock("pid-marker").unwrap();
+
+        assert!(
+            lock.is_some(),
+            "an unlocked marker must not cause contention"
+        );
+    }
+
+    #[test]
+    fn advisory_lock_owns_key_even_with_unparseable_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let lock_path = store.entry_dir("foreign-owner").with_extension("lock");
+        let mut owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        use std::io::Write;
+        write!(owner, "not-a-pid").unwrap();
+        owner.lock().unwrap();
+
+        assert!(
+            store.try_lock("foreign-owner").unwrap().is_none(),
+            "OS lock ownership must override PID metadata"
+        );
+        owner.unlock().unwrap();
+        assert!(store.try_lock("foreign-owner").unwrap().is_some());
+    }
+
+    #[test]
+    fn concurrent_advisory_lock_acquisition_has_one_winner() {
+        const CONTENDERS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONTENDERS));
         let mut handles = Vec::new();
@@ -7478,29 +7410,97 @@ mod tests {
         assert_eq!(
             guards.iter().filter(|guard| guard.is_some()).count(),
             1,
-            "serialized stale recovery must publish exactly one live guard"
+            "the advisory lock must admit exactly one live guard"
         );
     }
 
     #[test]
-    fn try_lock_recovers_unparseable_stale_lock() {
-        // Covers stale lock removal and retry-acquire branch.
+    fn dropping_key_lock_preserves_stable_lock_file() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config).unwrap();
-        let lock_path = store.entry_dir("stale_key").with_extension("lock");
-        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-        fs::write(&lock_path, b"not-a-pid").unwrap();
+        let lock_path = store.entry_dir("stable-path").with_extension("lock");
+        let lock = store.try_lock("stable-path").unwrap();
 
-        let lock = store.try_lock("stale_key").unwrap();
-
-        assert!(lock.is_some(), "stale lock should be replaced");
-        assert_eq!(
-            fs::read_to_string(&lock_path).unwrap(),
-            std::process::id().to_string()
-        );
+        assert!(lock.is_some());
         drop(lock);
-        assert!(!lock_path.exists(), "dropping the guard removes the lock");
+        assert!(
+            lock_path.exists(),
+            "advisory lock paths must not be unlinked after release"
+        );
+        assert!(store.try_lock("stable-path").unwrap().is_some());
+    }
+
+    #[test]
+    fn dropping_store_lock_unlocks_even_with_a_duplicated_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let lock = store
+            .try_lock("duplicated-handle")
+            .unwrap()
+            .expect("owner lock");
+        let duplicate = lock.file.try_clone().unwrap();
+
+        drop(lock);
+
+        assert!(
+            store.try_lock("duplicated-handle").unwrap().is_some(),
+            "explicit unlock must release duplicate descriptors of the lock"
+        );
+        drop(duplicate);
+    }
+
+    #[test]
+    fn process_exit_releases_advisory_key_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("lock-ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::advisory_key_lock_child_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_ADVISORY_LOCK_ROOT", dir.path())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "lock fixture exited before acquiring the key"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "lock fixture did not become ready");
+
+        let store = Store::open(&test_config(dir.path())).unwrap();
+        assert!(
+            store.try_lock("crash-release").unwrap().is_none(),
+            "child must own the key before it exits"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            store.try_lock("crash-release").unwrap().is_some(),
+            "the OS must release the key lock when its process exits"
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for process_exit_releases_advisory_key_lock"]
+    fn advisory_key_lock_child_fixture() {
+        let root =
+            PathBuf::from(std::env::var_os("KACHE_TEST_ADVISORY_LOCK_ROOT").expect("fixture root"));
+        let store = Store::open(&test_config(&root)).unwrap();
+        let _lock = store
+            .try_lock("crash-release")
+            .unwrap()
+            .expect("fixture key lock");
+        fs::write(root.join("lock-ready"), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(30));
     }
 
     #[test]
@@ -9066,14 +9066,127 @@ mod tests {
     }
 
     #[test]
-    fn test_store_wait_for_committed_returns_false_when_not_committed() {
+    fn wait_for_committed_returns_false_without_an_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::wait_for_committed_missing_child_fixture",
+                "--ignored",
+            ])
+            .env("KACHE_TEST_WAIT_ROOT", dir.path())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(status) => {
+                    assert!(status.success(), "wait fixture failed: {status}");
+                    break;
+                }
+                None if std::time::Instant::now() >= deadline => {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("waiting without an owner must return promptly");
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for wait_for_committed_returns_false_without_an_owner"]
+    fn wait_for_committed_missing_child_fixture() {
+        let root = PathBuf::from(std::env::var_os("KACHE_TEST_WAIT_ROOT").expect("fixture root"));
+        let store = Store::open(&test_config(&root)).unwrap();
+        assert!(!store.wait_for_committed("nope").unwrap());
+    }
+
+    #[test]
+    fn wait_for_committed_returns_true_for_an_existing_entry() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config).unwrap();
+        let output = dir.path().join("already-committed.rlib");
+        fs::write(&output, b"committed output").unwrap();
+        store
+            .put(
+                "already-committed",
+                "peer",
+                &["rlib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(output, "already-committed.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
 
-        // No entry committed — should return false immediately (no lock file)
-        let result = store.wait_for_committed("nope").unwrap();
-        assert!(!result);
+        assert!(store.wait_for_committed("already-committed").unwrap());
+    }
+
+    #[test]
+    fn wait_for_committed_observes_advisory_lock_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let owner = Store::open(&config).unwrap();
+        let cache_key = "peer-commit";
+        let owner_lock = owner.try_lock(cache_key).unwrap().expect("owner lock");
+        let root = dir.path().to_path_buf();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let waiter = std::thread::spawn(move || {
+            let store = Store::open(&test_config(&root)).unwrap();
+            ready_tx.send(()).unwrap();
+            store
+                .wait_for_committed_with_timeout(cache_key, Duration::from_secs(5))
+                .unwrap()
+        });
+        ready_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let output = dir.path().join("peer.rlib");
+        fs::write(&output, b"peer output").unwrap();
+        owner
+            .put(
+                cache_key,
+                "peer",
+                &["rlib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(output, "peer.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        drop(owner_lock);
+
+        assert!(
+            waiter.join().unwrap(),
+            "waiter must observe the committed key"
+        );
+        assert!(
+            owner.entry_dir(cache_key).with_extension("lock").exists(),
+            "waiting must not depend on deleting the lock file"
+        );
+    }
+
+    #[test]
+    fn wait_for_committed_respects_timeout_while_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let owner = Store::open(&config).unwrap();
+        let waiter = Store::open(&config).unwrap();
+        let _lock = owner.try_lock("slow-peer").unwrap().expect("owner lock");
+
+        assert!(
+            !waiter
+                .wait_for_committed_with_timeout("slow-peer", Duration::from_millis(10))
+                .unwrap()
+        );
     }
 
     #[test]

@@ -13,11 +13,11 @@ default:
 
 # Run all local quality checks.
 [group('dev')]
-check: fmt-check lint test
+check: fmt-check lint test-resource-guard-check test
 
 # Mirror the repo CI verification flow.
 [group('dev')]
-ci: fmt-check lint image-service-print helm-lint coverage
+ci: fmt-check lint image-service-print helm-lint test-resource-guard-check coverage
 
 # Auto-fix formatting and clippy warnings.
 [group('dev')]
@@ -59,7 +59,13 @@ image-service-release:
 # Run the full workspace test suite.
 [group('dev')]
 test:
-  cargo test --workspace
+  ./scripts/with-test-resources.sh cargo test --workspace
+
+# Verify both the raised-limit and bounded-thread fallback paths without
+# changing the invoking shell's resource limits.
+[group('dev')]
+test-resource-guard-check:
+  ./scripts/test-with-test-resources.sh
 
 # Model-check the bounded planner invariants. Install the pinned verifier with:
 # cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup
@@ -82,7 +88,7 @@ mutants-service *ARGS:
 # mutants-core and mutants-service. DIFF must describe the current working tree.
 [group('dev')]
 mutants-diff DIFF *ARGS:
-  cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
+  ./scripts/with-test-resources.sh cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
 
 # Audit dependencies with cargo-deny (advisories + licenses + bans +
 # sources; config and documented exceptions in `deny.toml`). Runs once
@@ -290,7 +296,7 @@ helm-lint:
 # Collect and report coverage for the complete Cargo workspace.
 [group('coverage')]
 coverage:
-  cargo llvm-cov --all-features --workspace --no-report
+  ./scripts/with-test-resources.sh cargo llvm-cov --all-features --workspace --no-report
   cargo llvm-cov report \
     --package kache \
     --package kache-core \
@@ -316,7 +322,7 @@ coverage-scope-check COVERAGE_JSON="tmp/llvm-cov/coverage.json":
 # Run cargo-llvm-cov and open the HTML report locally.
 [group('coverage')]
 coverage-open:
-  cargo llvm-cov --all-features --workspace --html --output-dir tmp/llvm-cov
+  ./scripts/with-test-resources.sh cargo llvm-cov --all-features --workspace --html --output-dir tmp/llvm-cov
   open tmp/llvm-cov/html/index.html || \
     xdg-open tmp/llvm-cov/html/index.html || true
 

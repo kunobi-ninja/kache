@@ -454,6 +454,11 @@ mod tests {
     // with no live compiler at test time.
     const O2: &str = include_str!("testdata/clang_o2.txt");
     const O2_NATIVE: &str = include_str!("testdata/clang_o2_march_native.txt");
+    // Real `cc -### -O2 -gdwarf-{2,4} -c …` output captured from Apple
+    // clang 21 — the cc-rs Apple debug shape of #838 and the Firefox
+    // baseline of #117.
+    const O2_GDWARF2: &str = include_str!("testdata/clang_o2_gdwarf2.txt");
+    const O2_GDWARF4: &str = include_str!("testdata/clang_o2_gdwarf4.txt");
     // Real `clang-cl -### /Z7 -c …` output captured on Windows — its
     // `-cc1` line is full of `C:\…` drive paths (toolchain, SDK,
     // `-fdebug-compilation-dir`, `-object-file-name`).
@@ -662,6 +667,27 @@ mod tests {
             plain, native,
             "-march=native must change the resolved invocation"
         );
+    }
+
+    /// `-gdwarf-2` (#838) and `-gdwarf-4` (#117) are keyed via the
+    /// probe: the resolved cc1 line carries `-dwarf-version=N`, so the
+    /// semantic tokens must distinguish DWARF 2 from DWARF 4 and both
+    /// from the no-flag baseline.
+    #[test]
+    fn gdwarf_version_changes_resolved_tokens() {
+        let plain = resolved_semantic_tokens(O2, true, &[]).unwrap();
+        let dwarf2 = resolved_semantic_tokens(O2_GDWARF2, true, &[]).unwrap();
+        let dwarf4 = resolved_semantic_tokens(O2_GDWARF4, true, &[]).unwrap();
+
+        assert!(dwarf2.iter().any(|t| t == "-dwarf-version=2"));
+        assert!(dwarf4.iter().any(|t| t == "-dwarf-version=4"));
+        assert!(
+            !plain.iter().any(|t| t.starts_with("-dwarf-version=")),
+            "the no-flag baseline must not carry a DWARF version"
+        );
+        assert_ne!(dwarf2, dwarf4, "DWARF 2 vs 4 must key differently");
+        assert_ne!(plain, dwarf2, "-gdwarf-2 must change the resolved key");
+        assert_ne!(plain, dwarf4, "-gdwarf-4 must change the resolved key");
     }
 
     /// Per-TU paths (this invocation's source/output) are blanked from the

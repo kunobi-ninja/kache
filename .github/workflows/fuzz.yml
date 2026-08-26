@@ -38,14 +38,24 @@ jobs:
         run: cargo +nightly-2026-05-16 metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 > /dev/null
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
-        with:
-          tool: cargo-fuzz@0.13.1
-          fallback: none
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/cargo-fuzz-0.13.1.tar.gz"
+          curl --fail --location --retry 3 --silent --show-error \
+            --output "$archive" \
+            https://github.com/rust-fuzz/cargo-fuzz/releases/download/0.13.1/cargo-fuzz-0.13.1-x86_64-unknown-linux-musl.tar.gz
+          printf '%s  %s\n' \
+            86edc9b8f20c29ff07c3e5fcd67bc3f0784b3b960a5428635060f20d50555461 \
+            "$archive" | sha256sum --check
+          tar --extract --gzip --file "$archive" \
+            --directory "$(dirname "$(command -v cargo)")" cargo-fuzz
+          cargo fuzz --version
 
       - name: Compile every fuzz target
         if: github.event_name == 'pull_request'
-        run: cargo +nightly-2026-05-16 fuzz check
+        run: >-
+          cargo +nightly-2026-05-16 fuzz check
+          --target x86_64-unknown-linux-gnu
 
       - name: Generate structurally valid seed corpus
         if: github.event_name != 'pull_request'
@@ -69,7 +79,9 @@ jobs:
       - name: Fuzz bounded native archive inputs
         if: github.event_name != 'pull_request'
         run: >-
-          cargo +nightly-2026-05-16 fuzz run native_archive
+          cargo +nightly-2026-05-16 fuzz run
+          --target x86_64-unknown-linux-gnu
+          native_archive
           "$KACHE_FUZZ_SEED_DIR" --
           -max_total_time=600
           -max_len=1048576

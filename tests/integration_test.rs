@@ -2017,6 +2017,13 @@ fn test_cc_gdwarf2_caches_and_keys_dwarf_version_issue_838() {
     }
 
     build_kache();
+    // Accepting the driver flags is not enough: a host whose `cc -###`
+    // output cannot be resolved should fail closed in production and should
+    // not turn this portability test red.
+    if !kache_caches_probe_keyed_flags(probe_dir.path()) {
+        eprintln!("skipping: probe-keyed flags are not cacheable on this host");
+        return;
+    }
     let cache_dir = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
     std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
@@ -2068,6 +2075,31 @@ fn test_cc_gdwarf2_caches_and_keys_dwarf_version_issue_838() {
         summary["misses"].as_u64().unwrap_or(0) + summary["dups"].as_u64().unwrap_or(0),
         3,
         "-gdwarf-4 and no-flag should have compiled under their own keys: {report}"
+    );
+
+    // Four compiles represent exactly three semantic modes: the repeated
+    // DWARF-2 invocation shares its key, while DWARF 4 and the no-flag
+    // baseline each have their own. This proves separation directly rather
+    // than inferring it only from aggregate hit/miss counters.
+    let events = report["all_events"]
+        .as_array()
+        .expect("report should include all_events");
+    assert_eq!(events.len(), 4, "expected one event per compile: {report}");
+    let keys: std::collections::BTreeSet<&str> = events
+        .iter()
+        .map(|event| {
+            let key = event["cache_key"].as_str().unwrap_or_default();
+            assert!(
+                !key.is_empty(),
+                "every DWARF test event should carry a cache key: {event}"
+            );
+            key
+        })
+        .collect();
+    assert_eq!(
+        keys.len(),
+        3,
+        "DWARF 2, DWARF 4, and no-flag must map to three cache keys: {report}"
     );
 }
 

@@ -680,9 +680,11 @@ mod tests {
     /// from the no-flag baseline.
     #[test]
     fn gdwarf_version_changes_resolved_tokens() {
-        let plain = resolved_semantic_tokens(O2, true, &[]).unwrap();
-        let dwarf2 = resolved_semantic_tokens(O2_GDWARF2, true, &[]).unwrap();
-        let dwarf4 = resolved_semantic_tokens(O2_GDWARF4, true, &[]).unwrap();
+        let plain_paths = ["main.c".to_string()];
+        let dwarf_paths = ["kache-fixture-main.c".to_string()];
+        let plain = resolved_semantic_tokens(O2, true, &plain_paths).unwrap();
+        let dwarf2 = resolved_semantic_tokens(O2_GDWARF2, true, &dwarf_paths).unwrap();
+        let dwarf4 = resolved_semantic_tokens(O2_GDWARF4, true, &dwarf_paths).unwrap();
 
         assert!(dwarf2.iter().any(|t| t == "-dwarf-version=2"));
         assert!(dwarf4.iter().any(|t| t == "-dwarf-version=4"));
@@ -693,6 +695,31 @@ mod tests {
         assert_ne!(dwarf2, dwarf4, "DWARF 2 vs 4 must key differently");
         assert_ne!(plain, dwarf2, "-gdwarf-2 must change the resolved key");
         assert_ne!(plain, dwarf4, "-gdwarf-4 must change the resolved key");
+
+        // The captures use different source basenames. Normalize those as
+        // per-TU paths, then prove DWARF metadata is the only semantic delta;
+        // otherwise the vector inequality above could pass for the wrong
+        // reason.
+        let without_dwarf_metadata = |tokens: &[String]| {
+            tokens
+                .iter()
+                .filter(|token| {
+                    token.as_str() != "-debug-info-kind=standalone"
+                        && !token.starts_with("-dwarf-version=")
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            without_dwarf_metadata(&plain),
+            without_dwarf_metadata(&dwarf2),
+            "the no-flag and DWARF-2 captures must differ only in DWARF metadata"
+        );
+        assert_eq!(
+            without_dwarf_metadata(&dwarf2),
+            without_dwarf_metadata(&dwarf4),
+            "the DWARF-2 and DWARF-4 captures must differ only in DWARF metadata"
+        );
     }
 
     /// Per-TU paths (this invocation's source/output) are blanked from the

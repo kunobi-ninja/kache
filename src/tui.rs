@@ -29,6 +29,11 @@ use crate::events::{self, BuildEvent, EventRecord, EventResult, EventTailer, Hea
 /// user's real screen instead of vanishing with the alternate one.
 pub(crate) struct TerminalModeGuard;
 
+#[cfg(test)]
+std::thread_local! {
+    static TERMINAL_RESTORE_OBSERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl TerminalModeGuard {
     pub(crate) fn enter() -> Result<Self> {
         static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
@@ -60,6 +65,8 @@ impl Drop for TerminalModeGuard {
 /// Idempotent: leaving the main screen buffer and disabling an already
 /// disabled raw mode are no-ops, so the hook and the guard can both run.
 fn restore_terminal() {
+    #[cfg(test)]
+    TERMINAL_RESTORE_OBSERVED.with(|observed| observed.set(true));
     let _ = stdout().execute(LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
@@ -2125,6 +2132,24 @@ fn draw_passthrough_help(frame: &mut Frame, state: &AppState, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_restore_was_observed(action: impl FnOnce()) -> bool {
+        TERMINAL_RESTORE_OBSERVED.with(|observed| observed.set(false));
+        action();
+        TERMINAL_RESTORE_OBSERVED.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn terminal_restore_function_runs_the_cleanup_path() {
+        assert!(terminal_restore_was_observed(restore_terminal));
+    }
+
+    #[test]
+    fn terminal_restore_guard_runs_on_drop() {
+        assert!(terminal_restore_was_observed(|| {
+            let _guard = TerminalModeGuard;
+        }));
+    }
 
     #[test]
     fn test_tab_needs_entries_only_for_store() {

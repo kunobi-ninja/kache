@@ -4767,6 +4767,68 @@ mod tests {
     }
 
     #[test]
+    fn tool_version_cache_path_is_a_named_file_in_the_cache_dir() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("rustc");
+        std::fs::write(&binary, b"test rustc").unwrap();
+
+        let cache_file = tool_version_cache_path(&binary, "rustc-ver")
+            .expect("a readable binary must produce a cache path");
+        let cache_dir = crate::config::default_cache_dir();
+        assert_eq!(cache_file.parent(), Some(cache_dir.as_path()));
+
+        let file_name = cache_file
+            .file_name()
+            .expect("cache path must name a file")
+            .to_string_lossy();
+        let digest = file_name
+            .strip_prefix("rustc-ver-")
+            .and_then(|name| name.strip_suffix(".txt"))
+            .expect("cache file must retain its prefix and extension");
+        assert_eq!(digest.len(), 16, "cache file uses the short BLAKE3 digest");
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    #[ignore = "spawned by the explicit RUSTUP_HOME regression"]
+    fn rustup_settings_path_explicit_home_fixture() {
+        let expected_home = std::env::var_os("KACHE_TEST_RUSTUP_HOME")
+            .map(std::path::PathBuf::from)
+            .expect("fixture requires its isolated expected home");
+
+        assert_eq!(
+            rustup_settings_path(),
+            Some(expected_home.join("settings.toml"))
+        );
+    }
+
+    #[test]
+    fn tool_version_cache_uses_settings_under_explicit_rustup_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve cache-key test executable"),
+        )
+        .args([
+            "--ignored",
+            "--exact",
+            "cache_key::tests::rustup_settings_path_explicit_home_fixture",
+            "--test-threads=1",
+        ])
+        .env("RUSTUP_HOME", dir.path())
+        .env("KACHE_TEST_RUSTUP_HOME", dir.path())
+        .output()
+        .expect("spawn isolated RUSTUP_HOME fixture");
+
+        assert!(
+            output.status.success(),
+            "isolated RUSTUP_HOME fixture failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn apply_key_env_vars_keeps_distinct_path_values_distinct() {
         let _lock = key_test_lock();
         let base = "deadbeef".to_string();

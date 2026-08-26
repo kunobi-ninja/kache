@@ -2705,6 +2705,23 @@ fn clean_handle_key(
     CleanStep::Continue
 }
 
+/// Ignore key-repeat/release notifications: one physical key press must apply
+/// exactly one selector action on terminals that report all key event kinds.
+fn clean_handle_event(
+    event: crossterm::event::Event,
+    selected: &mut [bool],
+    cursor: &mut usize,
+    len: usize,
+) -> CleanStep {
+    use crossterm::event::{Event, KeyEventKind};
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            clean_handle_key(key.code, selected, cursor, len)
+        }
+        _ => CleanStep::Continue,
+    }
+}
+
 /// Render one frame of the interactive `clean` selector. Extracted from the
 /// event loop so it can be unit-tested against a ratatui `TestBackend` with a
 /// fixed `targets`/`selected`/`cursor` state (the real loop owns the terminal).
@@ -2848,7 +2865,7 @@ fn draw_clean(
 
 /// Recursively find and remove target/ directories (TUI selector).
 pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
-    use crossterm::event::{self, Event, KeyEventKind};
+    use crossterm::event;
     use ratatui::prelude::*;
     use std::io::stdout;
 
@@ -2900,11 +2917,9 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
         loop {
             terminal.draw(|frame| draw_clean(frame, &targets, &selected, cursor, &root))?;
 
-            if event::poll(std::time::Duration::from_millis(100))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                match clean_handle_key(key.code, &mut selected, &mut cursor, targets.len()) {
+            if event::poll(std::time::Duration::from_millis(100))? {
+                match clean_handle_event(event::read()?, &mut selected, &mut cursor, targets.len())
+                {
                     CleanStep::Cancel => break None,
                     CleanStep::Confirm => {
                         let to_remove: Vec<_> = targets
@@ -9848,6 +9863,51 @@ mod tests {
         assert_eq!(
             clean_handle_key(KeyCode::Char('z'), &mut selected, &mut cursor, 1),
             CleanStep::Continue
+        );
+    }
+
+    #[test]
+    fn clean_event_applies_press_but_ignores_release() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let key_event = |kind| {
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                kind,
+            ))
+        };
+        let mut selected = vec![false];
+        let mut cursor = 0;
+
+        assert_eq!(
+            clean_handle_event(
+                key_event(KeyEventKind::Release),
+                &mut selected,
+                &mut cursor,
+                1,
+            ),
+            CleanStep::Continue,
+            "key release must not repeat the action"
+        );
+        assert_eq!(
+            clean_handle_event(
+                key_event(KeyEventKind::Repeat),
+                &mut selected,
+                &mut cursor,
+                1,
+            ),
+            CleanStep::Continue,
+            "key repeat must not repeat the action"
+        );
+        assert_eq!(
+            clean_handle_event(
+                key_event(KeyEventKind::Press),
+                &mut selected,
+                &mut cursor,
+                1,
+            ),
+            CleanStep::Cancel,
+            "key press must apply the action"
         );
     }
 

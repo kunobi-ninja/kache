@@ -43,6 +43,7 @@ came from the second pass.
 | In-flight coalescing across simultaneous cargo invocations (#646) | `e2e-rust-parallel-coalesce` |
 | Restore content correctness (byte-for-byte) | `[diff]` in C/C++/CMake/Rust-FFI/workspace scenarios |
 | S3 v3 sync across isolated caches (#695) | `tests/s3_remote_test.rs` (signed OpenDAL requests against a deterministic local wire store) |
+| Daemon async upload + on-demand remote HIT across isolated clients (#696) | `tests/filesystem_remote_test.rs` (separate caches/source trees, no explicit sync, compiler-free byte-identical restore) |
 
 ## Gaps — features with NO e2e scenario
 
@@ -50,8 +51,7 @@ came from the second pass.
 |---|---|
 | **S3 provider/auth variants** | The required process test covers signed v3 manifest/pack upload, list, download, import, zstd, and restore. Live AWS/R2/Ceph/MinIO credentials and legacy v1/v2 layouts remain outside the hermetic PR gate; SigV4a is not supported. |
 | **`save-manifest`** | `sync --push/--pull --all` is process-tested; build-manifest and shard publication is not. |
-| **Daemon path** | prefetch/warming (shards), hash-files cache, remote-check HIT, upload queue |
-| **Daemon-driven cross-machine reuse** | Explicit sync across isolated caches/source trees is covered by `tests/s3_remote_test.rs`; asynchronous upload and on-demand remote HIT across clients remains #696. |
+| **Daemon path** | prefetch/warming (shards), hash-files cache |
 | **Config behaviors as toggles** | `key_salt`, `ignore_env`, `path_only_env_vars`, `cc_extra_allowlist_flags`, `local_only`, `modified_input_guard` (#324) — none asserted to flip hit/miss e2e |
 | **Refusal classes** | multi-source and response files now covered (`e2e-cc-multi-source`, `e2e-cc-response-file`); still open: `-E`/`-S`, PCH/modules, multi-arch fat binaries, stdout output |
 | **Platform restore modes** | reflink vs hardlink vs copy; Windows NTFS hardlink / ReFS block-clone (#435); macOS codesign of restored executables — restores happen but the *mode* is never asserted |
@@ -77,13 +77,13 @@ the originally-listed gaps do **not** fit and should stay where they are:
 
 ## Prioritized missing scenarios
 
-1. **Daemon upload + remote-check HIT across clients** — the remaining production async path (upload queue, on-demand remote check, batching, warmed cache), tracked by #696.
-2. **Platform restore** — Windows hardlink/ReFS (#435) and macOS codesign-after-restore.
-3. **Rust edge-key** — custom target JSON + native search paths, to catch under-keying.
-4. **Remaining refusal classes** — `-E`/`-S`, PCH/modules, multi-arch, stdout output → passthrough, no cache entry (extends `e2e-cc-multi-source` / `e2e-cc-response-file`).
-5. **Optional live-provider qualification** — scheduled/non-blocking AWS, R2, Ceph, or MinIO smoke coverage for provider-specific credentials and behavior; the required PR gate stays hermetic.
+1. **Platform restore** — Windows hardlink/ReFS (#435) and macOS codesign-after-restore.
+2. **Rust edge-key** — custom target JSON + native search paths, to catch under-keying.
+3. **Remaining refusal classes** — `-E`/`-S`, PCH/modules, multi-arch, stdout output → passthrough, no cache entry (extends `e2e-cc-multi-source` / `e2e-cc-response-file`).
+4. **Optional live-provider qualification** — scheduled/non-blocking AWS, R2, Ceph, or MinIO smoke coverage for provider-specific credentials and behavior; the required PR gate stays hermetic.
 
 ### Done (this branch)
 
 - ✅ **Refusal: multi-source + response file** — `e2e-cc-multi-source`, `e2e-cc-response-file` (verified green via the gate harness).
 - ✅ **S3 v3 sync round-trip across isolated caches** — `tests/s3_remote_test.rs` drives cold compile → signed push → fresh-cache pull/import → compiler-free restore and verifies the manifest, compressed pack, and artifact bytes (#695).
+- ✅ **Daemon async upload + on-demand remote HIT** — `tests/filesystem_remote_test.rs` drives a cold compile through the producer daemon's durable upload queue, waits for v3 publication without `sync`, and requires a fresh consumer daemon to restore the identical artifact with `compiler_runs = 0` (#696).

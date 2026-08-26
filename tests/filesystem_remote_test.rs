@@ -25,6 +25,10 @@ fn rustc_path() -> String {
     std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string())
 }
 
+fn toml_path(path: &Path) -> String {
+    toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
 /// One independently configured runtime. It normally owns its local cache;
 /// #811 coverage can instead point several runtimes at one node-local store.
 struct Client {
@@ -60,11 +64,19 @@ impl Client {
         std::fs::write(
             &config_path,
             format!(
-                "[cache.remote]\n\
+                "[cache]\n\
+                 ignore_env = true\n\
+                 local_store = {}\n\
+                 runtime_dir = {}\n\
+                 daemon_idle_timeout_secs = 60\n\
+                 prefetch_enabled = false\n\n\
+                 [cache.remote]\n\
                  type = \"filesystem\"\n\
-                 path = \"{}\"\n\
+                 path = {}\n\
                  prefix = \"artifacts\"\n",
-                shared_folder.display().to_string().replace('\\', "\\\\"),
+                toml_path(&cache_dir),
+                toml_path(&runtime_dir),
+                toml_path(shared_folder),
             ),
         )
         .unwrap();
@@ -79,17 +91,19 @@ impl Client {
 
     fn kache(&self) -> std::process::Command {
         let mut cmd = std::process::Command::new(kache_binary());
-        cmd.env("KACHE_CACHE_DIR", &self.cache_dir)
-            .env("KACHE_RUNTIME_DIR", &self.runtime_dir)
-            .env("KACHE_CONFIG", &self.config_path)
+        cmd.env("KACHE_CONFIG", &self.config_path)
             .env("KACHE_LOG", "off")
             // A BACKSTOP, not the cleanup mechanism: `Client`'s `Drop` stops
             // the daemon explicitly, which keeps it warm for the whole test
             // instead of tearing it down between commands. This only bounds
             // the damage if that stop is ever missed (a hard abort), since the
             // idle timeout is disabled by default (#662) and a leaked daemon
-            // would otherwise outlive the suite.
-            .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+            // would otherwise outlive the suite. The timeout and all
+            // file-backed settings are pinned in the ignore-env config above;
+            // only operational vars need clearing here.
+            .env_remove("KACHE_DISABLED")
+            .env_remove("KACHE_NAMESPACE")
+            .env_remove("KACHE_BASE_DIR")
             .env_remove("KACHE_SOCKET_PATH")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
@@ -110,7 +124,7 @@ impl Client {
     /// - **A deadline.** If something still blocks, the test fails in seconds
     ///   naming the exact command, instead of burning the job's whole budget
     ///   and reporting only "timed out".
-    fn run_within(&self, args: &[&str], deadline: Duration) -> Output {
+    fn run_within_at(&self, cwd: Option<&Path>, args: &[&str], deadline: Duration) -> Output {
         // Counter, not the args: an argv carries paths and slashes, which do
         // not belong in a file name.
         let seq = self.command_seq.fetch_add(1, Ordering::Relaxed);
@@ -119,8 +133,11 @@ impl Client {
         let stdout = std::fs::File::create(&out_path).expect("creating stdout capture");
         let stderr = std::fs::File::create(&err_path).expect("creating stderr capture");
 
-        let mut child = self
-            .kache()
+        let mut command = self.kache();
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let mut child = command
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(stdout)
@@ -154,6 +171,10 @@ impl Client {
         }
     }
 
+    fn run_within(&self, args: &[&str], deadline: Duration) -> Output {
+        self.run_within_at(None, args, deadline)
+    }
+
     /// A kache command that should complete promptly.
     fn run(&self, args: &[&str]) -> Output {
         self.run_within(args, Duration::from_secs(90))
@@ -177,6 +198,36 @@ impl Client {
             &out_dir,
             &src,
         ]);
+        assert!(
+            output.status.success(),
+            "kache rustc failed.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Compile `lib.rs` from an isolated checkout using only relative source
+    /// arguments. This makes cross-checkout cache-key normalization part of the
+    /// process-level remote reuse contract instead of reusing one source path.
+    fn compile_checkout(&self, checkout: &Path, out_dir: &Path) {
+        let out_dir = out_dir.display().to_string();
+        let rustc = rustc_path();
+        let output = self.run_within_at(
+            Some(checkout),
+            &[
+                &rustc,
+                "--crate-name",
+                "fsremote",
+                "--crate-type",
+                "lib",
+                "--edition",
+                "2021",
+                "--emit=link",
+                "--out-dir",
+                &out_dir,
+                "lib.rs",
+            ],
+            Duration::from_secs(90),
+        );
         assert!(
             output.status.success(),
             "kache rustc failed.\nstderr: {}",
@@ -212,32 +263,46 @@ impl Client {
             String::from_utf8_lossy(&output.stderr),
         );
 
+        self.wait_for_daemon_exit(Duration::from_secs(45))
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn wait_for_daemon_exit(&self, timeout: Duration) -> Result<(), String> {
         let run_lock_path = self.runtime_dir.join("daemon.run.lock");
         let run_lock = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
             .open(&run_lock_path)
-            .expect("opening daemon run lock probe");
-        // Upload workers may drain for up to 30s; leave overall shutdown margin.
-        let deadline = Instant::now() + Duration::from_secs(45);
+            .map_err(|error| {
+                format!(
+                    "opening daemon lifetime lock probe {}: {error}",
+                    run_lock_path.display()
+                )
+            })?;
+        let deadline = Instant::now() + timeout;
         loop {
             match run_lock.try_lock() {
                 Ok(()) => {
-                    run_lock.unlock().expect("releasing daemon run lock probe");
-                    return;
+                    run_lock.unlock().map_err(|error| {
+                        format!(
+                            "releasing daemon lifetime lock probe {}: {error}",
+                            run_lock_path.display()
+                        )
+                    })?;
+                    return Ok(());
                 }
                 Err(std::fs::TryLockError::Error(error)) => {
-                    panic!(
+                    return Err(format!(
                         "failed to probe daemon lifetime lock {}: {error}",
                         run_lock_path.display()
-                    );
+                    ));
                 }
                 Err(error @ std::fs::TryLockError::WouldBlock) if Instant::now() >= deadline => {
-                    panic!(
+                    return Err(format!(
                         "daemon lifetime lock {} remained held after its drain phase: {error}",
                         run_lock_path.display()
-                    );
+                    ));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     std::thread::sleep(Duration::from_millis(100));
@@ -268,13 +333,15 @@ impl Client {
         output
     }
 
-    /// Per-result event counts from `kache report` over this client's cache.
-    fn results(&self) -> Vec<String> {
+    fn report(&self) -> serde_json::Value {
         let output = self.run(&["report", "--format", "json", "--since", "1h"]);
         assert!(output.status.success(), "kache report failed");
-        let report: serde_json::Value =
-            serde_json::from_slice(&output.stdout).expect("report should be valid json");
-        report["all_events"]
+        serde_json::from_slice(&output.stdout).expect("report should be valid json")
+    }
+
+    /// Per-result event counts from `kache report` over this client's cache.
+    fn results(&self) -> Vec<String> {
+        self.report()["all_events"]
             .as_array()
             .map(|events| {
                 events
@@ -286,26 +353,68 @@ impl Client {
     }
 }
 
+fn crate_event<'a>(report: &'a serde_json::Value, crate_name: &str) -> &'a serde_json::Value {
+    report["all_events"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .rev()
+                .find(|event| event["crate_name"] == crate_name)
+        })
+        .unwrap_or_else(|| panic!("report has no event for {crate_name}: {report}"))
+}
+
+fn wait_for_remote_entry(shared: &Path, crate_name: &str, cache_key: &str) {
+    let manifest = shared
+        .join("artifacts/v3/manifests")
+        .join(crate_name)
+        .join(format!("{cache_key}.json"));
+    let pack = shared
+        .join("artifacts/v3/packs")
+        .join(crate_name)
+        .join(format!("{cache_key}.tar.zst"));
+    let deadline = Instant::now() + Duration::from_secs(45);
+
+    loop {
+        if manifest.is_file() && pack.is_file() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let mut remote_files = Vec::new();
+            collect_files(shared, &mut remote_files);
+            panic!(
+                "daemon upload did not publish the v3 entry within 45s\n\
+                 expected manifest: {}\nexpected pack: {}\nremote files: {remote_files:#?}",
+                manifest.display(),
+                pack.display(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 impl Drop for Client {
     /// Stop this client's daemon when the test ends — including on panic.
-    /// Nothing waits on the daemon's exit: `stop` is a request, and the test
-    /// has no reason to block on the shutdown completing. This is what keeps
-    /// daemons from piling up across the suite without making them die
-    /// between commands.
+    /// Waiting for its lifetime lock matters on Windows, where the daemon can
+    /// retain handles into temporary directories during teardown.
     fn drop(&mut self) {
-        // Bounded, and through the same file-backed runner: cleanup must
-        // never be the thing that wedges a test run (#704). Nothing waits on
-        // the daemon's own exit — `stop` is a request.
+        // Bounded, and through the same file-backed runner: cleanup must never
+        // be the thing that wedges a test run (#704). Cleanup failures must
+        // not turn an existing test panic into a double panic.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.run_within(&["daemon", "stop"], Duration::from_secs(30))
+            let _ = self.run_within(&["daemon", "stop"], Duration::from_secs(30));
+            // Upload workers may drain for up to 30s; leave overall shutdown
+            // margin before the client's temporary runtime is removed.
+            let _ = self.wait_for_daemon_exit(Duration::from_secs(45));
         }));
     }
 }
 
-/// kunobi-ninja/kache#414 acceptance: two independently configured clients
+/// kunobi-ninja/kache#414/#696 acceptance: two independently configured clients
 /// sharing one folder — and nothing else — get a cross-client cache hit with
-/// no S3 server anywhere. Exercises the **pull-on-miss** path: client B never
-/// syncs explicitly, it just compiles and its daemon fetches A's artifact.
+/// no S3 server or explicit sync anywhere. Client A publishes through the real
+/// asynchronous daemon upload queue; client B exercises the pull-on-miss path.
 ///
 /// Runs everywhere, including Windows, on purpose. An earlier form of this
 /// file hung the Windows job to its 45-minute limit (kunobi-ninja/kache#704)
@@ -314,34 +423,48 @@ impl Drop for Client {
 /// capture and per-command deadlines remain defense in depth and make any
 /// future hang fail with a bounded, specific diagnostic.
 #[test]
-fn two_independent_clients_share_hits_through_one_folder() {
+fn daemon_upload_reaches_an_independent_client_through_one_folder() {
     build_kache();
 
     let shared = TempDir::new().unwrap();
-    let sources = TempDir::new().unwrap();
-    let src = sources.path().join("lib.rs");
-    std::fs::write(&src, "pub fn answer() -> u32 { 42 }\n").unwrap();
+    let producer_source = TempDir::new().unwrap();
+    let consumer_source = TempDir::new().unwrap();
+    std::fs::write(
+        producer_source.path().join("lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        consumer_source.path().join("lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
 
     // Client A compiles cold and publishes to the shared folder.
     let alpha = Client::new(shared.path());
     let out_a = TempDir::new().unwrap();
-    alpha.compile(&src, out_a.path());
+    alpha.start_daemon();
+    alpha.compile_checkout(producer_source.path(), out_a.path());
+    let alpha_report = alpha.report();
+    let alpha_event = crate_event(&alpha_report, "fsremote");
     assert!(
-        alpha.results().iter().any(|r| r == "miss" || r == "dup"),
-        "client A's first compile must be a real compile: {:?}",
-        alpha.results()
+        alpha_event["result"] == "miss" || alpha_event["result"] == "dup",
+        "client A's first compile must be a real compile: {alpha_report}"
     );
-    alpha.stop_daemon_and_wait();
-    let push = alpha.sync(&["--push"]);
+    assert_eq!(
+        alpha_event["compiler_runs"], 1,
+        "the producer must compile instead of restoring: {alpha_report}"
+    );
+    let cache_key = alpha_event["cache_key"]
+        .as_str()
+        .expect("producer event should include its cache key")
+        .to_owned();
 
-    let manifests = shared.path().join("artifacts/v3/manifests");
-    assert!(
-        manifests.is_dir(),
-        "the push must have written the v3 object layout into the shared folder.\n\
-         stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&push.stdout),
-        String::from_utf8_lossy(&push.stderr),
-    );
+    // The v3 manifest is the remote publication commit point. Polling both
+    // objects proves the fire-and-forget wrapper request reached the daemon,
+    // drained through its upload worker, and completed without a sync fallback.
+    wait_for_remote_entry(shared.path(), "fsremote", &cache_key);
+    alpha.stop_daemon_and_wait();
 
     // Client B has never seen this compile: separate cache, separate config,
     // separate output dir. Its only connection to A is the folder. Its daemon
@@ -350,17 +473,32 @@ fn two_independent_clients_share_hits_through_one_folder() {
     let beta = Client::new(shared.path());
     let out_b = TempDir::new().unwrap();
     beta.start_daemon();
-    beta.compile(&src, out_b.path());
-    let beta_results = beta.results();
+    beta.compile_checkout(consumer_source.path(), out_b.path());
+    let beta_report = beta.report();
+    let beta_event = crate_event(&beta_report, "fsremote");
 
-    assert!(
-        beta_results.iter().any(|r| r == "remote_hit"),
-        "client B must pull A's artifact from the shared folder on miss: {beta_results:?}"
+    assert_eq!(
+        beta_event["result"], "remote_hit",
+        "client B must pull A's artifact from the shared folder on miss: {beta_report}"
+    );
+    assert_eq!(
+        beta_event["compiler_runs"], 0,
+        "client B must restore without running rustc: {beta_report}"
+    );
+    assert_eq!(
+        beta_event["cache_key"], cache_key,
+        "producer and consumer checkouts must resolve to the same key"
     );
     assert!(
         out_b.path().join("libfsremote.rlib").is_file(),
         "client B must end up with the artifact materialized"
     );
+    assert_eq!(
+        std::fs::read(out_a.path().join("libfsremote.rlib")).unwrap(),
+        std::fs::read(out_b.path().join("libfsremote.rlib")).unwrap(),
+        "the remotely restored artifact must match the producer byte-for-byte"
+    );
+    beta.stop_daemon_and_wait();
 }
 
 /// #811 acceptance: two job-scoped daemon runtimes may concurrently use one
@@ -536,24 +674,14 @@ fn capturing_kache_output_through_pipes_does_not_hang() {
     let out_dir = TempDir::new().unwrap();
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let cache_dir = client.cache_dir.clone();
-    let runtime_dir = client.runtime_dir.clone();
-    let config_path = client.config_path.clone();
+    let mut command = client.kache();
     let src_path = src.display().to_string();
     let out_path = out_dir.path().display().to_string();
     let rustc = rustc_path();
     std::thread::spawn(move || {
         // Plain `output()`: pipes for both streams, exactly what an ordinary
         // caller writes.
-        let result = std::process::Command::new(kache_binary())
-            .env("KACHE_CACHE_DIR", &cache_dir)
-            .env("KACHE_RUNTIME_DIR", &runtime_dir)
-            .env("KACHE_CONFIG", &config_path)
-            .env("KACHE_LOG", "off")
-            .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
-            .env_remove("KACHE_SOCKET_PATH")
-            .env_remove("RUSTC_WRAPPER")
-            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        let result = command
             .args([
                 &rustc,
                 "--crate-name",
@@ -587,38 +715,35 @@ fn capturing_kache_output_through_pipes_does_not_hang() {
 /// daemon is gone, not merely asked to leave. Without this the suite would
 /// leak a daemon per test, which is what the 3-second idle timeouts elsewhere
 /// were compensating for (kunobi-ninja/kache#704).
-#[cfg(unix)]
 #[test]
 fn dropping_a_client_stops_its_daemon() {
     build_kache();
     let shared = TempDir::new().unwrap();
 
-    let socket = {
+    let run_lock = {
         let client = Client::new(shared.path());
         client.start_daemon();
-        let socket = client.runtime_dir.join("daemon.sock");
+        let run_lock_path = client.runtime_dir.join("daemon.run.lock");
+        let run_lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&run_lock_path)
+            .expect("opening the live daemon's lifetime lock");
         assert!(
-            socket.exists(),
-            "the daemon should have published its socket at {}",
-            socket.display()
+            matches!(run_lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the running daemon must hold {}",
+            run_lock_path.display()
         );
-        socket
-        // `client` drops here — its Drop issues `daemon stop`.
+        run_lock
+        // `client` drops here — its Drop stops the daemon and waits for this
+        // same lifetime lock to become available.
     };
 
-    // The socket is removed on shutdown; allow a moment for the daemon to
-    // finish unlinking it, then assert it is really gone.
-    for _ in 0..50 {
-        if !socket.exists() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!(
-        "daemon socket {} still present after the client was dropped — \
-         Drop cleanup did not stop the daemon",
-        socket.display()
-    );
+    run_lock
+        .try_lock()
+        .expect("Client::drop must wait until the daemon releases its lifetime lock");
+    run_lock
+        .unlock()
+        .expect("releasing the post-drop lifetime lock probe");
 }
 
 /// The shared folder must stay a pure object store: no SQLite index and no

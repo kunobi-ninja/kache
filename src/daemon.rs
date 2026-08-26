@@ -5726,6 +5726,7 @@ async fn server_main(
         &shutdown_flag,
         &shutdown_notify,
         idle_timeout,
+        CONNECTION_HANDLER_DRAIN_TIMEOUT,
         shutdown_signal(),
     )
     .await;
@@ -5799,6 +5800,12 @@ async fn drain_upload_pipeline(
 /// signal; this tick guarantees the idle-timeout check still runs when the
 /// daemon is completely quiet.
 const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
+
+/// Maximum time to let accepted IPC handlers finish their current response
+/// during shutdown. A bounded drain preserves in-flight replies (including the
+/// shutdown acknowledgement) without letting a silent client hold the daemon
+/// open forever.
+const CONNECTION_HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Overall budget a `RemoteCheck` waits behind another task's in-flight
 /// download of the same key before giving up and reporting a remote miss
@@ -6039,10 +6046,12 @@ async fn accept_loop(
     shutdown_flag: &Arc<AtomicBool>,
     shutdown_notify: &Arc<Notify>,
     idle_timeout: Option<Duration>,
+    handler_drain_timeout: Duration,
     shutdown_signal: impl std::future::Future<Output = ()>,
 ) {
     tokio::pin!(shutdown_signal);
     let mut last_activity = Instant::now();
+    let mut handlers = tokio::task::JoinSet::new();
 
     // Bound the number of connection handlers doing work at once. Excess
     // connections park on `acquire_owned` (cheap) instead of all running
@@ -6079,7 +6088,7 @@ async fn accept_loop(
                         let flag = shutdown_flag.clone();
                         let notify = shutdown_notify.clone();
                         let limiter = conn_limiter.clone();
-                        tokio::spawn(async move {
+                        handlers.spawn(async move {
                             if let Err(e) = handle_connection_after_queue(
                                 stream,
                                 &d,
@@ -6117,8 +6126,58 @@ async fn accept_loop(
                 tracing::info!("shutdown signal received, draining...");
                 break;
             }
+            Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                observe_connection_handler(result);
+            }
         }
     }
+
+    // Every accepted connection is owned by this loop. Tell persistent
+    // handlers to stop after their current response, then wait for those
+    // responses under a deadline. This must happen before `server_main` drops
+    // the runtime and starts draining uploads.
+    shutdown_flag.store(true, Ordering::Relaxed);
+    if drain_connection_handlers(&mut handlers, handler_drain_timeout).await {
+        tracing::warn!(
+            timeout_ms = handler_drain_timeout.as_millis() as u64,
+            "connection handler drain timed out; aborted remaining handlers"
+        );
+    }
+}
+
+fn observe_connection_handler(result: std::result::Result<(), tokio::task::JoinError>) -> bool {
+    if let Err(error) = result
+        && !error.is_cancelled()
+    {
+        tracing::warn!("connection handler task failed: {error}");
+        return true;
+    }
+    false
+}
+
+/// Drain all accepted connection handlers under one deadline. Returns true if
+/// unfinished handlers had to be aborted.
+async fn drain_connection_handlers(
+    handlers: &mut tokio::task::JoinSet<()>,
+    timeout: Duration,
+) -> bool {
+    let drained = tokio::time::timeout(timeout, async {
+        while let Some(result) = handlers.join_next().await {
+            observe_connection_handler(result);
+        }
+    })
+    .await
+    .is_ok();
+
+    if drained {
+        return false;
+    }
+
+    handlers.abort_all();
+    while let Some(result) = handlers.join_next().await {
+        observe_connection_handler(result);
+    }
+    true
 }
 
 /// Populate the key cache by listing every key in the remote.
@@ -6554,6 +6613,24 @@ where
     }
 }
 
+/// Read the next request only while the daemon is still accepting work.
+/// Checking on both sides of the await covers handlers already parked between
+/// persistent requests when another connection initiates shutdown.
+async fn read_request_before_shutdown(
+    shutdown_flag: &AtomicBool,
+    read: impl std::future::Future<Output = std::io::Result<Option<String>>>,
+) -> std::io::Result<Option<String>> {
+    if shutdown_flag.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+
+    let line = read.await?;
+    if shutdown_flag.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    Ok(line)
+}
+
 fn decode_request_frame(buf: &[u8]) -> String {
     let mut s = String::from_utf8_lossy(buf).into_owned();
     if s.ends_with('\r') {
@@ -6636,7 +6713,12 @@ async fn handle_connection_started_at(
     let mut frame = Vec::new();
 
     loop {
-        let line = match read_bounded_line(&mut reader, &mut frame).await {
+        let line = match read_request_before_shutdown(
+            shutdown_flag,
+            read_bounded_line(&mut reader, &mut frame),
+        )
+        .await
+        {
             Ok(Some(l)) => l,
             Ok(None) => break,
             Err(e) if is_client_disconnect(&e) => {
@@ -6740,6 +6822,13 @@ async fn handle_connection_started_at(
         if let Err(e) = (&stream).write_all(resp_line.as_bytes()).await {
             // Client closed without reading (fire-and-forget mode) — not an error.
             tracing::debug!("response write failed (client likely closed): {e}");
+            break;
+        }
+
+        // Once shutdown starts, finish this response but do not wait for a
+        // persistent client to send another request. In particular, the stop
+        // handler must write its own acknowledgement before it exits.
+        if shutdown_flag.load(Ordering::Relaxed) {
             break;
         }
     }
@@ -8655,21 +8744,12 @@ mod tests {
         child
     }
 
-    /// Run one client request→response roundtrip against a daemon socket and
-    /// return the parsed response.
-    ///
-    /// This mirrors the production client (`send_request_with_timeout`):
-    /// connect, write the request line, read exactly one response line, then
-    /// **drop the stream** so the server's read loop sees EOF and
-    /// `handle_connection` returns.
-    ///
-    /// Tests must NOT instead half-close with `AsyncWriteExt::shutdown`: the
-    /// `interprocess` tokio stream's `poll_shutdown` does not perform a
-    /// `shutdown(SHUT_WR)` on macOS, so the server never sees EOF on its read
-    /// half and the test hangs forever waiting on `server.await`. Dropping the
-    /// whole stream closes both halves and behaves identically on every
-    /// platform — which is also exactly what the real client does.
-    async fn client_roundtrip(socket_path: &Path, req: &Request) -> Response {
+    /// Send one request, read one response, and deliberately keep the socket
+    /// open so shutdown tests can prove the server does not require client EOF.
+    async fn client_request_keep_open(
+        socket_path: &Path,
+        req: &Request,
+    ) -> (Response, TokioStream) {
         let mut stream = connect_stream(socket_path).await;
 
         let mut line = serde_json::to_string(req).expect("serialize request");
@@ -8687,9 +8767,31 @@ mod tests {
                 .await
                 .expect("read response");
         }
-        drop(stream);
 
-        serde_json::from_str(&resp_line).expect("parse response")
+        (
+            serde_json::from_str(&resp_line).expect("parse response"),
+            stream,
+        )
+    }
+
+    /// Run one client request→response roundtrip against a daemon socket and
+    /// return the parsed response.
+    ///
+    /// This mirrors the production client (`send_request_with_timeout`):
+    /// connect, write the request line, read exactly one response line, then
+    /// **drop the stream** so the server's read loop sees EOF and
+    /// `handle_connection` returns.
+    ///
+    /// Tests must NOT instead half-close with `AsyncWriteExt::shutdown`: the
+    /// `interprocess` tokio stream's `poll_shutdown` does not perform a
+    /// `shutdown(SHUT_WR)` on macOS, so the server never sees EOF on its read
+    /// half and the test hangs forever waiting on `server.await`. Dropping the
+    /// whole stream closes both halves and behaves identically on every
+    /// platform — which is also exactly what the real client does.
+    async fn client_roundtrip(socket_path: &Path, req: &Request) -> Response {
+        let (response, stream) = client_request_keep_open(socket_path, req).await;
+        drop(stream);
+        response
     }
 
     /// Bind a fresh daemon socket, serve exactly one connection with
@@ -8946,6 +9048,178 @@ mod tests {
             .expect("stop request must leave a notify permit (issue #288)");
     }
 
+    struct GatedHeadBackend {
+        head_started: Arc<Notify>,
+        release_head: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for GatedHeadBackend {
+        async fn head(&self, _key: &str) -> Result<bool> {
+            self.head_started.notify_one();
+            let _release = self
+                .release_head
+                .acquire()
+                .await
+                .expect("test gate stays open");
+            Ok(false)
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+            _max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            panic!("a missing HEAD result must not issue GET");
+        }
+
+        async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+            panic!("remote check must not issue PUT");
+        }
+
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn describe(&self, key: &str) -> String {
+            format!("gated-head://test/{key}")
+        }
+    }
+
+    /// Once shutdown starts, the accept loop must keep ownership of accepted
+    /// requests until their current responses are written. Before the handler
+    /// JoinSet, the loop returned as soon as the stop handler notified it,
+    /// leaving both responses detached and vulnerable to runtime teardown.
+    #[tokio::test]
+    async fn accept_loop_drains_in_flight_response_and_shutdown_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let head_started = Arc::new(Notify::new());
+        let release_head = Arc::new(tokio::sync::Semaphore::new(0));
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> = Arc::new(GatedHeadBackend {
+            head_started: head_started.clone(),
+            release_head: release_head.clone(),
+        });
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        daemon.signal_warming_complete();
+        assert!(
+            daemon.remote_backend.set(backend).is_ok(),
+            "inject gated backend"
+        );
+
+        let listener = bind_listener(&socket_path);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_notify = Arc::new(Notify::new());
+        let loop_daemon = daemon.clone();
+        let loop_flag = shutdown_flag.clone();
+        let loop_notify = shutdown_notify.clone();
+        let mut accept_task = tokio::spawn(async move {
+            accept_loop(
+                &listener,
+                &loop_daemon,
+                &loop_flag,
+                &loop_notify,
+                None,
+                Duration::from_secs(2),
+                std::future::pending::<()>(),
+            )
+            .await;
+        });
+
+        let key = test_cache_key("shutdown-drain-gated-request");
+        let remote_socket = socket_path.clone();
+        let remote_client = tokio::spawn(async move {
+            client_roundtrip(
+                &remote_socket,
+                &Request::RemoteCheck(RemoteCheckRequest {
+                    entry_dir: config.store_dir().join(&key).to_string_lossy().into_owned(),
+                    key,
+                    crate_name: "serde".into(),
+                    deadline_ms: Some(2_000),
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), head_started.notified())
+            .await
+            .expect("remote request reached gated HEAD");
+
+        let shutdown_socket = socket_path.clone();
+        let shutdown_client = tokio::spawn(async move {
+            client_request_keep_open(&shutdown_socket, &Request::Shutdown).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !shutdown_flag.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown handler set flag");
+
+        let (shutdown_response, shutdown_stream) =
+            tokio::time::timeout(Duration::from_secs(1), shutdown_client)
+                .await
+                .expect("shutdown acknowledgement was written")
+                .expect("join shutdown client");
+        assert!(shutdown_response.ok, "shutdown request should return ok");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut accept_task)
+                .await
+                .is_err(),
+            "accept loop returned while an accepted response was still blocked"
+        );
+
+        release_head.add_permits(1);
+        let remote_response = tokio::time::timeout(Duration::from_secs(1), remote_client)
+            .await
+            .expect("in-flight response was written after gate release")
+            .expect("join remote client");
+        assert!(remote_response.ok, "remote request should complete");
+        assert_eq!(remote_response.found, Some(false));
+        tokio::time::timeout(Duration::from_secs(1), &mut accept_task)
+            .await
+            .expect("accept loop completed after draining handlers")
+            .expect("join accept loop");
+        drop(shutdown_stream);
+    }
+
+    #[tokio::test]
+    async fn connection_handler_drain_aborts_silent_handler_at_deadline() {
+        let mut handlers = tokio::task::JoinSet::new();
+        handlers.spawn(std::future::pending::<()>());
+
+        assert!(
+            drain_connection_handlers(&mut handlers, Duration::from_millis(20)).await,
+            "a silent handler must be aborted at the drain deadline"
+        );
+        assert!(handlers.is_empty(), "aborted handlers must still be joined");
+    }
+
+    #[tokio::test]
+    async fn connection_handler_observation_distinguishes_panics_from_cancellation() {
+        assert!(
+            !observe_connection_handler(tokio::spawn(async {}).await),
+            "a successful handler is not anomalous"
+        );
+
+        let panicked = tokio::spawn(async { panic!("expected handler panic") }).await;
+        assert!(
+            observe_connection_handler(panicked),
+            "a handler panic must remain operationally visible"
+        );
+
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        assert!(
+            !observe_connection_handler(cancelled.await),
+            "deadline cancellation is expected and must stay quiet"
+        );
+    }
+
     /// Regression for #288 (loop side): a quiet `stop` must wake the accept loop
     /// immediately rather than leaving it parked until the periodic idle tick.
     /// We drive the real `accept_loop` with the idle timeout disabled and an
@@ -8981,6 +9255,7 @@ mod tests {
                 &shutdown_flag,
                 &shutdown_notify,
                 None,
+                Duration::from_secs(1),
                 std::future::pending::<()>(),
             ),
         )
@@ -16614,5 +16889,36 @@ mod tests {
         let mut buf = Vec::new();
         let err = read_bounded_line(&mut reader, &mut buf).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn request_read_refuses_frames_across_both_shutdown_boundaries() {
+        let shutdown_flag = AtomicBool::new(true);
+        let read_was_polled = AtomicBool::new(false);
+        let before_read = read_request_before_shutdown(&shutdown_flag, async {
+            read_was_polled.store(true, Ordering::Relaxed);
+            Ok::<_, std::io::Error>(Some("must-not-run".to_string()))
+        })
+        .await
+        .unwrap();
+        assert!(before_read.is_none(), "shutdown must skip the next read");
+        assert!(
+            !read_was_polled.load(Ordering::Relaxed),
+            "a queued handler must not poll its request after shutdown"
+        );
+
+        shutdown_flag.store(false, Ordering::Relaxed);
+        let completed_during_shutdown = read_request_before_shutdown(&shutdown_flag, async {
+            // Models another connection initiating shutdown while this handler
+            // is parked in its request read.
+            shutdown_flag.store(true, Ordering::Relaxed);
+            Ok::<_, std::io::Error>(Some("late-frame".to_string()))
+        })
+        .await
+        .unwrap();
+        assert!(
+            completed_during_shutdown.is_none(),
+            "a frame completed after shutdown must not be dispatched"
+        );
     }
 }

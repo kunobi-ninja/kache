@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Assert that an llvm-cov JSON report contains product source from every Cargo
-# workspace member. A percentage over only the default package is otherwise a
-# plausible-looking but incomplete workspace gate.
+# workspace member that requires runtime coverage. A percentage over only the
+# default package is otherwise a plausible-looking but incomplete workspace
+# gate. Formal-only members may assign coverage ownership to Kani explicitly in
+# package metadata; such members must remain unpublished.
 #
-# Membership and source roots come from `cargo metadata`, not a mirrored list,
-# so adding a fifth member makes this check fail until coverage reports it too.
+# Membership, verification ownership, and source roots come from `cargo
+# metadata`, not a mirrored list, so a new member is runtime-coverage-owned by
+# default and fails this check until llvm-cov reports it.
 #
 # Usage: scripts/check-coverage-scope.sh [coverage-json]
 # Exit: 0 when every member is represented; 1 on missing/malformed input.
@@ -126,8 +129,31 @@ def is_within(path, directory):
 
 missing_members = []
 represented = []
+exempt_members = []
 for package_id in workspace_ids:
     package = packages_by_id[package_id]
+    raw_package_metadata = package.get("metadata")
+    package_metadata = {} if raw_package_metadata is None else raw_package_metadata
+    if not isinstance(package_metadata, dict):
+        fail(f"workspace member {package['name']!r} has malformed package metadata")
+    kache_metadata = package_metadata.get("kache", {})
+    if not isinstance(kache_metadata, dict):
+        fail(f"workspace member {package['name']!r} has malformed kache metadata")
+    coverage_owner = kache_metadata.get("coverage-owner", "llvm-cov")
+    if not isinstance(coverage_owner, str) or coverage_owner not in {
+        "llvm-cov",
+        "kani",
+    }:
+        fail(
+            f"workspace member {package['name']!r} has unsupported coverage owner "
+            f"{coverage_owner!r}"
+        )
+    if coverage_owner == "kani":
+        if package.get("publish") != []:
+            fail(f"published workspace member {package['name']!r} cannot be Kani-owned")
+        exempt_members.append((package["name"], coverage_owner))
+        continue
+
     source_roots = {
         os.path.dirname(normalized(target["src_path"]))
         for target in package.get("targets", [])
@@ -151,15 +177,18 @@ for package_id in workspace_ids:
 
 if missing_members:
     fail(
-        "llvm-cov JSON omits workspace member source; report every package explicitly",
+        "llvm-cov JSON omits runtime-coverage-owned workspace member source",
         sorted(missing_members),
     )
 
-print(f"coverage scope OK: {len(represented)}/{len(workspace_ids)} workspace members present")
+required_members = len(workspace_ids) - len(exempt_members)
+print(f"coverage scope OK: {len(represented)}/{required_members} required workspace members present")
 for name, filename in sorted(represented):
     try:
         display = Path(filename).relative_to(root)
     except ValueError:
         display = Path(filename)
     print(f"  - {name}: {display}")
+for name, owner in sorted(exempt_members):
+    print(f"  - {name}: owned by {owner}")
 PY

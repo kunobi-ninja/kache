@@ -316,8 +316,9 @@ helm-lint:
 # (and opened locally by `coverage-open`). `--no-report` collects
 # coverage once; the two `report` invocations then emit the formats
 # from that single test run. Unlike the collection command, the `report`
-# subcommand has no `--workspace` flag, so every workspace package must be
-# selected explicitly or its instrumented objects silently disappear.
+# subcommand has no `--workspace` flag, so every workspace package is selected
+# explicitly. Kani-only packages currently add no runtime lines, but selecting
+# them ensures any future ordinary code enters the percentage automatically.
 # Collect and report coverage for the complete Cargo workspace.
 [group('coverage')]
 coverage:
@@ -326,20 +327,22 @@ coverage:
     --package kache \
     --package kache-core \
     --package kache-e2e \
+    --package kache-proofs \
     --package kache-service \
     --html --output-dir tmp/llvm-cov
   cargo llvm-cov report \
     --package kache \
     --package kache-core \
     --package kache-e2e \
+    --package kache-proofs \
     --package kache-service \
     --json --output-path tmp/llvm-cov/coverage.json
   just coverage-scope-check
 
-# Fail closed if a report omits any Cargo workspace member. This is separate
-# from the percentage threshold: an excellent percentage over an incomplete
-# package set is not workspace coverage.
-# Verify that coverage JSON contains every Cargo workspace member.
+# Fail closed if a report omits any runtime-coverage-owned Cargo workspace
+# member. This is separate from the percentage threshold: an excellent
+# percentage over an incomplete package set is not workspace coverage.
+# Verify that coverage JSON contains every runtime-coverage-owned member.
 [group('coverage')]
 coverage-scope-check COVERAGE_JSON="tmp/llvm-cov/coverage.json":
   ./scripts/check-coverage-scope.sh "{{COVERAGE_JSON}}"

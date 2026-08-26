@@ -1815,6 +1815,17 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #114 — fp-contract codegen knob.",
         dialect: None,
     },
+    FlagSpec {
+        // Clang's automatic-variable hardening mode changes generated code and
+        // is forwarded verbatim to `-cc1`, so the resolved-token hash safely
+        // distinguishes it from the default mode. Keep the row exact on the
+        // Firefox-reported spelling; adjacent modes remain fail-closed until
+        // there is workload evidence for them.
+        matcher: Matcher::Exact("-ftrivial-auto-var-init=pattern"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #849 — Firefox automatic-variable pattern initialization; Apple clang forwards the value to -cc1 verbatim (verified -###).",
+        dialect: None,
+    },
     // ── Codegen knobs: one sorted stem list, BOTH polarities ──
     //
     // `-f(?:no-)?<stem>` matches `-f<stem>` AND `-fno-<stem>` for every stem
@@ -6514,6 +6525,46 @@ mod tests {
             "-fsanitize-undefined-strip-path-components=0",
             "-fsanitize-undefined-strip-path-components=2",
             "-fsanitize-undefined-strip-path-components=-2",
+        ] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                None,
+                "{flag} is not modeled and must keep refusing"
+            );
+        }
+    }
+
+    /// Firefox enables Clang's automatic-variable pattern initialization as a
+    /// hardening mode (#849). It affects generated code, and Clang preserves
+    /// the option verbatim in the resolved `-cc1` invocation, so it must be
+    /// accepted as probe-keyed rather than passed through.
+    #[test]
+    fn caches_trivial_auto_var_init_pattern_issue_849() {
+        let flag = "-ftrivial-auto-var-init=pattern";
+        assert_eq!(
+            classify_cc_flag(flag, Dialect::Gnu),
+            Some(FlagClass::CapturedByProbe),
+            "{flag} must key through the resolved invocation"
+        );
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", flag, "-O0"])).unwrap();
+        assert!(
+            parsed.refuse_reasons(&[]).is_empty(),
+            "Firefox compile with {flag} must cache: {:?}",
+            parsed.refuse_reasons(&[])
+        );
+        assert!(cc_flags_need_resolved_invocation(&parsed));
+    }
+
+    /// The #849 row intentionally covers only the reported mode. Other valid
+    /// Clang modes and malformed neighbouring spellings remain conservative
+    /// passthroughs instead of being accepted by a broad prefix.
+    #[test]
+    fn trivial_auto_var_init_other_spellings_still_refuse_issue_849() {
+        for flag in [
+            "-ftrivial-auto-var-init",
+            "-ftrivial-auto-var-init=zero",
+            "-ftrivial-auto-var-init=uninitialized",
+            "-ftrivial-auto-var-init=patterns",
         ] {
             assert_eq!(
                 classify_cc_flag(flag, Dialect::Gnu),

@@ -1978,6 +1978,99 @@ fn test_cc_ubsan_strip_path_components_caches_issue_840() {
     );
 }
 
+/// True if `cc` on PATH accepts both `-gdwarf-2` and `-gdwarf-4`, checked
+/// by actually compiling with each. A cl-like driver rejects the GNU
+/// spellings outright and has nothing to say about #838.
+fn cc_accepts_gdwarf_versions(dir: &Path) -> bool {
+    let source = dir.join("dwarf-support.c");
+    if std::fs::write(&source, "int dwarf_support(void) { return 0; }\n").is_err() {
+        return false;
+    }
+    ["-gdwarf-2", "-gdwarf-4"].iter().all(|flag| {
+        std::process::Command::new("cc")
+            .args(["-c", "-O0"])
+            .arg(&source)
+            .arg("-o")
+            .arg(dir.join("dwarf-support.o"))
+            .arg(flag)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// cc-rs adds `-gdwarf-2` on every Apple target with debug info enabled, so
+/// it lands on effectively every native-dep TU of a macOS Rust debug build
+/// (#838; aws-lc-sys was the sampled root). Like `-gdwarf-4` (#117) it is
+/// `CapturedByProbe`: the resolved cc1 line carries `-dwarf-version=N`, so
+/// DWARF 2, DWARF 4 and the no-flag baseline must key apart while identical
+/// invocations hit.
+#[test]
+fn test_cc_gdwarf2_caches_and_keys_dwarf_version_issue_838() {
+    let probe_dir = TempDir::new().unwrap();
+    if !cc_accepts_gdwarf_versions(probe_dir.path()) {
+        eprintln!(
+            "skipping: `cc` does not accept -gdwarf-2/-gdwarf-4 \
+             (cl-like driver, or no cc on PATH)"
+        );
+        return;
+    }
+
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
+    let object = work.path().join("tu.o");
+
+    let compile = |extra: &[&str]| {
+        let _ = std::fs::remove_file(&object);
+        let mut args = vec!["cc", "-c", "tu.c", "-o", "tu.o", "-O0"];
+        args.extend_from_slice(extra);
+        run_kache_cc(work.path(), cache_dir.path(), &args);
+        assert!(object.exists(), "compile must produce tu.o: {args:?}");
+    };
+
+    // Cold: compiles and stores. A passthrough would record neither, so the
+    // miss count is what proves `-gdwarf-2` classified at all — attach the
+    // raw event log so a failure names the refusal reason.
+    compile(&["-gdwarf-2"]);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["misses"].as_u64(),
+        Some(1),
+        "cold -gdwarf-2 compile must be cached, not passed through.\nevents.jsonl:\n{}",
+        std::fs::read_to_string(cache_dir.path().join("events.jsonl"))
+            .unwrap_or_else(|e| format!("(unreadable: {e})"))
+    );
+    assert_cc_report_counts(&report, 1, 0);
+
+    // Identical invocation: hit.
+    compile(&["-gdwarf-2"]);
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+
+    // `-gdwarf-4` and the no-flag baseline resolve to different cc1 token
+    // streams (`-dwarf-version=4` vs none), so neither may reuse the
+    // DWARF-2 entry. Asserted as "local_hits did not grow": a distinct key
+    // whose object comes out byte-identical is recorded as a `dup`, not a
+    // miss — a false HIT is the only wrong answer.
+    for extra in [&["-gdwarf-4"][..], &[][..]] {
+        compile(extra);
+    }
+    let report = kache_report(cache_dir.path());
+    let summary = &report["summary"];
+    assert_eq!(
+        summary["local_hits"].as_u64(),
+        Some(1),
+        "-gdwarf-4 / no-flag must not reuse the -gdwarf-2 entry: {report}"
+    );
+    assert_eq!(
+        summary["misses"].as_u64().unwrap_or(0) + summary["dups"].as_u64().unwrap_or(0),
+        3,
+        "-gdwarf-4 and no-flag should have compiled under their own keys: {report}"
+    );
+}
+
 #[test]
 fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     build_kache();

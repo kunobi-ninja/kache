@@ -1969,14 +1969,24 @@ pub static CC_FLAGS: &[FlagSpec] = &[
     // `-cc1 -dwarf-version=4` / `-dwarf-linkage-names=Abstract` / etc.,
     // so the resolved-tokens hash differentiates them per-value.
     //
-    // `-gdwarf-4` is *not* wildcarded over the DWARF version digit on
-    // purpose: `-gdwarf-5` produces a different (larger, newer-toolchain-
-    // dependent) object and isn't part of #117's evidence. If another
-    // workload needs it, file a follow-up and add a row.
+    // The DWARF version digit is *not* wildcarded on purpose:
+    // `-gdwarf-5` produces a different (larger, newer-toolchain-
+    // dependent) object and isn't part of any observed evidence. Each
+    // version is listed exactly as workloads surface it; the probe's
+    // resolved `-dwarf-version=N` token keeps the keys distinct.
     FlagSpec {
         matcher: Matcher::Exact("-gdwarf-4"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #117 — DWARF v4 emission (Firefox baseline).",
+        dialect: None,
+    },
+    // cc-rs selects `-gdwarf-2` for every Apple target when debug info is
+    // enabled, so every Rust workspace with native deps hits this on macOS
+    // debug/test profiles (aws-lc-sys was the sampled root).
+    FlagSpec {
+        matcher: Matcher::Exact("-gdwarf-2"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #838 — DWARF v2 emission; cc-rs default on Apple targets.",
         dialect: None,
     },
     FlagSpec {
@@ -7022,6 +7032,25 @@ mod tests {
         }
     }
 
+    /// cc-rs passes `-gdwarf-2` on every Apple target with debug info
+    /// enabled (kunobi-ninja/kache#838). Like `-gdwarf-4` it is
+    /// `CapturedByProbe`: the resolved `-###` cc1 line carries
+    /// `-dwarf-version=2`, so the probe keys it — and the probe is
+    /// REQUIRED (a driver whose `-###` doesn't resolve must fail closed).
+    #[test]
+    fn classifier_accepts_gdwarf2_issue_838() {
+        let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", "-gdwarf-2"]);
+        assert!(
+            descs.is_empty(),
+            "-gdwarf-2 should be classified (#838), got: {descs:?}"
+        );
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", "-gdwarf-2"])).unwrap();
+        assert!(
+            cc_flags_need_resolved_invocation(&parsed),
+            "-gdwarf-2 is probe-keyed and must force the resolved invocation"
+        );
+    }
+
     /// The argument-wrapper pair must work *together* on one
     /// invocation — that's the canonical clang usage shape
     /// (`--start-no-unused-arguments … <flags> … --end-no-unused-arguments`).
@@ -7053,7 +7082,8 @@ mod tests {
     #[test]
     fn classifier_does_not_overreach_117_additions() {
         for flag in &[
-            // DWARF version variants not on the #117 list
+            // DWARF version variants beyond the exactly-listed 2 (#838)
+            // and 4 (#117)
             "-gdwarf-3",
             "-gdwarf-5",
             "-gdwarf",
@@ -8095,28 +8125,31 @@ mod tests {
     fn cache_key_refuses_probe_captured_flags_without_resolved_invocation() {
         // `/usr/bin/true` accepts `--version` but produces no `-###`
         // `-cc1` line. That isolates the resolved-invocation guard
-        // before the preprocessor hash runs.
+        // before the preprocessor hash runs. Every `CapturedByProbe`
+        // shape fails closed here; `-gdwarf-2` pins the #838 row.
         let compiler = CcCompiler::new();
-        let parsed = compiler
-            .parse(&s(&["true", "-c", "foo.c", "-o", "foo.o", "-fno-rtti"]))
-            .unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        let file_hasher = crate::cache_key::FileHasher::new();
-        let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
-        let ctx = KeyCtx {
-            file_hasher: &file_hasher,
-            path_normalizer: &path_normalizer,
-            cache_dir: cache.path(),
-            key_salt: None,
-            key_env_vars: &[],
-            extra_inputs_digest: None,
-        };
+        for flag in ["-fno-rtti", "-gdwarf-2"] {
+            let parsed = compiler
+                .parse(&s(&["true", "-c", "foo.c", "-o", "foo.o", flag]))
+                .unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let file_hasher = crate::cache_key::FileHasher::new();
+            let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+            let ctx = KeyCtx {
+                file_hasher: &file_hasher,
+                path_normalizer: &path_normalizer,
+                cache_dir: cache.path(),
+                key_salt: None,
+                key_env_vars: &[],
+                extra_inputs_digest: None,
+            };
 
-        let err = compiler.cache_key(&parsed, &ctx).unwrap_err().to_string();
-        assert!(
-            err.contains("resolved invocation unavailable"),
-            "expected resolved-invocation refusal, got: {err}"
-        );
+            let err = compiler.cache_key(&parsed, &ctx).unwrap_err().to_string();
+            assert!(
+                err.contains("resolved invocation unavailable"),
+                "expected resolved-invocation refusal for {flag}, got: {err}"
+            );
+        }
     }
 
     #[test]

@@ -13951,6 +13951,12 @@ mod tests {
         put_test_object(&client, &test_pack_object_key(&key, "serde"), &pack).await;
         let daemon = Arc::new(Daemon::new(config.clone()));
         assert!(daemon.remote_backend.set(client).is_ok());
+        daemon.install_plan(
+            "test-session",
+            "test-plan",
+            "test",
+            std::iter::once(key.clone()),
+        );
 
         let response = daemon
             .handle_prefetch(&PrefetchRequest {
@@ -14019,6 +14025,20 @@ mod tests {
         let transfer = latest_transfer(&daemon);
         assert!(!transfer.ok);
         assert_eq!(transfer.compressed_bytes, pack.len() as u64);
+        {
+            let active_plan = daemon
+                .active_plan
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                active_plan
+                    .as_ref()
+                    .expect("test plan should remain active")
+                    .downloaded
+                    .is_empty(),
+                "a failed local import must not be attributed as a plan download"
+            );
+        }
         assert!(!daemon.prefetched_keys.read().await.contains(&key));
         assert!(!entry_dir.exists());
         assert!(!Store::open(&config).unwrap().contains(&key));

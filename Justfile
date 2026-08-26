@@ -67,11 +67,11 @@ test:
 test-resource-guard-check:
   ./scripts/test-with-test-resources.sh
 
-# Model-check the bounded planner invariants. Install the pinned verifier with:
+# Model-check the bounded planner and artifact-range invariants. Install with:
 # cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup
 [group('dev')]
 kani *ARGS:
-  cd crates/kache-core && cargo kani --all-features --output-format terse {{ARGS}}
+  cargo kani --package kache-core --package kache-proofs --all-features --output-format terse {{ARGS}}
 
 # Mutation-test the complete hermetic planner crate. Install the pinned local
 # tool with: cargo install --locked cargo-mutants --version 27.1.0
@@ -85,10 +85,12 @@ mutants-service *ARGS:
   cargo mutants --package kache-service --all-features --baseline run --caught --timeout 300 --build-timeout 600 --output tmp/mutants/service {{ARGS}}
 
 # Mutation-test changed Rust lines outside the crates covered completely by
-# mutants-core and mutants-service. DIFF must describe the current working tree.
+# mutants-core and mutants-service. The proof-only crate runs under Kani, not
+# ordinary tests, so it is deliberately outside mutation discovery. DIFF must
+# describe the current working tree.
 [group('dev')]
 mutants-diff DIFF *ARGS:
-  ./scripts/with-test-resources.sh cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
+  ./scripts/with-test-resources.sh cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --exclude 'crates/kache-proofs/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
 
 # Audit dependencies with cargo-deny (advisories + licenses + bans +
 # sources; config and documented exceptions in `deny.toml`). Runs once
@@ -103,7 +105,7 @@ audit:
   set -euo pipefail
   # `--config` is a global option in cargo-deny 0.20 (it no longer parses
   # after the `check` subcommand).
-  for member in . crates/kache-core crates/kache-service crates/kache-e2e; do
+  for member in . crates/kache-core crates/kache-service crates/kache-e2e crates/kache-proofs; do
     echo "── cargo deny check ($member) ──"
     ( cd "{{justfile_directory()}}/$member" \
         && cargo deny --config "{{justfile_directory()}}/deny.toml" check )

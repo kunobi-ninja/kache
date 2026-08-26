@@ -3015,6 +3015,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kache-proofs"
+version = "0.0.0"
+
+[[package]]
 name = "kache-service"
 version = "0.16.0"
 dependencies = [

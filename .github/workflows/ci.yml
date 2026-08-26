@@ -395,12 +395,14 @@ jobs:
           CARGO_INCREMENTAL: "1"
         run: |
           test -s tmp/mutants/pr.diff
+          # The proof-only crate is compiled and exercised by the Kani job.
           ./scripts/with-test-resources.sh cargo mutants \
             --workspace \
             --all-features \
             --in-diff tmp/mutants/pr.diff \
             --exclude 'crates/kache-core/**' \
             --exclude 'crates/kache-service/**' \
+            --exclude 'crates/kache-proofs/**' \
             --shard '${{ matrix.index }}/${{ matrix.total }}' \
             --sharding round-robin \
             --in-place \
@@ -468,11 +470,11 @@ jobs:
             require_result "changed-line mutation" "$DIFF_RESULT" "skipped"
           fi
 
-  # Bounded model checking for the small, hermetic planner crate. The proof
-  # command deliberately runs through the locally-built kache wrapper: Kani
-  # replaces rustc with `kani-compiler`, so this is also the end-to-end
-  # regression for #656. Unsupported compiler drivers must pass through
-  # uncached; Kache does not model Kani's verification artifacts.
+  # Bounded model checking for the small, hermetic planner and repository-only
+  # production-range harness crate. The proof command deliberately runs through
+  # the locally-built kache wrapper: Kani replaces rustc with `kani-compiler`,
+  # so this is also the end-to-end regression for #656. Unsupported compiler
+  # drivers must pass through uncached; Kache does not model Kani's artifacts.
   kani:
     name: Kani proofs
     runs-on: ubuntu-24.04
@@ -493,6 +495,7 @@ jobs:
           rustup toolchain install 1.93.0 --profile minimal
           cargo +1.93.0 test --package kache-core --all-features --locked
           cargo +1.93.0 check --package kache-core --no-default-features --locked
+          cargo +1.93.0 check --package kache-proofs --locked
       - name: Install Kani 0.67.0
         run: |
           cargo install --locked kani-verifier --version 0.67.0
@@ -505,13 +508,12 @@ jobs:
           KACHE_CACHE_DIR: ${{ runner.temp }}/kache-kani
           KACHE_CONFIG: ${{ runner.temp }}/kache-kani-config.toml
         run: |
-          cd crates/kache-core
-          cargo kani list --format json
+          cargo kani --package kache-core --package kache-proofs --all-features list --format json
           count="$(python3 -c 'import json; print(json.load(open("kani-list.json"))["totals"]["standard-harnesses"])')"
           echo "Kani harnesses: $count"
-          test "$count" -ge 6
+          test "$count" -ge 8
           output="$RUNNER_TEMP/kani-output.txt"
-          cargo kani --all-features --output-format terse 2>&1 | tee "$output"
+          cargo kani --package kache-core --package kache-proofs --all-features --output-format terse 2>&1 | tee "$output"
           covers="$(grep -c '1 of 1 cover properties satisfied' "$output" || true)"
           echo "Satisfied reachability covers: $covers"
           test "$covers" -eq "$count"

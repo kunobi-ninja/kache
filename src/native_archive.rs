@@ -76,6 +76,8 @@
 //! external member bytes are absent from the container. Other fallbacks bind
 //! both the archive bytes and lexical absolute archive path.
 
+use crate::checked_regions::checked_file_region;
+
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 const AR_HEADER_LEN: usize = 60;
 /// Domain tags so these schemes can never collide with the path-bound fallback,
@@ -1022,26 +1024,6 @@ fn validate_counted_region(
         commands_end,
     )?;
     Some(())
-}
-
-/// Return `(start, end)` after proving a file-offset range is representable,
-/// does not overlap the load-command area, and lies within `file_len`.
-fn checked_file_region(
-    file_len: usize,
-    offset: u64,
-    size: u64,
-    minimum_offset: usize,
-) -> Option<(usize, usize)> {
-    let start = usize::try_from(offset).ok()?;
-    let size = usize::try_from(size).ok()?;
-    if size != 0 && start < minimum_offset {
-        return None;
-    }
-    let end = start.checked_add(size)?;
-    if end > file_len {
-        return None;
-    }
-    Some((start, end))
 }
 
 fn macho_fixed_name(field: &[u8]) -> Option<&[u8]> {

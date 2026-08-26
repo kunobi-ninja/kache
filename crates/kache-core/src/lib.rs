@@ -173,7 +173,9 @@ const URGENCY_BUCKET: u32 = 16;
 /// Callers must apply this as a STABLE sort: equal keys keep source order,
 /// which is the planner's confidence-merge order.
 #[cfg(feature = "planning")]
-pub fn dispatch_sort_key(candidate: &PrefetchCandidate) -> (u32, u8, std::cmp::Reverse<u64>) {
+pub fn dispatch_sort_key(
+    candidate: &PrefetchCandidate,
+) -> (u32, u8, std::cmp::Reverse<Option<u64>>) {
     let bucket = candidate
         .demand_index
         .map(|index| index / URGENCY_BUCKET)
@@ -181,9 +183,10 @@ pub fn dispatch_sort_key(candidate: &PrefetchCandidate) -> (u32, u8, std::cmp::R
     (
         bucket,
         candidate.source.confidence_rank(),
-        // `None` -> 0 -> sorts last under Reverse, without claiming the
-        // candidate is worthless.
-        std::cmp::Reverse(candidate.compile_time_ms.unwrap_or(0)),
+        // `Option` orders `None` before every `Some`, so `Reverse` puts every
+        // known cost (including zero) before unknown while retaining
+        // descending order among known costs.
+        std::cmp::Reverse(candidate.compile_time_ms),
     )
 }
 
@@ -540,14 +543,13 @@ mod kani_proofs {
     }
 
     #[kani::proof]
-    fn known_positive_compile_cost_precedes_unknown_cost() {
+    fn known_compile_cost_including_zero_precedes_unknown_cost() {
         let known_cost: u64 = kani::any();
-        kani::assume(known_cost > 0);
         let demand_index: u32 = kani::any();
         let source: CandidateSource = kani::any();
         let known = candidate(source, Some(known_cost), Some(demand_index));
         let unknown = candidate(source, None, Some(demand_index));
-        kani::cover!();
+        kani::cover!(known_cost == 0);
 
         assert!(dispatch_sort_key(&known) < dispatch_sort_key(&unknown));
     }
@@ -1070,8 +1072,10 @@ mod tests {
     #[test]
     fn test_dispatch_order_places_unknown_cost_last_within_its_bucket() {
         let known = candidate("a", "a", CandidateSource::Shard, Some(1), Some(0));
+        let known_zero = candidate("zero", "zero", CandidateSource::Shard, Some(0), Some(0));
         let unknown = candidate("b", "b", CandidateSource::Shard, None, Some(0));
         assert!(dispatch_sort_key(&known) < dispatch_sort_key(&unknown));
+        assert!(dispatch_sort_key(&known_zero) < dispatch_sort_key(&unknown));
 
         // ...but an unknown-cost candidate needed NOW still beats a known-cost
         // one needed much later.

@@ -327,19 +327,15 @@ pub(crate) fn decode_pack<'a>(
     let index: PackIndex = serde_json::from_slice(&bytes[PACK_HEADER_BYTES..payload_start])
         .context("parsing prefetch pack index")?;
     let payload = &bytes[payload_start..];
-    validate_pack_index(&index, payload.len())?;
+    let ranges = validate_pack_index(&index, payload.len())?;
 
     let entries = index
         .entries
         .iter()
-        .map(|entry| {
-            let start = usize::try_from(entry.offset).expect("validated offset fits usize");
-            let end = usize::try_from(entry.offset + entry.length)
-                .expect("validated payload end fits usize");
-            DecodedPackEntry {
-                descriptor: entry.clone(),
-                payload: &payload[start..end],
-            }
+        .zip(ranges)
+        .map(|(entry, range)| DecodedPackEntry {
+            descriptor: entry.clone(),
+            payload: &payload[range],
         })
         .collect();
     Ok(DecodedPack { index, entries })
@@ -573,7 +569,10 @@ fn validate_catalog(catalog: &PackCatalog) -> Result<()> {
     Ok(())
 }
 
-fn validate_pack_index(index: &PackIndex, payload_len: usize) -> Result<()> {
+fn validate_pack_index(
+    index: &PackIndex,
+    payload_len: usize,
+) -> Result<Vec<std::ops::Range<usize>>> {
     if index.version != PACK_VERSION {
         bail!("unsupported prefetch pack version {}", index.version);
     }
@@ -589,25 +588,36 @@ fn validate_pack_index(index: &PackIndex, payload_len: usize) -> Result<()> {
     }
     let mut expected_offset = 0_u64;
     let mut previous_key: Option<&str> = None;
+    let mut ranges = Vec::with_capacity(index.entries.len());
     for entry in &index.entries {
         validate_entry_fields(&entry.cache_key, &entry.crate_name, &entry.meta_digest)?;
         if previous_key.is_some_and(|previous| previous >= entry.cache_key.as_str()) {
             bail!("prefetch pack entries are duplicated or not canonically ordered");
         }
         previous_key = Some(&entry.cache_key);
-        if entry.offset != expected_offset || entry.length == 0 {
-            bail!("prefetch pack entry frames overlap, contain a gap, or are empty");
-        }
-        expected_offset = expected_offset
-            .checked_add(entry.length)
-            .context("prefetch pack frame length overflow")?;
+        let Some((next_offset, (start, end))) =
+            crate::checked_regions::checked_nonempty_contiguous_region(
+                expected_offset,
+                entry.offset,
+                entry.length,
+                payload_len,
+            )
+        else {
+            bail!(
+                "prefetch pack entry frames overlap, contain a gap, are empty, or exceed the payload"
+            );
+        };
+        expected_offset = next_offset;
+        ranges.push(start..end);
     }
-    if expected_offset != payload_len as u64 {
+    let payload_len =
+        u64::try_from(payload_len).context("prefetch pack payload length overflow")?;
+    if expected_offset != payload_len {
         bail!(
             "prefetch pack frame lengths total {expected_offset} bytes, object contains {payload_len}"
         );
     }
-    Ok(())
+    Ok(ranges)
 }
 
 fn validate_pack_cap(max_bytes: u64) -> Result<()> {

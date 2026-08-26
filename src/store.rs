@@ -793,7 +793,8 @@ const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// Lock files deliberately persist after release. Unlinking an advisory lock
 /// file can split contenders across the unlinked inode and a newly-created
-/// inode, allowing two processes to both believe they hold the same lock.
+/// inode, allowing two processes to both believe they hold the same lock. This
+/// trades one small persistent file per encountered key for stable ownership.
 pub struct StoreLock {
     file: fs::File,
 }

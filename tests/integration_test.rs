@@ -2103,6 +2103,88 @@ fn test_cc_gdwarf2_caches_and_keys_dwarf_version_issue_838() {
     );
 }
 
+/// True when the host `cc` accepts Firefox's Clang automatic-variable
+/// hardening mode. GCC and older Clang versions may reject it, so they cannot
+/// exercise the issue #849 path.
+fn cc_accepts_trivial_auto_var_init_pattern(dir: &Path) -> bool {
+    let source = dir.join("auto-var-init-probe.c");
+    if std::fs::write(
+        &source,
+        "int auto_var_init_probe(void) { int value; return value; }\n",
+    )
+    .is_err()
+    {
+        return false;
+    }
+    std::process::Command::new("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("auto-var-init-probe.o"))
+        .args(["-ftrivial-auto-var-init=pattern", "-O0"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Live end-to-end for #849: the reported Firefox hardening flag must produce
+/// a normal cold cache store and warm hit, while the default initialization
+/// mode remains a distinct cache key.
+#[test]
+fn test_cc_trivial_auto_var_init_pattern_caches_issue_849() {
+    let probe_dir = TempDir::new().unwrap();
+    if !cc_accepts_trivial_auto_var_init_pattern(probe_dir.path()) {
+        eprintln!("skipping: `cc` does not accept -ftrivial-auto-var-init=pattern");
+        return;
+    }
+    build_kache();
+    if !kache_caches_probe_keyed_flags(probe_dir.path()) {
+        eprintln!("skipping: probe-keyed flags are not cacheable on this host");
+        return;
+    }
+
+    let work = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::write(
+        work.path().join("tu.c"),
+        "int use_auto_var(void) { int value; return value; }\n",
+    )
+    .unwrap();
+
+    let with_flag = [
+        "cc",
+        "-c",
+        "tu.c",
+        "-o",
+        "tu.o",
+        "-ftrivial-auto-var-init=pattern",
+        "-O0",
+        "-g0",
+    ];
+    run_kache_cc(work.path(), cache_dir.path(), &with_flag);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["misses"].as_u64(),
+        Some(1),
+        "cold compile with the #849 flag must be cached, not passed through: {report}"
+    );
+
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &with_flag);
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+
+    let without_flag = ["cc", "-c", "tu.c", "-o", "tu.o", "-O0", "-g0"];
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &without_flag);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["local_hits"].as_u64(),
+        Some(1),
+        "the flag-less compile must not reuse the pattern-initialized entry: {report}"
+    );
+}
+
 #[test]
 fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     build_kache();

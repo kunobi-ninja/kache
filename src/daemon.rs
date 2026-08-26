@@ -2400,11 +2400,30 @@ impl Daemon {
         self.warming_tx.send_replace(true);
     }
 
-    fn push_transfer_event(&self, event: TransferEvent) {
-        // Persist to JSONL — warn on failure but never fail the transfer
-        if let Err(e) = events::log_transfer(&self.config.transfer_log_path(), &event) {
-            tracing::warn!("failed to log transfer event: {e}");
-        }
+    async fn push_transfer_event(&self, event: TransferEvent) {
+        // Persist to JSONL — warn on failure but never fail the transfer.
+        // The append takes a cross-process file lock on the sidecar log,
+        // so it runs on the blocking pool: every caller is an async
+        // upload/download path, and a contended or stalled log must not
+        // park an async worker thread (#281).
+        let path = self.config.transfer_log_path();
+        let event = match tokio::task::spawn_blocking(move || {
+            let logged = events::log_transfer(&path, &event);
+            (event, logged)
+        })
+        .await
+        {
+            Ok((event, logged)) => {
+                if let Err(e) = logged {
+                    tracing::warn!("failed to log transfer event: {e}");
+                }
+                event
+            }
+            Err(e) => {
+                tracing::warn!("transfer log task failed: {e}");
+                return;
+            }
+        };
         if let Ok(mut q) = self.recent_transfers.lock() {
             if q.len() >= RECENT_TRANSFERS_CAP {
                 q.pop_front();
@@ -2908,10 +2927,23 @@ impl Daemon {
         if self.config.remote.is_none() {
             return Response::err("no remote configured");
         }
-        let normalized_job = match persist_upload_job(&self.config, job) {
-            Ok(job) => job,
-            Err(error) => {
+        // Intent publication blocks on the cross-process GC lock (a
+        // concurrent sweep can hold it for seconds) plus store open and
+        // `std::fs` work — park it on the blocking pool like the other
+        // store-touching handlers (#281) instead of an async worker.
+        let persist_config = self.config.clone();
+        let persist_job = job.clone();
+        let normalized_job = match tokio::task::spawn_blocking(move || {
+            persist_upload_job(&persist_config, &persist_job)
+        })
+        .await
+        {
+            Ok(Ok(job)) => job,
+            Ok(Err(error)) => {
                 return Response::err(format!("persisting upload intent failed: {error:#}"));
+            }
+            Err(error) => {
+                return Response::err(format!("persisting upload intent failed: {error}"));
             }
         };
 
@@ -3152,7 +3184,8 @@ impl Daemon {
                     blobs_total: 0,
                     ok: true,
                     timestamp: finished_at_unix_ms / 1_000,
-                });
+                })
+                .await;
                 // A successful PUT flips the key positive immediately:
                 // key-cache insert + negative-cache invalidation (#564).
                 self.note_key_present(&job.key, &job.crate_name).await;
@@ -3197,7 +3230,8 @@ impl Daemon {
                     blobs_total: 0,
                     ok: false,
                     timestamp: finished_at_unix_ms / 1_000,
-                });
+                })
+                .await;
                 let class = classify_remote_error(&e);
                 put_breaker.failure(class, &format!("remote upload failed ({class:?}): {e:#}"));
                 tracing::warn!(
@@ -3661,7 +3695,8 @@ impl Daemon {
                     blobs_total: dl.blobs_total,
                     ok: true,
                     timestamp: finished_at_unix_ms / 1_000,
-                });
+                })
+                .await;
                 Response::found(true)
             }
             Err(e) if classify_remote_error(&e) == RemoteErrorClass::Miss => {
@@ -3715,7 +3750,8 @@ impl Daemon {
                     blobs_total: 0,
                     ok: false,
                     timestamp: finished_at_unix_ms / 1_000,
-                });
+                })
+                .await;
                 // Feed the breaker with the failure class (#327) so a dead or
                 // stalling remote degrades and later restores skip S3
                 // entirely. A Timeout (transport deadline or the restore
@@ -4622,7 +4658,8 @@ impl Daemon {
                                 blobs_total: dl.blobs_total,
                                 ok: true,
                                 timestamp: finished_at_unix_ms / 1_000,
-                            });
+                            })
+                            .await;
                             // Track as prefetched for PrefetchHit attribution.
                             // Bound the set: a long-lived daemon that
                             // prefetches many distinct keys would otherwise
@@ -4690,7 +4727,8 @@ impl Daemon {
                                 blobs_total: 0,
                                 ok: false,
                                 timestamp: finished_at_unix_ms / 1_000,
-                            });
+                            })
+                            .await;
                             tracing::warn!("prefetch download failed for {}: {e}", key);
                         }
                     }
@@ -9541,6 +9579,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "spawned by the daemon PID-discovery regression"]
+    fn fake_daemon_process_fixture() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn find_daemon_pids_finds_a_process_running_the_kache_executable() {
         // The negative test below cannot tell "correctly excluded the
         // bystander" from "found nothing at all", which is what a broken
@@ -9553,24 +9598,32 @@ mod tests {
         // `pgrep -f` sees.
         //
         // Needs the same tools find_daemon_pids does. The Nix build sandbox
-        // has neither `pgrep` nor `ps` (nor a `/bin/sleep` to copy), and
-        // asserting there would only pin the sandbox, not the behaviour.
-        let (Some(sleep_bin), Some(_pgrep), Some(_ps)) = (
-            find_in_path("sleep"),
-            find_in_path("pgrep"),
-            find_in_path("ps"),
-        ) else {
+        // has neither `pgrep` nor `ps`, and asserting there would only pin the
+        // sandbox, not the behaviour.
+        let (Some(_pgrep), Some(_ps)) = (find_in_path("pgrep"), find_in_path("ps")) else {
             return;
         };
 
-        let dir = tempfile::tempdir().unwrap();
+        // Reuse this test executable as the sleeping fixture. Keeping the
+        // temporary hard link beside it guarantees one filesystem and avoids
+        // Linux's copy-then-exec ETXTBSY race under coverage.
+        let current_exe = std::env::current_exe().expect("resolve test executable");
+        let dir = tempfile::tempdir_in(current_exe.parent().expect("test executable parent"))
+            .expect("create fake daemon directory");
         let bin_dir = dir.path().join("kache daemon run");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let fake = bin_dir.join("kache");
-        std::fs::copy(&sleep_bin, &fake).unwrap();
+        std::fs::hard_link(&current_exe, &fake).expect("hard-link test executable as kache");
 
         let mut child = std::process::Command::new(&fake)
-            .arg("30")
+            .args([
+                "--ignored",
+                "--exact",
+                "daemon::tests::fake_daemon_process_fixture",
+                "--test-threads=1",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn fake daemon");
         let fake_pid = child.id();
@@ -12230,7 +12283,8 @@ mod tests {
     struct BlockingPackBackend {
         inner: Arc<dyn crate::remote_backend::RemoteBackend>,
         pack_started: Arc<Notify>,
-        release_pack: Arc<Notify>,
+        release_pack: Arc<tokio::sync::Semaphore>,
+        v3_get_started: Option<Arc<Notify>>,
     }
 
     #[async_trait::async_trait]
@@ -12246,7 +12300,15 @@ mod tests {
         ) -> Result<Option<crate::remote_backend::GetObject>> {
             if key.contains("/v4/prefetch/packs/") {
                 self.pack_started.notify_waiters();
-                self.release_pack.notified().await;
+                let _release = self
+                    .release_pack
+                    .acquire()
+                    .await
+                    .expect("test release semaphore stays open");
+            } else if key.contains("/v3/packs/")
+                && let Some(started) = &self.v3_get_started
+            {
+                started.notify_waiters();
             }
             self.inner.get(key, max_bytes).await
         }
@@ -12926,12 +12988,13 @@ mod tests {
         .await;
 
         let pack_started = Arc::new(Notify::new());
-        let release_pack = Arc::new(Notify::new());
+        let release_pack = Arc::new(tokio::sync::Semaphore::new(0));
         let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
             Arc::new(BlockingPackBackend {
                 inner,
                 pack_started: pack_started.clone(),
                 release_pack: release_pack.clone(),
+                v3_get_started: None,
             });
         let daemon = Arc::new(Daemon::new(config));
         assert!(daemon.remote_backend.set(backend).is_ok());
@@ -12940,7 +13003,7 @@ mod tests {
         tokio::pin!(started);
         started.as_mut().enable();
         let response = tokio::time::timeout(
-            Duration::from_millis(250),
+            Duration::from_secs(10),
             daemon.handle_prefetch_with_context(
                 &PrefetchRequest {
                     keys: vec![(key.clone(), "serde".into())],
@@ -12953,12 +13016,12 @@ mod tests {
         .await
         .expect("prefetch acknowledgement must not await the pack GET");
         assert!(response.ok);
-        tokio::time::timeout(Duration::from_secs(1), started)
+        tokio::time::timeout(Duration::from_secs(10), started)
             .await
             .expect("background coordinator should start the pack GET");
         assert!(!daemon.entry_dir_for(&key).exists());
 
-        release_pack.notify_waiters();
+        release_pack.add_permits(1);
         wait_for_store_entry(&daemon, &key).await;
     }
 
@@ -13006,15 +13069,18 @@ mod tests {
         .await;
 
         let pack_started = Arc::new(Notify::new());
-        let release_pack = Arc::new(Notify::new());
+        let release_pack = Arc::new(tokio::sync::Semaphore::new(0));
+        let v3_get_started = Arc::new(Notify::new());
         let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
             Arc::new(BlockingPackBackend {
                 inner,
                 pack_started: pack_started.clone(),
                 release_pack: release_pack.clone(),
+                v3_get_started: Some(v3_get_started.clone()),
             });
         let daemon = Arc::new(Daemon::new(config));
         assert!(daemon.remote_backend.set(backend).is_ok());
+        daemon.signal_warming_complete();
 
         let started = pack_started.notified();
         tokio::pin!(started);
@@ -13032,27 +13098,38 @@ mod tests {
                 )
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(1), started)
+        tokio::time::timeout(Duration::from_secs(10), started)
             .await
             .expect("pack GET should block in the injected backend");
 
-        let demand = tokio::time::timeout(
-            Duration::from_secs(1),
-            daemon.handle_remote_check(&RemoteCheckRequest {
-                key: demand_key.clone(),
-                entry_dir: daemon
-                    .entry_dir_for(&demand_key)
-                    .to_string_lossy()
-                    .into_owned(),
-                crate_name: "tokio".into(),
-                deadline_ms: None,
-            }),
-        )
-        .await
-        .expect("demand v3 read must not wait for the pack GET");
+        let v3_started = v3_get_started.notified();
+        tokio::pin!(v3_started);
+        v3_started.as_mut().enable();
+        let demand_daemon = daemon.clone();
+        let demand_entry_dir = daemon
+            .entry_dir_for(&demand_key)
+            .to_string_lossy()
+            .into_owned();
+        let demand_task = tokio::spawn(async move {
+            demand_daemon
+                .handle_remote_check(&RemoteCheckRequest {
+                    key: demand_key.clone(),
+                    entry_dir: demand_entry_dir,
+                    crate_name: "tokio".into(),
+                    deadline_ms: None,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), v3_started)
+            .await
+            .expect("demand v3 GET must start while the pack GET remains blocked");
+        let demand = tokio::time::timeout(Duration::from_secs(10), demand_task)
+            .await
+            .expect("demand v3 read must complete while the pack GET remains blocked")
+            .expect("demand task must not panic");
         assert_eq!(demand.found, Some(true));
 
-        release_pack.notify_waiters();
+        release_pack.add_permits(1);
         assert!(packed.await.unwrap().ok);
     }
 

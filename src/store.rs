@@ -1952,6 +1952,35 @@ impl Store {
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
         let tx = self.db.unchecked_transaction()?;
+        // A prior generation of this cache_key may still hold blob
+        // references — most commonly a stranded row whose removal was
+        // refused (#276) and that this put is about to overwrite via
+        // INSERT OR REPLACE. Release them inside this same transaction,
+        // before this generation's increments and before
+        // `record_entry_blobs` drops the old mapping: skipped, the old
+        // generation's hashes keep a refcount no mapping accounts for
+        // (never reaching zero, never reclaimed), and hashes shared by
+        // both generations double-count. Unconditional on `committed`,
+        // unlike the import path's variant: a committed-but-stranded row
+        // is exactly the shape that funnels back into put. Pre-#608 rows
+        // whose mapping the GC backfill hasn't materialized yet still
+        // slip through (there is nothing to decrement by); those remain
+        // `doctor --repair` / reconcile territory.
+        tx.execute(
+            "UPDATE blobs
+             SET refcount = MAX(0, refcount - COALESCE((
+                 SELECT refs FROM entry_blobs
+                 WHERE cache_key = ?1 AND hash = blobs.hash
+             ), 0))
+             WHERE hash IN (
+                 SELECT hash FROM entry_blobs WHERE cache_key = ?1
+             )",
+            params![cache_key],
+        )?;
+        // Rows released to zero would otherwise read as index drift; the
+        // blob files themselves stay for the orphan sweep (or an
+        // immediate re-reference by the loop below).
+        tx.execute("DELETE FROM blobs WHERE refcount <= 0", [])?;
         for (file, (source, use_source_hardlink)) in meta.files.iter().zip(sources.iter()) {
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
@@ -4234,7 +4263,32 @@ impl Store {
     }
 
     /// Clear the entire store.
+    ///
+    /// Index rows drop first, in one transaction: once it commits no
+    /// reader can begin a restore from a purged entry, and the
+    /// filesystem wipe then runs against a store the index no longer
+    /// references — a crash mid-wipe strands at worst orphan files for
+    /// the sweep, never the pre-existing rows dangling over deleted
+    /// blobs that the old wipe-then-delete order could leave.
+    ///
+    /// Publishers don't take `gc.lock`, so a put can still commit a
+    /// fresh row while the wipe is deleting the files it just staged.
+    /// The second row-deletion pass reduces that to the store's
+    /// tolerated shapes: a row committed before the pass is dropped
+    /// (its files become sweepable orphans), and one committed after it
+    /// at worst lands stranded — the refuse-removal / miss / re-put
+    /// path that already recovers it.
     pub fn clear(&self) -> Result<()> {
+        let drop_index_rows = || -> Result<()> {
+            let tx = self.db.unchecked_transaction()?;
+            tx.execute("DELETE FROM entries", [])?;
+            tx.execute("DELETE FROM entry_blobs", [])?;
+            tx.execute("DELETE FROM blobs", [])?;
+            tx.execute("DELETE FROM incremental_dirs", [])?;
+            tx.commit()?;
+            Ok(())
+        };
+        drop_index_rows()?;
         let store_dir = self.config.store_dir();
         if store_dir.exists() {
             // Make everything writable recursively, then remove all subdirs
@@ -4246,11 +4300,7 @@ impl Store {
                 }
             }
         }
-        self.db.execute("DELETE FROM entries", [])?;
-        self.db.execute("DELETE FROM entry_blobs", [])?;
-        self.db.execute("DELETE FROM blobs", [])?;
-        self.db.execute("DELETE FROM incremental_dirs", [])?;
-        Ok(())
+        drop_index_rows()
     }
 
     /// Recursively make all files in a directory writable so they can be deleted.
@@ -7645,6 +7695,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(still_there, 1, "entry row must survive a refused removal");
+    }
+
+    /// The resolution path the #276 comments promise: a refused removal
+    /// leaves the row "until a fresh put (INSERT OR REPLACE) overwrites
+    /// it". That re-put must also release the stranded generation's blob
+    /// references — stacking new increments on top leaks the old hashes
+    /// (a refcount no mapping accounts for never reaches zero) and
+    /// double-counts hashes shared by both generations.
+    #[test]
+    fn reput_over_refused_removal_releases_stale_refcounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let refcount_sum = |s: &Store| -> i64 {
+            s.db.query_row("SELECT COALESCE(SUM(refcount), 0) FROM blobs", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        // Each generation compiles to a fresh source path: put ingests by
+        // hardlink where reflinks are unavailable (ext4), sharing the
+        // store blob's read-only inode with the source, so rewriting one
+        // path across generations would EACCES on Linux while APFS
+        // reflinks mask it (the #822 snapshot-test lesson).
+        let put = |s: &Store, generation: &str, content: &[u8]| {
+            let output = dir.path().join(format!("lib-{generation}.rlib"));
+            std::fs::write(&output, content).unwrap();
+            s.put(
+                "strand1",
+                "c1",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(output, "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        };
+
+        put(&store, "one", b"generation one");
+        assert_eq!(refcount_sum(&store), 1);
+
+        // Strand the row: meta.json gone, DB row present. Removal
+        // refuses (#276), and lookup's discarded-error path then drives
+        // a miss, a recompile, and this re-put over the surviving row.
+        std::fs::remove_file(store.entry_dir("strand1").join("meta.json")).unwrap();
+        assert!(store.remove_entry("strand1").is_err());
+        put(&store, "two", b"generation two");
+
+        assert_eq!(
+            refcount_sum(&store),
+            1,
+            "re-put must release the stranded generation's references"
+        );
+        let mapped: i64 = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM entry_blobs WHERE cache_key = 'strand1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mapped, 1, "exactly the new generation's mapping remains");
+        assert_eq!(
+            store.blob_index_drift().unwrap().total(),
+            0,
+            "index must match the committed meta with no doctor repair"
+        );
+
+        // Same-content re-put: the shared hash must stay at one
+        // reference, not accumulate one per generation.
+        put(&store, "two-again", b"generation two");
+        assert_eq!(refcount_sum(&store), 1, "shared hash must not double-count");
+        assert_eq!(store.blob_index_drift().unwrap().total(), 0);
     }
 
     /// An unreadable meta.json (EACCES, not NotFound) must refuse through the

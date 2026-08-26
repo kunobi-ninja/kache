@@ -319,13 +319,20 @@ async fn readyz(State(state): State<AppState>) -> Result<Json<HealthResponse>, S
 
 impl AuthnProvider for AppState {
     async fn authenticate(&self, token: &str) -> Result<AuthIdentity, AuthError> {
+        // Constant-time comparison: a plain `==` short-circuits on the
+        // first differing byte, letting a network peer binary-search the
+        // token one byte at a time from response timing. Only the length
+        // check can leak, which a random bearer token doesn't hinge on.
+        use subtle::ConstantTimeEq;
         match self.token.as_deref() {
-            Some(expected) if token == expected => Ok(AuthIdentity {
-                provider: "kache".to_string(),
-                identity: "planner-client".to_string(),
-                method: "token".to_string(),
-                claims: HashMap::new(),
-            }),
+            Some(expected) if bool::from(token.as_bytes().ct_eq(expected.as_bytes())) => {
+                Ok(AuthIdentity {
+                    provider: "kache".to_string(),
+                    identity: "planner-client".to_string(),
+                    method: "token".to_string(),
+                    claims: HashMap::new(),
+                })
+            }
             Some(_) => Err(AuthError::Unauthorized("invalid bearer token".to_string())),
             None => Ok(AuthIdentity {
                 provider: "kache".to_string(),

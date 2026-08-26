@@ -3031,6 +3031,7 @@ dependencies = [
  "prometheus",
  "serde",
  "serde_json",
+ "subtle",
  "surrealdb",
  "tempfile",
  "tokio",

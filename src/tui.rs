@@ -16,6 +16,61 @@ use crate::config::Config;
 use crate::daemon;
 use crate::events::{self, BuildEvent, EventRecord, EventResult, EventTailer, HeartbeatEvent};
 
+// ── Terminal mode guard ────────────────────────────────────────────────────
+
+/// RAII owner of the crossterm raw-mode + alternate-screen pair, shared by
+/// every TUI entry point (monitor, config editor, interactive clean).
+///
+/// The straight-line "enable, run, disable" shape leaks a broken terminal
+/// on every early exit: a `?` between enable and disable returns with raw
+/// mode still on, and a panic unwinds past the restore entirely. Restoring
+/// in `Drop` covers both. A process-wide panic hook additionally restores
+/// the terminal *before* the panic message prints, so it lands on the
+/// user's real screen instead of vanishing with the alternate one.
+pub(crate) struct TerminalModeGuard;
+
+#[cfg(test)]
+std::thread_local! {
+    static TERMINAL_RESTORE_OBSERVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl TerminalModeGuard {
+    pub(crate) fn enter() -> Result<Self> {
+        static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+        PANIC_HOOK.call_once(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                restore_terminal();
+                previous(info);
+            }));
+        });
+        enable_raw_mode()?;
+        if let Err(e) = stdout().execute(EnterAlternateScreen) {
+            // No guard exists yet to undo the half-entered state — and
+            // the escape sequence may have been written before the error
+            // surfaced, so leave the alternate screen too.
+            restore_terminal();
+            return Err(e.into());
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+/// Idempotent: leaving the main screen buffer and disabling an already
+/// disabled raw mode are no-ops, so the hook and the guard can both run.
+fn restore_terminal() {
+    #[cfg(test)]
+    TERMINAL_RESTORE_OBSERVED.with(|observed| observed.set(true));
+    let _ = stdout().execute(LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}
+
 // ── Tabs & panels ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -421,8 +476,7 @@ const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Run the TUI monitor dashboard.
 pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
+    let _terminal_mode = TerminalModeGuard::enter()?;
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -625,8 +679,6 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
         }
     }
 
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
     Ok(())
 }
 
@@ -2080,6 +2132,24 @@ fn draw_passthrough_help(frame: &mut Frame, state: &AppState, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_restore_was_observed(action: impl FnOnce()) -> bool {
+        TERMINAL_RESTORE_OBSERVED.with(|observed| observed.set(false));
+        action();
+        TERMINAL_RESTORE_OBSERVED.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn terminal_restore_function_runs_the_cleanup_path() {
+        assert!(terminal_restore_was_observed(restore_terminal));
+    }
+
+    #[test]
+    fn terminal_restore_guard_runs_on_drop() {
+        assert!(terminal_restore_was_observed(|| {
+            let _guard = TerminalModeGuard;
+        }));
+    }
 
     #[test]
     fn test_tab_needs_entries_only_for_store() {

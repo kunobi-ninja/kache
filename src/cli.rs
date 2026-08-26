@@ -2620,6 +2620,13 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>, stale_schema: bool) -> Re
 pub fn purge(config: &Config, crate_filter: Option<&str>) -> Result<()> {
     let store = Store::open(config)?;
 
+    // Purge is a bulk mutation like a GC sweep, so it holds the same
+    // cross-process lock every GC driver takes: a sweep either finishes
+    // before the purge starts or sees the store only after the purge is
+    // done, never a half-wiped one. Per-blob safety against concurrent
+    // builds still comes from the delete-row-first transactional gates.
+    let _gc_lock = store.acquire_gc_lock().context("locking GC for purge")?;
+
     if let Some(name) = crate_filter {
         let entries = store.list_entries("name")?;
         let mut removed = 0;
@@ -2696,6 +2703,23 @@ fn clean_handle_key(
         _ => {}
     }
     CleanStep::Continue
+}
+
+/// Ignore key-repeat/release notifications: one physical key press must apply
+/// exactly one selector action on terminals that report all key event kinds.
+fn clean_handle_event(
+    event: crossterm::event::Event,
+    selected: &mut [bool],
+    cursor: &mut usize,
+    len: usize,
+) -> CleanStep {
+    use crossterm::event::{Event, KeyEventKind};
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            clean_handle_key(key.code, selected, cursor, len)
+        }
+        _ => CleanStep::Continue,
+    }
 }
 
 /// Render one frame of the interactive `clean` selector. Extracted from the
@@ -2841,11 +2865,7 @@ fn draw_clean(
 
 /// Recursively find and remove target/ directories (TUI selector).
 pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
-    use crossterm::ExecutableCommand;
-    use crossterm::event::{self, Event, KeyEventKind};
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
+    use crossterm::event;
     use ratatui::prelude::*;
     use std::io::stdout;
 
@@ -2887,37 +2907,34 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
     let mut selected: Vec<bool> = vec![false; targets.len()];
     let mut cursor: usize = 0;
 
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
+    // Scoped so the guard restores the terminal before the post-TUI
+    // summary prints to the real screen.
+    let result = {
+        let _terminal_mode = crate::tui::TerminalModeGuard::enter()?;
+        let backend = CrosstermBackend::new(stdout());
+        let mut terminal = Terminal::new(backend)?;
 
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
+        loop {
+            terminal.draw(|frame| draw_clean(frame, &targets, &selected, cursor, &root))?;
 
-    let result = loop {
-        terminal.draw(|frame| draw_clean(frame, &targets, &selected, cursor, &root))?;
-
-        if event::poll(std::time::Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match clean_handle_key(key.code, &mut selected, &mut cursor, targets.len()) {
-                CleanStep::Cancel => break None,
-                CleanStep::Confirm => {
-                    let to_remove: Vec<_> = targets
-                        .iter()
-                        .zip(selected.iter())
-                        .filter(|(_, s)| **s)
-                        .map(|(t, _)| RemovalTarget::from_entry(t))
-                        .collect();
-                    break Some(to_remove);
+            if event::poll(std::time::Duration::from_millis(100))? {
+                match clean_handle_event(event::read()?, &mut selected, &mut cursor, targets.len())
+                {
+                    CleanStep::Cancel => break None,
+                    CleanStep::Confirm => {
+                        let to_remove: Vec<_> = targets
+                            .iter()
+                            .zip(selected.iter())
+                            .filter(|(_, s)| **s)
+                            .map(|(t, _)| RemovalTarget::from_entry(t))
+                            .collect();
+                        break Some(to_remove);
+                    }
+                    CleanStep::Continue => {}
                 }
-                CleanStep::Continue => {}
             }
         }
     };
-
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
 
     // Process deletions outside TUI
     match result {
@@ -7481,6 +7498,45 @@ mod tests {
         );
     }
 
+    /// Purge is a bulk mutation and must serialize behind the same
+    /// cross-process lock every GC driver takes; unlocked, a purge can
+    /// interleave with a live sweep and each observes the other's
+    /// half-removed state.
+    #[test]
+    fn purge_waits_for_the_gc_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        put_entry(&config, "purgelockkey", "locked", dir.path());
+
+        let store = crate::store::Store::open(&config).unwrap();
+        let gc_lock = store.try_gc_lock().unwrap().expect("uncontended lock");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let cfg = config.clone();
+        let worker = std::thread::spawn(move || {
+            let result = purge(&cfg, None);
+            let _ = done_tx.send(());
+            result
+        });
+
+        // While the "sweep" holds gc.lock the purge must not complete.
+        // (A scheduling hiccup can only delay the mutant's completion
+        // signal, never produce a false failure for the real code.)
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "purge completed while the GC lock was held"
+        );
+        drop(gc_lock);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("purge proceeds once the GC lock is released");
+        worker.join().unwrap().expect("purge succeeds");
+        let store = crate::store::Store::open(&config).unwrap();
+        assert_eq!(store.entry_count().unwrap(), 0, "store cleared");
+    }
+
     #[test]
     fn verify_reports_valid_entries_on_a_clean_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -9807,6 +9863,51 @@ mod tests {
         assert_eq!(
             clean_handle_key(KeyCode::Char('z'), &mut selected, &mut cursor, 1),
             CleanStep::Continue
+        );
+    }
+
+    #[test]
+    fn clean_event_applies_press_but_ignores_release() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let key_event = |kind| {
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                kind,
+            ))
+        };
+        let mut selected = vec![false];
+        let mut cursor = 0;
+
+        assert_eq!(
+            clean_handle_event(
+                key_event(KeyEventKind::Release),
+                &mut selected,
+                &mut cursor,
+                1,
+            ),
+            CleanStep::Continue,
+            "key release must not repeat the action"
+        );
+        assert_eq!(
+            clean_handle_event(
+                key_event(KeyEventKind::Repeat),
+                &mut selected,
+                &mut cursor,
+                1,
+            ),
+            CleanStep::Continue,
+            "key repeat must not repeat the action"
+        );
+        assert_eq!(
+            clean_handle_event(
+                key_event(KeyEventKind::Press),
+                &mut selected,
+                &mut cursor,
+                1,
+            ),
+            CleanStep::Cancel,
+            "key press must apply the action"
         );
     }
 

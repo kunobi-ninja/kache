@@ -1781,15 +1781,20 @@ fn resolve_native_static_lib(
         return Ok(None);
     };
     // Probe the common platform conventions by existence (host-agnostic; the
-    // file only exists where the build produced it). If more than one candidate
-    // matches — `lib<name>.a` and `<name>.lib`, or hits in two dirs — the choice
-    // is ambiguous (rustc's pick is target-specific), so fail the cache key
-    // rather than risk hashing the wrong file.
+    // file only exists where the build produced it). Build scripts can emit the
+    // same search directory more than once (for example, one `cc::Build::compile`
+    // call per archive), so repeated sightings of the same candidate are not
+    // ambiguous. If more than one distinct candidate matches — `lib<name>.a`
+    // and `<name>.lib`, or hits in two dirs — the choice is target-specific, so
+    // fail the cache key rather than risk hashing the wrong file.
     let mut found: Option<PathBuf> = None;
     for dir in search_dirs {
         for filename in [format!("lib{name}.a"), format!("{name}.lib")] {
             let candidate = dir.join(&filename);
             if candidate.is_file() {
+                if found.as_ref().is_some_and(|path| path == &candidate) {
+                    continue;
+                }
                 if found.is_some() {
                     anyhow::bail!("ambiguous native static library {name:?}");
                 }
@@ -5136,6 +5141,14 @@ mod tests {
             .expect("static lib in a search dir must resolve");
         assert_eq!(path, lib);
 
+        // `cc` emits the same OUT_DIR once per compiled archive. Repeating an
+        // identical `-L native=...` must still resolve the one physical file.
+        let duplicate_dirs = vec![dir.path().to_path_buf(), dir.path().to_path_buf()];
+        let (duplicate_path, _) = resolve_native_static_lib("static=foo", &duplicate_dirs, &fh)
+            .unwrap()
+            .expect("duplicate search dirs must not make one archive ambiguous");
+        assert_eq!(duplicate_path, lib);
+
         // Changed bytes → different hash (this is the false hit we close).
         std::fs::write(&lib, b"v2 different bytes").unwrap();
         let (_, h2) = resolve_native_static_lib("static=foo", &dirs, &fh)
@@ -5166,8 +5179,22 @@ mod tests {
                 .is_none()
         );
 
-        // Ambiguous match (both `libfoo.a` and `foo.lib` present) is
-        // uncacheable, so we never omit the file rustc actually picked.
+        // Distinct matches remain uncacheable, so we never hash a file other
+        // than the one rustc actually picked.
+        let other_dir = tempfile::tempdir().unwrap();
+        std::fs::write(other_dir.path().join("libfoo.a"), b"different archive").unwrap();
+        assert!(
+            resolve_native_static_lib(
+                "static=foo",
+                &[dir.path().to_path_buf(), other_dir.path().to_path_buf()],
+                &fh,
+            )
+            .is_err(),
+            "distinct search-dir matches must fail closed"
+        );
+
+        // Both platform filename conventions in one directory are also
+        // ambiguous.
         std::fs::write(dir.path().join("foo.lib"), b"msvc import lib").unwrap();
         assert!(
             resolve_native_static_lib("static=foo", &dirs, &fh).is_err(),
@@ -5583,6 +5610,30 @@ mod tests {
         std::fs::write(&lib, b"v1 archive bytes").unwrap();
         let k3 = key_of(&flag_base(&source, &flags));
         assert_eq!(k1, k3, "identical bytes must reproduce the key");
+    }
+
+    /// `cc::Build::compile` emits its OUT_DIR for every archive it creates.
+    /// Repeating that directory must not make the one archive uncacheable.
+    #[test]
+    fn duplicate_native_search_dir_keeps_static_lib_cacheable() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let libdir = dir.path().join("out");
+        std::fs::create_dir_all(&libdir).unwrap();
+        std::fs::write(libdir.join("libfoo.a"), b"archive bytes").unwrap();
+        let search = format!("native={}", libdir.display());
+        let flags = [
+            "-L",
+            search.as_str(),
+            "-L",
+            search.as_str(),
+            "-l",
+            "static=foo",
+        ];
+
+        assert!(!key_of(&flag_base(&source, &flags)).is_empty());
     }
 
     /// A `dylib=` lib is referenced at runtime, not bundled into the output, so

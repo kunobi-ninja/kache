@@ -1771,6 +1771,110 @@ fn test_cc_forced_include_and_param_converge_across_clones_issue_580() {
     );
 }
 
+/// cc-rs emits `-mno-omit-leaf-frame-pointer` when Rust requests forced
+/// frame pointers (and in debug-mode tool setup), so every aws-lc-sys TU of
+/// a macOS debug build passed through on it (#839). The flag is
+/// `CapturedByProbe`: clang's `-###` resolves it to `-mframe-pointer=all`
+/// against the default `-mframe-pointer=non-leaf`, so the resolved-token
+/// hash must key the two codegen modes apart.
+///
+/// Gated like the other probe-keyed tests: a driver that rejects the flag or
+/// a host whose `cc -###` cannot resolve skips rather than false-fails.
+#[test]
+fn test_cc_no_omit_leaf_frame_pointer_keys_on_probe_issue_839() {
+    let probe_dir = TempDir::new().unwrap();
+    let gate_src = probe_dir.path().join("gate.c");
+    std::fs::write(&gate_src, "int gate(void) { return 0; }\n").unwrap();
+    let accepts = std::process::Command::new("cc")
+        .arg("-c")
+        .arg(&gate_src)
+        .arg("-o")
+        .arg(probe_dir.path().join("gate.o"))
+        .args(["-mno-omit-leaf-frame-pointer", "-O0", "-g0"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !accepts {
+        eprintln!("skipping: `cc` does not accept -mno-omit-leaf-frame-pointer");
+        return;
+    }
+    build_kache();
+    if !kache_caches_probe_keyed_flags(probe_dir.path()) {
+        eprintln!("skipping: probe-keyed flags are not cacheable on this host");
+        return;
+    }
+
+    let work = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
+
+    // Cold: compiles and stores. A passthrough records no miss, so this is
+    // what proves the flag classified at all.
+    let flagged = [
+        "cc",
+        "-c",
+        "tu.c",
+        "-o",
+        "tu.o",
+        "-mno-omit-leaf-frame-pointer",
+        "-O0",
+        "-g0",
+    ];
+    run_kache_cc(work.path(), cache_dir.path(), &flagged);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["misses"].as_u64(),
+        Some(1),
+        "cold -mno-omit-leaf-frame-pointer compile must be cached, not passed \
+         through.\n`cc -###` said:\n{}\nevents.jsonl:\n{}",
+        cc_probe_stderr_head(work.path(), &flagged[1..]),
+        std::fs::read_to_string(cache_dir.path().join("events.jsonl"))
+            .unwrap_or_else(|e| format!("(unreadable: {e})"))
+    );
+
+    // The entry is real: the same compile hits it.
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &flagged);
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+
+    // The default frame-pointer mode must NOT hit the flagged entry: clang
+    // resolves the two to `-mframe-pointer=all` vs `-mframe-pointer=non-leaf`
+    // in the cc1 stream, so a false hit would mean the probe under-keys a
+    // codegen difference. Asserted as "local_hits did not grow" (a distinct
+    // key with byte-identical output records as a `dup`, not a miss).
+    let default_mode = ["cc", "-c", "tu.c", "-o", "tu.o", "-O0", "-g0"];
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &default_mode);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["local_hits"].as_u64(),
+        Some(1),
+        "default -mframe-pointer=non-leaf must not hit the \
+         -mno-omit-leaf-frame-pointer entry: {report}"
+    );
+
+    // Key-level proof from the events: three compiles, two flag modes,
+    // exactly two distinct cache keys.
+    let events = report["all_events"]
+        .as_array()
+        .expect("report should include all_events");
+    assert_eq!(events.len(), 3, "expected one event per compile: {report}");
+    let keys: std::collections::BTreeSet<&str> = events
+        .iter()
+        .map(|e| {
+            let key = e["cache_key"].as_str().unwrap_or_default();
+            assert!(!key.is_empty(), "every event should carry a cache key: {e}");
+            key
+        })
+        .collect();
+    assert_eq!(
+        keys.len(),
+        2,
+        "the two frame-pointer modes must map to distinct cache keys: {report}"
+    );
+}
+
 #[test]
 fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     build_kache();

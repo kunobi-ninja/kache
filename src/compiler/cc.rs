@@ -1860,6 +1860,22 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // `-mno-omit-leaf-frame-pointer` (clang): forces frame pointers for
+        // leaf functions too. Current cc-rs emits it when Rust requests
+        // forced frame pointers, and in debug-mode tool setup alongside
+        // `-fno-omit-frame-pointer` — so it lands on every aws-lc-sys TU of
+        // a macOS debug build (#839). Real codegen effect: clang's `-###`
+        // resolves it to `-mframe-pointer=all` against the default
+        // `-mframe-pointer=non-leaf`, which the resolved-token hash
+        // separates. gcc spells the equivalent knob `-momit-leaf-frame-
+        // pointer` (opposite default, same `-m` shape); a driver whose
+        // `-###` doesn't resolve keeps refusing fail-closed.
+        matcher: Matcher::Exact("-mno-omit-leaf-frame-pointer"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #839 — cc-rs forced-frame-pointer flag (aws-lc-sys debug builds); clang -### resolves to -mframe-pointer=all.",
+        dialect: None,
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-pthread"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #114 — pthread feature switch (also visible via _REENTRANT in preprocessor).",
@@ -6651,6 +6667,44 @@ mod tests {
         assert!(
             !descs.iter().any(|d| d.contains("unsupported flag")),
             "the Firefox omit-fp + SIMD combo must no longer refuse, got: {descs:?}"
+        );
+    }
+
+    #[test]
+    fn cc_rs_no_omit_leaf_frame_pointer_no_longer_refuses_issue_839() {
+        // cc-rs emits `-mno-omit-leaf-frame-pointer` when Rust requests forced
+        // frame pointers, and in debug-mode tool setup — every aws-lc-sys TU
+        // of a macOS debug build passed through on it (#839). The flag is
+        // CapturedByProbe: it must classify clean AND force the resolved
+        // invocation (clang `-###` resolves it to `-mframe-pointer=all`,
+        // against the default `-mframe-pointer=non-leaf`, so the key
+        // separates the two codegen modes; an unresolvable probe refuses
+        // fail-closed instead of under-keying).
+        let argv = s(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-O0",
+            "-fno-omit-frame-pointer",
+            "-mno-omit-leaf-frame-pointer",
+        ]);
+        let parsed = CcArgs::parse(&argv).unwrap();
+        assert!(
+            parsed.refuse_reasons(&[]).is_empty(),
+            "the cc-rs forced-frame-pointer invocation must cache: {:?}",
+            parsed.refuse_reasons(&[])
+        );
+        assert!(
+            cc_flags_need_resolved_invocation(&parsed),
+            "-mno-omit-leaf-frame-pointer must force the resolved invocation"
+        );
+        // The related-but-distinct gcc spelling stays unmodeled.
+        assert_eq!(
+            classify_cc_flag("-momit-leaf-frame-pointer", Dialect::Gnu),
+            None,
+            "-momit-leaf-frame-pointer is not modeled and must keep refusing"
         );
     }
 

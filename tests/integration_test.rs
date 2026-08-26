@@ -1875,6 +1875,109 @@ fn test_cc_no_omit_leaf_frame_pointer_keys_on_probe_issue_839() {
     );
 }
 
+/// True if `cc` on PATH accepts `-fsanitize-undefined-strip-path-components=-1`,
+/// checked by actually compiling with it. The option is clang-only — gcc
+/// rejects it, and aws-lc-sys itself adds it only after a compiler support
+/// probe — so a driver that rejects it has nothing to say about #840.
+fn cc_accepts_ubsan_strip_path_components(dir: &Path) -> bool {
+    let source = dir.join("ubsan-strip-probe.c");
+    if std::fs::write(&source, "int ubsan_strip_probe(void) { return 0; }\n").is_err() {
+        return false;
+    }
+    std::process::Command::new("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("ubsan-strip-probe.o"))
+        .args(["-fsanitize-undefined-strip-path-components=-1", "-O0"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Live end-to-end for #840: aws-lc-sys 0.44 compiles its jitterentropy TUs
+/// with `-fsanitize-undefined-strip-path-components=-1` on clang. The flag
+/// must not refuse an otherwise cacheable compile, and because its only
+/// keying is the resolved `-cc1` token, absence of the flag must key apart
+/// from its presence.
+#[test]
+fn test_cc_ubsan_strip_path_components_caches_issue_840() {
+    let probe_dir = TempDir::new().unwrap();
+    if !cc_accepts_ubsan_strip_path_components(probe_dir.path()) {
+        eprintln!(
+            "skipping: `cc` does not accept \
+             -fsanitize-undefined-strip-path-components=-1 \
+             (non-clang driver, or no cc on PATH)"
+        );
+        return;
+    }
+    build_kache();
+    // The flag is probe-keyed, so a host that cannot resolve `cc -###`
+    // refuses to cache it however it is classified (see the message this
+    // gate prints). Pre-existing platform gap, not something the
+    // classification change can fix.
+    if !kache_caches_probe_keyed_flags(probe_dir.path()) {
+        eprintln!("skipping: probe-keyed flags are not cacheable on this host");
+        return;
+    }
+
+    let work = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::write(work.path().join("je.c"), "int je(void) { return 0; }\n").unwrap();
+
+    let with_flag = [
+        "cc",
+        "-c",
+        "je.c",
+        "-o",
+        "je.o",
+        "-fsanitize-undefined-strip-path-components=-1",
+        "-O0",
+        "-g0",
+    ];
+    // Cold: compiles and stores. A passthrough would record neither, so the
+    // miss count is what proves the flag classified at all. Attach the raw
+    // event log — the refusal reason is the whole content of a failure here.
+    run_kache_cc(work.path(), cache_dir.path(), &with_flag);
+    assert!(work.path().join("je.o").exists());
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["misses"].as_u64(),
+        Some(1),
+        "cold compile with the #840 flag must be cached, not passed through.\nevents.jsonl:\n{}",
+        std::fs::read_to_string(cache_dir.path().join("events.jsonl"))
+            .unwrap_or_else(|e| format!("(unreadable: {e})"))
+    );
+
+    // The entry must be real: the same compile hits it.
+    std::fs::remove_file(work.path().join("je.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &with_flag);
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+
+    // Absence of the flag must NOT hit — clang leaves the token out of the
+    // resolved cc1 stream, so the no-flag compile is a different key.
+    // Asserted as "local_hits did not grow", not "misses grew": the flag
+    // only strips UBSan metadata paths and this TU carries none, so the
+    // object can come out byte-identical and record as a `dup`. Either
+    // bucket is correct — a false HIT is the only wrong answer.
+    let without_flag = ["cc", "-c", "je.c", "-o", "je.o", "-O0", "-g0"];
+    std::fs::remove_file(work.path().join("je.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &without_flag);
+    let report = kache_report(cache_dir.path());
+    let summary = &report["summary"];
+    assert_eq!(
+        summary["local_hits"].as_u64(),
+        Some(1),
+        "the flag-less compile must not reuse the flagged entry: {report}"
+    );
+    assert_eq!(
+        summary["misses"].as_u64().unwrap_or(0) + summary["dups"].as_u64().unwrap_or(0),
+        2,
+        "the flag-less compile should have compiled under its own key: {report}"
+    );
+}
+
 #[test]
 fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     build_kache();

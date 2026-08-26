@@ -1919,6 +1919,24 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #580 — joined spelling of --param; value rides through to cc1.",
         dialect: None,
     },
+    // `-fsanitize-undefined-strip-path-components=-1` (clang-only). aws-lc-sys
+    // 0.44 adds it to the same jitterentropy TUs as the `--param` rows above
+    // once a compile probe confirms support (`builder/cc_builder.rs`): Clang's
+    // UBSan check metadata at -O0 can embed the full source path, and the
+    // option strips leading path components from it. Path metadata rather
+    // than codegen, but it still changes object bytes, so it must be keyed —
+    // clang forwards the option, value included, verbatim into the resolved
+    // `-cc1` line, and the resolved-token hash captures it. Exact-matched on
+    // the one observed value: every integer value clang accepts rides through
+    // to cc1 (verified `=0`/`=2` on Apple clang 21), so widening is safe when
+    // a workload needs it, but `=-1` is the only spelling in evidence and the
+    // exact row keeps unobserved values refusing — the `-gdwarf-4` precedent.
+    FlagSpec {
+        matcher: Matcher::Exact("-fsanitize-undefined-strip-path-components=-1"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #840 — aws-lc-sys 0.44 jitterentropy UBSan path-stripping; Apple clang forwards the value to -cc1 verbatim (verified -###).",
+        dialect: None,
+    },
     // (math-errno, strict-aliasing, omit-frame-pointer, unwind-tables —
     // #114/#426 — are now covered by the sorted codegen-knob stem list above,
     // both polarities.)
@@ -6435,6 +6453,62 @@ mod tests {
             assert!(
                 descs.is_empty(),
                 "aws-lc-sys invocation must cache, got: {descs:?} for {args:?}"
+            );
+        }
+    }
+
+    /// aws-lc-sys 0.44 adds `-fsanitize-undefined-strip-path-components=-1`
+    /// to the same jitterentropy TUs as #580's `-fwrapv --param` flags once a
+    /// compile probe confirms clang support (#840). The option only strips
+    /// path components from UBSan check metadata, but that still changes
+    /// object bytes, so it is keyed: CapturedByProbe, with Apple clang
+    /// forwarding the value verbatim into the resolved `-cc1` tokens.
+    #[test]
+    fn caches_aws_lc_sys_ubsan_strip_path_components_issue_840() {
+        let flag = "-fsanitize-undefined-strip-path-components=-1";
+        assert_eq!(
+            classify_cc_flag(flag, Dialect::Gnu),
+            Some(FlagClass::CapturedByProbe),
+            "{flag} must key through the resolved invocation"
+        );
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            "jitterentropy-base.c",
+            "-o",
+            "je.o",
+            "-fwrapv",
+            "--param",
+            "ssp-buffer-size=4",
+            flag,
+            "-O0",
+        ]))
+        .unwrap();
+        assert!(
+            parsed.refuse_reasons(&[]).is_empty(),
+            "aws-lc-sys 0.44 jitterentropy invocation must cache: {:?}",
+            parsed.refuse_reasons(&[])
+        );
+        // Probe-captured ⇒ the resolved invocation is required to key; an
+        // unresolvable probe refuses rather than under-keys.
+        assert!(cc_flags_need_resolved_invocation(&parsed));
+    }
+
+    /// The #840 row is exact on the one observed value. Other values — and
+    /// the value-less spelling clang rejects outright — stay refused until a
+    /// workload needs them, the same evidence-scoping as `-gdwarf-4`.
+    #[test]
+    fn ubsan_strip_path_components_other_spellings_still_refuse_issue_840() {
+        for flag in [
+            "-fsanitize-undefined-strip-path-components",
+            "-fsanitize-undefined-strip-path-components=0",
+            "-fsanitize-undefined-strip-path-components=2",
+            "-fsanitize-undefined-strip-path-components=-2",
+        ] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                None,
+                "{flag} is not modeled and must keep refusing"
             );
         }
     }

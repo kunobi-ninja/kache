@@ -466,6 +466,11 @@ mod tests {
     // Real `gcc -### -c … -fwrapv --param ssp-buffer-size=4` output captured
     // on GNU gcc 15.2.0 — the aws-lc-sys jitterentropy flag shape of #580.
     const GCC_WRAPV_PARAM: &str = include_str!("testdata/gcc_wrapv_param.txt");
+    // Real `clang -### -c … -fwrapv --param ssp-buffer-size=4
+    // -fsanitize-undefined-strip-path-components=-1 -O0` output captured on
+    // Apple clang 21.0.0 (arm64 macOS) — the aws-lc-sys 0.44 jitterentropy
+    // flag shape of #840.
+    const CLANG_UBSAN_STRIP_PATH: &str = include_str!("testdata/clang_ubsan_strip_path.txt");
 
     #[test]
     fn extract_cc1_line_finds_the_compile_line_past_the_banner() {
@@ -978,6 +983,56 @@ mod tests {
         assert_ne!(
             toks, other,
             "a changed --param value must change the gnu token list"
+        );
+    }
+
+    /// `-fsanitize-undefined-strip-path-components=-1` is `CapturedByProbe`
+    /// (#840, aws-lc-sys 0.44 jitterentropy), so the resolved `-cc1` token is
+    /// the ONLY place its effect is keyed. Pin the premise on real Apple
+    /// clang 21 output: the driver forwards the option verbatim, value
+    /// included, so presence, absence, and a different value are three
+    /// distinct token lists and cannot collide.
+    #[test]
+    fn clang_tokens_keep_ubsan_strip_path_components_value_issue_840() {
+        const TOKEN: &str = "\"-fsanitize-undefined-strip-path-components=-1\"";
+        assert!(
+            CLANG_UBSAN_STRIP_PATH.contains(TOKEN),
+            "fixture must carry the resolved token"
+        );
+        let toks = resolved_semantic_tokens(CLANG_UBSAN_STRIP_PATH, true, &[])
+            .expect("clang -fsanitize-undefined-strip-path-components fixture resolves");
+        assert!(
+            toks.iter()
+                .any(|t| t == "-fsanitize-undefined-strip-path-components=-1"),
+            "the path-component value must survive into the token list: {toks:?}"
+        );
+
+        // Same compile without the flag → a different token list.
+        let without = resolved_semantic_tokens(
+            &CLANG_UBSAN_STRIP_PATH.replace(format!("{TOKEN} ").as_str(), ""),
+            true,
+            &[],
+        )
+        .expect("edited fixture resolves");
+        assert_ne!(
+            toks, without,
+            "absence of the flag must key apart from its presence"
+        );
+
+        // Same compile with a different value → a different token list. The
+        // classifier only accepts `=-1` today; this pins the premise that
+        // makes widening the row sound later: the resolved token carries the
+        // value, so every accepted value keys separately.
+        let other = resolved_semantic_tokens(
+            &CLANG_UBSAN_STRIP_PATH
+                .replace(TOKEN, "\"-fsanitize-undefined-strip-path-components=-2\""),
+            true,
+            &[],
+        )
+        .expect("edited fixture resolves");
+        assert_ne!(
+            toks, other,
+            "a changed path-component value must change the token list"
         );
     }
 

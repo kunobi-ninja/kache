@@ -1666,6 +1666,9 @@ impl Store {
 
     /// Wait for a cache key to become committed (another process is building it).
     pub fn wait_for_committed(&self, cache_key: &str) -> Result<bool> {
+        if self.contains(cache_key) {
+            return Ok(true);
+        }
         self.wait_for_committed_with_timeout(cache_key, BUILD_LOCK_TIMEOUT)
     }
 
@@ -9062,15 +9065,65 @@ mod tests {
     }
 
     #[test]
-    fn test_store_wait_for_committed_returns_false_when_not_committed() {
+    fn wait_for_committed_returns_false_without_an_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::wait_for_committed_missing_child_fixture",
+                "--ignored",
+            ])
+            .env("KACHE_TEST_WAIT_ROOT", dir.path())
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(status) => {
+                    assert!(status.success(), "wait fixture failed: {status}");
+                    break;
+                }
+                None if std::time::Instant::now() >= deadline => {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("waiting without an owner must return promptly");
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for wait_for_committed_returns_false_without_an_owner"]
+    fn wait_for_committed_missing_child_fixture() {
+        let root = PathBuf::from(std::env::var_os("KACHE_TEST_WAIT_ROOT").expect("fixture root"));
+        let store = Store::open(&test_config(&root)).unwrap();
+        assert!(!store.wait_for_committed("nope").unwrap());
+    }
+
+    #[test]
+    fn wait_for_committed_returns_true_for_an_existing_entry() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config).unwrap();
+        let output = dir.path().join("already-committed.rlib");
+        fs::write(&output, b"committed output").unwrap();
+        store
+            .put(
+                "already-committed",
+                "peer",
+                &["rlib".to_string()],
+                &[],
+                "host",
+                "dev",
+                &[(output, "already-committed.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
 
-        // No owner and no entry committed: acquire the persistent lock file and
-        // return false immediately.
-        let result = store.wait_for_committed("nope").unwrap();
-        assert!(!result);
+        assert!(store.wait_for_committed("already-committed").unwrap());
     }
 
     #[test]

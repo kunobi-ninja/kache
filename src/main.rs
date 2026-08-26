@@ -4,6 +4,7 @@ mod build_intent;
 mod cache_fs;
 mod cache_key;
 mod cargo_proxy;
+mod checked_regions;
 mod cli;
 mod compile;
 mod compiler;
@@ -42,6 +43,8 @@ mod shards;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod sharing;
 mod store;
+#[cfg(test)]
+mod test_support;
 mod transport;
 mod tui;
 mod wrapper;

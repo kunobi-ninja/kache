@@ -1,0 +1,25 @@
+[package]
+name = "kache-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+blake3 = "1"
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "native_archive"
+path = "fuzz_targets/native_archive.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+resolver = "3"

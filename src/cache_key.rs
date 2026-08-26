@@ -4030,6 +4030,7 @@ fn resolve_in_path(name: &str) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::args::RustcArgs;
+    use crate::test_support::process_state_test_lock;
 
     const GNU_RUSTC_VERSION: &str =
         "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
@@ -7617,9 +7618,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
     // onto a serial mutex so parallel test threads can't interleave.
     // ────────────────────────────────────────────────────────────────
 
-    use std::sync::{Mutex, MutexGuard};
-
-    /// Serializes every test that computes a cache key.
+    /// Serializes every test that computes a cache key through the shared
+    /// process-state lock also used by argument-parser tests.
     ///
     /// `compute_cache_key` reads process-wide env (`RUSTFLAGS`,
     /// `CARGO_ENCODED_RUSTFLAGS`, `CARGO_CFG_*`); the env-mutating
@@ -7634,13 +7634,10 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
     /// `compute_cache_key` — matrix or not — holds it for its full
     /// duration. New key tests must do the same; that is the price of
     /// `compute_cache_key` reading process-global env directly.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Acquire the key-test serial lock. Tolerates a poisoned mutex (a
-    /// panic in an earlier key test) so one failure doesn't cascade
-    /// into spurious failures of the rest.
-    fn key_test_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// Keep the local name used throughout this large test module while the
+    /// underlying lock remains shared with other process-state observers.
+    fn key_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        process_state_test_lock()
     }
 
     /// Key computation stashes this compile's unit identity and its per-extern
@@ -7871,7 +7868,7 @@ exec {} \"$@\"\n",
         std::fs::write(dir_b.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
         let args = base_args(Path::new("lib.rs"));
 
-        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        // SAFETY: env access is serialized by the process-state test lock; restored below.
         unsafe { std::env::set_var("KACHE_RUSTC_PATH_NORMALIZE", "0") };
         std::env::set_current_dir(dir_a.path()).unwrap();
         let optout_a = key_for(&args);
@@ -7937,7 +7934,7 @@ exec {} \"$@\"\n",
             compute_cache_key(&parsed, &fh, &pn).unwrap()
         };
 
-        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        // SAFETY: env access is serialized by the process-state test lock; restored below.
         unsafe { std::env::set_var("KACHE_RUSTC_PATH_NORMALIZE", "0") };
         unsafe { std::env::set_var("CARGO_TARGET_DIR", target_a.path()) };
         let optout_a = key();
@@ -8565,7 +8562,7 @@ pub fn value() -> (&'static str, u8) {
 
         let saved = std::env::var("RUSTFLAGS").ok();
 
-        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        // SAFETY: env access is serialized by the process-state test lock; restored below.
         unsafe { std::env::remove_var("RUSTFLAGS") };
         let key_none = key_for(&args);
 
@@ -8765,7 +8762,7 @@ pub fn value() -> (&'static str, u8) {
         let saved = std::env::var("RUSTFLAGS").ok();
         let set = |v: &str| unsafe { std::env::set_var("RUSTFLAGS", v) };
 
-        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        // SAFETY: env access is serialized by the process-state test lock; restored below.
         set("--remap-path-prefix=/work/clone-a/=/topsrcdir/");
         let key_a = key_for(&args);
         set("--remap-path-prefix=/work/clone-b/=/topsrcdir/");
@@ -8806,7 +8803,7 @@ pub fn value() -> (&'static str, u8) {
 
         let saved = std::env::var("RUSTFLAGS").ok();
 
-        // SAFETY: env access is serialized by ENV_LOCK; restored below.
+        // SAFETY: env access is serialized by the process-state test lock; restored below.
         unsafe { std::env::set_var("RUSTFLAGS", "-C debuginfo=2 -C codegen-units=1") };
         let key_tight = key_for(&args);
 

@@ -327,19 +327,15 @@ pub(crate) fn decode_pack<'a>(
     let index: PackIndex = serde_json::from_slice(&bytes[PACK_HEADER_BYTES..payload_start])
         .context("parsing prefetch pack index")?;
     let payload = &bytes[payload_start..];
-    validate_pack_index(&index, payload.len())?;
+    let ranges = validate_pack_index(&index, payload.len())?;
 
     let entries = index
         .entries
         .iter()
-        .map(|entry| {
-            let start = usize::try_from(entry.offset).expect("validated offset fits usize");
-            let end = usize::try_from(entry.offset + entry.length)
-                .expect("validated payload end fits usize");
-            DecodedPackEntry {
-                descriptor: entry.clone(),
-                payload: &payload[start..end],
-            }
+        .zip(ranges)
+        .map(|(entry, range)| DecodedPackEntry {
+            descriptor: entry.clone(),
+            payload: &payload[range],
         })
         .collect();
     Ok(DecodedPack { index, entries })
@@ -573,7 +569,10 @@ fn validate_catalog(catalog: &PackCatalog) -> Result<()> {
     Ok(())
 }
 
-fn validate_pack_index(index: &PackIndex, payload_len: usize) -> Result<()> {
+fn validate_pack_index(
+    index: &PackIndex,
+    payload_len: usize,
+) -> Result<Vec<std::ops::Range<usize>>> {
     if index.version != PACK_VERSION {
         bail!("unsupported prefetch pack version {}", index.version);
     }
@@ -589,25 +588,36 @@ fn validate_pack_index(index: &PackIndex, payload_len: usize) -> Result<()> {
     }
     let mut expected_offset = 0_u64;
     let mut previous_key: Option<&str> = None;
+    let mut ranges = Vec::with_capacity(index.entries.len());
     for entry in &index.entries {
         validate_entry_fields(&entry.cache_key, &entry.crate_name, &entry.meta_digest)?;
         if previous_key.is_some_and(|previous| previous >= entry.cache_key.as_str()) {
             bail!("prefetch pack entries are duplicated or not canonically ordered");
         }
         previous_key = Some(&entry.cache_key);
-        if entry.offset != expected_offset || entry.length == 0 {
-            bail!("prefetch pack entry frames overlap, contain a gap, or are empty");
-        }
-        expected_offset = expected_offset
-            .checked_add(entry.length)
-            .context("prefetch pack frame length overflow")?;
+        let Some((next_offset, (start, end))) =
+            crate::checked_regions::checked_nonempty_contiguous_region(
+                expected_offset,
+                entry.offset,
+                entry.length,
+                payload_len,
+            )
+        else {
+            bail!(
+                "prefetch pack entry frames overlap, contain a gap, are empty, or exceed the payload"
+            );
+        };
+        expected_offset = next_offset;
+        ranges.push(start..end);
     }
-    if expected_offset != payload_len as u64 {
+    let payload_len =
+        u64::try_from(payload_len).context("prefetch pack payload length overflow")?;
+    if expected_offset != payload_len {
         bail!(
             "prefetch pack frame lengths total {expected_offset} bytes, object contains {payload_len}"
         );
     }
-    Ok(())
+    Ok(ranges)
 }
 
 fn validate_pack_cap(max_bytes: u64) -> Result<()> {
@@ -658,6 +668,8 @@ fn hash_field(hasher: &mut blake3::Hasher, value: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
 
     fn digest(label: &str) -> String {
         blake3::hash(label.as_bytes()).to_hex().to_string()
@@ -732,6 +744,103 @@ mod tests {
         bytes.extend_from_slice(&json);
         bytes.push(b'x');
         bytes
+    }
+
+    fn arbitrary_pack_entries() -> impl Strategy<Value = Vec<PackInputEntry>> {
+        proptest::collection::btree_map(
+            any::<u16>(),
+            proptest::collection::vec(any::<u8>(), 1..4097),
+            2..9,
+        )
+        .prop_map(|entries| {
+            entries
+                .into_iter()
+                .map(|(id, payload)| PackInputEntry {
+                    cache_key: digest(&format!("property-key-{id}")),
+                    crate_name: format!("crate_{id}"),
+                    meta_digest: digest(&format!("property-meta-{id}")),
+                    payload,
+                })
+                .collect()
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            max_shrink_iters: 128,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn property_pack_build_decode_and_rebuild_is_canonical(
+            entries in arbitrary_pack_entries(),
+        ) {
+            const TEST_CAP: u64 = 1024 * 1024;
+
+            let mut permutation = entries.clone();
+            permutation.reverse();
+            let built = build_pack("property", entries.clone(), TEST_CAP).unwrap();
+            let permuted = build_pack("property", permutation, TEST_CAP).unwrap();
+            prop_assert_eq!(&built.bytes, &permuted.bytes);
+            prop_assert_eq!(&built.digest, &permuted.digest);
+
+            let decoded = decode_pack(&built.bytes, &built.digest, TEST_CAP).unwrap();
+            let expected = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.cache_key.clone(),
+                        (
+                            entry.crate_name.clone(),
+                            entry.meta_digest.clone(),
+                            entry.payload.clone(),
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let actual = decoded
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.descriptor.cache_key.clone(),
+                        (
+                            entry.descriptor.crate_name.clone(),
+                            entry.descriptor.meta_digest.clone(),
+                            entry.payload.to_vec(),
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            prop_assert_eq!(actual, expected);
+
+            let mut expected_offset = 0_u64;
+            for entry in &decoded.index.entries {
+                prop_assert_eq!(entry.offset, expected_offset);
+                expected_offset = expected_offset.checked_add(entry.length).unwrap();
+            }
+            let decoded_payload_bytes = decoded
+                .entries
+                .iter()
+                .map(|entry| entry.payload.len() as u64)
+                .sum::<u64>();
+            prop_assert_eq!(expected_offset, decoded_payload_bytes);
+
+            let rebuilt_entries = decoded
+                .entries
+                .iter()
+                .map(|entry| PackInputEntry {
+                    cache_key: entry.descriptor.cache_key.clone(),
+                    crate_name: entry.descriptor.crate_name.clone(),
+                    meta_digest: entry.descriptor.meta_digest.clone(),
+                    payload: entry.payload.to_vec(),
+                })
+                .collect();
+            let rebuilt = build_pack("property", rebuilt_entries, TEST_CAP).unwrap();
+            prop_assert_eq!(&rebuilt.bytes, &built.bytes);
+            prop_assert_eq!(&rebuilt.digest, &built.digest);
+        }
     }
 
     #[test]

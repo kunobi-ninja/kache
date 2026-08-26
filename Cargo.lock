@@ -2968,6 +2968,7 @@ dependencies = [
  "opendal-service-fs",
  "opendal-service-s3",
  "predicates",
+ "proptest",
  "ratatui",
  "regex",
  "reqsign-aws-v4",
@@ -3013,6 +3014,10 @@ dependencies = [
  "tempfile",
  "toml",
 ]
+
+[[package]]
+name = "kache-proofs"
+version = "0.0.0"
 
 [[package]]
 name = "kache-service"

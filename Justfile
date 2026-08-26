@@ -23,6 +23,7 @@ ci: fmt-check lint image-service-print helm-lint test-resource-guard-check cover
 [group('dev')]
 fix:
   cargo fmt --all
+  cargo fmt --manifest-path fuzz/Cargo.toml
   cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets -- -D warnings
 
 # Install kache to ~/.cargo/bin and register the daemon service.
@@ -67,11 +68,31 @@ test:
 test-resource-guard-check:
   ./scripts/test-with-test-resources.sh
 
-# Model-check the bounded planner invariants. Install the pinned verifier with:
+# Model-check the bounded planner and artifact-range invariants. Install with:
 # cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup
 [group('dev')]
 kani *ARGS:
-  cd crates/kache-core && cargo kani --all-features --output-format terse {{ARGS}}
+  cargo kani --package kache-core --package kache-proofs --all-features --output-format terse {{ARGS}}
+
+# Compile every libFuzzer target with the pinned nightly used by fuzz CI.
+# Install it with: rustup toolchain install nightly-2026-05-16 --profile minimal --component rust-src
+[group('dev')]
+fuzz-check:
+  cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
+  cargo +nightly-2026-05-16 fuzz check
+
+# Replay every committed minimized fuzz failure under ordinary stable tests.
+[group('dev')]
+fuzz-replay:
+  cargo test --locked --bin kache native_archive::tests::fuzz_regression_corpus_is_total_and_deterministic -- --exact
+
+# Generate deep valid seeds, then fuzz with explicit resource bounds.
+[group('dev')]
+fuzz-native-archive SECONDS="600":
+  cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
+  mkdir -p {{justfile_directory()}}/tmp/fuzz/native-archive-seeds
+  KACHE_FUZZ_SEED_DIR="{{justfile_directory()}}/tmp/fuzz/native-archive-seeds" cargo test --locked --bin kache native_archive::tests::emit_fuzz_seed_corpus -- --ignored --exact
+  cargo +nightly-2026-05-16 fuzz run native_archive "{{justfile_directory()}}/tmp/fuzz/native-archive-seeds" -- -max_total_time={{SECONDS}} -max_len=1048576 -rss_limit_mb=2048 -timeout=5
 
 # Mutation-test the complete hermetic planner crate. Install the pinned local
 # tool with: cargo install --locked cargo-mutants --version 27.1.0
@@ -85,10 +106,12 @@ mutants-service *ARGS:
   cargo mutants --package kache-service --all-features --baseline run --caught --timeout 300 --build-timeout 600 --output tmp/mutants/service {{ARGS}}
 
 # Mutation-test changed Rust lines outside the crates covered completely by
-# mutants-core and mutants-service. DIFF must describe the current working tree.
+# mutants-core and mutants-service. The proof-only crate runs under Kani, not
+# ordinary tests, so it is deliberately outside mutation discovery. DIFF must
+# describe the current working tree.
 [group('dev')]
 mutants-diff DIFF *ARGS:
-  ./scripts/with-test-resources.sh cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
+  ./scripts/with-test-resources.sh cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --exclude 'crates/kache-proofs/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
 
 # Audit dependencies with cargo-deny (advisories + licenses + bans +
 # sources; config and documented exceptions in `deny.toml`). Runs once
@@ -103,7 +126,7 @@ audit:
   set -euo pipefail
   # `--config` is a global option in cargo-deny 0.20 (it no longer parses
   # after the `check` subcommand).
-  for member in . crates/kache-core crates/kache-service crates/kache-e2e; do
+  for member in . crates/kache-core crates/kache-service crates/kache-e2e crates/kache-proofs fuzz; do
     echo "── cargo deny check ($member) ──"
     ( cd "{{justfile_directory()}}/$member" \
         && cargo deny --config "{{justfile_directory()}}/deny.toml" check )
@@ -260,11 +283,13 @@ lint:
 [group('dev')]
 fmt:
   cargo fmt --all
+  cargo fmt --manifest-path fuzz/Cargo.toml
 
 # Check formatting without changing files.
 [group('dev')]
 fmt-check:
   cargo fmt --all -- --check
+  cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
 # Format flake.nix and nix/ with nixfmt. Deliberately not part of `check`
 # or `ci`: nix isn't in mise.toml, so requiring it would break contributors
@@ -291,8 +316,9 @@ helm-lint:
 # (and opened locally by `coverage-open`). `--no-report` collects
 # coverage once; the two `report` invocations then emit the formats
 # from that single test run. Unlike the collection command, the `report`
-# subcommand has no `--workspace` flag, so every workspace package must be
-# selected explicitly or its instrumented objects silently disappear.
+# subcommand has no `--workspace` flag, so every workspace package is selected
+# explicitly. Kani-only packages currently add no runtime lines, but selecting
+# them ensures any future ordinary code enters the percentage automatically.
 # Collect and report coverage for the complete Cargo workspace.
 [group('coverage')]
 coverage:
@@ -301,20 +327,22 @@ coverage:
     --package kache \
     --package kache-core \
     --package kache-e2e \
+    --package kache-proofs \
     --package kache-service \
     --html --output-dir tmp/llvm-cov
   cargo llvm-cov report \
     --package kache \
     --package kache-core \
     --package kache-e2e \
+    --package kache-proofs \
     --package kache-service \
     --json --output-path tmp/llvm-cov/coverage.json
   just coverage-scope-check
 
-# Fail closed if a report omits any Cargo workspace member. This is separate
-# from the percentage threshold: an excellent percentage over an incomplete
-# package set is not workspace coverage.
-# Verify that coverage JSON contains every Cargo workspace member.
+# Fail closed if a report omits any runtime-coverage-owned Cargo workspace
+# member. This is separate from the percentage threshold: an excellent
+# percentage over an incomplete package set is not workspace coverage.
+# Verify that coverage JSON contains every runtime-coverage-owned member.
 [group('coverage')]
 coverage-scope-check COVERAGE_JSON="tmp/llvm-cov/coverage.json":
   ./scripts/check-coverage-scope.sh "{{COVERAGE_JSON}}"

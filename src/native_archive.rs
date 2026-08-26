@@ -76,6 +76,8 @@
 //! external member bytes are absent from the container. Other fallbacks bind
 //! both the archive bytes and lexical absolute archive path.
 
+use crate::checked_regions::checked_file_region;
+
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 const AR_HEADER_LEN: usize = 60;
 /// Domain tags so these schemes can never collide with the path-bound fallback,
@@ -1024,26 +1026,6 @@ fn validate_counted_region(
     Some(())
 }
 
-/// Return `(start, end)` after proving a file-offset range is representable,
-/// does not overlap the load-command area, and lies within `file_len`.
-fn checked_file_region(
-    file_len: usize,
-    offset: u64,
-    size: u64,
-    minimum_offset: usize,
-) -> Option<(usize, usize)> {
-    let start = usize::try_from(offset).ok()?;
-    let size = usize::try_from(size).ok()?;
-    if size != 0 && start < minimum_offset {
-        return None;
-    }
-    let end = start.checked_add(size)?;
-    if end > file_len {
-        return None;
-    }
-    Some((start, end))
-}
-
 fn macho_fixed_name(field: &[u8]) -> Option<&[u8]> {
     if field.len() != 16 {
         return None;
@@ -1105,6 +1087,7 @@ fn parse_ar_decimal(field: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     /// Build a 60-byte GNU `ar` header + data + even padding for one member.
     fn member(name: &str, data: &[u8]) -> Vec<u8> {
@@ -2745,5 +2728,126 @@ mod tests {
         let bytes = std::fs::read(&archive).unwrap();
         assert!(bsd_archive_hash(&bytes).is_none());
         assert!(portable_static_archive_hash(&bytes).is_none());
+    }
+
+    fn assert_portable_hash_shape(hash: &str) {
+        let digest = hash
+            .strip_prefix("gnu-ar-v2:")
+            .or_else(|| hash.strip_prefix("bsd-ar-v2:"))
+            .expect("portable archive hash has a known domain tag");
+        assert_eq!(digest.len(), 64, "portable archive hash is BLAKE3-sized");
+        assert!(
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "portable archive digest is lowercase hexadecimal"
+        );
+    }
+
+    /// Every minimized fuzz failure is committed here and replayed by ordinary
+    /// stable `cargo test`, so a regression does not depend on nightly or
+    /// libFuzzer being available in pull-request CI.
+    #[test]
+    fn fuzz_regression_corpus_is_total_and_deterministic() {
+        let corpus =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native_archive_fuzz");
+        let mut cases = std::fs::read_dir(&corpus)
+            .unwrap_or_else(|error| panic!("read {}: {error}", corpus.display()))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        cases.sort();
+        assert!(
+            !cases.is_empty(),
+            "native archive regression corpus is empty"
+        );
+
+        for case in cases {
+            let bytes = std::fs::read(&case).unwrap();
+            let first = portable_static_archive_hash(&bytes);
+            let second = portable_static_archive_hash(&bytes);
+            assert_eq!(
+                first,
+                second,
+                "non-deterministic result for {}",
+                case.display()
+            );
+            if let Some(hash) = first.as_deref() {
+                assert_portable_hash_shape(hash);
+            }
+        }
+    }
+
+    /// Export structurally deep fixtures into a temporary libFuzzer seed
+    /// corpus. The generated files are intentionally not committed: their
+    /// source-of-truth builders already live beside the parser tests.
+    #[test]
+    #[ignore = "seed generator for cargo-fuzz"]
+    fn emit_fuzz_seed_corpus() {
+        let output = PathBuf::from(
+            std::env::var_os("KACHE_FUZZ_SEED_DIR")
+                .expect("KACHE_FUZZ_SEED_DIR must name the output directory"),
+        );
+        std::fs::create_dir_all(&output).unwrap();
+
+        let elf32be = elf32be_object(b"big-endian seed payload");
+        let mut seeds = vec![
+            (
+                "gnu-short.a".to_string(),
+                archive(&[("/", SYMTAB), ("seed.o/", b"seed payload")]),
+                true,
+            ),
+            (
+                "gnu-long-name.a".to_string(),
+                archive(&[
+                    ("/", SYMTAB),
+                    ("//", b"very-long-object-name.o/\n"),
+                    ("/0", b"long-name seed payload"),
+                ]),
+                true,
+            ),
+            (
+                "gnu-elf32be.a".to_string(),
+                raw_archive(&[("sparc.o/", elf32be.as_slice())]),
+                true,
+            ),
+        ];
+
+        for (endian_name, endian) in [("little", MachEndian::Little), ("big", MachEndian::Big)] {
+            for width in [32_u8, 64] {
+                let object = macho_object(
+                    endian,
+                    width == 64,
+                    "__TEXT",
+                    "__text",
+                    0,
+                    N_SECT,
+                    b"Mach-O seed payload",
+                );
+                seeds.push((
+                    format!("bsd-{endian_name}-{width}.a"),
+                    bsd_archive(&[("seed.o", 16, object.as_slice())]),
+                    true,
+                ));
+            }
+        }
+        seeds.push((
+            "truncated-member.a".to_string(),
+            b"!<arch>\nX".to_vec(),
+            false,
+        ));
+
+        for (name, bytes, should_parse) in seeds {
+            let parsed = portable_static_archive_hash(&bytes);
+            assert_eq!(
+                parsed.is_some(),
+                should_parse,
+                "seed {name} did not exercise the expected parser path"
+            );
+            if let Some(hash) = parsed.as_deref() {
+                assert_portable_hash_shape(hash);
+            }
+            std::fs::write(output.join(name), bytes).unwrap();
+        }
     }
 }

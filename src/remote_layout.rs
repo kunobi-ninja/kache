@@ -733,7 +733,9 @@ mod tests {
         DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS, RemoteConfig,
     };
     use crate::remote_backend::{GetObject, RemoteBackend, memory_backend};
-    use crate::store::{EntryMeta, Store};
+    use crate::store::{CachedFile, EntryMeta, Store};
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
     #[test]
@@ -844,6 +846,98 @@ mod tests {
         let dir = std::path::Path::new("/store/blobs");
         let _ = blob_path(dir, "a");
         let _ = blob_path(dir, "");
+    }
+
+    fn arbitrary_artifacts() -> impl Strategy<Value = BTreeMap<u16, Vec<u8>>> {
+        proptest::collection::btree_map(
+            any::<u16>(),
+            proptest::collection::vec(any::<u8>(), 0..8193),
+            2..7,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 12,
+            max_shrink_iters: 64,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn property_v3_pack_round_trips_multiple_binary_artifacts(
+            artifacts in arbitrary_artifacts(),
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let entry_dir = tmp.path().join("entry");
+            let blobs_dir = tmp.path().join("blobs");
+            let restored_dir = tmp.path().join("restored");
+            std::fs::create_dir_all(&entry_dir).unwrap();
+
+            let mut files = Vec::with_capacity(artifacts.len());
+            for (id, contents) in &artifacts {
+                let name = format!("artifact_{id}.bin");
+                let hash = blake3::hash(contents).to_hex().to_string();
+                let path = blob_path(&blobs_dir, &hash);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, contents).unwrap();
+                files.push(CachedFile {
+                    name,
+                    size: contents.len() as u64,
+                    hash,
+                    executable: false,
+                });
+            }
+
+            let meta = EntryMeta {
+                cache_key: blake3::hash(b"property-v3-entry").to_hex().to_string(),
+                key_schema: crate::cache_key::CACHE_KEY_VERSION,
+                crate_name: "property_crate".to_string(),
+                crate_types: vec!["lib".to_string()],
+                files,
+                stdout: String::new(),
+                stderr: String::new(),
+                features: Vec::new(),
+                target: "x86_64-unknown-linux-gnu".to_string(),
+                profile: "debug".to_string(),
+                compile_time_ms: 1,
+                emit_kinds: vec!["link".to_string()],
+            };
+            let meta_bytes = serde_json::to_vec(&meta).unwrap();
+            std::fs::write(entry_dir.join("meta.json"), &meta_bytes).unwrap();
+
+            let packed = create_entry_pack_zstd(&entry_dir, &blobs_dir, &meta, 1).unwrap();
+            let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&packed)).unwrap();
+            let original_bytes = extract_entry_pack(decoder, &restored_dir).unwrap();
+            let expected_original_bytes = meta_bytes.len() as u64
+                + artifacts
+                    .values()
+                    .map(|contents| contents.len() as u64)
+                    .sum::<u64>();
+            prop_assert_eq!(original_bytes, expected_original_bytes);
+
+            for (id, contents) in &artifacts {
+                let name = format!("artifact_{id}.bin");
+                let restored = std::fs::read(restored_dir.join(name)).unwrap();
+                prop_assert_eq!(restored.as_slice(), contents.as_slice());
+            }
+
+            let restored_meta: EntryMeta = serde_json::from_slice(
+                &std::fs::read(restored_dir.join("meta.json")).unwrap(),
+            )
+            .unwrap();
+            prop_assert_eq!(restored_meta, meta);
+
+            let actual_names = std::fs::read_dir(&restored_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<BTreeSet<_>>();
+            let mut expected_names = artifacts
+                .keys()
+                .map(|id| format!("artifact_{id}.bin"))
+                .collect::<BTreeSet<_>>();
+            expected_names.insert("meta.json".to_string());
+            prop_assert_eq!(actual_names, expected_names);
+        }
     }
 
     #[test]

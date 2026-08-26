@@ -162,6 +162,378 @@ fn fresh_src() -> (TempDir, PathBuf) {
     (dir, src)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum OracleCfgTransport {
+    Inline,
+    ResponseFile,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OracleDebugOrder {
+    EndsOff,
+    EndsOn,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OracleState {
+    cfg: &'static str,
+    cfg_transport: OracleCfgTransport,
+    debug_order: OracleDebugOrder,
+    env_value: &'static str,
+    include_value: &'static str,
+    module_a: u8,
+    module_b: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OracleCase {
+    name: &'static str,
+    before: OracleState,
+    after: OracleState,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CompileObservation {
+    status: Option<i32>,
+    stdout: Vec<u8>,
+}
+
+const ORACLE_BASE: OracleState = OracleState {
+    cfg: "oracle_a",
+    cfg_transport: OracleCfgTransport::Inline,
+    debug_order: OracleDebugOrder::EndsOff,
+    env_value: "env-a",
+    include_value: "include-a",
+    module_a: 1,
+    module_b: 2,
+};
+
+fn oracle_binary(out_dir: &Path) -> PathBuf {
+    let mut binary = out_dir.join("kache-semantic-oracle");
+    if cfg!(windows) {
+        binary.set_extension("exe");
+    }
+    binary
+}
+
+/// Materialize one generated compiler-input state and return its effective
+/// rustc arguments. Each matrix row below changes exactly one input dimension.
+fn apply_oracle_state(root: &Path, state: OracleState) -> Vec<String> {
+    std::fs::write(
+        root.join("main.rs"),
+        r#"
+mod module_a;
+mod module_b;
+
+#[cfg(oracle_a)]
+const CFG_VALUE: &str = "cfg-a";
+#[cfg(oracle_b)]
+const CFG_VALUE: &str = "cfg-b";
+
+fn main() {
+    print!(
+        "{}|{}|{}|{}|{}:{}",
+        CFG_VALUE,
+        if cfg!(debug_assertions) { "debug-on" } else { "debug-off" },
+        env!("KACHE_ORACLE_ENV"),
+        include_str!("oracle-input.txt"),
+        module_a::VALUE,
+        module_b::VALUE,
+    );
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("module_a.rs"),
+        format!("pub const VALUE: u8 = {};\n", state.module_a),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("module_b.rs"),
+        format!("pub const VALUE: u8 = {};\n", state.module_b),
+    )
+    .unwrap();
+    std::fs::write(root.join("oracle-input.txt"), state.include_value).unwrap();
+
+    let mut args = match state.cfg_transport {
+        OracleCfgTransport::Inline => vec!["--cfg".to_string(), state.cfg.to_string()],
+        OracleCfgTransport::ResponseFile => {
+            let response = root.join("oracle.rsp");
+            std::fs::write(&response, format!("--cfg\n{}\n", state.cfg)).unwrap();
+            vec![format!("@{}", response.display())]
+        }
+    };
+    match state.debug_order {
+        OracleDebugOrder::EndsOff => args.extend([
+            "-C".to_string(),
+            "debug-assertions=on".to_string(),
+            "-C".to_string(),
+            "debug-assertions=off".to_string(),
+        ]),
+        OracleDebugOrder::EndsOn => args.extend([
+            "-C".to_string(),
+            "debug-assertions=off".to_string(),
+            "-C".to_string(),
+            "debug-assertions=on".to_string(),
+        ]),
+    }
+    args
+}
+
+fn oracle_rustc_args(root: &Path, out_dir: &Path, extra: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "--crate-name".to_string(),
+        "kache_semantic_oracle".to_string(),
+        "--crate-type".to_string(),
+        "bin".to_string(),
+        "--edition".to_string(),
+        "2021".to_string(),
+        "--emit=link".to_string(),
+        "-o".to_string(),
+        oracle_binary(out_dir).display().to_string(),
+        root.join("main.rs").display().to_string(),
+    ];
+    args.extend(extra.iter().cloned());
+    args
+}
+
+fn observe_oracle_compile(
+    root: &Path,
+    out_dir: &Path,
+    state: OracleState,
+    cache_dir: Option<&Path>,
+) -> CompileObservation {
+    std::fs::create_dir_all(out_dir).unwrap();
+    let binary = oracle_binary(out_dir);
+    if binary.exists() {
+        std::fs::remove_file(&binary).unwrap();
+    }
+
+    let extra = apply_oracle_state(root, state);
+    let rustc_args = oracle_rustc_args(root, out_dir, &extra);
+    let mut command = if let Some(cache_dir) = cache_dir {
+        let config_path = isolated_config_path(cache_dir);
+        std::fs::write(
+            &config_path,
+            format!(
+                "[cache]\nlocal_only = true\nignore_env = true\ncache_executables = true\nlocal_store = {}\nruntime_dir = {}\n",
+                toml_path(cache_dir),
+                toml_path(cache_dir)
+            ),
+        )
+        .unwrap();
+        let mut command = std::process::Command::new(kache_binary());
+        command
+            .arg(rustc_path())
+            .args(&rustc_args)
+            .env("KACHE_CACHE_DIR", cache_dir)
+            .env("KACHE_CONFIG", config_path)
+            .env("KACHE_LOG", "off")
+            .env_remove("KACHE_DISABLED")
+            .env_remove("KACHE_NAMESPACE")
+            .env_remove("KACHE_BASE_DIR")
+            .env_remove("KACHE_SOCKET_PATH")
+            .env_remove("KACHE_ACTIVE")
+            .env_remove("KACHE_FAMILY_PROBE_ACTIVE");
+        command
+    } else {
+        let mut command = std::process::Command::new(rustc_path());
+        command.args(&rustc_args);
+        command
+    };
+    command
+        .current_dir(root)
+        .env("KACHE_ORACLE_ENV", state.env_value)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+
+    let output = command.output().unwrap_or_else(|error| {
+        panic!(
+            "failed to run {} oracle compile: {error}",
+            if cache_dir.is_some() {
+                "Kache"
+            } else {
+                "bare rustc"
+            }
+        )
+    });
+    assert!(
+        output.status.success(),
+        "{} oracle compile failed.\nargs: {rustc_args:?}\nstdout: {}\nstderr: {}",
+        if cache_dir.is_some() {
+            "Kache"
+        } else {
+            "bare rustc"
+        },
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let run = std::process::Command::new(&binary)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {}: {error}", binary.display()));
+    assert!(
+        run.status.success(),
+        "oracle binary failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    CompileObservation {
+        status: output.status.code(),
+        stdout: run.stdout,
+    }
+}
+
+/// A cache-key test can pass while asserting only hit/miss counters even if a
+/// different bug corrupts the materialized artifact. This matrix uses bare
+/// rustc as the semantic authority, seeds Kache with the before state, and
+/// requires the after state to both miss and behave exactly like rustc.
+#[test]
+fn generated_semantic_cache_oracle_matches_bare_rustc() {
+    build_kache();
+    let cases = [
+        OracleCase {
+            name: "cfg value",
+            before: ORACLE_BASE,
+            after: OracleState {
+                cfg: "oracle_b",
+                ..ORACLE_BASE
+            },
+        },
+        OracleCase {
+            name: "last-wins codegen order",
+            before: ORACLE_BASE,
+            after: OracleState {
+                debug_order: OracleDebugOrder::EndsOn,
+                ..ORACLE_BASE
+            },
+        },
+        OracleCase {
+            name: "same-path response contents",
+            before: OracleState {
+                cfg_transport: OracleCfgTransport::ResponseFile,
+                ..ORACLE_BASE
+            },
+            after: OracleState {
+                cfg: "oracle_b",
+                cfg_transport: OracleCfgTransport::ResponseFile,
+                ..ORACLE_BASE
+            },
+        },
+        OracleCase {
+            name: "env! value",
+            before: ORACLE_BASE,
+            after: OracleState {
+                env_value: "env-b",
+                ..ORACLE_BASE
+            },
+        },
+        OracleCase {
+            name: "include_str! contents",
+            before: ORACLE_BASE,
+            after: OracleState {
+                include_value: "include-b",
+                ..ORACLE_BASE
+            },
+        },
+        OracleCase {
+            name: "module path-to-content mapping",
+            before: ORACLE_BASE,
+            after: OracleState {
+                module_a: ORACLE_BASE.module_b,
+                module_b: ORACLE_BASE.module_a,
+                ..ORACLE_BASE
+            },
+        },
+    ];
+
+    for case in cases {
+        let workspace = TempDir::new().unwrap();
+        let plain_out = TempDir::new().unwrap();
+        let kache_out = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+
+        let plain_before =
+            observe_oracle_compile(workspace.path(), plain_out.path(), case.before, None);
+        let plain_after =
+            observe_oracle_compile(workspace.path(), plain_out.path(), case.after, None);
+        assert_ne!(
+            plain_before, plain_after,
+            "{}: bare rustc must prove the generated perturbation is semantic",
+            case.name
+        );
+
+        let kache_before = observe_oracle_compile(
+            workspace.path(),
+            kache_out.path(),
+            case.before,
+            Some(cache_dir.path()),
+        );
+        assert_eq!(
+            kache_before, plain_before,
+            "{}: cold Kache compile differs from bare rustc",
+            case.name
+        );
+        let kache_before_hit = observe_oracle_compile(
+            workspace.path(),
+            kache_out.path(),
+            case.before,
+            Some(cache_dir.path()),
+        );
+        assert_eq!(
+            kache_before_hit, plain_before,
+            "{}: warm Kache result differs from bare rustc",
+            case.name
+        );
+        assert_eq!(
+            compiled_hit_counts(cache_dir.path()),
+            (1, 1),
+            "{}: the before state must prove a real cache hit",
+            case.name
+        );
+
+        let kache_after = observe_oracle_compile(
+            workspace.path(),
+            kache_out.path(),
+            case.after,
+            Some(cache_dir.path()),
+        );
+        assert_eq!(
+            kache_after, plain_after,
+            "{}: Kache returned semantics different from bare rustc after the perturbation",
+            case.name
+        );
+        assert_eq!(
+            compiled_hit_counts(cache_dir.path()),
+            (2, 1),
+            "{}: a semantic change must compile instead of hitting the before entry",
+            case.name
+        );
+
+        let kache_after_hit = observe_oracle_compile(
+            workspace.path(),
+            kache_out.path(),
+            case.after,
+            Some(cache_dir.path()),
+        );
+        assert_eq!(
+            kache_after_hit, plain_after,
+            "{}: repeated after state differs from bare rustc",
+            case.name
+        );
+        assert_eq!(
+            compiled_hit_counts(cache_dir.path()),
+            (2, 2),
+            "{}: the changed state must itself become a deterministic hit",
+            case.name
+        );
+    }
+}
+
 /// `--check-cfg` defines the accepted cfg names and values. Tightening that
 /// set under `-D unexpected_cfgs` must run rustc and fail, never replay the
 /// success cached under the earlier accepted set.

@@ -6145,12 +6145,14 @@ async fn accept_loop(
     }
 }
 
-fn observe_connection_handler(result: std::result::Result<(), tokio::task::JoinError>) {
+fn observe_connection_handler(result: std::result::Result<(), tokio::task::JoinError>) -> bool {
     if let Err(error) = result
         && !error.is_cancelled()
     {
         tracing::warn!("connection handler task failed: {error}");
+        return true;
     }
+    false
 }
 
 /// Drain all accepted connection handlers under one deadline. Returns true if
@@ -9195,6 +9197,27 @@ mod tests {
             "a silent handler must be aborted at the drain deadline"
         );
         assert!(handlers.is_empty(), "aborted handlers must still be joined");
+    }
+
+    #[tokio::test]
+    async fn connection_handler_observation_distinguishes_panics_from_cancellation() {
+        assert!(
+            !observe_connection_handler(tokio::spawn(async {}).await),
+            "a successful handler is not anomalous"
+        );
+
+        let panicked = tokio::spawn(async { panic!("expected handler panic") }).await;
+        assert!(
+            observe_connection_handler(panicked),
+            "a handler panic must remain operationally visible"
+        );
+
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        assert!(
+            !observe_connection_handler(cancelled.await),
+            "deadline cancellation is expected and must stay quiet"
+        );
     }
 
     /// Regression for #288 (loop side): a quiet `stop` must wake the accept loop

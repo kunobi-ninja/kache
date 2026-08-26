@@ -2206,9 +2206,74 @@ impl Store {
     /// Import a restored entry into the local store.
     ///
     /// This is the format-agnostic seam future remote layouts should call.
-    /// Today it is equivalent to `import_downloaded_entry()`.
+    /// A failed import must not leave an uncommitted `meta.json` behind: daemon
+    /// download waiters use the extracted directory as a wake-up hint, and the
+    /// residue could otherwise be mistaken for a published entry. Cleanup is
+    /// serialized with Store publishers and preserves any committed generation
+    /// that won the race.
     pub fn import_restored_entry(&self, cache_key: &str) -> Result<()> {
-        self.import_downloaded_entry(cache_key)
+        match self.import_downloaded_entry(cache_key) {
+            Ok(()) => Ok(()),
+            Err(import_error) => match self.discard_uncommitted_restored_entry(cache_key) {
+                Ok(()) => Err(import_error),
+                Err(cleanup_error) => Err(import_error.context(format!(
+                    "also failed to discard uncommitted restored entry: {cleanup_error:#}"
+                ))),
+            },
+        }
+    }
+
+    /// Remove extraction residue only when no committed row owns this key.
+    ///
+    /// An immediate transaction acquires SQLite's cross-process writer lock
+    /// before the row check and keeps it through directory removal. A concurrent
+    /// publisher therefore either commits first (and is preserved) or publishes
+    /// after the stale directory is gone.
+    fn discard_uncommitted_restored_entry(&self, cache_key: &str) -> Result<()> {
+        self.discard_uncommitted_restored_entry_inner(cache_key, || {}, || {})
+    }
+
+    fn discard_uncommitted_restored_entry_inner(
+        &self,
+        cache_key: &str,
+        before_write_lock: impl FnOnce(),
+        after_write_lock: impl FnOnce(),
+    ) -> Result<()> {
+        if !crate::cache_key::is_valid_cache_key(cache_key) {
+            anyhow::bail!("refusing to discard invalid restored cache key");
+        }
+
+        // The test hooks make both sides of lock acquisition observable
+        // without weakening the production lock or relying on scheduler
+        // sleeps.
+        before_write_lock();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        after_write_lock();
+        let committed: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1 AND committed = 1)",
+            params![cache_key],
+            |row| row.get(0),
+        )?;
+        if committed == 0 {
+            let entry_dir = self.entry_dir(cache_key);
+            match fs::remove_dir_all(&entry_dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "removing uncommitted restored entry {}",
+                            entry_dir.display()
+                        )
+                    });
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Install one already-verified artifact into the content-addressed blob
@@ -8182,6 +8247,201 @@ mod tests {
             "expected 'missing file' error, got: {err}"
         );
         assert!(!store.contains("incomplete_key"));
+    }
+
+    #[test]
+    fn failed_restore_cleanup_preserves_a_concurrent_committed_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let publisher_store = Store::open(&config).unwrap();
+        let cleanup_store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"restore-cleanup-publication-race")
+            .to_hex()
+            .to_string();
+        let entry_dir = config.store_dir().join(&key);
+        let meta_json = serde_json::to_string_pretty(&EntryMeta {
+            cache_key: key.clone(),
+            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            crate_name: "published".into(),
+            crate_types: vec!["lib".into()],
+            files: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            features: Vec::new(),
+            target: String::new(),
+            profile: "dev".into(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        })
+        .unwrap();
+
+        // Hold a publisher's SQLite write transaction after materializing its
+        // meta.json but before commit. The cleanup announces the exact point at
+        // which it is about to request the same writer lock; only then does the
+        // publisher commit. This fixes the ordering without scheduler sleeps.
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(0);
+        let (cleanup_attempt_tx, cleanup_attempt_rx) = std::sync::mpsc::sync_channel(0);
+        let publisher_key = key.clone();
+        let publisher_entry_dir = entry_dir.clone();
+        let publisher_meta = meta_json.clone();
+        let publisher = std::thread::spawn(move || {
+            let tx = publisher_store.db.unchecked_transaction().unwrap();
+            tx.execute(
+                "INSERT INTO entries (cache_key, crate_name, size, committed) \
+                 VALUES (?1, 'published', 0, 1)",
+                params![publisher_key],
+            )
+            .unwrap();
+            fs::create_dir_all(&publisher_entry_dir).unwrap();
+            fs::write(publisher_entry_dir.join("meta.json"), publisher_meta).unwrap();
+            published_tx.send(()).unwrap();
+            cleanup_attempt_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("cleanup must attempt the writer lock");
+            tx.commit().unwrap();
+        });
+
+        published_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("publisher must reach its pre-commit point");
+        let cleanup_key = key.clone();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_store.discard_uncommitted_restored_entry_inner(
+                &cleanup_key,
+                || {
+                    cleanup_attempt_tx.send(()).unwrap();
+                },
+                || {},
+            )
+        });
+
+        publisher.join().unwrap();
+        cleanup
+            .join()
+            .unwrap()
+            .expect("cleanup should observe and preserve the committed winner");
+
+        let store = Store::open(&config).unwrap();
+        assert!(store.contains(&key));
+        assert_eq!(
+            fs::read_to_string(entry_dir.join("meta.json")).unwrap(),
+            meta_json,
+            "cleanup must not remove or replace the generation that committed first"
+        );
+    }
+
+    #[test]
+    fn failed_restore_cleanup_holds_the_writer_lock_through_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let cleanup_store = Store::open(&config).unwrap();
+        let contender_store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"restore-cleanup-first").to_hex().to_string();
+        let entry_dir = cleanup_store.entry_dir(&key);
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("meta.json"), b"stale restore").unwrap();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let cleanup_key = key.clone();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_store.discard_uncommitted_restored_entry_inner(
+                &cleanup_key,
+                || {},
+                || {
+                    locked_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("test must release the cleanup writer lock");
+                },
+            )
+        });
+
+        locked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cleanup must acquire its writer lock");
+        contender_store.db.busy_timeout(Duration::ZERO).unwrap();
+        let lock_error = match rusqlite::Transaction::new_unchecked(
+            &contender_store.db,
+            rusqlite::TransactionBehavior::Immediate,
+        ) {
+            Ok(transaction) => {
+                drop(transaction);
+                panic!("another publisher acquired SQLite's writer lock during cleanup");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                lock_error,
+                SqlError::SqliteFailure(code, _)
+                    if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            ),
+            "unexpected competing-writer result: {lock_error}"
+        );
+
+        release_tx.send(()).unwrap();
+        cleanup
+            .join()
+            .unwrap()
+            .expect("cleanup should remove the uncommitted residue");
+        assert!(!entry_dir.exists());
+
+        let output = dir.path().join("published.rlib");
+        fs::write(&output, b"published after cleanup").unwrap();
+        contender_store
+            .put(
+                &key,
+                "published",
+                &["rlib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(output, "published.rlib".into())],
+                "",
+                "",
+            )
+            .expect("a publisher must succeed after cleanup releases the lock");
+        assert!(contender_store.contains(&key));
+        assert!(entry_dir.join("meta.json").is_file());
+    }
+
+    #[test]
+    fn failed_restore_cleanup_accepts_an_already_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"already-missing-restore")
+            .to_hex()
+            .to_string();
+
+        assert!(!store.entry_dir(&key).exists());
+        store
+            .discard_uncommitted_restored_entry(&key)
+            .expect("an already-absent restore has nothing left to clean up");
+    }
+
+    #[test]
+    fn failed_restore_cleanup_reports_non_directory_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"non-directory-restore-residue")
+            .to_hex()
+            .to_string();
+        let entry_path = store.entry_dir(&key);
+        fs::write(&entry_path, b"not a directory").unwrap();
+
+        let error = store
+            .discard_uncommitted_restored_entry(&key)
+            .expect_err("non-directory residue must not be silently accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("removing uncommitted restored entry"),
+            "unexpected cleanup error: {error:#}"
+        );
+        assert!(entry_path.is_file());
     }
 
     #[test]

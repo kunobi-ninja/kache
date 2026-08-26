@@ -38,6 +38,7 @@ buildRustPackage {
       ../assets
       ../crates
       ../src
+      ../tests/fixtures/mock_cc_lc_all.sh
     ];
   };
 

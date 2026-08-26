@@ -3552,8 +3552,17 @@ impl Daemon {
                 .fetch_add(join_start.elapsed().as_millis() as u64, Ordering::Relaxed);
             match outcome {
                 JoinOutcome::Found => {
-                    let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
-                    return Response::found_prefetched(true, was_prefetched);
+                    // `meta.json` is only a wake-up hint: extraction writes it
+                    // before Store publication, and an import failure may leave
+                    // residue. Only a committed Store row is a cache hit.
+                    let committed = self
+                        .with_store(|store| Ok(store.contains(&req.key)))
+                        .unwrap_or(false);
+                    if committed {
+                        let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
+                        return Response::found_prefetched(true, was_prefetched);
+                    }
+                    return Response::found(false);
                 }
                 JoinOutcome::Reclaimed => reclaimed = true,
                 JoinOutcome::GaveUp => {
@@ -3582,7 +3591,11 @@ impl Daemon {
         // the claim we now hold so we don't destructively re-download over
         // the freshly published entry (#620, cross-family review finding —
         // the same re-check-under-claim defence the prefetch path uses).
-        if reclaimed && self.entry_dir_for(&req.key).join("meta.json").exists() {
+        if reclaimed
+            && self
+                .with_store(|store| Ok(store.contains(&req.key)))
+                .unwrap_or(false)
+        {
             let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
             return Response::found_prefetched(true, was_prefetched);
         }
@@ -3655,14 +3668,25 @@ impl Daemon {
                 }
                 let (import_result, import_lock_wait_ms, import_ms) =
                     self.with_store_timed(|store| store.import_restored_entry(&req.key));
-                if let Err(e) = import_result {
-                    tracing::warn!("failed to import downloaded entry {}: {e}", &req.key);
-                }
+                let import_ok = match import_result {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("failed to import downloaded entry {}: {e:#}", &req.key);
+                        false
+                    }
+                };
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 let finished_at_unix_ms = unix_time_ms();
-                self.transfer_counters
-                    .downloads_completed
-                    .fetch_add(1, Ordering::Relaxed);
+                if import_ok {
+                    self.transfer_counters
+                        .downloads_completed
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.transfer_counters
+                        .downloads_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                // The pack crossed the wire even when local publication failed.
                 self.transfer_counters
                     .bytes_downloaded
                     .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
@@ -3693,11 +3717,11 @@ impl Daemon {
                     head_checks_ms: 0,
                     blobs_skipped: dl.blobs_skipped,
                     blobs_total: dl.blobs_total,
-                    ok: true,
+                    ok: import_ok,
                     timestamp: finished_at_unix_ms / 1_000,
                 })
                 .await;
-                Response::found(true)
+                Response::found(import_ok)
             }
             Err(e) if classify_remote_error(&e) == RemoteErrorClass::Miss => {
                 // GET 404 = clean miss (#485 Phase 0). Reached when a
@@ -4598,22 +4622,34 @@ impl Daemon {
                             }
                             let (import_result, import_lock_wait_ms, import_ms) =
                                 d.with_store_timed(|store| store.import_restored_entry(&key));
-                            if let Err(e) = import_result {
-                                tracing::warn!("prefetch import failed for {}: {e}", key);
-                            }
+                            let import_ok = match import_result {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    tracing::warn!("prefetch import failed for {}: {e:#}", key);
+                                    false
+                                }
+                            };
                             let elapsed_ms = start.elapsed().as_millis() as u64;
                             let finished_at_unix_ms = unix_time_ms();
-                            d.transfer_counters
-                                .downloads_completed
-                                .fetch_add(1, Ordering::Relaxed);
+                            if import_ok {
+                                d.transfer_counters
+                                    .downloads_completed
+                                    .fetch_add(1, Ordering::Relaxed);
+                                d.prefetch_stats
+                                    .downloads_completed
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                d.transfer_counters
+                                    .downloads_failed
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            // The pack crossed the wire even when local
+                            // publication failed, so preserve byte telemetry.
                             d.transfer_counters
                                 .bytes_downloaded
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                             // Phase-0 telemetry: the prefetch-attributed subset
                             // of the transfer counters above.
-                            d.prefetch_stats
-                                .downloads_completed
-                                .fetch_add(1, Ordering::Relaxed);
                             d.prefetch_stats
                                 .bytes_downloaded
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
@@ -4622,7 +4658,7 @@ impl Daemon {
                                 .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                             // Per-plan attribution (#583 P0.5): byte-accurate
                             // downloaded set for the session summary.
-                            {
+                            if import_ok {
                                 let mut plan =
                                     d.active_plan.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Some(p) = plan.as_mut() {
@@ -4656,10 +4692,13 @@ impl Daemon {
                                 head_checks_ms: 0,
                                 blobs_skipped: dl.blobs_skipped,
                                 blobs_total: dl.blobs_total,
-                                ok: true,
+                                ok: import_ok,
                                 timestamp: finished_at_unix_ms / 1_000,
                             })
                             .await;
+                            if !import_ok {
+                                return;
+                            }
                             // Track as prefetched for PrefetchHit attribution.
                             // Bound the set: a long-lived daemon that
                             // prefetches many distinct keys would otherwise
@@ -5779,7 +5818,7 @@ fn download_join_deadline(
 /// Outcome of waiting behind another task's in-flight download of a key.
 #[derive(Debug, PartialEq, Eq)]
 enum JoinOutcome {
-    /// The leader landed the entry (meta.json exists); use it.
+    /// The leader left `meta.json`; the caller must verify committed Store state.
     Found,
     /// The leader failed and this task won the atomic re-claim: it is now
     /// the leader and MUST release the claim via [`DownloadingGuard`].
@@ -12326,6 +12365,69 @@ mod tests {
         }
     }
 
+    struct BlockingV3Backend {
+        inner: Arc<dyn crate::remote_backend::RemoteBackend>,
+        v3_get_started: tokio::sync::mpsc::UnboundedSender<u64>,
+        release_v3_get: Arc<tokio::sync::Semaphore>,
+        v3_gets: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for BlockingV3Backend {
+        async fn head(&self, key: &str) -> Result<bool> {
+            self.inner.head(key).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            if key.contains("/v3/packs/") {
+                let ordinal = self.v3_gets.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = self.v3_get_started.send(ordinal);
+                let permit = self
+                    .release_v3_get
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("v3 GET test gate closed"))?;
+                permit.forget();
+            }
+            self.inner.get(key, max_bytes).await
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+            self.inner.put(key, body, content_type).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+
+        fn describe(&self, key: &str) -> String {
+            self.inner.describe(key)
+        }
+    }
+
+    async fn wait_for_download_waiter(daemon: &Daemon, key: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let attached = {
+                    let downloading = daemon.downloading.read().await;
+                    downloading
+                        .get(key)
+                        .is_some_and(|notify| Arc::strong_count(notify) > 1)
+                };
+                if attached {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-key request must attach to the active download claim");
+    }
+
     #[tokio::test]
     async fn test_socket_remote_check_miss_with_injected_mock_client() {
         // Remote configured + an empty in-memory backend: handle_remote_check
@@ -13420,6 +13522,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_check_import_failure_is_not_reported_as_hit() {
+        // The v3 GET/extraction can succeed while local publication fails. A
+        // regular file at `store/blobs` deterministically makes the import's
+        // `create_dir_all(store/blobs/<shard>)` fail on every platform, without
+        // weakening or corrupting the otherwise-valid remote pack.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let key = test_cache_key("download-import-failure");
+        let pack = build_entry_pack(&key, "serde");
+        let entry_dir = config.store_dir().join(&key);
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        std::fs::write(config.store_dir().join("blobs"), b"not a directory").unwrap();
+
+        let client = test_remote_backend();
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(&client, &test_pack_object_key(&key, "serde"), &pack).await;
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(daemon.remote_backend.set(client).is_ok());
+
+        let response = daemon
+            .handle_remote_check(&RemoteCheckRequest {
+                key: key.clone(),
+                entry_dir: entry_dir.to_string_lossy().into_owned(),
+                crate_name: "serde".into(),
+                deadline_ms: None,
+            })
+            .await;
+
+        assert!(
+            response.ok,
+            "a cache fault must degrade to a miss: {response:?}"
+        );
+        assert_eq!(response.found, Some(false));
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_failed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .bytes_downloaded
+                .load(Ordering::Relaxed),
+            pack.len() as u64,
+            "a local import failure must not hide bytes already transferred"
+        );
+        let transfer = latest_transfer(&daemon);
+        assert!(!transfer.ok);
+        assert_eq!(transfer.compressed_bytes, pack.len() as u64);
+        assert!(
+            !entry_dir.exists(),
+            "failed extraction must not leave meta.json that a waiter can mistake for a hit"
+        );
+        assert!(!Store::open(&config).unwrap().contains(&key));
+    }
+
+    #[tokio::test]
+    async fn concurrent_remote_check_waiter_retries_after_leader_import_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let key = test_cache_key("concurrent-import-failure");
+        let pack = build_entry_pack(&key, "serde");
+        let entry_dir = config.store_dir().join(&key);
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        std::fs::write(config.store_dir().join("blobs"), b"not a directory").unwrap();
+
+        let inner = test_remote_backend();
+        put_test_object(&inner, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(&inner, &test_pack_object_key(&key, "serde"), &pack).await;
+        let (v3_started_tx, mut v3_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release_v3_get = Arc::new(tokio::sync::Semaphore::new(0));
+        let gated = Arc::new(BlockingV3Backend {
+            inner,
+            v3_get_started: v3_started_tx,
+            release_v3_get: release_v3_get.clone(),
+            v3_gets: AtomicU64::new(0),
+        });
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> = gated.clone();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend).is_ok());
+        daemon.signal_warming_complete();
+
+        let request = RemoteCheckRequest {
+            key: key.clone(),
+            entry_dir: entry_dir.to_string_lossy().into_owned(),
+            crate_name: "serde".into(),
+            deadline_ms: None,
+        };
+        let leader = {
+            let daemon = daemon.clone();
+            let request = request.clone();
+            tokio::spawn(async move {
+                daemon
+                    .handle_remote_check_leader(&request, RemoteDeadline::from_secs(10))
+                    .await
+            })
+        };
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), v3_started_rx.recv())
+                .await
+                .expect("leader must reach its gated v3 GET"),
+            Some(1)
+        );
+
+        let waiter = {
+            let daemon = daemon.clone();
+            tokio::spawn(async move {
+                daemon
+                    .handle_remote_check_leader(&request, RemoteDeadline::from_secs(10))
+                    .await
+            })
+        };
+        wait_for_download_waiter(&daemon, &key).await;
+
+        // Let the first valid pack finish. Its local import fails, releases the
+        // claim, and wakes the attached waiter. The waiter must re-claim and
+        // start a second GET; returning a hit from stale meta would skip it.
+        release_v3_get.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), v3_started_rx.recv())
+                .await
+                .expect("waiter must retry rather than report the failed leader as a hit"),
+            Some(2)
+        );
+        let leader_response = tokio::time::timeout(Duration::from_secs(5), leader)
+            .await
+            .expect("leader must finish after its GET is released")
+            .expect("leader task must not panic");
+        assert_eq!(leader_response.found, Some(false));
+
+        release_v3_get.add_permits(1);
+        let waiter_response = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must finish after its retry is released")
+            .expect("waiter task must not panic");
+        assert_eq!(waiter_response.found, Some(false));
+        assert_eq!(gated.v3_gets.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_failed
+                .load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_check_waiter_rejects_uncommitted_meta_after_leader_import_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let key = test_cache_key("waiter-uncommitted-meta");
+        let entry_dir = config.store_dir().join(&key);
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> = Arc::new(PanicOnGetBackend);
+        assert!(daemon.remote_backend.set(backend).is_ok());
+        daemon.signal_warming_complete();
+
+        // Model a leader that has the download claim and lands meta.json, but
+        // whose Store import fails before publishing a row. Keeping the residue
+        // deliberately exercises the committed-state check independently of
+        // best-effort cleanup.
+        assert!(claim_download(&daemon.downloading, &key).await.is_none());
+        let failed_leader = DownloadingGuard::new(daemon.downloading.clone(), key.clone());
+        let request = RemoteCheckRequest {
+            key: key.clone(),
+            entry_dir: entry_dir.to_string_lossy().into_owned(),
+            crate_name: "serde".into(),
+            deadline_ms: None,
+        };
+        let waiter = {
+            let daemon = daemon.clone();
+            tokio::spawn(async move {
+                daemon
+                    .handle_remote_check_leader(&request, RemoteDeadline::from_secs(10))
+                    .await
+            })
+        };
+        wait_for_download_waiter(&daemon, &key).await;
+
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        std::fs::write(entry_dir.join("meta.json"), b"{}").unwrap();
+        let store = Store::open(&config).unwrap();
+        assert!(store.import_downloaded_entry(&key).is_err());
+        assert!(entry_dir.join("meta.json").exists());
+        assert!(!store.contains(&key));
+        drop(failed_leader);
+
+        let response = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("failed leader must wake the waiter")
+            .expect("waiter task must not panic");
+        assert_eq!(
+            response.found,
+            Some(false),
+            "meta.json without a committed Store row is never a hit"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_meta_json_does_not_short_circuit_a_first_claim_leader() {
         // The under-claim meta.json re-check (#620) applies ONLY to a waiter
         // that won the re-claim after a failed leader; a first-claim leader
@@ -13611,6 +13934,114 @@ mod tests {
         assert_v3_transfer_timestamps(&latest_transfer(&daemon));
         // Nothing was imported.
         assert!(!config.store_dir().join(key).join("meta.json").exists());
+    }
+
+    #[tokio::test]
+    async fn prefetch_import_failure_is_counted_as_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let key = test_cache_key("prefetch-import-failure");
+        let pack = build_entry_pack(&key, "serde");
+        let entry_dir = config.store_dir().join(&key);
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        std::fs::write(config.store_dir().join("blobs"), b"not a directory").unwrap();
+
+        let client = test_remote_backend();
+        put_test_object(&client, &test_pack_object_key(&key, "serde"), &pack).await;
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(daemon.remote_backend.set(client).is_ok());
+        daemon.install_plan(
+            "test-session",
+            "test-plan",
+            "test",
+            std::iter::once(key.clone()),
+        );
+
+        let response = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: vec![(key.clone(), "serde".into())],
+                warm_all: false,
+            })
+            .await;
+        assert!(
+            response.ok,
+            "prefetch dispatch should remain fire-and-forget"
+        );
+
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let failed = daemon
+                    .transfer_counters
+                    .downloads_failed
+                    .load(Ordering::Relaxed);
+                let has_event = daemon
+                    .recent_transfers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .back()
+                    .is_some();
+                if failed == 1 && has_event {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "prefetch import failure was not recorded"
+        );
+
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .bytes_downloaded
+                .load(Ordering::Relaxed),
+            pack.len() as u64,
+            "a local import failure must not hide bytes already transferred"
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .bytes_downloaded
+                .load(Ordering::Relaxed),
+            pack.len() as u64
+        );
+        let transfer = latest_transfer(&daemon);
+        assert!(!transfer.ok);
+        assert_eq!(transfer.compressed_bytes, pack.len() as u64);
+        {
+            let active_plan = daemon
+                .active_plan
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                active_plan
+                    .as_ref()
+                    .expect("test plan should remain active")
+                    .downloaded
+                    .is_empty(),
+                "a failed local import must not be attributed as a plan download"
+            );
+        }
+        assert!(!daemon.prefetched_keys.read().await.contains(&key));
+        assert!(!entry_dir.exists());
+        assert!(!Store::open(&config).unwrap().contains(&key));
     }
 
     #[tokio::test]

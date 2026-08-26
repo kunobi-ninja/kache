@@ -24,7 +24,41 @@ const PROBE_SUBDIR: &str = "probes";
 /// compiler change `mtime` alone would miss. Deriving the key is a
 /// `stat`, not a process fork.
 pub fn probe_key(prober_id: &str, req: &ProbeRequest<'_>) -> Option<String> {
-    probe_key_with_env(prober_id, req, std::env::vars())
+    probe_key_with_env(
+        prober_id,
+        req,
+        std::env::vars_os().map(fingerprint_env_pair),
+    )
+}
+
+/// A `vars_os` pair as fingerprint text. Converted here rather than via
+/// `std::env::vars()`, which panics if *any* environment variable holds
+/// non-UTF-8 — even one the fingerprint would ignore.
+fn fingerprint_env_pair(
+    (name, value): (std::ffi::OsString, std::ffi::OsString),
+) -> (String, String) {
+    (fingerprint_text(name), fingerprint_text(value))
+}
+
+/// Valid UTF-8 (the only kind the fingerprinted build tools produce)
+/// passes through verbatim, so probe keys are unchanged. Non-UTF-8 text
+/// becomes a U+FFFD-tagged hex dump of its lossless encoded bytes: unlike
+/// `to_string_lossy`, distinct invalid sequences stay distinct and sort
+/// deterministically. (A valid value that textually equals such a dump
+/// could alias one — accepted: this is a probe memo key, and the worst
+/// case of the old behavior was aborting the compile.)
+fn fingerprint_text(text: std::ffi::OsString) -> String {
+    match text.into_string() {
+        Ok(utf8) => utf8,
+        Err(os) => {
+            use std::fmt::Write as _;
+            let mut out = String::from('\u{fffd}');
+            for byte in os.as_encoded_bytes() {
+                let _ = write!(out, "{byte:02x}");
+            }
+            out
+        }
+    }
 }
 
 /// Content-addressed key for a probe evaluated against an explicit
@@ -247,6 +281,33 @@ mod tests {
             key_args: &[],
             per_tu_paths: &[],
             windows_aware: true,
+        }
+    }
+
+    #[test]
+    fn fingerprint_env_pair_passes_utf8_verbatim_and_keeps_invalid_distinct() {
+        use std::ffi::OsString;
+        assert_eq!(
+            fingerprint_env_pair((OsString::from("SDKROOT"), OsString::from("/sdk"))),
+            ("SDKROOT".to_string(), "/sdk".to_string())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            // The shape that made `std::env::vars()` panic mid-key. Two
+            // different invalid values must stay two different
+            // fingerprints (lossy conversion would merge them).
+            let a = fingerprint_env_pair((
+                OsString::from_vec(vec![b'x', 0xff]),
+                OsString::from_vec(vec![b'x', 0xff]),
+            ));
+            let b = fingerprint_env_pair((
+                OsString::from_vec(vec![b'x', 0xfe]),
+                OsString::from_vec(vec![b'x', 0xfe]),
+            ));
+            assert_ne!(a, b);
+            assert!(a.0.starts_with('\u{fffd}'));
+            assert_eq!(a.1, "\u{fffd}78ff");
         }
     }
 

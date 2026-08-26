@@ -1158,25 +1158,12 @@ mod tests {
     #[test]
     fn probe_spawns_pin_lc_all_c() {
         let temp = TempDir::new().unwrap();
-        let log_file = temp.path().join("lc_all.log");
-        let script_body = format!(
-            r#"printf '%s\n' "$LC_ALL" >> "{log}"
-if [ "$1" = "--version" ]; then
-    echo "mock-cc 1.0"
-    exit 0
-fi
-if [ "$1" = "-###" ]; then
-    echo ' /usr/lib/gcc/cc1 -quiet -O2 foo.c -o foo.s' >&2
-    exit 0
-fi
-if [ "$1" = "-E" ]; then
-    echo 'KACHE_PROBE_GNU'
-    exit 0
-fi
-exit 0"#,
-            log = log_file.display()
-        );
-        let script = create_mock_probe_script(temp.path(), "mock_cc", &script_body);
+        let _cache_guard = set_test_cache_dir(temp.path());
+        // This fixture is checked in, not written immediately before exec.
+        // Runtime-created scripts can race another test's fork and fail with
+        // ETXTBSY under coverage even after the writer itself is closed.
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mock_cc_lc_all.sh");
         let compiler = script.to_str().unwrap();
 
         let req = ProbeRequest {
@@ -1201,11 +1188,7 @@ exit 0"#,
             other => panic!("expected Resolved diagnostic, got: {other:?}"),
         }
 
-        let recorded = std::fs::read_to_string(&log_file).unwrap();
-        let lines: Vec<&str> = recorded.lines().collect();
-        assert!(!lines.is_empty(), "expected compiler to be spawned");
-        for line in &lines {
-            assert_eq!(*line, "C", "expected LC_ALL=C, got: {line}");
-        }
+        // The fixture exits non-zero unless every spawn pins LC_ALL=C, so
+        // reaching each successful assertion above proves the environment.
     }
 }

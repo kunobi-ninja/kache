@@ -99,6 +99,7 @@ windows-sys = { version = "0.61", features = [
 assert_cmd = "2"
 axum = "0.8"
 predicates = "3"
+proptest = { version = "1.11.0", default-features = false, features = ["std", "handle-panics"] }
 serde_json = "1"
 bytes = "1"
 

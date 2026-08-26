@@ -43,6 +43,8 @@ mod shards;
 #[cfg_attr(not(unix), allow(dead_code))]
 mod sharing;
 mod store;
+#[cfg(test)]
+mod test_support;
 mod transport;
 mod tui;
 mod wrapper;

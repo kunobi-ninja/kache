@@ -965,6 +965,120 @@ fn record_codegen_opt(parsed: &mut RustcArgs, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::process_state_test_lock;
+    use proptest::prelude::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RustcArgsFingerprint {
+        rustc: PathBuf,
+        crate_name: Option<String>,
+        crate_types: Vec<String>,
+        output: Option<PathBuf>,
+        out_dir: Option<PathBuf>,
+        emit: Vec<String>,
+        dep_info_output: Option<PathBuf>,
+        source_file: Option<PathBuf>,
+        externs: Vec<(String, Option<PathBuf>)>,
+        target: Option<String>,
+        edition: Option<String>,
+        codegen_opts: Vec<(String, Option<String>)>,
+        features: Vec<String>,
+        cfgs: Vec<String>,
+        extra_filename: Option<String>,
+        incremental: Option<PathBuf>,
+        sysroot: Option<PathBuf>,
+        link_search: Vec<String>,
+        link_libs: Vec<String>,
+        unstable_flags: Vec<String>,
+        remap_path_prefixes: Vec<String>,
+        inner_rustc: Option<PathBuf>,
+        all_args: Vec<String>,
+        residual_args: Vec<String>,
+        outcome_lint_flags: Vec<String>,
+        is_test: bool,
+        is_primary: bool,
+        path_normalize_disabled: bool,
+        path_normalization_root: Option<PathBuf>,
+        executable_output: bool,
+        user_facing_executable: bool,
+        workspace_root: Option<PathBuf>,
+        target_dir: Option<PathBuf>,
+        output_stem: Option<String>,
+        dep_info_path: Option<PathBuf>,
+        checksum_freshness: bool,
+        unit_id: Option<String>,
+        coverage_instrumentation: bool,
+        skip_path_remap: bool,
+    }
+
+    fn semantic_fingerprint(parsed: &RustcArgs) -> RustcArgsFingerprint {
+        RustcArgsFingerprint {
+            rustc: parsed.rustc.clone(),
+            crate_name: parsed.crate_name.clone(),
+            crate_types: parsed.crate_types.clone(),
+            output: parsed.output.clone(),
+            out_dir: parsed.out_dir.clone(),
+            emit: parsed.emit.clone(),
+            dep_info_output: parsed.dep_info_output.clone(),
+            source_file: parsed.source_file.clone(),
+            externs: parsed
+                .externs
+                .iter()
+                .map(|dependency| (dependency.name.clone(), dependency.path.clone()))
+                .collect(),
+            target: parsed.target.clone(),
+            edition: parsed.edition.clone(),
+            codegen_opts: parsed.codegen_opts.clone(),
+            features: parsed.features.clone(),
+            cfgs: parsed.cfgs.clone(),
+            extra_filename: parsed.extra_filename.clone(),
+            incremental: parsed.incremental.clone(),
+            sysroot: parsed.sysroot.clone(),
+            link_search: parsed.link_search.clone(),
+            link_libs: parsed.link_libs.clone(),
+            unstable_flags: parsed.unstable_flags.clone(),
+            remap_path_prefixes: parsed.remap_path_prefixes.clone(),
+            inner_rustc: parsed.inner_rustc.clone(),
+            all_args: parsed.all_args.clone(),
+            residual_args: parsed.residual_args.clone(),
+            outcome_lint_flags: parsed.outcome_lint_flags.clone(),
+            is_test: parsed.is_test,
+            is_primary: parsed.is_primary,
+            path_normalize_disabled: parsed.path_normalize_disabled,
+            path_normalization_root: parsed.path_normalization_root().map(Path::to_path_buf),
+            executable_output: parsed.is_executable_output(),
+            user_facing_executable: parsed.is_user_facing_executable(),
+            workspace_root: parsed.workspace_root(),
+            target_dir: parsed.target_dir(),
+            output_stem: parsed.output_stem(),
+            dep_info_path: parsed.dep_info_path(),
+            checksum_freshness: parsed.checksum_freshness_enabled(),
+            unit_id: parsed.unit_id(),
+            coverage_instrumentation: parsed.has_coverage_instrumentation(),
+            skip_path_remap: parsed.skip_path_remap(),
+        }
+    }
+
+    fn response_file_extra_args() -> impl Strategy<Value = Vec<String>> {
+        proptest::collection::vec(any::<u8>(), 0..17).prop_map(|choices| {
+            choices
+                .into_iter()
+                .enumerate()
+                .flat_map(|(index, choice)| match choice % 8 {
+                    0 => vec!["-C".to_string(), format!("codegen-units={}", index + 1)],
+                    1 => vec!["--cfg".to_string(), format!("property_cfg_{index}")],
+                    2 => vec![format!("--extern=dep{index}=/tmp/libdep{index}.rlib")],
+                    3 => vec![format!("-Lnative=/tmp/native-{index}")],
+                    4 => vec![format!("-lstatic=property_{index}")],
+                    5 => vec!["-Z".to_string(), format!("property-option-{index}")],
+                    6 => vec![format!(
+                        "--remap-path-prefix=/tmp/property-{index}=/kache/{index}"
+                    )],
+                    _ => vec![format!("--future-kache-flag={index}")],
+                })
+                .collect()
+        })
+    }
 
     /// Outcome-affecting lint configuration must be captured exactly — flag AND
     /// value, separated and attached spellings — and must not leak into the
@@ -1280,6 +1394,57 @@ mod tests {
             let parsed = RustcArgs::parse(&raw).unwrap();
             assert!(parsed.argfile_expansion_failed(), "argument: {argument:?}");
             assert_eq!(parsed.all_args, raw[1..], "argument: {argument:?}");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            max_shrink_iters: 128,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn property_response_file_and_direct_argv_parse_identically(
+            extra_args in response_file_extra_args(),
+        ) {
+            let _process_state = process_state_test_lock();
+            let dir = tempfile::tempdir().unwrap();
+            let response = dir.path().join("rustc.args");
+            let mut effective_args = vec![
+                "--crate-name".to_string(),
+                "property_response".to_string(),
+                "--crate-type=lib".to_string(),
+                "--emit=dep-info,metadata,link".to_string(),
+                "--out-dir".to_string(),
+                "target/debug/deps".to_string(),
+                "input.rs".to_string(),
+                "-C".to_string(),
+                "opt-level=2".to_string(),
+                "--color".to_string(),
+                "always".to_string(),
+                "-Dwarnings".to_string(),
+                "  spaced residual  ".to_string(),
+            ];
+            effective_args.extend(extra_args);
+            std::fs::write(&response, format!("{}\n", effective_args.join("\n"))).unwrap();
+
+            let mut direct_argv = vec!["rustc".to_string()];
+            direct_argv.extend(effective_args.clone());
+            let response_arg = format!("@{}", response.display());
+            let response_argv = vec!["rustc".to_string(), response_arg.clone()];
+
+            let direct = RustcArgs::parse(&direct_argv).unwrap();
+            let expanded = RustcArgs::parse(&response_argv).unwrap();
+
+            prop_assert!(!direct.has_expanded_argfiles());
+            prop_assert!(!direct.argfile_expansion_failed());
+            prop_assert!(expanded.has_expanded_argfiles());
+            prop_assert!(!expanded.argfile_expansion_failed());
+            prop_assert_eq!(&expanded.all_args, &effective_args);
+            prop_assert_eq!(direct.raw_args(), effective_args.as_slice());
+            prop_assert_eq!(expanded.raw_args(), &[response_arg]);
+            prop_assert_eq!(semantic_fingerprint(&direct), semantic_fingerprint(&expanded));
         }
     }
 

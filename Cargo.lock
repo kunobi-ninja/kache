@@ -2968,6 +2968,7 @@ dependencies = [
  "opendal-service-fs",
  "opendal-service-s3",
  "predicates",
+ "proptest",
  "ratatui",
  "regex",
  "reqsign-aws-v4",

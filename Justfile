@@ -23,6 +23,7 @@ ci: fmt-check lint image-service-print helm-lint test-resource-guard-check cover
 [group('dev')]
 fix:
   cargo fmt --all
+  cargo fmt --manifest-path fuzz/Cargo.toml
   cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets -- -D warnings
 
 # Install kache to ~/.cargo/bin and register the daemon service.
@@ -73,6 +74,26 @@ test-resource-guard-check:
 kani *ARGS:
   cargo kani --package kache-core --package kache-proofs --all-features --output-format terse {{ARGS}}
 
+# Compile every libFuzzer target with the pinned nightly used by fuzz CI.
+# Install it with: rustup toolchain install nightly-2026-05-16 --profile minimal --component rust-src
+[group('dev')]
+fuzz-check:
+  cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
+  cargo +nightly-2026-05-16 fuzz check
+
+# Replay every committed minimized fuzz failure under ordinary stable tests.
+[group('dev')]
+fuzz-replay:
+  cargo test --locked --bin kache native_archive::tests::fuzz_regression_corpus_is_total_and_deterministic -- --exact
+
+# Generate deep valid seeds, then fuzz with explicit resource bounds.
+[group('dev')]
+fuzz-native-archive SECONDS="600":
+  cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1 >/dev/null
+  mkdir -p {{justfile_directory()}}/tmp/fuzz/native-archive-seeds
+  KACHE_FUZZ_SEED_DIR="{{justfile_directory()}}/tmp/fuzz/native-archive-seeds" cargo test --locked --bin kache native_archive::tests::emit_fuzz_seed_corpus -- --ignored --exact
+  cargo +nightly-2026-05-16 fuzz run native_archive "{{justfile_directory()}}/tmp/fuzz/native-archive-seeds" -- -max_total_time={{SECONDS}} -max_len=1048576 -rss_limit_mb=2048 -timeout=5
+
 # Mutation-test the complete hermetic planner crate. Install the pinned local
 # tool with: cargo install --locked cargo-mutants --version 27.1.0
 [group('dev')]
@@ -105,7 +126,7 @@ audit:
   set -euo pipefail
   # `--config` is a global option in cargo-deny 0.20 (it no longer parses
   # after the `check` subcommand).
-  for member in . crates/kache-core crates/kache-service crates/kache-e2e crates/kache-proofs; do
+  for member in . crates/kache-core crates/kache-service crates/kache-e2e crates/kache-proofs fuzz; do
     echo "── cargo deny check ($member) ──"
     ( cd "{{justfile_directory()}}/$member" \
         && cargo deny --config "{{justfile_directory()}}/deny.toml" check )
@@ -262,11 +283,13 @@ lint:
 [group('dev')]
 fmt:
   cargo fmt --all
+  cargo fmt --manifest-path fuzz/Cargo.toml
 
 # Check formatting without changing files.
 [group('dev')]
 fmt-check:
   cargo fmt --all -- --check
+  cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
 # Format flake.nix and nix/ with nixfmt. Deliberately not part of `check`
 # or `ci`: nix isn't in mise.toml, so requiring it would break contributors

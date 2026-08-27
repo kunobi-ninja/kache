@@ -9587,13 +9587,23 @@ mod tests {
 
         let content = b"identical artifact content shared across all entries";
 
+        // Same Windows-runner caveat as test_concurrent_put_remove_never_dangles:
+        // this proves refcount consistency, not the production five-second
+        // fail-fast. Eight WAL writers on a two-core hosted Windows runner
+        // queue past 5s and surface SQLITE_BUSY (v0.16.1 tag CI).
+        let stores: Vec<_> = (0..N)
+            .map(|_| {
+                let store = Store::open(&config).unwrap();
+                store.db.busy_timeout(Duration::from_secs(30)).unwrap();
+                store
+            })
+            .collect();
+
         let mut handles = Vec::new();
-        for i in 0..N {
-            let config = test_config(dir.path());
+        for (i, store) in stores.into_iter().enumerate() {
             let src = dir.path().join(format!("art-{i}.rlib"));
             std::fs::write(&src, content).unwrap();
             handles.push(std::thread::spawn(move || {
-                let store = Store::open(&config).unwrap();
                 store
                     .put(
                         &format!("key{i}"),

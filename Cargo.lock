@@ -2940,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "kache"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2991,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "kache-core"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "kache-e2e"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3017,11 +3017,11 @@ dependencies = [
 
 [[package]]
 name = "kache-proofs"
-version = "0.0.0"
+version = "0.16.1"
 
 [[package]]
 name = "kache-service"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "async-trait",

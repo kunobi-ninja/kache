@@ -1,119 +1,61 @@
 ---
-title: Lifecycle
-description: Starting, stopping, installing as a service, and how the daemon handles binary updates.
+title: Daemon lifecycle
+description: Start, stop, install, update, and troubleshoot the daemon
 ---
 
-# Lifecycle
+## Commands
 
-## Starting and stopping
-
-```sh
-kache daemon start      # start in background, blocks until the socket is ready
-kache daemon stop       # graceful shutdown (drains pending uploads, up to 30s)
-kache daemon restart    # restart in place (service-manager kickstart, else stop + fresh spawn)
-kache daemon            # status: binary version/epoch, service install state, running/stopped, socket path, log location, and (if running) the daemon's version/epoch
-kache daemon log        # stream the daemon log (follows like tail -f)
+```bash
+kache daemon             # status
+kache daemon start       # background process; waits for readiness
+kache daemon stop        # graceful drain, bounded to 30 seconds
+kache daemon restart     # service-manager restart or manual replacement
+kache daemon run         # foreground process
+kache daemon log         # follow logs
 ```
 
-`kache daemon restart` recovers a wedged daemon in three tiers: it first asks the service manager (launchd/systemd) to kickstart it, then falls back to killing any lingering `kache daemon run` processes and wiping stale socket/lock/state files, then spawns a fresh background daemon.
+Use `KACHE_LOG=kache=debug kache daemon run` for foreground debugging.
 
-`kache daemon run` starts the daemon in the foreground. This is mostly useful for debugging. By default only warnings and errors print to stderr; set `KACHE_LOG=kache=info` (or `kache=debug`) for verbose daemon logs.
+## Install a login service
 
-## Installing as a system service
+```bash
+kache daemon install
+```
 
-For the daemon to survive reboots and start automatically, install it as a system service.
+On macOS this installs `~/Library/LaunchAgents/ninja.kunobi.kache.plist`. On Linux it installs and enables the `kache.service` systemd user unit.
 
-<Tabs items={["macOS (launchd)", "Linux (systemd)"]}>
-  <Tab value="macOS (launchd)">
-    ```sh
-    kache daemon install
-    ```
+Remove either service with:
 
-    This creates a launchd plist at `~/Library/LaunchAgents/ninja.kunobi.kache.plist` and loads it. The daemon will start on login and restart if it crashes.
+```bash
+kache daemon uninstall
+```
 
-    On macOS 15 and newer, the first connection to a cache server on the local
-    network may show a **Local Network** permission prompt for kache. Allow it;
-    you can review the decision later under **System Settings > Privacy &
-    Security > Local Network**. Kache embeds the usage description in its binary
-    and associates the LaunchAgent with that identity.
+On current macOS releases, the first connection to a LAN cache endpoint may ask for Local Network permission. If an older service installation reports `No route to host`, reinstall it with the current Kache binary.
 
-    If an older installation instead logs `No route to host (os error 65)` for
-    a LAN endpoint, reinstall the service with the current binary. As a safe
-    fallback, `kache daemon uninstall` lets the next terminal build start an
-    on-demand daemon under the terminal's Local Network permission.
+## Updates and config changes
 
-    To remove it:
+The daemon records the running binary's build epoch. A newer client asks an older daemon to drain and exit. The service manager restarts installed services; otherwise later background work starts a fresh daemon.
 
-    ```sh
-    kache daemon uninstall
-    ```
-  </Tab>
-  <Tab value="Linux (systemd)">
-    ```sh
-    kache daemon install
-    ```
-
-    This creates a systemd user unit (`kache.service`) and enables it. The daemon runs under your user session.
-
-    ```sh
-    systemctl --user status kache.service
-    journalctl --user -u kache.service   # logs (or use `kache daemon log`)
-    ```
-
-    To remove it:
-
-    ```sh
-    kache daemon uninstall
-    ```
-  </Tab>
-</Tabs>
-
-## Automatic restart on binary update
-
-When you update kache, the old daemon and the new wrapper would disagree on RPC protocol versions. kache handles this automatically.
-
-Each process tracks a **build epoch** — the modification time of the kache binary. The daemon reads the client's epoch from incoming Upload/Stats/BuildStarted requests; when a client binary is newer, the daemon sets its own shutdown flag and self-terminates once in-flight work drains. If it was installed as a service, launchd/systemd restarts it with the new binary; otherwise the next upload or CLI/monitor command auto-starts it. The next RPC call hits the fresh daemon. You never need to manually restart the daemon after an update.
-
-The daemon applies the same self-restart to **config changes**. It loads its config once at startup, so it periodically re-fingerprints the active config file; when the file changes on disk (e.g. you edit `local_max_size`), it schedules the same graceful restart and comes back up with the new config — no manual `kache daemon stop` needed. Only the config *file* is watched: a running process's environment is fixed, so `KACHE_*` env overrides apply only to freshly started daemons. A manually managed daemon must be stopped and started from the intended environment. An installed service inherits its service definition, not the shell that invokes `kache daemon restart`.
-
-<Callout type="info">
-Restarting the daemon adds no latency to in-progress rustc invocations: the remote-check hot path never starts the daemon (it skips straight to compilation on a miss). Only the background upload path will lazily (re)start a downed daemon.
-</Callout>
+The daemon also fingerprints the active config file and restarts after it changes. Environment is fixed at process start, so changing an export requires a daemon started from the new environment. An installed service uses its stored environment.
 
 ## Idle shutdown
 
-The daemon runs indefinitely by default. You can opt into automatic shutdown after a stretch with no connections; it is re-spawned on the next build.
+The default idle timeout is disabled:
 
 ```toml
-# config.toml
 [cache]
-daemon_idle_timeout_secs = 600   # opt into exit after 10 min idle; 0 disables
+daemon_idle_timeout_secs = 600
 ```
 
-You can also set `KACHE_DAEMON_IDLE_TIMEOUT` (seconds). **The default is `0`, which disables the watchdog.** Set it to a positive number to opt into idle shutdown; otherwise the daemon runs until you stop it, the binary updates, or the OS signals it.
-
-## Lifecycle internals
-
-A few behaviors worth knowing about:
-
-- **Single instance**: a second `kache daemon run` exits cleanly (code 0) if another process holds the run lock or the socket is already live, so launchd/systemd `KeepAlive` won't loop. Stale socket files are removed on startup when nothing is listening.
-- **Background log file**: auto-started daemons write stderr to `<socket>.log` next to the daemon socket (under `KACHE_RUNTIME_DIR` unless `KACHE_SOCKET_PATH` overrides it). It is reset to a `--- log rotated ---` marker once it grows past 2 MiB. `kache daemon log` tails this file.
-- **Graceful drain**: on shutdown the daemon closes its upload queue and waits up to 30 s for in-flight remote uploads to finish before aborting workers.
+The equivalent environment variable is `KACHE_DAEMON_IDLE_TIMEOUT`. A later build can start the daemon again.
 
 ## Offline behavior
 
-If the daemon is down or unreachable when the wrapper makes an RPC call, the wrapper continues without it. This affects:
+When the daemon cannot be reached:
 
-- **Remote checks**: skipped — the wrapper goes straight to compilation on a local miss
-- **Upload jobs**: the wrapper records each validated intent under `<cache_dir>/upload-queue` before sending it. First publication is create-only and serialized with GC; the daemon idempotently reuses that durable file. Every GC policy keeps the intent's local payload until the daemon retires the file after confirming the object is present. The daemon replays remaining intents after restart and defers availability failures without failing the build.
-- **Prefetch**: skipped for the current build session
+- local hits and local stores continue
+- exact remote checks and prefetch are skipped
+- validated upload intents remain in `<cache_dir>/upload-queue`
+- a later daemon replays queued uploads before retiring their files
 
-The monitor shows `daemon: offline` when the daemon hasn't responded in the last refresh cycle. Common causes:
-
-| Symptom | Likely cause |
-|---|---|
-| `daemon: offline` after reboot | Service not installed, or install is user-scoped and session hasn't started |
-| `daemon: offline` after update | Epoch mismatch restart in progress — wait a second and refresh |
-| `daemon: offline` continuously | Check `kache daemon log` for startup errors |
-
-When the monitor shows `daemon: offline`, it falls back to reading the local store and event log directly, so the Build and Store tabs still show accurate data.
+The monitor falls back to direct store and event-log reads. Check `kache daemon log` when it remains offline.

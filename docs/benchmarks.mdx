@@ -1,95 +1,71 @@
 ---
 title: Benchmarks and reports
-description: Run real cold/warm benchmark scenarios, compare kache with sccache, and inspect native reports and Perfetto traces.
+description: Measure cold, local-hit, remote-hit, and cross-checkout behavior
 ---
 
-# Benchmarks and reports
+The repository benchmark harness builds real projects in separate checkouts. This tests wall time and whether path normalization produces portable keys.
 
-`kache-scenario` runs real projects through the shape kache is built for:
+## Nightly benchmark matrix
 
-1. Build a fresh checkout with an empty cache.
-2. Build a second checkout at a different absolute path against the populated cache.
-3. Report hit rate, speedup, storage reuse, key stability, passthrough reasons, and logs.
+The [Bench workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) is scheduled every night at 04:37 UTC. It runs:
 
-This catches both performance wins and portability failures. A cache key that
-accidentally depends on the checkout path will miss in the warm build.
+- Firefox cold/warm builds on Linux and Windows
+- LLVM, Substrate, and SurrealDB cold/warm builds
+- Firefox through sccache for comparison
+- Firefox source-update builds on Linux and Windows
 
-## Run a benchmark
+Jobs upload their reports, Perfetto traces, and logs even when a benchmark fails. GitHub retains those artifacts for 30 days.
 
-```sh
-just bench                 # list kache-backed benchmark profiles
-just bench firefox         # full cold + warm Firefox benchmark
-just bench substrate       # Rust-heavy polkadot-sdk benchmark
-just bench llvm            # almost-pure C/C++ CMake benchmark
-just bench-retry firefox   # restore the cold snapshot, re-measure warm only
-just bench-trace firefox   # also emit key-diff.{json,md}
+A scheduled run is not automatically a valid result. Check that the individual job succeeded and that its benchmark verdict is `ok` before using its timing or hit-rate numbers.
 
-just bench-sccache         # list sccache-backed benchmark profiles
-just bench-sccache firefox # same Firefox shape, with sccache
+## Run a scenario
+
+```bash
+just bench                 # list Kache scenarios
+just bench firefox
+just bench substrate
+just bench llvm
+just bench-retry firefox   # reuse the saved cold state
+just bench-trace firefox   # include key-diff artifacts
+
+just bench-sccache
+just bench-sccache firefox
 ```
 
-Benchmarks are intentionally large. Firefox is a mixed Rust + C/C++ build that
-runs for tens of minutes to hours and needs roughly 50 GB of scratch; substrate
-is Rust-heavy and lighter. Run them sequentially on an otherwise quiet host;
-concurrent builds make wall-clock results noisy.
+Firefox is a large mixed Rust/C++ workload and needs about 50 GB of scratch space. Run benchmark builds sequentially on an otherwise quiet host.
 
-## Is it working?
+## Trust the verdict first
 
-The headline numbers (cold/warm wall-clock, speedup, and hit rate) live in the
-`<scenario>.json` summary, but they are only meaningful when the run's
-`verdict` is `ok`. A `DEGRADED RUN` verdict means a guard tripped: a key leaked
-across checkouts, a clone missed for a non-path reason, or sccache changed cache
-location between phases. Treat the speedup as suspect until the listed issues are
-addressed. Check the verdict first, then the speedup.
+Each summary has a `verdict`. Use timing and hit-rate results only when it is `ok`. A degraded verdict can mean checkout-path leakage, an unexpected miss, or inconsistent cache placement.
 
-## Read the output
+Compare medians from several runs. Keep repository revision, toolchain, machine, target, profile, and remote location fixed.
 
-Each scenario writes its latest artifacts under `tmp/bench/<scenario>/`:
+## Output
 
-- `report-{cold,warm}.json` and `.md` from `kache report`
-- `trace-{cold,warm}.json` for Perfetto or Chrome trace viewer
-- `build-{cold,warm}.log` and `wrapper-{cold,warm}.log`
-- `<scenario>.json`, the summary including the cache tool version
-- `key-diff.{json,md}` when `just bench-trace` is used
-- `report-*.sccache.json` and `report-*.sccache-adv.txt` for sccache runs
+Latest artifacts are under `tmp/bench/<scenario>/`:
 
-Root-level artifacts are overwritten by the next run so `--retry` can find the
-latest cold snapshot. Completed runs are also archived under:
+- cold and warm JSON/Markdown reports
+- Perfetto-compatible trace files
+- build and wrapper logs
+- scenario summary with tool version
+- optional key-diff JSON and Markdown
+- sccache reports for comparison runs
 
-```text
-tmp/bench/<scenario>/runs/<YYYYMMDDTHHMMSSZ>-<backend>-<pid>/
+Completed runs are archived below `tmp/bench/<scenario>/runs/` so later runs do not erase the evidence.
+
+## Reports outside the harness
+
+```bash
+kache report --format text --since 24h
+kache report --format json --output report.json
+kache report --format trace --output trace.json
+kache report --format markdown --root "$PWD"
 ```
 
-That keeps repeated kache and sccache measurements side by side.
-
-## Perfetto traces
-
-`trace-cold.json` and `trace-warm.json` are native Chrome/Perfetto trace files.
-They contain complete events with kache timing, result, route, reason, cache key,
-artifact size, and compiler/preprocessor/probe counts.
-
-External build-system traces can be merged into the same Perfetto view when they
-share, or are normalized to, the same timebase. They are useful for target-level
-context, but kache's own hit/miss timeline does not depend on another tracing
-tool.
-
-## sccache comparison
-
-`just bench-sccache firefox` runs the same Firefox cold/warm shape through
-sccache. The harness uses an isolated sccache daemon and cache directory, then
-checks the reported cache location and base-dir settings before trusting the
-numbers. If cold and warm phases use different sccache cache locations, the run
-is invalid.
+`trace`, `perfetto`, and `chrome-trace` produce the same trace format. Open it in Perfetto or Chrome's trace viewer.
 
 ## Add a workload
 
-Benchmarks are scenario files under `scenarios/bench-*`. A scenario declares the
-repo/ref, wrapper wiring, setup, build command, tags, and optional patch files.
-Adding a workload is a new scenario directory, not a runner rewrite. The shipped
-scenarios are the worked examples: `bench-firefox` (mixed Rust + C/C++ via
-mozbuild), `bench-substrate` (Rust-only `RUSTC_WRAPPER`), and `bench-llvm`
-(almost-pure C/C++ via CMake compiler launchers).
+Benchmark definitions live under `scenarios/bench-*`. A scenario declares its repository, revision, setup, wrapper wiring, build command, and optional patches. Start from `bench-firefox`, `bench-substrate`, or `bench-llvm` and read the [scenario format](https://github.com/kunobi-ninja/kache/tree/main/scenarios#readme).
 
-See [`scenarios/README.md`](https://github.com/kunobi-ninja/kache/tree/main/scenarios#readme)
-for the scenario format, and the [`kache report`](/docs/commands/reference)
-reference for the trace and report formats these artifacts use.
+For choosing a cache before benchmarking, see [Kache or sccache?](/docs/getting-started/comparison).

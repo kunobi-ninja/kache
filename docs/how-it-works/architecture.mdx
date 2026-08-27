@@ -1,86 +1,70 @@
 ---
 title: Architecture
-description: The three pieces of kache — wrapper, store, and daemon — and how a build flows through them.
+description: How the compiler wrapper, local store, and daemon divide the work
 ---
 
-# Architecture
+Kache has three parts: a compiler wrapper, a local store, and an optional daemon.
 
-kache is made of three independent pieces that work together: the **wrapper**, the **local store**, and the **daemon**. Understanding what each one does makes it easier to configure kache correctly and diagnose problems when they appear.
+## Build path
 
-## The wrapper
+For an eligible compiler invocation, the wrapper:
 
-When cargo builds a Rust project, it invokes rustc once per compilation unit. Setting `RUSTC_WRAPPER=kache` tells cargo to call kache instead, passing the real rustc path as the first argument.
+1. parses the compiler arguments and discovers inputs
+2. computes a BLAKE3 cache key
+3. checks the local store
+4. asks the daemon for an exact remote result after a local miss
+5. takes a per-key lock and checks locally again
+6. runs the compiler if the entry is still absent
+7. stores outputs as content-addressed blobs
+8. queues a remote upload when a writable remote is configured
 
-kache detects this mode automatically: if its first argument looks like a path to rustc or `clippy-driver`, it runs as a wrapper. Otherwise it runs as the CLI.
+The second local check prevents duplicate work when another process fills the same key while this process waits for the lock.
 
-For each rustc invocation, the wrapper does this:
+| Result | Compiler ran | Meaning |
+| --- | ---: | --- |
+| `local_hit` | No | Entry was already in the local store |
+| `prefetch_hit` | No | Background prefetch had placed the entry locally |
+| `remote_hit` | No | Exact remote lookup downloaded the entry |
+| `miss` | Yes | The key and at least one output blob were new |
+| `dup` | Yes | The key was new but all output blobs already existed |
+| `passthrough` | Yes | Policy declined to cache the invocation |
 
-```
-parse args
-    ↓
-compute blake3 cache key
-    ↓
-check local store ──── hit → restore via reflink → done
-    ↓ miss
-check remote (via daemon) ── hit → restore via reflink → done
-    ↓ miss
-acquire per-key build lock
-    ↓
-re-check local store ── peer committed → restore via reflink → done
-    ↓ still absent
-run rustc
-    ↓
-store output files in content-addressed blobs
-    ↓
-send upload job to daemon (async)
-    ↓
-release lock
-```
+A `dup` is compiled work. It often means two over-specific keys produced the same bytes.
 
-The lock prevents duplicate compilation when cargo spawns multiple parallel rustc processes for the same crate (which can happen in certain workspace configurations). A process that loses the lock waits for the winner's result and restores from the cache instead of compiling. A process that acquires the lock re-checks the store before compiling, covering a peer that committed between the initial lookup and lock acquisition.
+## Local store
 
-Build outcomes are separated into three cacheable cases:
+The store contains:
 
-| Outcome | Cache key | Compiler ran? | Blob content | Meaning |
-|---|---|---:|---|---|
-| `hit` | Found | No | Already known | kache restored from an existing entry |
-| `dup` | Missed | Yes | Already known | a new key produced bytes kache already had |
-| `miss` | Missed | Yes | New | a new key produced at least one new blob |
+- `index.db`, a SQLite index of entries and their blobs
+- `store/blobs/<prefix>/<hash>`, the content-addressed output files
+- entry metadata under `store/<cache-key>/`
 
-`hit` is shown as one row, but kache records three hit kinds in the event log — `local_hit`, `prefetch_hit`, and `remote_hit` — distinguished by where the entry was found. Invocations that bypass the cache (non-primary, excluded, or a skipped executable) record a fourth outcome, `passthrough`.
+Identical output bytes share one blob. Restores first try copy-on-write cloning. Unix can use a restricted hardlink fallback for immutable artifacts; other cases copy. Executables and loadable libraries are never hardlinked because later tools may mutate them.
 
-`dup` is a cache-key/content outcome, not the same thing as the storage
-deduplication metric. A high `dup` count can point to over-specific cache keys
-or noisy inputs, because different keys are compiling to identical bytes.
+See [Deduplication](/docs/deduplication) for platform details.
 
-Non-primary invocations — rustc calls with no source file, like dependency probing — pass straight through without touching the cache.
+## Daemon
 
-## The local store
+The daemon owns remote work and periodic maintenance:
 
-The store lives under your platform cache dir — `~/Library/Caches/kache` on macOS, `~/.cache/kache` on Linux (`$XDG_CACHE_HOME/kache`), `%LOCALAPPDATA%\kache` on Windows — and has two parts:
+- exact remote checks and downloads
+- background uploads and durable upload replay
+- speculative prefetch
+- scheduled garbage collection
+- monitor statistics that require live transfer state
 
-**SQLite index (`index.db`)** tracks every cache entry: crate name, cache key, file list, feature flags, target, and profile. It runs in WAL mode with a 5-second busy timeout so 300+ parallel rustc processes can all hit it without contention.
+The wrapper connects through `<runtime_dir>/daemon.sock` on Unix or a named pipe on Windows. A daemon failure does not break compilation: local caching continues and remote work is skipped or deferred.
 
-**Content-addressed blobs (`store/blobs/`)** hold the actual compiled files, sharded into 256 subdirectories by the first two hex chars of the hash. Each blob is named after its blake3 hash, so two crates that happen to produce an identical artifact share the same physical file. When kache restores a cache hit it reflinks the blob into the build's output dir on copy-on-write filesystems (APFS, btrfs, XFS-with-reflink): zero-copy, but with an independent inode so a later write never mutates the cache blob.
+See [Daemon overview](/docs/daemon/overview) and [Lifecycle](/docs/daemon/lifecycle).
 
-On Unix filesystems without reflink, kache permits one target to hardlink each immutable artifact (`.rlib` / `.rmeta`) to its blob. Additional target consumers use private copies so their restore-time mtime stamp cannot affect an active linker in another tree. Files that may be mutated post-build (executables, dylibs, proc-macros) always use the private-copy fallback. Windows defaults to private copies for all non-CoW restores; its legacy hardlink mode is an explicit, concurrency-unsafe opt-in.
+## Interception boundary
 
-## The daemon
+As `RUSTC_WRAPPER`, Kache sees rustc and workspace-wrapper invocations. It does not wrap Cargo itself or arbitrary tools. Rust link work driven by rustc can be cached when the artifact policy allows it; an independently invoked linker is outside this path.
 
-The daemon is a long-running background process that handles everything async: uploading new artifacts to the configured remote, checking it before a build starts, and prefetching artifacts for upcoming crates.
+C/C++ caching is separate. Kache must be invoked as the compiler wrapper or through a compiler-name shim, and currently caches supported object compilations locally.
 
-The wrapper communicates with the daemon over a Unix socket (`daemon.sock` inside the runtime dir, which defaults to the cache dir; a named pipe on Windows) using lightweight RPC calls. Local-only calls — queuing an upload, a cached remote-check answer — return in well under a millisecond; a remote check that reaches the configured backend takes as long as that round-trip. If the daemon is down, the wrapper continues without it — local caching works normally, remote features degrade gracefully.
+## Planner
 
-The daemon runs as a separate binary invocation (`kache daemon run`) and can be managed as a system service via launchd (macOS) or systemd (Linux). See [Daemon lifecycle](/docs/daemon/lifecycle) for details.
+Without a planner service, the daemon can prefetch from manifests, Cargo metadata, remote indexes, and local history. With `cache.planner.endpoint` or `KACHE_PLANNER_ENDPOINT`, it first asks the preview planner for ranked candidates. A fallback response returns the client to its local planning path.
 
-## What kache does not touch
-
-As a `RUSTC_WRAPPER`, kache intercepts only `rustc` and `clippy-driver` invocations — not `cargo`, `ld`, or any other tool; linking, proc-macro expansion, and build scripts run unmodified. Separately, kache can be set as `CC` / `CXX` to wrap a C/C++ compiler — `gcc`/`clang`, or `clang` in MSVC driver mode (`clang-cl` / `--driver-mode=cl`, as used by mozconfigs and the `cc` crate on Windows) — for local object-compile caching. That path is independent of the rustc wrapper. See [C/C++ caching](/docs/getting-started/c-cpp).
-
-Executables — `bin` crates and `--test` harness binaries — are cached by default on Linux and skipped by default on macOS and Windows, where debug info is referenced from outside the binary (see [#319](https://github.com/kunobi-ninja/kache/issues/319) and `cache_executables`). dylib, cdylib, and proc-macro crates stay cached everywhere. Restored executables are independent copies rather than hardlinks, so a post-build `strip` or code-signing step cannot write back into a store blob. The final binary is often the single most expensive unit on a warm build's critical path, so caching it is worth materially more than its one-unit share suggests.
-
-## The remote planner
-
-By default, prefetch is driven entirely by the client running `cargo metadata` and asking the daemon to pull every crate in the resolved graph from the configured remote. This is good but not optimal — the metadata pass is workspace-local and can't reason about which artifacts are *most* likely to hit on the current toolchain / target / feature set.
-
-A separate planner service (see [Remote service](/docs/remote-service)) accepts manifests from clients (`kache save-manifest`), stores them in an embedded database, and replies to prefetch queries with a ranked candidate list. The client path is already wired: when `KACHE_PLANNER_ENDPOINT` is set, the daemon asks the planner before each build. When the planner has no useful data it returns a fallback disposition and the client behaves exactly as it does without it. The planner is purely additive — local caching, remote sync, and metadata-driven prefetch keep working with no planner configured. (The hosted planner service itself is still in preview.)
+The planner does not affect local correctness or exact-key lookup. See [Remote service](/docs/remote-service).

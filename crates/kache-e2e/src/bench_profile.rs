@@ -1006,6 +1006,33 @@ diff --git a/hello.txt b/hello.txt
         );
     }
 
+    /// The shipped OpenDAL scenario wires kache via `RUSTC_WRAPPER` only
+    /// (no file injection, no CC/CXX — aws-lc-sys stays outside kache),
+    /// builds the `core/` workspace with the portable service-feature set,
+    /// and wipes `core/target` between phases.
+    #[test]
+    fn shipped_opendal_profile_is_rustc_wrapper_only() {
+        let p = BenchProfile::load(&repo_profile("opendal")).expect("opendal.toml loads");
+        assert_eq!(p.name, "bench-opendal");
+        assert_eq!(p.objdir, "core/target");
+        assert!(p.files.is_empty(), "opendal uses RUSTC_WRAPPER only");
+        assert!(
+            p.env.is_empty(),
+            "no extra env — CARGO_INCREMENTAL is an engine baseline, not a profile var"
+        );
+        let build = p.build_command(Path::new("/k"));
+        assert!(build.contains("cd core"), "{build}");
+        assert!(
+            build.contains("cargo build --release --locked --features"),
+            "{build}"
+        );
+        assert!(build.contains("services-s3"), "{build}");
+        assert!(
+            !build.contains("services-rocksdb"),
+            "rocksdb needs a preinstalled native lib"
+        );
+    }
+
     #[test]
     fn source_ref_next_parses_and_marks_pull() {
         let dir = tempfile::tempdir().unwrap();

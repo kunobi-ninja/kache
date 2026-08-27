@@ -1,0 +1,96 @@
+# OpenDAL compile-cache benchmark scenario for kache-scenario.
+# A mid-size Rust workspace (the Apache OpenDAL core) — kache wires in via
+# RUSTC_WRAPPER only (set by the engine), caching every crate compile in the
+# `opendal` facade's dependency graph. Native C/C++ that rustls/aws-lc-sys
+# pulls in compiles OUTSIDE kache by design (no CC/CXX wrapper here); only
+# the Rust crates are cached. Mirrors substrate / surrealdb.
+name = "bench-opendal"
+tags = ["suite:bench", "project:opendal", "backend:kache", "lang:rust"]
+
+requires = ["cargo", "rustc"]
+
+# OpenDAL ships rust-toolchain.toml with channel = "stable" at the repo
+# root, so — like surrealdb — there is nothing to pin here: rustup
+# auto-selects that toolchain on the first cargo invocation in the tree,
+# and the bench workflow clears RUSTUP_TOOLCHAIN so the file is honoured.
+# The Cargo workspace lives under `core/` (no root Cargo.toml). The feature
+# set is OpenDAL's own portable `build_all_platforms` list: common object-
+# storage / HTTP / embedded services, excluding ones that need a
+# preinstalled native library (rocksdb, foundationdb, hdfs) or that are
+# known-broken on some hosts (sftp). System deps are NOT auto-installed —
+# the bench runner already provisions a C compiler + cmake + protoc (see
+# .github/workflows/bench.yml), and the echo below documents them for a
+# local run.
+setup = [
+  "echo '[bench] opendal selected features need system deps: a C/C++ compiler + cmake (aws-lc-sys via rustls), protoc (tikv). macOS: brew install cmake protobuf. Debian: apt install build-essential cmake protobuf-compiler pkg-config.'",
+]
+
+# Build the `opendal` facade from `core/` with the portable service set.
+# Cross-clone cache-key portability (the headline metric this bench
+# measures): each clone builds at a different absolute path, so pin
+# native-build paths/determinism the same way bench-surrealdb does. These
+# knobs change build PATHS and timestamps, not WHAT is built.
+build = """
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+export KACHE_BASE_DIR="$repo"
+
+cd core
+FEATURES=(
+  services-alluxio
+  services-azblob
+  services-azdls
+  services-cacache
+  services-cos
+  services-dashmap
+  services-dropbox
+  services-etcd
+  services-fs
+  services-ftp
+  services-gcs
+  services-gdrive
+  services-ghac
+  services-http
+  services-hf
+  services-ipfs
+  services-ipmfs
+  services-memcached
+  services-memory
+  services-mini-moka
+  services-moka
+  services-obs
+  services-onedrive
+  services-oss
+  services-persy
+  services-postgresql
+  services-redb
+  services-redis
+  services-s3
+  services-seafile
+  services-sled
+  services-swift
+  services-tikv
+  services-vercel-artifacts
+  services-webdav
+  services-webhdfs
+)
+cargo build --release --locked --features "${FEATURES[*]}"
+"""
+
+[source]
+kind = "clone"
+repo = "https://github.com/apache/opendal.git"
+# Latest stable release as of 2026-08-21. rust-toolchain.toml is
+# channel = "stable" (honoured automatically; see setup note). Cargo
+# workspace + lockfile live under `core/`.
+ref    = "v0.58.2"
+objdir = "core/target"
+
+[checks.assert.warm]
+min_key_stability_pct = 50.0
+max_passthrough_pct = 40.0
+max_errors = 0

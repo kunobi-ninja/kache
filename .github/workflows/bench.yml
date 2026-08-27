@@ -1,8 +1,8 @@
 name: Bench
 
 # Clone benchmark — builds kache from THIS ref and runs the cross-clone
-# cold/warm scenarios (Firefox, Substrate, SurrealDB, Lance, LLVM) against one
-# shared cache, then
+# cold/warm scenarios (Firefox, Substrate, SurrealDB, Lance, OpenDAL, LLVM)
+# against one shared cache, then
 # uploads the reports. This is the heavy, hours-long, tens-of-GB-disk job the
 # bench engine's doc-comment says is "intentionally NOT wired into [PR] CI": it
 # lives in its own workflow so it never blocks a push/PR.
@@ -31,7 +31,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, surrealdb, lance, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows]
+        options: [all, substrate, surrealdb, lance, opendal, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -92,6 +92,11 @@ jobs:
           # Needs protoc + openssl headers (already installed below). Lighter
           # than surrealdb: no rocksdb/grpcio/quickjs native compile.
           lance='{"name":"lance","cmd":"bench lance","dir":"bench-lance","timeout":180,"min_free_gb":60}'
+          # OpenDAL core (apache/opendal `core/` workspace) with the portable
+          # service-feature set — mid-size pure-Rust, lighter than surrealdb.
+          # aws-lc-sys (rustls) compiles outside kache; cmake + a C compiler
+          # are already in the apt step below.
+          opendal='{"name":"opendal","cmd":"bench opendal","dir":"bench-opendal","timeout":120,"min_free_gb":40}'
           # Full cold Firefox build is the long pole — hours. `bench firefox`
           # resolves to the exact `bench-firefox` scenario: `--profile firefox`
           # is a name SUBSTRING match that also catches `bench-firefox-windows`,
@@ -116,6 +121,7 @@ jobs:
             substrate)            inc="[$substrate]" ;;
             surrealdb)            inc="[$surrealdb]" ;;
             lance)                inc="[$lance]" ;;
+            opendal)              inc="[$opendal]" ;;
             firefox)              inc="[$firefox]" ;;
             firefox-sccache)      inc="[$firefox_sccache]" ;;
             llvm)                 inc="[$llvm]" ;;
@@ -126,7 +132,7 @@ jobs:
             # and wastefully run the whole Linux `all` matrix alongside.
             firefox-windows)      inc="[]" ;;
             firefox-pull-windows) inc="[]" ;;
-            *)                    inc="[$substrate,$surrealdb,$lance,$firefox,$firefox_sccache,$llvm,$firefox_pull]" ;;
+            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
           if [ "$inc" = "[]" ]; then
@@ -170,7 +176,8 @@ jobs:
       # protoc + clang + cmake + openssl headers (SurrealDB's default features
       # need the same set — rocksdb bindgen wants libclang, storage-tikv/grpcio
       # wants protoc; Lance's prost-build wants protoc and a few default-feature
-      # backends want openssl headers); Firefox's `./mach bootstrap`
+      # backends want openssl headers; OpenDAL's rustls/aws-lc-sys wants cmake +
+      # a C compiler); Firefox's `./mach bootstrap`
       # pulls its own clang/rust toolchain but still needs python3 + common
       # archive/file utilities present first; the LLVM scenario drives CMake
       # with the Ninja generator, so it needs ninja-build. git/curl are needed by

@@ -1006,6 +1006,32 @@ diff --git a/hello.txt b/hello.txt
         );
     }
 
+    /// The shipped Lance scenario wires kache via `RUSTC_WRAPPER` only
+    /// (no file injection, no CC/CXX — optional fp16 kernels stay off),
+    /// honours the tree's rust-toolchain.toml, and builds the `lance` crate.
+    #[test]
+    fn shipped_lance_profile_is_rustc_wrapper_only() {
+        let p = BenchProfile::load(&repo_profile("lance")).expect("lance.toml loads");
+        assert_eq!(p.name, "bench-lance");
+        assert_eq!(p.objdir, "target");
+        assert_eq!(p.repo, "https://github.com/lance-format/lance.git");
+        assert_eq!(p.git_ref, "v10.0.0");
+        assert!(p.files.is_empty(), "lance uses RUSTC_WRAPPER only");
+        assert!(
+            p.env.is_empty(),
+            "no extra env — CARGO_INCREMENTAL is an engine baseline, not a profile var"
+        );
+        assert!(p.requires.iter().any(|tool| tool == "protoc"));
+        assert!(
+            p.build_command(Path::new("/k"))
+                .contains("cargo build --release -p lance")
+        );
+        assert!(
+            p.build_command(Path::new("/k")).contains("KACHE_BASE_DIR"),
+            "cross-clone path portability must be set in the build script"
+        );
+    }
+
     #[test]
     fn source_ref_next_parses_and_marks_pull() {
         let dir = tempfile::tempdir().unwrap();

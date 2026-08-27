@@ -1,0 +1,47 @@
+# Lance compile-cache benchmark scenario for kache-scenario.
+# A large pure-Rust Cargo workspace — kache wires in via RUSTC_WRAPPER only
+# (set by the engine), caching every crate compile in the `lance` library's
+# dependency graph (Arrow, DataFusion, object-store backends, prost codegen).
+# Default features do not compile the optional C fp16 kernels or the bundled
+# protobuf-src build; those stay outside this workload by design.
+name = "bench-lance"
+tags = ["suite:bench", "project:lance", "backend:kache", "lang:rust"]
+
+requires = ["cargo", "rustc", "protoc"]
+
+# Lance ships a rust-toolchain.toml (channel = "1.97.0"), so there is nothing
+# to pin here: rustup auto-installs and selects that toolchain on the first
+# cargo invocation in the tree, and the bench workflow clears RUSTUP_TOOLCHAIN
+# so the file is honoured. System protobuf (`protoc`) is required by
+# prost-build; openssl headers / pkg-config are needed by a few default-feature
+# cloud backends. They are NOT auto-installed — the bench runner already
+# provisions them (see .github/workflows/bench.yml), and the echo below
+# documents them for a local run.
+setup = [
+  "echo '[bench] lance default features need system deps: protoc (REQUIRED), pkg-config, openssl headers, a C compiler. macOS: brew install protobuf pkg-config openssl. Debian: apt install protobuf-compiler pkg-config libssl-dev build-essential.'",
+]
+
+# Build the `lance` crate with its DEFAULT features (aws, azure, gcp, oss,
+# huggingface, tencent, tos, goosefs, geo) — i.e. what Lance actually ships.
+# No RUSTUP_TOOLCHAIN pin: the tree's rust-toolchain.toml drives toolchain
+# selection. KACHE_BASE_DIR keeps checkout-absolute paths (OUT_DIR from
+# prost-build, CARGO_MANIFEST_DIR) portable across the two clones so the
+# headline cross-clone metric is measuring kache, not path baking.
+build = """
+src="$(pwd -P)"
+export KACHE_BASE_DIR="$src"
+cargo build --release -p lance
+"""
+
+[source]
+kind = "clone"
+repo = "https://github.com/lance-format/lance.git"
+# Latest stable release as of 2026-08-27. This tag pins Rust via
+# rust-toolchain.toml (channel "1.97.0"), honoured automatically (see setup note).
+ref    = "v10.0.0"
+objdir = "target"
+
+[checks.assert.warm]
+min_key_stability_pct = 50.0
+max_passthrough_pct = 40.0
+max_errors = 0

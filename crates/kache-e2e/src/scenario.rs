@@ -546,6 +546,14 @@ mod tests {
         assert_eq!(firefox.source_kind, SourceKind::Clone);
         assert!(firefox.tags.contains(&"suite:bench".to_string()));
 
+        let opendal = scenarios
+            .iter()
+            .find(|scenario| scenario.name == "bench-opendal")
+            .unwrap();
+        assert_eq!(opendal.source_kind, SourceKind::Clone);
+        assert!(opendal.tags.contains(&"suite:bench".to_string()));
+        assert!(opendal.tags.contains(&"project:opendal".to_string()));
+
         let c_hello = scenarios
             .iter()
             .find(|scenario| scenario.name == "e2e-c-hello")

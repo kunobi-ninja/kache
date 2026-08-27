@@ -623,6 +623,35 @@ content = "value"
         assert!(!profiles.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn all_shipped_bench_shell_commands_parse_with_linux_sh() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let selectors = Selectors::parse_many(&["suite:bench".to_string()]).unwrap();
+        let profiles = BenchProfile::discover(&root, &selectors).unwrap();
+
+        for profile in profiles {
+            let commands = std::iter::once(("build", profile.build.as_str())).chain(
+                profile
+                    .setup
+                    .iter()
+                    .map(|command| ("setup", command.as_str())),
+            );
+            for (kind, command) in commands {
+                let output = std::process::Command::new("sh")
+                    .args(["-n", "-c", command])
+                    .output()
+                    .expect("sh is available on Linux");
+                assert!(
+                    output.status.success(),
+                    "{} {kind} command is not valid POSIX sh: {}",
+                    profile.name,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
     #[test]
     fn name_must_match_file_stem() {
         let dir = tempfile::tempdir().unwrap();
@@ -1029,6 +1058,37 @@ diff --git a/hello.txt b/hello.txt
         assert!(
             p.build_command(Path::new("/k")).contains("KACHE_BASE_DIR"),
             "cross-clone path portability must be set in the build script"
+        );
+    }
+
+    /// The shipped OpenDAL scenario wires kache via `RUSTC_WRAPPER` only
+    /// (no file injection, no CC/CXX — aws-lc-sys stays outside kache),
+    /// builds the `core/` workspace with the portable service-feature set,
+    /// and wipes `core/target` between phases.
+    #[test]
+    fn shipped_opendal_profile_is_rustc_wrapper_only() {
+        let p = BenchProfile::load(&repo_profile("opendal")).expect("opendal.toml loads");
+        assert_eq!(p.name, "bench-opendal");
+        assert_eq!(p.objdir, "core/target");
+        assert!(p.files.is_empty(), "opendal uses RUSTC_WRAPPER only");
+        assert!(
+            p.env.is_empty(),
+            "no extra env — CARGO_INCREMENTAL is an engine baseline, not a profile var"
+        );
+        let build = p.build_command(Path::new("/k"));
+        assert!(build.contains("cd core"), "{build}");
+        assert!(
+            build.contains("cargo build --release --locked --features"),
+            "{build}"
+        );
+        assert!(build.contains("services-s3"), "{build}");
+        assert!(
+            !build.contains("opendal_features=\"\n"),
+            "the quoted Cargo feature list must not contain newlines"
+        );
+        assert!(
+            !build.contains("services-rocksdb"),
+            "rocksdb needs a preinstalled native lib"
         );
     }
 

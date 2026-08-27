@@ -55,7 +55,7 @@ Need to choose between compiler caches? Read [Kache or sccache?](https://kunobi.
 
 ## Tested nightly on real projects
 
-The scheduled [benchmark workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) runs real cold/warm builds of Firefox, LLVM, Substrate, SurrealDB, and Lance on Linux, compares Firefox with sccache, and exercises Firefox on Windows. It also measures how much of a Firefox build survives a source update.
+The scheduled [benchmark workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) runs real cold/warm builds of Firefox, LLVM, Substrate, SurrealDB, Lance, and OpenDAL on Linux, compares Firefox with sccache, and exercises Firefox on Windows. It also measures how much of a Firefox build survives a source update.
 
 Each run checks its own measurement validity and uploads reports, traces, and logs for 30 days. Treat timing or hit-rate numbers as evidence only when the individual job succeeds and its benchmark verdict is `ok`.
 

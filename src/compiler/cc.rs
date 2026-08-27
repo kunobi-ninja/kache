@@ -2000,6 +2000,19 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         source: "Issue #838 — DWARF v2 emission; cc-rs default on Apple targets.",
         dialect: None,
     },
+    // ring's Darwin build.rs requires full debug information so Apple's
+    // dead strip can see which symbols are used. Apple clang's `-###`
+    // resolves `-gfull` to `-debug-info-kind=standalone -dwarf-version=5`,
+    // the same cc1 tokens as ordinary `-g` on that compiler; a no-debug
+    // invocation has neither. Exact, not a `-g*` prefix: neighbouring
+    // Apple spellings such as `-gused` stay refused until a workload
+    // needs them. (Issue #857)
+    FlagSpec {
+        matcher: Matcher::Exact("-gfull"),
+        class: FlagClass::CapturedByProbe,
+        source: "Issue #857 — Darwin full debug info; ring 0.17 dead-strip contract. Apple clang -### resolves it to standalone DWARF; keyed via those tokens.",
+        dialect: None,
+    },
     FlagSpec {
         matcher: Matcher::Exact("-gsimple-template-names"),
         class: FlagClass::CapturedByProbe,
@@ -7140,6 +7153,50 @@ mod tests {
         );
     }
 
+    /// ring's Darwin build.rs adds `-gfull` so Apple dead stripping can
+    /// see used symbols (kunobi-ninja/kache#857). The flag changes DWARF
+    /// sections, so it must be `CapturedByProbe`: the resolved `-###`
+    /// tokens (`-debug-info-kind=standalone`, `-dwarf-version=N`) key
+    /// it, and a driver whose probe cannot establish the effect must
+    /// fail closed rather than under-key.
+    #[test]
+    fn classifier_accepts_gfull_issue_857() {
+        assert_eq!(
+            classify_cc_flag("-gfull", Dialect::Gnu),
+            Some(FlagClass::CapturedByProbe),
+            "-gfull must key through the resolved invocation"
+        );
+        let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", "-gfull"]);
+        assert!(
+            descs.is_empty(),
+            "-gfull should be classified (#857), got: {descs:?}"
+        );
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", "-gfull"])).unwrap();
+        assert!(
+            parsed.refuse_reasons(&[]).is_empty(),
+            "ring Darwin compile with -gfull must cache: {:?}",
+            parsed.refuse_reasons(&[])
+        );
+        assert!(
+            cc_flags_need_resolved_invocation(&parsed),
+            "-gfull is probe-keyed and must force the resolved invocation"
+        );
+    }
+
+    /// The #857 row is exact on the observed Apple spelling. The other
+    /// Darwin dead-strip debug mode (`-gused`) and neighbouring `-g*`
+    /// lookalikes stay refused until a workload needs them.
+    #[test]
+    fn gfull_neighbours_still_refuse_issue_857() {
+        for flag in ["-gused", "-gfuller", "-gfull-dwarf"] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                None,
+                "{flag} is not modeled and must keep refusing"
+            );
+        }
+    }
+
     /// The argument-wrapper pair must work *together* on one
     /// invocation — that's the canonical clang usage shape
     /// (`--start-no-unused-arguments … <flags> … --end-no-unused-arguments`).
@@ -8217,7 +8274,7 @@ mod tests {
         // before the preprocessor hash runs. Every `CapturedByProbe`
         // shape fails closed here; `-gdwarf-2` pins the #838 row.
         let compiler = CcCompiler::new();
-        for flag in ["-fno-rtti", "-gdwarf-2"] {
+        for flag in ["-fno-rtti", "-gdwarf-2", "-gfull"] {
             let parsed = compiler
                 .parse(&s(&["true", "-c", "foo.c", "-o", "foo.o", flag]))
                 .unwrap();

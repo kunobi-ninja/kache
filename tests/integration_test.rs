@@ -2185,6 +2185,138 @@ fn test_cc_trivial_auto_var_init_pattern_caches_issue_849() {
     );
 }
 
+/// True when the host `cc` accepts zstd-sys's merge-all-constants knob.
+/// gcc and clang both have it; a cl-like driver does not, so a host that
+/// rejects the spelling cannot exercise #856.
+fn cc_accepts_merge_all_constants(dir: &Path) -> bool {
+    let source = dir.join("merge-all-constants-probe.c");
+    if std::fs::write(&source, "int merge_probe(void) { return 0; }\n").is_err() {
+        return false;
+    }
+    std::process::Command::new("cc")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("merge-all-constants-probe.o"))
+        .args(["-fmerge-all-constants", "-O0", "-g0"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Live end-to-end for #856: zstd-sys's `-fmerge-all-constants` must cache,
+/// hit on an identical second compile, and stay keyed apart from the
+/// default mode. `-fno-merge-all-constants` is accepted and may share the
+/// default key when the resolved tokens are identical.
+#[test]
+fn test_cc_merge_all_constants_keys_on_probe_issue_856() {
+    let probe_dir = TempDir::new().unwrap();
+    if !cc_accepts_merge_all_constants(probe_dir.path()) {
+        eprintln!("skipping: `cc` does not accept -fmerge-all-constants");
+        return;
+    }
+    build_kache();
+    if !kache_caches_probe_keyed_flags(probe_dir.path()) {
+        eprintln!("skipping: probe-keyed flags are not cacheable on this host");
+        return;
+    }
+
+    let work = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
+
+    let enabled = [
+        "cc",
+        "-c",
+        "tu.c",
+        "-o",
+        "tu.o",
+        "-fmerge-all-constants",
+        "-O0",
+        "-g0",
+    ];
+    run_kache_cc(work.path(), cache_dir.path(), &enabled);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["misses"].as_u64(),
+        Some(1),
+        "cold -fmerge-all-constants compile must be cached, not passed \
+         through.\n`cc -###` said:\n{}\nevents.jsonl:\n{}",
+        cc_probe_stderr_head(work.path(), &enabled[1..]),
+        std::fs::read_to_string(cache_dir.path().join("events.jsonl"))
+            .unwrap_or_else(|e| format!("(unreadable: {e})"))
+    );
+
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &enabled);
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+
+    // Default mode must not reuse the enabled key. Asserted as "local_hits
+    // did not grow": the objects can be byte-identical and record as a
+    // `dup`. A false HIT is the only wrong answer.
+    let default_mode = ["cc", "-c", "tu.c", "-o", "tu.o", "-O0", "-g0"];
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &default_mode);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["local_hits"].as_u64(),
+        Some(1),
+        "default merge-constants mode must not hit the \
+         -fmerge-all-constants entry: {report}"
+    );
+
+    // Disabled polarity must classify (not passthrough) and must not reuse
+    // the enabled key. It may share the default key when the probe emits no
+    // extra token (Apple clang 21).
+    let disabled = [
+        "cc",
+        "-c",
+        "tu.c",
+        "-o",
+        "tu.o",
+        "-fno-merge-all-constants",
+        "-O0",
+        "-g0",
+    ];
+    std::fs::remove_file(work.path().join("tu.o")).unwrap();
+    run_kache_cc(work.path(), cache_dir.path(), &disabled);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["passthroughs"].as_u64().unwrap_or(0),
+        0,
+        "-fno-merge-all-constants must cache, not pass through: {report}"
+    );
+
+    let events = report["all_events"]
+        .as_array()
+        .expect("report should include all_events");
+    assert_eq!(events.len(), 4, "expected one event per compile: {report}");
+    let keys: Vec<&str> = events
+        .iter()
+        .map(|event| {
+            let key = event["cache_key"].as_str().unwrap_or_default();
+            assert!(
+                !key.is_empty(),
+                "every event should carry a cache key: {event}"
+            );
+            key
+        })
+        .collect();
+    assert_eq!(
+        keys[0], keys[1],
+        "the repeated enabled compile must reuse its own key: {report}"
+    );
+    assert_ne!(
+        keys[0], keys[2],
+        "enabled mode must not reuse the default key: {report}"
+    );
+    assert_ne!(
+        keys[0], keys[3],
+        "enabled mode must not reuse the disabled key: {report}"
+    );
+}
+
 #[test]
 fn test_cc_depinfo_sidecar_restores_on_hit_and_new_mf_path() {
     build_kache();

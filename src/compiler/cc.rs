@@ -1851,14 +1851,14 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Regex(concat!(
             r"-f(?:no-)?(?:",
             "associative-math|data-sections|fast-math|finite-math-only|",
-            "function-sections|math-errno|omit-frame-pointer|reciprocal-math|",
-            "rounding-math|semantic-interposition|signaling-nans|signed-zeros|",
-            "strict-aliasing|trapping-math|unsafe-math-optimizations|unwind-tables|",
-            "wrapv",
+            "function-sections|math-errno|merge-all-constants|omit-frame-pointer|",
+            "reciprocal-math|rounding-math|semantic-interposition|signaling-nans|",
+            "signed-zeros|strict-aliasing|trapping-math|unsafe-math-optimizations|",
+            "unwind-tables|wrapv",
             ")",
         )),
         class: FlagClass::CapturedByProbe,
-        source: "#114/#245/#418/#422/#426/#580 — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class).",
+        source: "#114/#245/#418/#422/#426/#580/#856 — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class).",
         dialect: None,
     },
     FlagSpec {
@@ -6699,6 +6699,9 @@ mod tests {
             "-mfma",
             "-mavx512f",
             "-mno-sse3",
+            // zstd-sys merge-all-constants knob (#856)
+            "-fmerge-all-constants",
+            "-fno-merge-all-constants",
         ] {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
             assert!(
@@ -6760,6 +6763,7 @@ mod tests {
             "trapping-math",
             "semantic-interposition",
             "math-errno",
+            "merge-all-constants",
             "strict-aliasing",
             "function-sections",
             "data-sections",
@@ -6840,6 +6844,40 @@ mod tests {
             classify_cc_flag("-momit-leaf-frame-pointer", Dialect::Gnu),
             None,
             "-momit-leaf-frame-pointer is not modeled and must keep refusing"
+        );
+    }
+
+    /// zstd-sys 2.0.16 adds `-fmerge-all-constants` via `flag_if_supported`
+    /// on every translation unit (#856). The flag changes codegen, and Apple
+    /// clang preserves the enabled form in the resolved `-cc1` stream, so
+    /// both polarities are CapturedByProbe. The disabled form may
+    /// canonicalize to the default mode when the probe emits no extra token.
+    #[test]
+    fn zstd_sys_merge_all_constants_caches_issue_856() {
+        for flag in ["-fmerge-all-constants", "-fno-merge-all-constants"] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                Some(FlagClass::CapturedByProbe),
+                "{flag} must key through the resolved invocation"
+            );
+            let parsed =
+                CcArgs::parse(&s(&["cc", "-c", "zstd.c", "-o", "zstd.o", flag, "-O0"])).unwrap();
+            assert!(
+                parsed.refuse_reasons(&[]).is_empty(),
+                "zstd-sys compile with {flag} must cache: {:?}",
+                parsed.refuse_reasons(&[])
+            );
+            assert!(
+                cc_flags_need_resolved_invocation(&parsed),
+                "{flag} must force the resolved invocation"
+            );
+        }
+        // Adjacent gcc spelling stays unmodeled: `-fmerge-constants` is a
+        // different knob and must not ride in on the stem list.
+        assert_eq!(
+            classify_cc_flag("-fmerge-constants", Dialect::Gnu),
+            None,
+            "-fmerge-constants is a different knob and must keep refusing"
         );
     }
 

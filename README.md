@@ -127,6 +127,11 @@ Run `kache help <command>` for exact flags. The [command reference](https://kuno
 - [Daemon lifecycle](https://kunobi.ninja/docs/kache/daemon/lifecycle)
 - [Benchmarks](https://kunobi.ninja/docs/kache/benchmarks)
 
+## Questions and gaps
+
+- [Open a bug report](https://github.com/kunobi-ninja/kache/issues/new?template=bug_report.md) when Kache behaves differently from the documentation.
+- [Request a feature](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md) for a missing compiler, remote backend, or build workflow.
+
 ## Development
 
 ```bash

@@ -3,7 +3,7 @@ title: Kache or sccache?
 description: Choose a compiler cache based on the workflow you need
 ---
 
-Kache and [sccache](https://github.com/mozilla/sccache#readme) both avoid repeated compiler work. They differ more in workflow than in headline purpose.
+Kache and [sccache](https://github.com/mozilla/sccache#readme) both avoid repeated compiler work. This page explains the differences for teams moving to Kache or deciding whether it covers their build today.
 
 This page describes the current projects; it does not claim that one cache is universally faster. Test the same repository, toolchain, runner, and remote before deciding.
 
@@ -28,12 +28,13 @@ This page describes the current projects; it does not claim that one cache is un
 - You want explicit pull, push, manifest, and prefetch controls for CI.
 - Caching eligible Rust executable and linker outputs matters to your workload.
 
-## Choose sccache when
+## Where Kache may not fit yet
 
 - You need one of its additional remote backends.
-- Your existing CI or development environment already operates sccache reliably.
-- You need its broader documented compiler set, including CUDA or HIP.
-- Your team prefers its established client-server workflow.
+- You need a compiler Kache does not support yet, such as CUDA or HIP.
+- You must keep an existing sccache deployment unchanged during a migration.
+
+If a missing compiler, backend, or workflow blocks your use of Kache, [open a feature request](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md). Include the build command, compiler or backend, and why the fallback described below does not fit. Concrete workloads help us prioritize support.
 
 ## Measure your own build
 
@@ -49,9 +50,9 @@ Run several samples after one warm-up and compare medians. A count-based hit rat
 
 Kache can generate benchmark artifacts with `kache report` and the repository benchmark harness. See [Benchmarks](/docs/benchmarks).
 
-## Use sccache as a fallback
+## Keep sccache during migration
 
-Kache can pass compiler invocations it declines to cache to sccache:
+You can put Kache in front of an existing sccache setup. Kache passes compiler invocations it declines to cache to sccache:
 
 ```bash
 export KACHE_FALLBACK=sccache
@@ -59,4 +60,4 @@ export RUSTC_WRAPPER=kache
 cargo build
 ```
 
-The fallback only receives passthrough work. Kache still owns the invocations it decides to cache or isolate.
+The fallback only receives passthrough work. Kache still owns the invocations it decides to cache or isolate. Remove the fallback when Kache covers the remaining workload.

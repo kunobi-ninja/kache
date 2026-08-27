@@ -10,7 +10,7 @@ The repository benchmark harness builds real projects in separate checkouts. Thi
 The [Bench workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) is scheduled every night at 04:37 UTC. It runs:
 
 - Firefox cold/warm builds on Linux and Windows
-- LLVM, Substrate, and SurrealDB cold/warm builds
+- LLVM, Substrate, SurrealDB, and Lance cold/warm builds
 - Firefox through sccache for comparison
 - Firefox source-update builds on Linux and Windows
 
@@ -24,6 +24,7 @@ A scheduled run is not automatically a valid result. Check that the individual j
 just bench                 # list Kache scenarios
 just bench firefox
 just bench substrate
+just bench lance
 just bench llvm
 just bench-retry firefox   # reuse the saved cold state
 just bench-trace firefox   # include key-diff artifacts

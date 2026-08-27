@@ -1,64 +1,42 @@
 ---
-title: Overview
-description: What the daemon does, when it matters, and when you can skip it.
+title: Daemon overview
+description: What the background daemon owns and what still works without it
 ---
 
-# Daemon
+The daemon keeps network and maintenance work away from compiler processes. Local cache lookup and storage do not require it.
 
-The daemon is a background process that handles everything that shouldn't block the build. The wrapper process is on cargo's critical path — every millisecond it adds to a rustc invocation adds to your build time. Anything that involves network I/O or heavy computation goes to the daemon instead.
+## Responsibilities
 
-## What the daemon handles
+- Download an exact entry after a local miss.
+- Upload newly stored entries in the background.
+- Replay durable upload intents after a restart.
+- Prefetch likely entries at the start of a build session.
+- Refresh the remote key index used by fallback planning.
+- Run garbage collection at startup and every six hours.
 
-**Upload queue.** After a cache miss and successful compilation, the wrapper hands the daemon a reference to the freshly stored entry and returns immediately. The daemon reads it from the local store and uploads to the configured remote in the background. No build time is spent waiting for uploads.
+Set `cache.prefetch_enabled = false` or `KACHE_PREFETCH_ENABLED=0` to disable speculative prefetch while retaining exact remote checks and uploads.
 
-**Remote checks.** Before compiling a crate that missed locally, the wrapper asks the daemon to check the remote for the artifact. The daemon downloads it if found, then signals the wrapper to restore from the local store.
+## When it is required
 
-**Prefetch.** At the start of a new build session, the wrapper detects that a build is beginning (via a timestamped marker file), runs `cargo metadata` to get the full dependency graph, and sends the daemon a prefetch hint with all crate names in topological order. The daemon prefetches them from the remote before cargo even asks for them, turning remote hits into local hits for the rest of the build.
+Local-only caching works with no daemon. A configured remote needs the daemon for reads, writes, and prefetch. If the daemon is unavailable, the wrapper continues with the local store and compiles an exact remote miss locally.
 
-The prefetch hint fires once per build session (with a 5-minute cooldown) to avoid redundant work across sequential cargo commands in CI — `cargo check`, `cargo clippy`, `cargo test` may all run within the same session window.
+## Endpoint placement
 
-Prefetch is optional. Set `KACHE_PREFETCH_ENABLED=0` or `[cache] prefetch_enabled = false` on a long-lived runner whose persistent local store is already warm. The daemon then skips manifest warming, build-start planning, direct prefetch requests, and remote key-cache population. Exact-key remote checks and background uploads remain enabled.
+On Unix the default socket is `<runtime_dir>/daemon.sock`. Windows derives a named-pipe identity from the configured path. Override the runtime root with `KACHE_RUNTIME_DIR` or only the endpoint with an absolute `KACHE_SOCKET_PATH`.
 
-When prefetch is enabled, the fallback planner maintains a remote key index. `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` / `cache.remote_key_cache_refresh_secs` controls its refresh interval; `0` performs one initial population and disables periodic refreshes.
+Use a short, user-owned runtime directory. Unix socket paths are length-limited, and shared temporary directories allow another local user to interfere with adjacent lock and state files.
 
-**Garbage collection.** The daemon runs a GC sweep immediately on startup and then every 6 hours — eviction, dedup, orphan-blob cleanup, and incremental-dir pruning — so the store stays bounded without blocking any build.
+Every client and daemon process must resolve the same runtime and socket settings. Installed services do not inherit later shell exports; put persistent values in the config or service definition.
 
-<Callout type="info">
-When a planner endpoint ([Remote service](/docs/remote-service)) is configured, the daemon asks it first and prefetches its ranked candidates from prior builds — useful on cold runners where `cargo metadata` alone underprefetches. Otherwise it falls back to the metadata/local planner; nothing else is needed. The client support ships in the daemon today; the hosted planner service is still in preview.
-</Callout>
+## Basic commands
 
-## When the daemon is optional
-
-If you're using kache locally with no remote configured, you don't need the daemon. Local caching works entirely without it — the wrapper reads and writes the local store directly.
-
-The daemon becomes necessary as soon as you configure a remote cache. Without it:
-
-- New artifacts won't be uploaded to the remote
-- The cache won't be checked before a local miss triggers compilation
-- Prefetch won't run
-
-You'll still get local cache hits from previous builds, but the remote is effectively inert.
-
-## Communication
-
-The wrapper communicates with the daemon over a Unix socket at `<runtime_dir>/daemon.sock` (on Windows this becomes a named pipe). The runtime dir defaults to the cache dir for compatibility and can be set with `KACHE_RUNTIME_DIR` or `[cache] runtime_dir`; the socket alone can be overridden with `KACHE_SOCKET_PATH`. RPC calls are synchronous from the wrapper's perspective but non-blocking — the remote check has a 3-second timeout, so even a hung daemon caps the added latency.
-
-`KACHE_SOCKET_PATH` exists for one specific failure: unix sockets cap the path at 104 bytes on macOS and 108 on Linux, so a deep `runtime_dir` (nested worktrees, long CI checkout paths) makes `<runtime_dir>/daemon.sock` unbindable and the daemon never comes up. Pointing the socket at a short path fixes it without moving either directory.
-
-Pick a short directory that only you can write to — `$XDG_RUNTIME_DIR/kache` on Linux or a CI job's private temporary directory. Avoid shared `/tmp` paths: the daemon keeps its lock, state, and log files next to the socket, and another local user could create those files or bind the socket first. Values must be absolute. Unusable `KACHE_SOCKET_PATH` values are logged and fall back to `<runtime_dir>/daemon.sock`.
-
-Every process has to agree on `KACHE_RUNTIME_DIR` and any socket override: the wrapper, CLI, and daemon each resolve them at startup. If you run the daemon under launchd or systemd (`kache service install`), the generated service doesn't inherit your shell profile, so put persistent settings in the config file or the service definition.
-
-On Windows nothing is bound at the path: it is hashed into a named pipe (`\\.\pipe\kache-daemon-<hash>`), so `KACHE_SOCKET_PATH` still selects *which* daemon you talk to, and the unix length limit doesn't apply. The daemon still writes its lock, state, and log files next to the configured path, so pick a directory you own there too.
-
-If the daemon is unreachable (not running, stale socket, or timeout), the wrapper silently skips the daemon — logging at debug level only on a connect/timeout error — and continues without it. The monitor shows `daemon: offline` in this state, but local cache data is still displayed.
-
-## Starting the daemon
-
-```sh
-kache daemon start     # start in background, returns when ready
-kache daemon           # show status (service, running state, socket, log path, version)
-kache daemon log       # tail the daemon log
+```bash
+kache daemon start
+kache daemon status
+kache daemon log
+kache daemon stop
 ```
 
-For persistent operation, install as a system service — see [Lifecycle](/docs/daemon/lifecycle).
+Bare `kache daemon` is an alias for `kache daemon status`.
+
+See [Lifecycle](/docs/daemon/lifecycle) for service installation and restart behavior.

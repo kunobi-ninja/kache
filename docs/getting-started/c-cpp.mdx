@@ -1,98 +1,89 @@
 ---
 title: C/C++ caching
-description: Wrap cc, c++, gcc, clang, and clang-cl for local object-compile caching.
+description: Cache supported GCC, Clang, and clang-cl object compilations
 ---
 
-# C/C++ caching
+Kache caches conservative, single-source C and C++ object compilations. If it cannot prove that an invocation is safe to cache, it runs the real compiler unchanged.
 
-kache can wrap C and C++ compilers in addition to rustc. This path is live for local object compiles and intentionally conservative: if kache cannot model an invocation safely, it passes through to the real compiler.
+## Set up the wrapper
 
-## Setup
+For build systems that honor `CC` and `CXX`:
 
-For Make, CMake, autotools, or build scripts that honor `CC` / `CXX`:
-
-```sh
+```bash
 export CC="kache cc"
 export CXX="kache c++"
 ```
 
-For Cargo build scripts that use the Rust `cc` crate, also declare `kache` as a known wrapper so the crate keeps the real compiler argument:
+The Rust `cc` crate also needs to know that `kache` is a wrapper:
 
-```sh
-export CC_KNOWN_WRAPPER_CUSTOM="kache"
+```bash
+export CC_KNOWN_WRAPPER_CUSTOM=kache
 ```
 
-For clang-cl / MSVC-driver mode:
+For build systems that call compiler names directly, install shims on Unix:
 
-```bat
-set "CC=kache clang-cl"
+```bash
+kache install-shims ~/.local/lib/kache/shims
+export PATH="$HOME/.local/lib/kache/shims:$PATH"
 ```
 
-kache recognizes `cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`, versioned variants like `gcc-13`, target-prefixed cross compilers like `arm-linux-gnueabihf-gcc`, `clang-cl`, and `clang --driver-mode=cl`. Any other compiler wrapper names that miss this allowlist are dynamically detected via `-E` preprocessor probing.
+Kache creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks. Keep the real compilers later in `PATH`; Kache skips paths that resolve back to itself.
 
-## What Is Cached
+For clang-cl driver mode:
 
-kache caches single-source object compiles:
+```powershell
+$env:CC = "kache clang-cl"
+```
 
-```sh
+## Cached invocations
+
+Supported shapes compile one source into one object:
+
+```bash
 cc -c src/foo.c -o build/foo.o
 c++ -c src/foo.cpp -o build/foo.o
-clang-cl -c foo.c -Fofoo.obj
+clang-cl /c foo.c /Fofoo.obj
 ```
 
-On a hit, kache restores the object file and dep-info sidecar without re-running the compiler. The key includes:
+The key includes preprocessor output, compiler identity, modeled code-generation options, and normalized paths. Header changes therefore invalidate the entry.
 
-- preprocessor output, so header edits invalidate the object
-- compiler identity and resolved target/codegen flags
-- source path normalization for gcc/clang
-- CodeView path inputs for clang-cl debug compiles (`/Z7`, `-Z7`, `-g`)
+Kache recognizes GCC, Clang, Apple Clang, clang-cl, versioned names such as `gcc-13`, and target-prefixed compiler names. It can probe other wrapper names to identify the underlying compiler family.
 
-For gcc/clang, keys are portable across worktrees when paths normalize cleanly. Use `KACHE_BASE_DIR` for checkout, container mount, or shared source/build prefixes the automatic detection cannot strip.
+## Portability
 
-For clang-cl debug builds, keys are machine-local. clang-cl embeds CodeView paths in the `.obj` and does not honor `-ffile-prefix-map`, so kache keeps those paths literal instead of pretending the object is portable.
+GCC and Clang entries can be reused across worktrees when source and build paths normalize cleanly. Set `KACHE_BASE_DIR` when the automatic roots do not cover a container mount or out-of-tree layout:
 
-## Out-of-tree builds
-
-kache supports out-of-tree C/C++ builds, including sibling CMake-style layouts:
-
-```sh
-cmake -S source -B build
-cmake --build build
-```
-
-The cache key normalizes both source and build roots when kache can derive them from the compiler invocation. If generated sources, configured headers, or `__FILE__` paths point above those roots, set `KACHE_BASE_DIR` to the common parent so the same object can hit across fresh checkouts:
-
-```sh
+```bash
 KACHE_BASE_DIR="$PWD" cmake --build build
 ```
 
-## What Passes Through
+clang-cl debug objects remain machine-local because CodeView records paths that clang-cl does not remap.
 
-These shapes compile normally but are not cached yet:
+## Passthroughs
 
-- link or whole-program steps
-- multi-source or multi-arch invocations
-- response files (`@file`)
+Kache currently passes through:
+
+- link and whole-program steps
+- multi-source or multi-architecture invocations
+- response files
 - precompiled headers and modules
-- coverage and split-DWARF
-- clang-cl `-bigobj` and `-showIncludes`
-- flags kache has not classified
+- coverage and split-DWARF builds
+- flags it has not classified
 
-C/C++ artifacts are local-only today. Remote sync and sharing apply to Rust artifacts, not `cc` objects.
+C/C++ entries are local-only. Remote sync currently handles Rust entries.
 
-## Diagnosing Passthroughs
+Inspect passthrough reasons in the monitor or logs:
 
-Use `kache monitor` and open the Passthrough tab, or run with debug logging:
-
-```sh
+```bash
+kache monitor
 KACHE_LOG=kache=debug make
 ```
 
-If a safe flag is missing from kache's built-in allow-list, opt it in locally:
+You can opt a known-safe flag into the local model:
 
 ```toml title=".kache.toml"
 [cc]
-extra_allowlist_flags = ["-ffunction-sections", "-fdata-sections"]
+extra_allowlist_flags = ["-ffunction-sections"]
 ```
 
-The flag is folded into the key verbatim. Avoid host-dependent values like `-march=native`, because the same spelling can produce different objects on different CPUs.
+Kache folds the spelling into the key. Do not allow flags whose meaning depends on the host, such as `-march=native`.

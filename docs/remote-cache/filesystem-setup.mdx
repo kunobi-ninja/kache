@@ -1,15 +1,9 @@
 ---
 title: Filesystem setup
-description: Configure a shared filesystem as the kache remote cache.
+description: Use a mounted directory as the remote cache
 ---
 
-# Filesystem setup
-
-A filesystem remote stores the same versioned cache objects as S3 in a shared
-directory. It is useful when every builder can mount the same NFS, SMB, or other
-shared filesystem and no object-storage service is needed.
-
-## Minimal configuration
+A filesystem remote uses the same logical objects as S3 but stores them below a shared directory.
 
 ```toml title="~/.config/kache/config.toml"
 [cache.remote]
@@ -18,106 +12,47 @@ path = "/mnt/shared-kache"
 prefix = "artifacts"
 ```
 
-Use an absolute `path` so the wrapper, daemon, and `kache sync` resolve the same
-directory regardless of their working directory. Every machine that reads or
-writes the remote must mount that directory and have suitable permissions.
+Use an absolute path mounted consistently on every machine. Keep `cache.local_store` on local storage; the local SQLite store is not designed for cross-machine sharing.
 
-Treat every writer to the shared directory as trusted. A filesystem remote is
-not a security boundary: a peer that can replace cache paths or create symlinks
-can influence what other machines read or overwrite. Use S3 with access controls
-when writers are not mutually trusted.
+## Trust and permissions
 
-<Callout type="info">
-  kache currently compiles the `s3` and `filesystem` remote types. Other
-  OpenDAL services are not included in the binary.
-</Callout>
+Every writer to the mount is trusted. A filesystem remote is not an isolation boundary. Use directory permissions or choose S3 with access policy when clients are not mutually trusted.
+
+Kache validates paths and writes only below the configured root, but this is defense in depth rather than a substitute for mount security.
 
 ## Atomic writes
 
-Writes are staged in a temporary directory and atomically renamed into their
-final location, so readers never observe a partially written pack or manifest.
-By default, the staging directory is `<path>/.kache-tmp`.
+Writes stage under `<path>/.kache-tmp` and then rename into place. Override the directory only when necessary:
 
-Override it only when the default is unsuitable:
-
-```toml title="~/.config/kache/config.toml"
+```toml
 [cache.remote]
 type = "filesystem"
 path = "/mnt/shared-kache"
-prefix = "artifacts"
 atomic_write_dir = "/mnt/shared-kache/.staging"
 ```
 
-<Callout type="warn">
-  `atomic_write_dir` and `path` must be on the same filesystem. The final
-  rename cannot be atomic across filesystems and will fail with a cross-device
-  error. In particular, do not use the machine's `/tmp` unless it is on the
-  same filesystem as the shared cache. kache checks this when it connects and
-  refuses the remote with an explicit message rather than failing every write.
+The staging directory must:
 
-  It must also sit outside the object tree (`<prefix>/v3/...`); otherwise
-  in-progress staging files are listed as if they were cached objects. The
-  default `<path>/.kache-tmp` already satisfies both rules.
-</Callout>
+- be on the same filesystem as `path`
+- sit outside the object subtree `<prefix>/v3/`
 
-<Callout type="info">
-  A shared cache directory that other users can write is a trust boundary. kache
-  verifies that each write resolves inside the configured `path`, so a symlink
-  planted under the cache cannot redirect writes elsewhere, and it rejects keys
-  whose components end in a dot or space (Windows strips those, which would make
-  two distinct keys collide). This is defense in depth: provision the directory
-  with restrictive permissions rather than relying on it.
-</Callout>
+Kache rejects a configuration that cannot provide atomic final renames.
 
-## Directory layout
-
-With the minimal configuration, the shared directory contains:
+## Layout
 
 ```text
 /mnt/shared-kache/
 ├── .kache-tmp/
 └── artifacts/
-    ├── v3/
-    │   ├── manifests/{crate_name}/{cache_key}.json
-    │   └── packs/{crate_name}/{cache_key}.tar.zst
+    ├── v3/manifests/{crate}/{key}.json
+    ├── v3/packs/{crate}/{key}.tar.zst
     └── _manifests/
 ```
 
-`prefix` keeps kache's objects in their own subtree. The logical layout and
-`kache sync` behavior are the same for S3 and filesystem remotes. Filesystem
-prefixes cannot contain `:` so the same config cannot become a Windows drive
-path or alternate data stream.
+Filesystem prefixes cannot contain `:`.
 
-Keep `KACHE_CACHE_DIR` on fast local storage for each machine. Only
-`cache.remote.path` should point at the shared mount; the local store is not
-safe to share between machines.
+## Reclaim remote space
 
-## Reclaiming space on the share
+Local `kache gc` never deletes remote objects. Remote deletion is manual because no protocol coordinates deletion with in-flight readers and writers.
 
-Uploads are safe from any number of machines at once: objects are
-content-addressed and immutable, every write lands via a temp file plus atomic
-rename, and two machines publishing the same key are writing identical bytes.
-Deletion has no such story. Nothing coordinates a delete against another
-machine's in-flight read or upload of the same object, so **removing objects
-from the shared folder is a manual, single-writer operation**.
-
-`kache gc` and the automatic size-pressure eviction apply to a machine's own
-local store only. They never delete from the shared folder — a local eviction
-just means that machine pulls the object again on its next miss.
-
-When the share does need reclaiming, pick one of:
-
-- **A single designated host.** Nominate one machine (or a scheduled job) as
-  the only thing that ever deletes from the share, and run it when the fleet is
-  idle.
-- **Prune by age, offline.** Stop or pause the writers, then delete whole
-  `{cache_key}` pairs — the `.json` manifest and its `.tar.zst` pack — older
-  than your retention window. Deleting a pack while leaving its manifest makes
-  peers fetch a manifest whose pack 404s; they degrade to a compile, but you
-  are paying for a lookup that can never succeed.
-- **Start over.** For a small team, deleting the whole `artifacts/` subtree and
-  letting the next builds repopulate it is often simpler than partial pruning.
-
-Cross-host coordinated deletion is tracked as phase 2 of
-[#414](https://github.com/kunobi-ninja/kache/issues/414). Until it lands, treat
-the share as append-mostly.
+Use one designated deletion job and pause writers when pruning. Delete each manifest and pack pair together. For a small cache, removing the complete `artifacts/` subtree and allowing it to repopulate is safer than an inconsistent partial prune.

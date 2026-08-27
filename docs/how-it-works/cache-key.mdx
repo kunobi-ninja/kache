@@ -1,108 +1,82 @@
 ---
 title: Cache key
-description: What goes into the blake3 cache key and why keys are portable across machines.
+description: Inputs, normalization, and tools for explaining a cache miss
 ---
 
-# Cache key
+Kache hashes the inputs that can change compiler output and normalizes machine-local paths that should not. Missing a real input risks a wrong hit; retaining harmless machine identity causes avoidable misses.
 
-The cache key is a blake3 hash that uniquely identifies one compiled artifact. Two rustc invocations that would produce identical output must produce the same key. Two invocations that differ in any input that affects the output must produce different keys.
+## Rust key inputs
 
-Getting this right is the core correctness challenge in any build cache. A false positive (same key, different output) corrupts the build. A false negative (different keys, identical output) wastes time.
+The exact set depends on the invocation. It can include:
 
-## What's in the key
+- rustc identity and target
+- linker identity for outputs that invoke linking
+- crate name, crate types, edition, cfg values, and features
+- source and included file contents discovered through dep-info
+- code-generation flags, rustflags, and requested emit kinds
+- the contents of `--extern` dependencies
+- compile-time environment values rustc reports
+- native libc identity for host-loaded Linux outputs
+- configured salt, extra inputs, and declared environment inputs
 
-The principle is simple: **anything that changes the compiled output goes into the key; anything that's just machine-local noise is normalized out.** That's what lets one machine restore what another built.
+Incremental directory names and harmless local path spellings are excluded or normalized.
 
-What goes in (change any of these and the crate re-keys):
+The live implementation is the authority. Use `kache why-miss` and trace logging to see the components for a particular build.
 
-- **Toolchain identity** — the `rustc --version --verbose` banner (commit hash + host triple), plus the linker's `--version` for outputs that actually link.
-- **What you're compiling** — crate name, types, and edition; and every source file the crate reads. kache finds them with a `--emit=dep-info` pre-pass, so modules, `include!()` targets, and build-script output are all covered, and hashes each by content.
-- **How you're compiling it** — target triple, feature/`cfg` flags, codegen (`-C`) options, `RUSTFLAGS`, and the active `--emit` set (so a `cargo check` entry is never served to a `cargo build`).
-- **What it depends on** — each `--extern` rlib/rmeta, hashed by content, so a dependency change propagates to everything downstream.
-- **Compile-time environment** — the `env!()` / `option_env!()` values a build bakes in. These are the reads rustc reports; an env var a **proc macro** reads with `std::env::var` while expanding is invisible to the compiler and has to be declared (see [`key_env_vars`](/getting-started/configuration#env-vars-that-steer-expansion)).
-- **Native Linux libc** — for OS-loaded outputs (`bin`, `dylib`, `cdylib`, and proc-macros), the GNU libc or musl version. Portable rlibs and cross-target outputs deliberately exclude this host-only signal.
+## Path normalization
 
-What's deliberately left out (machine-local, doesn't affect output): the incremental-compilation directory, the linker path (its *identity* is captured via `--version` instead), and absolute build/checkout paths — those are normalized to stable sentinels so the key is the same regardless of where you built. See [Cross-machine portability](#cross-machine-portability).
+Kache maps known roots to stable sentinels before hashing and asks the compiler to emit matching remapped paths. This allows equivalent worktrees and runners to share entries.
 
-<Callout type="info">
-The authoritative, always-current list for any specific build is what kache actually logs — `kache why-miss <crate>` and `KACHE_LOG=trace` print every component it hashed (see [Debugging cache misses](#debugging-cache-misses)). Prefer that over a hand-kept enumeration, which drifts as the keying logic evolves.
-</Callout>
+Common mappings include the workspace, Cargo home, Rustup home, temporary directory, target directory, and configured base directories. Add a missing root with `KACHE_BASE_DIR` or `paths.base_dirs`.
 
-### Tuning the key
+Do not choose an overly broad base directory. Normalization deliberately merges path identities; two genuinely different inputs must not map to the same sentinel.
 
-A few opt-in knobs, all no-ops by default:
+Disable Rust path normalization for a local profiling or debugging session:
 
-- **`KACHE_BASE_DIR`** — declare a path prefix to strip from the key (collapsed to `<BASE_DIR>`). Use it for checkout or container-mount paths the automatic sentinels don't catch, so out-of-tree builds still share hits.
-- **`paths.base_dirs`** — a deterministic file-config list for multiple container, sandbox, or custom roots. Each entry maps to its own sentinel; longest match wins. This is a correctness-sensitive key-merging option, so read the [safety warning](/getting-started/configuration#extra-path-prefixes).
-- **`KACHE_KEY_SALT` / `cache.key_salt`** — fold an opaque string into every key to force a cold cache when the toolchain changes in a way kache cannot observe (a custom/cross-target libc or sysroot change, a same-version distro libc patch, a Nix closure rebuild, or a hidden linker change). See [Configuration](/getting-started/configuration#cache-key-salt).
-- **`kache.toml` extra inputs** — declare files the compiler reads but never reports (sqlx's `.sqlx/`, `migrations/`, `include!`'d data) so editing them re-keys the crate. See [Configuration](/getting-started/configuration#extra-cache-key-inputs).
-- **`path_only_env_vars`** — plain path-locator env vars, plus narrowly scoped `rustc_crate_name:VAR` assertions for known scan false positives. See [Configuration](/getting-started/configuration#path-only-env-vars).
-- **`key_env_vars`** — env vars a proc macro reads at expansion time. rustc reports only `env!`/`option_env!` reads, so a macro branching on `std::env::var` produces different code from an identical command line; declaring the var separates the two. See [Configuration](/getting-started/configuration#env-vars-that-steer-expansion).
-
-## Cross-machine portability
-
-The key is designed to be the same on any machine that has the same:
-
-- Rust toolchain version
-- Target triple
-- Source code
-- Feature flags and cfg values
-- RUSTFLAGS (after path normalization)
-- Native Linux libc version, when the output is OS-loaded rather than a portable rlib
-
-This is what makes the remote cache useful in CI: a developer's laptop and a fresh CI runner with the same toolchain produce identical keys, so CI can restore what the developer already built.
-
-## Debugging cached binaries
-
-The same `--remap-path-prefix` rules that make artifacts portable also rewrite the paths baked into debug info. So the DWARF (or PDB on Windows) in a cached binary refers to your sources through stable, machine-independent paths instead of the local path it was compiled at. Those paths are chosen so profilers and debuggers can resolve them:
-
-| Real location | Path baked into debug info |
-|---|---|
-| the repo / workspace checkout | `/proc/self/cwd` (Linux) or `/kache/workspace` |
-| rust std / core sources | `/rustc/<commit-hash>/...` (the upstream form) |
-| registry + git deps (`~/.cargo`) | `/kache/.cargo/registry/src/...` |
-| `~/.rustup` toolchain files | `/kache/rustup` |
-| `KACHE_BASE_DIR`, `paths.base_dirs`, `$HOME`, tempdir, `$CARGO_TARGET_DIR` | `/kache/base-dir`, `/kache/base-dir-N`, `/kache/home`, `/kache/tmp`, `/kache/target` |
-
-The paths are absolute, so a debugger or profiler never composes them into nonsense, and machine-independent, so one cached binary is valid in every checkout.
-
-**samply / the [Firefox Profiler](https://github.com/mstange/samply) resolve most of this with no configuration.** std sources (`/rustc/<hash>/...`) are fetched from `github.com/rust-lang/rust`, and dependency sources (`/kache/.cargo/registry/src/...`) from crates.io, exactly as they are for a plain cargo build. That works on **every OS**, because it depends on the path *shape*, not on `/proc`.
-
-Your own workspace sources are the exception, and here the OS matters:
-
-- **Linux:** they resolve with no configuration, as long as you run the profiler from the workspace root. `/proc/self/cwd` is a kernel-provided symlink to the reading process's working directory, so the profiler opens the real files.
-- **macOS / Windows:** there is no `/proc`, so workspace sources use the fixed `/kache/workspace` prefix. gdb/lldb can map that back (below), but samply currently has no source-map setting, so *workspace* sources are not resolved there yet (std and dependency sources still are). Closing that gap needs an upstream samply feature; it is tracked in the [#485 follow-up](https://github.com/kunobi-ninja/kache/issues/485). If you need workspace sources in samply on macOS/Windows today, use the `KACHE_RUSTC_PATH_NORMALIZE=0` opt-out below.
-
-For **gdb / lldb**, map the workspace prefix back to your checkout. On Linux, launching the debugger from the workspace root usually makes this unnecessary (`/proc/self/cwd` already points there); elsewhere:
-
-```sh title="gdb"
-# in ~/.gdbinit or at the prompt
-set substitute-path /kache/workspace /abs/path/to/your/checkout
+```bash
+KACHE_RUSTC_PATH_NORMALIZE=0 cargo build
 ```
 
-```sh title="lldb"
-# in ~/.lldbinit or at the prompt
-settings set target.source-map /kache/workspace /abs/path/to/your/checkout
+That puts real paths in debug information and makes the key local to those path identities. C/C++ has the corresponding `KACHE_CC_PATH_NORMALIZE=0` control.
+
+Coverage-instrumented Rust builds use real paths and a separate, path-local key namespace so coverage tools can find source files.
+
+## Debugger source maps
+
+On macOS and Windows, map the stable workspace prefix back to your checkout:
+
+```text title="gdb"
+set substitute-path /kache/workspace /absolute/path/to/checkout
 ```
 
-Add `substitute-path` / `source-map` entries for `/kache/.cargo` or `/kache/rustup` if you want to step into dependency or std sources from a local copy instead of fetching them.
-
-If you would rather have your real local paths baked in with no mapping at all, set `KACHE_RUSTC_PATH_NORMALIZE=0` (see below).
-
-This page describes the **rustc** artifact cache. C/C++ object compiles (`cc` / `c++` / `clang-cl`, see [C/C++ caching](/docs/getting-started/c-cpp)) are keyed separately, and their `-ffile-prefix-map` targets follow the same scheme (`/proc/self/cwd` for the build directory on Linux, `/kache/cc-root`, `/kache/sdkroot`, and so on). clang-cl debug compiles (`/Z7` / `-Z7` / `-g`) *are* cached, but the key stays machine-local: clang-cl embeds CodeView paths directly in the `.obj` (no separate PDB) and ignores `-ffile-prefix-map`, so kache keeps those paths literal in the key rather than remapping them, giving correct local hits but no cross-machine sharing.
-
-**Coverage builds are exempt.** When coverage instrumentation is active (`-C instrument-coverage`), kache skips path remapping entirely, so tools like `cargo-llvm-cov` and tarpaulin map profiling data back to real source paths with no extra configuration. Skipping the remap also changes the key, so coverage builds keep a separate cache from regular ones — and, because the artifact then bakes real machine-local paths, that key includes the build's local path identity too (same mechanism as the opt-out below), so coverage artifacts only share when the baked path identity matches — different checkouts or tool roots get different keys.
-
-**Opting out entirely.** If you profile or debug locally and would rather have real source paths baked into debug info than configure a source map — e.g. so [samply](https://github.com/mstange/samply) / the Firefox Profiler resolve sources with no setup — set `KACHE_RUSTC_PATH_NORMALIZE=0`. kache then injects no `--remap-path-prefix` flags and rustc records the real machine-local paths (this is the rustc analog of `KACHE_CC_PATH_NORMALIZE=0` for C/C++). The trade-off: the key hashes `remap:none` **plus the build's real local path identity** (working directory, `$CARGO_HOME`/`$RUSTUP_HOME`/`$HOME`/tempdir roots) — a separate namespace from remapped builds *and* from other checkouts, so these real-path artifacts only share when the baked path identity matches — different checkouts or tool roots get different keys (the rustc analog of cc's path-literal keys). Accepted tokens are the same as the cc toggle — `0` / `false` / `off` / `no` disable it; anything else (including unset) keeps normalization on, which is the default so ordinary builds stay portable.
-
-## Debugging cache misses
-
-If a crate keeps missing when you expect a hit, use `kache why-miss <crate-name>`. It compares the cache key from the last known entry against the current build and reports which input changed.
-
-For full key-component details, run the command `why-miss` prints:
-
-```sh
-KACHE_LOG=trace cargo build -p <crate-name> 2>&1 | grep '\[key:<crate-name>\]'
+```text title="lldb"
+settings set target.source-map /kache/workspace /absolute/path/to/checkout
 ```
 
-This logs every component being hashed during key computation. As a defense-in-depth check, a `KACHE_LOG=warn` run also flags any residual machine-local absolute path that survives normalization (matching prefixes like `/Users/`, `/home/`, `/private/tmp/`, `/var/folders/`, `C:\Users\`), naming the offending key field — a fast signal that something is leaking a per-machine path into the key.
+Linux workspace paths use `/proc/self/cwd` when possible, so running the debugger from the workspace root usually resolves them directly.
+
+## Inputs the compiler does not report
+
+Use these controls only for a real hidden input:
+
+- `cache.key_salt` or `KACHE_KEY_SALT` for an opaque toolchain boundary
+- crate `kache.toml` for files read during compilation but absent from dep-info
+- `workspace.extra_inputs` for workspace-root provider inputs
+- `cache.key_env_vars` for environment read by proc macros through `std::env`
+- `cache.path_only_env_vars` for locator variables proven not to affect emitted bytes
+
+See [Configuration](/docs/getting-started/configuration) for syntax and safety limits.
+
+## Explain a miss
+
+```bash
+kache why-miss my_crate
+```
+
+The command compares recent key material for that crate and prints changed groups. For individual components, run the trace command it suggests, typically:
+
+```bash
+KACHE_LOG=trace cargo build -p my_crate 2>&1 | grep '\[key:my_crate\]'
+```
+
+Warnings also identify residual absolute paths that survive normalization.

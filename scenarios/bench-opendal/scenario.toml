@@ -39,46 +39,16 @@ export SOURCE_DATE_EPOCH=1735689600
 export ZERO_AR_DATE=1
 export KACHE_BASE_DIR="$repo"
 
-cd core
-FEATURES=(
-  services-alluxio
-  services-azblob
-  services-azdls
-  services-cacache
-  services-cos
-  services-dashmap
-  services-dropbox
-  services-etcd
-  services-fs
-  services-ftp
-  services-gcs
-  services-gdrive
-  services-ghac
-  services-http
-  services-hf
-  services-ipfs
-  services-ipmfs
-  services-memcached
-  services-memory
-  services-mini-moka
-  services-moka
-  services-obs
-  services-onedrive
-  services-oss
-  services-persy
-  services-postgresql
-  services-redb
-  services-redis
-  services-s3
-  services-seafile
-  services-sled
-  services-swift
-  services-tikv
-  services-vercel-artifacts
-  services-webdav
-  services-webhdfs
-)
-cargo build --release --locked --features "${FEATURES[*]}"
+cd core || exit
+opendal_features="services-alluxio services-azblob services-azdls services-cacache"
+opendal_features="$opendal_features services-cos services-dashmap services-dropbox services-etcd"
+opendal_features="$opendal_features services-fs services-ftp services-gcs services-gdrive services-ghac"
+opendal_features="$opendal_features services-http services-hf services-ipfs services-ipmfs services-memcached"
+opendal_features="$opendal_features services-memory services-mini-moka services-moka services-obs services-onedrive"
+opendal_features="$opendal_features services-oss services-persy services-postgresql services-redb services-redis"
+opendal_features="$opendal_features services-s3 services-seafile services-sled services-swift services-tikv"
+opendal_features="$opendal_features services-vercel-artifacts services-webdav services-webhdfs"
+cargo build --release --locked --features "$opendal_features"
 """
 
 [source]

@@ -1,64 +1,43 @@
 ---
 title: Deduplication
-description: How content-addressed storage and zero-copy restores eliminate redundant disk usage.
+description: How Kache shares output bytes and restores them safely
 ---
 
-# Deduplication
-
-Rust's build system compiles the same crate multiple times in a workspace — once per unique combination of features, targets, and profiles. Without a cache, each compilation writes a fresh copy of the output files. kache avoids this through two mechanisms: content-addressed storage and zero-copy restores (reflink where the filesystem supports it, hardlink or copy otherwise).
+Kache saves disk in two independent places: inside the store and between the store and build trees.
 
 ## Content-addressed blobs
 
-Every compiled artifact stored in kache's local store is named after its blake3 hash. If two different crate compilations produce identical output — which happens frequently for crates that appear in multiple feature sets — they share a single blob file. Only one physical copy exists on disk, no matter how many cache entries reference it.
+Each output blob is named by its BLAKE3 content hash:
 
-The store directory layout looks like this:
-
-```
-~/.cache/kache/
-└── store/
-    └── blobs/
-        ├── ab/
-        │   └── abcdef1234...   ← a blob, named by hash
-        └── cd/
-            └── cdabef5678...
+```text
+<cache-dir>/store/blobs/ab/abcdef...
 ```
 
-The cache directory is `~/.cache/kache` on Linux, `~/Library/Caches/kache` on macOS, and `%LOCALAPPDATA%\kache` on Windows; override it with `KACHE_CACHE_DIR`. Blobs live two levels deep, under `store/blobs/<first-2-hex>/<hash>`; cache-entry directories (`<cache_key>/meta.json`) sit directly under `store/`.
+Entries refer to blobs through metadata and the SQLite index. Identical bytes share one blob even when they came from different cache keys. Garbage collection removes a blob only after no entry needs it.
 
-The SQLite index (`index.db`, a sibling of `store/`, not inside it) tracks which blobs belong to which cache entries. When an entry is evicted by GC, the blob is removed only if no other entry references it.
+## Restore methods
 
-## Zero-copy restores
+Kache chooses the safest available method per artifact:
 
-When kache restores a cache hit, it doesn't copy blob files into `target/` if it can avoid it. On every platform it first tries a **reflink** — a copy-on-write clone that is zero-copy *and* gives the restored file an independent inode — where the filesystem supports it (APFS on macOS, btrfs, XFS with reflink, the common dev case). Mutations to a reflinked file never propagate back to the cache blob.
+1. copy-on-write clone on APFS, ReFS, btrfs, or reflink-capable XFS
+2. one exclusive Unix hardlink carrier for immutable `.rlib` and `.rmeta` artifacts
+3. byte copy
 
-On filesystems without copy-on-write (e.g. ext4 without `reflink`, tmpfs, NTFS), kache falls back per platform and artifact type:
+Executable and loadable outputs use clone or copy, never the hardlink fallback, because signing, stripping, or another consumer may modify them. Windows copies on non-CoW volumes unless the unsafe `windows_hardlink` option is enabled.
 
-- **Exclusive hardlink on Unix** for immutable artifacts (`.rlib` / `.rmeta`): when the blob has no existing target consumer, one target may share its inode. Additional target trees get private copies so their required restore-time mtime stamp cannot change a file another linker is reading. A hardlink that fails — for example across mount points — also falls back to a plain copy.
-- **Copy** for mutable, OS-loaded outputs (`bin`, `dylib`, `cdylib`, `proc-macro`): the build may modify the file after linking (codesigning, stripping), so kache never hardlinks these. Where reflink is available they are still reflinked (then made executable); only the non-CoW fallback is a byte copy.
-- **Copy on Windows by default** for every non-CoW restore. The `windows_hardlink` legacy opt-in permits unrestricted hardlink sharing, but is unsafe for concurrent builds and consumers that mutate outputs.
+Reflinks have independent inodes. A later write copies changed blocks instead of modifying the store blob.
 
-Under the default settings, the shared-inode property holds only on Unix and only for the blob plus its single hardlink carrier. Reflinks share physical blocks through copy-on-write while giving every restore its own inode; additional Unix non-CoW consumers trade that storage sharing for active-reader safety.
+## Monitor metrics
 
-## The dedup line in the monitor
+The monitor separates:
 
-The monitor header carries a single dedup line, for example:
+- `Dedup`: logical bytes avoided by content-addressed blob sharing
+- `Blobs`: physical blob bytes in the store
+- `Hardlinks`: Unix bytes shared through the hardlink fallback
+- `Scan`: whether link accounting is running or complete
 
-```
-Dedup: 1.2 GiB saved (38.4%)    Blobs: 1.9 GiB physical    Hardlinks: 240 MiB via 312 hardlinks    Scan: idle
-```
+A zero hardlink count is normal on copy-on-write filesystems. Their sharing is reflected by filesystem allocation, not inode link count.
 
-The pieces map to two independent measurements:
+## `dup` build events
 
-- **`Dedup: <bytes> saved (<pct>%)` / `Blobs: <bytes> physical`** — content-addressed blob savings: how much is saved by storing each unique output once (logical − physical blob bytes), and the physical size of the blob store. This figure is cross-platform.
-- **`Hardlinks: <bytes> via <N> hardlinks`** — the inode-link scan: bytes that the hardlink fallback keeps from being separate copies, summed from blob link counts. When no blob has extra links this reads `none — restores prefer reflink/CoW` — the expected state on copy-on-write filesystems (APFS, btrfs, XFS-with-reflink), where restores are reflinks with independent inodes (so `nlink` stays 1) and the real savings are the cross-platform `Dedup` figure above. This scan is Unix-only; on Windows it always reports zero, because Windows does not expose a portable inode link count.
-- **`Scan: <calculating | idle | not scanned>`** — `calculating` means the background scan is running right now, `idle` means it finished and is waiting for the next interval, `not scanned` means it hasn't run yet. A freshly built project may not be reflected until the next scan.
-
-The dedup line is informational — it doesn't affect behavior and doesn't need to reach any particular value to confirm kache is working correctly.
-
-## `dup` events are different
-
-The monitor's `dup` outcome is not the same thing as the dedup storage
-line above. A `dup` event means a cache key missed, the compiler ran, and the
-compiled output hashes were already present before storing. That usually points
-to equivalent builds under different keys, such as over-specific arguments,
-paths, or environment inputs. It still counts as compiled work.
+A `dup` event is not a restore and is not the dedup metric. It means the cache key missed, the compiler ran, and all resulting blobs were already present. Repeated dups can expose noisy or over-specific key inputs.

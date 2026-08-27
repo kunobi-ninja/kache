@@ -1,270 +1,119 @@
 ---
 title: Installation
-description: How to install kache — mise, cargo-binstall, source, Nix, or an OS package manager (Homebrew, APT, winget, Scoop, Chocolatey, AUR).
+description: Install Kache from a release, package manager, crates.io, or Nix
 ---
 
-# Installation
+Kache requires Rust 1.95 when built from source. Release binaries have no Rust runtime dependency.
 
-kache requires Rust 1.95 or later and is built with the 2024 edition (`Cargo.toml` `edition = "2024"`). The binary is self-contained — no runtime dependencies.
+## Recommended methods
 
-## Methods
-
-<Tabs items={["mise (recommended)", "cargo-binstall", "from source"]}>
-  <Tab value="mise (recommended)">
-    [mise](https://mise.jdx.dev) downloads the pre-built binary from GitHub releases and pins the version per project or globally.
-
-    ```sh
-    # install globally
+<Tabs items={["mise", "cargo-binstall", "cargo install"]}>
+  <Tab value="mise">
+    ```bash
     mise use -g github:kunobi-ninja/kache@latest
-
-    # or pin a specific version
-    mise use -g github:kunobi-ninja/kache@0.5.0
     ```
 
-    To pin kache in your project so every contributor gets the same version, add it to your `mise.toml`:
+    To pin Kache in a project:
 
-    ```toml
+    ```toml title="mise.toml"
     [tools]
     "github:kunobi-ninja/kache" = "latest"
     ```
-
-    Running `mise install` in the project root will install the pinned version.
   </Tab>
   <Tab value="cargo-binstall">
-    [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) downloads the pre-built binary from GitHub releases without compiling.
-
-    ```sh
+    ```bash
     cargo binstall kache
     ```
 
-    Every release (including RCs) is published to crates.io, so the plain crate
-    name works. To install an unreleased branch build instead, use the `--git`
-    form: `cargo binstall --git https://github.com/kunobi-ninja/kache kache`.
-
-    If a pre-built binary isn't available for your target, use the source install method below.
+    This downloads a release binary when one exists for your target.
   </Tab>
-  <Tab value="from source">
-    ```sh
+  <Tab value="cargo install">
+    ```bash
     cargo install kache
     ```
 
-    This compiles kache with your local toolchain. It takes a couple of minutes
-    and works on Linux, macOS, and Windows (with the MSVC toolchain). To build an
-    unreleased branch instead, use `cargo install --git https://github.com/kunobi-ninja/kache kache`.
+    Cargo builds Kache with your local Rust toolchain.
   </Tab>
 </Tabs>
 
-<Callout type="info">
-  The methods above install the latest **stable** release. Release-candidates are
-  published but never resolve as "latest", so request one explicitly:
-  `cargo install kache --version 0.6.0-rc.1` (or `cargo binstall kache@0.6.0-rc.1`).
-</Callout>
+Release candidates do not resolve as `latest`. Request their full `x.y.z-rc.n` version explicitly.
 
-## OS package managers
+## Package managers
 
-kache is also published to Homebrew, APT, winget, Scoop, Chocolatey, and the AUR. Most have both a **stable** channel and an **unstable** channel (release-candidates / betas).
-
-<Tabs items={["Homebrew (macOS)", "APT (Debian/Ubuntu)", "winget (Windows)", "Scoop (Windows)", "Chocolatey (Windows)", "AUR (Arch Linux)"]}>
-  <Tab value="Homebrew (macOS)">
-    ```sh
-    # Stable
+<Tabs items={["Homebrew", "APT", "Windows", "AUR"]}>
+  <Tab value="Homebrew">
+    ```bash
     brew install kunobi-ninja/kunobi/kache
-
-    # Unstable (RC/beta)
-    brew install kunobi-ninja/kunobi/kache-unstable
     ```
-  </Tab>
-  <Tab value="APT (Debian/Ubuntu)">
-    Install the signing key once, then add the repo — `stable` or `unstable` suite:
 
-    ```sh
-    # Signing key (KMS-rooted OpenPGP cert), dearmored into a keyring
+    Use `kunobi-ninja/kunobi/kache-unstable` for release candidates and betas.
+  </Tab>
+  <Tab value="APT">
+    ```bash
     sudo mkdir -p /etc/apt/keyrings
     curl -fsSL https://r2.kunobi.com/kache/apt/gpg.key \
       | sudo gpg --dearmor -o /etc/apt/keyrings/kache.gpg
-
-    # Stable
     echo "deb [signed-by=/etc/apt/keyrings/kache.gpg] https://r2.kunobi.com/kache/apt stable main" \
       | sudo tee /etc/apt/sources.list.d/kache.list
-
-    # Unstable (RC/beta) — swap the suite instead:
-    # echo "deb [signed-by=/etc/apt/keyrings/kache.gpg] https://r2.kunobi.com/kache/apt unstable main" \
-    #   | sudo tee /etc/apt/sources.list.d/kache.list
-
-    sudo apt update && sudo apt install kache
+    sudo apt update
+    sudo apt install kache
     ```
 
-    <Callout type="info">
-      Stable `.deb`s also land in the `unstable` suite, so an `unstable` subscriber still receives GA releases.
-    </Callout>
+    Replace `stable` with `unstable` to receive prereleases as well as stable releases.
   </Tab>
-  <Tab value="winget (Windows)">
+  <Tab value="Windows">
     ```powershell
-    # Stable
     winget install kunobi-ninja.kache
-
-    # Unstable (RC/beta)
-    winget install kunobi-ninja.kache.Unstable
-    ```
-  </Tab>
-  <Tab value="Scoop (Windows)">
-    Add the Kunobi bucket once, then install from it:
-
-    ```powershell
+    # or
     scoop bucket add kunobi https://github.com/kunobi-ninja/scoop-kunobi
-
-    # Stable
     scoop install kunobi/kache
-
-    # Unstable (RC/beta)
-    scoop install kunobi/kache-unstable
-    ```
-
-    <Callout type="info">
-      `kache` and `kache-unstable` both provide a `kache` command. With both installed, run `scoop reset kache-unstable` (or `scoop reset kache`) to choose which one the `kache` shim points at.
-    </Callout>
-  </Tab>
-  <Tab value="Chocolatey (Windows)">
-    ```powershell
-    # Stable
+    # or
     choco install kache
-
-    # Unstable (RC/beta) — same package, pre-release versions
-    choco install kache --pre
     ```
+
+    The corresponding prerelease packages are `kunobi-ninja.kache.Unstable`, `kunobi/kache-unstable`, and `choco install kache --pre`.
   </Tab>
-  <Tab value="AUR (Arch Linux)">
-    Three packages are available (all provide the `kache` command — install one):
-
-    ```sh
-    # Official prebuilt binary — recommended (statically linked, x86_64 + aarch64, no compile)
+  <Tab value="AUR">
+    ```bash
     paru -S kache-bin
-
-    # Official, builds the latest main from source
-    paru -S kache-git
-
-    # Community-maintained, builds the latest release from source
-    paru -S kache
     ```
 
-    <Callout type="info">
-      `kache-bin` and `kache-git` are the official Kunobi packages; `kache` is a community-maintained source build.
-    </Callout>
+    `kache-bin` is the official prebuilt package. `kache-git` builds the current main branch; the community `kache` package builds a release from source.
   </Tab>
 </Tabs>
 
-## Compiler shims (transparent interception)
-
-Setting `CC`/`CXX` per project does not scale when you support many
-differently structured builds. A shim directory routes every compiler call on
-the machine through kache with one `PATH` change and no per-project edits:
-
-```sh
-kache install-shims ~/.kache/shims
-export PATH="$HOME/.kache/shims:$PATH"
-```
-
-That creates symlinks named `cc`, `c++`, `gcc`, `g++`, `clang` and `clang++`,
-all pointing at the kache binary. When a build invokes one, kache recognizes
-that it was called under a compiler name, finds the real compiler behind the
-shim, and wraps it.
-
-Two rules make or break it:
-
-- The shim directory must come **before** your real toolchain on `PATH`.
-  Appended, it is never consulted and nothing happens.
-- The real compilers must still be reachable on `PATH` behind it, because
-  kache runs them. If every `cc` on `PATH` is a shim, kache says so and exits
-  rather than recursing.
-
-The real compiler is found by skipping any `PATH` entry that resolves to the
-kache binary, so several shim directories, relative entries, and symlinked
-entries all behave.
-
-Unix only for now: it relies on symlinks, and the Windows `.exe` shim story
-differs. Use `CC`/`CXX` there. C/C++ caching is still experimental, so treat
-machine-wide interception as opt-in.
-
 ## Nix
 
-The repo is a flake. Unlike the methods above it builds kache from source, with the Rust toolchain pinned in `rust-toolchain.toml` rather than whatever rustc your nixpkgs happens to ship. Use the `stable` branch: it advances only after a non-prerelease GitHub release has passed the gated release build. The default `main` branch contains unreleased development work.
+The `stable` branch follows released versions:
 
-```sh
-# Run it once without installing
+```bash
 nix run github:kunobi-ninja/kache/stable -- --version
-
-# Install into your profile
 nix profile install github:kunobi-ninja/kache/stable
 ```
 
-To consume it from your own flake, add the input and apply the overlay. The overlay provides `pkgs.kache` and `pkgs.kache-rust-toolchain`. Following `stable`, `nix flake update` moves you from one release to the next and never onto unreleased commits:
+Pin a release tag when updates must be explicit:
 
-```nix
-{
-  inputs.kache.url = "github:kunobi-ninja/kache/stable";
-
-  outputs = { nixpkgs, kache, ... }: {
-    # ...
-    nixpkgs.overlays = [ kache.overlays.default ];
-    environment.systemPackages = [ pkgs.kache ];
-  };
-}
+```bash
+nix profile install github:kunobi-ninja/kache/v0.14.2
 ```
 
-If you want a version that never moves at all, pin a release tag instead: `github:kunobi-ninja/kache/v0.14.2`. A tag ref is inert under `nix flake update`; bump it yourself when you want a new version.
+The flake also exports an overlay, NixOS module, and nix-darwin module. See the repository [`flake.nix`](https://github.com/kunobi-ninja/kache/blob/main/flake.nix) for their current names and options.
 
-There is also a NixOS and nix-darwin module that installs kache, writes `config.toml`, optionally sets `RUSTC_WRAPPER` system-wide, and runs the daemon as a systemd user service (Linux) or launchd agent (macOS):
+## Supported release targets
 
-```nix
-{
-  imports = [ kache.nixosModules.default ];  # or kache.darwinModules.default
+| Platform | Architectures |
+| --- | --- |
+| Linux, musl | x86_64, aarch64 |
+| macOS | x86_64, Apple silicon |
+| Windows, MSVC | x86_64, ARM64 |
 
-  services.kache = {
-    enable = true;
-    daemon.enable = true;
-    settings.cache = {
-      local_max_size = "50GB";
-      remote = {
-        type = "s3";
-        bucket = "my-kache-bucket";
-      };
-    };
-  };
-}
-```
+Other Rust-supported targets may work through `cargo install`, but they are not release-tested targets.
 
-Apply `kache.overlays.default` alongside the module. `services.kache.package` defaults to `pkgs.kache` from the overlay; without it the module falls back to building against nixpkgs' rustc, which can be older than the crate's `rust-version`.
+## Verify the install
 
-<Callout type="info">
-  The flake builds for `x86_64-linux`, `aarch64-linux`, and `aarch64-darwin`.
-  Intel macOS (`x86_64-darwin`) is absent because nixpkgs 26.11 dropped the
-  platform, not because kache dropped it: the pre-built `x86_64-apple-darwin`
-  binary and `cargo install` both still work there.
-</Callout>
-
-Contributors can get the pinned toolchain plus `just` and `cargo-deny` with `nix develop`. `mise` remains the primary tool manager for the repo.
-
-## Supported platforms
-
-Pre-built binaries are available for:
-
-| Target | Notes |
-|---|---|
-| `x86_64-unknown-linux-musl` | Statically linked, works on any Linux |
-| `aarch64-unknown-linux-musl` | ARM Linux (AWS Graviton, etc.) |
-| `x86_64-apple-darwin` | Intel macOS |
-| `aarch64-apple-darwin` | Apple Silicon |
-| `x86_64-pc-windows-msvc` | Windows x64 (MSVC) |
-| `aarch64-pc-windows-msvc` | Windows ARM64 (MSVC) |
-
-## Verify the installation
-
-```sh
+```bash
 kache --version
+kache doctor
 ```
 
-You should see a version string like `kache 0.5.0`. If the command isn't found, make sure the binary is on your `PATH` (mise handles this automatically).
-
-## Next: enable kache for cargo
-
-Installing the binary doesn't yet wire it into cargo. Run `kache init` to configure your cargo config (`~/.cargo/config.toml`, or the legacy `~/.cargo/config` if that file already exists), install the daemon as a login service, and start it — see [Quick start](/docs/getting-started/quick-start) for the full walkthrough.
+Next, follow the [quick start](/docs/getting-started/quick-start).

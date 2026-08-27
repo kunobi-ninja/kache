@@ -1,632 +1,215 @@
 ---
 title: Configuration
-description: Config file, environment variables, and the TUI editor.
+description: Configure Kache with TOML files and environment variables
 ---
 
-# Configuration
+Kache resolves settings in this order:
 
-kache reads configuration from three places, in order of priority:
+1. environment variable
+2. config file
+3. built-in default
 
-1. **Environment variables** — always win, useful for CI overrides
-2. **Config file** — selected from the config file priority below
-3. **Defaults** — sensible values that work without any configuration
+`KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_SOCKET_PATH`, logging controls, progress controls, and credentials are operational settings. They do not all have TOML equivalents.
 
 ## Config file
 
-The config file is TOML. You can edit it directly or use the TUI editor:
+Open the editor:
 
-```sh
+```bash
 kache config
 ```
 
-The TUI editor surfaces the common fields with their current values, marks which ones are coming from env vars (those are read-only and the cursor skips them), and lets you toggle or edit the rest interactively. Navigate with the arrows or `j`/`k`, jump between sections with Tab/Shift-Tab, Enter edits a field, Space toggles a boolean, `s` (or Ctrl-S) saves, and `q`/Esc quits with an unsaved-changes prompt. Some advanced sections — `[cache.planner]`, `[cc]`, `[paths]`, `[workspace]`, `cache.path_only_env_vars`, `cache.incremental_crates`, and `cache.key_env_vars` — have no form fields and are preserved verbatim on save.
+Or edit TOML directly. Kache chooses the first file in this order:
 
-Config file priority:
+1. `KACHE_CONFIG`
+2. the nearest `.kache.toml`, walking up from the current directory
+3. `$XDG_CONFIG_HOME/kache/config.toml` or `~/.config/kache/config.toml`
 
-1. `KACHE_CONFIG`, when set
-2. The nearest project-local `.kache.toml`, walking up from the current directory
-3. User config at `~/.config/kache/config.toml`, respecting `XDG_CONFIG_HOME`
+The editor covers common fields and preserves advanced tables it does not expose.
 
-kache currently compiles two remote types: `s3` and `filesystem`.
+```toml title="~/.config/kache/config.toml"
+[cache]
+local_max_size = "50GiB"
+cache_executables = true
 
-<Tabs items={["S3", "Filesystem"]}>
-  <Tab value="S3">
-    ```toml title="~/.config/kache/config.toml"
-    [cache.remote]
-    type = "s3"
-    bucket = "my-build-cache"
-    endpoint = "https://s3.example.com"   # omit for AWS S3
-    profile = "my-aws-profile"            # omit to use the default credential chain
-    ```
-  </Tab>
-  <Tab value="Filesystem">
-    ```toml title="~/.config/kache/config.toml"
-    [cache.remote]
-    type = "filesystem"
-    path = "/mnt/shared-kache"
-    prefix = "artifacts"
-    ```
+[cache.remote]
+type = "s3"
+bucket = "my-build-cache"
+region = "us-east-1"
+```
 
-    `atomic_write_dir` is optional and defaults to
-    `/mnt/shared-kache/.kache-tmp`. See [Filesystem setup](/docs/remote-cache/filesystem-setup)
-    before overriding it.
-  </Tab>
-</Tabs>
+Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem remote. Only `s3` and `filesystem` are compiled remote backends.
 
-Other OpenDAL services are not included in the kache binary. Existing S3
-configuration names remain compatible: a legacy `[cache.remote]` table without
-`type = "s3"` and an environment-only setup rooted in `KACHE_S3_BUCKET` still
-select S3; the other `KACHE_S3_*` overrides remain available. See the
-[S3 migration boundaries](/docs/remote-cache/s3-setup#opendal-migration-boundaries)
-for AWS SDK-specific cases that need attention.
+## Core settings
 
-## All settings
+| Environment | TOML key | Default | Purpose |
+| --- | --- | --- | --- |
+| `KACHE_CACHE_DIR` | `cache.local_store` | OS cache directory | Persistent store |
+| `KACHE_RUNTIME_DIR` | `cache.runtime_dir` | local store | Socket, locks, logs, state, and session markers |
+| `KACHE_SOCKET_PATH` | none | `<runtime_dir>/daemon.sock` | Absolute daemon endpoint override |
+| `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GiB` | Registered blob bytes allowed before GC |
+| `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
+| `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
+| `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Skip local retention for faster compiles; `0` stores all eligible results |
+| `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
+| none | `cache.event_log_max_size` | `10MiB` | Rotate the event log after this size |
+| none | `cache.event_log_keep_lines` | `1000` | Lines retained when the event log rotates |
+| `KACHE_DISABLED` | none | `false` | Pass all compiler work through when set to `1` or `true` |
+| `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Ignore all remote and planner configuration while keeping local caching |
+| `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes |
 
-| Environment variable | Config key | Default | Description |
-|---|---|---|---|
-| `KACHE_CACHE_DIR` | `cache.local_store` | `~/Library/Caches/kache` on macOS, `~/.cache/kache` on Linux | Local cache directory |
-| `KACHE_RUNTIME_DIR` | `cache.runtime_dir` | `<cache_dir>` | Job/process-lifetime state directory: daemon socket, locks, state and background log, event/transfer/summary logs, and build-session markers. Give concurrent jobs sharing one local store distinct runtime directories |
-| `KACHE_SOCKET_PATH` | — | `<runtime_dir>/daemon.sock` | Daemon socket path, for when a deep `runtime_dir` pushes the socket past the platform's unix-socket path limit. Operational and security-sensitive: it decides where clients look for the daemon, so `ignore_env` does **not** cover it (see [Daemon socket placement](/docs/daemon/overview#communication)). Must be absolute; an unusable value warns and falls back to the default |
-| `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GiB` | Maximum local store size, measured as **registered blob content bytes** (each deduplicated blob counted once, not once per entry referencing it; index and metadata overhead sit outside the sum). GC fires above this cap and evicts down to 90%, creating a 10% hysteresis band |
-| `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Opportunistic size-pressure GC: after storing a new entry the wrapper runs a cheap, throttled (5 min) store-size check and spawns a detached background `kache gc` when the store exceeds `local_max_size` by more than 10%. Keeps the size cap enforced even when no daemon is running (local-only builds). Set to `0`/`false` to rely solely on daemon GC and manual `kache gc` |
-| `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Local put-side admission control: a compile faster than this many milliseconds is not retained. `0` (default) stores everything. For Rust artifacts, a configured writable remote bypasses this gate so its staging and publication path is preserved; read-only remotes still honor the threshold. C/C++ artifacts are local-only and always honor it. This is separate from `KACHE_MIN_COMPILE_MS`, which gates remote prefetch downloads |
-| `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` (disabled) | Opt-in age-retention hours for automatic GC. A bare `kache gc` sends its effective configured value to the daemon; daemon-periodic and background sweeps use their own effective config. An explicit `kache gc --max-age <duration>` runs only the requested age policy |
-| `KACHE_CONFIG` | — | — | Explicit config file path; overrides the project-local `.kache.toml` / XDG resolution |
-| `KACHE_BASE_DIR` | — | — | Path prefix stripped from cache keys (collapsed to `<BASE_DIR>`) for checkout / container-mount paths the automatic sentinels don't catch — the analog of ccache's `CCACHE_BASEDIR` (see [Cache key](/docs/how-it-works/cache-key)) |
-| — (file-only) | `paths.base_dirs` | `[]` | Extra absolute path prefixes for container mounts, Snap, Flatpak, AppImage, or custom roots; each maps to a distinct deterministic sentinel (see [Extra path prefixes](#extra-path-prefixes)) |
-| — (file-only) | `cache.remote.type` | — | Remote type: `s3` or `filesystem`. A legacy S3 table or `KACHE_S3_BUCKET` still selects S3 when this is omitted |
-| — (file-only) | `cache.remote.path` | — | Shared root directory for a `filesystem` remote |
-| — (file-only) | `cache.remote.atomic_write_dir` | `<path>/.kache-tmp` | Staging directory for filesystem-remote atomic writes; must be on the same filesystem as `path` |
-| `KACHE_S3_BUCKET` | `cache.remote.bucket` | — | S3 bucket name |
-| `KACHE_S3_ENDPOINT` | `cache.remote.endpoint` | — | S3 endpoint URL (required for Ceph, MinIO, R2) |
-| `KACHE_S3_REGION` | `cache.remote.region` | `us-east-1` | AWS region |
-| `KACHE_S3_PREFIX` | `cache.remote.prefix` | `artifacts` | Object or path prefix. The environment override is retained for S3; filesystem remotes configure it in the file |
-| `KACHE_S3_PROFILE` | `cache.remote.profile` | — | AWS credentials profile |
-| `KACHE_S3_USER_AGENT` | `cache.remote.user_agent` | — | Custom User-Agent header for S3 HTTP requests |
-| `KACHE_S3_ACCESS_KEY` | — | — | Explicit S3 access key |
-| `KACHE_S3_SECRET_KEY` | — | — | Explicit S3 secret key |
-| `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | `true` on Linux/macOS, `false` on Windows | Also cache user-facing executables (`bin` crates and `--test` binaries). dylib/cdylib/proc-macro are always cached and are unaffected by this flag. On Linux, DWARF is embedded in the binary so a restored executable debugs like a fresh one; on macOS, kache bakes a `.dSYM` at store time and restores it next to the binary so `lldb` keeps source-level symbols ([#319](https://github.com/kunobi-ninja/kache/issues/319)); Windows (`.pdb` path) still references debug info outside the binary, so it stays off pending the equivalent work |
-| `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Auto-clean tracked incremental dirs during GC; active builds also remove the current crate's incremental dir eagerly. Env is on unless the value is exactly `0` or `false` (case-insensitive) |
-| `KACHE_ADAPTIVE_INCREMENTAL` | `cache.adaptive_incremental` | `true` | Automatically learn rapidly changing Cargo-primary units after repeated source/dependency misses, then use isolated incremental state for a bounded run before probing the exact artifact cache again. Kache directly owns learned compiles and eligible user-facing executables already excluded by `cache_executables=false` when no fallback is configured; declined compiles otherwise retain the configured fallback. No mutation-tool detection or project setup. Disable with `0`/`false` |
-| `KACHE_PRESERVE_INCREMENTAL` | `cache.preserve_incremental` | `false` | Force every rustc invocation carrying a safe Cargo incremental path to bypass artifact caching and reuse isolated incremental state. Normally unnecessary; useful as a diagnostic/benchmark override. Cargo's dev and test profiles already enable incremental compilation unless a project, environment, or custom profile disables it |
-| `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | For eligible Cargo-primary rustc invocations, listed crate names bypass artifact caching and use the adaptive policy's isolated incremental directory and exclusive lease without waiting for its learning heuristic. Unsafe layouts, declared hidden inputs, exclusions, or lease contention retain the normal safe cache/passthrough path with Cargo's original incremental argument stripped. User-facing executables first follow `cache_executables`; an intentional managed passthrough is available only when no fallback owns the compile. Entries match the actual rustc `--crate-name` with `-`/`_` treated as equal; a Cargo package name is not authoritative because its targets may have different names. The env value is comma/whitespace-separated and replaces the file list |
-| `KACHE_VERIFY_RESTORES` | — | `off` | Re-hash restored blobs before serving hits: `off`, `sampled` (~1/16 hits), or `always`. `1`/`true` map to `always` |
-| — | `cache.exclude` | `[]` | Source-path glob patterns that bypass kache and compile normally without lookup, store, or upload |
-| — | `cache.bypass_crates` | `[]` | Exact crate names that bypass kache and compile normally |
-| — | `cache.bypass_argv` | `[]` | Argument substrings that bypass kache and compile normally |
-| — | `cache.bypass_env` | `[]` | `NAME=VALUE` (exact value) or `NAME` (presence) env rules that bypass kache and compile normally |
-| `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd compression level (1–22) |
-| `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Max concurrent remote operations; the legacy S3 name applies to both remote types |
-| `KACHE_PREFETCH_ENABLED` | `cache.prefetch_enabled` | `true` | Enable speculative manifest/advisory/fallback prefetch. Set to `0`/`false` on long-lived warm runners to skip manifest warming, build-start planning, and the whole-remote key index. Exact-key remote checks and background uploads remain enabled. A running daemon cannot see environment changes; prefer the watched config file for persistent or service-managed daemons |
-| `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` | `cache.remote_key_cache_refresh_secs` | `60` | Remote key-index refresh interval used by speculative fallback planning. A negative index entry suppresses an exact remote HEAD only while the index is fresh, for at most `min(refresh × 5, 300s)`. `0` performs one initial population, never treats negative entries as authoritative, and disables periodic refresh. Ignored when `prefetch_enabled = false` |
-| `KACHE_PREFETCH_MAX_KEYS` | `cache.prefetch_max_keys` | `2000` | Max cache entries one prefetch plan may download; `0` = unlimited |
-| `KACHE_PREFETCH_MAX_BYTES` | `cache.prefetch_max_bytes` | `2GiB` | Max compressed bytes one prefetch plan may download; `0` = unlimited. Soft cap: downloads already in flight still finish, so overshoot is bounded by the prefetch concurrency |
-| `KACHE_PREFETCH_DEADLINE_SECS` | `cache.prefetch_deadline_secs` | `300` | How long a prefetch plan may keep starting downloads; `0` = no deadline |
-| `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | How long an idle S3 connection is kept in the HTTP pool. Higher values reuse warm TLS sessions across build phases; lower this if you sit behind a load balancer that drops idle connections aggressively |
-| `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | One monotonic daemon deadline for a remote operation, including concurrency queues, HEAD/LIST, GET/PUT, and restore decompression/extraction. Synchronous compiler-wrapper demand retains its legacy hard 3s end-to-end ceiling across mixed versions; the wrapper sends that budget and this setting may only tighten it. Demand expiry reports a miss so rustc recompiles; background work is deferred or skipped safely. `0` disables the configured background deadline but does not remove the 3s demand ceiling (transport connect/read-inactivity limits still apply) |
-| `KACHE_REMOTE_NEGATIVE_TTL_SECS` | `cache.remote_negative_ttl_secs` | `60` | How long the daemon remembers a definitive remote miss (404 only — never timeouts, 5xx, or credential errors) so parallel wrappers demanding the same absent key share one first check instead of stampeding S3. Successful uploads invalidate misses immediately, and per-key generations prevent late HEAD/GET/prefetch results from undoing newer knowledge. `0` disables the negative cache |
-| `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `0` | Idle daemon shutdown timeout in seconds (`0` disables auto-shutdown) |
-| `KACHE_KEY_SALT` | `cache.key_salt` | — | Opaque string folded into every cache key. Change it to force a cold cache on a toolchain change kache cannot otherwise see (see [Cache-key salt](#cache-key-salt)) |
-| `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` | `cc.extra_allowlist_flags` | `[]` | C/C++ flags to opt into caching that kache's built-in allow-list doesn't yet model (see [Extra cc allowlist flags](#extra-cc-allowlist-flags)). Env value is whitespace-separated |
-| `KACHE_DISABLED` | — | `false` | Disable caching entirely (pass-through to rustc). Env-only, no config key: `1` or `true` (case-insensitive) disables; any other value — including `0`, `false`, or unset — leaves caching on |
-| `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Strict local-only mode: ignore **all** remote and planner config/env (no configured remote, no planner endpoint, no egress) for a guaranteed-hermetic build. Local caching stays fully on — unlike `KACHE_DISABLED`. `1`/`true` enables; env wins over the file (an explicit `0` overrides `local_only = true`) |
-| `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Read-only remote consumer mode: when enabled, kache performs remote cache reads/restores as normal, but suppresses all remote uploads (including the sync push phase and manifest saving). `1`/`true` enables; env wins over the file (an explicit `0` overrides `remote_readonly = true`) |
-| `KACHE_WINDOWS_HARDLINK` | `cache.windows_hardlink` | `false` | Windows only: restore cache hits on non-CoW volumes (NTFS) via hardlink instead of copy, deduplicating the working tree against the store. Opt in **only** if your build never deletes or rewrites a restored output in place and never runs concurrent builds against the same store — mutations corrupt the shared blob, and restore-time timestamp changes can abort an active reader (#794). ReFS (Dev Drive) volumes always block-clone regardless of this flag |
-| `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Surface an advisory (deduplicated, at most once per 5-minute window) when a cache hit is restored by copy because the storage layout prevents zero-copy dedup: no copy-on-write on the volume, cache and build tree on different volumes, or an inconclusive capability probe. Set to `0`/`false` when the layout is intentional (e.g. an NTFS-only machine that cannot host a ReFS Dev Drive); genuine clone faults are still reported |
-| `KACHE_HEARTBEAT_SECS` | `cache.heartbeat_secs` | `30` | In-flight compile heartbeat cadence: while a cache-miss compile runs longer than one cadence, kache appends a structured `heartbeat` line to `events.jsonl`. With `KACHE_PROGRESS=verbose`/`all`, it also prints `still compiling <crate> — 4m20s elapsed (typical: 7m51s, ETA 3m31s)` to stderr. The typical/ETA figures come from the median of the crate's recent recorded compile times. `0` disables both sinks |
-| `KACHE_EXPLAIN_MISS` | `cache.explain_miss` | `false` | Miss diagnostics: on a cache miss for a crate that previously hit in the same build tree, print which key input group changed (`key changed in: args, env_deps`) and record it on the miss event. Costs one event-log read per miss, so enable it only while investigating unexpected misses |
-| — (file-only) | `cache.ignore_env` | `false` | Make the config file authoritative by ignoring `KACHE_*` env overrides for file-backed settings (see [Pinning config against env](#pinning-config-against-env)) |
-| `KACHE_FALLBACK` | `cache.fallback` | — | Secondary compiler-wrapper for ordinary passed-through compiles; kache runs `<fallback> <compiler> <args>` when it declines to cache outside its directly owned adaptive lane. `off`/`none`/empty disables |
-| `KACHE_PATH_ONLY_ENV_VARS` | `cache.path_only_env_vars` | `[]` | Plain path-locator env vars, plus optional `rustc_crate_name:VAR` force assertions for one crate. Env value is comma/whitespace-separated and replaces the file list (see [Path-only env vars](#path-only-env-vars)) |
-| `KACHE_KEY_ENV_VARS` | `cache.key_env_vars` | `[]` | Env vars to fold into every cache key, for values a proc macro reads at expansion time that the compiler never reports. Exact names or a trailing-`*` prefix glob. Env value is comma/whitespace-separated and replaces the file list (see [Env vars that steer expansion](#env-vars-that-steer-expansion)) |
-| `KACHE_PLANNER_ENDPOINT` | `cache.planner.endpoint` | — | Prefetch-planner service URL; setting it enables the planner client. Empty/whitespace is treated as unset |
-| `KACHE_PLANNER_TIMEOUT_MS` | `cache.planner.timeout_ms` | `750` | Planner request timeout in milliseconds |
-| `KACHE_PLANNER_TOKEN` | `cache.planner.token` | — | Bearer credential sent with planner requests |
-| `KACHE_NAMESPACE` | — | — | Enables content-addressed shard uploads/prefetch (requires a `Cargo.lock`); the `kache save-manifest --namespace` flag takes precedence. Unset uploads only the monolithic manifest |
-| `KACHE_EVENT_ROOT` | — | auto-detected | Explicit root path stamped on wrapper events for report filtering; useful for benchmark harnesses that share a cache/event log |
-| `KACHE_LOG` | — | `kache=warn` * | Log level for stderr output |
-| `KACHE_LOG_FILE` | — | `kache=info` * | Log level for the file log |
-| `KACHE_PROGRESS` | — | (off) | Per-crate progress lines to stderr: `1`/`hits` prints cache hits only; `verbose`/`all` also prints dups, misses, and in-flight heartbeats; unset or anything else stays silent |
-| `KACHE_PAGER` | — | `$PAGER`, then `less -FRX` on Unix / `more.com` on Windows | Pager program and arguments for populated interactive `kache list` output. Empty or the single command `cat` disables paging; see the [command reference](/docs/commands/reference#paging) for the safe argv format |
+On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CACHE_HOME/kache` or `~/.cache/kache`; on Windows it is under `%LOCALAPPDATA%`.
 
-\* In wrapper mode (`RUSTC_WRAPPER`, the common path) stderr logging defaults to **off** and the file log is **disabled** unless `KACHE_LOG_FILE` is set explicitly. The `kache=warn` / `kache=info` defaults apply to CLI and daemon invocations.
+## Compiler policy
 
-## Prefetch policy by runner lifetime
+| Environment | TOML key | Default | Purpose |
+| --- | --- | --- | --- |
+| `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | Linux/macOS: `true`; Windows: `false` | Cache eligible Rust bins and test executables |
+| `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Remove tracked incremental directories during cleanup |
+| `KACHE_ADAPTIVE_INCREMENTAL` | `cache.adaptive_incremental` | `true` | Learn rapidly changing Cargo units and give them isolated incremental state |
+| `KACHE_PRESERVE_INCREMENTAL` | `cache.preserve_incremental` | `false` | Force eligible Cargo units onto isolated incremental state |
+| `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | Force listed rustc crate names onto that incremental path |
+| `KACHE_MODIFIED_INPUT_GUARD` | `cache.modified_input_guard` | `false` | Do not store a result when a keyed input changed at or after build start |
+| `KACHE_FALLBACK` | `cache.fallback` | none | Wrapper used for ordinary Kache passthroughs |
+| none | `cache.exclude` | `[]` | Source-path globs that bypass Kache |
+| none | `cache.bypass_crates` | `[]` | Exact rustc crate names that bypass Kache |
+| none | `cache.bypass_argv` | `[]` | Argument substrings that bypass Kache |
+| none | `cache.bypass_env` | `[]` | `NAME` or `NAME=VALUE` rules that bypass Kache |
+| `KACHE_CC_EXTRA_ALLOWLIST_FLAGS` | `cc.extra_allowlist_flags` | `[]` | Exact C/C++ flag spellings accepted in addition to the built-in model |
 
-Speculative prefetch is designed to hide remote latency on a cold runner by downloading likely artifacts before rustc asks for their exact keys. It is optional: exact-key remote lookup and background uploads use separate daemon paths.
+Bypass rules can only reduce caching:
 
-For a long-lived runner with a persistent local store, speculative prefetch can cost more than it saves. The local store is already warm, while fallback planning may have to index a large shared remote and choose among many variants of the same crate name. Disable speculation without disabling the remote cache:
+```toml title=".kache.toml"
+[cache]
+exclude = ["vendor/problematic/**"]
+bypass_crates = ["generated_bindings"]
+bypass_argv = ["--cfg", "uncacheable_mode"]
+bypass_env = ["SPECIAL_BUILD=1"]
+```
+
+## Cache-key controls
+
+| Environment | TOML key | Default | Purpose |
+| --- | --- | --- | --- |
+| `KACHE_KEY_SALT` | `cache.key_salt` | none | Opaque value folded into every key |
+| `KACHE_BASE_DIR` | none | none | One extra path prefix normalized as `<BASE_DIR>` |
+| none | `paths.base_dirs` | `[]` | Additional absolute prefixes with distinct stable sentinels |
+| `KACHE_PATH_ONLY_ENV_VARS` | `cache.path_only_env_vars` | `[]` | Path locator variables eligible for safe normalization |
+| `KACHE_KEY_ENV_VARS` | `cache.key_env_vars` | `[]` | Environment read by proc macros but not reported by rustc |
+| `KACHE_VERIFY_RESTORES` | none | `off` | Re-hash `sampled` or `always` before restoring |
+
+Use a key salt when an unobserved toolchain component changes output:
 
 ```toml
 [cache]
-prefetch_enabled = false
+key_salt = "sysroot-2026-08"
 ```
 
-This mode keeps local hits, exact remote hits, and asynchronous uploads. It skips startup manifest warming, build-start advisory/fallback planning, direct prefetch requests, and remote key-cache population. The daemon watches the config file and restarts when it changes. A running daemon cannot see a changed `KACHE_PREFETCH_ENABLED`; stop and start a manually managed daemon from the intended environment. An installed launchd/systemd/Task Scheduler service keeps the environment in its service definition, so a shell export followed by `kache daemon restart` does not apply that export.
+Keep `paths.base_dirs` narrow. Normalizing unrelated roots to stable sentinels can make different inputs appear equal.
 
-For cold or ephemeral CI, leave prefetch enabled and use build-shape-specific manifest keys and namespaces. If periodic discovery is useful but a 60-second full listing is too frequent, keep prefetch enabled and raise `remote_key_cache_refresh_secs`. Raising it reduces LIST frequency, but stale negative entries are authoritative for no more than five minutes; after that, exact misses fall through to a remote HEAD probe. Set the interval to `0` for one startup population with no refresh: positive entries and fallback planning still use that snapshot, while negative entries never suppress exact remote lookup.
+`key_env_vars` accepts exact names and trailing-star prefix patterns:
 
-## Excluding Sources
-
-Use `cache.exclude` when a source file should compile normally but never use kache:
-
-```toml title=".kache.toml"
+```toml
 [cache]
-exclude = [
-  "crates/problematic-rust-crate/**",
-  "vendor/problematic-c-lib/**",
-  "$CARGO_HOME/registry/src/**/some-crate-*/**",
-]
+key_env_vars = ["BOLTFFI_*"]
 ```
 
-Patterns are globs matched against the compiler's primary source path. Relative patterns are matched relative to the current build directory and, when kache can infer it, the Cargo workspace root. Excluded invocations bypass local lookup, remote lookup, store, and upload.
+Values are hashed exactly and are not written to event logs. A changing value such as a job ID will destroy hit rate.
 
-Exclude patterns support `~`, `$VAR`, and `${VAR}` expansion. `$CARGO_HOME` falls back to Cargo's default `~/.cargo` when the environment variable is not set, so registry-source exclusions work on default Cargo installs.
+## Hidden compile-time inputs
 
-### Bypass rules
+Some macros read files that rustc does not report. Put `kache.toml` without a leading dot next to the crate manifest:
 
-`cache.exclude` keys on the source path. When the reason a compile must not be
-cached is the *invocation* rather than the file, three sibling lists match on
-the crate name, the argv, and the environment:
-
-```toml title=".kache.toml"
-[cache]
-# Exact crate names.
-bypass_crates = ["my-mutants-runner"]
-# Substring of any single argument.
-bypass_argv = ["--cfg=live_db"]
-# `NAME=VALUE` for an exact value, or bare `NAME` for presence alone.
-bypass_env = ["SQLX_OFFLINE=false"]
-```
-
-The motivating case is an online `sqlx` build: it validates queries against
-live database state that no environment value captures, so two compiles with
-identical sources and environment can legitimately produce different results.
-Adding the variable to `key_env_vars` only *separates* those compiles into
-distinct keys, and still caches them. Declining to cache is the sound answer.
-
-Rules are evaluated before any cache-key work, so a match costs nothing, and
-they are fail-closed by construction: a rule can only mean "do not cache",
-never "force cache", so a misconfigured rule costs hit rate and can never
-produce a wrong artifact. A bypassed compile is reported as a passthrough
-naming the rule that fired, visible in `kache report`.
-
-## Pinning config against env
-
-By default every `KACHE_*` environment variable **wins** over the config file — convenient for CI overrides, but it means a stray machine-global export can silently change behavior. The riskiest case is `KACHE_KEY_SALT`: a leaked export would shift *every* cache key without a word.
-
-Set `ignore_env` to make a pinned config authoritative:
-
-```toml title=".kache.toml"
-[cache]
-ignore_env = true
-key_salt = "v3-toolchain-abc"
-```
-
-With this, kache ignores the `KACHE_*` overrides for **file-backed settings** (cache/runtime dirs, max size, key salt, fallback, remote/planner settings, the toggles, etc.) and takes the file value (or built-in default) instead. When an ignored override is actually set, kache logs a warning naming it, so the suppression is never silent.
-
-`ignore_env` is **file-only** by design — an env var can't re-enable env overrides, or the lockdown would be trivially undone by the same stray export it defends against. It deliberately does **not** cover bootstrap/operational vars that have no file representation (`KACHE_CONFIG`, `KACHE_DISABLED`, `KACHE_SOCKET_PATH`, `KACHE_LOG` / `KACHE_LOG_FILE` / `KACHE_PROGRESS`, `KACHE_PAGER`, `KACHE_NAMESPACE`, `KACHE_BASE_DIR`) or S3 credentials (`KACHE_S3_ACCESS_KEY` / `KACHE_S3_SECRET_KEY`), which are secrets rather than config.
-
-`KACHE_SOCKET_PATH` is the one to watch in that list. Most others log or locate;
-`KACHE_PAGER` only selects a display program when a user explicitly runs a
-populated, interactive `kache list`. The socket variable moves the IPC endpoint,
-so a stray machine-global export redirects every client to a different daemon
-even under a pinned config. Treat it as a trust boundary rather than a setting
-`ignore_env` protects you from, and see [Daemon socket placement](/docs/daemon/overview#communication) for where to put it.
-
-## Cache-key salt
-
-kache's cache key captures everything it can *observe* about a compile: the rustc version, the target, flags, source and dependency hashes, and the linker's `--version` banner. Native Linux OS-loaded outputs also key the host GNU libc or musl version, while portable rlibs and cross-target outputs exclude that host-only signal. The observable set is **not** complete for toolchain changes that leave every reported version unchanged — for example a custom or cross-target libc/sysroot replacement, a distro patch that retains the same upstream libc version, a hidden `mold`/linker change, or a Nix store rebuild that swaps the ELF interpreter baked into a binary.
-
-When that happens, the key does not move, so a stale artifact can be restored. On Nix in particular, a `nixpkgs` bump followed by `nix store gc` can leave a restored executable pointing at a garbage-collected interpreter — an error no `cargo clean` can fix, because the key never changed.
-
-`key_salt` is an opaque string folded into every cache key. Set it to a value that *does* change when your toolchain changes — a hash of the toolchain closure, a store-path digest, a date, a CI build id — and that change re-keys the cache (a cold miss) instead of serving a stale hit:
-
-```toml title=".kache.toml"
-[cache]
-key_salt = "nixpkgs-a1b2c3d-mold-2.40"
-```
-
-Or compute it from the toolchain itself:
-
-```sh
-export KACHE_KEY_SALT="$(nix eval --raw .#devShells.default.outPath | sha256sum | cut -c1-16)"
-```
-
-The salt is hashed raw; its meaning is entirely yours. An unset or empty value has **no effect** — keys are byte-identical to not setting it — so it is safe to leave off until you need it. A misconfigured salt can only cost hit rate (an extra miss), never cause a wrong artifact to be restored.
-
-## Extra cache-key inputs
-
-kache keys a crate on what the compiler reports — source files, `--extern` dependencies, flags. Some crates also read files **at compile time that the compiler never reports**, so kache can't see them change:
-
-- sqlx's `query!` macro reads `.sqlx/query-*.json` (the offline query cache)
-- migration macros read `migrations/`
-- codegen / macros that `include!` data files by a path rustc doesn't surface
-
-Edit one of those and the `.rs` files are unchanged, so the key doesn't move — and kache would restore the previously-compiled artifact (a stale hit). Declare those files so a change to them re-keys the crate.
-
-Add a `kache.toml` next to the crate's `Cargo.toml`:
-
-```toml title="my-app/db/kache.toml"
+```toml title="crates/db/kache.toml"
 extra_inputs = [
   ".sqlx/**/*.json",
   "migrations/**/*.sql",
 ]
 ```
 
-Globs are relative to the crate directory. A bare directory is fine — `.sqlx` and `.sqlx/` both mean "everything under it." The matched files' contents are folded into that crate's key. Patterns must use stable literal paths; `$ENV` and `~` expansion is rejected because Cargo cannot observe that expansion changing.
+Matches are relative to that crate. Kache folds their paths and contents into its key and adds bounded watches to Cargo dep-info. Invalid or unreadable declarations fail closed.
 
-A pattern **may** reach outside the crate with `..` or an absolute path when a build genuinely depends on a shared tree above the crates or a machine-specific file. That's allowed and stays fail-safe, but it makes the crate's key host- or layout-specific (kache logs a warning), so it no longer shares across machines or worktrees — prefer a co-located input where you can.
+For a workspace-root input used by a provider package and its direct consumers:
 
-This is **opt-in and scoped per crate**: a crate with no `kache.toml` is unaffected, and one crate's `extra_inputs` never *implicitly* touch a sibling crate's key. Declared matches only add inputs to the key, but the declaration must cover every hidden compile-time input; an omitted file cannot be tracked. Each file is folded as its crate-relative path plus content hash, so moving the worktree doesn't bust the cache, but swapping two matched files' contents (where order matters, like sqlx migrations) does re-key. The declared patterns are folded too, so editing `kache.toml` itself re-keys — even when it currently matches nothing.
-
-`extra_inputs = []` leaves the cache key unchanged but still makes Cargo watch
-`kache.toml`, so activating the declaration later works in an already-warm target.
-
-### Workspace-shared provider inputs
-
-Use the project config when several packages share one workspace-root input, or
-when a proc macro reads that input while it executes inside a dependent crate:
-
-```toml title="<workspace-root>/.kache.toml"
+```toml title=".kache.toml"
 [[workspace.extra_inputs]]
 crates = ["query-macros"]
 inputs = [".sqlx/**/*.json"]
 propagate_to_dependents = true
 ```
 
-- `crates` contains exact Cargo **package names**. Selector globs are rejected,
-  and every Rust target in a selected package (library, binary, example, and so
-  on) folds the package's digest. For propagation, Kache maps the package's
-  library/proc-macro target from `[lib].name` or Cargo's default `-` to `_`
-  conversion; `propagate_to_dependents = true` is rejected for a bin-only
-  package.
-- `inputs` are relative to the workspace root; absolute paths and `..` are
-  rejected. Their workspace-relative paths and contents form a relocation-stable
-  digest.
-- The selected package's targets fold that digest. With
-  `propagate_to_dependents = true`, each direct `--extern` consumer also folds
-  it—even when the provider artifact is byte-identical, as happens when a proc
-  macro reads the file only while expanding the consumer. A two-hop dependent
-  then re-keys normally from the rebuilt direct consumer artifact.
+Workspace rules are accepted only from the `.kache.toml` beside the active Cargo workspace manifest. After adding a declaration to a target Cargo already considers fresh, rebuild that package once.
 
-Kache verifies propagation against the producer artifact's Cargo dep-info, so
-two packages exposing the same library crate name are not guessed by name. A
-legacy artifact without the provider marker must be rebuilt once.
+## Remote settings
 
-The table is honored only when the active config is exactly
-`<workspace-root>/.kache.toml`, beside a Cargo manifest containing `[workspace]`.
-An explicit or global `KACHE_CONFIG` elsewhere cannot inject workspace rules.
-Cargo `members` path globs are supported, but every selected provider must
-resolve to an explicit member. Crates that are neither selected providers nor
-direct consumers of a propagated provider retain their existing key bytes, as
-do projects without this table. Workspace rules are Rust/Cargo-only and are
-additive with a provider's co-located `kache.toml`.
+| Environment | TOML key | Default | Purpose |
+| --- | --- | --- | --- |
+| none | `cache.remote.type` | inferred as S3 for legacy config | `s3` or `filesystem` |
+| `KACHE_S3_BUCKET` | `cache.remote.bucket` | none | S3 bucket |
+| `KACHE_S3_ENDPOINT` | `cache.remote.endpoint` | AWS | Custom S3-compatible endpoint |
+| `KACHE_S3_REGION` | `cache.remote.region` | `us-east-1` | Region |
+| `KACHE_S3_PREFIX` | `cache.remote.prefix` | `artifacts` | Object prefix |
+| `KACHE_S3_PROFILE` | `cache.remote.profile` | credential-chain default | AWS profile |
+| `KACHE_S3_USER_AGENT` | `cache.remote.user_agent` | none | Custom HTTP User-Agent |
+| none | `cache.remote.path` | none | Filesystem remote root |
+| none | `cache.remote.atomic_write_dir` | `<path>/.kache-tmp` | Same-filesystem staging directory |
+| `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Concurrent operations for either backend |
+| `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | S3 connection pool idle time |
+| `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; wrapper demand remains capped at three seconds |
+| `KACHE_REMOTE_NEGATIVE_TTL_SECS` | `cache.remote_negative_ttl_secs` | `60` | Cache definitive remote 404 results |
 
-<Callout type="warn">
-  Keep patterns narrow. Kache rejects watches rooted at the crate root, an
-  ancestor of it, or the filesystem root. A narrower watch that still matches
-  an unusually large number of files is allowed with a warning, but re-walks
-  that tree on every compile and re-keys on every matching change.
-</Callout>
+Credentials resolve from explicit `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, standard AWS variables, the selected AWS profile, web identity, container credentials, then instance credentials.
 
-Invalid declarations, unreadable inputs, broad root watches, and symlinked
-dependencies fail closed with an actionable error; Kache never silently drops
-one from Cargo freshness tracking.
+See [S3 setup](/docs/remote-cache/s3-setup) or [filesystem setup](/docs/remote-cache/filesystem-setup).
 
-After a Kache-instrumented build, Kache adds `kache.toml` and bounded watches for
-its declared inputs to rustc's Cargo-facing dep-info. Cargo can then notice an
-in-place edit, addition, deletion, or declaration change and invoke Kache to
-recompute the key; no Kache-specific `build.rs` is required.
-Older cache entries are completed when Kache restores them, so the artifact
-cache itself does not need to be cleared. If Kache must pass such a crate
-through, it bypasses the configured fallback cache because that wrapper cannot
-see Kache's extra-input digest.
-Adaptive and forced incremental lanes remain disabled for declared hidden
-inputs; Kache uses the normal cache or safe passthrough path instead.
+## Prefetch and planner
 
-<Callout type="warn">
-  Cargo cannot retroactively learn dependencies for an already-fresh target.
-  After upgrading from Kache 0.13 or earlier—or after adding `kache.toml` or a
-  workspace rule to a target that is already Cargo-fresh—rebuild the affected
-  package once (for example, `cargo clean -p <package> && cargo build`). Later
-  declared-input changes are tracked automatically.
-</Callout>
+| Environment | TOML key | Default | Purpose |
+| --- | --- | --- | --- |
+| `KACHE_PREFETCH_ENABLED` | `cache.prefetch_enabled` | `true` | Enable speculative manifest and planner prefetch |
+| `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` | `cache.remote_key_cache_refresh_secs` | `60` | Refresh the fallback planner's remote key index; `0` means initial load only |
+| `KACHE_PREFETCH_MAX_KEYS` | `cache.prefetch_max_keys` | `2000` | Entries allowed per plan; `0` is unlimited |
+| `KACHE_PREFETCH_MAX_BYTES` | `cache.prefetch_max_bytes` | `2GiB` | Compressed bytes allowed per plan; in-flight downloads may finish |
+| `KACHE_PREFETCH_DEADLINE_SECS` | `cache.prefetch_deadline_secs` | `300` | Time during which a plan may start downloads; `0` disables the deadline |
+| `KACHE_PLANNER_ENDPOINT` | `cache.planner.endpoint` | none | Planner service URL |
+| `KACHE_PLANNER_TIMEOUT_MS` | `cache.planner.timeout_ms` | `750` | Planner request timeout |
+| `KACHE_PLANNER_TOKEN` | `cache.planner.token` | none | Bearer token |
+| `KACHE_NAMESPACE` | none | none | Shard namespace used by manifest upload and prefetch |
 
-<Callout type="warn">
-  Cargo's unstable checksum-freshness mode cannot checksum directory watches,
-  which are needed to detect glob additions and deletions. Kache currently
-  rejects an active `extra_inputs` declaration in that mode instead of risking
-  stale output. Use Cargo's normal freshness. If checksum freshness is required,
-  run the whole Cargo command with `KACHE_DISABLED=1`; because Kache then cannot
-  inject these dependencies, keep equivalent `cargo:rerun-if-changed` directives
-  until checksum support lands. Non-Cargo build systems must likewise provide
-  their own freshness mechanism.
-</Callout>
+On a long-lived runner with a warm local store, speculative prefetch may be unnecessary:
 
-<Callout type="info">
-  `kache.toml` (no leading dot) is **only** for `extra_inputs`. It is distinct
-  from the project config `.kache.toml`; any other key in it is a loud error.
-</Callout>
-
-## Extra path prefixes
-
-Use the file-only `[paths].base_dirs` list when automatic workspace/home/temp
-detection and the legacy single `KACHE_BASE_DIR` do not cover paths baked into
-artifacts—for example container mounts, `/snap`, `/var/lib/flatpak`, an
-AppImage mount, or a custom toolchain root:
-
-```toml title=".kache.toml"
-[paths]
-base_dirs = ["/snap", "/var/lib/flatpak", "/work"]
-```
-
-Entries must be absolute, narrower than a filesystem root, and contain no `..`. They need not exist on every
-machine, so a shared project config remains usable outside the container or
-sandbox. kache sorts the normalized entries independently of TOML order,
-assigns each one a distinct `<BASE_DIR_N>` key sentinel and
-`/kache/base-dir-N` compiler path, and uses the longest configured prefix when
-entries overlap. The configured roots feed both rustc and gcc/clang key inputs
-and emitted prefix maps. `KACHE_BASE_DIR` remains supported as the separate
-legacy `<BASE_DIR>` rule.
-
-<Callout type="warn">
-  Path normalization removes distinctions and therefore merges cache keys. An
-  over-broad root, or differently paired lists on two machines, can make
-  genuinely different inputs look identical and restore a wrong artifact.
-  C/C++ compiler prefix maps use raw byte-prefix semantics: for example,
-  `/work` also matches `/workspace`. Rust mappings are path-component aware.
-  Choose narrow, unambiguous roots, commit the same `.kache.toml` for every
-  cache participant, and review this warning and kache's per-entry audit log
-  when this list is active.
-</Callout>
-
-## Path-only env vars
-
-By default kache normalizes the absolute path baked into `OUT_DIR` so the cache key stays portable across machines and worktrees. Some builds set other env vars that serve the same role — they only point at a generated file that a crate `include!`s, and their absolute value should not bust the key (e.g. Firefox's `BUILDCONFIG_RS` / `MOZ_TOPOBJDIR`).
-
-`cache.path_only_env_vars` opts those vars into the same path-only treatment:
-
-```toml title=".kache.toml"
+```toml
 [cache]
-path_only_env_vars = ["BUILDCONFIG_RS", "MOZ_TOPOBJDIR"]
+prefetch_enabled = false
 ```
 
-Or via the environment (comma- or whitespace-separated; replaces the file list entirely):
+Exact remote lookup and background upload continue to work.
 
-```sh
-export KACHE_PATH_ONLY_ENV_VARS="BUILDCONFIG_RS MOZ_TOPOBJDIR"
-```
+## Daemon, events, and diagnostics
 
-Plain `VAR` entries still require kache to prove that the value only locates an included source file. For a known false positive in one crate, `rustc_crate_name:VAR` explicitly bypasses the include and runtime-value scans for only that pair:
+| Environment | TOML key | Default | Purpose |
+| --- | --- | --- | --- |
+| `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `0` | Stop after idle seconds; `0` keeps it running |
+| `KACHE_LOCAL_HIT_DAEMON` | `cache.local_hit_daemon` | `false` | Experimental daemon-assisted local lookup with local fallback |
+| `KACHE_HEARTBEAT_SECS` | `cache.heartbeat_secs` | `30` | Event heartbeat cadence for long miss compiles; `0` disables it |
+| `KACHE_EXPLAIN_MISS` | `cache.explain_miss` | `false` | Record changed key groups on repeat misses |
+| `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Warn when storage layout forces copies |
+| `KACHE_WINDOWS_HARDLINK` | `cache.windows_hardlink` | `false` | Unsafe opt-in hardlink restores on non-CoW Windows volumes |
+| `KACHE_PROGRESS` | none | off | `hits` or `verbose` compiler progress |
+| `KACHE_LOG` | none | CLI: `kache=warn`; wrapper: off | Stderr tracing filter |
+| `KACHE_LOG_FILE` | none | CLI/daemon: `kache=info`; wrapper: off | File tracing filter and wrapper opt-in |
+| `KACHE_EVENT_ROOT` | none | detected | Root attached to events for report filtering |
+| `KACHE_PAGER` | none | platform pager | Pager command for `kache list` |
 
-```toml title=".kache.toml"
+## Pin file-backed settings
+
+Set `cache.ignore_env` in a controlled project config to ignore environment overrides for settings that also exist in TOML:
+
+```toml
 [cache]
-path_only_env_vars = ["cef_dll_sys:OUT_DIR"]
+ignore_env = true
 ```
 
-Use rustc's crate name (hyphens become underscores). This force form is a correctness assertion: only use it when the compiled artifact cannot observe the value. `CARGO_MANIFEST_DIR` cannot be forced because erasing it can restore an artifact containing another checkout's path. An empty list leaves only the built-in `OUT_DIR` behavior.
+It does not suppress `KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_SOCKET_PATH`, credentials, logging, progress, or other environment-only controls. Kache warns when it ignores a set variable.
 
-## Env vars that steer expansion
-
-kache keys the compile-time environment a build *bakes in* — the `env!()` and `option_env!()` values rustc reports in dep-info. A **proc macro** that calls `std::env::var` while expanding is a different story: rustc has no way to report it, so the command line, the source hashes, and the `--extern` set are byte-identical whether or not the var is set, while the emitted artifact is not.
-
-That is a real failure mode, not a hypothetical one. In [#635](https://github.com/kunobi-ninja/kache/issues/635) a two-phase build ran the same crate graph twice — once with `BOLTFFI_BINDING_EXPANSION=1`, where the `#[export]` macro strips itself from dependency crates and emits no trait impls, and once without. The dependency crate's rustc invocation was identical in both phases, so both compiles keyed the same and the normal build restored the stripped 264 KiB artifact instead of building the 620 KiB one. It surfaced as a missing trait impl at compile time; the same mechanism can just as easily produce a wrong binary that builds cleanly.
-
-`cache.key_env_vars` declares the vars that steer expansion so the two modes get distinct entries:
-
-```toml title=".kache.toml"
-[cache]
-key_env_vars = ["BOLTFFI_*"]
-```
-
-Or via the environment (comma- or whitespace-separated; replaces the file list entirely):
-
-```sh
-export KACHE_KEY_ENV_VARS="BOLTFFI_BINDING_EXPANSION,BOLTFFI_SURFACE"
-```
-
-Semantics:
-
-- **Exact names, or a trailing `*` prefix glob.** `BOLTFFI_*` selects every var starting with `BOLTFFI_`; `APP_MODE` selects only that name. Matching is ASCII case-insensitive, so a Windows environment behaves like a Unix one. A `*` anywhere but the end is a literal character — `A*B` matches a variable actually named `A*B` — and kache warns when it sees one, since that is almost never what someone meant.
-- **Turning it on re-keys the crate.** The declared patterns are folded, not just the matched values — otherwise the build that leaves the vars unset would land back on the poisoned entry that made you reach for this setting. Expect one cold rebuild after adding or editing the list.
-- **Only vars actually set are folded**, as `NAME=VALUE` pairs. Set-to-empty and unset are distinct, matching what `std::env::var` reports.
-- **Declaration spelling doesn't matter.** The list is upper-cased, sorted and deduplicated before it is folded, so two teammates writing `BOLTFFI_*` and `boltffi_*` in either order still share a cache.
-- **Values are folded exactly**, as their raw OS bytes. See the warning below.
-- **Off by default.** An empty list has no effect; keys are byte-identical to not setting it.
-- **Union-only.** A misdeclared pattern can cost a cache miss, never restore a wrong artifact.
-
-<Callout type="warn">
-  Declared values are **not** path-normalized, unlike most paths kache keys. A
-  macro is free to paste a variable's value straight into the code it emits, so
-  two checkout paths that would collapse to the same `<BASE_DIR>` sentinel can
-  still produce different artifacts — normalizing them would reintroduce the
-  wrong-hit this setting exists to prevent. The consequence is that a declared
-  variable holding a machine-local path (`BOLTFFI_ROOT=/home/alice/proj`) makes
-  that crate's key machine-specific and stops it sharing across hosts. Prefer
-  declaring the switch a macro actually branches on
-  (`BOLTFFI_BINDING_EXPANSION`) over a broad `BOLTFFI_*` glob that sweeps in
-  path variables too.
-</Callout>
-
-Keep the list to vars that genuinely change what a macro emits. Naming something that varies per build — a timestamp, a job id, `PWD` — gives every compile its own key and disables caching for the whole workspace. `"*"` is a valid pattern and folds the entire environment, but for the same reason it is close to a cache-off switch, and it makes every credential in the process contribute to your cache keys.
-
-Values are never written to logs or events — only variable names appear at `KACHE_LOG=trace` — but they do influence the resulting cache key, which is stored and (with a remote) transmitted. Treat a declared secret as hashed, not as hidden.
-
-<Callout type="info">
-`proc_macro::tracked_env` would let a macro register these reads with the compiler and make this configuration unnecessary. It is still unstable, so for now the vars have to be declared. Other compiler caches share the limitation.
-</Callout>
-
-If you would rather not cache the affected crate at all, [`cache.exclude`](#excluding-sources) takes a source-path glob and bypasses kache entirely for those compiles.
-
-## Extra cc allowlist flags
-
-kache caches a C/C++ compile only when it recognizes every flag on the command line. Its cc flag classifier is an **allow-list**: each flag is one kache has reasoned about and knows how to key. Anything unrecognized is refused and the compile passes through uncached — the safe default, since a flag kache doesn't model could change the object file without changing the key.
-
-For setup and the current C/C++ support matrix, see [C/C++ caching](/docs/getting-started/c-cpp).
-
-**Supported compilers and dialects.** kache wraps the GNU-dialect drivers (`cc`, `c++`, `gcc`, `g++`, `clang`, `clang++`; POSIX) and the MSVC-dialect `clang-cl` (Windows, or `clang --driver-mode=cl`). The two dialects have separate allow-lists, so each flag is classified in the spelling its compiler actually uses — e.g. `-fno-rtti` (GNU) vs `-GR-` (clang-cl), `-std=c++20` vs `-std:c++20`. For clang-cl, debug info (`/Z7` / `-Z7` / `-g`) **is** cached (machine-local — clang-cl embeds CodeView paths in the `.obj`), while `-bigobj` and `-showIncludes` are still deliberately **refused** (passed through) for now; the common MSVC codegen set (`-EH*`, `-GR`/`-GS`, `-guard:`, `-std:`, `-fms-compatibility-version=`, `/O*`, `-Gy`/`-Gw`, `-MD`/`-MT`, …) is modeled. `extra_allowlist_flags` entries below are matched against command-line tokens verbatim, so list them in whichever dialect your compiler speaks (a `/`-spelled clang-cl flag included).
-
-The cost is that a common-but-unlisted flag disables caching for that compile until kache ships a release adding it. `cc.extra_allowlist_flags` lets you opt such a flag in locally, ahead of official support:
-
-```toml title=".kache.toml"
-[cc]
-extra_allowlist_flags = ["-ffunction-sections", "-fdata-sections", "-fno-rtti"]
-```
-
-Or via the environment (whitespace-separated; overrides the file):
-
-```sh
-export KACHE_CC_EXTRA_ALLOWLIST_FLAGS="-ffunction-sections -fdata-sections"
-```
-
-Semantics:
-
-- **Exact match.** An entry matches a command-line token character-for-character — no prefixes or wildcards. List each value you use (e.g. `-march=armv8.2-a`, not `-march=`).
-- **Hashed verbatim.** A matched flag that's actually present is folded into the cache key as its literal string, so a different flag (or value) always produces a different key — it can never miscache *by value*.
-- **Add-only.** This can only make kache *stop refusing* a flag. It cannot override structural refusals — link mode, coverage instrumentation, multi-`-arch`, precompiled headers, modules, and the like still pass through.
-- **Off by default.** An empty list has no effect; keys are byte-identical to not setting it.
-
-<Callout type="warn">
-Avoid host-dependent flags like `-march=native`. The string is identical on every machine but compiles to different objects per CPU, so hashing it verbatim collides across hosts — a cache hit on one machine can restore an object built for another. List explicit architectures instead.
-</Callout>
-
-To confirm it took effect, run with `KACHE_LOG=kache=debug`: the cc flag-classify summary gains a `user-allowed` count, and the flag no longer appears in any `unsupported flag(s): … — passthrough` line. At `kache=trace` each accepted flag logs as `user-allowed (config)` and each one folded into the key logs as `cc_extra_flag=`.
-
-## S3 credential resolution order
-
-Remote S3 credentials are resolved in this order:
-
-1. `KACHE_S3_ACCESS_KEY` + `KACHE_S3_SECRET_KEY`
-2. Standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-3. Static credentials in the selected profile (`KACHE_S3_PROFILE`, `cache.remote.profile`, `AWS_PROFILE`, then `default`)
-4. Legacy inline SSO, then `credential_process` for the selected profile
-5. Environment-based web identity, ECS/task credentials, then EC2 instance credentials
-
-For Ceph, MinIO, or R2, set `cache.remote.endpoint` or `KACHE_S3_ENDPOINT`.
-
-```toml title="Ceph example"
-[cache.remote]
-type = "s3"
-bucket = "build-cache"
-endpoint = "https://s3.example.com"
-profile = "ceph"
-```
-
-## Composing with other compiler wrappers
-
-kache works as a `RUSTC_WRAPPER` and composes with a second wrapper in either direction.
-
-**Behind another workspace wrapper** (`RUSTC_WORKSPACE_WRAPPER`, e.g. `clippy-driver`): when cargo has both `RUSTC_WRAPPER=kache` and a `RUSTC_WORKSPACE_WRAPPER` set, it invokes `kache <workspace-wrapper> <rustc> <args>`. kache detects that the inner argument is itself a compiler, forwards the real rustc path as the workspace wrapper expects, and keys/caches around it. `cargo clippy` (which drives `clippy-driver`) is handled the same way — no extra configuration needed.
-
-**In front of another wrapper** — when you want a second wrapper to cache the compiles kache *declines*: set [`KACHE_FALLBACK`](#all-settings) (or `cache.fallback`). kache then runs `<fallback> <compiler> <args>` for passed-through invocations, so e.g. sccache gets a chance at the compiles kache won't cache.
-
-<Callout type="info">
-  `KACHE_DISABLED=1` makes kache a transparent shim (no lookup, store, or
-  upload) while still stripping incremental flags unless
-  `KACHE_PRESERVE_INCREMENTAL=1` is set — useful to temporarily
-  bypass kache in a wrapper chain without unsetting the env var. Only `1` or
-  `true` (case-insensitive) disable; `0`/`false`/unset leave caching on.
-</Callout>
-
-## Restore verification
-
-By default, a hit checks recorded metadata and blob size, then restores the blob. Set `KACHE_VERIFY_RESTORES=sampled` to content-hash roughly one in sixteen hits, or `KACHE_VERIFY_RESTORES=always` to hash every restored blob before serving it:
-
-```sh
-KACHE_VERIFY_RESTORES=sampled cargo build
-```
-
-`sampled` is useful as cheap background coverage for silent disk corruption. `always` is stricter but adds an extra full read of every restored blob.
-
-## Size values
-
-Size fields (`KACHE_MAX_SIZE`, `cache.local_max_size`) accept human-friendly strings:
-
-```
-50GiB   10GB   512MiB   1024MB
-```
-
-## Log levels
-
-`KACHE_LOG` follows the `tracing` subscriber syntax:
-
-```sh
-KACHE_LOG=kache=debug   # verbose, useful when diagnosing cache misses
-KACHE_LOG=kache=info    # operational detail
-KACHE_LOG=kache=warn    # default — only surface real problems
-```
-
-The file log is written to `~/Library/Logs/kache/kache.log` on macOS and `~/.cache/kache/kache.log` elsewhere. It rotates automatically when it exceeds 5 MB.
-
-## Local store layout
-
-```
-<cache_dir>/               # Linux: ~/.cache/kache · macOS: ~/Library/Caches/kache · Windows: %LOCALAPPDATA%\kache
-├── store/
-│   ├── blobs/
-│   │   └── ab/
-│   │       └── abcdef...   # content-addressed blob (blake3), stored once
-│   └── <cache_key>/
-│       └── meta.json       # entry metadata; references its blobs by hash
-│   └── gc.lock             # serializes store-wide GC
-├── index.db                # SQLite index (WAL mode) — sibling of store/, not inside it
-└── upload-queue/           # durable remote-upload intents
-
-<runtime_dir>/              # defaults to <cache_dir>; set per job when sharing a store
-├── events.jsonl            # build event log
-├── transfers.jsonl         # transfer log
-├── summaries.jsonl         # build-session summaries
-├── .build-sessions/        # build-session markers
-└── daemon.sock             # IPC socket; daemon locks/state/log live beside it
-```
-
-The whole cache directory is excluded from Time Machine and Spotlight on macOS automatically — on first start the daemon sets a `tmutil` exclusion and a `.metadata_never_index` sentinel.
-
-### Concurrent jobs on one trusted runner
-
-Jobs on the same host may reuse one persistent local store while running a daemon per job. Keep `KACHE_CACHE_DIR` on a host-local disk, and give each job a private `KACHE_RUNTIME_DIR` (for example, the CI system's per-job temporary directory):
-
-```sh
-export KACHE_CACHE_DIR=/var/lib/kache/trusted-rust
-export KACHE_RUNTIME_DIR="$RUNNER_TEMP/kache-runtime"
-```
-
-Do this only inside one trust domain. Any job that can write the shared store can influence later cache hits, so untrusted pull requests must use a different runner group or a different mounted cache directory. Never share `KACHE_RUNTIME_DIR` between concurrent jobs; the persistent SQLite index, blob store, upload queue, and GC coordination remain under `KACHE_CACHE_DIR`.
-
-## Containers and cross-compilation
-
-kache's index (`index.db`) is a SQLite database, and SQLite needs reliable file locking from the filesystem it lives on — plus shared memory, in WAL mode. A normal local cache directory provides both. A cache directory **shared across machine or OS boundaries** does not.
-
-The usual way to hit this is bind-mounting your host cache directory into a build container — for example [`cross`](https://github.com/cross-rs/cross), Docker, or Podman:
-
-- The directory is mounted from the host into the container, so `index.db` is opened from two different operating systems at once.
-- A kache daemon on the host typically holds `index.db` open in WAL mode for the duration of the build, and that WAL state cannot be shared with the process inside the container.
-
-When kache can't open the index it falls back to building **uncached** — your build still succeeds, just with no cache hits or stores — and prints a one-time warning:
-
-```
-[kache] the cache index could not be opened after retries (...).
-[kache] Caching is disabled for this build — compilation still succeeds,
-[kache] just without cache hits or stores (everything builds uncached).
-[kache] ...
-[kache] → set KACHE_CACHE_DIR to a fast, local, single-machine path
-```
-
-**Give the container its own cache directory.** Point `KACHE_CACHE_DIR` at a path the container alone uses — ideally a dedicated volume so the cache persists across runs:
-
-```sh
-# inside the container / cross build — a container-local volume, NOT the host's cache dir
-export KACHE_CACHE_DIR=/kache-cache
-```
-
-Don't bind-mount the host's cache directory into the container. Sharing it gains little anyway: host and cross builds target different platforms and feature sets, so they produce different cache keys and would not reuse each other's entries.
-
-<Callout type="info">
-  The same rule applies to network filesystems (NFS, SMB/CIFS, 9p) and any
-  setup where more than one machine touches the same directory: keep
-  `KACHE_CACHE_DIR` on a fast, local disk owned by a single machine. To reuse
-  build artifacts *across* machines, configure an [S3 remote](/docs/remote-cache/s3-setup)
-  or a separate [filesystem remote](/docs/remote-cache/filesystem-setup). Only
-  the filesystem remote's `path` belongs on the shared mount.
-</Callout>
+The daemon reads configuration at startup and watches the active config file. File changes trigger a graceful restart. Environment changes require starting a new daemon from that environment; an installed service uses its service definition, not your current shell.

@@ -1,169 +1,89 @@
 ---
 title: CI setup
-description: Using kache in GitHub Actions and other CI environments.
+description: Use Kache in GitHub Actions or a shell-based CI job
 ---
-
-# CI setup
 
 ## GitHub Actions
 
-The fastest way to add kache to a GitHub Actions workflow is the official action:
+The official action installs Kache, configures the Rust wrapper, and can persist the local store through GitHub's cache service:
 
 ```yaml title=".github/workflows/ci.yml"
 steps:
   - uses: actions/checkout@v4
   - uses: dtolnay/rust-toolchain@stable
-
   - uses: kunobi-ninja/kache-action@v1
-
-  - run: cargo build --release
+  - run: cargo build --locked
 ```
 
-The action installs kache, sets `RUSTC_WRAPPER=kache`, and persists the local kache store with GitHub's built-in Actions cache by default. No S3 bucket is required.
+See the [kache-action repository](https://github.com/kunobi-ninja/kache-action) for its current input reference and release notes.
 
-<Callout type="info">
-The default GitHub Actions cache backend is the simplest choice for most open-source projects. For private infrastructure, larger caches, or sharing across repositories, use an S3 bucket instead.
-</Callout>
-
-## Using S3 with kache-action
-
-If you have an S3 bucket, pass it to the action:
-
-```yaml
-steps:
-  - uses: actions/checkout@v4
-  - uses: dtolnay/rust-toolchain@stable
-
-  - uses: kunobi-ninja/kache-action@v1
-    with:
-      s3-bucket: my-build-cache
-      s3-region: eu-west-1
-      s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
-      s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
-
-  - run: cargo build --release
-  - run: cargo test
-```
-
-For S3-compatible stores such as MinIO, Ceph, or R2, also set `s3-endpoint`:
+For S3-compatible storage:
 
 ```yaml
 - uses: kunobi-ninja/kache-action@v1
   with:
     s3-bucket: my-build-cache
-    s3-endpoint: https://minio.internal:9000
+    s3-region: eu-west-1
     s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
     s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
 ```
 
-With S3 configured, the action starts the kache daemon for warm prefetch, saves a build manifest after the build, pushes new artifacts with `kache sync --push`, writes a job summary, and can post a sticky PR comment with `kache report --format github`.
+Add `s3-endpoint` for R2, Ceph, or MinIO. Prefer workload identity or IAM roles over long-lived access keys when the runner supports them.
 
-Warm prefetch is most useful for ephemeral runners with an empty local store. Long-lived self-hosted runners should measure it separately: when their local store is already warm, speculative planning and remote-key indexing can cost more than exact on-demand remote lookup. Prefer a persistent config file on those runners:
+## Other CI systems
 
-```toml title="~/.config/kache/config.toml"
+Install Kache, then provide wrapper and remote configuration:
+
+```bash
+export RUSTC_WRAPPER=kache
+export KACHE_S3_BUCKET=my-build-cache
+export KACHE_S3_REGION=eu-west-1
+
+kache sync --pull
+cargo build --locked
+kache sync --push
+```
+
+Set credentials through the runner's secret store or standard cloud identity chain. Use `--allow-partial` only when cache failure must not fail the job.
+
+## Ephemeral and persistent runners
+
+Speculative prefetch is intended for empty runners. A persistent self-hosted runner may already have the needed entries locally. Measure both modes and disable speculation when it adds work:
+
+```toml
 [cache]
 prefetch_enabled = false
 ```
 
-The daemon watches the config file and restarts itself when it changes. This retains exact remote hits and uploads without speculative warming. A running daemon cannot see a changed `KACHE_PREFETCH_ENABLED`; stop and start a manually managed daemon from the intended environment. An installed service keeps the environment in its service definition, so a shell export followed by `kache daemon restart` does not apply that export. `kache stats` reports the daemon's effective policy and warns when it differs from the invoking process.
+This keeps exact remote reads and uploads.
 
-Useful action inputs:
+Concurrent jobs may share a persistent local store, but each job should have a distinct `KACHE_RUNTIME_DIR` for sockets, locks, event logs, and session state.
 
-| Input | Default | Description |
-|---|---|---|
-| `version` | latest release | kache version to install |
-| `github-cache` | `true` | Use GitHub Actions cache when S3 is not configured |
-| `s3-bucket` | — | S3 bucket name; enables the S3 backend |
-| `s3-region` | `us-east-1` | S3 region |
-| `s3-prefix` | `artifacts` | S3 key prefix |
-| `s3-endpoint` | — | Custom endpoint for MinIO, Ceph, R2, etc. |
-| `sync` | `false` | With S3, pull the full remote cache during setup |
-| `warm` | `true` | With S3, prefetch likely artifacts from the saved build manifest |
-| `manifest-key` | target triple | Scope saved manifests for different build shapes |
-| `pr-comment` | `true` | Post or update a sticky PR cache summary comment |
-| `max-size` | `50GiB` | Local store cap, mapped to `KACHE_MAX_SIZE` |
+## Progress and reports
 
-## Other CI systems
-
-Outside GitHub Actions, configure kache directly via environment variables:
+Kache is quiet in compiler-wrapper mode by default because Cargo can retain wrapper stderr as compiler diagnostics.
 
 ```yaml
 env:
-  RUSTC_WRAPPER: kache
-  KACHE_S3_BUCKET: my-build-cache
-  KACHE_S3_REGION: us-east-1
-  KACHE_S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
-  KACHE_S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+  KACHE_PROGRESS: hits       # hits only
+  # KACHE_PROGRESS: verbose # hits, dups, misses, and long-compile heartbeats
 ```
 
-For AWS with IAM roles (OIDC), skip the access key variables and let kache use the standard credential chain.
+Create a machine-readable summary after the build:
 
-For S3-compatible stores, also set `KACHE_S3_ENDPOINT`. `KACHE_S3_PREFIX` is optional and defaults to `artifacts`.
+```bash
+kache report --format json --output kache-report.json
+kache stats
+```
 
-When no daemon is running in an ephemeral runner, use explicit sync steps:
+## Coverage and uncached steps
+
+Coverage instrumentation uses separate, path-local keys. If you do not want coverage artifacts in Kache:
 
 ```yaml
-- name: Warm cache
-  run: kache sync --pull
-
-- run: cargo build --release
-
-- name: Push new artifacts
-  run: kache sync --push
-  if: always()
-```
-
-The `if: always()` on the push step stores newly built artifacts even when the build fails partway through. Partial cache population still speeds up future runs.
-
-Both sync subcommands require a configured remote. Without one they error with `No remote configured`. By default `kache sync --pull` is filtered to the crates in the current workspace's `Cargo.lock`, so an ephemeral runner only fetches what this build needs. Use `kache sync --pull --all` to pull every artifact in the remote regardless of the local lockfile.
-
-By default, `kache sync` exits non-zero if any transfer or import fails, allowing CI jobs to detect synchronization errors directly from the command exit status. All scheduled transfers continue to drain to completion before exiting. If you want best-effort synchronization where transfer or import failures do not fail the CI step, pass `--allow-partial`.
-
-## CI progress output
-
-kache can print per-crate progress lines to stderr when `KACHE_PROGRESS` is set. It is silent by default — both in CI and locally — to avoid cargo caching the wrapper's stderr as stale compiler diagnostics. Set the variable to opt in:
-
-| Value | Behavior |
-|---|---|
-| unset / anything else | Silent (default) |
-| `1` or `hits` | Print hits only |
-| `verbose` or `all` | Print hits, dups, misses, and in-flight heartbeats |
-
-With `KACHE_PROGRESS=verbose`, lines look like:
-
-```
-[kache] serde: local hit (2ms, 1.2 MB)
-[kache] tokio: local hit (3ms, 4.8 MB)
-[kache] myapp: miss (1.4s, 892 KB)
-[kache] still compiling gkrust — 30s elapsed (typical: 7m51s, ETA 7m21s)
-```
-
-At `hits`/`1` only the `local hit` lines appear; `miss` and `dup` lines show up only under `verbose`/`all`. Result lines use `[kache] <crate>: <label> (<elapsed>[, <size>])`. There is no terminal or CI detection — output depends solely on this variable.
-
-Heartbeat timing is controlled by `KACHE_HEARTBEAT_SECS` / `cache.heartbeat_secs` (30 seconds by default). Structured heartbeat events continue to be written to `events.jsonl` when stderr progress is off.
-
-## Coverage and instrumentation
-
-Coverage tools like `cargo-tarpaulin` and `cargo-llvm-cov` use `-C instrument-coverage`, which changes what kache stores (path remapping is skipped to preserve source mapping for coverage reports). This produces different cache keys from regular builds, and those keys include the build's local path identity, so the coverage cache is isolated automatically — from regular builds and from builds at a different checkout path or tool root.
-
-That said, many teams disable kache for coverage runs entirely to keep things simple:
-
-```yaml
-- name: Test with coverage
-  run: cargo tarpaulin --engine llvm --all-features --workspace --out Json
-  env:
-    RUSTC_WRAPPER: ""   # disable kache for this step
-```
-
-## Disabling kache for specific steps
-
-```yaml
-- name: Some step without caching
-  run: cargo build
+- run: cargo llvm-cov
   env:
     KACHE_DISABLED: "1"
 ```
 
-Only `1` or `true` (case-insensitive) disable kache. Other values — including `0`, `false`, and empty — are ignored, so to re-enable kache in a later step you must unset the variable rather than set it to `0`.
-
-kache still strips the rustc `-C incremental=…` flags when disabled, which avoids APFS-related corruption in git worktrees on macOS — even when caching is off — unless explicit preserve-incremental hybrid mode is enabled.
+Unset `KACHE_DISABLED` to enable caching again. Only `1` and `true` disable it.

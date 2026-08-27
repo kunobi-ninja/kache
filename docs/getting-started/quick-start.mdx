@@ -1,172 +1,90 @@
 ---
 title: Quick start
-description: Run kache init, watch a cold build populate the cache, then see the second build restore every artifact with zero-copy reflinks.
+description: Try Kache safely, then choose whether to enable it permanently
 ---
 
-# Quick start
+## Try Kache in one shell
 
-The fastest path is `kache init`. It edits `~/.cargo/config.toml` to set `rustc-wrapper = "kache"`, installs the background daemon as a login service, and starts it. The whole flow takes a few seconds and is idempotent — re-run it any time to repair configuration.
-
-```sh
-# interactive setup
-kache init
-
-# or accept all defaults non-interactively
-kache init -y
-
-# skip the login service if you'd rather start the daemon manually
-kache init --no-service
-
-# check what init would do without changing anything
-kache init --check
-```
-
-After `kache init`, your next `cargo build` is already cached. The first run is a normal cold compile; the second run restores everything from kache's store with zero-copy reflinks (copy-on-write) where the filesystem supports it, and hardlink or copy otherwise.
-
-<Callout type="warning" title="Do not share one Cargo target directory across live worktrees">
-  With ordinary `cargo`, share Kache's cache but give each worktree its own
-  `CARGO_TARGET_DIR`. Cargo can declare an older worktree's unit `Fresh` from
-  shared fingerprint state without invoking `RUSTC_WRAPPER`, so no compiler
-  cache can validate that unit. If final artifacts must share one target, use
-  `kache cargo -- build` on Cargo 1.91+: it keeps intermediate fingerprints
-  worktree-local while Kache shares compiled artifacts.
-</Callout>
-
-![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact with zero-copy reflinks](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
-
-## Verify the setup
-
-```sh
-kache doctor
-```
-
-`doctor` checks for a working `RUSTC_WRAPPER`, conflicting wrappers (e.g. sccache), config file problems, and daemon connectivity. Add `--fix` to apply automatic repairs. For store integrity, `--verify` walks the store and checks entries, blobs, and metadata; add `--checksums` to also recompute and verify blob content hashes (slower); `--repair` removes corrupted entries.
-
-## Manual setup (without `kache init`)
-
-If you'd rather wire things up yourself:
-
-<Steps>
-  <Step>
-    **Set the wrapper for your current shell session**
-
-    ```sh
-    export RUSTC_WRAPPER=kache
-    ```
-
-    Or persist it in `~/.cargo/config.toml` so it applies to every project:
-
-    ```toml title="~/.cargo/config.toml"
-    [build]
-    rustc-wrapper = "kache"
-    ```
-
-    The `~/.cargo/config.toml` approach is more convenient for daily use. The env var is handy for CI or when you want to test kache on a single project without changing global config.
-  </Step>
-
-  <Step>
-    **Run a build**
-
-    ```sh
-    cargo build
-    ```
-
-    The first build runs normally — kache compiles each crate and stores the result. You'll see normal cargo output.
-  </Step>
-
-  <Step>
-    **Run the build again**
-
-    ```sh
-    cargo clean && cargo build
-    ```
-
-    This time, kache restores every crate from the cache with zero-copy reflinks (hardlink or copy where the filesystem has no copy-on-write). Cargo should complete in seconds for a project with no source changes.
-  </Step>
-
-  <Step>
-    **Open the monitor**
-
-    ```sh
-    kache monitor
-    ```
-
-    The TUI monitor opens and shows the Build tab with the events from the last run — each crate listed as a local hit or miss with timing. Press `q` to quit. (Running bare `kache` prints help; use `kache monitor` to open the dashboard.)
-  </Step>
-</Steps>
-
-## How to tell it's working
-
-kache can print a one-line summary to stderr per crate, off by default. Enable it with `KACHE_PROGRESS=1` (or `hits`) to show hits, or `KACHE_PROGRESS=verbose` (or `all`) to also show dups and misses:
-
-```
-[kache] serde: local hit (2ms, 1.2 MB)
-[kache] tokio: local hit (3ms, 4.8 MB)
-[kache] myapp: miss (1.4s, 892 KB)
-```
-
-The `miss` line only appears at `KACHE_PROGRESS=verbose`; at `KACHE_PROGRESS=1`/`hits` only hit lines are shown. For a live view, open the monitor instead with `kache monitor`.
-
-Verbose progress also prints `still compiling` heartbeats for misses that outlive the configured heartbeat cadence. They stay off by default because Cargo caches compiler-wrapper stderr and can replay old progress on later builds.
-
-After upgrading from kache 0.12, already-cached heartbeat lines can keep replaying until the affected crates rebuild. Clean the project's Cargo target directory if they must be removed immediately.
-
-You can also check the cache state directly:
-
-```sh
-kache list               # all cached crates, sorted by name
-kache list serde         # details for a specific crate
-kache stats              # one-shot summary (no UI)
-```
-
-## What kache does not cache
-
-On Linux, kache caches user-facing executables (`bin` crates and `--test` harnesses) by default: DWARF lives inside the binary, so a restored executable debugs exactly like a freshly linked one. On macOS and Windows it skips them by default, because their debug info is referenced from *outside* the binary (macOS `N_OSO` records point at per-build object files; a Windows `.exe` records its `.pdb` path), so a restored binary would lose source-level debugging — see [#319](https://github.com/kunobi-ninja/kache/issues/319). Dynamic libraries (`dylib`, `cdylib`) and proc-macros stay cached everywhere regardless. Override either way with `KACHE_CACHE_EXECUTABLES=1`/`=0` or `cache_executables` in the config file.
-
-For ordinary builds, kache strips `-C incremental=...` and prefers exact local
-or remote artifacts. Rapid source churn is different: mutation testing, for
-example, presents a new source hash on almost every build while rustc can reuse
-most prior work.
-
-Kache detects that pattern automatically. After a normal miss and a successful
-incremental seed, it temporarily bypasses key work for that Cargo-primary unit,
-using per-unit state and a cross-process lock. The lane is bounded; kache then
-probes the exact artifact cache again, so a repeated revision can still hit.
-Stable dependencies and non-adaptive cache rejections continue through the
-normal Kache/fallback pipeline. Learned units run directly through Kache.
-Eligible user-facing test/bin units already excluded by
-`cache_executables=false` do too when no fallback is configured; otherwise
-their normal passthrough honors the configured fallback.
-
-No special mutation command is needed:
+From a Rust project:
 
 ```bash
-cargo mutants
+RUSTC_WRAPPER=kache cargo build
+cargo clean
+KACHE_PROGRESS=hits RUSTC_WRAPPER=kache cargo build
+kache stats
 ```
 
-Cargo's dev and test profiles already enable incremental compilation by
-default, so `CARGO_INCREMENTAL=1` is unnecessary unless your project,
-environment, or custom profile disabled it. Set `KACHE_ADAPTIVE_INCREMENTAL=0`
-to disable learning, or `KACHE_PRESERVE_INCREMENTAL=1` to force the incremental
-lane for diagnostics and benchmarks. Custom incremental layouts fail closed to
-normal kache behavior.
+The first build fills the local cache. `cargo clean` makes Cargo request the same outputs again, so the second build can demonstrate restores. Do not add `cargo clean` to a normal build workflow.
 
-## C/C++ object compiles
+This trial does not edit Cargo configuration or install a service.
 
-kache can also wrap C/C++ compilers for local object-compile caching:
+## Enable Kache permanently
 
-```sh
-export CC="kache cc"
-export CXX="kache c++"
+```bash
+kache init
 ```
 
-This is separate from `RUSTC_WRAPPER`: supported single-source `-c` compiles are cached, while link steps and unmodeled compiler shapes pass through. See [C/C++ caching](/docs/getting-started/c-cpp).
+`init` configures Cargo, installs the daemon as a login service, and starts it. It is safe to run again when repairing a setup.
 
-## Disabling kache temporarily
+Useful variants:
 
-```sh
+```bash
+kache init --check       # print proposed changes only
+kache init --no-service  # configure Cargo without a login service
+kache init --yes         # accept defaults without prompts
+```
+
+To configure Cargo yourself, use either the environment or Cargo config:
+
+```bash
+export RUSTC_WRAPPER=kache
+```
+
+```toml title="~/.cargo/config.toml"
+[build]
+rustc-wrapper = "kache"
+```
+
+## Check the setup
+
+```bash
+kache doctor
+kache monitor
+```
+
+`doctor` checks wrapper configuration, conflicting wrappers, config parsing, and daemon access. `monitor` shows hits, misses, passthroughs, store use, and remote transfers.
+
+For a non-interactive check:
+
+```bash
+kache stats
+kache list
+```
+
+## Worktrees
+
+Share the Kache store across worktrees, but give concurrent Cargo builds separate target directories. Cargo owns `target/` fingerprints and can mark a unit fresh without invoking any compiler wrapper.
+
+On Cargo 1.91 or newer, this command keeps intermediate fingerprints worktree-local while allowing final target output to be shared:
+
+```bash
+kache cargo -- build
+```
+
+Otherwise set a distinct `CARGO_TARGET_DIR` per live worktree.
+
+## Executables and incremental builds
+
+Kache caches eligible Rust executables by default on Linux and macOS. The default is off on Windows because executable debug information still refers to an external PDB path. Override the policy with `KACHE_CACHE_EXECUTABLES` or `cache.cache_executables`.
+
+Normal artifact-cached builds strip Cargo's incremental directory argument. Adaptive incremental mode, enabled by default, learns rapidly changing Cargo units and temporarily gives them isolated incremental state. Use `KACHE_ADAPTIVE_INCREMENTAL=0` to turn that off or `KACHE_PRESERVE_INCREMENTAL=1` to force the incremental path for diagnostics.
+
+## Temporarily disable caching
+
+```bash
 KACHE_DISABLED=1 cargo build
 ```
 
-Even when disabled, kache strips incremental flags to avoid the APFS issue on
-macOS unless `KACHE_PRESERVE_INCREMENTAL=1` is explicitly set.
+This keeps the wrapper in place but passes compiler work through.
+
+For C and C++, continue with [C/C++ caching](/docs/getting-started/c-cpp).

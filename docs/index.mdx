@@ -1,64 +1,88 @@
 ---
-title: kache
-description: Content-addressed build cache for Rust and C/C++ object compiles, with zero-copy local restores where safe plus S3 or filesystem sharing.
+title: Kache
+description: A local-first compiler cache for Rust and C/C++ builds
 ---
 
-# Introduction
+Kache stores compiler outputs by content and reuses them across builds, repositories, and worktrees. The local cache works on its own. S3-compatible and filesystem remotes are optional.
 
-**kache** is a drop-in `RUSTC_WRAPPER` for Rust and a `cc` / `c++` compiler wrapper for C/C++ object compiles. Cache keys are blake3 hashes of normalized compiler inputs; cache hits prefer reflinks. On Unix without CoW, one immutable target may hardlink to a blob while additional consumers receive private copies. Windows restores copy by default; unrestricted hardlink sharing is an explicit legacy opt-in. Identical blobs are stored once in the cache. An optional S3-compatible or shared-filesystem remote shares Rust artifacts across machines.
+## Decide first
 
-Local Rust caching, local C/C++ object caching, and direct remote sync are working today. C/C++ artifacts are local-only for now; unsupported compiler shapes pass through to the real compiler.
+- Use Kache if you want shared caching across worktrees, local-first operation, built-in inspection tools, or explicit cache synchronization.
+- Read [Kache or sccache?](/docs/getting-started/comparison) if you are comparing compiler caches.
+- Start with a temporary wrapper if you want to evaluate Kache without changing Cargo configuration or installing a service.
 
-<Callout type="info">
-**PREVIEW:** a remote planner that prefetches from workspace manifests, dependency history, and build intent — warming the right artifacts before rustc asks for them. The daemon already calls a planner when `KACHE_PLANNER_ENDPOINT` is set; the hosted service is still preview. See [Remote service](/docs/remote-service).
-</Callout>
+## Five-minute Rust trial
 
-![kache: cold build populates the store, then `cargo clean && cargo build` restores every artifact zero-copy](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
+Install Kache:
 
-> Cold compile populates kache's store, `cargo clean` wipes `target/`, and the second build pulls every artifact back zero-copy (reflink, falling back to hardlink/copy).
-
-## Why local kache is fast
-
-kache is useful even before remote cache is configured:
-
-- **Zero-copy where safe.** Local hits use reflink (copy-on-write) where supported. On Unix without CoW, one immutable target may hardlink to a blob; additional consumers use private copies so restore timestamps cannot disturb active readers. Windows copies by default.
-- **Content-addressed storage.** The store is keyed by blake3 hash, so identical artifact blobs are stored once in the cache.
-- **Compile-then-record on misses.** Misses compile normally, then kache records the outputs for future builds.
-- **Daemon-optional locally.** If the daemon is not running, local hits and misses still work; remote checks, uploads, and prefetching degrade gracefully.
-- **Adaptive source-churn builds.** Exact artifacts remain the default. After repeated source-only misses, kache temporarily gives the affected Cargo unit isolated rustc incremental state, which speeds mutation tests and similar workloads without detecting a particular tool or requiring project setup.
-
-## Try it
-
-```sh
-# install
-mise use -g github:kunobi-ninja/kache@latest
-
-# interactive setup: cargo wrapper + login service + daemon start
-kache init
-
-# verify
-kache doctor
+```bash
+cargo install kache
 ```
 
-`kache init` is idempotent — re-run it any time to repair configuration. Prefer to wire things by hand? Just export `RUSTC_WRAPPER=kache` or set `rustc-wrapper = "kache"` under `[build]` in `~/.cargo/config.toml`.
+From a Rust project, run:
 
-## Architecture in one screen
+```bash
+RUSTC_WRAPPER=kache cargo build
+cargo clean
+KACHE_PROGRESS=hits RUSTC_WRAPPER=kache cargo build
+kache stats
+```
 
-- **Wrapper** — `RUSTC_WRAPPER` intercepts rustc calls; `CC="kache cc"` and `CXX="kache c++"` intercept supported C/C++ object compiles. Hits use a reflink where supported, an exclusive Unix hardlink, or a private copy.
-- **Daemon** — background process handles async remote uploads, checks, and prefetch. Auto-restarts on binary update.
-- **Store** — SQLite index at `{cache_dir}/index.db`, plus content-addressed blobs under `{cache_dir}/store/blobs/`; hits restore those blobs into `target/` with a reflink, exclusive Unix hardlink, or private copy.
-- **Cache keys** — deterministic blake3 hash of rustc version, crate name, source, dependencies, and normalized flags — portable across machines.
+The second build should report cache hits. `cargo clean` forces Cargo to ask the compiler for the same outputs again; it is only needed for this demonstration.
+
+Nothing above edits your Cargo configuration. When you are ready to keep Kache enabled, run:
+
+```bash
+kache init
+```
+
+Use `kache init --check` to preview the changes, or `kache init --no-service` to skip OS service installation.
+
+## Current support
+
+| Area | Support |
+| --- | --- |
+| Rust libraries and build scripts | Linux, macOS, and Windows |
+| Rust executables | Enabled by default on Linux and macOS; disabled by default on Windows |
+| C and C++ object compilation | GCC, Clang, Apple Clang, and MSVC-compatible invocations that Kache can model safely |
+| Local cache | Content-addressed storage with automatic garbage collection |
+| Remote cache | S3-compatible and filesystem backends |
+| Build visibility | Live monitor, stats, miss explanations, and reports |
+
+Kache passes unsupported compiler invocations through unchanged. A passthrough is not a cache hit or miss; inspect its reason in the monitor's Passthrough tab or debug logs.
+
+## Tested nightly on real projects
+
+The [nightly benchmark workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) runs cold/warm builds of Firefox, LLVM, Substrate, SurrealDB, and Lance, including Firefox runs on Linux and Windows and a side-by-side sccache run. Reports, traces, and logs are retained for 30 days.
+
+Benchmark numbers count only when the individual job succeeds and its self-checking verdict is `ok`.
+
+## Go further
 
 <Cards>
-  <Card title="Installation" href="/docs/getting-started/installation" description="mise, cargo-binstall, or build from source" />
-  <Card title="Quick start" href="/docs/getting-started/quick-start" description="kache init, first build, verifying hits" />
-  <Card title="C/C++ caching" href="/docs/getting-started/c-cpp" description="Wrap cc, c++, gcc, clang, and clang-cl object compiles" />
-  <Card title="How it works" href="/docs/how-it-works/architecture" description="Wrapper, store, daemon — the full picture" />
-  <Card title="Cache key" href="/docs/how-it-works/cache-key" description="What's hashed and why keys are portable" />
-  <Card title="S3 remote cache" href="/docs/remote-cache/s3-setup" description="AWS, R2, Ceph, MinIO — same config" />
-  <Card title="Filesystem remote cache" href="/docs/remote-cache/filesystem-setup" description="Share artifacts through a mounted directory" />
-  <Card title="CI setup" href="/docs/remote-cache/ci" description="GitHub Actions one-liner via kache-action" />
-  <Card title="Monitor" href="/docs/monitor" description="Live TUI dashboard for builds, store, transfers" />
-  <Card title="Benchmarks" href="/docs/benchmarks" description="Cold/warm scenarios, sccache comparison, reports, and Perfetto traces" />
-  <Card title="Commands" href="/docs/commands/reference" description="Every CLI subcommand with flags and examples" />
+  <Card title="Install" href="/docs/getting-started/installation">
+    Packages, binaries, source builds, and platform notes.
+  </Card>
+  <Card title="Quick start" href="/docs/getting-started/quick-start">
+    Enable Kache for a project or across Cargo builds.
+  </Card>
+  <Card title="C and C++" href="/docs/getting-started/c-cpp">
+    Set up compiler shims and check what is cached.
+  </Card>
+  <Card title="Remote cache" href="/docs/remote-cache/s3-setup">
+    Share entries through S3-compatible or filesystem storage.
+  </Card>
+  <Card title="Command reference" href="/docs/commands/reference">
+    Exact commands and common flags.
+  </Card>
+  <Card title="How it works" href="/docs/how-it-works/architecture">
+    Cache keys, storage, daemon behavior, and correctness boundaries.
+  </Card>
+  <Card title="Benchmarks" href="/docs/benchmarks">
+    Nightly real-project runs, local scenarios, reports, and traces.
+  </Card>
 </Cards>
+
+## Feedback
+
+If Kache behaves differently from these docs, [open a bug report](https://github.com/kunobi-ninja/kache/issues/new?template=bug_report.md). For a missing compiler, remote backend, or workflow, [open a feature request](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md).

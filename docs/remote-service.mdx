@@ -1,81 +1,67 @@
 ---
-title: Remote service
-description: Server-side kache — a remote planner that prefetches artifacts from workspace manifests, dependency history, and build intent.
+title: Remote planner service
+description: Preview service for ranking cache entries to prefetch
 ---
 
-# Remote service
-
 <Callout type="warn">
-**SOON.** Server-side kache is the next milestone. The deployment model, auth integration, and HA behavior are still hardening — treat the planner service and Helm chart as a preview today.
+The planner service and Helm chart are previews. Deployment, authentication, and HA behavior may still change.
 </Callout>
 
-The remote planner service warms the *right* artifacts before rustc asks for them. Where local kache reacts to cargo invoking rustc, the planner anticipates: it draws on build manifests (uploaded by `kache save-manifest`), dependency history, and the client's build intent, then advises clients which artifacts to prefetch from the configured remote at the start of a session.
+The planner ranks likely artifacts before rustc asks for exact keys. It is optional: local caching, exact remote lookup, sync, and client-side fallback planning work without it.
 
-The service lives in [`crates/kache-service`](https://github.com/kunobi-ninja/kache/tree/main/crates/kache-service). It persists planner state in an embedded SurrealDB database and serves three HTTP routes: `POST /v1/prefetch-plan` and `POST /v2/prefetch-plan` (both aliased to the same handler — clients default to `/v2`), plus `GET /healthz` and `GET /readyz` probes. It safely returns a `use_fallback` disposition when the database has no matching candidates — so clients always have a working code path even before the planner has data for them.
+## API and state
 
-## What it does
+The service in [`crates/kache-service`](https://github.com/kunobi-ninja/kache/tree/main/crates/kache-service) exposes:
 
-- **Manifest upload.** Clients call `kache save-manifest` at the end of a build. This uploads a build manifest (and, with `--namespace`, sharded indexes keyed by `Cargo.lock`) to the configured remote — each entry records cache key, crate name, compile time, and artifact size. The planner service consumes that data out of band (it is seeded from a snapshot today; see `KACHE_PLANNER_SEED_STATE_FILE`) — `save-manifest` does not POST to the service.
-- **Prefetch hints.** At the start of a new build session, the client `POST`s a build intent (crate names, namespace, `Cargo.lock` deps) to the planner. The planner replies with a plan: a `disposition` (`Execute` or `UseFallback`) and, when executing, ranked `candidates` (cache key + crate name) likely to be needed.
-- **Use-fallback safety.** If the planner has no service-side state, resolves no candidates, or hits an internal planning error, it returns a `UseFallback` plan rather than an HTTP error. Clients then fall back to filtering remote prefetch by `Cargo.lock` (the same path the daemon uses today without a planner).
+- `POST /v1/prefetch-plan`
+- `POST /v2/prefetch-plan`
+- `GET /healthz`
+- `GET /readyz`
 
-## Build and run
+Both plan versions use the same handler. When no useful candidates exist, the service returns a fallback disposition and the client uses its normal planner.
 
-```sh
-just build-service
-just image-service
-just image-service-release
+Planner state is stored in embedded SurrealDB. `kache save-manifest` writes manifests to the configured remote; it does not post them directly to this service. Current deployments seed or ingest that data separately.
+
+## Run locally
+
+```bash
 cargo run -p kache-service
 ```
 
-For local development, `cargo run -p kache-service` binds `0.0.0.0:8080` by default (override with `--bind` / `KACHE_PLANNER_BIND`) and persists the embedded SurrealDB planner database at `/var/lib/kache/planner.db` (override with `--db-path` / `KACHE_PLANNER_DB_PATH`). Pass `--token` / `KACHE_PLANNER_TOKEN` to enforce bearer auth on the standalone binary, and `KACHE_LOG` (default `kache_service=info`) to filter logs. For a containerized run, the `image-service` recipes produce a `linux/amd64` image (override `PLATFORM` in `docker-bake.hcl` to target other architectures).
+The default bind address is `0.0.0.0:8080` and the default database path is `/var/lib/kache/planner.db`. Override them with `--bind` / `KACHE_PLANNER_BIND` and `--db-path` / `KACHE_PLANNER_DB_PATH`.
 
-## Helm chart
+Set `--token` or `KACHE_PLANNER_TOKEN` to require bearer authentication.
 
-```sh
+## Helm
+
+```bash
 helm upgrade --install kache-service ./charts/kache-service
 ```
 
-The chart in [`charts/kache-service`](https://github.com/kunobi-ninja/kache/tree/main/charts/kache-service) is intentionally small: one `Deployment`, one `Service`, optional `PersistentVolumeClaim`, hardened security defaults (`runAsNonRoot`, UID/GID `65532`, `readOnlyRootFilesystem`, all capabilities dropped — the writable DB path must live on a mounted volume), health probes, optional `kunobi-auth` bearer-token wiring through an existing `Secret`, and optional `kunobi-ha` Lease-based leader election. When `ha.enabled`, it also ships a `ServiceAccount` plus `Role`/`RoleBinding` granting the `coordination.k8s.io` Lease permissions leader election needs (and mounts the service-account token only under HA). It does not bundle ingress or cluster-level policy — bring your own.
+The chart supplies a Deployment, Service, probes, optional persistent volume, optional existing-secret authentication, and optional Lease-based leader election. It does not create ingress.
 
-### Pointing clients at the planner
+Point clients at it:
 
-Clients only consult the planner when `KACHE_PLANNER_ENDPOINT` is set (or `cache.planner.endpoint` in config) — `KACHE_PLANNER_TOKEN` alone does nothing. Point clients at the in-cluster service:
-
-```sh
-KACHE_PLANNER_ENDPOINT=http://<svc>.<ns>.svc.cluster.local:8080
-# optional: KACHE_PLANNER_TIMEOUT_MS to bound the planner round-trip
+```bash
+export KACHE_PLANNER_ENDPOINT=http://kache-service.namespace.svc.cluster.local:8080
+export KACHE_PLANNER_TOKEN=secret-if-required
 ```
 
-### Bearer-token auth
+The equivalent TOML is under `[cache.planner]`.
 
-Auth is enabled by pointing the chart at an existing secret. Clients must send the matching token through `KACHE_PLANNER_TOKEN`. The standalone binary enforces the same check when started with `--token` / `KACHE_PLANNER_TOKEN`; with no token configured, requests are accepted anonymously. A request that lacks valid auth when a token is set gets `401`.
+## Persistence and HA
 
-```yaml title="values.yaml"
-auth:
-  existingSecret: kache-planner-token
-  existingSecretKey: token
-```
-
-### Planner state and persistence
-
-The service stores its embedded planner database at `/var/lib/kache/planner.db` by default (`planner.dbPath`, also `--db-path` / `KACHE_PLANNER_DB_PATH`). The chart default is `persistence.enabled: true` with `type: ephemeral` — an `emptyDir` that does **not** survive pod restarts. Switch `type` to `pvc` for durable planner state:
+The chart defaults to ephemeral `emptyDir` planner storage. Choose `pvc` when state must survive pod replacement:
 
 ```yaml title="values.yaml"
 planner:
-  dbPath: /var/lib/kache/planner.db
   persistence:
     enabled: true
-    type: pvc          # default is `ephemeral` (emptyDir, lost on restart)
-    mountPath: /var/lib/kache
+    type: pvc
     size: 10Gi
 ```
 
-For bootstrap / migration only, the service can still import a legacy JSON planner snapshot on startup via `KACHE_PLANNER_SEED_STATE_FILE`. New installs should ignore this knob.
-
-### High availability
-
-For HA deployments, enable leader election and raise the replica count. `/healthz` always returns `200`, but `/readyz` (and `prefetch-plan`) return `503` until the repository is loaded and leadership is acquired — so followers stay live-but-not-ready until they win the Kubernetes Lease:
+Enable leader election for multiple replicas:
 
 ```yaml title="values.yaml"
 replicaCount: 2
@@ -84,10 +70,4 @@ ha:
   leaseName: kache-service
 ```
 
-The chart's `ha.*` keys map to the binary's `--ha-enabled` / `--ha-namespace` / `--ha-lease-name` flags (`KACHE_HA_ENABLED` / `KACHE_HA_NAMESPACE` / `KACHE_HA_LEASE_NAME`). The namespace resolves from `ha.namespace`, then `POD_NAMESPACE`, then the mounted service-account namespace file — startup fails if none resolve.
-
-When combining HA with PVC-backed planner state, use storage that can be mounted by all scheduled replicas (e.g. ReadWriteMany), or keep `replicaCount: 1`. The Lease itself is fine across replicas — the constraint is the planner DB volume.
-
-## What you get without the service
-
-Local caching, remote sync, and `cargo metadata`-driven prefetch all work without the planner. The planner is purely additive: it raises the hit rate on the *first* build of a new branch or runner where `cargo metadata` alone would underprefetch. If you don't run the service, clients silently behave as they do today.
+Followers remain live but not ready. If replicas share one embedded database, the volume must support their mount pattern; otherwise keep one replica.

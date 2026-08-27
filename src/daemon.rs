@@ -14191,21 +14191,33 @@ mod tests {
             "prefetch dispatch is ok even if downloads fail: {resp:?}"
         );
 
-        // Poll the failure counter; the download runs in the background.
-        let mut failed = false;
-        for _ in 0..100 {
-            if daemon
-                .transfer_counters
-                .downloads_failed
-                .load(Ordering::Relaxed)
-                >= 1
-            {
-                failed = true;
-                break;
+        // The download runs in the background. downloads_failed is bumped
+        // before the TransferEvent is pushed, so waiting on the counter
+        // alone races on Windows. Wait for both, same as
+        // prefetch_import_failure_is_counted_as_failure.
+        let completed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let failed = daemon
+                    .transfer_counters
+                    .downloads_failed
+                    .load(Ordering::Relaxed);
+                let has_event = daemon
+                    .recent_transfers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .back()
+                    .is_some();
+                if failed >= 1 && has_event {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(failed, "a garbage pack must record a failed download");
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "a garbage pack must record a failed download and a transfer event"
+        );
         assert_v3_transfer_timestamps(&latest_transfer(&daemon));
         // Nothing was imported.
         assert!(!config.store_dir().join(key).join("meta.json").exists());

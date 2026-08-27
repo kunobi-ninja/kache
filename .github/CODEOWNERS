@@ -1,0 +1,8 @@
+# Private-runner workflows and benchmark definitions execute commands on
+# infrastructure owned by Kunobi. Changes to these paths require approval from
+# a trusted repository administrator.
+/.github/CODEOWNERS @jleni @emmanuelm41 @ainhoa-a
+/.github/workflows/ @jleni @emmanuelm41 @ainhoa-a
+/Justfile @jleni @emmanuelm41 @ainhoa-a
+/crates/kache-e2e/ @jleni @emmanuelm41 @ainhoa-a
+/scenarios/bench-*/ @jleni @emmanuelm41 @ainhoa-a

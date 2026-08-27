@@ -225,6 +225,7 @@ just bench-trace firefox   # also emit key-diff.{json,md}
 just bench-sccache         # list sccache-backed benchmark profiles
 just bench-sccache firefox # same Firefox shape, with sccache
 just bench substrate       # Rust-heavy polkadot-sdk benchmark (tens of min to ~1.5h, ~20-40 GB)
+just bench lance           # Rust-heavy lance crate benchmark (Arrow/DataFusion, tens of min, ~20-40 GB)
 just bench llvm            # almost-pure C/C++ CMake benchmark (tens of min, large scratch)
 ```
 
@@ -250,7 +251,7 @@ the build system can be merged into the same Perfetto view when they share, or
 are normalized to, the same timebase; they are useful for target-level context
 but not required to understand kache hit/miss behavior.
 
-Each benchmark scenario uses a **per-scenario scratch dir** — `./tmp/bench/<scenario>` by default (override with `--work-dir`) — so firefox, firefox-sccache, substrate, and any other scenario **coexist** without clobbering each other's clones, cache, or logs; `rm -rf tmp/bench` cleans them all. A `work_dir` lock refuses a second run pointed at the same scratch dir. Concurrent runs on one host invalidate the wall-clock numbers (CPU/IO/RAM contention), so run benchmarks sequentially or on separate hosts.
+Each benchmark scenario uses a **per-scenario scratch dir** — `./tmp/bench/<scenario>` by default (override with `--work-dir`) — so firefox, firefox-sccache, substrate, lance, and any other scenario **coexist** without clobbering each other's clones, cache, or logs; `rm -rf tmp/bench` cleans them all. A `work_dir` lock refuses a second run pointed at the same scratch dir. Concurrent runs on one host invalidate the wall-clock numbers (CPU/IO/RAM contention), so run benchmarks sequentially or on separate hosts.
 
 Each project is described by a [scenario](scenarios/) (`scenarios/bench-*/scenario.toml`) — repo/ref, how to wire kache or sccache in, and how to build. The Substrate probe is `RUSTC_WRAPPER`-only: it caches the Rust compile surface — the polkadot node's dependency tree plus the nested wasm-runtime compiles — while native C deps (rocksdb, secp256k1) compile outside kache's view by design. Needs `protoc`, `clang`, `cmake`, `pkg-config` installed.
 

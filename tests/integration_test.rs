@@ -2103,6 +2103,91 @@ fn test_cc_gdwarf2_caches_and_keys_dwarf_version_issue_838() {
     );
 }
 
+/// True if `cc` on PATH accepts `-gfull`, checked by actually compiling
+/// with it. GCC and cl-like drivers reject the Apple spelling and have
+/// nothing to say about #857.
+fn cc_accepts_gfull(dir: &Path) -> bool {
+    let source = dir.join("gfull-support.c");
+    if std::fs::write(&source, "int gfull_support(void) { return 0; }\n").is_err() {
+        return false;
+    }
+    std::process::Command::new("cc")
+        .args(["-c", "-O0"])
+        .arg(&source)
+        .arg("-o")
+        .arg(dir.join("gfull-support.o"))
+        .arg("-gfull")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// ring adds `-gfull` on Apple ABI targets so Darwin dead stripping can
+/// see used symbols (#857). The flag is `CapturedByProbe`: Apple clang
+/// `-###` resolves it to `-debug-info-kind=standalone -dwarf-version=5`,
+/// so the no-debug baseline must key apart while an identical second
+/// compile hits. Where `-g` resolves to the same cc1 tokens it may share
+/// the key; this test only requires the no-debug invocation to stay
+/// distinct.
+#[test]
+fn test_cc_gfull_caches_and_keys_apart_from_no_debug_issue_857() {
+    let probe_dir = TempDir::new().unwrap();
+    if !cc_accepts_gfull(probe_dir.path()) {
+        eprintln!(
+            "skipping: `cc` does not accept -gfull \
+             (non-Apple driver, or no cc on PATH)"
+        );
+        return;
+    }
+
+    build_kache();
+    if !kache_caches_probe_keyed_flags(probe_dir.path()) {
+        eprintln!("skipping: probe-keyed flags are not cacheable on this host");
+        return;
+    }
+    let cache_dir = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    std::fs::write(work.path().join("tu.c"), "int tu(void) { return 7; }\n").unwrap();
+    let object = work.path().join("tu.o");
+
+    let compile = |extra: &[&str]| {
+        let _ = std::fs::remove_file(&object);
+        let mut args = vec!["cc", "-c", "tu.c", "-o", "tu.o", "-O0"];
+        args.extend_from_slice(extra);
+        run_kache_cc(work.path(), cache_dir.path(), &args);
+        assert!(object.exists(), "compile must produce tu.o: {args:?}");
+    };
+
+    compile(&["-gfull"]);
+    let report = kache_report(cache_dir.path());
+    assert_eq!(
+        report["summary"]["misses"].as_u64(),
+        Some(1),
+        "cold -gfull compile must be cached, not passed through.\nevents.jsonl:\n{}",
+        std::fs::read_to_string(cache_dir.path().join("events.jsonl"))
+            .unwrap_or_else(|e| format!("(unreadable: {e})"))
+    );
+    assert_cc_report_counts(&report, 1, 0);
+
+    compile(&["-gfull"]);
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 1, 1);
+
+    compile(&[]);
+    let report = kache_report(cache_dir.path());
+    let summary = &report["summary"];
+    assert_eq!(
+        summary["local_hits"].as_u64(),
+        Some(1),
+        "no-debug must not reuse the -gfull entry: {report}"
+    );
+    assert_eq!(
+        summary["misses"].as_u64().unwrap_or(0) + summary["dups"].as_u64().unwrap_or(0),
+        2,
+        "no-debug should have compiled under its own key: {report}"
+    );
+}
+
 /// True when the host `cc` accepts Firefox's Clang automatic-variable
 /// hardening mode. GCC and older Clang versions may reject it, so they cannot
 /// exercise the issue #849 path.

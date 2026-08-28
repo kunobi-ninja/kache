@@ -24,8 +24,9 @@ name: Bench
 # is minimal, so the base build toolchain is installed below.
 on:
   schedule:
-    # ~04:37 UTC nightly. Off the top-of-hour to dodge GitHub's cron congestion.
-    - cron: "37 4 * * *"
+    # 03:37 Zurich time nightly. Keeping :37 avoids top-of-hour cron congestion.
+    - cron: "37 3 * * *"
+      timezone: "Europe/Zurich"
   workflow_dispatch:
     inputs:
       scenario:

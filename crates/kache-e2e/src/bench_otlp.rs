@@ -547,8 +547,10 @@ mod tests {
     }
 
     #[test]
-    fn write_otlp_emits_both_files() {
+    fn write_otlp_replaces_seeded_failure_artifact() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(METRICS_FILE), "seeded failure\n").unwrap();
+        std::fs::write(dir.path().join(SCHEMA_VERSION_FILE), "1\n").unwrap();
         write_otlp(dir.path(), &kache_run()).unwrap();
         let body: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join(METRICS_FILE)).unwrap())

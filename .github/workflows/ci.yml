@@ -139,9 +139,22 @@ jobs:
               sys.exit(1)
           print(f'OK: >= {threshold}%')
           "
-      - name: Build coverage telemetry
+      - name: Set up Node for Kartero
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: python3 -B scripts/ci/coverage_otlp.py tmp/llvm-cov/coverage.json tmp/coverage-telemetry
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: Export coverage telemetry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          npx --yes @kunobi/kartero@0.3.0 coverage \
+            --input tmp/llvm-cov/coverage.json \
+            --format llvm-cov-json \
+            --output tmp/coverage-telemetry
+          npx --yes @kunobi/kartero@0.3.0 validate \
+            --input tmp/coverage-telemetry
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache
       - name: Upload coverage telemetry
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

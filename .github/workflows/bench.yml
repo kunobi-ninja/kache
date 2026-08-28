@@ -76,39 +76,40 @@ jobs:
         run: |
           # Each arm carries: name (display + artifact label), cmd (the `just`
           # recipe + profile to run), dir (scratch subdir under tmp/bench to
-          # upload), timeout (minutes), min_free_gb (precheck floor — fail the
-          # arm if free disk is below this before we start, since disk-full
-          # mid-build is the worst failure mode; emptyDir is node-backed, so the
-          # precheck also catches a too-small node).
+          # upload), timeout (benchmark-step minutes), job_timeout (adds time
+          # for setup and the final telemetry upload), min_free_gb (precheck
+          # floor — fail the arm if free disk is below this before we start,
+          # since disk-full mid-build is the worst failure mode; emptyDir is
+          # node-backed, so the precheck also catches a too-small node).
           #
           # Smaller than Firefox but still tens of minutes cold.
-          substrate='{"name":"substrate","cmd":"bench substrate","dir":"bench-substrate","timeout":180,"min_free_gb":60}'
+          substrate='{"name":"substrate","cmd":"bench substrate","dir":"bench-substrate","timeout":180,"job_timeout":225,"min_free_gb":60}'
           # SurrealDB's `surreal` server binary at default features — a large
           # pure-Rust workspace whose default features also drag in native C/C++
           # deps (rocksdb, grpcio, quickjs) that build outside kache. Comparable
           # weight to substrate; same native-prereq set (already installed below).
-          surrealdb='{"name":"surrealdb","cmd":"bench surrealdb","dir":"bench-surrealdb","timeout":180,"min_free_gb":80}'
+          surrealdb='{"name":"surrealdb","cmd":"bench surrealdb","dir":"bench-surrealdb","timeout":180,"job_timeout":225,"min_free_gb":80}'
           # Lance's `lance` crate at default features — a large pure-Rust
           # workspace (Arrow, DataFusion, object-store backends, prost codegen).
           # Needs protoc + openssl headers (already installed below). Lighter
           # than surrealdb: no rocksdb/grpcio/quickjs native compile.
-          lance='{"name":"lance","cmd":"bench lance","dir":"bench-lance","timeout":180,"min_free_gb":60}'
+          lance='{"name":"lance","cmd":"bench lance","dir":"bench-lance","timeout":180,"job_timeout":225,"min_free_gb":60}'
           # OpenDAL core (apache/opendal `core/` workspace) with the portable
           # service-feature set — mid-size pure-Rust, lighter than surrealdb.
           # aws-lc-sys (rustls) compiles outside kache; cmake + a C compiler
           # are already in the apt step below.
-          opendal='{"name":"opendal","cmd":"bench opendal","dir":"bench-opendal","timeout":120,"min_free_gb":40}'
+          opendal='{"name":"opendal","cmd":"bench opendal","dir":"bench-opendal","timeout":120,"job_timeout":165,"min_free_gb":40}'
           # Full cold Firefox build is the long pole — hours. `bench firefox`
           # resolves to the exact `bench-firefox` scenario: `--profile firefox`
           # is a name SUBSTRING match that also catches `bench-firefox-windows`,
           # but discovery prefers the exact-name hit (#458), so no `os:` tag is
           # needed to pin this host-native arm. (The Windows variant runs in its
           # own job below, on the self-hosted Windows runner.)
-          firefox='{"name":"firefox","cmd":"bench firefox","dir":"bench-firefox","timeout":360,"min_free_gb":120}'
+          firefox='{"name":"firefox","cmd":"bench firefox","dir":"bench-firefox","timeout":360,"job_timeout":405,"min_free_gb":120}'
           # Same Firefox shape through sccache for a side-by-side comparison.
-          firefox_sccache='{"name":"firefox-sccache","cmd":"bench-sccache firefox","dir":"bench-firefox-sccache","timeout":360,"min_free_gb":120}'
+          firefox_sccache='{"name":"firefox-sccache","cmd":"bench-sccache firefox","dir":"bench-firefox-sccache","timeout":360,"job_timeout":405,"min_free_gb":120}'
           # Almost-pure C/C++ CMake build (X86-only Release) — lighter than Firefox.
-          llvm='{"name":"llvm","cmd":"bench llvm","dir":"bench-llvm","timeout":240,"min_free_gb":100}'
+          llvm='{"name":"llvm","cmd":"bench llvm","dir":"bench-llvm","timeout":240,"job_timeout":285,"min_free_gb":100}'
           # Daily-pull (TEMPORAL axis, #477): one clone, build ref A then rebuild
           # ref B in the SAME worktree — two full sequential Firefox builds, so a
           # longer timeout than `firefox`. Only ONE worktree (no cross-clone
@@ -117,7 +118,7 @@ jobs:
           # scenario (substring also catches `bench-firefox-pull-windows`, but
           # discovery prefers the exact-name hit). The Windows variant runs in its
           # own job below, on the self-hosted Windows runner.
-          firefox_pull='{"name":"firefox-pull","cmd":"bench firefox-pull","dir":"bench-firefox-pull","timeout":480,"min_free_gb":120}'
+          firefox_pull='{"name":"firefox-pull","cmd":"bench firefox-pull","dir":"bench-firefox-pull","timeout":480,"job_timeout":525,"min_free_gb":120}'
           case "$SCENARIO" in
             substrate)            inc="[$substrate]" ;;
             surrealdb)            inc="[$surrealdb]" ;;
@@ -151,7 +152,7 @@ jobs:
     # gha-runner-scale-set: match by the scale-set's installation name (single
     # label), not a `[self-hosted, …]` set. See header comment.
     runs-on: kunobi-runners
-    timeout-minutes: ${{ matrix.timeout }}
+    timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       # Arms run concurrently (up to the kunobi-runners scale-set's maxRunners).
       # They previously starved the 120 GB free-disk precheck (103 GB, #447) by
@@ -171,6 +172,27 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
+
+      - name: Set up Node for Kartero
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+
+      # Seed a valid failure artifact before prerequisites or benchmark work.
+      # A completed benchmark overwrites it with the full metric set. Any early
+      # exit leaves verdict.ok=0 for the final always-running upload.
+      - name: Seed failure telemetry
+        run: |
+          mkdir -p tmp/bench
+          npx --yes @kunobi/kartero@0.3.0 gauge \
+            --name kache.bench.verdict.ok \
+            --value 0 \
+            --unit 1 \
+            --attribute kache.bench.project=${{ matrix.dir }} \
+            --attribute kache.bench.cache_tool=${{ matrix.name == 'firefox-sccache' && 'sccache' || 'kache' }} \
+            --output tmp/bench/${{ matrix.dir }}
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache
 
       # The ARC runner image is minimal. Install the base toolchain the bench
       # needs around the build: substrate links rocksdb/secp256k1 and needs
@@ -222,6 +244,7 @@ jobs:
           fi
 
       - name: Run bench (${{ matrix.name }})
+        timeout-minutes: ${{ matrix.timeout }}
         # `just bench` builds release kache + the scenario engine, then runs cold
         # then warm against one cache and writes reports under
         # tmp/bench/bench-<scenario>/. The engine self-diagnoses: a non-zero exit
@@ -279,8 +302,16 @@ jobs:
       # the diagnostic bundle above: kartero pulls `telemetry-otlp-v1*` and
       # nothing else. The suffix is required because upload-artifact v4
       # rejects two jobs in one run sharing an identical artifact name.
+      - name: Validate telemetry
+        if: always()
+        timeout-minutes: 5
+        run: npx --yes @kunobi/kartero@0.3.0 validate --input tmp/bench/${{ matrix.dir }}
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache
+
       - name: Upload telemetry
         if: always()
+        timeout-minutes: 10
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: telemetry-otlp-v1-${{ matrix.name }}
@@ -289,7 +320,7 @@ jobs:
             tmp/bench/${{ matrix.dir }}/schema_version
             tmp/bench/${{ matrix.dir }}/${{ matrix.dir }}.json
           retention-days: 3
-          if-no-files-found: warn
+          if-no-files-found: error
 
   # Firefox compile-cache bench on the self-hosted Windows runner (clang-cl +
   # MSVC under MozillaBuild). Separate from the `bench` matrix above: that runs
@@ -310,13 +341,31 @@ jobs:
       (github.event_name == 'workflow_dispatch' &&
        (github.event.inputs.scenario == 'firefox-windows' || github.event.inputs.scenario == 'all'))
     runs-on: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
-    timeout-minutes: 360
+    timeout-minutes: 420
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
+
+      - name: Set up Node for Kartero
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+
+      - name: Seed failure telemetry
+        run: |
+          output="$(printf '%s' "$RUNNER_TEMP" | tr '\\' '/')/f"
+          npx --yes @kunobi/kartero@0.3.0 gauge \
+            --name kache.bench.verdict.ok \
+            --value 0 \
+            --unit 1 \
+            --attribute kache.bench.project=bench-firefox-windows \
+            --attribute kache.bench.cache_tool=kache \
+            --output "$output"
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache
 
       # Fail fast with an explicit checklist if a Firefox build prerequisite is
       # missing. MozillaBuild provides mach's bash/python env; clang-cl, nasm,
@@ -393,6 +442,7 @@ jobs:
           reshim: false
 
       - name: Run bench (firefox-windows)
+        timeout-minutes: 360
         # The fuller `firefox-windows` profile is a unique substring, so it
         # selects bench-firefox-windows directly — no `os:` workaround needed
         # (the `bench` recipe already ANDs suite:bench + backend:kache).
@@ -480,8 +530,16 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+      - name: Validate telemetry
+        if: always()
+        timeout-minutes: 5
+        run: npx --yes @kunobi/kartero@0.3.0 validate --input "${{ runner.temp }}/f"
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache
+
       - name: Upload telemetry
         if: always()
+        timeout-minutes: 10
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: telemetry-otlp-v1-firefox-windows
@@ -490,7 +548,7 @@ jobs:
             ${{ runner.temp }}/f/schema_version
             ${{ runner.temp }}/f/bench-firefox-windows.json
           retention-days: 3
-          if-no-files-found: warn
+          if-no-files-found: error
 
   # Firefox DAILY-PULL (temporal, #477) compile-cache bench on the self-hosted
   # Windows runner — the axis that matches the reported issue (clang-cl on
@@ -507,13 +565,31 @@ jobs:
       (github.event_name == 'workflow_dispatch' &&
        (github.event.inputs.scenario == 'firefox-pull-windows' || github.event.inputs.scenario == 'all'))
     runs-on: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
-    timeout-minutes: 480
+    timeout-minutes: 540
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
+
+      - name: Set up Node for Kartero
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+
+      - name: Seed failure telemetry
+        run: |
+          output="$(printf '%s' "$RUNNER_TEMP" | tr '\\' '/')/b"
+          npx --yes @kunobi/kartero@0.3.0 gauge \
+            --name kache.bench.verdict.ok \
+            --value 0 \
+            --unit 1 \
+            --attribute kache.bench.project=bench-firefox-pull-windows \
+            --attribute kache.bench.cache_tool=kache \
+            --output "$output"
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache
 
       # Fail fast with an explicit checklist if a Firefox build prerequisite is
       # missing. MozillaBuild provides mach's bash/python env; clang-cl (cc/c++),
@@ -595,6 +671,7 @@ jobs:
           reshim: false
 
       - name: Run bench (firefox-pull-windows)
+        timeout-minutes: 480
         # `firefox-pull-windows` is a unique substring, so it selects
         # bench-firefox-pull-windows directly (the `bench` recipe already ANDs
         # suite:bench + backend:kache).
@@ -697,8 +774,16 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+      - name: Validate telemetry
+        if: always()
+        timeout-minutes: 5
+        run: npx --yes @kunobi/kartero@0.3.0 validate --input "${{ runner.temp }}/b"
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache
+
       - name: Upload telemetry
         if: always()
+        timeout-minutes: 10
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: telemetry-otlp-v1-firefox-pull-windows
@@ -707,4 +792,4 @@ jobs:
             ${{ runner.temp }}/b/schema_version
             ${{ runner.temp }}/b/bench-firefox-pull-windows.json
           retention-days: 3
-          if-no-files-found: warn
+          if-no-files-found: error

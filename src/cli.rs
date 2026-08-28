@@ -1436,17 +1436,12 @@ fn why_miss_json(
         .filter(|e| e.crate_name == crate_name)
         .collect();
     let miss_key_stored = stored.iter().any(|e| e.cache_key == miss.cache_key);
-    let diagnosis = if !miss.store_error.is_empty() {
-        "not_cached"
-    } else if !miss.lookup_rejection.is_empty() {
-        "lookup_rejected"
-    } else if stored.is_empty() {
-        "never_cached"
-    } else if miss_key_stored {
-        "first_build_now_cached"
-    } else {
-        "key_mismatch"
-    };
+    let diagnosis = why_miss_diagnosis(
+        &miss.store_error,
+        &miss.lookup_rejection,
+        stored.len(),
+        miss_key_stored,
+    );
     let _ = prior_same_key_miss;
     crate::machine::emit(
         "why-miss",
@@ -1461,6 +1456,25 @@ fn why_miss_json(
         },
         Vec::new(),
     )
+}
+
+fn why_miss_diagnosis(
+    store_error: &str,
+    lookup_rejection: &str,
+    stored_entries: usize,
+    miss_key_stored: bool,
+) -> &'static str {
+    if !store_error.is_empty() {
+        "not_cached"
+    } else if !lookup_rejection.is_empty() {
+        "lookup_rejected"
+    } else if stored_entries == 0 {
+        "never_cached"
+    } else if miss_key_stored {
+        "first_build_now_cached"
+    } else {
+        "key_mismatch"
+    }
 }
 
 /// Compare the miss event's stored metadata against other stored entries
@@ -2267,7 +2281,10 @@ pub fn list(
         }
         let entries = store.list_entries(sort_by)?;
         let matching: Vec<&crate::store::EntryInfo> = if let Some(name) = crate_name {
-            entries.iter().filter(|e| e.crate_name == name).collect()
+            entries
+                .iter()
+                .filter(|e| crate_name_matches(name, &e.crate_name))
+                .collect()
         } else {
             entries.iter().collect()
         };
@@ -2371,6 +2388,10 @@ pub fn list(
     }
 
     Ok(())
+}
+
+fn crate_name_matches(requested: &str, actual: &str) -> bool {
+    requested == actual
 }
 
 fn push_nonempty_detail(lines: &mut Vec<String>, prefix: &str, value: &str) {
@@ -2664,6 +2685,26 @@ fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats)
     total.skipped |= part.skipped;
 }
 
+fn gc_stats_from_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store::GcStats {
+    let mut total = crate::store::GcStats::default();
+    for part in [&report.age, &report.duplicate, &report.size] {
+        total.entries_evicted = total.entries_evicted.saturating_add(part.entries_evicted);
+        total.bytes_freed = total.bytes_freed.saturating_add(part.bytes_freed);
+        total.entries_pinned = total.entries_pinned.saturating_add(part.entries_pinned);
+        total.disk_bytes_reclaimed = total
+            .disk_bytes_reclaimed
+            .saturating_add(part.disk_bytes_reclaimed);
+        total.entries_unreclaimable = total
+            .entries_unreclaimable
+            .saturating_add(part.entries_unreclaimable);
+    }
+    total
+}
+
+fn human_gc_output(json: bool) -> bool {
+    !json
+}
+
 fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -> Result<()> {
     let store = Store::open(config)?;
     let store_bytes = store.physical_size().unwrap_or(0);
@@ -2699,27 +2740,6 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
         },
         next,
     )
-}
-
-fn aggregate_gc_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store::GcStats {
-    crate::store::GcStats {
-        entries_evicted: report.age.entries_evicted
-            + report.duplicate.entries_evicted
-            + report.size.entries_evicted,
-        bytes_freed: report.age.bytes_freed
-            + report.duplicate.bytes_freed
-            + report.size.bytes_freed,
-        entries_pinned: report.age.entries_pinned
-            + report.duplicate.entries_pinned
-            + report.size.entries_pinned,
-        disk_bytes_reclaimed: report.age.disk_bytes_reclaimed
-            + report.duplicate.disk_bytes_reclaimed
-            + report.size.disk_bytes_reclaimed,
-        entries_unreclaimable: report.age.entries_unreclaimable
-            + report.duplicate.entries_unreclaimable
-            + report.size.entries_unreclaimable,
-        ..crate::store::GcStats::default()
-    }
 }
 
 /// Run garbage collection via the daemon.
@@ -2780,8 +2800,8 @@ pub fn gc(
         }
         Ok(outcome) => {
             if let Some(report) = outcome.breakdown.as_ref() {
-                combined = aggregate_gc_breakdown(report);
-                if !json {
+                combined = gc_stats_from_breakdown(report);
+                if human_gc_output(json) {
                     if let Some(hours) = max_age_hours {
                         println!("Age GC ({hours}h):");
                     } else {
@@ -2796,7 +2816,7 @@ pub fn gc(
                     let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
                     println!("{}", describe_eviction(&combined, over_limit));
                 }
-            } else if !json {
+            } else if human_gc_output(json) {
                 if let Some(hours) = max_age_hours {
                     println!(
                         "Evicted {} entries older than {hours}h.",
@@ -2812,7 +2832,7 @@ pub fn gc(
             }
         }
         Err(e) => {
-            if !json {
+            if human_gc_output(json) {
                 println!("Daemon GC failed ({e}), running locally...");
             }
             if let Some(hours) = max_age_hours {
@@ -3115,6 +3135,12 @@ struct CleanSkipped {
     reason: String,
 }
 
+const DEFAULT_TRACKED_STALE_HOURS: u64 = 336;
+
+fn path_was_removed(path: &std::path::Path) -> bool {
+    !path.exists()
+}
+
 /// Find and remove target directories, either below cwd or from the bounded
 /// machine-local registry populated by the compiler wrapper.
 pub fn clean(
@@ -3131,7 +3157,7 @@ pub fn clean(
 
     let root = std::env::current_dir()?;
     let (mut targets, skipped) = if tracked {
-        tracked_target_entries(config, stale_hours.unwrap_or(14 * 24))?
+        tracked_target_entries(config, stale_hours.unwrap_or(DEFAULT_TRACKED_STALE_HOURS))?
     } else {
         let mut targets = Vec::new();
         find_target_dirs(&root, &mut targets);
@@ -3231,13 +3257,13 @@ pub fn clean(
         let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, &root, json);
         let removed_paths: Vec<String> = to_remove
             .iter()
-            .filter(|target| !target.path.exists())
+            .filter(|target| path_was_removed(&target.path))
             .map(|target| target.path.display().to_string())
             .collect();
         if tracked {
             let store = Store::open(config)?;
             for target in &to_remove {
-                if !target.path.exists() {
+                if path_was_removed(&target.path) {
                     store.forget_target_root(&target.path)?;
                 }
             }
@@ -3307,7 +3333,7 @@ pub fn clean(
             if tracked {
                 let store = Store::open(config)?;
                 for target in &to_remove {
-                    if !target.path.exists() {
+                    if path_was_removed(&target.path) {
                         store.forget_target_root(&target.path)?;
                     }
                 }
@@ -3360,7 +3386,7 @@ fn remove_targets(
         let rel = target.path.strip_prefix(root).unwrap_or(&target.path);
         let current_identity = directory_identity(&target.path);
         if target.scanned_identity.is_none() || current_identity != target.scanned_identity {
-            if !quiet {
+            if human_clean_output(quiet) {
                 println!(
                     "  failed  {} — directory changed since scan; refusing to remove",
                     rel.display()
@@ -3374,18 +3400,22 @@ fn remove_targets(
                     estimated_reclaimed.saturating_add(target.estimated_reclaimable);
                 apparent_gap = apparent_gap.saturating_add(target.apparent_gap);
                 removed += 1;
-                if !quiet {
+                if human_clean_output(quiet) {
                     println!("  removed {}", rel.display());
                 }
             }
             Err(e) => {
-                if !quiet {
+                if human_clean_output(quiet) {
                     println!("  failed  {} — {e}", rel.display());
                 }
             }
         }
     }
     (removed, estimated_reclaimed, apparent_gap)
+}
+
+fn human_clean_output(quiet: bool) -> bool {
+    !quiet
 }
 
 /// Explain the gap between apparent size and estimated physical reclaim without
@@ -4428,7 +4458,7 @@ pub fn doctor(
             issues: usize,
             checks: Vec<CheckBody>,
         }
-        let next = if issues > 0 {
+        let next = if doctor_has_issues(issues) {
             vec![crate::machine::NextAction {
                 argv: vec!["kache".into(), "doctor".into(), "--fix".into()],
                 why: "one or more required checks failed".into(),
@@ -4460,7 +4490,7 @@ pub fn doctor(
         }
         if verify && let Some(ref cfg) = config {
             let outcome = self::verify(cfg, checksums, repair)?;
-            if outcome.unresolved_integrity_findings() > 0 {
+            if doctor_has_issues(outcome.unresolved_integrity_findings()) {
                 std::process::exit(1);
             }
         }
@@ -4551,6 +4581,10 @@ pub fn doctor(
     }
 
     Ok(())
+}
+
+fn doctor_has_issues(issues: usize) -> bool {
+    issues > 0
 }
 
 /// Migrate from sccache to kache (called by `doctor --fix`).
@@ -6298,36 +6332,104 @@ mod tests {
     }
 
     #[test]
-    fn skipped_gc_stats_preserves_the_lock_contention_signal() {
+    fn gc_machine_output_boundaries_are_explicit() {
+        assert!(human_gc_output(false));
+        assert!(!human_gc_output(true));
+
         let stats = skipped_gc_stats();
         assert!(stats.skipped);
         assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(DEFAULT_TRACKED_STALE_HOURS, 14 * 24);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target");
+        std::fs::create_dir(&path).unwrap();
+        assert!(!path_was_removed(&path));
+        std::fs::remove_dir(&path).unwrap();
+        assert!(path_was_removed(&path));
+        assert!(human_clean_output(false));
+        assert!(!human_clean_output(true));
+        assert!(!doctor_has_issues(0));
+        assert!(doctor_has_issues(1));
     }
 
     #[test]
-    fn gc_breakdown_aggregation_sums_every_policy() {
-        fn policy(seed: usize) -> crate::daemon::GcPolicyOutcome {
+    fn why_miss_json_diagnosis_has_distinct_precedence() {
+        assert_eq!(
+            why_miss_diagnosis("write failed", "", 0, false),
+            "not_cached"
+        );
+        assert_eq!(
+            why_miss_diagnosis("", "metadata mismatch", 0, false),
+            "lookup_rejected"
+        );
+        assert_eq!(why_miss_diagnosis("", "", 0, false), "never_cached");
+        assert_eq!(
+            why_miss_diagnosis("", "", 1, true),
+            "first_build_now_cached"
+        );
+        assert_eq!(why_miss_diagnosis("", "", 1, false), "key_mismatch");
+    }
+
+    #[test]
+    fn json_list_crate_filter_is_exact() {
+        assert!(crate_name_matches("serde", "serde"));
+        assert!(!crate_name_matches("serde", "serde_json"));
+    }
+
+    #[test]
+    fn daemon_gc_breakdown_sums_every_policy_field() {
+        fn policy(n: u64) -> crate::daemon::GcPolicyOutcome {
             crate::daemon::GcPolicyOutcome {
-                entries_evicted: seed,
-                bytes_freed: (seed as u64) * 10,
-                entries_pinned: seed + 10,
-                disk_bytes_reclaimed: (seed as u64) * 100,
-                entries_unreclaimable: seed + 20,
+                entries_evicted: n as usize,
+                bytes_freed: n * 10,
+                entries_pinned: (n * 100) as usize,
+                disk_bytes_reclaimed: n * 1_000,
+                entries_unreclaimable: (n * 10_000) as usize,
             }
         }
-
         let report = crate::daemon::GcBreakdown {
             mode: crate::daemon::GcRequestMode::Automatic,
             age: policy(1),
             duplicate: policy(2),
-            size: policy(4),
+            size: policy(3),
         };
-        let stats = aggregate_gc_breakdown(&report);
-        assert_eq!(stats.entries_evicted, 7);
-        assert_eq!(stats.bytes_freed, 70);
-        assert_eq!(stats.entries_pinned, 37);
-        assert_eq!(stats.disk_bytes_reclaimed, 700);
-        assert_eq!(stats.entries_unreclaimable, 67);
+        let total = gc_stats_from_breakdown(&report);
+        assert_eq!(total.entries_evicted, 6);
+        assert_eq!(total.bytes_freed, 60);
+        assert_eq!(total.entries_pinned, 600);
+        assert_eq!(total.disk_bytes_reclaimed, 6_000);
+        assert_eq!(total.entries_unreclaimable, 60_000);
+
+        let mut accumulated = crate::store::GcStats {
+            entries_evicted: 1,
+            bytes_freed: 2,
+            entries_pinned: 3,
+            blobs_removed: 4,
+            duration_ms: 7,
+            entries_unreclaimable: 5,
+            disk_bytes_reclaimed: 6,
+            skipped: false,
+        };
+        let part = crate::store::GcStats {
+            entries_evicted: 10,
+            bytes_freed: 20,
+            entries_pinned: 30,
+            blobs_removed: 40,
+            duration_ms: 70,
+            entries_unreclaimable: 50,
+            disk_bytes_reclaimed: 60,
+            skipped: true,
+        };
+        add_gc_stats(&mut accumulated, &part);
+        assert_eq!(accumulated.entries_evicted, 11);
+        assert_eq!(accumulated.bytes_freed, 22);
+        assert_eq!(accumulated.entries_pinned, 33);
+        assert_eq!(accumulated.blobs_removed, 44);
+        assert_eq!(accumulated.duration_ms, 77);
+        assert_eq!(accumulated.entries_unreclaimable, 55);
+        assert_eq!(accumulated.disk_bytes_reclaimed, 66);
+        assert!(accumulated.skipped);
     }
 
     #[test]
@@ -6377,21 +6479,41 @@ mod tests {
 
     #[test]
     fn a_successful_eviction_reports_bytes_and_still_flags_pinned_entries() {
-        let msg = describe_eviction(&gc_stats(12, 3, 5 * 1024 * 1024), false);
+        let mut stats = gc_stats(12, 3, 5 * 1024 * 1024);
+        stats.disk_bytes_reclaimed = 4 * 1024 * 1024;
+        stats.entries_unreclaimable = 2;
+        let msg = describe_eviction(&stats, false);
         assert!(msg.contains("12 entries"), "{msg}");
         assert!(msg.contains("MiB") || msg.contains("MB"), "{msg}");
         assert!(
             msg.contains('3'),
             "entries left behind matter even on a successful sweep — they are \
-             why the store may still be over budget: {msg}"
+            why the store may still be over budget: {msg}"
         );
+        assert!(msg.contains("became free on disk"), "{msg}");
+        assert!(msg.contains("remains cloned"), "{msg}");
+        assert!(msg.contains("2 entries left in place"), "{msg}");
+    }
+
+    #[test]
+    fn fully_retained_eviction_has_a_cleanup_path() {
+        let mut stats = gc_stats(0, 0, 0);
+        stats.entries_unreclaimable = 1;
+        let msg = describe_eviction(&stats, false);
+        assert!(msg.contains("1 entry cloned"), "{msg}");
+        assert!(msg.contains("clean --tracked"), "{msg}");
     }
 
     #[test]
     fn eviction_messages_are_singular_for_one_entry() {
-        let msg = describe_eviction(&gc_stats(1, 0, 1024), false);
+        let mut stats = gc_stats(1, 0, 1024);
+        stats.disk_bytes_reclaimed = 1024;
+        let msg = describe_eviction(&stats, false);
         assert!(msg.contains("1 entry"), "{msg}");
         assert!(!msg.contains("1 entries"), "{msg}");
+        assert!(!msg.contains("remains cloned"), "{msg}");
+        assert!(!msg.contains("more 0 entries"), "{msg}");
+        assert!(!msg.contains("0 entries left in place"), "{msg}");
     }
 
     #[test]

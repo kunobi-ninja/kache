@@ -69,7 +69,7 @@ fn windows_path_identity_from_parts(
 ) -> PathIdentity {
     PathIdentity {
         device: u64::from(volume_serial),
-        inode: (u64::from(file_index_high) << 32) | u64::from(file_index_low),
+        inode: (u64::from(file_index_high) << 32).saturating_add(u64::from(file_index_low)),
     }
 }
 
@@ -154,7 +154,17 @@ pub fn stdout_is_tty() -> bool {
 }
 
 pub fn refuse_tui(command: &str, alternative: &str) -> Result<()> {
-    anyhow::bail!("`kache {command}` needs a terminal. For scripts and agents, use {alternative}.");
+    tui_requirement(false, command, alternative)
+}
+
+fn tui_requirement(is_tty: bool, command: &str, alternative: &str) -> Result<()> {
+    if is_tty {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "`kache {command}` needs a terminal. For scripts and agents, use {alternative}."
+        );
+    }
 }
 
 pub fn cloned_coverage() -> ClonedCoverage {
@@ -220,6 +230,10 @@ fn retainer_from_sharing(size: u64, sharing: Sharing) -> BlobRetainer {
 /// Walk `store_dir/blobs` and split apparent blob bytes into private vs cloned.
 pub fn disk_view(store_dir: &Path, store_bytes: u64, store_limit_bytes: u64) -> DiskView {
     let probed = probe_store_blobs(store_dir);
+    disk_view_from_probe(store_bytes, store_limit_bytes, probed)
+}
+
+fn disk_view_from_probe(store_bytes: u64, store_limit_bytes: u64, probed: ProbeTotals) -> DiskView {
     // Prefer the indexed store size when the walk and the index disagree:
     // the index is what `max_size` bounds. Scale the probe split to it when
     // the walk found anything.
@@ -239,6 +253,7 @@ pub fn disk_view(store_dir: &Path, store_bytes: u64, store_limit_bytes: u64) -> 
     }
 }
 
+#[derive(Debug, Default)]
 struct ProbeTotals {
     apparent_bytes: u64,
     cloned_bytes: u64,
@@ -380,6 +395,34 @@ mod tests {
         assert!(target_root_is_safe(&target, &workspace));
         assert!(!target_root_is_safe(&workspace, &workspace));
         assert!(!target_root_is_safe(dir.path(), &workspace));
+
+        let missing_markers = workspace.join("missing-markers");
+        std::fs::create_dir_all(&missing_markers).unwrap();
+        assert!(!target_root_is_safe(&missing_markers, &workspace));
+
+        let tag_only = workspace.join("tag-only");
+        std::fs::create_dir_all(&tag_only).unwrap();
+        std::fs::write(
+            tag_only.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        assert!(!target_root_is_safe(&tag_only, &workspace));
+
+        let build_dir_marker = workspace.join("build-dir-marker");
+        std::fs::create_dir_all(build_dir_marker.join("debug")).unwrap();
+        std::fs::write(
+            build_dir_marker.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        assert!(target_root_is_safe(&build_dir_marker, &workspace));
+
+        let file = workspace.join("ordinary-file");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(directory_identity(&file), None);
+        assert_eq!(directory_identity(&workspace.join("missing")), None);
+        assert!(directory_identity(&workspace).is_some());
     }
 
     #[test]
@@ -393,22 +436,69 @@ mod tests {
     }
 
     #[test]
+    fn disk_view_scales_the_probe_split_to_the_indexed_store_size() {
+        let view = disk_view_from_probe(
+            1_000,
+            2_000,
+            ProbeTotals {
+                apparent_bytes: 400,
+                cloned_bytes: 100,
+            },
+        );
+        assert_eq!(view.disk_private_bytes, 750);
+        assert_eq!(view.cloned_into_targets_bytes, 250);
+        assert_eq!(view.store_bytes, 1_000);
+        assert_eq!(view.store_limit_bytes, 2_000);
+    }
+
+    #[test]
+    fn blob_probe_ignores_files_outside_shard_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = dir.path().join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join("not-a-shard"), vec![0u8; 99]).unwrap();
+        let shard = blobs.join("aa");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("blob"), vec![0u8; 7]).unwrap();
+
+        let totals = probe_store_blobs(dir.path());
+        assert_eq!(totals.apparent_bytes, 7);
+    }
+
+    #[test]
+    fn terminal_requirement_names_the_command_and_alternative() {
+        assert!(tui_requirement(true, "config", "the alternative").is_ok());
+        let error = tui_requirement(false, "config", "the alternative")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("kache config"), "{error}");
+        assert!(error.contains("the alternative"), "{error}");
+    }
+
+    #[test]
     fn next_for_clones_is_silent_when_nothing_is_cloned() {
         assert!(next_for_clones(0).is_empty());
         assert_eq!(next_for_clones(1)[0].argv[1], "clean");
     }
 
     #[test]
-    fn next_after_gc_reports_each_source_of_retained_blocks() {
-        let dir = tempfile::tempdir().unwrap();
-        let clean = disk_view(dir.path(), 0, 1024);
-        assert!(next_after_gc(&clean, 0, 0, 0).is_empty());
+    fn next_after_gc_covers_each_retention_signal_boundary() {
+        let empty = DiskView {
+            store_bytes: 0,
+            store_limit_bytes: 0,
+            disk_private_bytes: 0,
+            cloned_into_targets_bytes: 0,
+            cloned_coverage: ClonedCoverage::Unknown,
+        };
+        assert!(next_after_gc(&empty, 0, 0, 0).is_empty());
+        assert!(!next_after_gc(&empty, 1, 0, 0).is_empty());
+        assert!(!next_after_gc(&empty, 0, 0, 1).is_empty());
+        assert!(next_after_gc(&empty, 0, 1, 1).is_empty());
 
-        assert!(!next_after_gc(&clean, 1, 0, 0).is_empty());
-        assert!(!next_after_gc(&clean, 0, 0, 1).is_empty());
-
-        let mut cloned = clean;
-        cloned.cloned_into_targets_bytes = 1;
+        let cloned = DiskView {
+            cloned_into_targets_bytes: 1,
+            ..empty
+        };
         assert!(!next_after_gc(&cloned, 0, 0, 0).is_empty());
     }
 }

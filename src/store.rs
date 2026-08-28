@@ -4253,10 +4253,11 @@ impl Store {
                     params![hash],
                     |row| row.get(0),
                 )?;
-                if rc > 0
-                    && rc <= held
-                    && crate::machine::blob_has_external_retainer(&self.blob_path(hash))
-                {
+                if externally_retained_last_reference(
+                    rc,
+                    held,
+                    crate::machine::blob_has_external_retainer(&self.blob_path(hash)),
+                ) {
                     return Ok(RemovalAttempt::Unreclaimable);
                 }
             }
@@ -4682,6 +4683,10 @@ impl Store {
             savings: (total_logical_size as u64).saturating_sub(total_blob_size as u64),
         })
     }
+}
+
+fn externally_retained_last_reference(rc: i64, held: i64, retained: bool) -> bool {
+    rc > 0 && rc <= held && retained
 }
 
 /// Content-dedup statistics.
@@ -6687,8 +6692,8 @@ mod tests {
 
         let stats = store.evict().unwrap();
         assert_eq!(stats.entries_evicted, 0, "clone still holds the blocks");
-        assert!(
-            stats.entries_unreclaimable > 0,
+        assert_eq!(
+            stats.entries_unreclaimable, 1,
             "the skip must be counted as unreclaimable, not as a pin: {stats:?}"
         );
         assert!(store.contains("kept"), "entry remains restorable");
@@ -6696,12 +6701,23 @@ mod tests {
 
         store.config.gc_evict_shared = true;
         let stats = store.evict().unwrap();
-        assert!(stats.entries_evicted > 0);
+        assert_eq!(stats.entries_evicted, 1);
+        assert_eq!(stats.bytes_freed, 200);
+        assert_eq!(stats.disk_bytes_reclaimed, 0);
         assert!(!store.contains("kept"));
         assert!(
             retainer.is_file(),
             "compatibility mode drops the store name, not the retained blocks"
         );
+    }
+
+    #[test]
+    fn shared_entry_retention_requires_the_last_positive_reference() {
+        assert!(externally_retained_last_reference(1, 1, true));
+        assert!(externally_retained_last_reference(2, 2, true));
+        assert!(!externally_retained_last_reference(2, 1, true));
+        assert!(!externally_retained_last_reference(0, 1, true));
+        assert!(!externally_retained_last_reference(1, 1, false));
     }
 
     #[cfg(unix)]
@@ -7535,6 +7551,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.tracked_target_roots(24).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn target_registry_prunes_only_after_a_real_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let workspace = dir.path().join("workspace");
+        let target = workspace.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+
+        let insert_stale = |path: &str| {
+            store
+                .db
+                .execute(
+                    "INSERT INTO target_roots
+                     (path, workspace_root, first_seen, last_seen, device, inode)
+                     VALUES (?1, '/workspace', 0, unixepoch() - 15552001, '1', '1')",
+                    params![path],
+                )
+                .unwrap();
+        };
+        let contains = |path: &str| -> bool {
+            store
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM target_roots WHERE path = ?1)",
+                    params![path],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                != 0
+        };
+
+        insert_stale("/stale-before-write");
+        store.remember_target_root(&target, &workspace).unwrap();
+        assert!(!contains("/stale-before-write"));
+
+        insert_stale("/stale-before-debounced-noop");
+        store.remember_target_root(&target, &workspace).unwrap();
+        assert!(contains("/stale-before-debounced-noop"));
     }
 
     #[test]
@@ -10672,6 +10735,7 @@ mod tests {
             "evicting `unique` frees 300 KiB physical → 300 <= 450 KiB, done"
         );
         assert_eq!(stats.bytes_freed, 300 * 1024);
+        assert_eq!(stats.disk_bytes_reclaimed, 300 * 1024);
         assert!(
             !store.contains("unique"),
             "the freeing entry is the one evicted"
@@ -10923,6 +10987,7 @@ mod tests {
             "zero-freeing removals must not stop the sweep early"
         );
         assert_eq!(stats.bytes_freed, 300, "the blob's bytes are freed once");
+        assert_eq!(stats.disk_bytes_reclaimed, 300);
         assert_eq!(stats.blobs_removed, 1);
         assert_eq!(store.physical_size().unwrap(), 0);
     }

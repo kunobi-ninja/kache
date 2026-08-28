@@ -2681,6 +2681,10 @@ pub(crate) mod tests {
         let _override = NamedEnvGuard::set("KACHE_GC_EVICT_SHARED", "0");
         assert!(!Config::load().unwrap().gc_evict_shared);
 
+        drop(_override);
+        let _true_override = NamedEnvGuard::set("KACHE_GC_EVICT_SHARED", "1");
+        assert!(Config::load().unwrap().gc_evict_shared);
+
         std::fs::write(
             &config_path,
             "[cache]\nignore_env = true\ngc_evict_shared = true\n",

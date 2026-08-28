@@ -172,6 +172,36 @@ fn unknown_subcommand_is_a_usage_error() {
         .code(2);
 }
 
+#[test]
+fn interactive_commands_refuse_captured_non_tty_output() {
+    let e = env();
+    e.cmd()
+        .arg("config")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("needs a terminal"));
+    e.cmd()
+        .arg("monitor")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("kache stats --json"));
+}
+
+#[test]
+fn json_rejects_unsupported_or_mutating_commands() {
+    let e = env();
+    e.cmd()
+        .args(["--json", "report"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("is supported on"));
+    e.cmd()
+        .args(["--json", "doctor", "--fix"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("reports diagnostics only"));
+}
+
 #[cfg(unix)]
 #[test]
 fn path_resolvable_unknown_subcommand_is_still_a_usage_error() {
@@ -514,6 +544,24 @@ fn why_miss_on_unknown_crate_succeeds() {
 }
 
 #[test]
+fn why_miss_json_reports_the_last_recorded_miss() {
+    let e = env();
+    write_legacy_miss_events(&e, "serde", &["miss-key"]);
+    let output = e
+        .cmd()
+        .args(["--json", "why-miss", "serde"])
+        .output()
+        .expect("run why-miss JSON");
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["command"], "why-miss");
+    assert_eq!(value["crate_name"], "serde");
+    assert_eq!(value["cache_key"], "miss-key");
+    assert_eq!(value["diagnosis"], "never_cached");
+    assert_eq!(value["stored_entries"], 0);
+}
+
+#[test]
 fn machine_readable_commands_emit_one_json_document() {
     let e = env();
     let workdir = TempDir::new().unwrap();
@@ -586,6 +634,16 @@ fn tracked_clean_previews_and_removes_only_the_remembered_target() {
         project.path().join("Cargo.toml").is_file(),
         "tracked cleanup must not remove the source workspace"
     );
+
+    let after = e
+        .cmd()
+        .current_dir(elsewhere.path())
+        .args(["--json", "clean", "--tracked", "--stale", "0h"])
+        .output()
+        .expect("recheck tracked clean");
+    assert!(after.status.success());
+    let after: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(after["targets"].as_array().unwrap().len(), 0);
 }
 
 #[test]

@@ -35,6 +35,10 @@ const UPLOAD_SPOOL_MAX_BYTES: u64 = 65_536;
 const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
 const TARGET_REGISTRATION_DEBOUNCE: Duration = Duration::from_secs(300);
 
+fn target_registration_is_recent(last: Instant, now: Instant) -> bool {
+    now.duration_since(last) < TARGET_REGISTRATION_DEBOUNCE
+}
+
 fn target_registration_due(path: &str) -> bool {
     static SEEN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
     let mut seen = SEEN
@@ -44,7 +48,7 @@ fn target_registration_due(path: &str) -> bool {
     let now = Instant::now();
     if seen
         .get(path)
-        .is_some_and(|last| now.duration_since(*last) < TARGET_REGISTRATION_DEBOUNCE)
+        .is_some_and(|last| target_registration_is_recent(*last, now))
     {
         return false;
     }
@@ -57,6 +61,14 @@ fn target_registration_due(path: &str) -> bool {
     }
     seen.insert(path.to_string(), now);
     true
+}
+
+fn local_hit_can_register_target(
+    outcome: &str,
+    target: Option<&str>,
+    workspace: Option<&str>,
+) -> bool {
+    outcome == "hit" && target.is_some() && workspace.is_some()
 }
 
 fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> NonZeroU64 {
@@ -2920,9 +2932,12 @@ impl Daemon {
             }
         };
         let reply = await_local_lookup(deadline, lookup).await;
-        if reply.outcome == "hit"
-            && let (Some(target), Some(workspace)) =
-                (req.target_dir.as_deref(), req.workspace_root.as_deref())
+        if local_hit_can_register_target(
+            &reply.outcome,
+            req.target_dir.as_deref(),
+            req.workspace_root.as_deref(),
+        ) && let (Some(target), Some(workspace)) =
+            (req.target_dir.as_deref(), req.workspace_root.as_deref())
             && target_registration_due(target)
         {
             let daemon = Arc::clone(self);
@@ -8459,11 +8474,40 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn target_registration_is_debounced_per_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy();
-        assert!(target_registration_due(&path));
-        assert!(!target_registration_due(&path));
+    fn target_registration_debounce_expires_at_the_boundary() {
+        let last = Instant::now();
+        assert!(target_registration_is_recent(
+            last,
+            last + TARGET_REGISTRATION_DEBOUNCE - Duration::from_nanos(1)
+        ));
+        assert!(!target_registration_is_recent(
+            last,
+            last + TARGET_REGISTRATION_DEBOUNCE
+        ));
+
+        let key = format!("target-registration-test-{}", std::process::id());
+        assert!(target_registration_due(&key));
+        assert!(!target_registration_due(&key));
+    }
+
+    #[test]
+    fn only_a_hit_with_both_paths_can_register_a_target() {
+        assert!(local_hit_can_register_target(
+            "hit",
+            Some("target"),
+            Some("workspace")
+        ));
+        assert!(!local_hit_can_register_target(
+            "miss",
+            Some("target"),
+            Some("workspace")
+        ));
+        assert!(!local_hit_can_register_target(
+            "hit",
+            None,
+            Some("workspace")
+        ));
+        assert!(!local_hit_can_register_target("hit", Some("target"), None));
     }
 
     /// kunobi-ninja/kache#706: an auto-spawned daemon must not inherit the

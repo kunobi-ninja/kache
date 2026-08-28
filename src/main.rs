@@ -358,6 +358,18 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
     )
 }
 
+fn doctor_json_is_read_only(
+    fix: bool,
+    purge_sccache: bool,
+    verify: bool,
+    checksums: bool,
+    repair: bool,
+) -> bool {
+    ![fix, purge_sccache, verify, checksums, repair]
+        .into_iter()
+        .any(|enabled| enabled)
+}
+
 /// Diagnostic log file path.
 /// macOS: `~/Library/Logs/kache/kache.log` (visible in Console.app).
 /// Linux/other: `<cache_dir>/kache.log`.
@@ -644,7 +656,7 @@ fn main() -> Result<()> {
             checksums,
             repair,
         }) => {
-            if json && (fix || purge_sccache || verify || checksums || repair) {
+            if json && !doctor_json_is_read_only(fix, purge_sccache, verify, checksums, repair) {
                 anyhow::bail!(
                     "`kache doctor --json` reports diagnostics only; run repair options without `--json`."
                 );
@@ -1109,6 +1121,34 @@ mod tests {
         assert_eq!(parse_duration_hours("48"), Some(48));
         assert_eq!(parse_duration_hours("invalid"), None);
         assert_eq!(parse_duration_hours("18446744073709551615d"), None);
+    }
+
+    #[test]
+    fn json_support_is_limited_to_machine_readable_commands() {
+        assert!(command_supports_json(&Some(Commands::Stats {
+            since: "24h".to_string(),
+        })));
+        assert!(command_supports_json(&Some(Commands::Daemon {
+            command: Some(DaemonCommands::Status),
+        })));
+        assert!(!command_supports_json(&Some(Commands::Config)));
+        assert!(!command_supports_json(&Some(Commands::Monitor {
+            since: None
+        })));
+        assert!(!command_supports_json(&None));
+
+        assert!(doctor_json_is_read_only(false, false, false, false, false));
+        for flags in [
+            (true, false, false, false, false),
+            (false, true, false, false, false),
+            (false, false, true, false, false),
+            (false, false, false, true, false),
+            (false, false, false, false, true),
+        ] {
+            assert!(!doctor_json_is_read_only(
+                flags.0, flags.1, flags.2, flags.3, flags.4
+            ));
+        }
     }
 
     #[test]

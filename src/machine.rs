@@ -47,7 +47,7 @@ pub fn directory_identity(path: &Path) -> Option<PathIdentity> {
             .ok()?;
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         let ok = unsafe { GetFileInformationByHandle(directory.as_raw_handle() as _, &mut info) };
-        (ok != 0).then(|| {
+        win32_call_succeeded(ok).then(|| {
             windows_path_identity_from_parts(
                 info.dwVolumeSerialNumber,
                 info.nFileIndexHigh,
@@ -59,6 +59,11 @@ pub fn directory_identity(path: &Path) -> Option<PathIdentity> {
     {
         None
     }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn win32_call_succeeded(result: i32) -> bool {
+    result != 0
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -149,12 +154,8 @@ pub fn emit<T: Serialize>(command: &'static str, body: T, next: Vec<NextAction>)
     Ok(())
 }
 
-pub fn stdout_is_tty() -> bool {
-    std::io::stdout().is_terminal()
-}
-
-pub fn refuse_tui(command: &str, alternative: &str) -> Result<()> {
-    tui_requirement(false, command, alternative)
+pub fn require_stdout_tty(command: &str, alternative: &str) -> Result<()> {
+    tui_requirement(std::io::stdout().is_terminal(), command, alternative)
 }
 
 fn tui_requirement(is_tty: bool, command: &str, alternative: &str) -> Result<()> {
@@ -335,6 +336,8 @@ mod tests {
 
     #[test]
     fn windows_directory_identity_preserves_the_full_file_index() {
+        assert!(!win32_call_succeeded(0));
+        assert!(win32_call_succeeded(1));
         let identity = windows_path_identity_from_parts(0x1020_3040, 0x1122_3344, 0x5566_7788);
         assert_eq!(identity.device, 0x1020_3040);
         assert_eq!(identity.inode, 0x1122_3344_5566_7788);
@@ -467,6 +470,7 @@ mod tests {
 
     #[test]
     fn terminal_requirement_names_the_command_and_alternative() {
+        assert!(require_stdout_tty("config", "the alternative").is_err());
         assert!(tui_requirement(true, "config", "the alternative").is_ok());
         let error = tui_requirement(false, "config", "the alternative")
             .unwrap_err()

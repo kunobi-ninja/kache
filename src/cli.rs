@@ -1433,9 +1433,11 @@ fn why_miss_json(
     let stored: Vec<_> = store
         .list_entries("name")?
         .into_iter()
-        .filter(|e| e.crate_name == crate_name)
+        .filter(|e| crate_name_matches(crate_name, &e.crate_name))
         .collect();
-    let miss_key_stored = stored.iter().any(|e| e.cache_key == miss.cache_key);
+    let miss_key_stored = stored
+        .iter()
+        .any(|e| cache_key_matches(&e.cache_key, &miss.cache_key));
     let diagnosis = why_miss_diagnosis(
         &miss.store_error,
         &miss.lookup_rejection,
@@ -1475,6 +1477,10 @@ fn why_miss_diagnosis(
     } else {
         "key_mismatch"
     }
+}
+
+fn cache_key_matches(stored: &str, missed: &str) -> bool {
+    stored == missed
 }
 
 /// Compare the miss event's stored metadata against other stored entries
@@ -2847,13 +2853,13 @@ pub fn gc(
                         return Ok(());
                     }
                 };
-                if !json {
+                if human_gc_output(json) {
                     print!("Running eviction...");
                     std::io::Write::flush(&mut std::io::stdout()).ok();
                 }
                 let evict_stats = store.evict_older_than(hours)?;
                 combined = evict_stats.clone();
-                if !json {
+                if human_gc_output(json) {
                     let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
                     println!("{}", describe_eviction(&evict_stats, over_limit));
                 }
@@ -3279,12 +3285,7 @@ pub fn clean(
         return Ok(());
     }
 
-    if !crate::machine::stdout_is_tty() {
-        return crate::machine::refuse_tui(
-            "clean",
-            "`kache clean --dry-run` or `kache clean --json`",
-        );
-    }
+    crate::machine::require_stdout_tty("clean", "`kache clean --dry-run` or `kache clean --json`")?;
 
     // TUI mode — interactive selection
     let mut selected: Vec<bool> = vec![false; targets.len()];
@@ -6369,6 +6370,8 @@ mod tests {
             "first_build_now_cached"
         );
         assert_eq!(why_miss_diagnosis("", "", 1, false), "key_mismatch");
+        assert!(cache_key_matches("same", "same"));
+        assert!(!cache_key_matches("stored", "missed"));
     }
 
     #[test]

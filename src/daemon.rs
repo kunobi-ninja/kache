@@ -39,6 +39,10 @@ fn target_registration_is_recent(last: Instant, now: Instant) -> bool {
     now.duration_since(last) < TARGET_REGISTRATION_DEBOUNCE
 }
 
+fn target_registry_should_evict(entries: usize, already_seen: bool) -> bool {
+    entries >= 2048 && !already_seen
+}
+
 fn target_registration_due(path: &str) -> bool {
     static SEEN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
     let mut seen = SEEN
@@ -52,8 +56,7 @@ fn target_registration_due(path: &str) -> bool {
     {
         return false;
     }
-    if seen.len() >= 2048
-        && !seen.contains_key(path)
+    if target_registry_should_evict(seen.len(), seen.contains_key(path))
         && let Some(oldest) = seen.iter().min_by_key(|(_, seen_at)| **seen_at)
     {
         let oldest = oldest.0.clone();
@@ -8488,6 +8491,9 @@ mod tests {
         let key = format!("target-registration-test-{}", std::process::id());
         assert!(target_registration_due(&key));
         assert!(!target_registration_due(&key));
+        assert!(!target_registry_should_evict(2047, false));
+        assert!(target_registry_should_evict(2048, false));
+        assert!(!target_registry_should_evict(2048, true));
     }
 
     #[test]

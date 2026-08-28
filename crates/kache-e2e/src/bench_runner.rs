@@ -3132,6 +3132,32 @@ mod tests {
     }
 
     #[test]
+    fn write_otlp_or_warn_writes_artifact_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        write_otlp_or_warn(
+            dir.path(),
+            crate::bench_otlp::OtlpRun {
+                project: "bench-test".into(),
+                git_ref: "main".into(),
+                cache_tool: "kache",
+                time_unix_nano: "1".into(),
+                verdict_ok: true,
+                speedup: None,
+                cache_size_bytes: 0,
+                key_stability_pct: None,
+                disk_measured_bytes: None,
+                phases: Vec::new(),
+            },
+        );
+        assert!(dir.path().join(crate::bench_otlp::METRICS_FILE).is_file());
+        assert!(
+            dir.path()
+                .join(crate::bench_otlp::SCHEMA_VERSION_FILE)
+                .is_file()
+        );
+    }
+
+    #[test]
     fn wrapped_compile_failures_do_not_degrade_the_run() {
         let stability = KeyStability {
             stable_pct: 96.9,

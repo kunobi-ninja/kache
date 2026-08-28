@@ -386,6 +386,13 @@ mod tests {
     }
 
     #[test]
+    fn current_time_unix_nano_is_nonzero_decimal() {
+        let timestamp = OtlpRun::now_unix_nano();
+        let nanos = timestamp.parse::<u128>().unwrap();
+        assert!(nanos > 1_000_000_000_000_000_000);
+    }
+
+    #[test]
     fn integer_counts_use_as_int_string() {
         let body = serialize_metrics(&kache_run());
         let point = &metric(&body, "kache.bench.cache.size")["gauge"]["dataPoints"][0];

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
+use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -2496,8 +2497,6 @@ fn write_pager_lines<W: std::io::Write>(writer: &mut W, lines: &[String]) -> boo
 /// commands and spawn failures fall back to plain output. An early pager exit
 /// stops further delivery without failing the command or reprinting the listing.
 fn write_paged(lines: &[String], no_pager: bool) {
-    use std::io::IsTerminal;
-
     let plain = || {
         for line in lines {
             println!("{line}");
@@ -3285,7 +3284,11 @@ pub fn clean(
         return Ok(());
     }
 
-    crate::machine::require_stdout_tty("clean", "`kache clean --dry-run` or `kache clean --json`")?;
+    crate::machine::require_tty(
+        std::io::stdout().is_terminal(),
+        "clean",
+        "`kache clean --dry-run` or `kache clean --json`",
+    )?;
 
     // TUI mode — interactive selection
     let mut selected: Vec<bool> = vec![false; targets.len()];

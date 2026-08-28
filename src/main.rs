@@ -64,6 +64,7 @@ static MACOS_INFO_PLIST: [u8; include_bytes!("../assets/macos/Info.plist").len()
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 /// Build version: CI sets KACHE_VERSION from the git tag, local builds use
@@ -581,7 +582,11 @@ fn main() -> Result<()> {
             if json {
                 anyhow::bail!("`kache config` is interactive and has no JSON form.");
             }
-            crate::machine::require_stdout_tty("config", "`kache config` in a terminal")?;
+            crate::machine::require_tty(
+                std::io::stdout().is_terminal(),
+                "config",
+                "`kache config` in a terminal",
+            )?;
             return config_tui::run_config_editor();
         }
         Some(Commands::Cargo { args }) => return cargo_proxy::run(args.clone()),
@@ -750,7 +755,11 @@ fn main() -> Result<()> {
             if json {
                 anyhow::bail!("`kache monitor` is interactive; use `kache stats --json`.");
             }
-            crate::machine::require_stdout_tty("monitor", "`kache stats --json`")?;
+            crate::machine::require_tty(
+                std::io::stdout().is_terminal(),
+                "monitor",
+                "`kache stats --json`",
+            )?;
             let hours = since.as_deref().and_then(parse_duration_hours);
             tui::run_monitor(&config, hours)
         }

@@ -6,7 +6,6 @@
 
 use anyhow::Result;
 use serde::Serialize;
-use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::sharing::Sharing;
@@ -154,11 +153,7 @@ pub fn emit<T: Serialize>(command: &'static str, body: T, next: Vec<NextAction>)
     Ok(())
 }
 
-pub fn require_stdout_tty(command: &str, alternative: &str) -> Result<()> {
-    tui_requirement(std::io::stdout().is_terminal(), command, alternative)
-}
-
-fn tui_requirement(is_tty: bool, command: &str, alternative: &str) -> Result<()> {
+pub fn require_tty(is_tty: bool, command: &str, alternative: &str) -> Result<()> {
     if is_tty {
         Ok(())
     } else {
@@ -470,8 +465,8 @@ mod tests {
 
     #[test]
     fn terminal_requirement_names_the_command_and_alternative() {
-        assert!(tui_requirement(true, "config", "the alternative").is_ok());
-        let error = tui_requirement(false, "config", "the alternative")
+        assert!(require_tty(true, "config", "the alternative").is_ok());
+        let error = require_tty(false, "config", "the alternative")
             .unwrap_err()
             .to_string();
         assert!(error.contains("kache config"), "{error}");

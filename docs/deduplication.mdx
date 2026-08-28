@@ -33,10 +33,9 @@ The monitor separates:
 
 - `Dedup`: logical bytes avoided by content-addressed blob sharing
 - `Blobs`: physical blob bytes in the store
-- `Hardlinks`: Unix bytes shared through the hardlink fallback
-- `Scan`: whether link accounting is running or complete
+- `Scan`: whether project target discovery is running or complete
 
-A zero hardlink count is normal on copy-on-write filesystems. Their sharing is reflected by filesystem allocation, not inode link count.
+Use `kache gc` and `kache clean --dry-run` for clone-reclamation estimates. The live monitor stays focused on builds, store usage, and transfers.
 
 ## `dup` build events
 

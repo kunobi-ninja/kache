@@ -50,6 +50,7 @@ Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem rem
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GiB` | Registered blob bytes allowed before GC |
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
+| `KACHE_GC_EVICT_SHARED` | `cache.gc_evict_shared` | `false` | Restore namespace-first GC for entries retained by build outputs |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Skip local retention for faster compiles; `0` stores all eligible results |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
 | none | `cache.event_log_max_size` | `10MiB` | Rotate the event log after this size |
@@ -59,6 +60,28 @@ Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem rem
 | `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes |
 
 On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CACHE_HOME/kache` or `~/.cache/kache`; on Windows it is under `%LOCALAPPDATA%`.
+
+## GC and shared build outputs
+
+`cache.local_max_size` measures blob bytes registered in Kache's store. A Cargo target directory can hardlink or block-clone those blobs. In that case the store name and the build output refer to the same disk blocks.
+
+By default, GC keeps an entry when removing its last store name would reclaim zero bytes. This preserves a usable cache hit. It also means the registered store size can remain above `local_max_size` until the target output is removed. `kache gc` reports these entries as unreclaimable and separates store bytes removed from disk bytes reclaimed.
+
+To reclaim the blocks, remove the retaining build output. For known stale targets, preview Kache's machine-local registry before deleting anything:
+
+```bash
+kache clean --tracked --stale 14d --dry-run
+kache clean --tracked --stale 14d --yes
+```
+
+If enforcing the store namespace limit matters more than retaining hits, restore the older policy:
+
+```toml title="~/.config/kache/config.toml"
+[cache]
+gc_evict_shared = true
+```
+
+The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this option, GC can drop an entry even though target files still hold all its blocks. The registered store size falls, but disk usage does not. A later build must compile or download that entry again. Explicit `purge` and repair operations remain unconditional regardless of this setting.
 
 ## Compiler policy
 

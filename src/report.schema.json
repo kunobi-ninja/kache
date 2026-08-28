@@ -306,9 +306,11 @@
         "last_run": { "type": "string" },
         "entries_evicted": { "type": "integer", "minimum": 0 },
         "bytes_freed": { "type": "integer", "minimum": 0 },
+        "disk_bytes_reclaimed": { "type": "integer", "minimum": 0 },
+        "shared_bytes_retained": { "type": "integer", "minimum": 0 },
         "blobs_removed": { "type": "integer", "minimum": 0 }
       },
-      "required": ["last_run", "entries_evicted", "bytes_freed", "blobs_removed"]
+      "required": ["last_run", "entries_evicted", "bytes_freed", "disk_bytes_reclaimed", "shared_bytes_retained", "blobs_removed"]
     }
   },
   "definitions": {

@@ -16,6 +16,8 @@ pub struct GcStatsPersisted {
     pub last_run: String,
     pub entries_evicted: usize,
     pub bytes_freed: u64,
+    #[serde(default)]
+    pub disk_bytes_reclaimed: u64,
     pub blobs_removed: usize,
     pub duration_ms: u64,
 }
@@ -26,6 +28,8 @@ pub struct GcSummary {
     pub last_run: String,
     pub entries_evicted: usize,
     pub bytes_freed: u64,
+    pub disk_bytes_reclaimed: u64,
+    pub shared_bytes_retained: u64,
     pub blobs_removed: usize,
 }
 
@@ -839,6 +843,10 @@ fn load_gc_summary(cache_dir: &std::path::Path, hours: u64) -> Option<GcSummary>
         last_run: persisted.last_run,
         entries_evicted: persisted.entries_evicted,
         bytes_freed: persisted.bytes_freed,
+        disk_bytes_reclaimed: persisted.disk_bytes_reclaimed,
+        shared_bytes_retained: persisted
+            .bytes_freed
+            .saturating_sub(persisted.disk_bytes_reclaimed),
         blobs_removed: persisted.blobs_removed,
     })
 }
@@ -2233,8 +2241,16 @@ pub fn format_markdown(report: &BuildReport) -> String {
         lines.push(format!("| Last run | {} |", gc.last_run));
         lines.push(format!("| Entries evicted | {} |", gc.entries_evicted));
         lines.push(format!(
-            "| Bytes freed | {} |",
+            "| Store bytes removed | {} |",
             format_bytes(gc.bytes_freed)
+        ));
+        lines.push(format!(
+            "| Disk bytes reclaimed | {} |",
+            format_bytes(gc.disk_bytes_reclaimed)
+        ));
+        lines.push(format!(
+            "| Shared bytes retained | {} |",
+            format_bytes(gc.shared_bytes_retained)
         ));
         lines.push(format!("| Blobs removed | {} |", gc.blobs_removed));
         lines.push(String::new());
@@ -2692,7 +2708,7 @@ pub fn format_github(report: &BuildReport) -> String {
         lines.push(String::new());
         lines.push("<details>".to_string());
         lines.push(format!(
-            "<summary><strong>GC</strong> — {} entries evicted, {} freed</summary>",
+            "<summary><strong>GC</strong> — {} entries evicted, {} removed from the store</summary>",
             gc.entries_evicted,
             format_bytes(gc.bytes_freed),
         ));
@@ -2702,8 +2718,16 @@ pub fn format_github(report: &BuildReport) -> String {
         lines.push(format!("| Last run | {} |", gc.last_run));
         lines.push(format!("| Entries evicted | {} |", gc.entries_evicted));
         lines.push(format!(
-            "| Bytes freed | {} |",
+            "| Store bytes removed | {} |",
             format_bytes(gc.bytes_freed)
+        ));
+        lines.push(format!(
+            "| Disk bytes reclaimed | {} |",
+            format_bytes(gc.disk_bytes_reclaimed)
+        ));
+        lines.push(format!(
+            "| Shared bytes retained | {} |",
+            format_bytes(gc.shared_bytes_retained)
         ));
         lines.push(format!("| Blobs removed | {} |", gc.blobs_removed));
         lines.push(String::new());
@@ -3013,7 +3037,18 @@ pub fn format_text(report: &BuildReport) -> String {
         lines.push("GC:".to_string());
         lines.push(format!("  Last run: {}", gc.last_run));
         lines.push(format!("  Entries evicted: {}", gc.entries_evicted));
-        lines.push(format!("  Bytes freed: {}", format_bytes(gc.bytes_freed)));
+        lines.push(format!(
+            "  Store bytes removed: {}",
+            format_bytes(gc.bytes_freed)
+        ));
+        lines.push(format!(
+            "  Disk bytes reclaimed: {}",
+            format_bytes(gc.disk_bytes_reclaimed)
+        ));
+        lines.push(format!(
+            "  Shared bytes retained: {}",
+            format_bytes(gc.shared_bytes_retained)
+        ));
         lines.push(format!("  Blobs removed: {}", gc.blobs_removed));
         lines.push(String::new());
     }
@@ -3201,6 +3236,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -3925,6 +3961,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -3987,6 +4024,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -4059,6 +4097,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -4132,6 +4171,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -4210,6 +4250,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -4370,6 +4411,8 @@ mod tests {
             last_run: "2026-06-19T12:00:00+00:00".to_string(),
             entries_evicted: 7,
             bytes_freed: 9000,
+            disk_bytes_reclaimed: 4000,
+            shared_bytes_retained: 5000,
             blobs_removed: 3,
         });
 
@@ -4606,6 +4649,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -4936,6 +4980,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,

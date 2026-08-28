@@ -33,6 +33,31 @@ const REMOTE_CHECK_SINGLEFLIGHT_MAX_KEYS: usize = 4096;
 const REMOTE_CHECK_LEGACY_BUDGET_MS: u64 = 3_000;
 const UPLOAD_SPOOL_MAX_BYTES: u64 = 65_536;
 const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
+const TARGET_REGISTRATION_DEBOUNCE: Duration = Duration::from_secs(300);
+
+fn target_registration_due(path: &str) -> bool {
+    static SEEN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    if seen
+        .get(path)
+        .is_some_and(|last| now.duration_since(*last) < TARGET_REGISTRATION_DEBOUNCE)
+    {
+        return false;
+    }
+    if seen.len() >= 2048
+        && !seen.contains_key(path)
+        && let Some(oldest) = seen.iter().min_by_key(|(_, seen_at)| **seen_at)
+    {
+        let oldest = oldest.0.clone();
+        seen.remove(&oldest);
+    }
+    seen.insert(path.to_string(), now);
+    true
+}
 
 fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> NonZeroU64 {
     let configured_ms = if configured_secs == 0 {
@@ -777,6 +802,11 @@ pub struct LocalLookupRequest {
     /// Client binary mtime — lets the daemon detect when it's running stale code.
     #[serde(default)]
     pub client_epoch: u64,
+    /// Machine-local provenance for guarded cleanup. Older daemons ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Reply payload for [`Request::LocalLookup`]. `outcome` is a plain string —
@@ -1298,6 +1328,12 @@ pub struct EventStatsResponse {
 pub struct GcPolicyOutcome {
     pub entries_evicted: usize,
     pub bytes_freed: u64,
+    #[serde(default)]
+    pub entries_pinned: usize,
+    #[serde(default)]
+    pub disk_bytes_reclaimed: u64,
+    #[serde(default)]
+    pub entries_unreclaimable: usize,
 }
 
 impl From<&crate::store::GcStats> for GcPolicyOutcome {
@@ -1305,6 +1341,9 @@ impl From<&crate::store::GcStats> for GcPolicyOutcome {
         Self {
             entries_evicted: stats.entries_evicted,
             bytes_freed: stats.bytes_freed,
+            disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
+            entries_pinned: stats.entries_pinned,
+            entries_unreclaimable: stats.entries_unreclaimable,
         }
     }
 }
@@ -2881,6 +2920,25 @@ impl Daemon {
             }
         };
         let reply = await_local_lookup(deadline, lookup).await;
+        if reply.outcome == "hit"
+            && let (Some(target), Some(workspace)) =
+                (req.target_dir.as_deref(), req.workspace_root.as_deref())
+            && target_registration_due(target)
+        {
+            let daemon = Arc::clone(self);
+            let target = std::path::PathBuf::from(target);
+            let workspace = std::path::PathBuf::from(workspace);
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) =
+                    daemon.with_store(|store| store.remember_target_root(&target, &workspace))
+                {
+                    tracing::warn!(
+                        target = %target.display(),
+                        "failed to register daemon-hit target root: {error:#}"
+                    );
+                }
+            });
+        }
         if let Some(reason) = reply.reason.as_deref() {
             tracing::debug!(
                 key = key_prefix(&req.key),
@@ -5222,6 +5280,12 @@ impl Daemon {
                 age_evict_stats.entries_pinned,
                 evict_stats.entries_pinned,
             ),
+            entries_unreclaimable: dedup_stats.entries_unreclaimable
+                + evict_stats.entries_unreclaimable
+                + age_evict_stats.entries_unreclaimable,
+            disk_bytes_reclaimed: dedup_stats.disk_bytes_reclaimed
+                + evict_stats.disk_bytes_reclaimed
+                + age_evict_stats.disk_bytes_reclaimed,
         };
 
         tracing::info!(
@@ -5238,6 +5302,7 @@ impl Daemon {
             last_run: chrono::Utc::now().to_rfc3339(),
             entries_evicted: stats.entries_evicted,
             bytes_freed: stats.bytes_freed,
+            disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
             blobs_removed: stats.blobs_removed,
             duration_ms: stats.duration_ms,
         };
@@ -7119,7 +7184,12 @@ pub fn send_remote_check(
 /// request) — the caller must run the fully local path. The read timeout is
 /// deliberately tight: this sits on the warm-hit critical path, and an
 /// overloaded daemon must shed to the local path, never queue the build.
-pub fn send_local_lookup(config: &Config, key: &str) -> Option<LocalLookupReply> {
+pub fn send_local_lookup(
+    config: &Config,
+    key: &str,
+    target_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+) -> Option<LocalLookupReply> {
     let socket_path = config.socket_path();
     if !crate::transport::is_reachable(&socket_path) {
         return None;
@@ -7128,6 +7198,8 @@ pub fn send_local_lookup(config: &Config, key: &str) -> Option<LocalLookupReply>
     let req = Request::LocalLookup(LocalLookupRequest {
         key: key.to_string(),
         client_epoch: build_epoch(),
+        target_dir: target_dir.map(|path| path.to_string_lossy().into_owned()),
+        workspace_root: workspace_root.map(|path| path.to_string_lossy().into_owned()),
     });
     let timeout = std::env::var("KACHE_LOCAL_HIT_TIMEOUT_MS")
         .ok()
@@ -9386,6 +9458,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -10684,11 +10757,12 @@ mod tests {
                 &[],
                 "host",
                 "dev",
-                &[(src_file, "lib.rlib".into())],
+                &[(src_file.clone(), "lib.rlib".into())],
                 "",
                 "",
             )
             .unwrap();
+        std::fs::remove_file(&src_file).unwrap();
         assert!(store.contains("testkey"));
         assert!(store.total_size().unwrap() >= 200);
         // Age past the active-pin grace so eviction can claim it (a just-put
@@ -10731,11 +10805,12 @@ mod tests {
                 &[],
                 "host",
                 "dev",
-                &[(src_file, "lib.rlib".into())],
+                &[(src_file.clone(), "lib.rlib".into())],
                 "",
                 "",
             )
             .unwrap();
+        std::fs::remove_file(&src_file).unwrap();
         store.set_last_accessed_for_test("stale_key", "-2 hours");
         drop(store);
 
@@ -10807,7 +10882,7 @@ mod tests {
                 &[],
                 "host",
                 "dev",
-                &[(old_file, "old.rlib".into())],
+                &[(old_file.clone(), "old.rlib".into())],
                 "",
                 "",
             )
@@ -10823,11 +10898,13 @@ mod tests {
                 &[],
                 "host",
                 "dev",
-                &[(fresh_file, "fresh.rlib".into())],
+                &[(fresh_file.clone(), "fresh.rlib".into())],
                 "",
                 "",
             )
             .unwrap();
+        std::fs::remove_file(&old_file).unwrap();
+        std::fs::remove_file(&fresh_file).unwrap();
         store.set_last_accessed_for_test("old_valuable", "-2 hours");
         store.set_last_accessed_for_test("fresh_cheap", "-2 minutes");
         drop(store);
@@ -10864,11 +10941,12 @@ mod tests {
                 &[],
                 "host",
                 "dev",
-                &[(src_file, "lib.rlib".into())],
+                &[(src_file.clone(), "lib.rlib".into())],
                 "",
                 "",
             )
             .unwrap();
+        std::fs::remove_file(&src_file).unwrap();
         // Age past the active-pin grace so eviction can claim it
         // (kunobi-ninja/kache#326).
         store.set_last_accessed_for_test("upload_evict_key", "-1 hour");
@@ -11862,6 +11940,8 @@ mod tests {
                 &Request::LocalLookup(LocalLookupRequest {
                     key: key.to_string(),
                     client_epoch: 0,
+                    target_dir: None,
+                    workspace_root: None,
                 }),
             )
             .await;
@@ -11896,6 +11976,8 @@ mod tests {
                     key: "0000000000000000000000000000000000000000000000000000000000000002"
                         .to_string(),
                     client_epoch: 0,
+                    target_dir: None,
+                    workspace_root: None,
                 }),
             )
             .await;
@@ -11940,6 +12022,8 @@ mod tests {
             .handle_local_lookup(&LocalLookupRequest {
                 key: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
                 client_epoch: 0,
+                target_dir: None,
+                workspace_root: None,
             })
             .await;
         assert!(response.ok);

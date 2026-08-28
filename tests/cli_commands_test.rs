@@ -514,6 +514,81 @@ fn why_miss_on_unknown_crate_succeeds() {
 }
 
 #[test]
+fn machine_readable_commands_emit_one_json_document() {
+    let e = env();
+    let workdir = TempDir::new().unwrap();
+    let commands: &[&[&str]] = &[
+        &["--json", "list"],
+        &["--json", "stats"],
+        &["--json", "gc"],
+        &["--json", "clean"],
+        &["--json", "doctor"],
+        &["--json", "why-miss", "serde"],
+        &["--json", "daemon", "status"],
+    ];
+
+    for args in commands {
+        let output = e
+            .cmd()
+            .current_dir(workdir.path())
+            .args(*args)
+            .output()
+            .expect("run JSON command");
+        assert!(
+            output.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{args:?} did not emit clean JSON: {error}"));
+        assert_eq!(value["schema_version"], 1, "{args:?}");
+        assert!(value["command"].is_string(), "{args:?}");
+    }
+}
+
+#[test]
+fn tracked_clean_previews_and_removes_only_the_remembered_target() {
+    let e = env();
+    let project = scaffold_lib("trackedclean", "pub fn value() -> u8 { 1 }\n");
+    let external = TempDir::new().unwrap();
+    let target = external.path().join("cargo-output");
+    let build = e.wrapper_build(project.path(), &target);
+    assert!(
+        build.status.success(),
+        "wrapper build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(target.is_dir());
+
+    let elsewhere = TempDir::new().unwrap();
+    let preview = e
+        .cmd()
+        .current_dir(elsewhere.path())
+        .args(["--json", "clean", "--tracked", "--stale", "0h"])
+        .output()
+        .expect("preview tracked clean");
+    assert!(preview.status.success());
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview["changed"], false);
+    assert_eq!(preview["targets"][0]["path"], target.display().to_string());
+
+    let clean = e
+        .cmd()
+        .current_dir(elsewhere.path())
+        .args(["--json", "clean", "--tracked", "--stale", "0h", "--yes"])
+        .output()
+        .expect("run tracked clean");
+    assert!(clean.status.success());
+    let clean: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    assert_eq!(clean["changed"], true);
+    assert!(!target.exists(), "tracked target should be removed");
+    assert!(
+        project.path().join("Cargo.toml").is_file(),
+        "tracked cleanup must not remove the source workspace"
+    );
+}
+
+#[test]
 fn clean_dry_run_reports_no_targets_in_empty_dir() {
     let e = env();
     // Run from an empty working dir so `clean` finds nothing to remove.

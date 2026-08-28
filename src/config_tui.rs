@@ -158,6 +158,9 @@ struct EditorState {
     /// `[cache] auto_gc` as loaded — the editor has no form field for it, so
     /// carry it through verbatim on save (kunobi-ninja/kache#497).
     preserved_auto_gc: Option<bool>,
+    /// `[cache] gc_evict_shared` is an advanced compatibility setting; keep
+    /// it unchanged when the interactive editor saves the file.
+    preserved_gc_evict_shared: Option<bool>,
     /// `[cache] storage_layout_advice` as loaded — the editor has no form field
     /// for it, so carry it through verbatim on save (kunobi-ninja/kache#551).
     preserved_storage_layout_advice: Option<bool>,
@@ -777,6 +780,7 @@ fn fields_to_file_config(
     preserved_local_hit_daemon: Option<bool>,
     preserved_windows_hardlink: Option<bool>,
     preserved_auto_gc: Option<bool>,
+    preserved_gc_evict_shared: Option<bool>,
     preserved_storage_layout_advice: Option<bool>,
     preserved_heartbeat_secs: Option<u64>,
     preserved_explain_miss: Option<bool>,
@@ -881,6 +885,7 @@ fn fields_to_file_config(
             local_hit_daemon: preserved_local_hit_daemon,
             windows_hardlink: preserved_windows_hardlink,
             auto_gc: preserved_auto_gc,
+            gc_evict_shared: preserved_gc_evict_shared,
             storage_layout_advice: preserved_storage_layout_advice,
             heartbeat_secs: preserved_heartbeat_secs,
             explain_miss: preserved_explain_miss,
@@ -980,6 +985,7 @@ fn initial_editor_state(
         preserved_local_hit_daemon: file_config.cache.as_ref().and_then(|c| c.local_hit_daemon),
         preserved_windows_hardlink: file_config.cache.as_ref().and_then(|c| c.windows_hardlink),
         preserved_auto_gc: file_config.cache.as_ref().and_then(|c| c.auto_gc),
+        preserved_gc_evict_shared: file_config.cache.as_ref().and_then(|c| c.gc_evict_shared),
         preserved_storage_layout_advice: file_config
             .cache
             .as_ref()
@@ -1173,6 +1179,7 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_local_hit_daemon,
         state.preserved_windows_hardlink,
         state.preserved_auto_gc,
+        state.preserved_gc_evict_shared,
         state.preserved_storage_layout_advice,
         state.preserved_heartbeat_secs,
         state.preserved_explain_miss,
@@ -2028,6 +2035,7 @@ mod tests {
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,
+                gc_evict_shared: Some(true),
                 storage_layout_advice: None,
                 heartbeat_secs: None,
                 explain_miss: None,
@@ -2096,6 +2104,7 @@ mod tests {
             original.cache.as_ref().and_then(|c| c.local_hit_daemon),
             original.cache.as_ref().and_then(|c| c.windows_hardlink),
             original.cache.as_ref().and_then(|c| c.auto_gc),
+            original.cache.as_ref().and_then(|c| c.gc_evict_shared),
             original
                 .cache
                 .as_ref()
@@ -2130,6 +2139,7 @@ mod tests {
         assert_eq!(cache.remote_negative_ttl_secs, Some(45));
         assert_eq!(cache.min_store_compile_ms, Some(750));
         assert_eq!(cache.gc_max_age_hours, Some(72));
+        assert_eq!(cache.gc_evict_shared, Some(true));
         assert_eq!(cache.daemon_idle_timeout_secs, Some(600));
         // The editor has no planner fields, but a save must preserve the
         // loaded `[cache.planner]` section verbatim (endpoint + token).
@@ -2222,6 +2232,7 @@ mod tests {
             state.preserved_local_hit_daemon,
             state.preserved_windows_hardlink,
             state.preserved_auto_gc,
+            state.preserved_gc_evict_shared,
             state.preserved_storage_layout_advice,
             state.preserved_heartbeat_secs,
             state.preserved_explain_miss,
@@ -2266,6 +2277,7 @@ mod tests {
             None,
             None,
             PreservedAdvancedConfig::default(),
+            None,
             None,
             None,
             None,
@@ -2328,6 +2340,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let remote = result
             .cache
@@ -2354,6 +2367,7 @@ mod tests {
             None,
             None,
             PreservedAdvancedConfig::default(),
+            None,
             None,
             None,
             None,
@@ -2439,6 +2453,7 @@ mod tests {
             preserved_local_hit_daemon: None,
             preserved_windows_hardlink: None,
             preserved_auto_gc: None,
+            preserved_gc_evict_shared: None,
             preserved_storage_layout_advice: None,
             preserved_heartbeat_secs: None,
             preserved_explain_miss: None,

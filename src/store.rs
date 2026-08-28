@@ -655,6 +655,8 @@ pub struct CachedFile {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GcStats {
     pub entries_evicted: usize,
+    /// Store-namespace bytes whose blob rows went away. Not filesystem
+    /// reclamation — clones in `target/` can keep the blocks.
     pub bytes_freed: u64,
     pub blobs_removed: usize,
     pub duration_ms: u64,
@@ -670,6 +672,14 @@ pub struct GcStats {
     /// filed about and plausibly what turned #497 into a 113 GB bug report.
     #[serde(default)]
     pub entries_pinned: usize,
+    /// Entries eviction selected but left in place because unlinking their
+    /// last-ref blobs would not free disk (hardlink or CoW clone still live
+    /// in a worktree). Distinct from [`Self::entries_pinned`].
+    #[serde(default)]
+    pub entries_unreclaimable: usize,
+    /// Best-effort private bytes actually returned by unlinking store names.
+    #[serde(default)]
+    pub disk_bytes_reclaimed: u64,
 }
 
 /// Registered blob bytes and blob rows an entry removal released — blobs
@@ -682,6 +692,7 @@ pub struct GcStats {
 pub(crate) struct RemovalReclaim {
     pub(crate) freed_bytes: u64,
     pub(crate) blobs_unlinked: usize,
+    pub(crate) disk_bytes_reclaimed: u64,
 }
 
 /// One pass of `remove_entry_guarded_with_hooks`: either a settled outcome,
@@ -690,6 +701,26 @@ pub(crate) struct RemovalReclaim {
 enum RemovalAttempt {
     Done(Option<RemovalReclaim>),
     Republished,
+    /// Last-ref blobs are still cloned outside the store; eviction must not
+    /// drop the entry (kunobi-ninja/kache#725).
+    Unreclaimable,
+}
+
+/// Outcome of [`Store::remove_entry_guarded`].
+#[derive(Debug)]
+pub(crate) enum GuardedRemoval {
+    Reclaimed(RemovalReclaim),
+    Skipped,
+    Unreclaimable,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct TrackedTargetRoot {
+    pub path: PathBuf,
+    pub workspace_root: PathBuf,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    pub identity: crate::machine::PathIdentity,
 }
 
 /// A shadow policy's would-evict set for one size-driven sweep
@@ -1171,6 +1202,22 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
             path      TEXT PRIMARY KEY,
             last_seen TEXT NOT NULL DEFAULT (datetime('now'))
         );",
+    )?;
+
+    // Machine-local build-output provenance (kunobi-ninja/kache#725). These
+    // absolute paths stay in the local SQLite index and are never exported to
+    // remote manifests or artifact metadata.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS target_roots (
+            path           TEXT PRIMARY KEY,
+            workspace_root TEXT NOT NULL,
+            first_seen     INTEGER NOT NULL DEFAULT (unixepoch()),
+            last_seen      INTEGER NOT NULL DEFAULT (unixepoch()),
+            device         TEXT NOT NULL,
+            inode          TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_target_roots_last_seen
+            ON target_roots(last_seen);",
     )?;
 
     crate::cache_key::ensure_file_hash_cache_schema(db)?;
@@ -3103,6 +3150,100 @@ impl Store {
         Ok(())
     }
 
+    /// Remember a Cargo target root without putting absolute paths in cache
+    /// entries or remote data. Updates are debounced to keep compiler-wrapper
+    /// writes off the hot path.
+    pub fn remember_target_root(&self, target: &Path, workspace_root: &Path) -> Result<()> {
+        if !crate::machine::target_root_is_safe(target, workspace_root) {
+            return Ok(());
+        }
+        let target = std::path::absolute(target)?;
+        let workspace_root = std::path::absolute(workspace_root)?;
+        let Some(identity) = crate::machine::directory_identity(&target) else {
+            return Ok(());
+        };
+        let changed = self.db.execute(
+            "INSERT INTO target_roots
+                (path, workspace_root, first_seen, last_seen, device, inode)
+             VALUES (?1, ?2, unixepoch(), unixepoch(), ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET
+                workspace_root = excluded.workspace_root,
+                last_seen = unixepoch(),
+                device = excluded.device,
+                inode = excluded.inode
+             WHERE target_roots.last_seen <= unixepoch() - 300
+                OR target_roots.workspace_root != excluded.workspace_root
+                OR target_roots.device != excluded.device
+                OR target_roots.inode != excluded.inode",
+            params![
+                target.to_string_lossy(),
+                workspace_root.to_string_lossy(),
+                identity.device.to_string(),
+                identity.inode.to_string(),
+            ],
+        )?;
+        if changed > 0 {
+            self.db.execute(
+                "DELETE FROM target_roots WHERE last_seen < unixepoch() - 15552000",
+                [],
+            )?;
+            self.db.execute(
+                "DELETE FROM target_roots WHERE path IN (
+                    SELECT path FROM target_roots
+                    ORDER BY last_seen DESC, path ASC
+                    LIMIT -1 OFFSET 2048
+                )",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn tracked_target_roots(&self, stale_hours: u64) -> Result<Vec<TrackedTargetRoot>> {
+        let stale_seconds = stale_hours.saturating_mul(3600).min(i64::MAX as u64) as i64;
+        let mut stmt = self.db.prepare(
+            "SELECT path, workspace_root, first_seen, last_seen, device, inode
+             FROM target_roots
+             WHERE last_seen <= unixepoch() - ?1
+             ORDER BY last_seen ASC, path ASC",
+        )?;
+        let rows = stmt.query_map(params![stale_seconds], |row| {
+            let device: String = row.get(4)?;
+            let inode: String = row.get(5)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                device,
+                inode,
+            ))
+        })?;
+        let mut targets = Vec::new();
+        for row in rows {
+            let (path, workspace_root, first_seen, last_seen, device, inode) = row?;
+            let (Ok(device), Ok(inode)) = (device.parse::<u64>(), inode.parse::<u64>()) else {
+                continue;
+            };
+            targets.push(TrackedTargetRoot {
+                path: PathBuf::from(path),
+                workspace_root: PathBuf::from(workspace_root),
+                first_seen,
+                last_seen,
+                identity: crate::machine::PathIdentity { device, inode },
+            });
+        }
+        Ok(targets)
+    }
+
+    pub(crate) fn forget_target_root(&self, path: &Path) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM target_roots WHERE path = ?1",
+            params![path.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
     /// Remove registered incremental directories and prune stale registry rows.
     pub fn clean_registered_incremental_dirs(&self) -> Result<usize> {
         let paths: Vec<String> = {
@@ -3293,7 +3434,7 @@ impl Store {
             }
             let features = by_key.get(key.as_str()).copied();
             match self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE)) {
-                Ok(Some(reclaim)) => {
+                Ok(GuardedRemoval::Reclaimed(reclaim)) => {
                     stats.entries_evicted += 1;
                     // Budget on bytes the removal *actually* freed on disk, not
                     // the entry's logical size: evicting an entry whose blobs
@@ -3301,6 +3442,7 @@ impl Store {
                     // going rather than stop believing it reached the target
                     // (#608).
                     stats.bytes_freed += reclaim.freed_bytes;
+                    stats.disk_bytes_reclaimed += reclaim.disk_bytes_reclaimed;
                     stats.blobs_removed += reclaim.blobs_unlinked;
                     current_size = current_size.saturating_sub(reclaim.freed_bytes);
                     // Telemetry, deliberately outside remove_entry_guarded so
@@ -3318,8 +3460,12 @@ impl Store {
                 // race to a concurrent remover. Leave it for next round, but
                 // count it so the caller can say *why* nothing was evicted
                 // instead of reporting a bare "0" (#509).
-                Ok(None) => {
+                Ok(GuardedRemoval::Skipped) => {
                     stats.entries_pinned += 1;
+                    continue;
+                }
+                Ok(GuardedRemoval::Unreclaimable) => {
+                    stats.entries_unreclaimable += 1;
                     continue;
                 }
                 Err(e) => {
@@ -3893,12 +4039,13 @@ impl Store {
     /// the blobs, so it serializes against that `last_accessed` bump: either the
     /// bump commits first (and we skip the eviction), or we delete first (and
     /// the racing restore reads a now-gone blob → ENOENT → clean recompile,
-    /// never a false hit). Returns `Ok(Some(_))` when this call removed the
-    /// entry, with the *physical* bytes and blob files actually reclaimed —
-    /// zero when every blob is still referenced by another entry (#608).
+    /// never a false hit). Returns [`GuardedRemoval::Reclaimed`] when this
+    /// call removed the entry, with the *physical* bytes and blob files
+    /// actually reclaimed — zero when every blob is still referenced by
+    /// another entry (#608).
     ///
     /// `None` (the plain `remove_entry` path) always removes — explicit purge /
-    /// `doctor` must not be blocked by recency.
+    /// `doctor` must not be blocked by recency or by external clones.
     ///
     /// Concurrent same-key *publication* is guarded too (#670): the entry's
     /// references are decremented only if `meta.json` is byte-identical, under
@@ -3910,7 +4057,7 @@ impl Store {
         &self,
         cache_key: &str,
         skip_if_idle_lt: Option<Duration>,
-    ) -> Result<Option<RemovalReclaim>> {
+    ) -> Result<GuardedRemoval> {
         self.remove_entry_guarded_with_hook(cache_key, skip_if_idle_lt, || {})
     }
 
@@ -3922,7 +4069,7 @@ impl Store {
         cache_key: &str,
         skip_if_idle_lt: Option<Duration>,
         after_meta_read: impl FnOnce(),
-    ) -> Result<Option<RemovalReclaim>> {
+    ) -> Result<GuardedRemoval> {
         self.remove_entry_guarded_with_hooks(cache_key, skip_if_idle_lt, after_meta_read, || {})
     }
 
@@ -3938,7 +4085,7 @@ impl Store {
         skip_if_idle_lt: Option<Duration>,
         after_meta_read: impl FnOnce(),
         before_dir_cleanup: impl FnOnce(),
-    ) -> Result<Option<RemovalReclaim>> {
+    ) -> Result<GuardedRemoval> {
         // Boxed so the republication-retry loop below stays non-generic; the
         // production closures are zero-sized, so no allocation happens.
         let mut after_meta_read: Option<Box<dyn FnOnce() + '_>> = Some(Box::new(after_meta_read));
@@ -3951,7 +4098,11 @@ impl Store {
                 after_meta_read.take(),
                 before_dir_cleanup.take(),
             )? {
-                RemovalAttempt::Done(outcome) => return Ok(outcome),
+                RemovalAttempt::Done(Some(reclaim)) => {
+                    return Ok(GuardedRemoval::Reclaimed(reclaim));
+                }
+                RemovalAttempt::Done(None) => return Ok(GuardedRemoval::Skipped),
+                RemovalAttempt::Unreclaimable => return Ok(GuardedRemoval::Unreclaimable),
                 // A republication landed while this attempt waited out a
                 // concurrent removal: the row belongs to a fresh generation
                 // whose meta is back. The caller asked to remove whatever is
@@ -4082,6 +4233,32 @@ impl Store {
             )?;
             if recently_accessed != 0 {
                 return Ok(RemovalAttempt::Done(None));
+            }
+        }
+
+        // Eviction only: refuse to drop an entry whose last-ref blobs are
+        // still cloned into a worktree (kunobi-ninja/kache#725). Unlinking
+        // those names frees no disk and destroys a still-usable hit.
+        // Explicit `remove_entry` (purge / doctor) passes `skip_if_idle_lt =
+        // None` and still unlinks.
+        if skip_if_idle_lt.is_some() && !self.config.gc_evict_shared {
+            let mut last_ref_count: std::collections::HashMap<&str, i64> =
+                std::collections::HashMap::new();
+            for hash in &hashes {
+                *last_ref_count.entry(hash.as_str()).or_insert(0) += 1;
+            }
+            for (hash, held) in last_ref_count {
+                let rc: i64 = tx.query_row(
+                    "SELECT refcount FROM blobs WHERE hash = ?1",
+                    params![hash],
+                    |row| row.get(0),
+                )?;
+                if rc > 0
+                    && rc <= held
+                    && crate::machine::blob_has_external_retainer(&self.blob_path(hash))
+                {
+                    return Ok(RemovalAttempt::Unreclaimable);
+                }
             }
         }
 
@@ -4238,8 +4415,12 @@ impl Store {
                 |row| row.get(0),
             )?;
             if readopted == 0 {
-                unlink_blob(&self.blob_path(&hash));
+                let blob = self.blob_path(&hash);
+                let disk =
+                    crate::machine::blob_reclaimable_bytes(&blob).unwrap_or(size.max(0) as u64);
+                unlink_blob(&blob);
                 reclaim.freed_bytes += size.max(0) as u64;
+                reclaim.disk_bytes_reclaimed += disk;
                 reclaim.blobs_unlinked += 1;
             }
         }
@@ -4297,6 +4478,7 @@ impl Store {
             tx.execute("DELETE FROM entry_blobs", [])?;
             tx.execute("DELETE FROM blobs", [])?;
             tx.execute("DELETE FROM incremental_dirs", [])?;
+            tx.execute("DELETE FROM target_roots", [])?;
             tx.commit()?;
             Ok(())
         };
@@ -5511,6 +5693,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -6105,6 +6288,7 @@ mod tests {
                 "",
             )
             .unwrap();
+        let _ = std::fs::remove_file(dir.join(format!("out-{seed}.rlib")));
         k
     }
 
@@ -6440,11 +6624,12 @@ mod tests {
                 &[],
                 "x86_64-unknown-linux-gnu",
                 "dev",
-                &[(output_file, "libbig.rlib".to_string())],
+                &[(output_file.clone(), "libbig.rlib".to_string())],
                 "",
                 "",
             )
             .unwrap();
+        let _ = std::fs::remove_file(&output_file);
 
         // Age the entry past the active-pin grace so size-pressure eviction can
         // claim it (a just-put entry is "recently accessed" and is now pinned
@@ -6460,6 +6645,116 @@ mod tests {
         let stats = store.evict().unwrap();
         assert!(stats.entries_evicted > 0);
         assert!(!store.contains("key1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evict_leaves_an_entry_whose_blob_is_still_hardlinked_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+        let mut store = Store::open(&config).unwrap();
+
+        let output_file = dir.path().join("big.rlib");
+        std::fs::write(&output_file, vec![0u8; 200]).unwrap();
+        store
+            .put(
+                "kept",
+                "big_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file.clone(), "libbig.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&output_file);
+
+        let meta = store.get("kept").unwrap().unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        let retainer = dir.path().join("worktree-copy.rlib");
+        std::fs::hard_link(&blob, &retainer).unwrap();
+
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'kept'",
+                [],
+            )
+            .unwrap();
+
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.entries_evicted, 0, "clone still holds the blocks");
+        assert!(
+            stats.entries_unreclaimable > 0,
+            "the skip must be counted as unreclaimable, not as a pin: {stats:?}"
+        );
+        assert!(store.contains("kept"), "entry remains restorable");
+        assert!(blob.is_file(), "store name remains");
+
+        store.config.gc_evict_shared = true;
+        let stats = store.evict().unwrap();
+        assert!(stats.entries_evicted > 0);
+        assert!(!store.contains("kept"));
+        assert!(
+            retainer.is_file(),
+            "compatibility mode drops the store name, not the retained blocks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evict_leaves_an_entry_whose_blob_is_still_reflinked_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+        let store = Store::open(&config).unwrap();
+        let output_file = dir.path().join("big.rlib");
+        std::fs::write(&output_file, vec![0u8; 4096]).unwrap();
+        store
+            .put(
+                "kept-reflink",
+                "big_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file.clone(), "libbig.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&output_file);
+
+        let meta = store.get("kept-reflink").unwrap().unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        let retainer = dir.path().join("worktree-reflink.rlib");
+        if crate::link::try_reflink(&blob, &retainer).is_err() {
+            return;
+        }
+        let sharing = crate::sharing::probe(&blob, 4096);
+        if !sharing.shared || sharing.private_bytes != 0 {
+            return;
+        }
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'kept-reflink'",
+                [],
+            )
+            .unwrap();
+
+        let stats = store.evict().unwrap();
+        assert_eq!(stats.entries_evicted, 0);
+        assert!(stats.entries_unreclaimable > 0);
+        assert!(store.contains("kept-reflink"));
+
+        std::fs::remove_file(&retainer).unwrap();
+        let stats = store.evict().unwrap();
+        assert!(stats.entries_evicted > 0);
+        assert!(!store.contains("kept-reflink"));
     }
 
     #[test]
@@ -6483,7 +6778,7 @@ mod tests {
                 &[],
                 "x86_64-unknown-linux-gnu",
                 "dev",
-                &[(pending_output, "libshared.rlib".to_string())],
+                &[(pending_output.clone(), "libshared.rlib".to_string())],
                 "",
                 "",
             )
@@ -6505,11 +6800,13 @@ mod tests {
                 &[],
                 "x86_64-unknown-linux-gnu",
                 "dev",
-                &[(newer_output, "libshared.rlib".to_string())],
+                &[(newer_output.clone(), "libshared.rlib".to_string())],
                 "",
                 "",
             )
             .unwrap();
+        fs::remove_file(&pending_output).unwrap();
+        fs::remove_file(&newer_output).unwrap();
         // Form a duplicate group while retaining distinct refcount-1 blobs.
         // Healthy identical entries have zero marginal reclaim and are
         // correctly excluded before the durable-upload pin is consulted.
@@ -6613,12 +6910,13 @@ mod tests {
                 &[],
                 "x86_64-unknown-linux-gnu",
                 "dev",
-                &[(out, "libbig.rlib".to_string())],
+                &[(out.clone(), "libbig.rlib".to_string())],
                 "",
                 "",
                 2500,
             )
             .unwrap();
+        fs::remove_file(&out).unwrap();
         // Age it past the active-pin grace so it is actually evictable.
         store
             .db
@@ -7061,11 +7359,12 @@ mod tests {
                 &[],
                 "x86_64-unknown-linux-gnu",
                 "dev",
-                &[(output_file, "libbig.rlib".to_string())],
+                &[(output_file.clone(), "libbig.rlib".to_string())],
                 "",
                 "",
             )
             .unwrap();
+        std::fs::remove_file(&output_file).unwrap();
 
         // Fresh put → last_accessed = now → within the grace window → pinned.
         let stats = store.evict().unwrap();
@@ -7119,10 +7418,12 @@ mod tests {
 
         // Just put → recent. The guarded path skips it…
         assert!(
-            store
-                .remove_entry_guarded("rk", Some(EVICTION_IDLE_GRACE))
-                .unwrap()
-                .is_none(),
+            matches!(
+                store
+                    .remove_entry_guarded("rk", Some(EVICTION_IDLE_GRACE))
+                    .unwrap(),
+                GuardedRemoval::Skipped
+            ),
             "guarded removal must skip a recently-accessed entry"
         );
         assert!(store.contains("rk"));
@@ -7167,6 +7468,73 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count_after, 0);
+    }
+
+    #[test]
+    fn target_root_registry_is_local_bounded_provenance_with_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let workspace = dir.path().join("workspace");
+        let target = workspace.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+
+        store.remember_target_root(&target, &workspace).unwrap();
+        store.remember_target_root(&target, &workspace).unwrap();
+        let roots = store.tracked_target_roots(0).unwrap();
+        assert_eq!(roots.len(), 1, "same target is upserted, not duplicated");
+        assert_eq!(roots[0].path, std::path::absolute(&target).unwrap());
+        assert_eq!(
+            roots[0].workspace_root,
+            std::path::absolute(&workspace).unwrap()
+        );
+        assert_eq!(
+            crate::machine::directory_identity(&target),
+            Some(roots[0].identity)
+        );
+
+        store.remember_target_root(&workspace, &workspace).unwrap();
+        assert_eq!(
+            store.tracked_target_roots(0).unwrap().len(),
+            1,
+            "a source root must never be registered as a cleanup target"
+        );
+
+        store.forget_target_root(&target).unwrap();
+        assert!(store.tracked_target_roots(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn target_root_registry_filters_by_last_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let workspace = dir.path().join("workspace");
+        let target = workspace.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        std::fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+        store.remember_target_root(&target, &workspace).unwrap();
+
+        assert!(store.tracked_target_roots(24).unwrap().is_empty());
+        store
+            .db
+            .execute(
+                "UPDATE target_roots SET last_seen = unixepoch() - 90000",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.tracked_target_roots(24).unwrap().len(), 1);
     }
 
     #[test]
@@ -8009,11 +8377,12 @@ mod tests {
                 &[],
                 "",
                 "dev",
-                &[(output, "lib.rlib".into())],
+                &[(output.clone(), "lib.rlib".into())],
                 "",
                 "",
             )
             .unwrap();
+        std::fs::remove_file(&output).unwrap();
 
         // Backdate the entry so eviction is deterministic (not timing-dependent)
         store
@@ -8079,11 +8448,12 @@ mod tests {
                     &[],
                     "",
                     "dev",
-                    &[(output, format!("{key}.rlib"))],
+                    &[(output.clone(), format!("{key}.rlib"))],
                     "",
                     "",
                 )
                 .unwrap();
+            std::fs::remove_file(&output).unwrap();
         }
 
         let prior_schema = crate::cache_key::CACHE_KEY_VERSION.saturating_sub(1);
@@ -9843,7 +10213,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            outcome.is_none(),
+            matches!(outcome, GuardedRemoval::Skipped),
             "a removal that lost to a republication must report nothing removed"
         );
         assert!(
@@ -9995,7 +10365,10 @@ mod tests {
             .unwrap();
         publisher.join().unwrap();
 
-        assert!(removed.is_some(), "the removal owned generation A's row");
+        assert!(
+            matches!(removed, GuardedRemoval::Reclaimed(_)),
+            "the removal owned generation A's row"
+        );
         assert!(
             store.contains("key"),
             "generation B's row must be committed"
@@ -10150,10 +10523,10 @@ mod tests {
             let removed: Vec<bool> = handles
                 .into_iter()
                 .map(|h| {
-                    h.join()
-                        .unwrap()
-                        .expect("losing remover must not error")
-                        .is_some()
+                    matches!(
+                        h.join().unwrap().expect("losing remover must not error"),
+                        GuardedRemoval::Reclaimed(_)
+                    )
                 })
                 .collect();
             assert_eq!(
@@ -10210,11 +10583,12 @@ mod tests {
                     &[],
                     "",
                     "dev",
-                    &[(src, "lib.rlib".into())],
+                    &[(src.clone(), "lib.rlib".into())],
                     "",
                     "",
                 )
                 .unwrap();
+            let _ = std::fs::remove_file(&src);
         }
         assert_eq!(store.total_size().unwrap(), 400, "logical double-counts");
         assert_eq!(store.physical_size().unwrap(), 200, "disk holds one copy");
@@ -10258,11 +10632,12 @@ mod tests {
                     &[],
                     "",
                     "dev",
-                    &[(src, "lib.rlib".into())],
+                    &[(src.clone(), "lib.rlib".into())],
                     "",
                     "",
                 )
                 .unwrap();
+            let _ = std::fs::remove_file(&src);
         }
         // …plus one entry with its own 300-byte blob.
         let src = dir.path().join("unique.rlib");
@@ -10275,11 +10650,12 @@ mod tests {
                 &[],
                 "",
                 "dev",
-                &[(src, "lib.rlib".into())],
+                &[(src.clone(), "lib.rlib".into())],
                 "",
                 "",
             )
             .unwrap();
+        let _ = std::fs::remove_file(&src);
 
         assert_eq!(store.physical_size().unwrap(), 600 * 1024);
         store
@@ -10372,11 +10748,12 @@ mod tests {
                     &[],
                     "",
                     "dev",
-                    &[(src, "lib.rlib".into())],
+                    &[(src.clone(), "lib.rlib".into())],
                     "",
                     "",
                 )
                 .unwrap();
+            let _ = std::fs::remove_file(&src);
         }
         assert_eq!(store.physical_size().unwrap(), 1140);
         store
@@ -10423,12 +10800,13 @@ mod tests {
                     &[],
                     "",
                     "dev",
-                    &[(src, "lib.rlib".into())],
+                    &[(src.clone(), "lib.rlib".into())],
                     "",
                     "",
                     compile_ms,
                 )
                 .unwrap();
+            let _ = std::fs::remove_file(&src);
         }
         store
             .db
@@ -10524,11 +10902,12 @@ mod tests {
                     &[],
                     "",
                     "dev",
-                    &[(src, "lib.rlib".into())],
+                    &[(src.clone(), "lib.rlib".into())],
                     "",
                     "",
                 )
                 .unwrap();
+            let _ = std::fs::remove_file(&src);
         }
         store
             .db
@@ -12267,11 +12646,12 @@ mod tests {
                     &[],
                     "x86_64-unknown-linux-gnu",
                     "dev",
-                    &[(old_file, "lib.rlib".to_string())],
+                    &[(old_file.clone(), "lib.rlib".to_string())],
                     "",
                     "",
                 )
                 .unwrap();
+            std::fs::remove_file(&old_file).unwrap();
             store
                 .db
                 .execute(
@@ -12296,11 +12676,12 @@ mod tests {
                     &[],
                     "x86_64-unknown-linux-gnu",
                     "dev",
-                    &[(new_file, "lib.rlib".to_string())],
+                    &[(new_file.clone(), "lib.rlib".to_string())],
                     "",
                     "",
                 )
                 .unwrap();
+            std::fs::remove_file(&new_file).unwrap();
             store
                 .db
                 .execute(

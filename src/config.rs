@@ -119,6 +119,13 @@ pub struct Config {
     /// disabled). Set via `KACHE_GC_MAX_AGE_HOURS` or
     /// `[cache] gc_max_age_hours`.
     pub gc_max_age_hours: u64,
+    /// Permit GC to evict an entry even when its last store blob is still
+    /// hardlinked or block-cloned into a build target. Off by default because
+    /// that eviction frees no disk and destroys a usable cache hit. Enable it
+    /// only when enforcing the store namespace limit matters more than disk
+    /// reclamation. Set via `KACHE_GC_EVICT_SHARED=1`/`=true` or
+    /// `[cache] gc_evict_shared = true`.
+    pub gc_evict_shared: bool,
     /// Daemon idle timeout in seconds (default 0 = no timeout).
     pub daemon_idle_timeout_secs: u64,
     /// How long an idle TCP/TLS connection is kept in the S3 client's pool, in
@@ -289,8 +296,8 @@ pub struct Config {
     /// default), the compiler wrapper — after storing a new entry — performs a
     /// cheap, throttled store-size check and, if the store has grown past
     /// `max_size` (plus slack), spawns a detached `kache gc` in the
-    /// background. This keeps `max_size` enforced for local-only builds where
-    /// no daemon is running (the daemon's periodic GC and post-upload sweep
+    /// background. This applies size pressure for local-only builds where no
+    /// daemon is running (the daemon's periodic GC and post-upload sweep
     /// were previously the *only* eviction triggers, so a daemon-less store
     /// grew without bound). GC never runs inside the compile hot path — the
     /// wrapper only pays one `stat()` per compile (plus one SQLite `SUM` at
@@ -578,6 +585,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) windows_hardlink: Option<bool>,
     /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
     pub(crate) auto_gc: Option<bool>,
+    /// Namespace-first GC compatibility mode. See [`Config::gc_evict_shared`].
+    pub(crate) gc_evict_shared: Option<bool>,
     /// Storage-layout advisory toggle. See [`Config::storage_layout_advice`].
     pub(crate) storage_layout_advice: Option<bool>,
     /// In-flight heartbeat cadence. See [`Config::heartbeat_secs`].
@@ -1417,6 +1426,7 @@ impl Config {
         let local_hit_daemon = Self::local_hit_daemon_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
+        let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
         let heartbeat_secs = env_or_ignored("KACHE_HEARTBEAT_SECS", ignore_env)
             .ok()
@@ -1466,6 +1476,7 @@ impl Config {
             local_hit_daemon,
             windows_hardlink,
             auto_gc,
+            gc_evict_shared,
             storage_layout_advice,
             heartbeat_secs,
             explain_miss,
@@ -1855,7 +1866,7 @@ impl Config {
     }
 
     /// Opportunistic size-pressure GC (kunobi-ninja/kache#497): on by default so
-    /// `max_size` is enforced even for daemon-less, local-only builds.
+    /// size pressure also runs for daemon-less, local-only builds.
     /// `KACHE_AUTO_GC=0`/`=false` (env wins), else `[cache] auto_gc`, else on.
     /// See [`Config::auto_gc`].
     fn auto_gc_enabled(file_config: &Result<FileConfig>) -> bool {
@@ -1869,6 +1880,23 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.auto_gc)
             .unwrap_or(true)
+    }
+
+    /// Preserve externally retained entries by default. The opt-in restores
+    /// the older namespace-first policy for installations that require the
+    /// registered store size to fall below `max_size` even when no filesystem
+    /// blocks would be reclaimed.
+    fn gc_evict_shared_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_GC_EVICT_SHARED", ignore_env) {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.gc_evict_shared)
+            .unwrap_or(false)
     }
 
     /// Storage-layout advisories (kunobi-ninja/kache#551): on by default so
@@ -2638,6 +2666,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn gc_evict_shared_is_opt_in_and_obeys_env_precedence() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let _config = set_kache_config_for_test(&config_path);
+        let _missing = NamedEnvGuard::remove("KACHE_GC_EVICT_SHARED");
+
+        assert!(!Config::load().unwrap().gc_evict_shared);
+
+        std::fs::write(&config_path, "[cache]\ngc_evict_shared = true\n").unwrap();
+        assert!(Config::load().unwrap().gc_evict_shared);
+
+        let _override = NamedEnvGuard::set("KACHE_GC_EVICT_SHARED", "0");
+        assert!(!Config::load().unwrap().gc_evict_shared);
+
+        std::fs::write(
+            &config_path,
+            "[cache]\nignore_env = true\ngc_evict_shared = true\n",
+        )
+        .unwrap();
+        assert!(Config::load().unwrap().gc_evict_shared);
+    }
+
+    #[test]
     fn min_store_compile_is_opt_in_and_obeys_env_precedence() {
         let _lock = config_path_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -3135,6 +3187,7 @@ remote_key_cache_refresh_secs = 900
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,
+                gc_evict_shared: None,
                 storage_layout_advice: None,
                 heartbeat_secs: None,
                 explain_miss: None,
@@ -3598,6 +3651,7 @@ remote_key_cache_refresh_secs = 900
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -3651,6 +3705,7 @@ remote_key_cache_refresh_secs = 900
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -3700,6 +3755,7 @@ remote_key_cache_refresh_secs = 900
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -3768,6 +3824,7 @@ remote_key_cache_refresh_secs = 900
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -4421,6 +4478,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,
+                gc_evict_shared: None,
                 storage_layout_advice: None,
                 heartbeat_secs: None,
                 explain_miss: None,

@@ -192,6 +192,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,

@@ -5,13 +5,15 @@ description: Every top-level Kache command, its purpose, and common flags
 
 Run `kache <command> --help` for the exact syntax in your installed version.
 
+`--json` emits one versioned JSON document for `list`, `stats`, `gc`, `clean`, `doctor`, `why-miss`, and `daemon status`. `clean --json` is a preview unless `--yes` is also present.
+
 | Command | Purpose |
 | --- | --- |
 | `cargo` | Run Cargo with duplicate Cargo-home rustflags collapsed |
 | `list` | Inspect local entries |
 | `gc` | Evict local entries |
 | `purge` | Remove local cache entries |
-| `clean` | Remove Cargo target directories below the current directory |
+| `clean` | Remove Cargo target directories below cwd or from the local tracked-root registry |
 | `init` | Configure Cargo and optionally install the daemon service |
 | `doctor` | Diagnose setup and store integrity |
 | `sync` | Pull from and push to a remote |
@@ -58,6 +60,10 @@ A bare run enforces configured size and age policies. `--max-age` runs the reque
 
 GC affects only the local store.
 
+GC reports store bytes removed separately from bytes reclaimed on disk. It keeps an entry when its last store blob is still cloned into a build output, because unlinking that blob would free no disk and destroy a usable hit. This can leave the registered store size above `cache.local_max_size`; remove stale targets to reclaim the blocks.
+
+Set `cache.gc_evict_shared = true` or `KACHE_GC_EVICT_SHARED=1` to restore the older namespace-first policy. That lowers the registered store size but does not reclaim blocks retained by target directories, and the discarded entry becomes a future miss. See [Configuration: GC and shared build outputs](/docs/getting-started/configuration#gc-and-shared-build-outputs).
+
 ## `kache purge`
 
 ```bash
@@ -71,11 +77,15 @@ With no crate name, `purge` wipes the entire local cache after confirmation.
 
 ```bash
 kache clean
-kache clean --dry-run --yes
+kache clean --dry-run
 kache clean --yes
+kache clean --tracked --stale 14d --dry-run
+kache clean --tracked --stale 14d --yes
 ```
 
-`clean` recursively finds `target/` directories below the current directory. The default opens a selector. Use `--dry-run --yes` before a scripted `--yes` run.
+`clean` recursively finds `target/` directories below the current directory. The default opens a selector. Use `--dry-run` before a scripted `--yes` run.
+
+`--tracked` uses the bounded machine-local target registry populated by normal builds and restores. `--stale` filters by last use. Cleanup rechecks each directory identity and removes only the derived target directory; missing, moved, replaced, current-workspace, and unsafe paths are skipped.
 
 ## `kache init`
 

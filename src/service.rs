@@ -630,7 +630,7 @@ fn uninstall_task_scheduler() -> Result<()> {
 
 // ── Status ───────────────────────────────────────────────────────
 
-pub fn status() -> Result<()> {
+pub fn status(json: bool) -> Result<()> {
     let config = crate::config::Config::load().ok();
     let service_path = service_file_path();
     let installed_service_path = service_path
@@ -656,20 +656,22 @@ pub fn status() -> Result<()> {
         .and_then(|path| path.file_name().and_then(|name| name.to_str()))
         == Some(LEGACY_PLIST_NAME);
 
-    // 0. Binary version (always shown)
-    println!(
-        "  kache:    v{} (epoch {})",
-        crate::VERSION,
-        crate::daemon::build_epoch(),
-    );
+    if !json {
+        // 0. Binary version (always shown)
+        println!(
+            "  kache:    v{} (epoch {})",
+            crate::VERSION,
+            crate::daemon::build_epoch(),
+        );
 
-    // 1. Service file installed?
-    for line in format_service_line(
-        installed_service_path.as_deref(),
-        legacy_service_installed,
-        service_path.is_some(),
-    ) {
-        println!("{line}");
+        // 1. Service file installed?
+        for line in format_service_line(
+            installed_service_path.as_deref(),
+            legacy_service_installed,
+            service_path.is_some(),
+        ) {
+            println!("{line}");
+        }
     }
 
     // 2. Daemon running? (check IPC socket / named pipe)
@@ -678,6 +680,63 @@ pub fn status() -> Result<()> {
     } else {
         false
     };
+
+    let daemon_stats = if running {
+        config
+            .as_ref()
+            .and_then(|cfg| crate::daemon::send_stats_request(cfg, false, None, None).ok())
+    } else {
+        None
+    };
+    let exe_mismatch = installed_service_path
+        .as_deref()
+        .and_then(service_exe_mismatch);
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct Body {
+            version: &'static str,
+            epoch: u64,
+            daemon_running: bool,
+            service_installed: bool,
+            service_path: Option<String>,
+            socket: Option<String>,
+            daemon_version: Option<String>,
+            daemon_epoch: Option<u64>,
+            daemon_config_path: Option<String>,
+            service_executable_mismatch: bool,
+        }
+        return crate::machine::emit(
+            "daemon-status",
+            Body {
+                version: crate::VERSION,
+                epoch: crate::daemon::build_epoch(),
+                daemon_running: running,
+                service_installed: installed_service_path.is_some(),
+                service_path: installed_service_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                socket: config
+                    .as_ref()
+                    .map(|cfg| cfg.socket_path().display().to_string()),
+                daemon_version: daemon_stats.as_ref().map(|stats| stats.version.clone()),
+                daemon_epoch: daemon_stats.as_ref().map(|stats| stats.build_epoch),
+                daemon_config_path: daemon_stats
+                    .as_ref()
+                    .and_then(|stats| stats.effective_config.as_ref())
+                    .map(|config| config.config_path.clone()),
+                service_executable_mismatch: exe_mismatch.is_some(),
+            },
+            if running {
+                Vec::new()
+            } else {
+                vec![crate::machine::NextAction {
+                    argv: vec!["kache".into(), "daemon".into(), "start".into()],
+                    why: "daemon is not running".into(),
+                }]
+            },
+        );
+    }
 
     if running {
         println!("  Daemon:   \x1b[32mrunning\x1b[0m");
@@ -701,10 +760,7 @@ pub fn status() -> Result<()> {
     }
 
     // 5. Daemon version check
-    if running
-        && let Some(ref cfg) = config
-        && let Ok(stats) = crate::daemon::send_stats_request(cfg, false, None, None)
-    {
+    if let Some(stats) = daemon_stats.as_ref() {
         let my_epoch = crate::daemon::build_epoch();
         for line in
             format_version_status(&stats.version, stats.build_epoch, crate::VERSION, my_epoch)
@@ -725,9 +781,7 @@ pub fn status() -> Result<()> {
     }
 
     // 6. Exe path mismatch warning
-    if let Some(ref path) = installed_service_path
-        && let Some(mismatch) = service_exe_mismatch(path)
-    {
+    if let Some(mismatch) = exe_mismatch {
         println!();
         println!("  \x1b[33mWarning: installed exe differs from current exe\x1b[0m");
         println!("    installed: {}", mismatch.installed.display());

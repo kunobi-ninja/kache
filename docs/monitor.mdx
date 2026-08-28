@@ -23,7 +23,6 @@ The monitor attempts to start the daemon for transfer statistics. It still reads
 | `Remote` | Effective remote state |
 | `Dedup` | Logical bytes avoided by shared content blobs |
 | `Blobs` | Physical blob bytes |
-| `Hardlinks` | Unix hardlink fallback savings; zero is normal on CoW filesystems |
 | `Transfer` | Active daemon uploads and downloads |
 | wrapper and versions | Cargo wrapper source, client version, daemon version, and cache path |
 
@@ -53,6 +52,6 @@ r                 rescan Projects
 ## Triage
 
 - Daemon offline: run `kache daemon status` and inspect `kache daemon log`.
-- Store near its limit: run `kache gc` or set a larger `cache.local_max_size`.
+- Store near its limit: run `kache gc`. If cloned outputs keep entries in place, preview stale targets with `kache clean --tracked --stale 14d --dry-run`.
 - No remote activity: check daemon state, credentials, and `kache doctor`.
 - Unexpected misses: run `kache why-miss <crate>`.

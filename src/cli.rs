@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
+use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -362,11 +363,22 @@ pub(crate) fn snapshot_from_direct_reads(
 
 // ── kache stats ────────────────────────────────────────────────────────────
 
+fn cloned_targets_line(disk: &crate::machine::DiskView) -> Option<String> {
+    (disk.cloned_into_targets_bytes > 0).then(|| {
+        format!(
+            "On disk:    {} private; {} cloned into target/",
+            ByteSize(disk.disk_private_bytes),
+            ByteSize(disk.cloned_into_targets_bytes)
+        )
+    })
+}
+
 /// Print a one-shot stats summary to stdout.
 pub fn stats(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
     hours: Option<u64>,
+    json: bool,
 ) -> Result<()> {
     let hours = hours.unwrap_or(24);
     let snap = fetch_stats_snapshot(config, false, "size", Some(hours), true, true);
@@ -381,7 +393,54 @@ pub fn stats(
         }
     }
 
+    let store_bytes = snap
+        .blob_stats
+        .as_ref()
+        .map(|s| s.total_blob_size)
+        .unwrap_or(snap.total_size);
+    let disk = crate::machine::disk_view(&config.store_dir(), store_bytes, snap.max_size);
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            disk: crate::machine::DiskView,
+            entries: usize,
+            hit_rate_pct: f64,
+            local_hits: usize,
+            prefetch_hits: usize,
+            remote_hits: usize,
+            dups: usize,
+            misses: usize,
+            daemon_connected: bool,
+            hours: u64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            remote: Option<&'a str>,
+        }
+        let hit_rate = count_hit_rate(&snap.event_stats);
+        let remote = config.remote.as_ref().map(|r| r.describe());
+        return crate::machine::emit(
+            "stats",
+            Body {
+                disk: disk.clone(),
+                entries: snap.entry_count,
+                hit_rate_pct: hit_rate,
+                local_hits: snap.event_stats.local_hits,
+                prefetch_hits: snap.event_stats.prefetch_hits,
+                remote_hits: snap.event_stats.remote_hits,
+                dups: snap.event_stats.dups,
+                misses: snap.event_stats.misses,
+                daemon_connected: snap.daemon_connected,
+                hours,
+                remote: remote.as_deref(),
+            },
+            crate::machine::next_for_clones(disk.cloned_into_targets_bytes),
+        );
+    }
+
     for line in render_stats(&snap, config, hours) {
+        println!("{line}");
+    }
+    if let Some(line) = cloned_targets_line(&disk) {
         println!("{line}");
     }
 
@@ -938,7 +997,7 @@ fn legacy_repeated_same_key_banner(
     )
 }
 
-pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
+pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
     let all_events = events::read_events(&config.event_log_path())?;
     let crate_events: Vec<_> = all_events
         .iter()
@@ -946,6 +1005,29 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
         .collect();
 
     if crate_events.is_empty() {
+        if json {
+            #[derive(serde::Serialize)]
+            struct Body<'a> {
+                crate_name: &'a str,
+                diagnosis: &'static str,
+            }
+            return crate::machine::emit(
+                "why-miss",
+                Body {
+                    crate_name,
+                    diagnosis: "no_events",
+                },
+                vec![crate::machine::NextAction {
+                    argv: vec![
+                        "cargo".into(),
+                        "build".into(),
+                        "-p".into(),
+                        crate_name.into(),
+                    ],
+                    why: "no wrapper events yet; build the crate first".into(),
+                }],
+            );
+        }
         println!("No events found for `{crate_name}`.");
         println!("\nTip: Build the crate first, then re-run this command:");
         println!("  cargo build -p {crate_name}");
@@ -961,6 +1043,21 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
     });
 
     if last_miss.is_none() {
+        if json {
+            #[derive(serde::Serialize)]
+            struct Body<'a> {
+                crate_name: &'a str,
+                diagnosis: &'static str,
+            }
+            return crate::machine::emit(
+                "why-miss",
+                Body {
+                    crate_name,
+                    diagnosis: "all_hits",
+                },
+                Vec::new(),
+            );
+        }
         println!("No misses or dups found for `{crate_name}` -- all events are hits!");
         println!("\nRecent events:");
         for event in crate_events.iter().rev().take(5).rev() {
@@ -988,6 +1085,9 @@ pub fn why_miss(config: &Config, crate_name: &str) -> Result<()> {
                 events::EventResult::Dup | events::EventResult::Miss
             )
     };
+    if json {
+        return why_miss_json(config, crate_name, miss, prior_same_key_miss);
+    }
 
     // ── Header ─────────────────────────────────────────────────────────
     println!("Why `{crate_name}` missed:\n");
@@ -1313,6 +1413,77 @@ fn print_extern_chain(
     }
 }
 
+fn why_miss_json(
+    config: &Config,
+    crate_name: &str,
+    miss: &events::BuildEvent,
+    prior_same_key_miss: bool,
+) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        crate_name: &'a str,
+        diagnosis: &'a str,
+        last_result: String,
+        cache_key: &'a str,
+        store_error: &'a str,
+        lookup_rejection: &'a str,
+        stored_entries: usize,
+    }
+
+    let store = Store::open(config)?;
+    let stored: Vec<_> = store
+        .list_entries("name")?
+        .into_iter()
+        .filter(|e| crate_name_matches(crate_name, &e.crate_name))
+        .collect();
+    let miss_key_stored = stored
+        .iter()
+        .any(|e| cache_key_matches(&e.cache_key, &miss.cache_key));
+    let diagnosis = why_miss_diagnosis(
+        &miss.store_error,
+        &miss.lookup_rejection,
+        stored.len(),
+        miss_key_stored,
+    );
+    let _ = prior_same_key_miss;
+    crate::machine::emit(
+        "why-miss",
+        Body {
+            crate_name,
+            diagnosis,
+            last_result: miss.result.to_string(),
+            cache_key: &miss.cache_key,
+            store_error: &miss.store_error,
+            lookup_rejection: &miss.lookup_rejection,
+            stored_entries: stored.len(),
+        },
+        Vec::new(),
+    )
+}
+
+fn why_miss_diagnosis(
+    store_error: &str,
+    lookup_rejection: &str,
+    stored_entries: usize,
+    miss_key_stored: bool,
+) -> &'static str {
+    if !store_error.is_empty() {
+        "not_cached"
+    } else if !lookup_rejection.is_empty() {
+        "lookup_rejected"
+    } else if stored_entries == 0 {
+        "never_cached"
+    } else if miss_key_stored {
+        "first_build_now_cached"
+    } else {
+        "key_mismatch"
+    }
+}
+
+fn cache_key_matches(stored: &str, missed: &str) -> bool {
+    stored == missed
+}
+
 /// Compare the miss event's stored metadata against other stored entries
 /// to surface what likely differs (target, profile, features).
 fn why_miss_diff_entries(
@@ -1468,11 +1639,22 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
 
     if stats.entries_evicted > 0 {
         let mut msg = format!(
-            " evicted {} {} ({}).",
+            " dropped {} {} from the store ({}).",
             stats.entries_evicted,
             plural(stats.entries_evicted),
             ByteSize(stats.bytes_freed)
         );
+        msg.push_str(&format!(
+            "\n  {} became free on disk.",
+            ByteSize(stats.disk_bytes_reclaimed)
+        ));
+        let leftover = stats.bytes_freed.saturating_sub(stats.disk_bytes_reclaimed);
+        if leftover > 0 {
+            msg.push_str(&format!(
+                "\n  {} remains cloned in build outputs.",
+                ByteSize(leftover)
+            ));
+        }
         if stats.entries_pinned > 0 {
             msg.push_str(&format!(
                 "\n  {} more {} accessed within the last {grace_secs}s or awaiting a durable \
@@ -1482,7 +1664,25 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
                 plural(stats.entries_pinned),
             ));
         }
+        if stats.entries_unreclaimable > 0 {
+            msg.push_str(&format!(
+                "\n  {} {} left in place because clones still hold their blocks. \
+                 Inspect stale outputs with `kache clean --tracked --stale 14d --dry-run`, then run `kache gc` again.",
+                stats.entries_unreclaimable,
+                plural(stats.entries_unreclaimable),
+            ));
+        }
         return msg;
+    }
+
+    if stats.entries_unreclaimable > 0 {
+        return format!(
+            " nothing reclaimable on disk.\n  {} {} cloned into build outputs \
+             (same bytes as target/, not extra).\n  Remove stale outputs with \
+             `kache clean --tracked --stale 14d --dry-run`, then run `kache gc` again.",
+            stats.entries_unreclaimable,
+            plural(stats.entries_unreclaimable),
+        );
     }
 
     // Nothing evicted. Say why, because this is the case that reads as a bug.
@@ -2064,109 +2264,56 @@ fn is_binary_artifact(path: &std::path::Path) -> bool {
     }
 }
 
-pub(crate) struct LinkStats {
-    pub store_bytes: u64,
-    pub linked_refs: u64,
-    pub saved_bytes: u64,
-}
-
-/// Fold one reflinked blob into the running totals.
-///
-/// Split out of the walk because a reflink can only be *created* on a
-/// filesystem that supports one, so the branch is unreachable in CI (ext4)
-/// while the arithmetic in it is exactly what the reported savings depend on.
-/// Taking the probe result as a parameter makes it testable anywhere.
-///
-/// The bytes the filesystem reports as non-private are shared with something
-/// else, so they are stored once instead of twice — the same saving a hardlink
-/// gives, just invisible to `nlink`.
-#[cfg(unix)]
-fn record_reflink_sharing(stats: &mut LinkStats, size: u64, sharing: crate::sharing::Sharing) {
-    if !sharing.shared {
-        return;
-    }
-    stats.linked_refs += 1;
-    stats.saved_bytes += size.saturating_sub(sharing.private_bytes);
-}
-
-/// Walk the blob store and compute how much storage it shares with live
-/// `target/` directories.
-///
-/// Blobs live in `store_dir/blobs/{shard}/{hash}`. A blob shares storage either
-/// by hardlink (`nlink > 1`) or by reflink, and only the first shows up in
-/// `nlink` — so a store of purely reflinked blobs used to report zero savings
-/// on APFS/btrfs/XFS (kunobi-ninja/kache#602).
-///
-/// `saved_bytes` is what sharing has saved: for hardlinks that is `size` per
-/// extra link, and for reflinks it is the shared (non-private) portion. Both are
-/// lower bounds — the reporter measured 62.3% of their store sharing storage
-/// with live targets, against a reported 0.
-pub(crate) fn compute_link_stats(store_dir: &std::path::Path) -> LinkStats {
-    let mut stats = LinkStats {
-        store_bytes: 0,
-        linked_refs: 0,
-        saved_bytes: 0,
-    };
-
-    let blobs_dir = store_dir.join("blobs");
-    let Ok(shards) = std::fs::read_dir(&blobs_dir) else {
-        return stats;
-    };
-
-    for shard in shards.flatten() {
-        let Ok(file_type) = shard.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-
-        let Ok(blobs) = std::fs::read_dir(shard.path()) else {
-            continue;
-        };
-
-        for blob in blobs.flatten() {
-            let Ok(meta) = blob.metadata() else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-
-            let size = meta.len();
-            stats.store_bytes += size;
-
-            #[cfg(unix)]
-            {
-                let nlink = meta.nlink();
-                if nlink > 1 {
-                    let extra = nlink - 1;
-                    stats.linked_refs += extra;
-                    stats.saved_bytes += size * extra;
-                } else {
-                    // No hardlink, but the blob may still be reflinked into one
-                    // or more target/ dirs.
-                    record_reflink_sharing(
-                        &mut stats,
-                        size,
-                        crate::sharing::probe(&blob.path(), size),
-                    );
-                }
-            }
-        }
-    }
-
-    stats
-}
-
 /// List all cached entries, or show details for a specific crate.
 pub fn list(
     config: &Config,
     crate_name: Option<&str>,
     sort_by: &str,
     no_pager: bool,
+    json: bool,
 ) -> Result<()> {
     let store = Store::open(config)?;
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct EntryBody<'a> {
+            cache_key: &'a str,
+            crate_name: &'a str,
+            crate_type: &'a str,
+            profile: &'a str,
+            size: u64,
+            hits: u64,
+            created_at: &'a str,
+            last_accessed: &'a str,
+        }
+        let entries = store.list_entries(sort_by)?;
+        let matching: Vec<&crate::store::EntryInfo> = if let Some(name) = crate_name {
+            entries
+                .iter()
+                .filter(|e| crate_name_matches(name, &e.crate_name))
+                .collect()
+        } else {
+            entries.iter().collect()
+        };
+        let body: Vec<EntryBody> = matching
+            .iter()
+            .map(|e| EntryBody {
+                cache_key: &e.cache_key,
+                crate_name: &e.crate_name,
+                crate_type: &e.crate_type,
+                profile: &e.profile,
+                size: e.size,
+                hits: e.hit_count,
+                created_at: &e.created_at,
+                last_accessed: &e.last_accessed,
+            })
+            .collect();
+        #[derive(serde::Serialize)]
+        struct Body<T> {
+            entries: Vec<T>,
+        }
+        return crate::machine::emit("list", Body { entries: body }, Vec::new());
+    }
 
     if let Some(name) = crate_name {
         // Detail view for a specific crate
@@ -2248,6 +2395,10 @@ pub fn list(
     }
 
     Ok(())
+}
+
+fn crate_name_matches(requested: &str, actual: &str) -> bool {
+    requested == actual
 }
 
 fn push_nonempty_detail(lines: &mut Vec<String>, prefix: &str, value: &str) {
@@ -2346,8 +2497,6 @@ fn write_pager_lines<W: std::io::Write>(writer: &mut W, lines: &[String]) -> boo
 /// commands and spawn failures fall back to plain output. An early pager exit
 /// stops further delivery without failing the command or reprinting the listing.
 fn write_paged(lines: &[String], no_pager: bool) {
-    use std::io::IsTerminal;
-
     let plain = || {
         for line in lines {
             println!("{line}");
@@ -2410,7 +2559,7 @@ impl GcMode {
 }
 
 /// Run garbage collection locally under `gc.lock`.
-pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
+pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcStats> {
     let verbose = mode == GcMode::Cli;
     let store = Store::open(config)?;
     let _gc_lock = match store.try_gc_lock()? {
@@ -2419,9 +2568,10 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
             if verbose {
                 println!("Another GC is already running; skipping.");
             }
-            return Ok(());
+            return Ok(skipped_gc_stats());
         }
     };
+    let mut combined = crate::store::GcStats::default();
 
     if verbose {
         print!("Backfilling content hashes...");
@@ -2475,12 +2625,14 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
             std::io::Write::flush(&mut std::io::stdout()).ok();
         }
         let age_stats = store.evict_older_than(config.gc_max_age_hours)?;
+        add_gc_stats(&mut combined, &age_stats);
         if verbose {
             if age_stats.entries_evicted > 0 {
                 println!(
-                    " removed {} entries ({} freed).",
+                    " dropped {} entries from the store ({}); {} became free on disk.",
                     age_stats.entries_evicted,
-                    crate::report::format_bytes(age_stats.bytes_freed)
+                    crate::report::format_bytes(age_stats.bytes_freed),
+                    crate::report::format_bytes(age_stats.disk_bytes_reclaimed),
                 );
             } else {
                 println!(" none old enough.");
@@ -2493,6 +2645,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
     let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
+    add_gc_stats(&mut combined, &dedup_stats);
     if verbose {
         if dedup_stats.entries_evicted > 0 {
             println!(" removed {} duplicates.", dedup_stats.entries_evicted);
@@ -2506,26 +2659,117 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<()> {
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
     let evict_stats = store.evict()?;
+    add_gc_stats(&mut combined, &evict_stats);
     if verbose {
         let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
-    Ok(())
+    Ok(combined)
+}
+
+fn skipped_gc_stats() -> crate::store::GcStats {
+    crate::store::GcStats {
+        skipped: true,
+        ..crate::store::GcStats::default()
+    }
+}
+
+fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats) {
+    total.entries_evicted = total.entries_evicted.saturating_add(part.entries_evicted);
+    total.bytes_freed = total.bytes_freed.saturating_add(part.bytes_freed);
+    total.blobs_removed = total.blobs_removed.saturating_add(part.blobs_removed);
+    total.duration_ms = total.duration_ms.saturating_add(part.duration_ms);
+    total.entries_pinned = total.entries_pinned.saturating_add(part.entries_pinned);
+    total.entries_unreclaimable = total
+        .entries_unreclaimable
+        .saturating_add(part.entries_unreclaimable);
+    total.disk_bytes_reclaimed = total
+        .disk_bytes_reclaimed
+        .saturating_add(part.disk_bytes_reclaimed);
+    total.skipped |= part.skipped;
+}
+
+fn gc_stats_from_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store::GcStats {
+    let mut total = crate::store::GcStats::default();
+    for part in [&report.age, &report.duplicate, &report.size] {
+        total.entries_evicted = total.entries_evicted.saturating_add(part.entries_evicted);
+        total.bytes_freed = total.bytes_freed.saturating_add(part.bytes_freed);
+        total.entries_pinned = total.entries_pinned.saturating_add(part.entries_pinned);
+        total.disk_bytes_reclaimed = total
+            .disk_bytes_reclaimed
+            .saturating_add(part.disk_bytes_reclaimed);
+        total.entries_unreclaimable = total
+            .entries_unreclaimable
+            .saturating_add(part.entries_unreclaimable);
+    }
+    total
+}
+
+fn human_gc_output(json: bool) -> bool {
+    !json
+}
+
+fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -> Result<()> {
+    let store = Store::open(config)?;
+    let store_bytes = store.physical_size().unwrap_or(0);
+    let disk = crate::machine::disk_view(&config.store_dir(), store_bytes, config.max_size);
+    #[derive(serde::Serialize)]
+    struct Body {
+        skipped: bool,
+        disk: crate::machine::DiskView,
+        entries: usize,
+        entries_dropped: usize,
+        store_bytes_removed: u64,
+        disk_bytes_reclaimed: u64,
+        entries_pinned: usize,
+        entries_unreclaimable: usize,
+    }
+    let next = crate::machine::next_after_gc(
+        &disk,
+        stats.entries_unreclaimable,
+        stats.disk_bytes_reclaimed,
+        stats.bytes_freed,
+    );
+    crate::machine::emit(
+        "gc",
+        Body {
+            skipped,
+            disk,
+            entries: store.entry_count().unwrap_or(0),
+            entries_dropped: stats.entries_evicted,
+            store_bytes_removed: stats.bytes_freed,
+            disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
+            entries_pinned: stats.entries_pinned,
+            entries_unreclaimable: stats.entries_unreclaimable,
+        },
+        next,
+    )
 }
 
 /// Run garbage collection via the daemon.
-pub fn gc(config: &Config, max_age_hours: Option<u64>, stale_schema: bool) -> Result<()> {
+pub fn gc(
+    config: &Config,
+    max_age_hours: Option<u64>,
+    stale_schema: bool,
+    json: bool,
+) -> Result<()> {
     if stale_schema {
         let store = Store::open(config)?;
         let _gc_lock = match store.try_gc_lock()? {
             Some(lock) => lock,
             None => {
+                if json {
+                    return emit_gc_json(config, true, &crate::store::GcStats::default());
+                }
                 println!("Another GC is already running; skipping.");
                 return Ok(());
             }
         };
         let stats = store.evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)?;
+        if json {
+            return emit_gc_json(config, false, &stats);
+        }
         println!(
             "Stale-schema GC:{}\nCurrent key schema: {}.",
             describe_eviction(&stats, false),
@@ -2551,61 +2795,88 @@ pub fn gc(config: &Config, max_age_hours: Option<u64>, stale_schema: bool) -> Re
         return Ok(());
     }
 
+    let mut combined = crate::store::GcStats::default();
     match crate::daemon::send_gc_request(config, max_age_hours) {
         Ok(outcome) if outcome.skipped => {
+            if json {
+                return emit_gc_json(config, true, &combined);
+            }
             println!("Another GC is already running; skipping.");
         }
         Ok(outcome) => {
             if let Some(report) = outcome.breakdown.as_ref() {
+                combined = gc_stats_from_breakdown(report);
+                if human_gc_output(json) {
+                    if let Some(hours) = max_age_hours {
+                        println!("Age GC ({hours}h):");
+                    } else {
+                        println!(
+                            "GC complete: age {}, duplicates {}, size {}.",
+                            report.age.entries_evicted,
+                            report.duplicate.entries_evicted,
+                            report.size.entries_evicted,
+                        );
+                    }
+                    let store = Store::open(config)?;
+                    let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
+                    println!("{}", describe_eviction(&combined, over_limit));
+                }
+            } else if human_gc_output(json) {
                 if let Some(hours) = max_age_hours {
                     println!(
-                        "Age GC ({hours}h): {} entries evicted ({} freed).",
-                        report.age.entries_evicted,
-                        crate::report::format_bytes(report.age.bytes_freed)
+                        "Evicted {} entries older than {hours}h.",
+                        outcome.evicted.unwrap_or(0)
                     );
                 } else {
                     println!(
-                        "GC complete: age {} ({}), duplicates {} ({}), size {} ({}).",
-                        report.age.entries_evicted,
-                        crate::report::format_bytes(report.age.bytes_freed),
-                        report.duplicate.entries_evicted,
-                        crate::report::format_bytes(report.duplicate.bytes_freed),
-                        report.size.entries_evicted,
-                        crate::report::format_bytes(report.size.bytes_freed),
+                        "Evicted {} entries (daemon returned no per-policy breakdown).",
+                        outcome.evicted.unwrap_or(0)
                     );
                 }
-            } else if let Some(hours) = max_age_hours {
-                println!(
-                    "Evicted {} entries older than {hours}h.",
-                    outcome.evicted.unwrap_or(0)
-                );
-            } else {
-                println!(
-                    "Evicted {} entries (daemon returned no per-policy breakdown).",
-                    outcome.evicted.unwrap_or(0)
-                );
+                combined.entries_evicted = outcome.evicted.unwrap_or(0);
             }
         }
         Err(e) => {
-            println!("Daemon GC failed ({e}), running locally...");
+            if human_gc_output(json) {
+                println!("Daemon GC failed ({e}), running locally...");
+            }
             if let Some(hours) = max_age_hours {
                 let store = Store::open(config)?;
                 let _gc_lock = match store.try_gc_lock()? {
                     Some(lock) => lock,
                     None => {
+                        if json {
+                            return emit_gc_json(config, true, &combined);
+                        }
                         println!("Another GC is already running; skipping.");
                         return Ok(());
                     }
                 };
-                print!("Running eviction...");
-                std::io::Write::flush(&mut std::io::stdout()).ok();
+                if human_gc_output(json) {
+                    print!("Running eviction...");
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                }
                 let evict_stats = store.evict_older_than(hours)?;
-                let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
-                println!("{}", describe_eviction(&evict_stats, over_limit));
+                combined = evict_stats.clone();
+                if human_gc_output(json) {
+                    let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
+                    println!("{}", describe_eviction(&evict_stats, over_limit));
+                }
             } else {
-                run_gc_local(config, GcMode::Cli)?;
+                combined = run_gc_local(
+                    config,
+                    if json {
+                        GcMode::Background
+                    } else {
+                        GcMode::Cli
+                    },
+                )?;
             }
         }
+    }
+
+    if json {
+        return emit_gc_json(config, false, &combined);
     }
 
     let store = Store::open(config)?;
@@ -2863,29 +3134,123 @@ fn draw_clean(
     frame.render_widget(help, chunks[3]);
 }
 
-/// Recursively find and remove target/ directories (TUI selector).
-pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
+#[derive(Debug, Clone, serde::Serialize)]
+struct CleanSkipped {
+    path: String,
+    reason: String,
+}
+
+const DEFAULT_TRACKED_STALE_HOURS: u64 = 336;
+
+fn path_was_removed(path: &std::path::Path) -> bool {
+    !path.exists()
+}
+
+/// Find and remove target directories, either below cwd or from the bounded
+/// machine-local registry populated by the compiler wrapper.
+pub fn clean(
+    config: &Config,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    tracked: bool,
+    stale_hours: Option<u64>,
+) -> Result<()> {
     use crossterm::event;
     use ratatui::prelude::*;
     use std::io::stdout;
 
     let root = std::env::current_dir()?;
-    let mut targets: Vec<TargetEntry> = Vec::new();
-
-    find_target_dirs(&root, &mut targets);
+    let (mut targets, skipped) = if tracked {
+        tracked_target_entries(config, stale_hours.unwrap_or(DEFAULT_TRACKED_STALE_HOURS))?
+    } else {
+        let mut targets = Vec::new();
+        find_target_dirs(&root, &mut targets);
+        (targets, Vec::new())
+    };
 
     if targets.is_empty() {
-        println!("No target/ directories found.");
+        if json {
+            #[derive(serde::Serialize)]
+            struct Body {
+                targets: [(); 0],
+                skipped: Vec<CleanSkipped>,
+                removed_paths: Vec<String>,
+                changed: bool,
+                estimated_reclaimed_bytes: u64,
+            }
+            return crate::machine::emit(
+                "clean",
+                Body {
+                    targets: [],
+                    skipped,
+                    removed_paths: Vec::new(),
+                    changed: false,
+                    estimated_reclaimed_bytes: 0,
+                },
+                Vec::new(),
+            );
+        }
+        for item in &skipped {
+            println!("Skipped {}: {}", item.path, item.reason);
+        }
+        if tracked {
+            println!("No stale tracked target directories found.");
+        } else {
+            println!("No target/ directories found.");
+        }
         return Ok(());
     }
 
     // Sort by size descending
     targets.sort_by_key(|entry| std::cmp::Reverse(entry.size));
 
+    let emit_clean_json = |targets: &[TargetEntry], removed_paths: Vec<String>, reclaimed: u64| {
+        #[derive(serde::Serialize)]
+        struct TargetBody {
+            path: String,
+            apparent_bytes: u64,
+            cached_bytes: u64,
+            estimated_reclaimable_bytes: u64,
+        }
+        #[derive(serde::Serialize)]
+        struct Body {
+            targets: Vec<TargetBody>,
+            skipped: Vec<CleanSkipped>,
+            removed_paths: Vec<String>,
+            changed: bool,
+            estimated_reclaimed_bytes: u64,
+        }
+        let body = Body {
+            targets: targets
+                .iter()
+                .map(|t| TargetBody {
+                    path: t.path.display().to_string(),
+                    apparent_bytes: t.size,
+                    cached_bytes: t.cached_bytes,
+                    estimated_reclaimable_bytes: t.estimated_reclaimable_bytes,
+                })
+                .collect(),
+            skipped: skipped.clone(),
+            changed: !removed_paths.is_empty(),
+            removed_paths,
+            estimated_reclaimed_bytes: reclaimed,
+        };
+        crate::machine::emit("clean", body, Vec::new())
+    };
+
+    // `--json` without `--yes` is a dry-run. Agents should not enter the TUI.
+    if json && !yes {
+        return emit_clean_json(&targets, Vec::new(), 0);
+    }
+
     // `--dry-run` takes precedence over `--yes`: preview only, never delete.
     if dry_run {
         for line in render_clean_dry_run(&targets, &root) {
             println!("{line}");
+        }
+        for item in &skipped {
+            println!("Skipped {}: {}", item.path, item.reason);
         }
         return Ok(());
     }
@@ -2894,7 +3259,23 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
     // scripts and cron where the interactive selector cannot run.
     if yes {
         let to_remove: Vec<_> = targets.iter().map(RemovalTarget::from_entry).collect();
-        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, &root);
+        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, &root, json);
+        let removed_paths: Vec<String> = to_remove
+            .iter()
+            .filter(|target| path_was_removed(&target.path))
+            .map(|target| target.path.display().to_string())
+            .collect();
+        if tracked {
+            let store = Store::open(config)?;
+            for target in &to_remove {
+                if path_was_removed(&target.path) {
+                    store.forget_target_root(&target.path)?;
+                }
+            }
+        }
+        if json {
+            return emit_clean_json(&targets, removed_paths, estimated_reclaimed);
+        }
         println!(
             "\nRemoved {removed} target/ dirs; estimated reclaimed {}{}",
             ByteSize(estimated_reclaimed),
@@ -2902,6 +3283,12 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
         );
         return Ok(());
     }
+
+    crate::machine::require_tty(
+        std::io::stdout().is_terminal(),
+        "clean",
+        "`kache clean --dry-run` or `kache clean --json`",
+    )?;
 
     // TUI mode — interactive selection
     let mut selected: Vec<bool> = vec![false; targets.len()];
@@ -2945,7 +3332,16 @@ pub fn clean(dry_run: bool, yes: bool) -> Result<()> {
             println!("Nothing selected.");
         }
         Some(to_remove) => {
-            let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, &root);
+            let (removed, estimated_reclaimed, apparent_gap) =
+                remove_targets(&to_remove, &root, false);
+            if tracked {
+                let store = Store::open(config)?;
+                for target in &to_remove {
+                    if path_was_removed(&target.path) {
+                        store.forget_target_root(&target.path)?;
+                    }
+                }
+            }
             println!(
                 "\nRemoved {removed} target/ dirs; estimated reclaimed {}{}",
                 ByteSize(estimated_reclaimed),
@@ -2982,7 +3378,11 @@ impl RemovalTarget {
 /// the rest. Returns the scan-time estimates only for directories whose
 /// `remove_dir_all` completed successfully. The actual filesystem delta can
 /// differ after a concurrent change or a partially-completed failed removal.
-fn remove_targets(to_remove: &[RemovalTarget], root: &std::path::Path) -> (usize, u64, u64) {
+fn remove_targets(
+    to_remove: &[RemovalTarget],
+    root: &std::path::Path,
+    quiet: bool,
+) -> (usize, u64, u64) {
     let mut estimated_reclaimed = 0u64;
     let mut apparent_gap = 0u64;
     let mut removed = 0usize;
@@ -2990,10 +3390,12 @@ fn remove_targets(to_remove: &[RemovalTarget], root: &std::path::Path) -> (usize
         let rel = target.path.strip_prefix(root).unwrap_or(&target.path);
         let current_identity = directory_identity(&target.path);
         if target.scanned_identity.is_none() || current_identity != target.scanned_identity {
-            println!(
-                "  failed  {} — directory changed since scan; refusing to remove",
-                rel.display()
-            );
+            if human_clean_output(quiet) {
+                println!(
+                    "  failed  {} — directory changed since scan; refusing to remove",
+                    rel.display()
+                );
+            }
             continue;
         }
         match std::fs::remove_dir_all(&target.path) {
@@ -3002,14 +3404,22 @@ fn remove_targets(to_remove: &[RemovalTarget], root: &std::path::Path) -> (usize
                     estimated_reclaimed.saturating_add(target.estimated_reclaimable);
                 apparent_gap = apparent_gap.saturating_add(target.apparent_gap);
                 removed += 1;
-                println!("  removed {}", rel.display());
+                if human_clean_output(quiet) {
+                    println!("  removed {}", rel.display());
+                }
             }
             Err(e) => {
-                println!("  failed  {} — {e}", rel.display());
+                if human_clean_output(quiet) {
+                    println!("  failed  {} — {e}", rel.display());
+                }
             }
         }
     }
     (removed, estimated_reclaimed, apparent_gap)
+}
+
+fn human_clean_output(quiet: bool) -> bool {
+    !quiet
 }
 
 /// Explain the gap between apparent size and estimated physical reclaim without
@@ -3089,6 +3499,67 @@ pub(crate) struct TargetEntry {
     pub breakdown: CategoryBreakdown,
     /// Marked true when a rescan starts; cleared when fresh data arrives.
     pub stale: bool,
+}
+
+fn tracked_target_entries(
+    config: &Config,
+    stale_hours: u64,
+) -> Result<(Vec<TargetEntry>, Vec<CleanSkipped>)> {
+    let store = Store::open(config)?;
+    let tracked = store.tracked_target_roots(stale_hours)?;
+    let cwd = std::env::current_dir()?;
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+
+    for tracked in tracked {
+        let display = tracked.path.display().to_string();
+        let skip = |reason: &str| CleanSkipped {
+            path: display.clone(),
+            reason: reason.to_string(),
+        };
+        if !tracked.path.exists() {
+            skipped.push(skip("path no longer exists; registry entry removed"));
+            store.forget_target_root(&tracked.path)?;
+            continue;
+        }
+        if cwd.starts_with(&tracked.workspace_root) {
+            skipped.push(skip("belongs to the current workspace"));
+            continue;
+        }
+        if !crate::machine::target_root_is_safe(&tracked.path, &tracked.workspace_root) {
+            skipped.push(skip("path is no longer a safe derived target directory"));
+            store.forget_target_root(&tracked.path)?;
+            continue;
+        }
+        if crate::machine::directory_identity(&tracked.path) != Some(tracked.identity) {
+            skipped.push(skip("directory identity changed; registry entry removed"));
+            store.forget_target_root(&tracked.path)?;
+            continue;
+        }
+
+        let Some(scan_identity) = directory_identity(&tracked.path) else {
+            skipped.push(skip("directory identity is unavailable"));
+            continue;
+        };
+        let (stats, breakdown) = compute_project_stats(&tracked.path);
+        if directory_identity(&tracked.path) != Some(scan_identity) {
+            skipped.push(skip("directory changed while it was scanned"));
+            continue;
+        }
+        let profiles = detect_profiles(&tracked.path);
+        targets.push(TargetEntry {
+            path: tracked.path,
+            size: stats.total_bytes,
+            cached_bytes: stats.cached_bytes,
+            estimated_reclaimable_bytes: stats.estimated_reclaimable_bytes,
+            scan_identity: Some(scan_identity),
+            profiles,
+            breakdown,
+            stale: false,
+        });
+    }
+
+    Ok((targets, skipped))
 }
 
 /// Returns true if `path` is under a macOS directory that would trigger a TCC
@@ -3451,6 +3922,7 @@ pub fn doctor(
     verify: bool,
     checksums: bool,
     repair: bool,
+    json: bool,
 ) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
     let config = crate::config::Config::load().ok();
@@ -3969,6 +4441,66 @@ pub fn doctor(
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
+    let issues = checks
+        .iter()
+        .filter(|c| is_doctor_issue(c.pass, check_is_optional(c.label)))
+        .count();
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct CheckBody {
+            label: &'static str,
+            pass: bool,
+            optional: bool,
+            detail: String,
+            fix: Option<String>,
+        }
+        #[derive(serde::Serialize)]
+        struct Body {
+            version: &'static str,
+            rustc: String,
+            issues: usize,
+            checks: Vec<CheckBody>,
+        }
+        let next = if doctor_has_issues(issues) {
+            vec![crate::machine::NextAction {
+                argv: vec!["kache".into(), "doctor".into(), "--fix".into()],
+                why: "one or more required checks failed".into(),
+            }]
+        } else {
+            Vec::new()
+        };
+        crate::machine::emit(
+            "doctor",
+            Body {
+                version,
+                rustc: rustc_version,
+                issues,
+                checks: checks
+                    .iter()
+                    .map(|c| CheckBody {
+                        label: c.label,
+                        pass: c.pass,
+                        optional: check_is_optional(c.label),
+                        detail: c.detail.clone(),
+                        fix: c.fix.clone(),
+                    })
+                    .collect(),
+            },
+            next,
+        )?;
+        if fix {
+            migrate(purge_sccache)?;
+        }
+        if verify && let Some(ref cfg) = config {
+            let outcome = self::verify(cfg, checksums, repair)?;
+            if doctor_has_issues(outcome.unresolved_integrity_findings()) {
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     println!();
     println!("  kache v{version}    {rustc_version}");
     println!();
@@ -4003,10 +4535,6 @@ pub fn doctor(
         }
     }
 
-    let issues = checks
-        .iter()
-        .filter(|c| is_doctor_issue(c.pass, check_is_optional(c.label)))
-        .count();
     println!();
     if issues == 0 {
         println!("  \x1b[32mAll checks passed.\x1b[0m");
@@ -4057,6 +4585,10 @@ pub fn doctor(
     }
 
     Ok(())
+}
+
+fn doctor_has_issues(issues: usize) -> bool {
+    issues > 0
 }
 
 /// Migrate from sccache to kache (called by `doctor --fix`).
@@ -5791,6 +6323,122 @@ mod tests {
     }
 
     #[test]
+    fn cloned_targets_summary_only_appears_for_retained_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = crate::machine::disk_view(dir.path(), 0, 1024);
+        assert!(cloned_targets_line(&disk).is_none());
+
+        disk.disk_private_bytes = 3;
+        disk.cloned_into_targets_bytes = 7;
+        let line = cloned_targets_line(&disk).expect("cloned blocks need a summary");
+        assert!(line.contains("3 B"), "{line}");
+        assert!(line.contains("7 B"), "{line}");
+    }
+
+    #[test]
+    fn gc_machine_output_boundaries_are_explicit() {
+        assert!(human_gc_output(false));
+        assert!(!human_gc_output(true));
+
+        let stats = skipped_gc_stats();
+        assert!(stats.skipped);
+        assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(DEFAULT_TRACKED_STALE_HOURS, 14 * 24);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target");
+        std::fs::create_dir(&path).unwrap();
+        assert!(!path_was_removed(&path));
+        std::fs::remove_dir(&path).unwrap();
+        assert!(path_was_removed(&path));
+        assert!(human_clean_output(false));
+        assert!(!human_clean_output(true));
+        assert!(!doctor_has_issues(0));
+        assert!(doctor_has_issues(1));
+    }
+
+    #[test]
+    fn why_miss_json_diagnosis_has_distinct_precedence() {
+        assert_eq!(
+            why_miss_diagnosis("write failed", "", 0, false),
+            "not_cached"
+        );
+        assert_eq!(
+            why_miss_diagnosis("", "metadata mismatch", 0, false),
+            "lookup_rejected"
+        );
+        assert_eq!(why_miss_diagnosis("", "", 0, false), "never_cached");
+        assert_eq!(
+            why_miss_diagnosis("", "", 1, true),
+            "first_build_now_cached"
+        );
+        assert_eq!(why_miss_diagnosis("", "", 1, false), "key_mismatch");
+        assert!(cache_key_matches("same", "same"));
+        assert!(!cache_key_matches("stored", "missed"));
+    }
+
+    #[test]
+    fn json_list_crate_filter_is_exact() {
+        assert!(crate_name_matches("serde", "serde"));
+        assert!(!crate_name_matches("serde", "serde_json"));
+    }
+
+    #[test]
+    fn daemon_gc_breakdown_sums_every_policy_field() {
+        fn policy(n: u64) -> crate::daemon::GcPolicyOutcome {
+            crate::daemon::GcPolicyOutcome {
+                entries_evicted: n as usize,
+                bytes_freed: n * 10,
+                entries_pinned: (n * 100) as usize,
+                disk_bytes_reclaimed: n * 1_000,
+                entries_unreclaimable: (n * 10_000) as usize,
+            }
+        }
+        let report = crate::daemon::GcBreakdown {
+            mode: crate::daemon::GcRequestMode::Automatic,
+            age: policy(1),
+            duplicate: policy(2),
+            size: policy(3),
+        };
+        let total = gc_stats_from_breakdown(&report);
+        assert_eq!(total.entries_evicted, 6);
+        assert_eq!(total.bytes_freed, 60);
+        assert_eq!(total.entries_pinned, 600);
+        assert_eq!(total.disk_bytes_reclaimed, 6_000);
+        assert_eq!(total.entries_unreclaimable, 60_000);
+
+        let mut accumulated = crate::store::GcStats {
+            entries_evicted: 1,
+            bytes_freed: 2,
+            entries_pinned: 3,
+            blobs_removed: 4,
+            duration_ms: 7,
+            entries_unreclaimable: 5,
+            disk_bytes_reclaimed: 6,
+            skipped: false,
+        };
+        let part = crate::store::GcStats {
+            entries_evicted: 10,
+            bytes_freed: 20,
+            entries_pinned: 30,
+            blobs_removed: 40,
+            duration_ms: 70,
+            entries_unreclaimable: 50,
+            disk_bytes_reclaimed: 60,
+            skipped: true,
+        };
+        add_gc_stats(&mut accumulated, &part);
+        assert_eq!(accumulated.entries_evicted, 11);
+        assert_eq!(accumulated.bytes_freed, 22);
+        assert_eq!(accumulated.entries_pinned, 33);
+        assert_eq!(accumulated.blobs_removed, 44);
+        assert_eq!(accumulated.duration_ms, 77);
+        assert_eq!(accumulated.entries_unreclaimable, 55);
+        assert_eq!(accumulated.disk_bytes_reclaimed, 66);
+        assert!(accumulated.skipped);
+    }
+
+    #[test]
     fn evicting_nothing_because_everything_is_pinned_explains_itself() {
         // The #509 report: `evicted 0 entries` printed next to a store at 912%.
         // The number is right and the message is useless, so the user concludes
@@ -5837,21 +6485,41 @@ mod tests {
 
     #[test]
     fn a_successful_eviction_reports_bytes_and_still_flags_pinned_entries() {
-        let msg = describe_eviction(&gc_stats(12, 3, 5 * 1024 * 1024), false);
+        let mut stats = gc_stats(12, 3, 5 * 1024 * 1024);
+        stats.disk_bytes_reclaimed = 4 * 1024 * 1024;
+        stats.entries_unreclaimable = 2;
+        let msg = describe_eviction(&stats, false);
         assert!(msg.contains("12 entries"), "{msg}");
         assert!(msg.contains("MiB") || msg.contains("MB"), "{msg}");
         assert!(
             msg.contains('3'),
             "entries left behind matter even on a successful sweep — they are \
-             why the store may still be over budget: {msg}"
+            why the store may still be over budget: {msg}"
         );
+        assert!(msg.contains("became free on disk"), "{msg}");
+        assert!(msg.contains("remains cloned"), "{msg}");
+        assert!(msg.contains("2 entries left in place"), "{msg}");
+    }
+
+    #[test]
+    fn fully_retained_eviction_has_a_cleanup_path() {
+        let mut stats = gc_stats(0, 0, 0);
+        stats.entries_unreclaimable = 1;
+        let msg = describe_eviction(&stats, false);
+        assert!(msg.contains("1 entry cloned"), "{msg}");
+        assert!(msg.contains("clean --tracked"), "{msg}");
     }
 
     #[test]
     fn eviction_messages_are_singular_for_one_entry() {
-        let msg = describe_eviction(&gc_stats(1, 0, 1024), false);
+        let mut stats = gc_stats(1, 0, 1024);
+        stats.disk_bytes_reclaimed = 1024;
+        let msg = describe_eviction(&stats, false);
         assert!(msg.contains("1 entry"), "{msg}");
         assert!(!msg.contains("1 entries"), "{msg}");
+        assert!(!msg.contains("remains cloned"), "{msg}");
+        assert!(!msg.contains("more 0 entries"), "{msg}");
+        assert!(!msg.contains("0 entries left in place"), "{msg}");
     }
 
     #[test]
@@ -5881,68 +6549,6 @@ mod tests {
             "an unreadable size must not be reported as over budget — that sends \
              the user chasing an eviction problem they may not have"
         );
-    }
-
-    /// The reflink half of the store accounting, which no CI filesystem can
-    /// reach: ext4 has no reflinks, so the walk never takes this branch there
-    /// even though it carries the savings figure users read.
-    #[cfg(unix)]
-    #[test]
-    fn a_reflinked_blob_counts_as_one_ref_saving_its_shared_bytes() {
-        let mut stats = LinkStats {
-            store_bytes: 0,
-            linked_refs: 0,
-            saved_bytes: 0,
-        };
-
-        // Fully shared: every byte of this blob is stored once, not twice.
-        record_reflink_sharing(
-            &mut stats,
-            4096,
-            crate::sharing::Sharing {
-                shared: true,
-                private_bytes: 0,
-            },
-        );
-        assert_eq!(stats.linked_refs, 1);
-        assert_eq!(stats.saved_bytes, 4096);
-
-        // Partly shared: only the non-private part is a saving.
-        record_reflink_sharing(
-            &mut stats,
-            4096,
-            crate::sharing::Sharing {
-                shared: true,
-                private_bytes: 1024,
-            },
-        );
-        assert_eq!(stats.linked_refs, 2);
-        assert_eq!(stats.saved_bytes, 4096 + 3072);
-
-        // Not shared: nothing to count, and counting it would overstate what a
-        // `clean` would reclaim.
-        record_reflink_sharing(
-            &mut stats,
-            4096,
-            crate::sharing::Sharing {
-                shared: false,
-                private_bytes: 4096,
-            },
-        );
-        assert_eq!(stats.linked_refs, 2);
-        assert_eq!(stats.saved_bytes, 4096 + 3072);
-
-        // A probe that reports more private bytes than the file's size must not
-        // underflow into a colossal fake saving.
-        record_reflink_sharing(
-            &mut stats,
-            4096,
-            crate::sharing::Sharing {
-                shared: true,
-                private_bytes: 8192,
-            },
-        );
-        assert_eq!(stats.saved_bytes, 4096 + 3072, "saturating, not wrapping");
     }
 
     /// Hardlink identity is tracked separately from extent sharing so callers
@@ -6300,51 +6906,6 @@ mod tests {
         let mut results = Vec::new();
         find_target_dirs(dir.path(), &mut results);
         assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_compute_link_stats_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let stats = compute_link_stats(dir.path());
-        assert_eq!(stats.store_bytes, 0);
-        assert_eq!(stats.linked_refs, 0);
-        assert_eq!(stats.saved_bytes, 0);
-    }
-
-    #[test]
-    fn test_compute_link_stats_nonexistent() {
-        let stats = compute_link_stats(std::path::Path::new("/nonexistent"));
-        assert_eq!(stats.store_bytes, 0);
-    }
-
-    #[test]
-    fn test_compute_link_stats_with_files() {
-        let dir = tempfile::tempdir().unwrap();
-        // Blobs live in blobs/{shard}/{hash}
-        let shard = dir.path().join("blobs").join("ab");
-        fs::create_dir_all(&shard).unwrap();
-        fs::write(shard.join("abcdef1234567890"), vec![0u8; 500]).unwrap();
-        fs::write(shard.join("abcdef9876543210"), vec![0u8; 300]).unwrap();
-
-        let stats = compute_link_stats(dir.path());
-        assert_eq!(stats.store_bytes, 800);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_compute_link_stats_counts_hardlinked_refs() {
-        // Hardlinked blob path -> linked refs and saved bytes.
-        let dir = tempfile::tempdir().unwrap();
-        let shard = dir.path().join("blobs").join("ab");
-        fs::create_dir_all(&shard).unwrap();
-        let blob = shard.join("abcdef1234567890");
-        fs::write(&blob, vec![0u8; 128]).unwrap();
-        fs::hard_link(&blob, dir.path().join("linked-output")).unwrap();
-
-        let stats = compute_link_stats(dir.path());
-        assert_eq!(stats.store_bytes, 128);
-        assert_eq!(stats.linked_refs, 1);
-        assert_eq!(stats.saved_bytes, 128);
     }
 
     #[test]
@@ -7177,6 +7738,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -7250,7 +7812,7 @@ mod tests {
         // No events for the crate -> the "build it first" tip path.
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), None);
-        why_miss(&config, "ghost").expect("why_miss with no events should succeed");
+        why_miss(&config, "ghost", false).expect("why_miss with no events should succeed");
     }
 
     #[test]
@@ -7276,7 +7838,7 @@ mod tests {
         )
         .unwrap();
 
-        why_miss(&config, "serde").expect("why_miss should succeed for a missed key");
+        why_miss(&config, "serde", false).expect("why_miss should succeed for a missed key");
     }
 
     #[test]
@@ -7370,7 +7932,7 @@ mod tests {
         )
         .unwrap();
 
-        why_miss(&config, "tokio").expect("why_miss with only hits should succeed");
+        why_miss(&config, "tokio", false).expect("why_miss with only hits should succeed");
     }
 
     #[test]
@@ -7414,7 +7976,7 @@ mod tests {
         )
         .unwrap();
 
-        why_miss(&config, "serde").expect("why_miss should print capped diffs");
+        why_miss(&config, "serde", false).expect("why_miss should print capped diffs");
     }
 
     #[test]
@@ -9771,7 +10333,8 @@ mod tests {
                 apparent_gap: 0,
             },
         ];
-        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, root.path());
+        let (removed, estimated_reclaimed, apparent_gap) =
+            remove_targets(&to_remove, root.path(), false);
 
         assert_eq!(removed, 2, "both target/ dirs removed");
         assert_eq!(estimated_reclaimed, 260);
@@ -9802,7 +10365,8 @@ mod tests {
                 apparent_gap: 50,
             },
         ];
-        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, root.path());
+        let (removed, estimated_reclaimed, apparent_gap) =
+            remove_targets(&to_remove, root.path(), false);
 
         assert_eq!(removed, 1, "only the existing dir counts as removed");
         assert_eq!(
@@ -9829,7 +10393,8 @@ mod tests {
             estimated_reclaimable: 100,
             apparent_gap: 0,
         }];
-        let (removed, estimated_reclaimed, apparent_gap) = remove_targets(&to_remove, root.path());
+        let (removed, estimated_reclaimed, apparent_gap) =
+            remove_targets(&to_remove, root.path(), false);
 
         assert_eq!((removed, estimated_reclaimed, apparent_gap), (0, 0, 0));
         assert!(

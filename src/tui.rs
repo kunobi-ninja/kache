@@ -283,70 +283,14 @@ fn effective_remote_status(config: &Config, snap: &StatsSnapshot) -> String {
     }
 }
 
-/// Store whose hardlink figures can be combined with this snapshot. A modern
-/// connected daemon owns the blob figures, so only its absolute reported store
-/// is admissible; an old daemon with no effective-config report stays unknown.
-fn effective_stats_store_dir(config: &Config, snap: &StatsSnapshot) -> Option<std::path::PathBuf> {
-    if !snap.daemon_connected {
-        return Some(config.store_dir());
-    }
-    let cache_dir =
-        std::path::PathBuf::from(snap.daemon_effective_config.as_ref()?.cache_dir.as_str());
-    cache_dir.is_absolute().then(|| cache_dir.join("store"))
-}
-
 // ── App state ──────────────────────────────────────────────────────────────
 
 /// Project scan data computed in a background thread.
+#[derive(Default)]
 struct ProjectScanData {
     project_targets: Vec<cli::TargetEntry>,
-    link_stats: cli::LinkStats,
-    /// Exact store directory from which `link_stats` was computed.
-    link_store_dir: Option<std::path::PathBuf>,
     scanning: bool,
     scanned: bool,
-}
-
-impl Default for ProjectScanData {
-    fn default() -> Self {
-        Self {
-            project_targets: Vec::new(),
-            link_stats: cli::LinkStats {
-                store_bytes: 0,
-                linked_refs: 0,
-                saved_bytes: 0,
-            },
-            link_store_dir: None,
-            scanning: false,
-            scanned: false,
-        }
-    }
-}
-
-fn hardlink_summary(
-    scan: &ProjectScanData,
-    expected_store_dir: Option<&std::path::Path>,
-) -> String {
-    let Some(expected_store_dir) = expected_store_dir else {
-        return "unavailable — daemon store not reported".to_string();
-    };
-    if scan.link_store_dir.as_deref() != Some(expected_store_dir) {
-        return if scan.scanning {
-            "waiting for active-store scan".to_string()
-        } else {
-            "not scanned for active store".to_string()
-        };
-    }
-
-    if scan.link_stats.saved_bytes > 0 {
-        format!(
-            "{} via {} hardlinks",
-            ByteSize(scan.link_stats.saved_bytes),
-            scan.link_stats.linked_refs,
-        )
-    } else {
-        "none — restores prefer reflink/CoW".to_string()
-    }
 }
 
 fn project_scan_status(stats_loaded: bool, scanning: bool, scanned: bool) -> &'static str {
@@ -654,13 +598,8 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
                 .map(|s| s.scanning)
                 .unwrap_or(false);
             if project_scan_can_start(is_scanning) {
-                let store_dir = effective_stats_store_dir(&state.config, &state.stats_snapshot);
                 let root = std::env::current_dir().unwrap_or_default();
-                drop(spawn_project_scan(
-                    Arc::clone(&state.project_scan),
-                    store_dir,
-                    root,
-                ));
+                drop(spawn_project_scan(Arc::clone(&state.project_scan), root));
                 state.last_project_refresh = Instant::now();
             }
         }
@@ -682,39 +621,21 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-/// Spawn a background thread to scan target dirs and compute link stats.
+/// Spawn a background thread to scan target dirs.
 /// Results stream in progressively — each discovered project updates the UI immediately.
 fn spawn_project_scan(
     stats: Arc<Mutex<ProjectScanData>>,
-    store_dir: Option<std::path::PathBuf>,
     root: std::path::PathBuf,
 ) -> std::thread::JoinHandle<()> {
     if let Ok(mut s) = stats.lock() {
         s.scanning = true;
-        // Never render a previous store's hardlink data while this scan is in
-        // flight; the daemon snapshot may have switched stores in between.
-        s.link_store_dir = None;
         // Mark existing entries stale instead of clearing — keeps the UI populated
         for t in s.project_targets.iter_mut() {
             t.stale = true;
         }
     }
     std::thread::spawn(move || {
-        // First: compute link stats (fast — just walks the store)
-        let link = store_dir.as_deref().map_or(
-            cli::LinkStats {
-                store_bytes: 0,
-                linked_refs: 0,
-                saved_bytes: 0,
-            },
-            cli::compute_link_stats,
-        );
-        if let Ok(mut s) = stats.lock() {
-            s.link_stats = link;
-            s.link_store_dir = store_dir;
-        }
-
-        // Then: discover target dirs and scan each one progressively
+        // Discover target dirs and scan each one progressively.
         let mut all_targets = Vec::new();
         cli::find_target_dirs(&root, &mut all_targets);
 
@@ -1045,12 +966,10 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         // Blob-level savings from the latest periodic stats refresh.
         let blob_savings = state.stats_snapshot.blob_stats.as_ref();
 
-        let expected_store_dir = effective_stats_store_dir(&state.config, snap);
         let scan_part = if let Ok(scan_stats) = state.project_scan.lock() {
             let dedup_status =
                 project_scan_status(state.stats_loaded, scan_stats.scanning, scan_stats.scanned);
-            let hardlinks = hardlink_summary(&scan_stats, expected_store_dir.as_deref());
-            format!("{hardlinks}    Scan: {dedup_status}")
+            format!("Scan: {dedup_status}")
         } else {
             "n/a".to_string()
         };
@@ -1062,7 +981,7 @@ fn draw_stats_bar(frame: &mut Frame, state: &AppState, area: Rect) {
                 0.0
             };
             format!(
-                "  Dedup: {} saved ({:.1}%)    Blobs: {} physical    Hardlinks: {scan_part}",
+                "  Dedup: {} saved ({:.1}%)    Blobs: {} physical    {scan_part}",
                 ByteSize(bs.savings),
                 pct,
                 ByteSize(bs.total_blob_size),
@@ -1507,29 +1426,17 @@ fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
         "n/a".to_string()
     };
 
-    let expected_store_dir = effective_stats_store_dir(&state.config, snap);
-    // Dedup summary: lead with the cross-platform blob-level savings (storing
-    // each unique artifact once). The hardlink sub-figure is a Unix-only
-    // restore detail that reads zero on copy-on-write filesystems, where
-    // restores are reflinks (independent inodes) rather than hardlinks — so
-    // never present it as the headline dedup number.
-    let hardlink_part = format!(
-        "Hardlinks: {}",
-        hardlink_summary(&scan_stats, expected_store_dir.as_deref())
-    );
+    // Blob-level content dedup is the only storage figure in the live header.
+    // Clone reclamation belongs to `kache gc` and `kache clean`.
     let dedup_summary = if let Some(bs) = state.stats_snapshot.blob_stats.as_ref() {
         let pct = if bs.total_logical_size > 0 {
             bs.savings as f64 / bs.total_logical_size as f64 * 100.0
         } else {
             0.0
         };
-        format!(
-            "{} saved ({:.1}%)    {hardlink_part}",
-            ByteSize(bs.savings),
-            pct,
-        )
+        format!("{} saved ({:.1}%)", ByteSize(bs.savings), pct)
     } else {
-        format!("calculating...    {hardlink_part}")
+        "calculating...".to_string()
     };
 
     let wrapper_status = crate::wrapper_config::wrapper_status_line();
@@ -2247,6 +2154,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
@@ -2332,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_never_combines_daemon_stats_with_a_client_store_scan() {
+    fn tui_uses_the_daemon_remote_status() {
         let config = test_config();
         let daemon_cache_dir =
             std::path::absolute(std::env::temp_dir().join("kache-tui-daemon-a")).unwrap();
@@ -2354,35 +2262,6 @@ mod tests {
             }),
             ..StatsSnapshot::default()
         };
-        let scan = ProjectScanData {
-            link_stats: cli::LinkStats {
-                store_bytes: 10_000_000,
-                linked_refs: 42,
-                saved_bytes: 7_000_000,
-            },
-            link_store_dir: Some(config.store_dir()),
-            scanned: true,
-            ..ProjectScanData::default()
-        };
-
-        let daemon_store = effective_stats_store_dir(&config, &snapshot).unwrap();
-        assert_eq!(daemon_store, daemon_cache_dir.join("store"));
-        let client_store = config.store_dir();
-        let client_hardlinks = hardlink_summary(&scan, Some(&client_store));
-        assert!(client_hardlinks.contains("42 hardlinks"));
-        let hardlinks = hardlink_summary(&scan, Some(&daemon_store));
-        assert_eq!(hardlinks, "not scanned for active store");
-        assert!(!hardlinks.contains("42"));
-
-        let empty_scan = ProjectScanData {
-            link_store_dir: Some(client_store.clone()),
-            scanned: true,
-            ..ProjectScanData::default()
-        };
-        assert_eq!(
-            hardlink_summary(&empty_scan, Some(&client_store)),
-            "none — restores prefer reflink/CoW"
-        );
         assert_eq!(
             effective_remote_status(&config, &snapshot),
             "s3://daemon-a/cache"
@@ -2390,10 +2269,8 @@ mod tests {
     }
 
     #[test]
-    fn project_scan_records_its_store_and_removes_stale_entries() {
+    fn project_scan_removes_stale_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let store_dir = dir.path().join("store");
-        std::fs::create_dir_all(&store_dir).unwrap();
         let stats = Arc::new(Mutex::new(ProjectScanData {
             project_targets: vec![cli::TargetEntry {
                 path: dir.path().join("removed-target"),
@@ -2405,23 +2282,17 @@ mod tests {
                 breakdown: cli::CategoryBreakdown::default(),
                 stale: false,
             }],
-            link_store_dir: Some(dir.path().join("old-store")),
             ..ProjectScanData::default()
         }));
 
-        spawn_project_scan(
-            Arc::clone(&stats),
-            Some(store_dir.clone()),
-            dir.path().to_path_buf(),
-        )
-        .join()
-        .unwrap();
+        spawn_project_scan(Arc::clone(&stats), dir.path().to_path_buf())
+            .join()
+            .unwrap();
 
         let scan = stats.lock().unwrap();
         assert!(scan.scanned);
         assert!(!scan.scanning);
         assert!(scan.project_targets.is_empty());
-        assert_eq!(scan.link_store_dir.as_ref(), Some(&store_dir));
     }
 
     #[test]
@@ -2993,7 +2864,6 @@ mod tests {
 
         let mut state = test_state();
         state.active_tab = Tab::Projects;
-        let store_dir = state.config.store_dir();
         {
             let mut scan = state.project_scan.lock().unwrap();
             scan.project_targets = vec![cli::TargetEntry {
@@ -3006,12 +2876,6 @@ mod tests {
                 breakdown: cli::CategoryBreakdown::default(),
                 stale: false,
             }];
-            scan.link_stats = cli::LinkStats {
-                store_bytes: 10_000_000,
-                linked_refs: 42,
-                saved_bytes: 7_000_000,
-            };
-            scan.link_store_dir = Some(store_dir);
             scan.scanning = false;
             scan.scanned = true;
         }
@@ -3029,10 +2893,6 @@ mod tests {
         assert!(
             rendered.contains("kache projects"),
             "projects overview title should render: {rendered}"
-        );
-        assert!(
-            rendered.contains("42 hardlinks"),
-            "projects overview should use the matching-store scan: {rendered}"
         );
     }
 }

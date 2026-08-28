@@ -19,6 +19,7 @@ mod fallback_planner;
 mod heartbeat;
 mod incremental_policy;
 mod link;
+mod machine;
 mod miss_chain;
 mod native_archive;
 mod opcounts;
@@ -63,6 +64,7 @@ static MACOS_INFO_PLIST: [u8; include_bytes!("../assets/macos/Info.plist").len()
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 /// Build version: CI sets KACHE_VERSION from the git tag, local builds use
@@ -90,6 +92,10 @@ pub const VERSION: &str = {
 #[derive(Parser)]
 #[command(name = "kache", version = VERSION, about)]
 pub(crate) struct Cli {
+    /// Machine-readable JSON on stdout (stats, gc, clean, doctor, why-miss, list, daemon status)
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Commands>,
 }
@@ -145,6 +151,14 @@ enum Commands {
         /// For scripts and cron. Preview first with --dry-run.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Use target directories remembered by the compiler wrapper
+        #[arg(long)]
+        tracked: bool,
+
+        /// Only tracked targets not seen for this long (for example 14d)
+        #[arg(long, requires = "tracked")]
+        stale: Option<String>,
     },
 
     /// Interactive setup: configure cargo wrapper, install and start the daemon
@@ -325,6 +339,36 @@ enum DaemonCommands {
     Uninstall,
     /// Stream daemon logs
     Log,
+}
+
+fn command_supports_json(command: &Option<Commands>) -> bool {
+    matches!(
+        command,
+        Some(
+            Commands::List { .. }
+                | Commands::Gc { .. }
+                | Commands::Clean { .. }
+                | Commands::Doctor { .. }
+                | Commands::Stats { .. }
+                | Commands::WhyMiss { .. }
+                | Commands::Daemon { command: None }
+                | Commands::Daemon {
+                    command: Some(DaemonCommands::Status),
+                }
+        )
+    )
+}
+
+fn doctor_json_is_read_only(
+    fix: bool,
+    purge_sccache: bool,
+    verify: bool,
+    checksums: bool,
+    repair: bool,
+) -> bool {
+    ![fix, purge_sccache, verify, checksums, repair]
+        .into_iter()
+        .any(|enabled| enabled)
 }
 
 /// Diagnostic log file path.
@@ -525,10 +569,26 @@ fn main() -> Result<()> {
 
     // CLI mode: parse subcommands
     let cli = Cli::parse();
+    let json = cli.json;
+    if json && !command_supports_json(&cli.command) {
+        anyhow::bail!(
+            "`--json` is supported on stats, gc, clean, doctor, why-miss, list, and daemon status."
+        );
+    }
 
     // Config and Completions run before Config::load() (broken/missing config).
     match &cli.command {
-        Some(Commands::Config) => return config_tui::run_config_editor(),
+        Some(Commands::Config) => {
+            if json {
+                anyhow::bail!("`kache config` is interactive and has no JSON form.");
+            }
+            crate::machine::require_tty(
+                std::io::stdout().is_terminal(),
+                "config",
+                "`kache config` in a terminal",
+            )?;
+            return config_tui::run_config_editor();
+        }
         Some(Commands::Cargo { args }) => return cargo_proxy::run(args.clone()),
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;
@@ -548,7 +608,7 @@ fn main() -> Result<()> {
             crate_name,
             sort,
             no_pager,
-        }) => cli::list(&config, crate_name.as_deref(), &sort, no_pager),
+        }) => cli::list(&config, crate_name.as_deref(), &sort, no_pager, json),
         Some(Commands::Gc {
             max_age,
             stale_schema,
@@ -563,10 +623,30 @@ fn main() -> Result<()> {
                     })
                 })
                 .transpose()?;
-            cli::gc(&config, hours, stale_schema)
+            cli::gc(&config, hours, stale_schema, json)
         }
-        Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
-        Some(Commands::Clean { dry_run, yes }) => cli::clean(dry_run, yes),
+        Some(Commands::Purge { crate_name }) => {
+            if json {
+                anyhow::bail!("`kache purge` has no JSON form yet; run it without `--json`.");
+            }
+            cli::purge(&config, crate_name.as_deref())
+        }
+        Some(Commands::Clean {
+            dry_run,
+            yes,
+            tracked,
+            stale,
+        }) => {
+            let stale_hours = if tracked {
+                Some(
+                    parse_duration_hours(stale.as_deref().unwrap_or("14d"))
+                        .ok_or_else(|| anyhow::anyhow!("invalid --stale duration"))?,
+                )
+            } else {
+                None
+            };
+            cli::clean(&config, dry_run, yes, json, tracked, stale_hours)
+        }
         Some(Commands::Init {
             yes,
             no_service,
@@ -578,13 +658,21 @@ fn main() -> Result<()> {
             verify,
             checksums,
             repair,
-        }) => cli::doctor(
-            fix,
-            purge_sccache,
-            verify || checksums || repair,
-            checksums,
-            repair,
-        ),
+        }) => {
+            if json && !doctor_json_is_read_only(fix, purge_sccache, verify, checksums, repair) {
+                anyhow::bail!(
+                    "`kache doctor --json` reports diagnostics only; run repair options without `--json`."
+                );
+            }
+            cli::doctor(
+                fix,
+                purge_sccache,
+                verify || checksums || repair,
+                checksums,
+                repair,
+                json,
+            )
+        }
         Some(Commands::Sync {
             manifest_path,
             pull,
@@ -607,10 +695,10 @@ fn main() -> Result<()> {
             manifest_key,
             namespace,
         }) => cli::save_manifest(&config, manifest_key.as_deref(), namespace.as_deref()),
-        Some(Commands::Daemon { command: None }) => service::status(),
+        Some(Commands::Daemon { command: None }) => service::status(json),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Status),
-        }) => service::status(),
+        }) => service::status(json),
         Some(Commands::Daemon {
             command: Some(DaemonCommands::Run),
         }) => daemon::run_server(&config, &config_provenance),
@@ -660,10 +748,18 @@ fn main() -> Result<()> {
         }
         Some(Commands::Stats { since }) => {
             let hours = parse_duration_hours(&since);
-            cli::stats(&config, &config_provenance, hours)
+            cli::stats(&config, &config_provenance, hours, json)
         }
-        Some(Commands::WhyMiss { crate_name }) => cli::why_miss(&config, &crate_name),
+        Some(Commands::WhyMiss { crate_name }) => cli::why_miss(&config, &crate_name, json),
         Some(Commands::Monitor { since }) => {
+            if json {
+                anyhow::bail!("`kache monitor` is interactive; use `kache stats --json`.");
+            }
+            crate::machine::require_tty(
+                std::io::stdout().is_terminal(),
+                "monitor",
+                "`kache stats --json`",
+            )?;
             let hours = since.as_deref().and_then(parse_duration_hours);
             tui::run_monitor(&config, hours)
         }
@@ -1030,6 +1126,34 @@ mod tests {
         assert_eq!(parse_duration_hours("48"), Some(48));
         assert_eq!(parse_duration_hours("invalid"), None);
         assert_eq!(parse_duration_hours("18446744073709551615d"), None);
+    }
+
+    #[test]
+    fn json_support_is_limited_to_machine_readable_commands() {
+        assert!(command_supports_json(&Some(Commands::Stats {
+            since: "24h".to_string(),
+        })));
+        assert!(command_supports_json(&Some(Commands::Daemon {
+            command: Some(DaemonCommands::Status),
+        })));
+        assert!(!command_supports_json(&Some(Commands::Config)));
+        assert!(!command_supports_json(&Some(Commands::Monitor {
+            since: None
+        })));
+        assert!(!command_supports_json(&None));
+
+        assert!(doctor_json_is_read_only(false, false, false, false, false));
+        for flags in [
+            (true, false, false, false, false),
+            (false, true, false, false, false),
+            (false, false, true, false, false),
+            (false, false, false, true, false),
+            (false, false, false, false, true),
+        ] {
+            assert!(!doctor_json_is_read_only(
+                flags.0, flags.1, flags.2, flags.3, flags.4
+            ));
+        }
     }
 
     #[test]

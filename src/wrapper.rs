@@ -1808,6 +1808,18 @@ fn run_parsed_rustc(
         }
     };
 
+    if args.is_primary
+        && let Some(target_dir) = args.target_dir()
+        && let Some(workspace_root) = workspace_root.as_deref()
+        && let Err(e) = store.remember_target_root(&target_dir, workspace_root)
+    {
+        tracing::warn!(
+            "failed to register target root {}: {}",
+            target_dir.display(),
+            e
+        );
+    }
+
     tracing::debug!("cache key for {}: {}", crate_name, &cache_key[..16]);
 
     // 1. Check local store
@@ -3034,7 +3046,13 @@ fn try_daemon_local_hit(
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
 ) -> Option<i32> {
     let lookup_start = std::time::Instant::now();
-    let reply = crate::daemon::send_local_lookup(config, cache_key)?;
+    let target_dir = args.target_dir();
+    let reply = crate::daemon::send_local_lookup(
+        config,
+        cache_key,
+        target_dir.as_deref(),
+        args.path_normalization_root(),
+    )?;
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     if reply.outcome != "hit" {
         return None;
@@ -5120,6 +5138,7 @@ mod tests {
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
+            gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,

@@ -633,6 +633,73 @@ jobs:
       - name: Build flake checks
         run: nix flake check --keep-going --print-build-logs
 
+  # --- Copy-on-write filesystem coverage ---
+  # Every hosted runner is ext4, where `try_reflink` always fails and the
+  # `fs::copy` fallback preserves permissions. That makes an entire class of bug
+  # unobservable in CI: the store's reflink ingest creates its staging temp with
+  # `File::create` (umask mode, no +x), so a mode-losing ingest looks perfectly
+  # healthy here and only breaks on btrfs / XFS-with-reflink / ZFS >= 2.2 /
+  # bcachefs / APFS. #648 fixed the restore half of that and #822 silently
+  # reverted it through the ingest half; both shipped green. This lane exists so
+  # a third round can't.
+  cow-filesystem:
+    name: CoW filesystem (btrfs)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
+          version: 2026.6.9
+          install_args: rust
+          cache: false
+      - name: Mount a loopback btrfs volume
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs
+          # Sparse: the image only occupies what the tests actually write.
+          truncate -s 20G "$RUNNER_TEMP/cow.img"
+          mkfs.btrfs -q "$RUNNER_TEMP/cow.img"
+          sudo mkdir -p /mnt/cow
+          sudo mount -o loop "$RUNNER_TEMP/cow.img" /mnt/cow
+          sudo chown "$(id -u):$(id -g)" /mnt/cow
+          mkdir -p /mnt/cow/scratch /mnt/cow/tmp
+      # A mount that silently cannot clone makes this whole job a slower
+      # duplicate of the ext4 lanes — the exact blind spot it is here to close.
+      # `--reflink=always` fails rather than falling back to a copy, so this
+      # proves FICLONE works before any test relies on it.
+      - name: Prove reflink works on the mount
+        run: |
+          set -euo pipefail
+          head -c 1M /dev/urandom > /mnt/cow/probe-src
+          cp --reflink=always /mnt/cow/probe-src /mnt/cow/probe-dst
+          rm -f /mnt/cow/probe-src /mnt/cow/probe-dst
+      # `KACHE_TEST_SCRATCH_DIR` moves the integration fixtures' cache and target
+      # dirs onto btrfs; `TMPDIR` does the same for `tempfile::tempdir()`, which
+      # is where the store and link unit tests do their ingest. The build tree
+      # itself stays on the runner disk — it is the artifacts under test that
+      # need the CoW filesystem, not the compile.
+      #
+      # No kache-action here: this lane must exercise the wrapper built from
+      # this PR, not a released one, and dogfooding would put a second store in
+      # play.
+      - name: Run the filesystem-sensitive suites on btrfs
+        env:
+          KACHE_TEST_SCRATCH_DIR: /mnt/cow/scratch
+          TMPDIR: /mnt/cow/tmp
+          RUSTC_WRAPPER: ""
+        run: |
+          set -euo pipefail
+          cargo test --test custom_harness_test
+          cargo test --bins -- store:: link:: wrapper::tests::materialize_cached_artifact
+      - name: Report mount usage
+        if: always()
+        run: df -h /mnt/cow || true
+
   # --- E2E smoke test ---
   # Builds kache, configures as RUSTC_WRAPPER, cold-builds a fixture project,
   # cleans, warm-builds, and verifies cache hits work end-to-end.
@@ -1111,7 +1178,16 @@ jobs:
     # the full validation suite — `version-consistency` rejects a tag that
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
     # (blocking) Windows arm, so a tag won't release unless Windows e2e is green.
-    needs: [check, nix-package, e2e, test-macos, test-windows, version-consistency]
+    needs:
+      [
+        check,
+        cow-filesystem,
+        nix-package,
+        e2e,
+        test-macos,
+        test-windows,
+        version-consistency,
+      ]
     # IN-ORG MIRROR of zondax/_workflows@7f61511 (v11) — a byte-identical import.
     # The macOS legs run on the self-hosted signing runners, whose runner group
     # restricts which workflows may use it. GitHub matches that allowlist against

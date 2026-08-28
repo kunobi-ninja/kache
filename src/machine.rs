@@ -283,6 +283,10 @@ pub fn next_for_clones(cloned_bytes: u64) -> Vec<NextAction> {
     if cloned_bytes == 0 {
         return Vec::new();
     }
+    clean_tracked_targets_action()
+}
+
+fn clean_tracked_targets_action() -> Vec<NextAction> {
     vec![NextAction {
         argv: vec![
             "kache".into(),
@@ -304,7 +308,7 @@ pub fn next_after_gc(
 ) -> Vec<NextAction> {
     let leftover = store_removed.saturating_sub(disk_reclaimed);
     if unreclaimable > 0 || leftover > 0 || disk.cloned_into_targets_bytes > 0 {
-        next_for_clones(disk.cloned_into_targets_bytes.max(leftover))
+        clean_tracked_targets_action()
     } else {
         Vec::new()
     }
@@ -392,5 +396,19 @@ mod tests {
     fn next_for_clones_is_silent_when_nothing_is_cloned() {
         assert!(next_for_clones(0).is_empty());
         assert_eq!(next_for_clones(1)[0].argv[1], "clean");
+    }
+
+    #[test]
+    fn next_after_gc_reports_each_source_of_retained_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let clean = disk_view(dir.path(), 0, 1024);
+        assert!(next_after_gc(&clean, 0, 0, 0).is_empty());
+
+        assert!(!next_after_gc(&clean, 1, 0, 0).is_empty());
+        assert!(!next_after_gc(&clean, 0, 0, 1).is_empty());
+
+        let mut cloned = clean;
+        cloned.cloned_into_targets_bytes = 1;
+        assert!(!next_after_gc(&cloned, 0, 0, 0).is_empty());
     }
 }

@@ -362,6 +362,16 @@ pub(crate) fn snapshot_from_direct_reads(
 
 // ── kache stats ────────────────────────────────────────────────────────────
 
+fn cloned_targets_line(disk: &crate::machine::DiskView) -> Option<String> {
+    (disk.cloned_into_targets_bytes > 0).then(|| {
+        format!(
+            "On disk:    {} private; {} cloned into target/",
+            ByteSize(disk.disk_private_bytes),
+            ByteSize(disk.cloned_into_targets_bytes)
+        )
+    })
+}
+
 /// Print a one-shot stats summary to stdout.
 pub fn stats(
     config: &Config,
@@ -429,12 +439,8 @@ pub fn stats(
     for line in render_stats(&snap, config, hours) {
         println!("{line}");
     }
-    if disk.cloned_into_targets_bytes > 0 {
-        println!(
-            "On disk:    {} private; {} cloned into target/",
-            ByteSize(disk.disk_private_bytes),
-            ByteSize(disk.cloned_into_targets_bytes)
-        );
+    if let Some(line) = cloned_targets_line(&disk) {
+        println!("{line}");
     }
 
     // Recent per-session prefetch summaries (#583 P0.5): the durable record
@@ -2536,10 +2542,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
             if verbose {
                 println!("Another GC is already running; skipping.");
             }
-            return Ok(crate::store::GcStats {
-                skipped: true,
-                ..crate::store::GcStats::default()
-            });
+            return Ok(skipped_gc_stats());
         }
     };
     let mut combined = crate::store::GcStats::default();
@@ -2639,6 +2642,13 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     Ok(combined)
 }
 
+fn skipped_gc_stats() -> crate::store::GcStats {
+    crate::store::GcStats {
+        skipped: true,
+        ..crate::store::GcStats::default()
+    }
+}
+
 fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats) {
     total.entries_evicted = total.entries_evicted.saturating_add(part.entries_evicted);
     total.bytes_freed = total.bytes_freed.saturating_add(part.bytes_freed);
@@ -2689,6 +2699,27 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
         },
         next,
     )
+}
+
+fn aggregate_gc_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store::GcStats {
+    crate::store::GcStats {
+        entries_evicted: report.age.entries_evicted
+            + report.duplicate.entries_evicted
+            + report.size.entries_evicted,
+        bytes_freed: report.age.bytes_freed
+            + report.duplicate.bytes_freed
+            + report.size.bytes_freed,
+        entries_pinned: report.age.entries_pinned
+            + report.duplicate.entries_pinned
+            + report.size.entries_pinned,
+        disk_bytes_reclaimed: report.age.disk_bytes_reclaimed
+            + report.duplicate.disk_bytes_reclaimed
+            + report.size.disk_bytes_reclaimed,
+        entries_unreclaimable: report.age.entries_unreclaimable
+            + report.duplicate.entries_unreclaimable
+            + report.size.entries_unreclaimable,
+        ..crate::store::GcStats::default()
+    }
 }
 
 /// Run garbage collection via the daemon.
@@ -2749,20 +2780,7 @@ pub fn gc(
         }
         Ok(outcome) => {
             if let Some(report) = outcome.breakdown.as_ref() {
-                combined.entries_evicted = report.age.entries_evicted
-                    + report.duplicate.entries_evicted
-                    + report.size.entries_evicted;
-                combined.bytes_freed =
-                    report.age.bytes_freed + report.duplicate.bytes_freed + report.size.bytes_freed;
-                combined.entries_pinned = report.age.entries_pinned
-                    + report.duplicate.entries_pinned
-                    + report.size.entries_pinned;
-                combined.disk_bytes_reclaimed = report.age.disk_bytes_reclaimed
-                    + report.duplicate.disk_bytes_reclaimed
-                    + report.size.disk_bytes_reclaimed;
-                combined.entries_unreclaimable = report.age.entries_unreclaimable
-                    + report.duplicate.entries_unreclaimable
-                    + report.size.entries_unreclaimable;
+                combined = aggregate_gc_breakdown(report);
                 if !json {
                     if let Some(hours) = max_age_hours {
                         println!("Age GC ({hours}h):");
@@ -6264,6 +6282,52 @@ mod tests {
             entries_pinned: pinned,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn cloned_targets_summary_only_appears_for_retained_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut disk = crate::machine::disk_view(dir.path(), 0, 1024);
+        assert!(cloned_targets_line(&disk).is_none());
+
+        disk.disk_private_bytes = 3;
+        disk.cloned_into_targets_bytes = 7;
+        let line = cloned_targets_line(&disk).expect("cloned blocks need a summary");
+        assert!(line.contains("3 B"), "{line}");
+        assert!(line.contains("7 B"), "{line}");
+    }
+
+    #[test]
+    fn skipped_gc_stats_preserves_the_lock_contention_signal() {
+        let stats = skipped_gc_stats();
+        assert!(stats.skipped);
+        assert_eq!(stats.entries_evicted, 0);
+    }
+
+    #[test]
+    fn gc_breakdown_aggregation_sums_every_policy() {
+        fn policy(seed: usize) -> crate::daemon::GcPolicyOutcome {
+            crate::daemon::GcPolicyOutcome {
+                entries_evicted: seed,
+                bytes_freed: (seed as u64) * 10,
+                entries_pinned: seed + 10,
+                disk_bytes_reclaimed: (seed as u64) * 100,
+                entries_unreclaimable: seed + 20,
+            }
+        }
+
+        let report = crate::daemon::GcBreakdown {
+            mode: crate::daemon::GcRequestMode::Automatic,
+            age: policy(1),
+            duplicate: policy(2),
+            size: policy(4),
+        };
+        let stats = aggregate_gc_breakdown(&report);
+        assert_eq!(stats.entries_evicted, 7);
+        assert_eq!(stats.bytes_freed, 70);
+        assert_eq!(stats.entries_pinned, 37);
+        assert_eq!(stats.disk_bytes_reclaimed, 700);
+        assert_eq!(stats.entries_unreclaimable, 67);
     }
 
     #[test]

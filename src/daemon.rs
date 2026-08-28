@@ -8458,6 +8458,14 @@ mod tests {
     use std::fs;
     use std::sync::mpsc;
 
+    #[test]
+    fn target_registration_is_debounced_per_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy();
+        assert!(target_registration_due(&path));
+        assert!(!target_registration_due(&path));
+    }
+
     /// kunobi-ninja/kache#706: an auto-spawned daemon must not inherit the
     /// remote of whichever build started it, or its remote becomes a lottery
     /// decided by the startup race — the reported case logged 2,330

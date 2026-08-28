@@ -52,7 +52,8 @@
 //!
 //! Each run prints a summary block and writes `tmp/bench/<scenario>/<scenario>.json`
 //! plus per-phase reports (`report-<phase>.*`), build logs
-//! (`build-<phase>.log`), and wrapper logs (`wrapper-<phase>.log`).
+//! (`build-<phase>.log`), wrapper logs (`wrapper-<phase>.log`), and OTLP
+//! gauges (`metrics.otlp.json`) for kartero to pull from CI.
 //! By default each scenario writes under its own `./tmp/bench/<scenario>` (so
 //! scenarios coexist); a `work_dir` lock prevents two runs from sharing one
 //! scratch dir. Concurrent runs on one host make the wall-clock numbers
@@ -516,6 +517,24 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     let out = work_dir.join(format!("{}.json", profile.name));
     std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
         .with_context(|| format!("writing {}", out.display()))?;
+    write_otlp_or_warn(
+        &work_dir,
+        crate::bench_otlp::OtlpRun {
+            project: result.project.clone(),
+            git_ref: result.git_ref.clone(),
+            cache_tool: "kache",
+            time_unix_nano: crate::bench_otlp::OtlpRun::now_unix_nano(),
+            verdict_ok: result.verdict.ok,
+            speedup: Some(result.speedup),
+            cache_size_bytes: crate::bench_otlp::OtlpRun::bytes_from_mib(result.cache_size_mb),
+            key_stability_pct: Some(result.key_stability.stable_pct),
+            disk_measured_bytes: result.disk_measured_bytes,
+            phases: vec![
+                otlp_phase("cold", &result.cold, result.cold_objdir_bytes),
+                otlp_phase("warm", &result.warm, result.warm_objdir_bytes),
+            ],
+        },
+    );
 
     archive_run_artifacts(&work_dir, &run_archive_dir)?;
     print_summary(&result, &run_archive_dir);
@@ -576,6 +595,61 @@ fn is_run_artifact(name: &str) -> bool {
         || name.starts_with("trace-")
         || name.starts_with("key-diff.")
         || (name.starts_with("bench-") && name.ends_with(".json"))
+        || name == crate::bench_otlp::METRICS_FILE
+        || name == crate::bench_otlp::SCHEMA_VERSION_FILE
+}
+
+fn otlp_phase(
+    name: &'static str,
+    metrics: &PhaseMetrics,
+    objdir_bytes: u64,
+) -> crate::bench_otlp::OtlpPhase {
+    crate::bench_otlp::OtlpPhase {
+        name,
+        wall_s: metrics.wall_s,
+        time_saved_s: Some(metrics.time_saved_s),
+        hits: metrics.hits,
+        dups: Some(metrics.dups),
+        misses: metrics.misses,
+        errors: Some(metrics.errors),
+        total: Some(metrics.total_crates),
+        hit_rate_pct: metrics.hit_rate_pct,
+        weighted_hit_rate_pct: Some(metrics.weighted_hit_rate_pct),
+        leak_warnings: Some(metrics.leak_warnings),
+        objdir_bytes,
+    }
+}
+
+fn otlp_sccache_phase(
+    name: &'static str,
+    metrics: &SccachePhaseMetrics,
+    objdir_bytes: u64,
+) -> crate::bench_otlp::OtlpPhase {
+    crate::bench_otlp::OtlpPhase {
+        name,
+        wall_s: metrics.wall_s,
+        time_saved_s: None,
+        hits: metrics.cache_hits,
+        dups: None,
+        misses: metrics.cache_misses,
+        errors: None,
+        total: Some(metrics.compile_requests),
+        hit_rate_pct: metrics.hit_rate_pct,
+        weighted_hit_rate_pct: None,
+        leak_warnings: None,
+        objdir_bytes,
+    }
+}
+
+fn write_otlp_or_warn(work_dir: &Path, run: crate::bench_otlp::OtlpRun) {
+    if let Err(err) = crate::bench_otlp::write_otlp(work_dir, &run) {
+        eprintln!("[bench] warning: failed to write OTLP telemetry: {err:#}");
+        return;
+    }
+    eprintln!(
+        "[bench] otlp written to {}",
+        work_dir.join(crate::bench_otlp::METRICS_FILE).display()
+    );
 }
 
 /// Take an exclusive advisory lock on the work dir so two bench runs can't
@@ -1155,6 +1229,24 @@ fn run_pull_bench(
     let out = work_dir.join(format!("{}.json", profile.name));
     std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
         .with_context(|| format!("writing {}", out.display()))?;
+    write_otlp_or_warn(
+        work_dir,
+        crate::bench_otlp::OtlpRun {
+            project: result.project.clone(),
+            git_ref: result.git_ref.clone(),
+            cache_tool: "kache",
+            time_unix_nano: crate::bench_otlp::OtlpRun::now_unix_nano(),
+            verdict_ok: result.verdict.ok,
+            speedup: None,
+            cache_size_bytes: crate::bench_otlp::OtlpRun::bytes_from_mib(result.cache_size_mb),
+            key_stability_pct: None,
+            disk_measured_bytes: None,
+            phases: vec![
+                otlp_phase("cold", &result.cold, result.cold_objdir_bytes),
+                otlp_phase("pull", &result.pull, result.pull_objdir_bytes),
+            ],
+        },
+    );
     archive_run_artifacts(work_dir, run_archive_dir)?;
     print_pull_summary(&result, run_archive_dir);
     eprintln!("[bench] summary written to {}", out.display());
@@ -1279,6 +1371,24 @@ fn run_sccache_bench(
     let out = work_dir.join(format!("{}.json", profile.name));
     std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
         .with_context(|| format!("writing {}", out.display()))?;
+    write_otlp_or_warn(
+        work_dir,
+        crate::bench_otlp::OtlpRun {
+            project: result.project.clone(),
+            git_ref: result.git_ref.clone(),
+            cache_tool: "sccache",
+            time_unix_nano: crate::bench_otlp::OtlpRun::now_unix_nano(),
+            verdict_ok: true,
+            speedup: Some(result.speedup),
+            cache_size_bytes: result.cache_dir_bytes,
+            key_stability_pct: None,
+            disk_measured_bytes: result.disk_measured_bytes,
+            phases: vec![
+                otlp_sccache_phase("cold", &result.cold, result.cold_objdir_bytes),
+                otlp_sccache_phase("warm", &result.warm, result.warm_objdir_bytes),
+            ],
+        },
+    );
 
     archive_run_artifacts(work_dir, run_archive_dir)?;
     print_sccache_summary(&result, run_archive_dir);
@@ -3013,6 +3123,40 @@ mod tests {
     /// feature probes that rustc rejected — kache `EventResult::Error`) must
     /// NOT degrade the run: those are not kache cache faults. Regression guard
     /// for kunobi-ninja/kache (SurrealDB bench surfaced one such probe).
+    #[test]
+    fn run_archive_keeps_otlp_sidecars() {
+        assert!(is_run_artifact("metrics.otlp.json"));
+        assert!(is_run_artifact("schema_version"));
+        assert!(is_run_artifact("bench-firefox.json"));
+        assert!(!is_run_artifact("kache.log"));
+    }
+
+    #[test]
+    fn write_otlp_or_warn_writes_artifact_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        write_otlp_or_warn(
+            dir.path(),
+            crate::bench_otlp::OtlpRun {
+                project: "bench-test".into(),
+                git_ref: "main".into(),
+                cache_tool: "kache",
+                time_unix_nano: "1".into(),
+                verdict_ok: true,
+                speedup: None,
+                cache_size_bytes: 0,
+                key_stability_pct: None,
+                disk_measured_bytes: None,
+                phases: Vec::new(),
+            },
+        );
+        assert!(dir.path().join(crate::bench_otlp::METRICS_FILE).is_file());
+        assert!(
+            dir.path()
+                .join(crate::bench_otlp::SCHEMA_VERSION_FILE)
+                .is_file()
+        );
+    }
+
     #[test]
     fn wrapped_compile_failures_do_not_degrade_the_run() {
         let stability = KeyStability {

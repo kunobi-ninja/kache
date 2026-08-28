@@ -12,6 +12,7 @@
 //! owns the lifecycle; the TOML owns what the fixture is and what it expects.
 
 pub mod assertions;
+mod bench_otlp;
 pub mod bench_profile;
 pub mod bench_runner;
 pub mod daemon;

@@ -159,6 +159,13 @@ gitignore = true
 # EOF has no payload for the required non-empty, non-zero-length entry set.
 # Exact-limit and first-real-overshoot tests retain coverage of every reachable
 # boundary on the corresponding decode/build paths.
+#
+# The benchmark entry points orchestrate real repository clones, compilers,
+# cache daemons, and multi-gigabyte scenarios. Their whole-body `Ok(())`
+# replacement cannot be observed by the hermetic `cargo test` process. The
+# Linux/macOS/Windows E2E smoke lanes exercise those entry points instead.
+# Keep only the whole-body replacements out of this lane: their parsing,
+# selection, measurement, verdict, artifact, and OTLP helpers remain in scope.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -194,4 +201,7 @@ exclude_re = [
     "src/remote_pack.rs:351:20: replace > with (>=|==) in encode_catalog",
     "src/remote_pack.rs:309:20: replace < with <= in decode_pack",
     "src/remote_pack.rs:324:22: replace > with >= in decode_pack",
+    "replace run_bench .* with Ok",
+    "replace run_pull_bench .* with Ok",
+    "replace run_sccache_bench .* with Ok",
 ]

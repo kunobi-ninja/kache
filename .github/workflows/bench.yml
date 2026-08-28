@@ -275,6 +275,22 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
+      # Short-lived OTLP JSON for kartero. Separate name and retention from
+      # the diagnostic bundle above: kartero pulls `telemetry-otlp-v1*` and
+      # nothing else. The suffix is required because upload-artifact v4
+      # rejects two jobs in one run sharing an identical artifact name.
+      - name: Upload telemetry
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-${{ matrix.name }}
+          path: |
+            tmp/bench/${{ matrix.dir }}/metrics.otlp.json
+            tmp/bench/${{ matrix.dir }}/schema_version
+            tmp/bench/${{ matrix.dir }}/${{ matrix.dir }}.json
+          retention-days: 3
+          if-no-files-found: warn
+
   # Firefox compile-cache bench on the self-hosted Windows runner (clang-cl +
   # MSVC under MozillaBuild). Separate from the `bench` matrix above: that runs
   # on the ephemeral Linux ARC (`kunobi-runners`); this needs the persistent
@@ -462,6 +478,18 @@ jobs:
             ${{ runner.temp }}/f/*.log
             ${{ runner.temp }}/f/*.txt
           retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload telemetry
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-firefox-windows
+          path: |
+            ${{ runner.temp }}/f/metrics.otlp.json
+            ${{ runner.temp }}/f/schema_version
+            ${{ runner.temp }}/f/bench-firefox-windows.json
+          retention-days: 3
           if-no-files-found: warn
 
   # Firefox DAILY-PULL (temporal, #477) compile-cache bench on the self-hosted
@@ -667,4 +695,16 @@ jobs:
             ${{ runner.temp }}/b/*.log
             ${{ runner.temp }}/b/*.txt
           retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload telemetry
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-firefox-pull-windows
+          path: |
+            ${{ runner.temp }}/b/metrics.otlp.json
+            ${{ runner.temp }}/b/schema_version
+            ${{ runner.temp }}/b/bench-firefox-pull-windows.json
+          retention-days: 3
           if-no-files-found: warn

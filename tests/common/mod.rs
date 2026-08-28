@@ -108,11 +108,21 @@ pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
 /// they leave behind. Anchoring here keeps such tests on whatever filesystem
 /// the developer or CI actually builds on, and `cargo clean` reclaims it.
 ///
+/// `KACHE_TEST_SCRATCH_DIR` overrides it. The developer's filesystem is
+/// whatever it is, but CI's is ext4 — where `try_reflink` always fails and the
+/// `fs::copy` fallback preserves permissions, hiding every mode-losing
+/// reflink path (that is how #822 reverted #648 unnoticed). The
+/// `cow-filesystem` job points this at a loopback btrfs mount so those paths
+/// actually run.
+///
 /// Only the tests that materialize artifacts need this, and each integration
 /// test binary compiles this module separately, so the rest see it as dead.
 #[allow(dead_code)]
 pub fn scratch_dir() -> PathBuf {
-    let dir = bootstrap_target_dir().with_file_name("kache-test-scratch");
+    let dir = match std::env::var_os("KACHE_TEST_SCRATCH_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => bootstrap_target_dir().with_file_name("kache-test-scratch"),
+    };
     std::fs::create_dir_all(&dir).expect("creating scratch dir");
     dir
 }

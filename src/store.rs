@@ -47,6 +47,73 @@ fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
     fs::set_permissions(blob, perms)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only ingest override: reproduce, on any filesystem, what a Linux
+    /// CoW reflink does to a staged snapshot — independent bytes at the
+    /// *umask*, not at the source's mode.
+    ///
+    /// CI runs on ext4, where `try_reflink` always fails and the `fs::copy`
+    /// fallback carries the permission bits over. That is the blind spot #822
+    /// shipped through: a mode-losing ingest is simply unobservable there, so
+    /// the regression only ever appeared on a developer's btrfs/ZFS box.
+    /// Forcing the emulation makes the contract testable everywhere.
+    ///
+    /// Thread-local rather than a process-wide flag (`link.rs`'s
+    /// `WINDOWS_HARDLINK_RESTORE` is the latter, but it is a real feature
+    /// switch): `cargo test` runs store tests in parallel, and one test's
+    /// emulation must not leak into another's put.
+    static FORCE_MODE_DROPPING_INGEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Enable [`FORCE_MODE_DROPPING_INGEST`] for the duration of the guard.
+#[cfg(test)]
+struct ModeDroppingIngest;
+
+#[cfg(test)]
+impl ModeDroppingIngest {
+    fn enable() -> Self {
+        FORCE_MODE_DROPPING_INGEST.with(|forced| forced.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ModeDroppingIngest {
+    fn drop(&mut self) {
+        FORCE_MODE_DROPPING_INGEST.with(|forced| forced.set(false));
+    }
+}
+
+/// Stage `source` at `tmp` the way a Linux CoW reflink would, reporting whether
+/// the emulation was active at all. See [`FORCE_MODE_DROPPING_INGEST`].
+#[cfg(test)]
+fn emulate_cow_reflink_ingest(source: &Path, tmp: &Path) -> Result<bool> {
+    if !FORCE_MODE_DROPPING_INGEST.with(std::cell::Cell::get) {
+        return Ok(false);
+    }
+    fs::copy(source, tmp)
+        .with_context(|| format!("emulating a reflink ingest of {}", source.display()))?;
+    // `try_reflink` on Linux opens the destination with `File::create` before
+    // the FICLONE ioctl, so the snapshot lands at `0o666 & !umask` whatever the
+    // source was. The exact value varies with the umask; the only property that
+    // matters here is that it carries no `+x`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(tmp, fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("resetting the emulated staging mode on {}", tmp.display()))?;
+    }
+    Ok(true)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn emulate_cow_reflink_ingest(_source: &Path, _tmp: &Path) -> Result<bool> {
+    Ok(false)
+}
+
 /// Is `name` exactly a content-blob filename: 64 lowercase hex chars (a
 /// blake3 digest)? Used by the orphan sweep so it only ever unlinks files
 /// that look like a blob — never an in-progress temp (`.{hash}.{pid}.{n}.tmp`)
@@ -1852,13 +1919,29 @@ impl Store {
         let mut put_result = StorePutResult::default();
         let mut total_size = 0u64;
         for (source_path, store_name) in output_files {
-            // Eligibility decision only; the staged snapshot's own metadata
-            // is authoritative for what gets recorded below.
-            let source_executable = fs::metadata(source_path)
+            // The mode is read from the compiler's output, never from the
+            // staging snapshot taken below. That snapshot is authoritative for
+            // *bytes* — hashing it rather than the live output is the whole
+            // point of #822 — but it is not authoritative for permissions:
+            // `stage_blob_from_source` prefers `try_reflink`, whose Linux
+            // implementation creates the temp with `File::create` before the
+            // FICLONE ioctl, so a 0o755 binary reads back at the umask on every
+            // CoW filesystem (btrfs, XFS-with-reflink, ZFS >= 2.2, bcachefs).
+            // `fs::copy` and macOS `clonefile` happen to preserve it, which is
+            // why ext4 CI and macOS did not notice #822 undoing #648's restore
+            // fix: recorded `executable: false`, a `harness = false` test binary
+            // classifies as `Other("rustc:unknown")`, restores via `Hardlink`
+            // with no 0o755, and cargo fails the run with "Permission denied
+            // (os error 13)".
+            //
+            // A failed stat is an error rather than a silent `false`, because
+            // `false` is precisely the wrong value this guards against — and
+            // staging opens the same path one line below regardless.
+            let executable = fs::metadata(source_path)
                 .map(|meta| is_executable(&meta))
-                .unwrap_or(false);
+                .with_context(|| format!("stating compiler output for {store_name}"))?;
             let use_source_hardlink =
-                source_hardlink_allowed(allow_source_hardlinks, store_name, source_executable);
+                source_hardlink_allowed(allow_source_hardlinks, store_name, executable);
 
             let (staged, ingest) = self.stage_blob_from_source(source_path, use_source_hardlink)?;
             let staged_meta = match fs::metadata(&staged) {
@@ -1870,7 +1953,6 @@ impl Store {
                 }
             };
             let size = staged_meta.len();
-            let executable = is_executable(&staged_meta);
             if size == 0 && !zero_byte_is_valid_output(store_name, crate_types) {
                 Self::discard_staged_blob(&staged);
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
@@ -2909,6 +2991,15 @@ impl Store {
     /// reflink and hardlink ingests can only write to a destination that does
     /// not exist yet, so pre-creating it would cost a full byte copy per
     /// artifact on every filesystem.
+    ///
+    /// **The snapshot's bytes are faithful; its mode is not.** Only the hardlink
+    /// ingest shares the source's inode, and only `fs::copy` promises to carry
+    /// the permission bits over. [`crate::link::try_reflink`] on Linux creates
+    /// the destination with `File::create` before the FICLONE ioctl, so a
+    /// reflinked snapshot of a 0o755 binary lands at the umask instead — which
+    /// is how #822 silently reverted #648. Anything permission-shaped
+    /// (`CachedFile::executable`) must be read from the source, never from
+    /// here.
     fn stage_blob_from_source(
         &self,
         source: &Path,
@@ -2925,7 +3016,11 @@ impl Store {
             .with_context(|| format!("reserving a staging name in {}", dir.display()))?;
 
         let stage = |tmp: &Path, allow_hardlink: bool| -> Result<(StoreIngest, bool)> {
-            let ingest = if crate::link::try_reflink(source, tmp).is_ok() {
+            // Short-circuit: the real reflink is only attempted when no test
+            // emulation claimed the staging slot.
+            let ingest = if emulate_cow_reflink_ingest(source, tmp)?
+                || crate::link::try_reflink(source, tmp).is_ok()
+            {
                 StoreIngest::Reflink
             } else if allow_hardlink
                 && fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file())
@@ -4898,6 +4993,107 @@ mod tests {
             "independent ingest must never share the compiler output inode"
         );
         assert!(blob_meta.permissions().readonly());
+    }
+
+    /// #648 made restore honour the mode bit recorded at insert time, because a
+    /// `[[test]] harness = false` target supplies its own `main` and is compiled
+    /// with neither `--test` nor `--crate-type` — nothing in the rustc argv says
+    /// "executable", so the recorded bit is the only signal. #822 then began
+    /// reading that bit off the *staging snapshot* rather than the compiler's
+    /// output, and a reflinked snapshot is created at the umask: on every CoW
+    /// filesystem the entry recorded `executable: false`, restore fell back to
+    /// `Hardlink`, and cargo failed the run with "Permission denied (os error
+    /// 13)".
+    ///
+    /// The emulation is what makes this reachable on ext4. Without it the copy
+    /// fallback preserves the mode, the assertion holds for free, and the test
+    /// would only fail on the filesystems CI never runs on.
+    #[cfg(unix)]
+    #[test]
+    fn put_records_the_executable_bit_from_the_compiler_output_not_the_staging_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("harness-a1b2c3d4e5f60718");
+        fs::write(&output, b"\x7fELF harness=false test binary").unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
+
+        {
+            let _forced = ModeDroppingIngest::enable();
+            store
+                .put_with_compile_time_independent(
+                    "harness-entry",
+                    "harness",
+                    &[],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "",
+                    &[(output.clone(), "harness-a1b2c3d4e5f60718".to_string())],
+                    "",
+                    "",
+                    1,
+                )
+                .unwrap();
+        }
+
+        let meta = store.get("harness-entry").unwrap().unwrap();
+        // Proves the emulation actually dropped the bit, so the assertion below
+        // cannot pass because the snapshot happened to keep it.
+        let blob_mode = fs::metadata(store.blob_path(&meta.files[0].hash))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            blob_mode & 0o111,
+            0,
+            "emulated reflink ingest should have staged without the bit, got {blob_mode:o}"
+        );
+        assert!(
+            meta.files[0].executable,
+            "the recorded mode must come from the compiler's 0o755 output, \
+             not from the staging snapshot"
+        );
+    }
+
+    /// The converse, under the same emulation: reading the mode from the source
+    /// must not degenerate into recording every artifact executable.
+    #[cfg(unix)]
+    #[test]
+    fn put_records_no_executable_bit_for_a_non_executable_output() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("libfoo.rlib");
+        fs::write(&output, b"rlib bytes").unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o644)).unwrap();
+
+        {
+            let _forced = ModeDroppingIngest::enable();
+            store
+                .put_with_compile_time_independent(
+                    "rlib-entry",
+                    "foo",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "",
+                    &[(output.clone(), "libfoo.rlib".to_string())],
+                    "",
+                    "",
+                    1,
+                )
+                .unwrap();
+        }
+
+        let meta = store.get("rlib-entry").unwrap().unwrap();
+        assert!(
+            !meta.files[0].executable,
+            "a 0o644 compiler output must not be recorded executable"
+        );
     }
 
     /// A mutable-kind blob must never share an inode with the build's output:

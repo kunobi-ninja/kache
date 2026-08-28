@@ -1000,6 +1000,8 @@ diff --git a/hello.txt b/hello.txt
         assert!(moz.contains("mk_add_options \"export RUSTC_WRAPPER=/k\""));
         assert!(moz.contains("mk_add_options \"export CARGO_INCREMENTAL=0\""));
         assert!(moz.contains("mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-kache-bench"));
+        assert!(moz.contains("ac_add_options --host=\"$rust_target\""));
+        assert!(moz.contains("ac_add_options --target=\"$rust_target\""));
         assert!(
             !moz.contains("{kache}") && !moz.contains("{objdir}"),
             "placeholders must be interpolated"
@@ -1011,6 +1013,38 @@ diff --git a/hello.txt b/hello.txt
         assert!(moz.contains("mk_add_options \"export MOZ_BUILD_DATE=20260101000000\""));
         assert!(moz.contains("export KACHE_PATH_ONLY_ENV_VARS=BUILDCONFIG_RS,"));
         assert!(moz.ends_with('\n'), "mozconfig is newline-terminated");
+    }
+
+    #[test]
+    fn shipped_firefox_windows_profile_uses_only_the_upstream_cbindgen_fix() {
+        let p = BenchProfile::load(&repo_profile("firefox-windows"))
+            .expect("firefox-windows.toml loads");
+        assert_eq!(p.name, "bench-firefox-windows");
+        let patches = p
+            .files
+            .iter()
+            .filter(|file| file.mode == FileMode::Patch)
+            .collect::<Vec<_>>();
+        assert_eq!(patches.len(), 1);
+        assert!(
+            patches[0]
+                .content_file
+                .as_deref()
+                .expect("patch file")
+                .ends_with("firefox-cbindgen-visibility.patch")
+        );
+        let mozconfig = p
+            .files
+            .iter()
+            .find(|file| file.path == "mozconfig")
+            .expect("mozconfig entry");
+        assert!(
+            !mozconfig
+                .content
+                .as_deref()
+                .expect("inline mozconfig")
+                .contains("KACHE_PATH_ONLY_ENV_VARS")
+        );
     }
 
     /// The shipped Substrate scenario wires kache via `RUSTC_WRAPPER` only
@@ -1035,9 +1069,9 @@ diff --git a/hello.txt b/hello.txt
         );
     }
 
-    /// The shipped Lance scenario wires kache via `RUSTC_WRAPPER` only
-    /// (no file injection, no CC/CXX — optional fp16 kernels stay off),
-    /// honours the tree's rust-toolchain.toml, and builds the `lance` crate.
+    /// The shipped Lance scenario wires kache via `RUSTC_WRAPPER`, exposes the
+    /// system protobuf includes to prost-build, honours the tree's
+    /// rust-toolchain.toml, and builds the `lance` crate.
     #[test]
     fn shipped_lance_profile_is_rustc_wrapper_only() {
         let p = BenchProfile::load(&repo_profile("lance")).expect("lance.toml loads");
@@ -1045,7 +1079,24 @@ diff --git a/hello.txt b/hello.txt
         assert_eq!(p.objdir, "target");
         assert_eq!(p.repo, "https://github.com/lance-format/lance.git");
         assert_eq!(p.git_ref, "v10.0.0");
-        assert!(p.files.is_empty(), "lance uses RUSTC_WRAPPER only");
+        assert_eq!(p.files.len(), 3);
+        for file in &p.files {
+            assert_eq!(file.mode, FileMode::Write);
+            assert!(file.path.starts_with("protos/google/protobuf/"));
+        }
+        let well_known_types = p
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            well_known_types,
+            std::collections::BTreeSet::from([
+                "protos/google/protobuf/any.proto",
+                "protos/google/protobuf/empty.proto",
+                "protos/google/protobuf/timestamp.proto",
+            ])
+        );
         assert!(
             p.env.is_empty(),
             "no extra env — CARGO_INCREMENTAL is an engine baseline, not a profile var"

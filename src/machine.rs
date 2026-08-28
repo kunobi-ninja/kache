@@ -34,15 +34,42 @@ pub fn directory_identity(path: &Path) -> Option<PathIdentity> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        Some(PathIdentity {
-            device: meta.volume_serial_number()? as u64,
-            inode: meta.file_index()?,
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
+        };
+
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .ok()?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(directory.as_raw_handle() as _, &mut info) };
+        (ok != 0).then(|| {
+            windows_path_identity_from_parts(
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            )
         })
     }
     #[cfg(not(any(unix, windows)))]
     {
         None
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_path_identity_from_parts(
+    volume_serial: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+) -> PathIdentity {
+    PathIdentity {
+        device: u64::from(volume_serial),
+        inode: (u64::from(file_index_high) << 32) | u64::from(file_index_low),
     }
 }
 
@@ -286,6 +313,13 @@ pub fn next_after_gc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_directory_identity_preserves_the_full_file_index() {
+        let identity = windows_path_identity_from_parts(0x1020_3040, 0x1122_3344, 0x5566_7788);
+        assert_eq!(identity.device, 0x1020_3040);
+        assert_eq!(identity.inode, 0x1122_3344_5566_7788);
+    }
 
     #[test]
     fn retainer_from_sharing_treats_fully_cloned_as_unreclaimable() {

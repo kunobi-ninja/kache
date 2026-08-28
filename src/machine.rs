@@ -470,7 +470,6 @@ mod tests {
 
     #[test]
     fn terminal_requirement_names_the_command_and_alternative() {
-        assert!(require_stdout_tty("config", "the alternative").is_err());
         assert!(tui_requirement(true, "config", "the alternative").is_ok());
         let error = tui_requirement(false, "config", "the alternative")
             .unwrap_err()

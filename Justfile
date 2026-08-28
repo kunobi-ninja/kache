@@ -13,11 +13,11 @@ default:
 
 # Run all local quality checks.
 [group('dev')]
-check: fmt-check lint test-resource-guard-check test
+check: fmt-check lint test-resource-guard-check coverage-otlp-test test
 
 # Mirror the repo CI verification flow.
 [group('dev')]
-ci: fmt-check lint image-service-print helm-lint test-resource-guard-check coverage
+ci: fmt-check lint image-service-print helm-lint test-resource-guard-check coverage-otlp-test coverage
 
 # Auto-fix formatting and clippy warnings.
 [group('dev')]
@@ -346,6 +346,11 @@ coverage:
 [group('coverage')]
 coverage-scope-check COVERAGE_JSON="tmp/llvm-cov/coverage.json":
   ./scripts/check-coverage-scope.sh "{{COVERAGE_JSON}}"
+
+# Verify the dependency-free llvm-cov to OTLP converter.
+[group('coverage')]
+coverage-otlp-test:
+  python3 -B -m unittest discover -s scripts/ci -p 'test_*.py'
 
 # Run cargo-llvm-cov and open the HTML report locally.
 [group('coverage')]

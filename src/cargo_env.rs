@@ -233,8 +233,7 @@ mod tests {
         }];
         let out = apply_cargo_env_edit("", &additions);
         assert_eq!(
-            out,
-            "[env]\nCC_KNOWN_WRAPPER_CUSTOM = \"kache\"\n",
+            out, "[env]\nCC_KNOWN_WRAPPER_CUSTOM = \"kache\"\n",
             "an empty config must not grow leading blank lines:\n{out}"
         );
     }

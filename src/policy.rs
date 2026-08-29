@@ -218,4 +218,33 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn display_env_treats_empty_as_unknown() {
+        assert_eq!(display_env(None), "unknown");
+        assert_eq!(display_env(Some(String::new())), "unknown");
+        assert_eq!(display_env(Some("push".into())), "push");
+    }
+
+    #[test]
+    fn github_empty_event_name_reason_says_unknown() {
+        let vars = github(&[("GITHUB_EVENT_NAME", "")]);
+        let forced = forced_remote_readonly_with(lookup(&vars)).expect("empty event is untrusted");
+        assert!(
+            forced.reason.contains("Actions unknown"),
+            "empty GITHUB_EVENT_NAME must render as unknown, got {}",
+            forced.reason
+        );
+    }
+
+    #[test]
+    fn gitlab_empty_pipeline_source_reason_says_unknown() {
+        let vars = gitlab(&[("CI_PIPELINE_SOURCE", "")]);
+        let forced = forced_remote_readonly_with(lookup(&vars)).expect("empty source is untrusted");
+        assert!(
+            forced.reason.contains("CI unknown"),
+            "empty CI_PIPELINE_SOURCE must render as unknown, got {}",
+            forced.reason
+        );
+    }
 }

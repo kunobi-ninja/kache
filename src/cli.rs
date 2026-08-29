@@ -4252,6 +4252,19 @@ pub fn doctor(
             detail: remote.describe(),
             fix: None,
         });
+        let writes = if let Some(forced) = crate::policy::forced_remote_readonly() {
+            format!("read-only — {}", forced.reason)
+        } else if cfg.remote_readonly {
+            "read-only (KACHE_REMOTE_READONLY or cache.remote_readonly)".to_string()
+        } else {
+            "read-write".to_string()
+        };
+        checks.push(Check {
+            label: "Remote writes",
+            pass: true,
+            detail: writes,
+            fix: None,
+        });
     } else if let Some(ref cfg) = config
         && cfg.local_only
     {

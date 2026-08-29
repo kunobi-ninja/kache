@@ -30,6 +30,26 @@ For S3-compatible storage:
 
 Add `s3-endpoint` for R2, Ceph, or MinIO. Prefer workload identity or IAM roles over long-lived access keys when the runner supports them.
 
+## Who may write
+
+A write credential for an S3 or filesystem remote can overwrite or delete objects.
+
+On GitHub Actions and GitLab CI, Kache suppresses remote writes unless the job is a **push to a protected branch**. Pull requests, merge requests, tags, unprotected branches, `workflow_dispatch`, and scheduled runs are read-only even if the job has a write credential. `KACHE_REMOTE_READONLY=0` does not turn that off.
+
+A laptop or other non-CI process is left as configured, so `kache sync --push` still works locally. Set `KACHE_REMOTE_READONLY=1` (or `cache.remote_readonly`) there when you want reads without writes.
+
+```yaml
+# Optional: make the read-only intent explicit in pull-request jobs.
+env:
+  KACHE_REMOTE_READONLY: "1"
+```
+
+GitHub withholds secrets and OIDC tokens from fork pull-request jobs, so those runs cannot publish unless you also pass a write credential another way. Same-repository pull requests do receive secrets; the CI policy above is what stops them writing.
+
+Pull-request jobs can still restore entries a trusted branch already published.
+
+C and C++ object entries are local-only. A remote pull does not warm them.
+
 ## Other CI systems
 
 Install Kache, then provide wrapper and remote configuration:

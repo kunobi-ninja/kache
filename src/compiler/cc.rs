@@ -4279,10 +4279,7 @@ fn digest_cc_include_dir_names_capped(parsed: &CcArgs, cap: usize) -> Result<Str
     hasher.update(b"include_dir_names.v1\n");
     let mut seen = 0usize;
     for dir in cc_user_include_dirs(parsed, &cwd) {
-        if exempt
-            .iter()
-            .any(|root| dir == *root || dir.starts_with(root))
-        {
+        if exempt.iter().any(|root| dir.starts_with(root)) {
             continue;
         }
         hasher.update(b"dir\n");
@@ -4343,20 +4340,17 @@ fn cc_flag_dir_values<'a>(rest: &'a [String], flag: &'a str) -> Vec<&'a str> {
     let mut values = Vec::new();
     let mut args = rest.iter();
     while let Some(arg) = args.next() {
-        if arg == flag {
+        let Some(suffix) = arg.strip_prefix(flag) else {
+            continue;
+        };
+        if suffix.is_empty() {
             if let Some(value) = args.next() {
                 values.push(value.as_str());
             }
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix(flag) {
-            if (flag == "-I" || flag == "/I") && !value.is_empty() {
-                values.push(value);
-            } else if let Some(value) = value.strip_prefix('=')
-                && !value.is_empty()
-            {
-                values.push(value);
-            }
+        } else if let Some(value) = suffix.strip_prefix('=')
+            && !value.is_empty()
+        {
+            values.push(value);
         }
     }
     values
@@ -10463,6 +10457,148 @@ mod tests {
         assert!(
             err.to_string().contains("exceeded 2"),
             "overflow must fail closed, got {err}"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_tracks_iquote_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let quote = temp.path().join("quote");
+        fs::create_dir(&quote).unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-iquote",
+            quote.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let before = digest_cc_include_dir_names(&parsed).unwrap();
+        fs::write(quote.join("local.h"), "int q;\n").unwrap();
+        let after = digest_cc_include_dir_names(&parsed).unwrap();
+        assert_ne!(
+            before, after,
+            "-iquote dirs must participate in the name digest"
+        );
+    }
+
+    #[test]
+    fn cc_flag_dir_values_reads_separated_and_equals_forms() {
+        let rest = [
+            "-iquote".to_string(),
+            "/q".to_string(),
+            "-isystem=/sys".to_string(),
+            "-isysroot".to_string(),
+            "/sdk".to_string(),
+            "-isystem=".to_string(),
+        ];
+        assert_eq!(cc_flag_dir_values(&rest, "-iquote"), ["/q"]);
+        assert_eq!(cc_flag_dir_values(&rest, "-isystem"), ["/sys"]);
+        assert_eq!(cc_flag_dir_values(&rest, "-isysroot"), ["/sdk"]);
+        assert!(cc_flag_dir_values(&rest, "-idirafter").is_empty());
+    }
+
+    #[test]
+    fn include_dir_digest_isystem_on_source_dir_is_exempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let srcdir = temp.path().join("src");
+        fs::create_dir(&srcdir).unwrap();
+        let source = srcdir.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-isystem",
+            srcdir.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let before = digest_cc_include_dir_names(&parsed).unwrap();
+        fs::write(srcdir.join("next_to_source.h"), "int n;\n").unwrap();
+        let after = digest_cc_include_dir_names(&parsed).unwrap();
+        assert_eq!(
+            before, after,
+            "-isystem on the source directory must exempt names next to the source"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_missing_dir_is_empty_not_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("no-such-inc");
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            missing.to_str().unwrap(),
+        ]))
+        .unwrap();
+        digest_cc_include_dir_names(&parsed)
+            .expect("ENOENT include dir must hash as empty, not fail closed");
+    }
+
+    #[test]
+    fn include_dir_digest_accepts_a_walk_that_hits_the_cap_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let include = temp.path().join("inc");
+        fs::create_dir(&include).unwrap();
+        for i in 0..2 {
+            fs::write(include.join(format!("h{i}.h")), "int h;\n").unwrap();
+        }
+        // Source lives in the include dir so the walk is one directory:
+        // unit.c + two headers = 3 names.
+        let source = include.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+        ]))
+        .unwrap();
+        digest_cc_include_dir_names_capped(&parsed, 3)
+            .expect("a walk of exactly `cap` names must succeed");
+    }
+
+    #[test]
+    fn include_dir_digest_counts_nested_directories_toward_the_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let include = temp.path().join("inc");
+        let nested = include.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("h.h"), "int h;\n").unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let err = digest_cc_include_dir_names_capped(&parsed, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeded 1"),
+            "the nested directory itself must count, got {err}"
+        );
+    }
+
+    #[test]
+    fn include_dir_names_still_match_is_false_without_a_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap()])).unwrap();
+        assert!(
+            !CcCompiler::new().include_dir_names_still_match(&parsed),
+            "no key snapshot means the names must not be treated as matching"
         );
     }
 

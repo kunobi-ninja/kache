@@ -101,9 +101,6 @@ pub(crate) fn apply_cargo_env_edit(existing: &str, additions: &[CargoEnvAssignme
             }
         }
         if !inserted {
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
             out.push_str("\n[env]\n");
             out.push_str(&block);
         }
@@ -226,6 +223,20 @@ mod tests {
         let path = dir.path().join("config.toml");
         let missing = missing_assignments_from_path(&path).unwrap();
         assert_eq!(missing, desired_assignments());
+    }
+
+    #[test]
+    fn apply_to_empty_file_starts_at_env_table() {
+        let additions = [CargoEnvAssignment {
+            name: "CC_KNOWN_WRAPPER_CUSTOM",
+            value: "kache",
+        }];
+        let out = apply_cargo_env_edit("", &additions);
+        assert_eq!(
+            out,
+            "[env]\nCC_KNOWN_WRAPPER_CUSTOM = \"kache\"\n",
+            "an empty config must not grow leading blank lines:\n{out}"
+        );
     }
 
     #[cfg(unix)]

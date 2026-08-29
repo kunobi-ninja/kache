@@ -672,7 +672,7 @@ fn write_cache_otlp_or_warn(
     dest: &Path,
     scenario: &str,
     phase: &str,
-) {
+) -> bool {
     let status = Command::new(kache)
         .args(["telemetry", "write"])
         .arg(dest)
@@ -687,12 +687,15 @@ fn write_cache_otlp_or_warn(
                 "[bench] cache otlp written to {}",
                 dest.join("metrics.otlp.json").display()
             );
+            true
         }
         Ok(code) => {
             eprintln!("[bench] warning: kache telemetry write exited {code}");
+            false
         }
         Err(err) => {
             eprintln!("[bench] warning: kache telemetry write failed: {err}");
+            false
         }
     }
 }
@@ -3191,6 +3194,95 @@ mod tests {
         assert!(is_run_artifact("schema_version"));
         assert!(is_run_artifact("bench-firefox.json"));
         assert!(!is_run_artifact("kache.log"));
+    }
+
+    #[test]
+    fn write_cache_otlp_or_warn_runs_telemetry_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("invoked.txt");
+        let kache = fake_kache_that_records(dir.path(), &marker, 0);
+        let dest = dir.path().join("cache-otlp-warm");
+        assert!(write_cache_otlp_or_warn(
+            &kache,
+            dir.path(),
+            &dir.path().join("kache.toml"),
+            &dest,
+            "bench-firefox",
+            "warm",
+        ));
+        let invoked = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            invoked.contains("telemetry"),
+            "expected telemetry subcommand, got {invoked:?}"
+        );
+        assert!(
+            invoked.contains("write"),
+            "expected write subcommand, got {invoked:?}"
+        );
+        assert!(
+            invoked.contains("bench-firefox") && invoked.contains("warm"),
+            "expected scenario and phase, got {invoked:?}"
+        );
+    }
+
+    #[test]
+    fn write_cache_otlp_or_warn_is_false_when_kache_exits_nonzero() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("invoked.txt");
+        let kache = fake_kache_that_records(dir.path(), &marker, 1);
+        assert!(!write_cache_otlp_or_warn(
+            &kache,
+            dir.path(),
+            &dir.path().join("kache.toml"),
+            &dir.path().join("cache-otlp-cold"),
+            "bench-firefox",
+            "cold",
+        ));
+        assert!(marker.is_file());
+    }
+
+    #[test]
+    fn write_cache_otlp_or_warn_is_false_when_kache_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!write_cache_otlp_or_warn(
+            &dir.path().join("no-such-kache"),
+            dir.path(),
+            &dir.path().join("kache.toml"),
+            &dir.path().join("cache-otlp-pull"),
+            "bench-firefox",
+            "pull",
+        ));
+    }
+
+    fn fake_kache_that_records(dir: &Path, marker: &Path, exit: i32) -> PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("fake-kache");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > '{}'\nexit {exit}\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).unwrap();
+            path
+        }
+        #[cfg(windows)]
+        {
+            let path = dir.join("fake-kache.cmd");
+            std::fs::write(
+                &path,
+                format!(
+                    "@echo off\r\necho %* > \"{}\"\r\nexit /b {exit}\r\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            path
+        }
     }
 
     #[test]

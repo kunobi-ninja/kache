@@ -503,6 +503,14 @@ mod tests {
             body["resourceMetrics"][0]["scopeMetrics"][0]["scope"]["name"],
             "kache.cache"
         );
+        let ts = body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["gauge"]["dataPoints"]
+            [0]["timeUnixNano"]
+            .as_str()
+            .expect("timeUnixNano is a string");
+        assert!(
+            ts.parse::<u128>().expect("unix nano") > 0,
+            "dump timestamp must be a positive integer, got {ts:?}"
+        );
     }
 
     #[test]

@@ -166,6 +166,8 @@ gitignore = true
 # Linux/macOS/Windows E2E smoke lanes exercise those entry points instead.
 # Keep only the whole-body replacements out of this lane: their parsing,
 # selection, measurement, verdict, artifact, and OTLP helpers remain in scope.
+# `run_cold_phase` is the same shape: a full clone/build that this lane cannot
+# drive. The dump it now calls (`write_cache_otlp_or_warn`) stays in scope.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -204,4 +206,5 @@ exclude_re = [
     "replace run_bench .* with Ok",
     "replace run_pull_bench .* with Ok",
     "replace run_sccache_bench .* with Ok",
+    "replace run_cold_phase .* with Ok",
 ]

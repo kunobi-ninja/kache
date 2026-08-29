@@ -82,7 +82,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ./scripts/require-ci-green.sh "$(git rev-parse HEAD)" \
-            "Check (Linux)" "Nix package" \
+            "Check (Linux)" "Nix package" "CoW filesystem (btrfs)" \
             "E2E smoke (Linux)" "E2E smoke (macOS)" "E2E smoke (Windows)" \
             "Test (macOS)" "Test (Windows)"
 

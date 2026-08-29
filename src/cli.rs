@@ -7449,6 +7449,14 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_never_writes_an_init_edit() {
+        assert!(should_write_init_step(false, true));
+        assert!(!should_write_init_step(true, true));
+        assert!(!should_write_init_step(false, false));
+        assert!(!should_write_init_step(true, false));
+    }
+
+    #[test]
     fn test_cargo_wrapper_edit_create() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -10722,6 +10730,8 @@ mod tests {
 // Interactive setup that resolves the common doctor issues:
 //   1. Writes `build.rustc-wrapper = "kache"` to $CARGO_HOME/config.toml
 //      (fallback to ~/.cargo/config.toml)
+//   1b. Adds HOST_CC / HOST_CXX / CC_KNOWN_WRAPPER_CUSTOM under `[env]`
+//       when those keys are absent. Never sets CC or CXX.
 //   2. Installs the daemon as a login service (launchd/systemd)
 //   3. Starts the daemon
 //
@@ -10810,6 +10820,12 @@ pub(crate) fn apply_cargo_wrapper_edit(existing: &str, plan: &CargoWrapperPlan) 
             out
         }
     }
+}
+
+/// Whether an init file-edit step should write. Dry-run (`check`) never
+/// writes, even if the operator would have accepted the prompt.
+fn should_write_init_step(check: bool, accepted: bool) -> bool {
+    !check && accepted
 }
 
 fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bool> {
@@ -10922,7 +10938,7 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
                 CargoWrapperPlan::AlreadySet => unreachable!(),
             };
             println!("  \x1b[33m→\x1b[0m {summary}");
-            if !check && prompt_yes_no(&question, true, yes)? {
+            if should_write_init_step(check, prompt_yes_no(&question, true, yes)?) {
                 if let Some(parent) = cargo_path.parent() {
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("creating {}", parent.display()))?;
@@ -10946,6 +10962,55 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
                     .with_context(|| format!("writing {}", cargo_path.display()))?;
                 println!("    \x1b[32m✓\x1b[0m wrote {}", cargo_path.display());
             }
+        }
+    }
+
+    // ── Step 1b: cargo [env] host C wrappers ─────────────────────
+    // HOST_CC/HOST_CXX wrap host compiles from the `cc` crate without replacing
+    // `cargo build --target`'s cross compiler. CC/CXX are never set here.
+    let env_missing = crate::cargo_env::missing_assignments_from_path(&cargo_path)?;
+    if env_missing.is_empty() {
+        println!(
+            "  \x1b[32m✓\x1b[0m cargo [env] host C wrappers already set in {}",
+            crate::wrapper_config::display_path(&cargo_path)
+        );
+    } else {
+        let names = env_missing
+            .iter()
+            .map(|assignment| assignment.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "  \x1b[33m→\x1b[0m set {names} in {} (does not set CC or CXX)",
+            crate::wrapper_config::display_path(&cargo_path)
+        );
+        if should_write_init_step(
+            check,
+            prompt_yes_no(
+                "Set host C compiler wrappers for Cargo build scripts?",
+                true,
+                yes,
+            )?,
+        ) {
+            if let Some(parent) = cargo_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            if cargo_path.exists()
+                && let Some(backup_path) = backup_path_for(&cargo_path)
+            {
+                std::fs::copy(&cargo_path, &backup_path)
+                    .with_context(|| format!("writing backup to {}", backup_path.display()))?;
+                println!(
+                    "    \x1b[32m✓\x1b[0m backup saved to {}",
+                    backup_path.display()
+                );
+            }
+            let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
+            let new = crate::cargo_env::apply_cargo_env_edit(&existing, &env_missing);
+            std::fs::write(&cargo_path, new)
+                .with_context(|| format!("writing {}", cargo_path.display()))?;
+            println!("    \x1b[32m✓\x1b[0m wrote {}", cargo_path.display());
         }
     }
 

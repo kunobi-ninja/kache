@@ -7,6 +7,8 @@ Kache caches conservative, single-source C and C++ object compilations. If it ca
 
 ## Set up the wrapper
 
+For Cargo build scripts, `kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config (and `CC_KNOWN_WRAPPER_CUSTOM=kache`). It does not set `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
+
 For build systems that honor `CC` and `CXX`:
 
 ```bash

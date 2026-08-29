@@ -5096,6 +5096,29 @@ mod tests {
         );
     }
 
+    /// cargo-mutants replacing `Drop` with `()` left the thread-local on.
+    /// The put tests never insert again after the guard, so they could not
+    /// see the leak.
+    #[cfg(unix)]
+    #[test]
+    fn mode_dropping_ingest_guard_clears_on_drop() {
+        assert!(
+            !FORCE_MODE_DROPPING_INGEST.with(std::cell::Cell::get),
+            "ingest emulation must start off"
+        );
+        {
+            let _forced = ModeDroppingIngest::enable();
+            assert!(
+                FORCE_MODE_DROPPING_INGEST.with(std::cell::Cell::get),
+                "enable must turn ingest emulation on"
+            );
+        }
+        assert!(
+            !FORCE_MODE_DROPPING_INGEST.with(std::cell::Cell::get),
+            "Drop must turn ingest emulation off so a later put on this thread is not forced"
+        );
+    }
+
     /// A mutable-kind blob must never share an inode with the build's output:
     /// mutating the output post-put (codesigning, stripping) must not be able
     /// to reach the content-addressed blob. Deterministic on every

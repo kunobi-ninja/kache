@@ -652,9 +652,9 @@ jobs:
   # unobservable in CI: the store's reflink ingest creates its staging temp with
   # `File::create` (umask mode, no +x), so a mode-losing ingest looks perfectly
   # healthy here and only breaks on btrfs / XFS-with-reflink / ZFS >= 2.2 /
-  # bcachefs / APFS. #648 fixed the restore half of that and #822 silently
-  # reverted it through the ingest half; both shipped green. This lane exists so
-  # a third round can't.
+  # bcachefs. macOS clonefile preserves mode, so APFS is not in that set.
+  # #648 fixed the restore half of that and #822 silently reverted it through
+  # the ingest half; both shipped green. This lane exists so a third round can't.
   cow-filesystem:
     name: CoW filesystem (btrfs)
     runs-on: ubuntu-latest
@@ -707,8 +707,8 @@ jobs:
           RUSTC_WRAPPER: ""
         run: |
           set -euo pipefail
-          cargo test --test custom_harness_test
-          cargo test --bins -- store:: link:: wrapper::tests::materialize_cached_artifact
+          cargo test -p kache --test custom_harness_test
+          cargo test -p kache --bins -- store:: link:: wrapper::tests::materialize_cached_artifact
       - name: Report mount usage
         if: always()
         run: df -h /mnt/cow || true

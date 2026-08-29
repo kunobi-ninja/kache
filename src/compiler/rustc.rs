@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use std::borrow::Cow;
+#[cfg(test)]
 use std::path::Path;
 
 use crate::args::RustcArgs;
@@ -316,8 +317,7 @@ fn is_compiler_bundled_wasm_target(target: &str) -> bool {
 }
 
 fn is_custom_target_spec(target: &str) -> bool {
-    let path = Path::new(target);
-    target.ends_with(".json") || target.contains('/') || target.contains('\\') || path.is_file()
+    target.contains('/') || target.contains('\\') || target.ends_with(".json")
 }
 
 fn is_wasm_triple(target: &str) -> bool {
@@ -366,16 +366,22 @@ fn wasm_link_refusal(parsed: &RustcArgs) -> Option<&'static str> {
 /// binary is not checkout-local. An invocation that already carries the flag
 /// keeps the caller's spelling. Passthrough compiles skip injection so the
 /// binary matches an unwrapped rustc.
+#[cfg(target_os = "macos")]
 fn macos_oso_prefix_flag(
     parsed: &RustcArgs,
     all_args: &[String],
     cache_this_compile: bool,
 ) -> Option<String> {
-    macos_oso_prefix_flag_inner(
-        parsed,
-        all_args,
-        cache_this_compile && cfg!(target_os = "macos"),
-    )
+    macos_oso_prefix_flag_inner(parsed, all_args, cache_this_compile)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_oso_prefix_flag(
+    _parsed: &RustcArgs,
+    _all_args: &[String],
+    _cache_this_compile: bool,
+) -> Option<String> {
+    None
 }
 
 fn macos_oso_prefix_flag_inner(
@@ -404,7 +410,7 @@ fn macos_oso_prefix_flag_inner(
         return None;
     }
     let mut prefix = out_dir.display().to_string();
-    if !prefix.ends_with('/') && !prefix.ends_with('\\') {
+    if !prefix.ends_with(['/', '\\']) {
         prefix.push('/');
     }
     Some(format!("-Clink-arg=-Wl,-oso_prefix,{prefix}"))
@@ -893,6 +899,42 @@ mod tests {
         ];
         argv.extend(extra.iter().map(|s| s.to_string()));
         RustcCompiler::new().parse(&argv).unwrap()
+    }
+
+    #[test]
+    fn refuse_reasons_admits_native_host_bins() {
+        let parsed = RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "--crate-name",
+                "app",
+                "--crate-type",
+                "bin",
+                "--emit",
+                "link",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "src/main.rs",
+            ]))
+            .unwrap();
+        assert!(
+            RustcCompiler::new().refuse_reasons(&parsed).is_empty(),
+            "a native GNU bin is not a WASM link: {:?}",
+            RustcCompiler::new().refuse_reasons(&parsed)
+        );
+    }
+
+    #[test]
+    fn refuse_reasons_treats_path_only_wasm_target_as_custom_spec() {
+        let parsed = linked_wasm("/tmp/wasm32-unknown-unknown", &[]);
+        let reasons = RustcCompiler::new().refuse_reasons(&parsed);
+        assert!(
+            reasons.iter().any(|r| matches!(
+                r,
+                RefuseReason::Unsupported(d) if d.contains("custom target spec")
+            )),
+            "a path-shaped wasm target must pass through, got {reasons:?}"
+        );
     }
 
     #[test]

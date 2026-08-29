@@ -1733,6 +1733,26 @@ mod tests {
     }
 
     #[test]
+    fn emits_link_is_false_for_metadata_only() {
+        let mut parsed = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "foo".to_string(),
+            "--crate-type".to_string(),
+            "bin".to_string(),
+            "src/main.rs".to_string(),
+            "--emit".to_string(),
+            "metadata".to_string(),
+        ])
+        .unwrap();
+        assert!(!parsed.emits_link());
+        parsed.emit = vec!["link".to_string()];
+        assert!(parsed.emits_link());
+        parsed.emit.clear();
+        assert!(parsed.emits_link());
+    }
+
+    #[test]
     fn test_parse_codegen_opt_no_value() {
         let (key, value) = parse_codegen_opt("debuginfo");
         assert_eq!(key, "debuginfo");

@@ -4633,6 +4633,46 @@ mod tests {
     }
 
     #[test]
+    fn crt_fold_requires_linux_os_and_linux_rustc_host() {
+        let args = parsed_linked_bin(None);
+        let a = crt_fold_key(
+            &args,
+            DARWIN_RUSTC_VERSION,
+            true,
+            false,
+            "crt1.o=aaa;libc.so.6=bbb",
+            "",
+            None,
+        )
+        .unwrap();
+        let b = crt_fold_key(
+            &args,
+            DARWIN_RUSTC_VERSION,
+            true,
+            false,
+            "crt1.o=zzz;libc.so.6=yyy",
+            "",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            a, b,
+            "a Darwin rustc hosted on Linux must not fold Linux CRT objects"
+        );
+    }
+
+    #[test]
+    fn sdk_fold_requires_macos_os_and_darwin_rustc_host() {
+        let args = parsed_linked_bin(None);
+        let a = crt_fold_key(&args, GNU_RUSTC_VERSION, false, true, "", "14.0 (a)", None).unwrap();
+        let b = crt_fold_key(&args, GNU_RUSTC_VERSION, false, true, "", "15.0 (b)", None).unwrap();
+        assert_eq!(
+            a, b,
+            "a GNU rustc hosted on macOS must not fold the Darwin SDK"
+        );
+    }
+
+    #[test]
     fn windows_hosts_do_not_key_linux_crt_or_macos_sdk() {
         let bin = parsed_linked_bin(None);
         assert_eq!(

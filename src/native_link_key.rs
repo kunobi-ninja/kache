@@ -119,10 +119,8 @@ fn print_file_name(driver: &Path, name: &str) -> Option<PathBuf> {
 /// Line Tools vs Xcode spell the same SDK differently and would over-key.
 /// `SDKROOT`, when set, is the SDK that is queried — reporting the default
 /// SDK's version beside another SDK's root would describe an SDK no link used.
+#[cfg(target_os = "macos")]
 pub(crate) fn sdk_identity_for(root: Option<String>) -> Result<Option<String>> {
-    if !cfg!(target_os = "macos") {
-        return Ok(None);
-    }
     let sdk = root.as_deref().unwrap_or("macosx");
     let version = xcrun(&["--sdk", sdk, "--show-sdk-version"])
         .ok_or_else(|| anyhow::anyhow!("xcrun --show-sdk-version failed"))?;
@@ -131,6 +129,12 @@ pub(crate) fn sdk_identity_for(root: Option<String>) -> Result<Option<String>> {
     Ok(Some(format!("{version} ({build})")))
 }
 
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn sdk_identity_for(_root: Option<String>) -> Result<Option<String>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
 fn xcrun(arguments: &[&str]) -> Option<String> {
     let output = Command::new("xcrun").args(arguments).output().ok()?;
     output

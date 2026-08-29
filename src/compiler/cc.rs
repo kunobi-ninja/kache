@@ -10358,6 +10358,7 @@ mod tests {
         assert_eq!(comp(&["gcc", "-c", "a.c", "-g"]), None);
     }
 
+    #[cfg(unix)]
     fn include_dir_test_compiler(dir: &Path) -> (CcCompiler, PathBuf, PathBuf) {
         use std::fs;
         #[cfg(unix)]
@@ -10376,6 +10377,7 @@ mod tests {
         (CcCompiler::new(), fake_cc, source)
     }
 
+    #[cfg(unix)]
     fn include_dir_key_ctx(dir: &Path) -> (crate::cache_key::FileHasher<'static>, PathBuf) {
         (crate::cache_key::FileHasher::new(), dir.join("cache"))
     }

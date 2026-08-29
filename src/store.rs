@@ -47,7 +47,7 @@ fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
     fs::set_permissions(blob, perms)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     /// Test-only ingest override: reproduce, on any filesystem, what a Linux
     /// CoW reflink does to a staged snapshot — independent bytes at the
@@ -63,15 +63,18 @@ thread_local! {
     /// `WINDOWS_HARDLINK_RESTORE` is the latter, but it is a real feature
     /// switch): `cargo test` runs store tests in parallel, and one test's
     /// emulation must not leak into another's put.
+    ///
+    /// Unix-only: the tests that construct [`ModeDroppingIngest`] are
+    /// `#[cfg(unix)]`, and Windows test builds fail `-D dead-code` otherwise.
     static FORCE_MODE_DROPPING_INGEST: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
 /// Enable [`FORCE_MODE_DROPPING_INGEST`] for the duration of the guard.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 struct ModeDroppingIngest;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl ModeDroppingIngest {
     fn enable() -> Self {
         FORCE_MODE_DROPPING_INGEST.with(|forced| forced.set(true));
@@ -79,7 +82,7 @@ impl ModeDroppingIngest {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for ModeDroppingIngest {
     fn drop(&mut self) {
         FORCE_MODE_DROPPING_INGEST.with(|forced| forced.set(false));
@@ -88,7 +91,7 @@ impl Drop for ModeDroppingIngest {
 
 /// Stage `source` at `tmp` the way a Linux CoW reflink would, reporting whether
 /// the emulation was active at all. See [`FORCE_MODE_DROPPING_INGEST`].
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn emulate_cow_reflink_ingest(source: &Path, tmp: &Path) -> Result<bool> {
     if !FORCE_MODE_DROPPING_INGEST.with(std::cell::Cell::get) {
         return Ok(false);
@@ -99,16 +102,13 @@ fn emulate_cow_reflink_ingest(source: &Path, tmp: &Path) -> Result<bool> {
     // the FICLONE ioctl, so the snapshot lands at `0o666 & !umask` whatever the
     // source was. The exact value varies with the umask; the only property that
     // matters here is that it carries no `+x`.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(tmp, fs::Permissions::from_mode(0o644))
-            .with_context(|| format!("resetting the emulated staging mode on {}", tmp.display()))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(tmp, fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("resetting the emulated staging mode on {}", tmp.display()))?;
     Ok(true)
 }
 
-#[cfg(not(test))]
+#[cfg(not(all(test, unix)))]
 #[inline(always)]
 fn emulate_cow_reflink_ingest(_source: &Path, _tmp: &Path) -> Result<bool> {
     Ok(false)

@@ -31,6 +31,67 @@ use crate::result::{FixtureResult, Measurement, PhaseResult, VerifyResult, fixtu
 use crate::scenario::MeasureSpec;
 use crate::source;
 
+/// Install PATH compiler-name shims for a masquerade fixture, or refuse on
+/// Windows (no symlink farm). Split by cfg so Windows does not see a `mut`
+/// that is never assigned (`unused_mut` under `-D warnings`).
+#[cfg(unix)]
+fn maybe_apply_compiler_shims(
+    fixture: &Fixture,
+    kache_path: &Path,
+    cache_dir: &Path,
+) -> Result<Option<Fixture>> {
+    if !fixture.compiler_shims {
+        return Ok(None);
+    }
+    let shim_dir = cache_dir.join("compiler-shims");
+    let output = Command::new(kache_path)
+        .arg("install-shims")
+        .arg("--force")
+        .arg(&shim_dir)
+        .output()
+        .with_context(|| {
+            format!(
+                "running `{} install-shims --force {}`",
+                kache_path.display(),
+                shim_dir.display()
+            )
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "kache install-shims failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut path = shim_dir.into_os_string();
+    path.push(":");
+    if let Some(orig) = std::env::var_os("PATH") {
+        path.push(orig);
+    }
+    let mut owned = fixture.clone();
+    owned
+        .env
+        .insert("PATH".into(), path.to_string_lossy().into_owned());
+    owned.env.remove("CC");
+    owned.env.remove("CXX");
+    Ok(Some(owned))
+}
+
+#[cfg(not(unix))]
+fn maybe_apply_compiler_shims(
+    fixture: &Fixture,
+    _kache_path: &Path,
+    _cache_dir: &Path,
+) -> Result<Option<Fixture>> {
+    if fixture.compiler_shims {
+        anyhow::bail!(
+            "fixture `{}` sets compiler_shims, which is Unix-only",
+            fixture.name
+        );
+    }
+    Ok(None)
+}
+
 /// Run every phase against `fixture` and return the aggregated result.
 ///
 /// The runner owns the cache dir lifecycle: a fresh `TempDir` is created
@@ -40,49 +101,7 @@ use crate::source;
 /// before `TempDir` removes the files underneath it.
 pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult> {
     let cache_dir = TempDir::new().context("creating per-fixture cache dir")?;
-    let mut fixture_owned: Option<Fixture> = None;
-    if fixture.compiler_shims {
-        #[cfg(not(unix))]
-        anyhow::bail!(
-            "fixture `{}` sets compiler_shims, which is Unix-only",
-            fixture.name
-        );
-        #[cfg(unix)]
-        {
-            let shim_dir = cache_dir.path().join("compiler-shims");
-            let output = Command::new(kache_path)
-                .arg("install-shims")
-                .arg("--force")
-                .arg(&shim_dir)
-                .output()
-                .with_context(|| {
-                    format!(
-                        "running `{} install-shims --force {}`",
-                        kache_path.display(),
-                        shim_dir.display()
-                    )
-                })?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "kache install-shims failed with {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            let mut path = shim_dir.into_os_string();
-            path.push(":");
-            if let Some(orig) = std::env::var_os("PATH") {
-                path.push(orig);
-            }
-            let mut owned = fixture.clone();
-            owned
-                .env
-                .insert("PATH".into(), path.to_string_lossy().into_owned());
-            owned.env.remove("CC");
-            owned.env.remove("CXX");
-            fixture_owned = Some(owned);
-        }
-    }
+    let fixture_owned = maybe_apply_compiler_shims(fixture, kache_path, cache_dir.path())?;
     let fixture = fixture_owned.as_ref().unwrap_or(fixture);
     eprintln!(
         "--- {} (cache: {})",

@@ -97,7 +97,7 @@ kache init --no-service
 kache init --yes
 ```
 
-`--check` reports proposed changes without writing. `--no-service` skips login-service installation.
+`--check` reports proposed changes without writing. `--no-service` skips login-service installation. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. It never sets `CC` or `CXX`.
 
 ## `kache doctor`
 

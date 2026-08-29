@@ -24,7 +24,7 @@ This trial does not edit Cargo configuration or install a service.
 kache init
 ```
 
-`init` configures Cargo, installs the daemon as a login service, and starts it. It is safe to run again when repairing a setup.
+`init` configures Cargo (`rustc-wrapper` and, when unset, `HOST_CC` / `HOST_CXX` for build-script C), installs the daemon as a login service, and starts it. It does not set `CC` or `CXX`. It is safe to run again when repairing a setup.
 
 Useful variants:
 

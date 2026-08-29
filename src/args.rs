@@ -914,6 +914,26 @@ impl RustcArgs {
             .find(|(k, _)| k == key)
             .and_then(|(_, v)| v.as_deref())
     }
+
+    /// Whether this invocation emits debug info.
+    ///
+    /// rustc's default is no debug info, so an absent `-Cdebuginfo` counts as
+    /// off, as do the explicit `0` / `none` spellings. Everything else (`1`,
+    /// `2`, `line-tables-only`, …) produces DWARF. `-g` desugars to
+    /// `-Cdebuginfo=2` at parse time.
+    pub fn debuginfo_enabled(&self) -> bool {
+        match self.get_codegen_opt("debuginfo") {
+            None => false,
+            Some("0") => false,
+            Some("none") => false,
+            Some(_) => true,
+        }
+    }
+
+    /// Whether rustc will invoke the linker for this invocation.
+    pub fn emits_link(&self) -> bool {
+        self.emit.is_empty() || self.emit.iter().any(|kind| kind == "link")
+    }
 }
 
 fn parse_extern(s: &str) -> ExternDep {

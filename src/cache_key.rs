@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Bump this when cache key logic changes in a way that could have produced
@@ -225,7 +225,16 @@ use std::path::{Path, PathBuf};
 // was enabled beneath a deny group, or accepted cfg values were tightened.
 // v0.16.0 shipped v27, so the bump also protects mixed fleets from consuming
 // already-persisted false-success entries.
-pub(crate) const CACHE_KEY_VERSION: u32 = 28;
+//
+// v29: native host-loaded links now pin the objects the driver actually
+// places (Linux CRT/startup + libc hashes) and the macOS SDK identity
+// (version + build), failing closed to passthrough when those essentials
+// cannot be resolved. macOS debug links also inject ld64 `-oso_prefix` so
+// `N_OSO` paths are relative to `--out-dir` rather than checkout-local.
+// WASM admission is explicit for rustc-bundled self-contained targets.
+// Shared with the cc recipe, so local and remote Rust/C entries from v28
+// are unreachable; `kache gc --stale-schema` reclaims them.
+pub(crate) const CACHE_KEY_VERSION: u32 = 29;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -1512,15 +1521,33 @@ pub fn compute_cache_key(
     // sysroot/toolchain, and poisoning those keys with the build host would
     // only destroy valid cross-machine hits without identifying that sysroot.
     // Probe failure is an error, making the wrapper pass through instead of
-    // risking a shared-cache false hit. This conditional component makes old
-    // native-linked keys unreachable while leaving portable rlib keys byte-for-
-    // byte unchanged, so a global CACHE_KEY_VERSION bump is unnecessary.
+    // risking a shared-cache false hit.
     fold_native_host_libc_signature(
         &mut hasher,
         args,
         &rustc_version,
         cfg!(target_os = "linux"),
         probe_linux_libc_signature,
+    )?;
+
+    // Stronger than the version string above: hash the CRT/startup objects and
+    // libc the driver actually places (Linux), and the SDK identity (macOS).
+    // Two hosts with the same `cc --version` / libc version banner and
+    // different object bytes then miss instead of sharing. If none of the
+    // essentials resolve, fail closed — passthrough rather than a key that
+    // claims to have pinned a runtime neither host identified. v29.
+    fold_native_link_runtime_identity(
+        &mut hasher,
+        args,
+        &rustc_version,
+        cfg!(target_os = "linux"),
+        cfg!(target_os = "macos"),
+        crate::native_link_key::probe_linux_crt_objects,
+        |sdkroot| match crate::native_link_key::sdk_identity_for(sdkroot)? {
+            Some(identity) => Ok(identity),
+            None => anyhow::bail!("the macOS SDK could not be identified"),
+        },
+        std::env::var("MACOSX_DEPLOYMENT_TARGET").ok(),
     )?;
 
     // Path remapping status: kache injects multi-prefix
@@ -3894,6 +3921,83 @@ where
     Ok(())
 }
 
+/// Fold hashed CRT/startup/libc objects (Linux) and SDK identity (macOS)
+/// into linked-output keys. Injected probes keep the gating testable without
+/// running host tools.
+fn fold_native_link_runtime_identity<H, Crt, Sdk>(
+    hasher: &mut H,
+    args: &RustcArgs,
+    rustc_version: &str,
+    running_on_linux: bool,
+    running_on_macos: bool,
+    crt_probe: Crt,
+    sdk_probe: Sdk,
+    deployment_target: Option<String>,
+) -> Result<()>
+where
+    H: KeyFold,
+    Crt: FnOnce(&Path) -> Result<BTreeMap<String, String>>,
+    Sdk: FnOnce(Option<String>) -> Result<String>,
+{
+    let emits_link = args.emit.is_empty() || args.emit.iter().any(|kind| kind == "link");
+    if !args.is_executable_output() || !emits_link {
+        return Ok(());
+    }
+    if !running_on_linux && !running_on_macos {
+        return Ok(());
+    }
+    let rustc_version = rustc_version_for_libc(args, rustc_version, get_rustc_version)?;
+    let host = rustc_host_triple(&rustc_version)
+        .context("wrapped rustc -vV output has no host triple; cannot key native link runtime")?;
+    let effective_target = args.target.as_deref().unwrap_or(host);
+    if effective_target != host {
+        return Ok(());
+    }
+
+    if running_on_linux && host.split('-').any(|component| component == "linux") {
+        let driver = resolve_link_driver(args)
+            .context("native Linux link has no cc/linker driver; cannot key CRT objects")?;
+        let objects = crt_probe(&driver).context("determining native Linux CRT/libc identity")?;
+        let encoded = crate::native_link_key::encode_crt_objects(&objects);
+        fold_field(hasher, b"host_crt.v1:", encoded.as_bytes());
+        tracing::trace!(
+            "[key:{}] host_crt={}",
+            args.crate_name.as_deref().unwrap_or("unknown"),
+            encoded.replace('\n', ",")
+        );
+    }
+
+    if running_on_macos && host.split('-').any(|component| component == "darwin") {
+        let identity = sdk_probe(std::env::var("SDKROOT").ok())
+            .context("determining macOS SDK identity for cache key")?;
+        fold_field(hasher, b"host_sdk.v1:", identity.as_bytes());
+        tracing::trace!(
+            "[key:{}] host_sdk={}",
+            args.crate_name.as_deref().unwrap_or("unknown"),
+            identity
+        );
+        if let Some(target) = deployment_target.filter(|value| !value.is_empty()) {
+            fold_field(hasher, b"host_deployment_target.v1:", target.as_bytes());
+            tracing::trace!(
+                "[key:{}] host_deployment_target={}",
+                args.crate_name.as_deref().unwrap_or("unknown"),
+                target
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_link_driver(args: &RustcArgs) -> Option<PathBuf> {
+    let linker = args.get_codegen_opt("linker").unwrap_or("cc");
+    let linker_path = Path::new(linker);
+    if linker_path.is_absolute() {
+        Some(linker_path.to_path_buf())
+    } else {
+        resolve_in_path(linker)
+    }
+}
+
 fn is_libc_version(version: &str) -> bool {
     let mut parts = version.split('.');
     let Some(major) = parts.next() else {
@@ -4034,6 +4138,8 @@ mod tests {
 
     const GNU_RUSTC_VERSION: &str =
         "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
+    const DARWIN_RUSTC_VERSION: &str =
+        "rustc 1.90.0\nhost: aarch64-apple-darwin\nrelease: 1.90.0\n";
 
     #[test]
     fn source_identity_uses_a_stable_configured_root() {
@@ -4288,6 +4394,262 @@ mod tests {
         assert_eq!(
             rustc_host_triple(&version),
             Some("x86_64-unknown-linux-gnu")
+        );
+    }
+
+    fn parsed_linked_bin(target: Option<&str>) -> RustcArgs {
+        let mut argv = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "probe".to_string(),
+            "--crate-type".to_string(),
+            "bin".to_string(),
+            "src/lib.rs".to_string(),
+            "-Clinker=/abs/cc".to_string(),
+        ];
+        if let Some(target) = target {
+            argv.push("--target".to_string());
+            argv.push(target.to_string());
+        }
+        RustcArgs::parse(&argv).unwrap()
+    }
+
+    fn crt_fold_key(
+        args: &RustcArgs,
+        rustc_version: &str,
+        linux: bool,
+        macos: bool,
+        crt: &str,
+        sdk: &str,
+        deployment_target: Option<&str>,
+    ) -> Result<String> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"base-key");
+        fold_native_link_runtime_identity(
+            &mut hasher,
+            args,
+            rustc_version,
+            linux,
+            macos,
+            |_| {
+                let mut objects = BTreeMap::new();
+                for pair in crt.split(';').filter(|pair| !pair.is_empty()) {
+                    let (name, digest) = pair.split_once('=').unwrap();
+                    objects.insert(name.to_string(), digest.to_string());
+                }
+                Ok(objects)
+            },
+            |_| Ok(sdk.to_string()),
+            deployment_target.map(str::to_string),
+        )?;
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    #[test]
+    fn native_linux_linked_outputs_key_crt_object_hashes() {
+        let args = parsed_linked_bin(None);
+        let old = crt_fold_key(
+            &args,
+            GNU_RUSTC_VERSION,
+            true,
+            false,
+            "crt1.o=aaa;libc.so.6=bbb",
+            "",
+            None,
+        )
+        .unwrap();
+        let new = crt_fold_key(
+            &args,
+            GNU_RUSTC_VERSION,
+            true,
+            false,
+            "crt1.o=aaa;libc.so.6=ccc",
+            "",
+            None,
+        )
+        .unwrap();
+        assert_ne!(old, new, "libc object bytes must re-key the native link");
+    }
+
+    #[test]
+    fn rlibs_and_cross_targets_do_not_key_crt_or_sdk() {
+        let rlib = parsed_crate_type("rlib", None);
+        assert_eq!(
+            crt_fold_key(
+                &rlib,
+                GNU_RUSTC_VERSION,
+                true,
+                true,
+                "crt1.o=aaa;libc.so.6=bbb",
+                "14.0 (a)",
+                Some("11.0"),
+            )
+            .unwrap(),
+            crt_fold_key(
+                &rlib,
+                GNU_RUSTC_VERSION,
+                true,
+                true,
+                "crt1.o=zzz;libc.so.6=yyy",
+                "15.0 (b)",
+                Some("12.0"),
+            )
+            .unwrap(),
+            "portable rlibs must not be tied to CRT/SDK identity"
+        );
+
+        let cross = parsed_linked_bin(Some("aarch64-unknown-linux-gnu"));
+        assert_eq!(
+            crt_fold_key(
+                &cross,
+                GNU_RUSTC_VERSION,
+                true,
+                false,
+                "crt1.o=aaa;libc.so.6=bbb",
+                "",
+                None,
+            )
+            .unwrap(),
+            crt_fold_key(
+                &cross,
+                GNU_RUSTC_VERSION,
+                true,
+                false,
+                "crt1.o=zzz;libc.so.6=yyy",
+                "",
+                None,
+            )
+            .unwrap(),
+            "cross-target output must not be tied to the build host CRT"
+        );
+    }
+
+    #[test]
+    fn native_linux_crt_probe_fails_closed() {
+        let bin = parsed_linked_bin(None);
+        let mut hasher = blake3::Hasher::new();
+        let err = fold_native_link_runtime_identity(
+            &mut hasher,
+            &bin,
+            GNU_RUSTC_VERSION,
+            true,
+            false,
+            |_| anyhow::bail!("no startup object"),
+            |_| unreachable!("linux fold must not probe the macOS SDK"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("determining native Linux CRT/libc identity")
+        );
+    }
+
+    #[test]
+    fn native_macos_linked_outputs_key_sdk_identity() {
+        let args = parsed_linked_bin(None);
+        let old = crt_fold_key(
+            &args,
+            DARWIN_RUSTC_VERSION,
+            false,
+            true,
+            "",
+            "14.0 (23A344)",
+            None,
+        )
+        .unwrap();
+        let new = crt_fold_key(
+            &args,
+            DARWIN_RUSTC_VERSION,
+            false,
+            true,
+            "",
+            "15.0 (24A348)",
+            None,
+        )
+        .unwrap();
+        assert_ne!(old, new, "SDK identity must re-key the native macOS link");
+
+        let with_dt = crt_fold_key(
+            &args,
+            DARWIN_RUSTC_VERSION,
+            false,
+            true,
+            "",
+            "14.0 (23A344)",
+            Some("11.0"),
+        )
+        .unwrap();
+        assert_ne!(
+            old, with_dt,
+            "MACOSX_DEPLOYMENT_TARGET must re-key when set"
+        );
+    }
+
+    #[test]
+    fn native_macos_sdk_probe_fails_closed() {
+        let bin = parsed_linked_bin(None);
+        let mut hasher = blake3::Hasher::new();
+        let err = fold_native_link_runtime_identity(
+            &mut hasher,
+            &bin,
+            DARWIN_RUSTC_VERSION,
+            false,
+            true,
+            |_| unreachable!("macOS fold must not probe Linux CRT"),
+            |_| anyhow::bail!("sdk missing"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("determining macOS SDK identity for cache key")
+        );
+    }
+
+    #[test]
+    fn metadata_only_outputs_do_not_probe_crt_or_sdk() {
+        let mut metadata = parsed_linked_bin(None);
+        metadata.emit = vec!["metadata".to_string()];
+        let mut hasher = blake3::Hasher::new();
+        fold_native_link_runtime_identity(
+            &mut hasher,
+            &metadata,
+            GNU_RUSTC_VERSION,
+            true,
+            true,
+            |_| panic!("metadata-only output must not probe CRT"),
+            |_| panic!("metadata-only output must not probe SDK"),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn windows_hosts_do_not_key_linux_crt_or_macos_sdk() {
+        let bin = parsed_linked_bin(None);
+        assert_eq!(
+            crt_fold_key(
+                &bin,
+                GNU_RUSTC_VERSION,
+                false,
+                false,
+                "crt1.o=aaa;libc.so.6=bbb",
+                "14.0 (a)",
+                Some("11.0"),
+            )
+            .unwrap(),
+            crt_fold_key(
+                &bin,
+                DARWIN_RUSTC_VERSION,
+                false,
+                false,
+                "crt1.o=zzz;libc.so.6=yyy",
+                "15.0 (b)",
+                Some("12.0"),
+            )
+            .unwrap(),
+            "Windows hosts keep the existing linker --version identity only"
         );
     }
 

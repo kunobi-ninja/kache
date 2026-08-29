@@ -6,6 +6,8 @@
 //! callers a stable shape that other compiler adapters can match.
 
 use anyhow::Result;
+use std::borrow::Cow;
+use std::path::Path;
 
 use crate::args::RustcArgs;
 use crate::cache_key::compute_cache_key;
@@ -144,10 +146,22 @@ impl RustcCompiler {
                 crate::cache_key::get_rustc_commit_hash(&parsed.rustc).as_deref(),
             );
         let skip_remap = skip_remap_override.unwrap_or_else(|| parsed.skip_path_remap());
+        // Only the cache miss path injects `-oso_prefix`. A passthrough must
+        // not change the binary relative to an unwrapped rustc. `None` here
+        // is that cache path (`execute` / isolated incremental).
+        let cache_this_compile = skip_remap_override.is_none();
+        let compiler_args = match macos_oso_prefix_flag(parsed, all_args, cache_this_compile) {
+            Some(flag) => {
+                let mut extended = all_args.to_vec();
+                extended.push(flag);
+                Cow::Owned(extended)
+            }
+            None => Cow::Borrowed(all_args),
+        };
         compile::run_rustc(
             &parsed.rustc,
             parsed.inner_rustc.as_deref(),
-            all_args,
+            compiler_args.as_ref(),
             parsed.has_expanded_argfiles(),
             parsed.output.as_deref(),
             parsed.out_dir.as_deref(),
@@ -279,7 +293,121 @@ fn rustc_refuse_reasons(
             "rustc --pretty/--unpretty source dump — not cacheable",
         ));
     }
+    if let Some(reason) = wasm_link_refusal(parsed) {
+        reasons.push(RefuseReason::Unsupported(reason));
+    }
     reasons
+}
+
+/// Built-in WebAssembly targets whose linker and CRT ship in rustc.
+/// Custom target specs never enter this list.
+const COMPILER_BUNDLED_WASM_TARGETS: &[&str] = &[
+    "wasm32-unknown-unknown",
+    "wasm32-wasi",
+    "wasm32-wasip1",
+    "wasm32-wasip1-threads",
+    "wasm32-wasip2",
+    "wasm32v1-none",
+    "wasm64-unknown-unknown",
+];
+
+fn is_compiler_bundled_wasm_target(target: &str) -> bool {
+    COMPILER_BUNDLED_WASM_TARGETS.contains(&target)
+}
+
+fn is_custom_target_spec(target: &str) -> bool {
+    let path = Path::new(target);
+    target.ends_with(".json") || target.contains('/') || target.contains('\\') || path.is_file()
+}
+
+fn is_wasm_triple(target: &str) -> bool {
+    target
+        .split(['-', '.', '/', '\\'])
+        .any(|component| component.starts_with("wasm"))
+}
+
+fn link_self_contained_disabled(parsed: &RustcArgs) -> bool {
+    match parsed.get_codegen_opt("link-self-contained") {
+        None => false,
+        Some("y" | "yes" | "on" | "true") => false,
+        Some(_) => true,
+    }
+}
+
+/// Explicit admission for rustc-bundled self-contained WASM links.
+///
+/// Custom specs, emscripten, and `link-self-contained=no` stay passthrough:
+/// those links depend on an external toolchain or CRT that kache does not
+/// pin. rlibs and metadata-only emits are unaffected.
+fn wasm_link_refusal(parsed: &RustcArgs) -> Option<&'static str> {
+    if !parsed.is_executable_output() || !parsed.emits_link() {
+        return None;
+    }
+    let target = parsed.target.as_deref()?;
+    if is_custom_target_spec(target) && is_wasm_triple(target) {
+        return Some("wasm custom target spec — not yet");
+    }
+    if is_compiler_bundled_wasm_target(target) {
+        if link_self_contained_disabled(parsed) {
+            return Some("wasm link-self-contained disabled — not yet");
+        }
+        return None;
+    }
+    if is_wasm_triple(target) {
+        return Some("wasm target uses an external toolchain — not yet");
+    }
+    None
+}
+
+/// ld64 `-oso_prefix` for a cached macOS debug link.
+///
+/// A `-g` Mach-O records absolute object paths in `N_OSO`. Prefixing the
+/// output directory makes those paths relative to `--out-dir`, so a restored
+/// binary is not checkout-local. An invocation that already carries the flag
+/// keeps the caller's spelling. Passthrough compiles skip injection so the
+/// binary matches an unwrapped rustc.
+fn macos_oso_prefix_flag(
+    parsed: &RustcArgs,
+    all_args: &[String],
+    cache_this_compile: bool,
+) -> Option<String> {
+    macos_oso_prefix_flag_inner(
+        parsed,
+        all_args,
+        cache_this_compile && cfg!(target_os = "macos"),
+    )
+}
+
+fn macos_oso_prefix_flag_inner(
+    parsed: &RustcArgs,
+    all_args: &[String],
+    enabled: bool,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    if !parsed.debuginfo_enabled() || !parsed.is_executable_output() || !parsed.emits_link() {
+        return None;
+    }
+    if all_args.iter().any(|arg| arg.contains("-oso_prefix,")) {
+        return None;
+    }
+    if parsed
+        .target
+        .as_deref()
+        .is_some_and(|target| !target.contains("-apple-darwin"))
+    {
+        return None;
+    }
+    let out_dir = parsed.out_dir.as_ref()?;
+    if !out_dir.is_absolute() {
+        return None;
+    }
+    let mut prefix = out_dir.display().to_string();
+    if !prefix.ends_with('/') && !prefix.ends_with('\\') {
+        prefix.push('/');
+    }
+    Some(format!("-Clink-arg=-Wl,-oso_prefix,{prefix}"))
 }
 
 #[cfg(test)]
@@ -748,5 +876,153 @@ mod tests {
                 "{t} should be Hardlink strategy"
             );
         }
+    }
+
+    fn linked_wasm(target: &str, extra: &[&str]) -> RustcArgs {
+        let mut argv = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "widget".to_string(),
+            "--crate-type".to_string(),
+            "bin".to_string(),
+            "--emit".to_string(),
+            "link".to_string(),
+            "--target".to_string(),
+            target.to_string(),
+            "src/main.rs".to_string(),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        RustcCompiler::new().parse(&argv).unwrap()
+    }
+
+    #[test]
+    fn refuse_reasons_admits_compiler_bundled_wasm_links() {
+        for target in COMPILER_BUNDLED_WASM_TARGETS {
+            let parsed = linked_wasm(target, &[]);
+            let reasons = RustcCompiler::new().refuse_reasons(&parsed);
+            assert!(
+                reasons.is_empty(),
+                "{target} should use rustc's bundled linker, got {reasons:?}"
+            );
+        }
+
+        let yes = linked_wasm("wasm32-wasip1", &["-Clink-self-contained=yes"]);
+        assert!(RustcCompiler::new().refuse_reasons(&yes).is_empty());
+    }
+
+    #[test]
+    fn refuse_reasons_passthroughs_external_wasm_toolchains() {
+        for target in ["wasm32-unknown-emscripten", "wasm32-wali-linux-musl"] {
+            let parsed = linked_wasm(target, &[]);
+            let reasons = RustcCompiler::new().refuse_reasons(&parsed);
+            assert!(
+                reasons.iter().any(|r| matches!(
+                    r,
+                    RefuseReason::Unsupported(d) if d.contains("external toolchain")
+                )),
+                "{target} should pass through, got {reasons:?}"
+            );
+        }
+
+        let custom = linked_wasm("/tmp/wasm32-unknown-unknown.json", &[]);
+        let reasons = RustcCompiler::new().refuse_reasons(&custom);
+        assert!(
+            reasons.iter().any(|r| matches!(
+                r,
+                RefuseReason::Unsupported(d) if d.contains("custom target spec")
+            )),
+            "custom wasm spec should pass through, got {reasons:?}"
+        );
+
+        let disabled = linked_wasm("wasm32-unknown-unknown", &["-Clink-self-contained=no"]);
+        let reasons = RustcCompiler::new().refuse_reasons(&disabled);
+        assert!(
+            reasons.iter().any(|r| matches!(
+                r,
+                RefuseReason::Unsupported(d) if d.contains("link-self-contained")
+            )),
+            "link-self-contained=no should pass through, got {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn refuse_reasons_does_not_refuse_wasm_rlibs() {
+        let parsed = RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "--crate-name",
+                "widget",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "wasm32-unknown-emscripten",
+                "src/lib.rs",
+            ]))
+            .unwrap();
+        assert!(RustcCompiler::new().refuse_reasons(&parsed).is_empty());
+    }
+
+    fn debug_bin_args(out_dir: &Path, extra: &[&str]) -> (RustcArgs, Vec<String>) {
+        let mut argv = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "foo".to_string(),
+            "--crate-type".to_string(),
+            "bin".to_string(),
+            "-g".to_string(),
+            "--out-dir".to_string(),
+            out_dir.display().to_string(),
+            "src/main.rs".to_string(),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        let parsed = RustcCompiler::new().parse(&argv).unwrap();
+        (parsed, argv)
+    }
+
+    #[test]
+    fn oso_prefix_is_injected_for_cached_macos_debug_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let (parsed, argv) = debug_bin_args(&out_dir, &[]);
+        let flag = macos_oso_prefix_flag_inner(&parsed, &argv, true).unwrap();
+        let mut prefix = out_dir.display().to_string();
+        if !prefix.ends_with('/') && !prefix.ends_with('\\') {
+            prefix.push('/');
+        }
+        assert_eq!(flag, format!("-Clink-arg=-Wl,-oso_prefix,{prefix}"));
+
+        let already = debug_bin_args(&out_dir, &["-Clink-arg=-Wl,-oso_prefix,/elsewhere/"]);
+        assert!(macos_oso_prefix_flag_inner(&already.0, &already.1, true).is_none());
+
+        let wasm = debug_bin_args(&out_dir, &["--target", "wasm32-unknown-unknown"]);
+        assert!(macos_oso_prefix_flag_inner(&wasm.0, &wasm.1, true).is_none());
+
+        let release = RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "bin",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "src/main.rs",
+            ]))
+            .unwrap();
+        assert!(
+            macos_oso_prefix_flag_inner(&release, &release.all_args, true).is_none(),
+            "no debuginfo means no oso_prefix"
+        );
+
+        let relative = debug_bin_args(Path::new("target/debug/deps"), &[]);
+        assert!(macos_oso_prefix_flag_inner(&relative.0, &relative.1, true).is_none());
+
+        let (parsed, argv) = debug_bin_args(&out_dir, &[]);
+        assert!(
+            macos_oso_prefix_flag_inner(&parsed, &argv, false).is_none(),
+            "passthrough must not rewrite the link"
+        );
     }
 }

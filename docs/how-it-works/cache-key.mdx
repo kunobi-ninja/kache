@@ -16,8 +16,13 @@ The exact set depends on the invocation. It can include:
 - code-generation flags, rustflags, and requested emit kinds
 - the contents of `--extern` dependencies
 - compile-time environment values rustc reports
-- native libc identity for host-loaded Linux outputs
+- native libc version and hashed CRT/startup objects for host-loaded Linux outputs
+- macOS SDK identity (version and build) for host-loaded Darwin outputs
 - configured salt, extra inputs, and declared environment inputs
+
+Host-loaded Linux and macOS links pass through if those runtime inputs cannot be resolved, rather than sharing a binary neither host pinned. rustc-bundled self-contained WebAssembly targets (`wasm32-unknown-unknown`, the WASI family, `wasm32v1-none`, `wasm64-unknown-unknown`) are cached; custom target specs, emscripten, and `link-self-contained=no` pass through.
+
+On macOS, a cached debug link gets ld64 `-oso_prefix` for `--out-dir`, so `N_OSO` object paths in the binary are not checkout-local.
 
 Incremental directory names and harmless local path spellings are excluded or normalized.
 

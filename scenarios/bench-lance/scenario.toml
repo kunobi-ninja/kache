@@ -41,6 +41,42 @@ repo = "https://github.com/lance-format/lance.git"
 ref    = "v10.0.0"
 objdir = "target"
 
+# Lance v10 invokes protoc with only its local proto directory but imports
+# three well-known types. Supply their schemas inside the include tree Lance
+# already passes to protoc.
+[[file]]
+path = "protos/google/protobuf/empty.proto"
+mode = "write"
+content = '''
+syntax = "proto3";
+package google.protobuf;
+message Empty {}
+'''
+
+[[file]]
+path = "protos/google/protobuf/any.proto"
+mode = "write"
+content = '''
+syntax = "proto3";
+package google.protobuf;
+message Any {
+  string type_url = 1;
+  bytes value = 2;
+}
+'''
+
+[[file]]
+path = "protos/google/protobuf/timestamp.proto"
+mode = "write"
+content = '''
+syntax = "proto3";
+package google.protobuf;
+message Timestamp {
+  int64 seconds = 1;
+  int32 nanos = 2;
+}
+'''
+
 [checks.assert.warm]
 min_key_stability_pct = 50.0
 max_passthrough_pct = 40.0

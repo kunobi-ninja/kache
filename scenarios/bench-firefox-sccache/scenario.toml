@@ -22,6 +22,9 @@ content = """
 ac_add_options --enable-optimize
 ac_add_options --disable-debug
 ac_add_options --disable-tests
+rust_target="$(rustc -vV | sed -n 's/^host: //p')"
+ac_add_options --host="$rust_target"
+ac_add_options --target="$rust_target"
 
 # Use Firefox's native sccache integration for C/C++ and rustc.
 ac_add_options --with-ccache={cache}
@@ -48,6 +51,11 @@ content_file = "patches/firefox-mozbuild-path-clean.patch"
 path         = "gfx/wr/webrender/build.rs"
 mode         = "patch"
 content_file = "patches/firefox-generated-source-relative.patch"
+
+[[file]]
+path         = "gfx/wr/webrender/src/texture_cache.rs"
+mode         = "patch"
+content_file = "../bench-firefox/patches/firefox-cbindgen-visibility.patch"
 
 [checks.measure.warm]
 min_hit_rate_pct = 50.0

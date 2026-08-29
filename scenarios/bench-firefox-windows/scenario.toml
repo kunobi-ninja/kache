@@ -88,32 +88,22 @@ mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/{objdir}
 
 # Cross-clone cache-key portability. KACHE_BASE_DIR rewrites paths under it to a
 # stable sentinel in the cache key; @TOPSRCDIR@ expands per worktree so each
-# normalizes its OWN objdir path. (Windows path shapes mean convergence is
-# best-effort here — see the relaxed warm assertion below.)
+# normalizes its own objdir path.
 mk_add_options "export KACHE_BASE_DIR=@TOPSRCDIR@"
 
 # Pin the Firefox build ID so buildid.cpp / application.ini.h are byte-identical
 # across worktrees built minutes apart.
 mk_add_options "export MOZ_BUILD_DATE=20260101000000"
 
-# Opt path-only env vars into kache key normalization (the OUT_DIR contract).
-mk_add_options "export KACHE_PATH_ONLY_ENV_VARS=BUILDCONFIG_RS,MOZ_TOPOBJDIR,MOZ_TOPSRCDIR,CONVERSIONS_FILE,GLEAN_METRICS_FILE,BINDINGS,TYPENUM_BUILD_CONSTS,TYPENUM_BUILD_OP,TYPENUM_BUILD_GENERIC_CONSTS"
 """
 
-# Shared cross-clone convergence patches — reused from bench-firefox (resolved
-# relative to this scenario dir). mozbuild path-clean + generated-source-relative
-# make the cascade-root rlibs byte-identical across checkouts. These are
-# text/`git apply` patches; if Windows checkout line endings reject them, the
-# run fails loudly at apply time (a known thing to shake out on first real run).
+# Mozilla's upstream cbindgen fix for Firefox 151 (Bug 2046162). Without it,
+# cbindgen emits `BudgetType_VALUES[COUNT]`, which clang-cl rejects because
+# COUNT is an associated Rust constant and is not in the C++ scope.
 [[file]]
-path         = "build/rust/mozbuild/generate_buildconfig.py"
+path         = "gfx/wr/webrender/src/texture_cache.rs"
 mode         = "patch"
-content_file = "../bench-firefox/patches/firefox-mozbuild-path-clean.patch"
-
-[[file]]
-path         = "gfx/wr/webrender/build.rs"
-mode         = "patch"
-content_file = "../bench-firefox/patches/firefox-generated-source-relative.patch"
+content_file = "../bench-firefox/patches/firefox-cbindgen-visibility.patch"
 
 # v1 gates. min_key_stability_pct is relaxed (cross-path convergence on Windows
 # is unsolved); max_passthrough_pct + max_errors are the meaningful gates that

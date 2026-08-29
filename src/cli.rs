@@ -361,6 +361,111 @@ pub(crate) fn snapshot_from_direct_reads(
     }
 }
 
+/// Write cache counters as OTLP JSON for Kartero (`metrics.otlp.json` +
+/// `schema_version`). Uses the running daemon when reachable; otherwise the
+/// local store. Does not auto-start a daemon, so a finished bench dumps what
+/// is already on disk instead of an empty new process.
+pub fn telemetry_write(
+    config: &Config,
+    dir: &std::path::Path,
+    scenario: Option<&str>,
+    phase: Option<&str>,
+) -> Result<()> {
+    let snap = match daemon::send_stats_request_options(config, false, false, None, Some(24)) {
+        Ok(resp) => StatsSnapshot {
+            total_size: resp.total_size,
+            max_size: resp.max_size,
+            entry_count: resp.entry_count,
+            entries: resp.entries.unwrap_or_default(),
+            event_stats: resp.events,
+            daemon_connected: true,
+            daemon_version: resp.version,
+            daemon_build_epoch: resp.build_epoch,
+            pending_uploads: resp.pending_uploads,
+            active_downloads: resp.active_downloads,
+            s3_concurrency_total: resp.s3_concurrency_total,
+            s3_concurrency_used: resp.s3_concurrency_used,
+            uploads_completed: resp.uploads_completed,
+            uploads_failed: resp.uploads_failed,
+            uploads_skipped: resp.uploads_skipped,
+            uploads_suppressed: resp.uploads_suppressed,
+            downloads_completed: resp.downloads_completed,
+            downloads_failed: resp.downloads_failed,
+            downloads_suppressed: resp.downloads_suppressed,
+            remote_check_roundtrips: resp.remote_check_roundtrips,
+            negative_hits: resp.negative_hits,
+            negative_entries: resp.negative_entries,
+            remote_degraded: resp.remote_degraded,
+            bytes_uploaded: resp.bytes_uploaded,
+            bytes_downloaded: resp.bytes_downloaded,
+            recent_transfers: resp.recent_transfers,
+            blob_stats: resp.blob_stats,
+            recent_summaries: resp.recent_summaries,
+            prefetch: resp.prefetch,
+            in_flight: resp.in_flight,
+            daemon_effective_config: resp.effective_config,
+        },
+        Err(_) => snapshot_from_direct_reads(config, false, "size", Some(24), false),
+    };
+    crate::otel::write_otlp(
+        dir,
+        &otel_snapshot_from_stats(config, &snap),
+        crate::VERSION,
+        scenario,
+        phase,
+    )?;
+    eprintln!(
+        "wrote {} and {}",
+        dir.join(crate::otel::METRICS_FILE).display(),
+        dir.join(crate::otel::SCHEMA_VERSION_FILE).display()
+    );
+    Ok(())
+}
+
+fn otel_snapshot_from_stats(config: &Config, snap: &StatsSnapshot) -> crate::otel::OtelSnapshot {
+    crate::otel::OtelSnapshot {
+        remote_kind: config
+            .remote
+            .as_ref()
+            .map(|remote| remote.backend_kind())
+            .unwrap_or("none"),
+        store_max: snap.max_size,
+        store_size: Some(snap.total_size),
+        store_entries: Some(snap.entry_count as u64),
+        pending_uploads: Some(snap.pending_uploads as u64),
+        active_downloads: Some(snap.active_downloads as u64),
+        s3_concurrency_total: snap.s3_concurrency_total as u64,
+        s3_concurrency_used: snap.s3_concurrency_used as u64,
+        uploads_completed: snap.uploads_completed,
+        uploads_failed: snap.uploads_failed,
+        uploads_skipped: snap.uploads_skipped,
+        uploads_suppressed: snap.uploads_suppressed,
+        downloads_completed: snap.downloads_completed,
+        downloads_failed: snap.downloads_failed,
+        downloads_suppressed: snap.downloads_suppressed,
+        bytes_uploaded: snap.bytes_uploaded,
+        bytes_downloaded: snap.bytes_downloaded,
+        remote_check_roundtrips: snap.remote_check_roundtrips,
+        negative_hits: snap.negative_hits,
+        negative_entries: snap.negative_entries,
+        remote_degraded: snap.remote_degraded,
+        prefetch_downloads: snap.prefetch.downloads_completed,
+        prefetch_bytes: snap.prefetch.bytes_downloaded,
+        prefetch_keys_used: snap.prefetch.keys_used,
+        prefetch_keys_cancelled: snap.prefetch.keys_cancelled,
+        prefetch_keys_over_budget: snap.prefetch.keys_over_budget,
+        prefetch_plans_advisory: snap.prefetch.plans_advisory,
+        prefetch_plans_fallback: snap.prefetch.plans_fallback,
+        prefetch_list_requests: snap.prefetch.list_requests_total,
+        prefetch_list_failures: snap.prefetch.list_failures_total,
+        prefetch_pack_requests: snap.prefetch.pack_requests_total,
+        prefetch_v3_requests: snap.prefetch.v3_requests_total,
+        prefetch_cancelled: snap.prefetch.cancelled,
+        prefetch_last_plan_candidates: snap.prefetch.last_plan_candidates,
+        prefetch_last_plan_wall_ms: snap.prefetch.last_plan_wall_ms,
+    }
+}
+
 // ── kache stats ────────────────────────────────────────────────────────────
 
 fn cloned_targets_line(disk: &crate::machine::DiskView) -> Option<String> {
@@ -8034,6 +8139,50 @@ mod tests {
                 .filter(|m| m.contains("likely source code"))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn telemetry_write_emits_cache_scope_not_bench() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let out = dir.path().join("otlp");
+        telemetry_write(&config, &out, Some("bench-firefox"), Some("warm"))
+            .expect("telemetry write");
+        let body = std::fs::read_to_string(out.join("metrics.otlp.json")).unwrap();
+        assert!(
+            body.contains("\"kache.cache\""),
+            "cache OTLP must use the kache.cache scope"
+        );
+        assert!(
+            body.contains("\"kache.cache.scenario\""),
+            "bench dumps must name the scenario"
+        );
+        assert!(
+            body.contains("bench-firefox"),
+            "scenario value must match kache.bench.project"
+        );
+        assert!(
+            body.contains("\"kache.cache.phase\""),
+            "bench dumps must name the phase"
+        );
+        assert!(
+            body.contains("warm"),
+            "phase value must match the bench phase"
+        );
+        assert!(
+            !body.contains("kache.bench."),
+            "cache dump must not mix bench gauges"
+        );
+        assert!(
+            !body.contains("\"sum\""),
+            "Kartero drops non-gauge series; cache dump must be gauges"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("schema_version"))
+                .unwrap()
+                .trim(),
+            "1"
         );
     }
 

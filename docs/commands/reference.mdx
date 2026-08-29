@@ -21,6 +21,7 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 | `daemon` | Inspect and manage the background daemon |
 | `monitor` | Open the live dashboard |
 | `stats` | Print a non-interactive summary |
+| `telemetry` | Write cache counters as OTLP JSON for Kartero |
 | `why-miss` | Explain a crate's recent key change |
 | `report` | Produce text, Markdown, JSON, or trace output |
 | `config` | Open the configuration editor |
@@ -184,6 +185,15 @@ kache stats --since 1h
 ```
 
 The default window is 24 hours.
+
+## `kache telemetry`
+
+```bash
+kache telemetry write ./cache-otlp
+kache telemetry write ./cache-otlp --scenario bench-firefox --phase warm
+```
+
+Writes `metrics.otlp.json` and `schema_version` for Kartero. Metric names are `kache.cache.*` / `kache.prefetch.*` (scope `kache.cache`), never `kache.bench.*`. `--scenario` must match `kache.bench.project`. `--phase` is `cold`, `warm`, or `pull` so dumps from the same scenario do not collide. The rustc wrapper does not write these files.
 
 ## `kache why-miss`
 

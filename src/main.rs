@@ -23,6 +23,7 @@ mod machine;
 mod miss_chain;
 mod native_archive;
 mod opcounts;
+mod otel;
 mod path_normalizer;
 mod planner_client;
 mod platform;
@@ -270,6 +271,12 @@ enum Commands {
         since: String,
     },
 
+    /// Write cache counters as OTLP JSON for Kartero to import later
+    Telemetry {
+        #[command(subcommand)]
+        command: TelemetryCommands,
+    },
+
     /// Diagnose why a specific crate missed the cache
     WhyMiss {
         /// Crate name to investigate
@@ -339,6 +346,21 @@ enum DaemonCommands {
     Uninstall,
     /// Stream daemon logs
     Log,
+}
+
+#[derive(Subcommand)]
+enum TelemetryCommands {
+    /// Snapshot live cache counters into `metrics.otlp.json` + `schema_version`
+    Write {
+        /// Directory to write. Created if missing.
+        dir: PathBuf,
+        /// Bench scenario this dump belongs to (same string as `kache.bench.project`).
+        #[arg(long)]
+        scenario: Option<String>,
+        /// Bench phase this dump belongs to (`cold`, `warm`, `pull`).
+        #[arg(long)]
+        phase: Option<String>,
+    },
 }
 
 fn command_supports_json(command: &Option<Commands>) -> bool {
@@ -750,6 +772,14 @@ fn main() -> Result<()> {
             let hours = parse_duration_hours(&since);
             cli::stats(&config, &config_provenance, hours, json)
         }
+        Some(Commands::Telemetry {
+            command:
+                TelemetryCommands::Write {
+                    dir,
+                    scenario,
+                    phase,
+                },
+        }) => cli::telemetry_write(&config, &dir, scenario.as_deref(), phase.as_deref()),
         Some(Commands::WhyMiss { crate_name }) => cli::why_miss(&config, &crate_name, json),
         Some(Commands::Monitor { since }) => {
             if json {
@@ -1139,6 +1169,13 @@ mod tests {
         assert!(!command_supports_json(&Some(Commands::Config)));
         assert!(!command_supports_json(&Some(Commands::Monitor {
             since: None
+        })));
+        assert!(!command_supports_json(&Some(Commands::Telemetry {
+            command: TelemetryCommands::Write {
+                dir: PathBuf::from("/tmp"),
+                scenario: None,
+                phase: None,
+            },
         })));
         assert!(!command_supports_json(&None));
 

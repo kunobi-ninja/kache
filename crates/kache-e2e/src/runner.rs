@@ -32,9 +32,8 @@ use crate::scenario::MeasureSpec;
 use crate::source;
 
 /// Install PATH compiler-name shims for a masquerade fixture, or refuse on
-/// Windows (no symlink farm). Split by cfg so Windows does not see a `mut`
-/// that is never assigned (`unused_mut` under `-D warnings`).
-#[cfg(unix)]
+/// Windows (no symlink farm). One function on every OS so Linux mutation
+/// testing does not "miss" a `cfg(not(unix))` helper it never compiles.
 fn maybe_apply_compiler_shims(
     fixture: &Fixture,
     kache_path: &Path,
@@ -43,53 +42,49 @@ fn maybe_apply_compiler_shims(
     if !fixture.compiler_shims {
         return Ok(None);
     }
-    let shim_dir = cache_dir.join("compiler-shims");
-    let output = Command::new(kache_path)
-        .arg("install-shims")
-        .arg("--force")
-        .arg(&shim_dir)
-        .output()
-        .with_context(|| {
-            format!(
-                "running `{} install-shims --force {}`",
-                kache_path.display(),
-                shim_dir.display()
-            )
-        })?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "kache install-shims failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let mut path = shim_dir.into_os_string();
-    path.push(":");
-    if let Some(orig) = std::env::var_os("PATH") {
-        path.push(orig);
-    }
-    let mut owned = fixture.clone();
-    owned
-        .env
-        .insert("PATH".into(), path.to_string_lossy().into_owned());
-    owned.env.remove("CC");
-    owned.env.remove("CXX");
-    Ok(Some(owned))
-}
-
-#[cfg(not(unix))]
-fn maybe_apply_compiler_shims(
-    fixture: &Fixture,
-    _kache_path: &Path,
-    _cache_dir: &Path,
-) -> Result<Option<Fixture>> {
-    if fixture.compiler_shims {
+    #[cfg(not(unix))]
+    {
+        let _ = (kache_path, cache_dir);
         anyhow::bail!(
             "fixture `{}` sets compiler_shims, which is Unix-only",
             fixture.name
         );
     }
-    Ok(None)
+    #[cfg(unix)]
+    {
+        let shim_dir = cache_dir.join("compiler-shims");
+        let output = Command::new(kache_path)
+            .arg("install-shims")
+            .arg("--force")
+            .arg(&shim_dir)
+            .output()
+            .with_context(|| {
+                format!(
+                    "running `{} install-shims --force {}`",
+                    kache_path.display(),
+                    shim_dir.display()
+                )
+            })?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "kache install-shims failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let mut path = shim_dir.into_os_string();
+        path.push(":");
+        if let Some(orig) = std::env::var_os("PATH") {
+            path.push(orig);
+        }
+        let mut owned = fixture.clone();
+        owned
+            .env
+            .insert("PATH".into(), path.to_string_lossy().into_owned());
+        owned.env.remove("CC");
+        owned.env.remove("CXX");
+        Ok(Some(owned))
+    }
 }
 
 /// Run every phase against `fixture` and return the aggregated result.
@@ -1562,5 +1557,93 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.c"), "int main(){}").unwrap();
         assert!(inspect_restored_depinfo(dir.path()).is_none());
+    }
+
+    fn dummy_shim_fixture(compiler_shims: bool) -> crate::fixture::Fixture {
+        crate::fixture::Fixture {
+            name: "shim-test".into(),
+            source: None,
+            env: std::collections::HashMap::from([("CC".into(), "cc".into())]),
+            commands: crate::fixture::Commands {
+                build: "true".into(),
+                clean: "true".into(),
+            },
+            verify: None,
+            assertions: Default::default(),
+            tags: Vec::new(),
+            checks: Default::default(),
+            diff: None,
+            modify: None,
+            negative_control_exempt: false,
+            check_depinfo: false,
+            requires: Vec::new(),
+            compiler_shims,
+            os: Vec::new(),
+            windows: None,
+            dir: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn compiler_shims_off_does_not_rewrite_the_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = dummy_shim_fixture(false);
+        let out = super::maybe_apply_compiler_shims(&fixture, Path::new("/no-kache"), tmp.path())
+            .expect("off must succeed without running kache");
+        assert!(out.is_none(), "must not rewrite a non-shim fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_shims_on_fails_when_kache_cannot_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = dummy_shim_fixture(true);
+        let err = super::maybe_apply_compiler_shims(
+            &fixture,
+            Path::new("/no-such-kache-binary"),
+            tmp.path(),
+        )
+        .expect_err("a missing kache must not look like a successful shim install");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("install-shims") || msg.contains("No such") || msg.contains("not found"),
+            "{msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_shims_on_prepends_path_and_drops_cc() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let kache = tmp.path().join("kache");
+        std::fs::write(&kache, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&kache, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fixture = dummy_shim_fixture(true);
+        let out = super::maybe_apply_compiler_shims(&fixture, &kache, tmp.path())
+            .expect("a succeeding kache must yield a rewritten fixture")
+            .expect("compiler_shims must produce a fixture, not None");
+        let path = out.env.get("PATH").expect("PATH must be set");
+        assert!(
+            path.contains("compiler-shims"),
+            "shim dir must be on PATH: {path}"
+        );
+        assert!(
+            !out.env.contains_key("CC"),
+            "CC must be dropped so Make uses PATH"
+        );
+        assert!(!out.env.contains_key("CXX"));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn compiler_shims_on_windows_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = dummy_shim_fixture(true);
+        let err = super::maybe_apply_compiler_shims(&fixture, Path::new("kache"), tmp.path())
+            .expect_err("Windows has no symlink farm");
+        assert!(format!("{err:#}").contains("Unix-only"));
     }
 }

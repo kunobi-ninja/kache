@@ -11269,14 +11269,10 @@ pub(crate) fn install_shims_named(
         "Make, CMake, autotools, and Arch PKGBUILDs that invoke gcc/cc/clang \
          from PATH then go through kache. No CC/CXX edit and no shell wrapper."
     );
-    if dir == crate::compiler::shim::system_shim_dir() {
-        println!("For makepkg, put PATH=\"/usr/lib/kache:$PATH\" in ~/.makepkg.conf.");
-    } else {
-        println!(
-            "For makepkg, put PATH=\"{}:$PATH\" in ~/.makepkg.conf.",
-            dir.display()
-        );
-    }
+    println!(
+        "For makepkg, put PATH=\"{}:$PATH\" in ~/.makepkg.conf.",
+        dir.display()
+    );
     Ok(())
 }
 
@@ -11306,6 +11302,39 @@ mod shim_install_tests {
                 "{name} must still be installed"
             );
         }
+    }
+
+    #[test]
+    fn empty_dir_is_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !super::shim_dir_is_ready(dir.path()),
+            "an empty directory must not count as an installed farm"
+        );
+    }
+
+    #[test]
+    fn install_makes_the_dir_ready_and_a_wrong_target_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        install_shims(&shims, false).unwrap();
+        assert!(
+            super::shim_dir_is_ready(&shims),
+            "the installer must produce a farm that init treats as already done"
+        );
+
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let not_kache = other.join("not-kache");
+        std::fs::write(&not_kache, b"#!/bin/sh\n").unwrap();
+        for name in SHIM_NAMES {
+            std::fs::remove_file(shims.join(name)).unwrap();
+            std::os::unix::fs::symlink(not_kache.as_path(), shims.join(name)).unwrap();
+        }
+        assert!(
+            !super::shim_dir_is_ready(&shims),
+            "links that do not resolve to this kache must not look ready"
+        );
     }
 
     #[test]

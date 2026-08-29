@@ -2418,6 +2418,36 @@ mod shim_tests {
 
     #[cfg(unix)]
     #[test]
+    fn default_and_system_shim_dirs_are_the_documented_locations() {
+        let home = default_shim_dir();
+        assert!(
+            home.ends_with(".local/lib/kache/shims"),
+            "user farm must be ~/.local/lib/kache/shims, got {}",
+            home.display()
+        );
+        assert_eq!(system_shim_dir(), PathBuf::from("/usr/lib/kache"));
+    }
+
+    #[test]
+    fn a_path_that_does_not_hold_kache_is_not_an_installed_farm() {
+        let kache = PathBuf::from("/opt/kache/bin/kache");
+        let decoy = PathBuf::from("/opt/other/shims");
+        let status = shim_path_status(
+            &[PathBuf::from("/usr/bin")],
+            Some(&kache),
+            std::slice::from_ref(&decoy),
+            &|_| true,
+            &|path| Some(path.to_path_buf()),
+        );
+        assert!(!status.on_path);
+        assert_eq!(
+            status.detail, "not installed",
+            "a decoy directory must not count as the kache farm: {}",
+            status.detail
+        );
+    }
+
+    #[test]
     fn extra_names_on_path_include_versioned_compilers_not_the_farm() {
         use std::os::unix::fs::PermissionsExt;
 

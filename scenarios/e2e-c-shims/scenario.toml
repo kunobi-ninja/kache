@@ -1,0 +1,56 @@
+# Same C project as e2e-c-hello, intercepted by PATH compiler-name shims
+# instead of `CC="$KACHE cc"`. Make uses `CC ?= cc`, so with CC unset it
+# execs `cc` from PATH. The harness installs shims and prepends them.
+#
+# Unix only (`install-shims` creates symlinks). Windows stays on the
+# prefix method in e2e-c-hello.
+
+name = "e2e-c-shims"
+tags = ["suite:e2e", "lang:cc"]
+compiler_shims = true
+os = ["linux", "macos"]
+
+[source]
+kind = "fixture"
+path = "../e2e-c-hello/source"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/foo"
+expected_stdout_contains = ["hello from bar"]
+
+[diff]
+artifacts = ["build/foo.o"]
+
+[modify]
+file = "src/bar.h"
+find = "hello from bar"
+replace = "edited greeting"
+
+[assertions.cold]
+min_entries_after = 1
+max_compiler_runs = 1
+max_preprocessor_runs = 1
+max_probe_runs = 1
+
+[assertions.warm]
+min_hits = 1
+max_compiler_runs = 0
+max_preprocessor_runs = 0
+max_probe_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+[assertions.relocate]
+min_hits = 1
+max_compiler_runs = 0
+max_preprocessor_runs = 1
+
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1
+max_preprocessor_runs = 1

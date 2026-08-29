@@ -116,6 +116,12 @@ pub struct Fixture {
     #[serde(default)]
     pub requires: Vec<String>,
 
+    /// When true, the harness runs `kache install-shims` into the fixture
+    /// cache dir, prepends that directory to `PATH`, and drops `CC`/`CXX`.
+    /// Make then finds `cc` as kache (ccache's masquerade method). Unix only.
+    #[serde(default)]
+    pub compiler_shims: bool,
+
     /// Operating systems this fixture supports, by `std::env::consts::OS`
     /// value (`"linux"`, `"macos"`, `"windows"`). Empty (default) = all.
     /// When non-empty and the current OS isn't listed, the harness SKIPS the

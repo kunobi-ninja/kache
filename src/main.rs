@@ -314,12 +314,17 @@ enum Commands {
     /// Create compiler-name symlinks pointing at kache, for transparent
     /// interception by prepending the directory to PATH
     InstallShims {
-        /// Directory to populate (created if missing)
-        dir: PathBuf,
+        /// Directory to populate. Defaults to ~/.local/lib/kache/shims
+        #[arg(value_name = "DIR")]
+        dir: Option<PathBuf>,
 
         /// Replace existing entries instead of refusing
         #[arg(long)]
         force: bool,
+
+        /// Also wrap compiler names already on PATH (gcc-13, target triplets)
+        #[arg(long)]
+        from_path: bool,
     },
 
     /// Generate shell completion scripts
@@ -796,7 +801,19 @@ fn main() -> Result<()> {
             tui::run_monitor(&config, hours)
         }
         #[cfg(unix)]
-        Some(Commands::InstallShims { dir, force }) => cli::install_shims(&dir, force),
+        Some(Commands::InstallShims {
+            dir,
+            force,
+            from_path,
+        }) => {
+            let dir = dir.unwrap_or_else(compiler::shim::default_shim_dir);
+            let extra = if from_path {
+                compiler::shim::extra_compiler_names_from_env()
+            } else {
+                Vec::new()
+            };
+            cli::install_shims_named(&dir, force, &extra)
+        }
         // Unix-only (symlinks); the Windows `.exe` shim story differs (#310).
         #[cfg(not(unix))]
         Some(Commands::InstallShims { .. }) => Err(anyhow::anyhow!(

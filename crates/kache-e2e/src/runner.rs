@@ -40,6 +40,50 @@ use crate::source;
 /// before `TempDir` removes the files underneath it.
 pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult> {
     let cache_dir = TempDir::new().context("creating per-fixture cache dir")?;
+    let mut fixture_owned: Option<Fixture> = None;
+    if fixture.compiler_shims {
+        #[cfg(not(unix))]
+        anyhow::bail!(
+            "fixture `{}` sets compiler_shims, which is Unix-only",
+            fixture.name
+        );
+        #[cfg(unix)]
+        {
+            let shim_dir = cache_dir.path().join("compiler-shims");
+            let output = Command::new(kache_path)
+                .arg("install-shims")
+                .arg("--force")
+                .arg(&shim_dir)
+                .output()
+                .with_context(|| {
+                    format!(
+                        "running `{} install-shims --force {}`",
+                        kache_path.display(),
+                        shim_dir.display()
+                    )
+                })?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "kache install-shims failed with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let mut path = shim_dir.into_os_string();
+            path.push(":");
+            if let Some(orig) = std::env::var_os("PATH") {
+                path.push(orig);
+            }
+            let mut owned = fixture.clone();
+            owned
+                .env
+                .insert("PATH".into(), path.to_string_lossy().into_owned());
+            owned.env.remove("CC");
+            owned.env.remove("CXX");
+            fixture_owned = Some(owned);
+        }
+    }
+    let fixture = fixture_owned.as_ref().unwrap_or(fixture);
     eprintln!(
         "--- {} (cache: {})",
         fixture.name,

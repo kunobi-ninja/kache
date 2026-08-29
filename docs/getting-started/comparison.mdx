@@ -13,7 +13,7 @@ This page describes the current projects; it does not claim that one cache is un
 | --- | --- | --- |
 | Primary workflow | Local-first cache with optional explicit remote synchronization | Client-server compiler cache with local and remote storage |
 | Rust setup | `RUSTC_WRAPPER=kache`, `kache init`, or `kache cargo` | `RUSTC_WRAPPER=sccache` |
-| C/C++ setup | Compiler-name shims or build-system launcher configuration | Compiler wrapper or build-system launcher configuration |
+| C/C++ setup | PATH compiler-name shims (`kache install-shims`) or `CC="kache cc"` | Prefix wrapper (`sccache gcc`); no ccache-style PATH farm |
 | Remote backends | S3-compatible storage and filesystem paths | S3, Redis, Memcached, GCS, Azure, GitHub Actions, WebDAV, and others listed by sccache |
 | Inspection | `monitor`, `stats`, `why-miss`, `report`, `list`, and `doctor` | `--show-stats`, logs, and server commands |
 | Remote transfer | On-demand restore plus `sync`, manifests, and prefetch | Remote access is part of normal server operation |
@@ -27,6 +27,7 @@ This page describes the current projects; it does not claim that one cache is un
 - You want to inspect individual events and ask why a compile missed.
 - You want explicit pull, push, manifest, and prefetch controls for CI.
 - Caching eligible Rust executable and linker outputs matters to your workload.
+- You want one `PATH` change to cache Make/CMake/PKGBUILD object compiles without wrapping `CC` in a shell.
 
 ## Where Kache may not fit yet
 

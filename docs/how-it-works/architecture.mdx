@@ -61,7 +61,7 @@ See [Daemon overview](/docs/daemon/overview) and [Lifecycle](/docs/daemon/lifecy
 
 As `RUSTC_WRAPPER`, Kache sees rustc and workspace-wrapper invocations. It does not wrap Cargo itself or arbitrary tools. Rust link work driven by rustc can be cached when the artifact policy allows it; an independently invoked linker is outside this path.
 
-C/C++ caching is separate. Kache must be invoked as the compiler wrapper or through a compiler-name shim, and currently caches supported object compilations locally.
+C/C++ caching is separate. Kache must be invoked as the compiler wrapper (`kache cc`) or through a compiler-name shim on `PATH` (`kache install-shims`), and currently caches supported object compilations locally. See [C and C++](/docs/getting-started/c-cpp).
 
 ## Planner
 

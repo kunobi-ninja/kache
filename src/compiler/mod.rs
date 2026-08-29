@@ -1908,6 +1908,7 @@ mod tests {
 /// compiler at `argv[1]`, fall through to CLI mode, and fail parsing `foo.c`
 /// as a subcommand.
 pub(crate) mod shim {
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
     /// The compiler names a generated shim directory populates. Deliberately
@@ -1972,6 +1973,164 @@ pub(crate) mod shim {
             name,
             &dirs,
             self_exe.as_deref(),
+            &|candidate| super::is_executable(candidate),
+            &|path| std::fs::canonicalize(path).ok(),
+        )
+    }
+
+    /// User-level farm created by `kache install-shims` with no directory argument.
+    pub(crate) fn default_shim_dir() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local/lib/kache/shims")
+    }
+
+    /// Distro-package farm (`pacman -S kache-bin`, the kache `.deb`).
+    pub(crate) fn system_shim_dir() -> PathBuf {
+        PathBuf::from("/usr/lib/kache")
+    }
+
+    /// Compiler names already on PATH that are not in [`SHIM_NAMES`].
+    ///
+    /// `kache install-shims --from-path` uses this so versioned and
+    /// target-prefixed drivers (`gcc-13`, `x86_64-pc-linux-gnu-gcc`) get a
+    /// symlink without a second hardcoded list. Entries that resolve to kache
+    /// itself are skipped, otherwise a re-run would treat the farm as compilers.
+    pub(crate) fn extra_compiler_names(
+        path_dirs: &[PathBuf],
+        self_exe: Option<&Path>,
+        is_candidate: &dyn Fn(&Path) -> bool,
+        resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> Vec<String> {
+        let self_real = self_exe.and_then(resolve);
+        let mut names = BTreeSet::new();
+        for dir in path_dirs {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !is_candidate(&path) {
+                    continue;
+                }
+                if let (Some(real), Some(mine)) = (resolve(&path), self_real.as_deref())
+                    && real == mine
+                {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if SHIM_NAMES.contains(&name) {
+                    continue;
+                }
+                if invoked_as_compiler(name) {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    /// Live wiring for [`extra_compiler_names`].
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn extra_compiler_names_from_env() -> Vec<String> {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        let self_exe = std::env::current_exe().ok();
+        extra_compiler_names(
+            &dirs,
+            self_exe.as_deref(),
+            &|candidate| super::is_executable(candidate),
+            &|path| std::fs::canonicalize(path).ok(),
+        )
+    }
+
+    /// Whether a compiler-name shim is the first `gcc`/`cc`/… on PATH.
+    pub(crate) struct ShimPathStatus {
+        pub on_path: bool,
+        pub detail: String,
+        pub fix: Option<String>,
+    }
+
+    fn dir_holds_kache_shims(
+        dir: &Path,
+        self_real: Option<&Path>,
+        resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> bool {
+        let Some(mine) = self_real else {
+            return false;
+        };
+        SHIM_NAMES
+            .iter()
+            .any(|name| resolve(&dir.join(name)).is_some_and(|real| real == mine))
+    }
+
+    /// `on_path` is true when the first PATH hit for any canonical compiler
+    /// name resolves to this kache binary. Otherwise, report a farm that exists
+    /// but is not first on PATH, or that nothing is installed.
+    pub(crate) fn shim_path_status(
+        path_dirs: &[PathBuf],
+        self_exe: Option<&Path>,
+        installed_dirs: &[PathBuf],
+        is_candidate: &dyn Fn(&Path) -> bool,
+        resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> ShimPathStatus {
+        let self_real = self_exe.and_then(resolve);
+        for name in SHIM_NAMES {
+            for dir in path_dirs {
+                let candidate = dir.join(name);
+                if !is_candidate(&candidate) {
+                    continue;
+                }
+                if let (Some(real), Some(mine)) = (resolve(&candidate), self_real.as_deref())
+                    && real == mine
+                {
+                    return ShimPathStatus {
+                        on_path: true,
+                        detail: format!("{name} on PATH is a kache shim ({})", dir.display()),
+                        fix: None,
+                    };
+                }
+                // First hit for this name is some other binary. Try the next name.
+                break;
+            }
+        }
+
+        let installed = installed_dirs
+            .iter()
+            .find(|dir| dir_holds_kache_shims(dir, self_real.as_deref(), resolve));
+        if let Some(dir) = installed {
+            return ShimPathStatus {
+                on_path: false,
+                detail: format!("installed at {}, not first on PATH", dir.display()),
+                fix: Some(format!("export PATH=\"{}:$PATH\"", dir.display())),
+            };
+        }
+
+        let default = default_shim_dir();
+        ShimPathStatus {
+            on_path: false,
+            detail: "not installed".into(),
+            fix: Some(format!(
+                "kache install-shims && export PATH=\"{}:$PATH\"",
+                default.display()
+            )),
+        }
+    }
+
+    /// Live wiring for [`shim_path_status`].
+    pub(crate) fn live_shim_path_status() -> ShimPathStatus {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        let self_exe = std::env::current_exe().ok();
+        let default = default_shim_dir();
+        let system = system_shim_dir();
+        let installed = [default, system];
+        shim_path_status(
+            &dirs,
+            self_exe.as_deref(),
+            &installed,
             &|candidate| super::is_executable(candidate),
             &|path| std::fs::canonicalize(path).ok(),
         )
@@ -2189,5 +2348,114 @@ mod shim_tests {
         assert!(wrapper_args(&["kache".into(), "gcc".into(), "a.c".into()]).is_none());
         assert!(wrapper_args(&["kache".into(), "stats".into()]).is_none());
         assert!(wrapper_args(&[]).is_none());
+    }
+
+    #[test]
+    fn shim_path_status_passes_when_the_first_gcc_is_kache() {
+        let kache = PathBuf::from("/opt/kache/bin/kache");
+        let shims = PathBuf::from("/shims");
+        let real = PathBuf::from("/usr/bin");
+        let resolve = |path: &Path| -> Option<PathBuf> {
+            if path.starts_with("/shims") {
+                Some(kache.clone())
+            } else {
+                Some(path.to_path_buf())
+            }
+        };
+        let status = shim_path_status(&[shims, real], Some(&kache), &[], &|_| true, &resolve);
+        assert!(status.on_path, "{}", status.detail);
+        assert!(status.detail.contains("/shims"), "{}", status.detail);
+        assert!(status.fix.is_none());
+    }
+
+    #[test]
+    fn shim_path_status_reports_installed_farm_that_is_not_on_path() {
+        let kache = PathBuf::from("/opt/kache/bin/kache");
+        let farm = PathBuf::from("/home/user/.local/lib/kache/shims");
+        let real = PathBuf::from("/usr/bin");
+        let resolve = |path: &Path| -> Option<PathBuf> {
+            if path.starts_with(&farm) {
+                Some(kache.clone())
+            } else {
+                Some(path.to_path_buf())
+            }
+        };
+        let status = shim_path_status(
+            &[real],
+            Some(&kache),
+            std::slice::from_ref(&farm),
+            &|_| true,
+            &resolve,
+        );
+        assert!(!status.on_path);
+        assert!(
+            status.detail.contains("not first on PATH"),
+            "{}",
+            status.detail
+        );
+        assert_eq!(
+            status.fix.as_deref(),
+            Some("export PATH=\"/home/user/.local/lib/kache/shims:$PATH\"")
+        );
+    }
+
+    #[test]
+    fn shim_path_status_reports_missing_farm() {
+        let kache = PathBuf::from("/opt/kache/bin/kache");
+        let status = shim_path_status(
+            &[PathBuf::from("/usr/bin")],
+            Some(&kache),
+            &[],
+            &|_| true,
+            &|path| Some(path.to_path_buf()),
+        );
+        assert!(!status.on_path);
+        assert_eq!(status.detail, "not installed");
+        let fix = status.fix.expect("missing farm must say how to install");
+        assert!(fix.contains("kache install-shims"), "{fix}");
+        assert!(fix.contains("export PATH="), "{fix}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extra_names_on_path_include_versioned_compilers_not_the_farm() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = crate::config::tests::config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = dir.path().join("shims");
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        let exe = std::env::current_exe().unwrap();
+        std::os::unix::fs::symlink(&exe, shim_dir.join("gcc")).unwrap();
+
+        let gcc13 = real_dir.join("gcc-13");
+        std::fs::write(&gcc13, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&gcc13, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Canonical names are already in SHIM_NAMES; --from-path must not
+        // re-list them just because a real gcc sits later on PATH.
+        let gcc = real_dir.join("gcc");
+        std::fs::write(&gcc, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&gcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _path = PathForTest(std::env::var_os("PATH"));
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", shim_dir.display(), real_dir.display()),
+            )
+        };
+
+        let extra = extra_compiler_names_from_env();
+        assert!(
+            extra.iter().any(|n| n == "gcc-13"),
+            "versioned compiler must be wrapped, got {extra:?}"
+        );
+        assert!(
+            !extra.iter().any(|n| n == "gcc"),
+            "canonical names belong to SHIM_NAMES, got {extra:?}"
+        );
     }
 }

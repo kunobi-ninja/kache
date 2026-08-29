@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+# Recreate the compiler-name farm from the installed binary so the
+# names cannot drift from compiler::shim::SHIM_NAMES.
+case "$1" in
+configure)
+  kache install-shims --force /usr/lib/kache >/dev/null
+  ;;
+esac
+
+exit 0

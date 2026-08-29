@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+# Remove only the canonical farm. Extra names a local admin added with
+# `kache install-shims --from-path /usr/lib/kache` are left in place.
+case "$1" in
+remove|deconfigure)
+  if [ -d /usr/lib/kache ]; then
+    for name in cc c++ gcc g++ clang clang++; do
+      path="/usr/lib/kache/$name"
+      if [ -L "$path" ]; then
+        rm -f "$path"
+      fi
+    done
+    rmdir /usr/lib/kache 2>/dev/null || true
+  fi
+  ;;
+esac
+
+exit 0

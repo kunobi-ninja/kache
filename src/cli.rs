@@ -3852,11 +3852,13 @@ const DAEMON_CHECK_LABELS: [&str; 5] = [
 ];
 
 /// Whether a failing doctor check is informational rather than an issue:
-/// daemon checks when no remote/planner needs a daemon (#443), and the
-/// compiler probe when there is no `cc` at all to diagnose (#626).
+/// daemon checks when no remote/planner needs a daemon (#443), the
+/// compiler probe when there is no `cc` at all to diagnose (#626), and
+/// C/C++ shims (PATH masquerade is opt-in).
 fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compiler: bool) -> bool {
     (daemon_optional && DAEMON_CHECK_LABELS.contains(&label))
         || (label == "Compiler probe" && probe_no_compiler)
+        || label == "C/C++ shims"
 }
 
 /// The daemon footnote prints when at least one daemon check failed but was
@@ -4508,6 +4510,16 @@ pub fn doctor(
             fix: Some("kache daemon install  (re-registers against current binary)".into()),
         });
     }
+
+    // Informational: rust-only setups skip the farm, so a miss here is not
+    // an issue. Failures tell Make/PKGBUILD users why gcc is not kache.
+    let shim_status = crate::compiler::shim::live_shim_path_status();
+    checks.push(Check {
+        label: "C/C++ shims",
+        pass: shim_status.on_path,
+        detail: shim_status.detail,
+        fix: shim_status.fix,
+    });
 
     // Compiler probe (#626): reported from the live toolchain, bypassing the
     // probe cache, so a stale stored "unresolved" record can't mask a fixed
@@ -6225,8 +6237,12 @@ mod tests {
         assert!(!doctor_check_is_optional("Binary", true, true));
         assert!(!doctor_check_is_optional("Daemon version", false, true));
         assert!(!doctor_check_is_optional("Compiler probe", true, false));
-        // Non-daemon, non-probe labels are never optional.
+        // Non-daemon, non-probe labels are never optional, except C/C++
+        // shims: PATH masquerade is opt-in and rust-only setups must not
+        // fail doctor for skipping it.
         assert!(!doctor_check_is_optional("Remote", true, true));
+        assert!(doctor_check_is_optional("C/C++ shims", false, false));
+        assert!(doctor_check_is_optional("C/C++ shims", true, true));
     }
 
     #[test]
@@ -10732,6 +10748,8 @@ mod tests {
 //      (fallback to ~/.cargo/config.toml)
 //   1b. Adds HOST_CC / HOST_CXX / CC_KNOWN_WRAPPER_CUSTOM under `[env]`
 //       when those keys are absent. Never sets CC or CXX.
+//   1c. Unix: offers compiler-name shims in ~/.local/lib/kache/shims.
+//       Does not edit PATH or shell rc.
 //   2. Installs the daemon as a login service (launchd/systemd)
 //   3. Starts the daemon
 //
@@ -11014,6 +11032,35 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
         }
     }
 
+    // ── Step 1c: C/C++ compiler-name shims (Unix) ───────────────
+    // Creates ~/.local/lib/kache/shims. Does not edit shell rc or PATH.
+    #[cfg(unix)]
+    {
+        let shim_dir = crate::compiler::shim::default_shim_dir();
+        if shim_dir_is_ready(&shim_dir) {
+            println!(
+                "  \x1b[32m✓\x1b[0m C/C++ shims already in {}",
+                shim_dir.display()
+            );
+            println!("    export PATH=\"{}:$PATH\"", shim_dir.display());
+        } else {
+            println!(
+                "  \x1b[33m→\x1b[0m install C/C++ compiler shims in {}",
+                shim_dir.display()
+            );
+            if should_write_init_step(
+                check,
+                prompt_yes_no(
+                    "Install C/C++ compiler shims for Make, CMake, and PKGBUILD?",
+                    true,
+                    yes,
+                )?,
+            ) {
+                install_shims(&shim_dir, false)?;
+            }
+        }
+    }
+
     // ── Step 2: daemon service ───────────────────────────────────
     let service_path = crate::service::service_file_path();
     let service_installed = service_path.as_ref().is_some_and(|p| p.exists());
@@ -11115,12 +11162,25 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
     }
 }
 
+/// True when `dir` already holds the canonical compiler-name farm pointing
+/// at this kache binary. Used by `kache init` so a second run is a no-op.
+#[cfg(unix)]
+fn shim_dir_is_ready(dir: &std::path::Path) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    crate::compiler::shim::SHIM_NAMES.iter().all(|name| {
+        let link = dir.join(name);
+        std::fs::canonicalize(&link).is_ok_and(|real| real == exe)
+    })
+}
+
 /// Populate `dir` with compiler-name symlinks pointing at this kache binary
 /// (kunobi-ninja/kache#310).
 ///
 /// Prepending the result to `PATH` routes every build's compiler calls through
 /// kache with no `CC`/`CXX` edits and no per-project build-system changes.
-///
 ///
 /// Unix-only: it creates symlinks, and the Windows `.exe` shim story differs
 /// (kunobi-ninja/kache#310). The unsupported message lives in the command
@@ -11128,6 +11188,15 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
 /// same-named ones the mutation lane cannot tell apart.
 #[cfg(unix)]
 pub(crate) fn install_shims(dir: &std::path::Path, force: bool) -> anyhow::Result<()> {
+    install_shims_named(dir, force, &[])
+}
+
+#[cfg(unix)]
+pub(crate) fn install_shims_named(
+    dir: &std::path::Path,
+    force: bool,
+    extra_names: &[String],
+) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locating the kache binary")?;
     // Resolve so the shims survive kache being invoked through its own
     // symlink, and so `resolve_real_compiler`'s identity check (which
@@ -11136,13 +11205,26 @@ pub(crate) fn install_shims(dir: &std::path::Path, force: bool) -> anyhow::Resul
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating shim directory {}", dir.display()))?;
 
+    let mut names: Vec<String> = crate::compiler::shim::SHIM_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for extra in extra_names {
+        if !crate::compiler::shim::invoked_as_compiler(extra) {
+            anyhow::bail!("`{extra}` is not a compiler name kache can wrap");
+        }
+        if !names.iter().any(|n| n == extra) {
+            names.push(extra.clone());
+        }
+    }
+
     let mut created = Vec::new();
     let mut skipped = Vec::new();
-    for name in crate::compiler::shim::SHIM_NAMES {
+    for name in &names {
         let link = dir.join(name);
         match std::fs::symlink_metadata(&link) {
             Ok(_) if !force => {
-                skipped.push((*name).to_string());
+                skipped.push(name.clone());
                 continue;
             }
             Ok(_) => std::fs::remove_file(&link)
@@ -11154,7 +11236,7 @@ pub(crate) fn install_shims(dir: &std::path::Path, force: bool) -> anyhow::Resul
         }
         std::os::unix::fs::symlink(&exe, &link)
             .with_context(|| format!("creating shim {}", link.display()))?;
-        created.push((*name).to_string());
+        created.push(name.clone());
     }
 
     println!(
@@ -11183,6 +11265,18 @@ pub(crate) fn install_shims(dir: &std::path::Path, force: bool) -> anyhow::Resul
         "The directory must come BEFORE the real toolchain on PATH, and the real \
          compilers must remain on PATH behind it — kache runs them."
     );
+    println!(
+        "Make, CMake, autotools, and Arch PKGBUILDs that invoke gcc/cc/clang \
+         from PATH then go through kache. No CC/CXX edit and no shell wrapper."
+    );
+    if dir == crate::compiler::shim::system_shim_dir() {
+        println!("For makepkg, put PATH=\"/usr/lib/kache:$PATH\" in ~/.makepkg.conf.");
+    } else {
+        println!(
+            "For makepkg, put PATH=\"{}:$PATH\" in ~/.makepkg.conf.",
+            dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -11194,6 +11288,34 @@ mod shim_install_tests {
 
     fn is_symlink(path: &std::path::Path) -> bool {
         std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
+    #[test]
+    fn extra_compiler_name_is_installed_next_to_the_canonical_farm() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        super::install_shims_named(&shims, false, &["gcc-13".into()]).unwrap();
+
+        let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let link = shims.join("gcc-13");
+        assert!(is_symlink(&link));
+        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+        for name in SHIM_NAMES {
+            assert!(
+                is_symlink(&shims.join(name)),
+                "{name} must still be installed"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_name_that_is_not_a_compiler_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        let err = super::install_shims_named(&shims, false, &["gcc-ar".into()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("gcc-ar"), "{msg}");
+        assert!(msg.contains("not a compiler name"), "{msg}");
     }
 
     #[test]

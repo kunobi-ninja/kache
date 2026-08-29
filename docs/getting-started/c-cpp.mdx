@@ -5,37 +5,70 @@ description: Cache supported GCC, Clang, and clang-cl object compilations
 
 Kache caches conservative, single-source C and C++ object compilations. If it cannot prove that an invocation is safe to cache, it runs the real compiler unchanged.
 
-## Set up the wrapper
+## Make, CMake, autotools, PKGBUILD
 
-For Cargo build scripts, `kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config (and `CC_KNOWN_WRAPPER_CUSTOM=kache`). It does not set `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
+The Unix path is the same idea as ccache's masquerade method: put a directory of compiler-named symlinks first on `PATH`. `make`, CMake, autotools, and Arch PKGBUILDs that call `gcc` or `clang` by name then go through Kache. There is no `CC=` edit and no shell wrapper.
 
-For build systems that honor `CC` and `CXX`:
+```bash
+kache install-shims
+export PATH="$HOME/.local/lib/kache/shims:$PATH"
+```
+
+`kache init` can create that directory. It does not edit your shell rc or `PATH`. Add the `export` to the shell you build from, or for `makepkg`:
+
+```bash
+# ~/.makepkg.conf
+PATH="$HOME/.local/lib/kache/shims:$PATH"
+```
+
+The APT and AUR packages also install `/usr/lib/kache` with the same symlinks:
+
+```bash
+export PATH="/usr/lib/kache:$PATH"
+```
+
+`kache install-shims` creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++`. Keep the real compilers later in `PATH`; Kache skips any entry that resolves back to itself.
+
+Versioned and target-prefixed names (`gcc-13`, `x86_64-pc-linux-gnu-gcc`) work if you create them by hand or scan `PATH`:
+
+```bash
+kache install-shims --from-path
+kache install-shims --force ~/.local/lib/kache/shims
+```
+
+Omitting the directory uses `~/.local/lib/kache/shims`. `--from-path` adds a symlink for every compiler-shaped name already on `PATH` that is not Kache itself.
+
+This is a native symlink to the `kache` binary. Do not wrap Kache in a shell script; that would spawn a shell per compile.
+
+Kache is a larger process than ccache. On a tree of many tiny `.c` files, measure both before replacing ccache.
+
+`kache doctor` reports whether a compiler name on `PATH` is a Kache shim. The check is informational, so a Rust-only setup does not fail doctor for skipping it.
+
+## Cargo build scripts
+
+`kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config (and `CC_KNOWN_WRAPPER_CUSTOM=kache`). It does not set `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
+
+PATH shims also cover Cargo's C bits when the crate invokes `cc` or `gcc` from `PATH` without `HOST_CC`.
+
+## Prefix method
+
+For a single project that honors `CC` and `CXX`:
 
 ```bash
 export CC="kache cc"
 export CXX="kache c++"
-```
-
-The Rust `cc` crate also needs to know that `kache` is a wrapper:
-
-```bash
 export CC_KNOWN_WRAPPER_CUSTOM=kache
 ```
 
-For build systems that call compiler names directly, install shims on Unix:
-
-```bash
-kache install-shims ~/.local/lib/kache/shims
-export PATH="$HOME/.local/lib/kache/shims:$PATH"
-```
-
-Kache creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks. Keep the real compilers later in `PATH`; Kache skips paths that resolve back to itself.
+The `cc` crate needs `CC_KNOWN_WRAPPER_CUSTOM` so it keeps the real compiler argument. PATH shims do not need that variable, because the compiler name stays `gcc`.
 
 For clang-cl driver mode:
 
 ```powershell
 $env:CC = "kache clang-cl"
 ```
+
+Windows has no `install-shims` generator yet. Use `CC`/`CXX`, or copy `kache.exe` to `gcc.exe` and put that directory first on `PATH`.
 
 ## Cached invocations
 

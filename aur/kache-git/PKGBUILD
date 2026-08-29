@@ -47,5 +47,12 @@ package() {
   install -Dm0644 kache.fish   "$pkgdir/usr/share/fish/vendor_completions.d/kache.fish"
   install -Dm0644 kache.elvish "$pkgdir/usr/share/elvish/lib/kache.elv"
 
+  # Compiler-name farm (ccache's /usr/lib/ccache). Keep in sync with
+  # compiler::shim::SHIM_NAMES.
+  install -d "$pkgdir/usr/lib/kache"
+  for name in cc c++ gcc g++ clang clang++; do
+    ln -s /usr/bin/kache "$pkgdir/usr/lib/kache/$name"
+  done
+
   install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

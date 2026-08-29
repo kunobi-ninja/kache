@@ -60,6 +60,8 @@ Release candidates do not resolve as `latest`. Request their full `x.y.z-rc.n` v
     ```
 
     Replace `stable` with `unstable` to receive prereleases as well as stable releases.
+
+    The package also installs compiler-name shims in `/usr/lib/kache`. Prepend that directory to `PATH` to cache Make and CMake object compiles. See [C and C++](/docs/getting-started/c-cpp).
   </Tab>
   <Tab value="Windows">
     ```powershell
@@ -79,6 +81,8 @@ Release candidates do not resolve as `latest`. Request their full `x.y.z-rc.n` v
     ```
 
     `kache-bin` is the official prebuilt package. `kache-git` builds the current main branch; the community `kache` package builds a release from source.
+
+    Both official packages install compiler-name shims in `/usr/lib/kache`. For `makepkg`, put `PATH="/usr/lib/kache:$PATH"` in `~/.makepkg.conf`.
   </Tab>
 </Tabs>
 

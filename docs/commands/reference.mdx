@@ -14,7 +14,7 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 | `gc` | Evict local entries |
 | `purge` | Remove local cache entries |
 | `clean` | Remove Cargo target directories below cwd or from the local tracked-root registry |
-| `init` | Configure Cargo and optionally install the daemon service |
+| `init` | Configure Cargo, optional C/C++ shims, and the daemon service |
 | `doctor` | Diagnose setup and store integrity |
 | `sync` | Pull from and push to a remote |
 | `save-manifest` | Publish build metadata for later prefetch |
@@ -233,11 +233,12 @@ This command can open even when the current config file is invalid. See [Configu
 ## `kache install-shims`
 
 ```bash
-kache install-shims ~/.local/lib/kache/shims
+kache install-shims
+kache install-shims --from-path
 kache install-shims --force ~/.local/lib/kache/shims
 ```
 
-This Unix command creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. Put the directory before the real compilers in `PATH`.
+Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. See [C and C++](/docs/getting-started/c-cpp).
 
 ## `kache completions`
 

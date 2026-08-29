@@ -31,4 +31,12 @@ package() {
   install -Dm0644 kache.zsh    "$pkgdir/usr/share/zsh/site-functions/_kache"
   install -Dm0644 kache.fish   "$pkgdir/usr/share/fish/vendor_completions.d/kache.fish"
   install -Dm0644 kache.elvish "$pkgdir/usr/share/elvish/lib/kache.elv"
+
+  # Compiler-name farm (ccache's /usr/lib/ccache). Keep in sync with
+  # compiler::shim::SHIM_NAMES. Symlink target is the installed path, not
+  # the extracted srcdir binary.
+  install -d "$pkgdir/usr/lib/kache"
+  for name in cc c++ gcc g++ clang clang++; do
+    ln -s /usr/bin/kache "$pkgdir/usr/lib/kache/$name"
+  done
 }

@@ -24,7 +24,7 @@ This trial does not edit Cargo configuration or install a service.
 kache init
 ```
 
-`init` configures Cargo (`rustc-wrapper` and, when unset, `HOST_CC` / `HOST_CXX` for build-script C), installs the daemon as a login service, and starts it. It does not set `CC` or `CXX`. It is safe to run again when repairing a setup.
+`init` configures Cargo (`rustc-wrapper` and, when unset, `HOST_CC` / `HOST_CXX` for build-script C), offers Unix compiler-name shims for Make/CMake/PKGBUILD, installs the daemon as a login service, and starts it. It does not set `CC` or `CXX`, and it does not edit `PATH`. After the shims exist, prepend their directory yourself. See [C and C++](/docs/getting-started/c-cpp). It is safe to run again when repairing a setup.
 
 Useful variants:
 
@@ -52,7 +52,7 @@ kache doctor
 kache monitor
 ```
 
-`doctor` checks wrapper configuration, conflicting wrappers, config parsing, and daemon access. `monitor` shows hits, misses, passthroughs, store use, and remote transfers.
+`doctor` checks wrapper configuration, conflicting wrappers, config parsing, daemon access, and (informational) whether a C/C++ compiler on `PATH` is a Kache shim. `monitor` shows hits, misses, passthroughs, store use, and remote transfers.
 
 For a non-interactive check:
 

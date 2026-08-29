@@ -73,16 +73,16 @@ See the [CI guide](https://kunobi.ninja/docs/kache/remote-cache/ci) for GitHub A
 
 ## C and C++
 
-Create compiler-name shims, then put their directory first in `PATH`:
+On Unix, install compiler-name shims and put that directory first in `PATH`. Make, CMake, autotools, and Arch PKGBUILDs that call `gcc` by name then go through Kache. No `CC=` edit and no shell wrapper.
 
 ```bash
-kache install-shims ~/.local/lib/kache/shims
+kache install-shims
 export PATH="$HOME/.local/lib/kache/shims:$PATH"
-cmake -S . -B build
-cmake --build build
 ```
 
-Kache inspects the real compiler invocation. Unsupported or unsafe invocations pass through to the compiler instead of being cached.
+APT and AUR packages install `/usr/lib/kache`. Nix puts the same farm in `$out/lib/kache`. `kache init` can create the user farm; it does not change `PATH`. For `makepkg`, put the same assignment in `~/.makepkg.conf`. Wrap extra names already on `PATH` with `kache install-shims --from-path`.
+
+Kache inspects the real compiler invocation. Unsupported or unsafe invocations pass through. See [C and C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
 
 ## Storage and remotes
 
@@ -109,6 +109,7 @@ Credentials come from the standard AWS environment variables or credential chain
 kache monitor                 # live build and cache activity
 kache stats                   # non-interactive summary
 kache doctor                  # setup and integrity checks
+kache install-shims           # Unix compiler-name PATH farm
 kache why-miss <crate>        # explain the latest miss
 kache list                    # inspect cached entries
 kache gc                      # enforce cache limits
@@ -122,6 +123,7 @@ Run `kache help <command>` for exact flags. The [command reference](https://kuno
 
 - [Install Kache](https://kunobi.ninja/docs/kache/getting-started/installation)
 - [Quick start](https://kunobi.ninja/docs/kache/getting-started/quick-start)
+- [C and C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp)
 - [Configuration](https://kunobi.ninja/docs/kache/getting-started/configuration)
 - [How cache keys work](https://kunobi.ninja/docs/kache/how-it-works/cache-key)
 - [Daemon lifecycle](https://kunobi.ninja/docs/kache/daemon/lifecycle)

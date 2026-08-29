@@ -2,7 +2,7 @@
 
 A map of kache's user-facing features to the e2e scenarios that exercise them,
 and the gaps where a feature has no end-to-end scenario. The functional suite
-(`just e2e`, `suite:e2e`) currently has **43 scenarios** (the `bench-*` cases are
+(`just e2e`, `suite:e2e`) currently has **44 scenarios** (the `bench-*` cases are
 load benchmarks, not feature tests).
 
 This was produced by a cross-family audit (Claude + codex, independent passes):
@@ -32,6 +32,7 @@ came from the second pass.
 | Bypass rules (`[cache].bypass_env` / `_argv` / `_crates`, #222) | `e2e-bypass-rules` |
 | Fallback wrapper (`KACHE_FALLBACK`, #109) | `e2e-rust-fallback`, `e2e-rust-sccache` |
 | C / C++ object + depfile caching, header invalidation | `e2e-c-hello`, `e2e-cpp-hello`, `e2e-c-depinfo` |
+| C compiler-name shims on PATH (no `CC=`) | `e2e-c-shims` |
 | Flag modeling (gcc / clang / clang-cl) | `e2e-cc-bench-flags`, `e2e-cc-bench-flags-gnu`, `e2e-cc-cl-debug`, `e2e-cc-cl-xclang-deps` |
 | Realistic flag-soup canaries | `e2e-cc-flag-soup`, `e2e-rust-flag-soup`, `e2e-cmake-ninja-flagset` |
 | `__FILE__` / out-of-tree base-dir handling (#410) | `e2e-cc-file-macro-oot`, `e2e-cmake-file-macro-oot` |

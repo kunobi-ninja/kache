@@ -76,6 +76,13 @@ buildRustPackage {
   # Avoid bootstrapping loop: don't let kache wrap itself during build
   env.RUSTC_WRAPPER = "";
 
+  postInstall = lib.optionalString stdenv.hostPlatform.isUnix ''
+    mkdir -p $out/lib/kache
+    for name in cc c++ gcc g++ clang clang++; do
+      ln -s $out/bin/kache $out/lib/kache/$name
+    done
+  '';
+
   # reqwest (rustls) loads system CA certs when building a client, even for the
   # plain-HTTP localhost planner tests. The sandbox has no trust store, so point
   # it at the cacert bundle to keep client construction from failing.

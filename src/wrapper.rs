@@ -872,7 +872,12 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             "admission: compile too cheap to store"
         );
     }
-    if store_decision.should_store {
+    if store_decision.should_store && !compiler.include_dir_names_still_match(&parsed) {
+        tracing::debug!(
+            crate_name = %crate_name,
+            "cc include-dir names changed during compile; skipping store"
+        );
+    } else if store_decision.should_store {
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         let target = parsed.cache_target_arch();
         match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {

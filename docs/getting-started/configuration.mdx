@@ -208,6 +208,21 @@ prefetch_enabled = false
 
 Exact remote lookup and background upload continue to work.
 
+## Telemetry
+
+Kache does not push metrics to a collector. It writes OTLP JSON files that Kartero imports from CI artifacts, the same way nightly benches already work.
+
+Two signals, never mixed:
+
+- `kache.bench.*` — one-shot bench gauges (duration, speedup, verdict) from `kache-scenario`
+- `kache.cache.*` — cache counters (uploads, prefetch, store size) from `kache telemetry write`
+
+```bash
+kache telemetry write ./cache-otlp --scenario bench-firefox --phase warm
+```
+
+That writes `metrics.otlp.json` and `schema_version` in the directory. `--scenario` must match `kache.bench.project`. `--phase` distinguishes cold from warm: the bench stops the daemon between phases, so counters are per daemon lifetime. The rustc wrapper does not write these files. The planner service still exposes Prometheus `/metrics` for cluster scrape.
+
 ## Daemon, events, and diagnostics
 
 | Environment | TOML key | Default | Purpose |

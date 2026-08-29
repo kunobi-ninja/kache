@@ -322,6 +322,30 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+      # Daemon/store counters (`kache.cache.*`), not the bench gauges above.
+      # Separate artifacts so Kartero imports them as different payloads.
+      # Do not validate with @kunobi/kartero@0.3.0: that CLI's published
+      # allowlist does not include kache.cache.* yet.
+      - name: Upload cache telemetry (cold)
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-cache-${{ matrix.name }}-cold
+          path: tmp/bench/${{ matrix.dir }}/cache-otlp-cold/
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Upload cache telemetry (warm)
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-cache-${{ matrix.name }}-warm
+          path: tmp/bench/${{ matrix.dir }}/cache-otlp-warm/
+          retention-days: 3
+          if-no-files-found: warn
+
   # Firefox compile-cache bench on the self-hosted Windows runner (clang-cl +
   # MSVC under MozillaBuild). Separate from the `bench` matrix above: that runs
   # on the ephemeral Linux ARC (`kunobi-runners`); this needs the persistent
@@ -549,6 +573,26 @@ jobs:
             ${{ runner.temp }}/f/bench-firefox-windows.json
           retention-days: 3
           if-no-files-found: error
+
+      - name: Upload cache telemetry (cold)
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-cache-firefox-windows-cold
+          path: ${{ runner.temp }}/f/cache-otlp-cold/
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Upload cache telemetry (warm)
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-cache-firefox-windows-warm
+          path: ${{ runner.temp }}/f/cache-otlp-warm/
+          retention-days: 3
+          if-no-files-found: warn
 
   # Firefox DAILY-PULL (temporal, #477) compile-cache bench on the self-hosted
   # Windows runner — the axis that matches the reported issue (clang-cl on
@@ -793,3 +837,23 @@ jobs:
             ${{ runner.temp }}/b/bench-firefox-pull-windows.json
           retention-days: 3
           if-no-files-found: error
+
+      - name: Upload cache telemetry (cold)
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-cache-firefox-pull-windows-cold
+          path: ${{ runner.temp }}/b/cache-otlp-cold/
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Upload cache telemetry (pull)
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-cache-firefox-pull-windows-pull
+          path: ${{ runner.temp }}/b/cache-otlp-pull/
+          retention-days: 3
+          if-no-files-found: warn

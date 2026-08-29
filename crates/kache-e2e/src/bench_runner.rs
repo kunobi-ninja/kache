@@ -52,8 +52,9 @@
 //!
 //! Each run prints a summary block and writes `tmp/bench/<scenario>/<scenario>.json`
 //! plus per-phase reports (`report-<phase>.*`), build logs
-//! (`build-<phase>.log`), wrapper logs (`wrapper-<phase>.log`), and OTLP
-//! gauges (`metrics.otlp.json`) for kartero to pull from CI.
+//! (`build-<phase>.log`), wrapper logs (`wrapper-<phase>.log`), OTLP
+//! gauges (`metrics.otlp.json`, `kache.bench.*`), and cache counters
+//! (`cache-otlp-<phase>/metrics.otlp.json`, `kache.cache.*`) for kartero.
 //! By default each scenario writes under its own `./tmp/bench/<scenario>` (so
 //! scenarios coexist); a `work_dir` lock prevents two runs from sharing one
 //! scratch dir. Concurrent runs on one host make the wall-clock numbers
@@ -381,6 +382,14 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         config.trace_keys,
         &sh,
     )?;
+    write_cache_otlp_or_warn(
+        &kache,
+        &cache_dir,
+        &kache_config,
+        &work_dir.join("cache-otlp-warm"),
+        &profile.name,
+        "warm",
+    );
     daemon::stop(&kache, &cache_dir);
     let (warm, warm_raw) =
         capture_report(&kache, &cache_dir, &work_dir, Phase::Warm.name(), &clone_b)?;
@@ -650,6 +659,45 @@ fn write_otlp_or_warn(work_dir: &Path, run: crate::bench_otlp::OtlpRun) {
         "[bench] otlp written to {}",
         work_dir.join(crate::bench_otlp::METRICS_FILE).display()
     );
+}
+
+/// Snapshot daemon/store counters into `cache-otlp-<phase>/` for Kartero.
+/// Separate from the bench gauges (`kache.bench.*`) so the two signals never
+/// share a metric name. Call while the phase's daemon is still up. Failures
+/// warn; a multi-hour bench must still upload reports.
+fn write_cache_otlp_or_warn(
+    kache: &Path,
+    cache_dir: &Path,
+    kache_config: &Path,
+    dest: &Path,
+    scenario: &str,
+    phase: &str,
+) -> bool {
+    let status = Command::new(kache)
+        .args(["telemetry", "write"])
+        .arg(dest)
+        .args(["--scenario", scenario, "--phase", phase])
+        .env("KACHE_CACHE_DIR", cache_dir)
+        .env("KACHE_CONFIG", kache_config)
+        .env("RUSTC_WRAPPER", "")
+        .status();
+    match status {
+        Ok(code) if code.success() => {
+            eprintln!(
+                "[bench] cache otlp written to {}",
+                dest.join("metrics.otlp.json").display()
+            );
+            true
+        }
+        Ok(code) => {
+            eprintln!("[bench] warning: kache telemetry write exited {code}");
+            false
+        }
+        Err(err) => {
+            eprintln!("[bench] warning: kache telemetry write failed: {err}");
+            false
+        }
+    }
 }
 
 /// Take an exclusive advisory lock on the work dir so two bench runs can't
@@ -1026,6 +1074,15 @@ fn run_cold_phase(
         trace_keys,
         sh,
     )?;
+    // Dump before stop: process-lifetime counters die with the daemon.
+    write_cache_otlp_or_warn(
+        kache,
+        cache_dir,
+        kache_config,
+        &work_dir.join("cache-otlp-cold"),
+        &profile.name,
+        "cold",
+    );
     daemon::stop(kache, cache_dir);
     let (cold, cold_raw) = capture_report(kache, cache_dir, work_dir, Phase::Cold.name(), clone_a)?;
     // Read the raw event log *before* the caller's reset — it carries the
@@ -1165,6 +1222,14 @@ fn run_pull_bench(
         trace_keys,
         sh,
     )?;
+    write_cache_otlp_or_warn(
+        kache,
+        cache_dir,
+        kache_config,
+        &work_dir.join("cache-otlp-pull"),
+        &profile.name,
+        "pull",
+    );
     daemon::stop(kache, cache_dir);
 
     let (pull, pull_raw) = capture_report(kache, cache_dir, work_dir, Phase::Pull.name(), clone_a)?;
@@ -3129,6 +3194,95 @@ mod tests {
         assert!(is_run_artifact("schema_version"));
         assert!(is_run_artifact("bench-firefox.json"));
         assert!(!is_run_artifact("kache.log"));
+    }
+
+    #[test]
+    fn write_cache_otlp_or_warn_runs_telemetry_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("invoked.txt");
+        let kache = fake_kache_that_records(dir.path(), &marker, 0);
+        let dest = dir.path().join("cache-otlp-warm");
+        assert!(write_cache_otlp_or_warn(
+            &kache,
+            dir.path(),
+            &dir.path().join("kache.toml"),
+            &dest,
+            "bench-firefox",
+            "warm",
+        ));
+        let invoked = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            invoked.contains("telemetry"),
+            "expected telemetry subcommand, got {invoked:?}"
+        );
+        assert!(
+            invoked.contains("write"),
+            "expected write subcommand, got {invoked:?}"
+        );
+        assert!(
+            invoked.contains("bench-firefox") && invoked.contains("warm"),
+            "expected scenario and phase, got {invoked:?}"
+        );
+    }
+
+    #[test]
+    fn write_cache_otlp_or_warn_is_false_when_kache_exits_nonzero() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("invoked.txt");
+        let kache = fake_kache_that_records(dir.path(), &marker, 1);
+        assert!(!write_cache_otlp_or_warn(
+            &kache,
+            dir.path(),
+            &dir.path().join("kache.toml"),
+            &dir.path().join("cache-otlp-cold"),
+            "bench-firefox",
+            "cold",
+        ));
+        assert!(marker.is_file());
+    }
+
+    #[test]
+    fn write_cache_otlp_or_warn_is_false_when_kache_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!write_cache_otlp_or_warn(
+            &dir.path().join("no-such-kache"),
+            dir.path(),
+            &dir.path().join("kache.toml"),
+            &dir.path().join("cache-otlp-pull"),
+            "bench-firefox",
+            "pull",
+        ));
+    }
+
+    fn fake_kache_that_records(dir: &Path, marker: &Path, exit: i32) -> PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("fake-kache");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > '{}'\nexit {exit}\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).unwrap();
+            path
+        }
+        #[cfg(windows)]
+        {
+            let path = dir.join("fake-kache.cmd");
+            std::fs::write(
+                &path,
+                format!(
+                    "@echo off\r\necho %* > \"{}\"\r\nexit /b {exit}\r\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            path
+        }
     }
 
     #[test]

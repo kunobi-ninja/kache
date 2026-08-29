@@ -7436,6 +7436,14 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_never_writes_an_init_edit() {
+        assert!(should_write_init_step(false, true));
+        assert!(!should_write_init_step(true, true));
+        assert!(!should_write_init_step(false, false));
+        assert!(!should_write_init_step(true, false));
+    }
+
+    #[test]
     fn test_cargo_wrapper_edit_create() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -10801,6 +10809,12 @@ pub(crate) fn apply_cargo_wrapper_edit(existing: &str, plan: &CargoWrapperPlan) 
     }
 }
 
+/// Whether an init file-edit step should write. Dry-run (`check`) never
+/// writes, even if the operator would have accepted the prompt.
+fn should_write_init_step(check: bool, accepted: bool) -> bool {
+    !check && accepted
+}
+
 fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bool> {
     use std::io::{BufRead, Write};
 
@@ -10911,7 +10925,7 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
                 CargoWrapperPlan::AlreadySet => unreachable!(),
             };
             println!("  \x1b[33m→\x1b[0m {summary}");
-            if !check && prompt_yes_no(&question, true, yes)? {
+            if should_write_init_step(check, prompt_yes_no(&question, true, yes)?) {
                 if let Some(parent) = cargo_path.parent() {
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("creating {}", parent.display()))?;
@@ -10957,13 +10971,14 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
             "  \x1b[33m→\x1b[0m set {names} in {} (does not set CC or CXX)",
             crate::wrapper_config::display_path(&cargo_path)
         );
-        if !check
-            && prompt_yes_no(
+        if should_write_init_step(
+            check,
+            prompt_yes_no(
                 "Set host C compiler wrappers for Cargo build scripts?",
                 true,
                 yes,
-            )?
-        {
+            )?,
+        ) {
             if let Some(parent) = cargo_path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating {}", parent.display()))?;

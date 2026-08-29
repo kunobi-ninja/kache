@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn apply_inserts_under_existing_env_table() {
-        let existing = "[env]\nRUST_BACKTRACE = \"1\"\n";
+        let existing = "# keep me first\n[env]\nRUST_BACKTRACE = \"1\"\n";
         let additions = [CargoEnvAssignment {
             name: "CC_KNOWN_WRAPPER_CUSTOM",
             value: "kache",
@@ -193,6 +193,39 @@ mod tests {
         assert!(out.contains("RUST_BACKTRACE = \"1\""));
         assert!(out.contains("CC_KNOWN_WRAPPER_CUSTOM = \"kache\""));
         assert_eq!(out.matches("[env]").count(), 1);
+        let preamble = out.split("[env]").next().expect("env table");
+        assert!(
+            preamble.contains("# keep me first"),
+            "comment before [env] must stay before it"
+        );
+        assert!(
+            !preamble.contains("CC_KNOWN_WRAPPER_CUSTOM"),
+            "keys must be inserted under [env], not after the first line: {out}"
+        );
+    }
+
+    #[test]
+    fn apply_puts_a_blank_line_before_a_new_env_table() {
+        let existing = "[build]\nrustc-wrapper = \"kache\"";
+        let additions = [CargoEnvAssignment {
+            name: "CC_KNOWN_WRAPPER_CUSTOM",
+            value: "kache",
+        }];
+        let out = apply_cargo_env_edit(existing, &additions);
+        assert!(
+            out.contains(
+                "[build]\nrustc-wrapper = \"kache\"\n\n[env]\nCC_KNOWN_WRAPPER_CUSTOM = \"kache\"\n"
+            ),
+            "expected a blank line between [build] and a newly created [env], got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn missing_assignments_from_absent_file_are_all_desired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let missing = missing_assignments_from_path(&path).unwrap();
+        assert_eq!(missing, desired_assignments());
     }
 
     #[cfg(unix)]

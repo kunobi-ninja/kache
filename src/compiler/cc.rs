@@ -4263,9 +4263,9 @@ fn cc_trace_name(parsed: &CcArgs) -> String {
 /// so overflow is fail-closed passthrough rather than a truncated key.
 const CC_INCLUDE_DIR_NAME_CAP: usize = 8192;
 
-const CC_INCLUDE_DIR_SKIP_EXTENSIONS: &[&str] = &[
-    "o", "obj", "lo", "d", "a", "lib", "so", "dylib", "dll", "rlib", "rmeta", "pyc", "pyo", "gcda",
-    "gcno", "tmp",
+const CC_INCLUDE_DIR_NAME_EXTENSIONS: &[&str] = &[
+    "h", "hh", "hpp", "hxx", "h++", "cuh", "c", "cc", "cpp", "cxx", "c++", "m", "mm", "i", "ii",
+    "inl", "inc", "def", "pch", "gch",
 ];
 
 fn digest_cc_include_dir_names(parsed: &CcArgs) -> Result<String> {
@@ -4330,11 +4330,11 @@ fn cc_system_include_dirs(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
         push(PathBuf::from(value));
         push(PathBuf::from(value).join("usr/include"));
     }
-    if let Ok(sdk) = std::env::var("SDKROOT") {
-        if !sdk.is_empty() {
-            push(PathBuf::from(&sdk));
-            push(PathBuf::from(sdk).join("usr/include"));
-        }
+    if let Ok(sdk) = std::env::var("SDKROOT")
+        && !sdk.is_empty()
+    {
+        push(PathBuf::from(&sdk));
+        push(PathBuf::from(sdk).join("usr/include"));
     }
     dirs
 }
@@ -4350,14 +4350,12 @@ fn cc_flag_dir_values<'a>(rest: &'a [String], flag: &'a str) -> Vec<&'a str> {
             continue;
         }
         if let Some(value) = arg.strip_prefix(flag) {
-            if flag == "-I" || flag == "/I" {
-                if !value.is_empty() {
-                    values.push(value);
-                }
-            } else if let Some(value) = value.strip_prefix('=') {
-                if !value.is_empty() {
-                    values.push(value);
-                }
+            if (flag == "-I" || flag == "/I") && !value.is_empty() {
+                values.push(value);
+            } else if let Some(value) = value.strip_prefix('=')
+                && !value.is_empty()
+            {
+                values.push(value);
             }
         }
     }
@@ -4393,7 +4391,7 @@ fn collect_include_dir_names(
         if file_type.is_symlink() {
             // Hash the name (it can shadow) but do not recurse; a
             // symlink dir can loop.
-            if !file_type.is_dir() && !cc_include_name_skipped(&name) {
+            if cc_include_name_counts(&name) {
                 files.push(name);
             }
             continue;
@@ -4402,10 +4400,9 @@ fn collect_include_dir_names(
             subdirs.push(name);
             continue;
         }
-        if cc_include_name_skipped(&name) {
-            continue;
+        if cc_include_name_counts(&name) {
+            files.push(name);
         }
-        files.push(name);
     }
     files.sort();
     subdirs.sort();
@@ -4429,14 +4426,14 @@ fn collect_include_dir_names(
     Ok(())
 }
 
-fn cc_include_name_skipped(name: &OsStr) -> bool {
+fn cc_include_name_counts(name: &OsStr) -> bool {
     let Some(ext) = Path::new(name).extension() else {
-        return false;
+        return true;
     };
     let ext = ext.to_string_lossy();
-    CC_INCLUDE_DIR_SKIP_EXTENSIONS
+    CC_INCLUDE_DIR_NAME_EXTENSIONS
         .iter()
-        .any(|skipped| ext.eq_ignore_ascii_case(skipped))
+        .any(|keep| ext.eq_ignore_ascii_case(keep))
 }
 
 struct PendingCcPreprocessMemo {
@@ -10431,7 +10428,9 @@ mod tests {
         .unwrap();
         let before = digest_cc_include_dir_names(&parsed).unwrap();
         fs::write(include.join("header.o"), "obj").unwrap();
+        fs::write(include.join("header.obj"), "obj").unwrap();
         fs::write(include.join("header.d"), "deps").unwrap();
+        fs::write(include.join("header.pp"), "deps").unwrap();
         fs::write(include.join("libfoo.a"), "ar").unwrap();
         let after = digest_cc_include_dir_names(&parsed).unwrap();
         assert_eq!(

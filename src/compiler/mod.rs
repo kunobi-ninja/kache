@@ -2416,7 +2416,6 @@ mod shim_tests {
         assert!(fix.contains("export PATH="), "{fix}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn default_and_system_shim_dirs_are_the_documented_locations() {
         let home = default_shim_dir();
@@ -2447,6 +2446,7 @@ mod shim_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn extra_names_on_path_include_versioned_compilers_not_the_farm() {
         use std::os::unix::fs::PermissionsExt;

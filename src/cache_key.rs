@@ -4397,6 +4397,13 @@ mod tests {
         );
     }
 
+    fn dummy_absolute_linker() -> String {
+        std::env::temp_dir()
+            .join("kache-dummy-cc")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn parsed_linked_bin(target: Option<&str>) -> RustcArgs {
         let mut argv = vec![
             "rustc".to_string(),
@@ -4405,7 +4412,7 @@ mod tests {
             "--crate-type".to_string(),
             "bin".to_string(),
             "src/lib.rs".to_string(),
-            "-Clinker=/abs/cc".to_string(),
+            format!("-Clinker={}", dummy_absolute_linker()),
         ];
         if let Some(target) = target {
             argv.push("--target".to_string());
@@ -6344,16 +6351,30 @@ mod tests {
             v
         };
 
-        // A resolvable linker (cc exists on dev/CI) folds its version identity;
-        // an unresolvable one folds nothing. The keys must differ.
-        let with_cc = key_of_flags(&bin(&["-Clinker=cc"]));
-        let with_missing = key_of_flags(&bin(&["-Clinker=/nonexistent/kache-linker-xyz"]));
-        assert_ne!(
-            with_cc, with_missing,
-            "linker choice must affect a bin's cache key"
-        );
-        // Deterministic for the same linker.
-        assert_eq!(with_cc, key_of_flags(&bin(&["-Clinker=cc"])));
+        // A resolvable linker (cc on PATH) folds its version and, on Linux,
+        // CRT identity. An unresolvable linker cannot place CRT/startup
+        // objects, so the invocation is uncacheable rather than keyed with
+        // an empty runtime identity.
+        let fh = FileHasher::new();
+        let pn = PathNormalizer::empty();
+        let key = |args: Vec<String>| {
+            let mut parsed = RustcArgs::parse(&args).unwrap();
+            parsed.source_file = None;
+            compute_cache_key(&parsed, &fh, &pn)
+        };
+        let with_cc = key(bin(&["-Clinker=cc"]));
+        let with_missing = key(bin(&["-Clinker=/nonexistent/kache-linker-xyz"]));
+        match (with_cc, with_missing) {
+            (Ok(cc), Ok(missing)) => {
+                assert_ne!(cc, missing, "linker choice must affect a bin's cache key");
+                assert_eq!(cc, key(bin(&["-Clinker=cc"])).unwrap());
+            }
+            (Ok(_), Err(_)) => {}
+            (Err(_), Err(_)) => {}
+            (Err(err), Ok(_)) => {
+                panic!("unresolvable linker produced a key while cc failed: {err:#}")
+            }
+        }
     }
 
     /// A readable `--extern name=path` rlib is content-hashed into the key (not

@@ -4379,9 +4379,6 @@ fn collect_include_dir_names(
             .file_type()
             .with_context(|| format!("stat {}", entry.path().display()))?;
         let name = entry.file_name();
-        if name == "." || name == ".." {
-            continue;
-        }
         if file_type.is_symlink() {
             // Hash the name (it can shadow) but do not recurse; a
             // symlink dir can loop.
@@ -10569,11 +10566,13 @@ mod tests {
     #[test]
     fn include_dir_digest_counts_nested_directories_toward_the_cap() {
         let temp = tempfile::tempdir().unwrap();
+        let srcdir = temp.path().join("src");
         let include = temp.path().join("inc");
         let nested = include.join("nested");
+        fs::create_dir_all(&srcdir).unwrap();
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("h.h"), "int h;\n").unwrap();
-        let source = temp.path().join("unit.c");
+        let source = srcdir.join("unit.c");
         fs::write(&source, "int x;\n").unwrap();
         let parsed = CcArgs::parse(&s(&[
             "cc",
@@ -10583,10 +10582,53 @@ mod tests {
             include.to_str().unwrap(),
         ]))
         .unwrap();
-        let err = digest_cc_include_dir_names_capped(&parsed, 1).unwrap_err();
+        // source parent (unit.c) + include subdir + nested header = 3 names.
+        // Cap 2 must overflow, including if the subdir increment is mutated
+        // to `*=` (which would otherwise stay under the cap).
+        let err = digest_cc_include_dir_names_capped(&parsed, 2).unwrap_err();
         assert!(
-            err.to_string().contains("exceeded 1"),
+            err.to_string().contains("exceeded 2"),
             "the nested directory itself must count, got {err}"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_counts_an_empty_subdir_at_exact_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let include = temp.path().join("inc");
+        fs::create_dir_all(include.join("empty")).unwrap();
+        fs::write(include.join("h.h"), "int h;\n").unwrap();
+        let source = include.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+        ]))
+        .unwrap();
+        // unit.c + h.h + empty/ = 3 names. Cap 3 must succeed; `>= cap`
+        // on the subdir increment would overflow one too early.
+        digest_cc_include_dir_names_capped(&parsed, 3)
+            .expect("file + empty subdir at exact cap must succeed");
+    }
+
+    #[test]
+    fn include_dir_digest_ignores_empty_sdkroot() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap()])).unwrap();
+        unsafe { std::env::remove_var("SDKROOT") };
+        let unset = digest_cc_include_dir_names(&parsed).unwrap();
+        unsafe { std::env::set_var("SDKROOT", "") };
+        let empty = digest_cc_include_dir_names(&parsed).unwrap();
+        unsafe { std::env::remove_var("SDKROOT") };
+        assert_eq!(
+            unset, empty,
+            "empty SDKROOT must not become an include root"
         );
     }
 

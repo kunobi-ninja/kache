@@ -106,7 +106,13 @@ impl Client {
             .env_remove("KACHE_BASE_DIR")
             .env_remove("KACHE_SOCKET_PATH")
             .env_remove("RUSTC_WRAPPER")
-            .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            // These tests publish to a hermetic filesystem remote. CI runners
+            // set GITHUB_ACTIONS/GITLAB_CI, which would force remote_readonly
+            // and skip the upload the suite is proving.
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITLAB_CI")
+            .env_remove("CI");
         cmd
     }
 

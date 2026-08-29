@@ -276,7 +276,10 @@ impl Client {
             .env_remove("KACHE_S3_PROFILE")
             .env_remove("KACHE_SOCKET_PATH")
             .env_remove("RUSTC_WRAPPER")
-            .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITLAB_CI")
+            .env_remove("CI");
         command
     }
 

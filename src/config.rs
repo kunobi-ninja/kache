@@ -262,6 +262,10 @@ pub struct Config {
     /// This is useful for environments with GET-only credentials (e.g. fork/PR
     /// CI or shared read-only caches). Set via `KACHE_REMOTE_READONLY=1`/`=true`
     /// or `[cache] remote_readonly`; env wins over the file.
+    ///
+    /// Untrusted CI (pull requests, tags, unprotected branches) also forces
+    /// this on. `KACHE_REMOTE_READONLY=0` does not disable that. See
+    /// [`crate::policy`].
     pub remote_readonly: bool,
     /// Opt-in too-new-input guard (kunobi-ninja/kache#324): when on, an
     /// invocation whose keyed inputs were modified at/after the build started is
@@ -1421,7 +1425,14 @@ impl Config {
         // becomes a clean no-op — no S3 client, no uploads, no remote checks.
         // The planner is suppressed symmetrically in `load_planner_config`.
         let local_only = Self::local_only_enabled(&file_config);
-        let remote_readonly = Self::remote_readonly_enabled(&file_config);
+        let mut remote_readonly = Self::remote_readonly_enabled(&file_config);
+        if let Some(forced) = crate::policy::forced_remote_readonly() {
+            tracing::debug!(
+                reason = %forced.reason,
+                "remote writes suppressed by CI policy"
+            );
+            remote_readonly = true;
+        }
         let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
         let local_hit_daemon = Self::local_hit_daemon_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
@@ -4606,6 +4617,83 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         assert!(
             Config::load_planner_config().is_none(),
             "planner must be suppressed under local-only"
+        );
+    }
+
+    #[test]
+    fn pull_request_ci_forces_remote_readonly() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _cfg = set_kache_config_for_test(&config_path);
+        let _gha = NamedEnvGuard::set("GITHUB_ACTIONS", "true");
+        let _event = NamedEnvGuard::set("GITHUB_EVENT_NAME", "pull_request");
+        let _ref_type = NamedEnvGuard::set("GITHUB_REF_TYPE", "branch");
+        let _protected = NamedEnvGuard::set("GITHUB_REF_PROTECTED", "false");
+        let _gitlab = NamedEnvGuard::remove("GITLAB_CI");
+        let _explicit = NamedEnvGuard::remove("KACHE_REMOTE_READONLY");
+
+        let config = Config::load().unwrap();
+        assert!(
+            config.remote_readonly,
+            "untrusted GitHub Actions must suppress remote writes"
+        );
+    }
+
+    #[test]
+    fn remote_readonly_zero_does_not_disable_ci_policy() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _cfg = set_kache_config_for_test(&config_path);
+        let _gha = NamedEnvGuard::set("GITHUB_ACTIONS", "true");
+        let _event = NamedEnvGuard::set("GITHUB_EVENT_NAME", "pull_request");
+        let _ref_type = NamedEnvGuard::set("GITHUB_REF_TYPE", "branch");
+        let _protected = NamedEnvGuard::set("GITHUB_REF_PROTECTED", "false");
+        let _gitlab = NamedEnvGuard::remove("GITLAB_CI");
+        let _explicit = NamedEnvGuard::set("KACHE_REMOTE_READONLY", "0");
+
+        let config = Config::load().unwrap();
+        assert!(
+            config.remote_readonly,
+            "KACHE_REMOTE_READONLY=0 must not re-enable writes on a pull request"
+        );
+    }
+
+    #[test]
+    fn protected_branch_push_keeps_configured_writable() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _cfg = set_kache_config_for_test(&config_path);
+        let _gha = NamedEnvGuard::set("GITHUB_ACTIONS", "true");
+        let _event = NamedEnvGuard::set("GITHUB_EVENT_NAME", "push");
+        let _ref_type = NamedEnvGuard::set("GITHUB_REF_TYPE", "branch");
+        let _protected = NamedEnvGuard::set("GITHUB_REF_PROTECTED", "true");
+        let _gitlab = NamedEnvGuard::remove("GITLAB_CI");
+        let _explicit = NamedEnvGuard::remove("KACHE_REMOTE_READONLY");
+
+        let config = Config::load().unwrap();
+        assert!(
+            !config.remote_readonly,
+            "a protected-branch push must keep the configured write mode"
+        );
+    }
+
+    #[test]
+    fn local_shell_keeps_configured_writable() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _cfg = set_kache_config_for_test(&config_path);
+        let _gha = NamedEnvGuard::remove("GITHUB_ACTIONS");
+        let _gitlab = NamedEnvGuard::remove("GITLAB_CI");
+        let _explicit = NamedEnvGuard::remove("KACHE_REMOTE_READONLY");
+
+        let config = Config::load().unwrap();
+        assert!(
+            !config.remote_readonly,
+            "a local shell must not be forced read-only"
         );
     }
 

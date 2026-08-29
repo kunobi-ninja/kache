@@ -27,6 +27,7 @@ mod otel;
 mod path_normalizer;
 mod planner_client;
 mod platform;
+mod policy;
 mod probe;
 mod remote;
 mod remote_backend;

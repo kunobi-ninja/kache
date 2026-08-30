@@ -168,10 +168,17 @@ gitignore = true
 # selection, measurement, verdict, artifact, and OTLP helpers remain in scope.
 # `run_cold_phase` is the same shape: a full clone/build that this lane cannot
 # drive. The dump it now calls (`write_cache_otlp_or_warn`) stays in scope.
+#
+# macOS SDK discovery is compiled only on macOS, while the diff mutation lane
+# runs on Ubuntu. The macOS unit test exercises both the default SDK and an
+# invalid SDKROOT. Exclude only the platform tool wrappers; the key-folding
+# logic that consumes their identity remains mutation-tested on every host.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
     "probe_macos",
+    "replace sdk_identity_for",
+    "xcrun",
     "probe_unsupported",
     "from struct AttrList",
     "regular_output_is_independent_windows",

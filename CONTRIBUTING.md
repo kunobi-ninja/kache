@@ -86,6 +86,8 @@ cargo install --locked cargo-mutants --version 27.1.0
 just mutants-core
 ```
 
+Coding agents: read [AGENTS.md](./AGENTS.md) before opening a PR. The usual CI failure is Mutation testing after a push that only ran `just check`.
+
 Run the PR gate before submitting. `just check` is fmt, clippy with `-D warnings`, and tests. CI also mutation-tests every changed Rust line; `just pr` runs that too.
 
 ```sh
@@ -109,7 +111,7 @@ Clippy on macOS does not type-check `#[cfg(target_os = "linux")]` functions. Ide
 - Keep PRs small and focused on a single change
 - Add tests for new functionality
 - Don't bundle unrelated refactors with feature work
-- CI must pass before merge (fmt, clippy, tests, coverage threshold)
+- CI must pass before merge (fmt, clippy, tests, coverage, changed-line mutants)
 
 ## Branching and releases
 

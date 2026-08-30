@@ -48,7 +48,7 @@ GitHub withholds secrets and OIDC tokens from fork pull-request jobs, so those r
 
 Pull-request jobs can still restore entries a trusted branch already published.
 
-C and C++ object entries are local-only. A remote pull does not warm them.
+C and C++ objects publish through the same remote as Rust. A daemon-backed compile restores them on miss; `kache sync --pull --all` also warms them in the local store. clang-cl debug objects stay on the machine and are not published.
 
 ## Other CI systems
 

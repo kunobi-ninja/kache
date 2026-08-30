@@ -92,7 +92,7 @@ GCC and Clang entries can be reused across worktrees when source and build paths
 KACHE_BASE_DIR="$PWD" cmake --build build
 ```
 
-clang-cl debug objects remain machine-local because CodeView records paths that clang-cl does not remap.
+A configured remote publishes GCC and Clang objects the same way it publishes Rust entries. clang-cl debug objects stay on the machine because CodeView records paths that clang-cl does not remap.
 
 ## Passthroughs
 
@@ -104,8 +104,6 @@ Kache currently passes through:
 - precompiled headers and modules
 - coverage and split-DWARF builds
 - flags it has not classified
-
-C/C++ entries are local-only. Remote sync currently handles Rust entries.
 
 Inspect passthrough reasons in the monitor or logs:
 

@@ -12368,6 +12368,28 @@ mod tests {
             .unwrap();
     }
 
+    fn seed_cc_store_entry(config: &Config, cache_key: &str, crate_name: &str, dir: &Path) {
+        let store = Store::open(config).unwrap();
+        let src = dir.join(format!("{cache_key}-src"));
+        std::fs::create_dir_all(&src).unwrap();
+        let artifact = src.join("foo.o");
+        std::fs::write(&artifact, b"cc object bytes").unwrap();
+        store
+            .put_with_compile_time_independent(
+                cache_key,
+                crate_name,
+                &[],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "",
+                &[(artifact, "foo.o".to_string())],
+                "",
+                "",
+                0,
+            )
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_socket_stats_roundtrip_with_populated_store() {
         // A populated store exercises the daemon's stats aggregation + entry
@@ -16554,6 +16576,44 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), server)
             .await
             .expect("the upload request must reach the live daemon")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_send_upload_job_client_roundtrip_for_cc_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let key = test_cache_key("cc-object-upload");
+        seed_cc_store_entry(&config, &key, "foo.c", dir.path());
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+        let listener = bind_listener(&socket_path);
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<UploadJob>();
+        daemon.set_upload_tx(tx);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let _ =
+                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new()).await;
+        });
+
+        let cfg = config.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            send_upload_job(&cfg, &key, Path::new("/tmp/test"), "foo.c")
+        })
+        .await
+        .unwrap();
+        assert!(
+            result.is_ok(),
+            "a C object upload job should send to a live daemon: {result:?}"
+        );
+        let jobs = load_upload_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].crate_name, "foo.c");
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("the cc upload request must reach the live daemon")
             .unwrap();
     }
 

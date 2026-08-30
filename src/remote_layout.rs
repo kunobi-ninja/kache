@@ -1433,6 +1433,34 @@ mod tests {
         (tmp, store, entry_dir)
     }
 
+    fn populated_cc_entry(
+        cache_key: &str,
+        crate_name: &str,
+    ) -> (tempfile::TempDir, Store, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&min_config(tmp.path().join("cache"))).unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source_file = source_dir.join("foo.o");
+        std::fs::write(&source_file, b"cc object bytes").unwrap();
+        store
+            .put_with_compile_time_independent(
+                cache_key,
+                crate_name,
+                &[],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "",
+                &[(source_file, "foo.o".to_string())],
+                "",
+                "",
+                0,
+            )
+            .unwrap();
+        let entry_dir = store.entry_dir(cache_key);
+        (tmp, store, entry_dir)
+    }
+
     #[tokio::test]
     async fn exists_entry_reports_present_and_missing_objects() {
         let remote = test_remote();
@@ -1516,6 +1544,36 @@ mod tests {
         assert_eq!(manifest.cache_key, "key123");
         assert_eq!(manifest.crate_name, "foo");
         assert_eq!(manifest.file_count, 1);
+    }
+
+    #[tokio::test]
+    async fn cc_object_pack_round_trips_through_v3() {
+        let cache_key = "c".repeat(64);
+        let (_tmp, store, entry_dir) = populated_cc_entry(&cache_key, "foo.c");
+        let remote = test_remote();
+        let backend = memory_backend();
+        let layout = RemoteLayout::new(&backend, &remote);
+
+        layout
+            .upload_entry(&cache_key, "foo.c", &entry_dir, &store.blobs_dir(), 3)
+            .await
+            .expect("cc object upload should reuse the v3 pack layout");
+
+        let dest = _tmp.path().join("restored");
+        layout
+            .download_entry(&cache_key, "foo.c", &dest, &store.blobs_dir())
+            .await
+            .expect("cc object download should extract the same pack");
+        assert_eq!(
+            std::fs::read(dest.join("foo.o")).unwrap(),
+            b"cc object bytes"
+        );
+        assert!(
+            backend
+                .head(&v3_manifest_key(&remote.prefix, &cache_key, "foo.c"))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -25,6 +25,14 @@ fn rustc_path() -> String {
     std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string())
 }
 
+fn cc_available() -> bool {
+    std::process::Command::new("cc")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn toml_path(path: &Path) -> String {
     toml::Value::String(path.to_string_lossy().into_owned()).to_string()
 }
@@ -208,6 +216,20 @@ impl Client {
             output.status.success(),
             "kache rustc failed.\nstderr: {}",
             String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    fn compile_cc_checkout(&self, checkout: &Path, source: &str, output: &str) {
+        let result = self.run_within_at(
+            Some(checkout),
+            &["cc", "-c", source, "-o", output, "-O0", "-g0"],
+            Duration::from_secs(90),
+        );
+        assert!(
+            result.status.success(),
+            "kache cc failed.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
         );
     }
 
@@ -503,6 +525,75 @@ fn daemon_upload_reaches_an_independent_client_through_one_folder() {
         std::fs::read(out_a.path().join("libfsremote.rlib")).unwrap(),
         std::fs::read(out_b.path().join("libfsremote.rlib")).unwrap(),
         "the remotely restored artifact must match the producer byte-for-byte"
+    );
+    beta.stop_daemon_and_wait();
+}
+
+/// C object compiles use the same v3 pack layout and daemon upload/check
+/// path as rustc. Two clients sharing a folder get a remote hit without
+/// an explicit sync.
+#[test]
+fn daemon_upload_reaches_an_independent_client_for_a_c_object() {
+    if !cc_available() {
+        eprintln!("skipping: no working `cc` on PATH");
+        return;
+    }
+    build_kache();
+
+    let shared = TempDir::new().unwrap();
+    let producer_source = TempDir::new().unwrap();
+    let consumer_source = TempDir::new().unwrap();
+    let source = "int answer(void) { return 42; }\n";
+    std::fs::write(producer_source.path().join("foo.c"), source).unwrap();
+    std::fs::write(consumer_source.path().join("foo.c"), source).unwrap();
+
+    let alpha = Client::new(shared.path());
+    alpha.start_daemon();
+    alpha.compile_cc_checkout(producer_source.path(), "foo.c", "foo.o");
+    let alpha_report = alpha.report();
+    let alpha_event = crate_event(&alpha_report, "foo.c");
+    assert!(
+        alpha_event["result"] == "miss" || alpha_event["result"] == "dup",
+        "client A's first C compile must be a real compile: {alpha_report}"
+    );
+    assert_eq!(
+        alpha_event["compiler_runs"], 1,
+        "the producer must compile instead of restoring: {alpha_report}"
+    );
+    let cache_key = alpha_event["cache_key"]
+        .as_str()
+        .expect("producer event should include its cache key")
+        .to_owned();
+
+    wait_for_remote_entry(shared.path(), "foo.c", &cache_key);
+    alpha.stop_daemon_and_wait();
+
+    let beta = Client::new(shared.path());
+    beta.start_daemon();
+    beta.compile_cc_checkout(consumer_source.path(), "foo.c", "foo.o");
+    let beta_report = beta.report();
+    let beta_event = crate_event(&beta_report, "foo.c");
+
+    assert_eq!(
+        beta_event["result"], "remote_hit",
+        "client B must pull A's C object from the shared folder on miss: {beta_report}"
+    );
+    assert_eq!(
+        beta_event["compiler_runs"], 0,
+        "client B must restore without running cc: {beta_report}"
+    );
+    assert_eq!(
+        beta_event["cache_key"], cache_key,
+        "producer and consumer C checkouts must resolve to the same key"
+    );
+    assert!(
+        consumer_source.path().join("foo.o").is_file(),
+        "client B must end up with the object materialized"
+    );
+    assert_eq!(
+        std::fs::read(producer_source.path().join("foo.o")).unwrap(),
+        std::fs::read(consumer_source.path().join("foo.o")).unwrap(),
+        "the remotely restored object must match the producer byte-for-byte"
     );
     beta.stop_daemon_and_wait();
 }

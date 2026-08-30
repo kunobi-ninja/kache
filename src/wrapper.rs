@@ -2664,12 +2664,7 @@ fn validate_extra_inputs_dep_info_before_store(
 /// spellings; everything else (`1`, `2`, `line-tables-only`, ...) produces
 /// DWARF worth bundling. `-g` desugars to `-Cdebuginfo=2` at parse time.
 fn rustc_debuginfo_enabled(args: &RustcArgs) -> bool {
-    match args.get_codegen_opt("debuginfo") {
-        None => false,
-        Some("0") => false,
-        Some("none") => false,
-        Some(_) => true,
-    }
+    args.debuginfo_enabled()
 }
 
 /// Store-time gate for [`crate::compiler::Platform::package_debug_bundle`]:

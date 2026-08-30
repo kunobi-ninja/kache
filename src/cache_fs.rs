@@ -290,8 +290,7 @@ fn statfs_total_bytes(stat: &libc::statfs) -> Option<u64> {
         stat.f_bsize
     };
     let frag = u64::try_from(frag).ok().filter(|&n| n > 0)?;
-    let blocks = u64::try_from(stat.f_blocks).ok()?;
-    blocks.checked_mul(frag)
+    stat.f_blocks.checked_mul(frag)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

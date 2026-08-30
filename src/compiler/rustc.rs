@@ -939,6 +939,14 @@ mod tests {
     }
 
     #[test]
+    fn custom_target_specs_accept_each_supported_path_shape() {
+        assert!(is_custom_target_spec("specs/wasm32-custom"));
+        assert!(is_custom_target_spec(r"specs\wasm32-custom"));
+        assert!(is_custom_target_spec("wasm32-custom.json"));
+        assert!(!is_custom_target_spec("wasm32-unknown-unknown"));
+    }
+
+    #[test]
     fn refuse_reasons_admits_compiler_bundled_wasm_links() {
         for target in COMPILER_BUNDLED_WASM_TARGETS {
             let parsed = linked_wasm(target, &[]);
@@ -1057,6 +1065,44 @@ mod tests {
         assert!(
             macos_oso_prefix_flag_inner(&release, &release.all_args, true).is_none(),
             "no debuginfo means no oso_prefix"
+        );
+
+        let library = RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "rlib",
+                "-g",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "src/lib.rs",
+            ]))
+            .unwrap();
+        assert!(
+            macos_oso_prefix_flag_inner(&library, &library.all_args, true).is_none(),
+            "non-executable outputs must not receive oso_prefix"
+        );
+
+        let metadata_only = RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "bin",
+                "-g",
+                "--emit",
+                "metadata",
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "src/main.rs",
+            ]))
+            .unwrap();
+        assert!(
+            macos_oso_prefix_flag_inner(&metadata_only, &metadata_only.all_args, true).is_none(),
+            "non-link outputs must not receive oso_prefix"
         );
 
         let relative = debug_bin_args(Path::new("target/debug/deps"), &[]);

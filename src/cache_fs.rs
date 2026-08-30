@@ -141,10 +141,7 @@ pub fn probe(path: &Path) -> FsProbe {
 /// A zero block size is `None` (the kernel did not report a size), not a
 /// zero-byte disk. Overflow is `None`. Pure so the cases are tested on every
 /// platform, not only the OS whose `statfs` produced the numbers.
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "linux")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn disk_bytes(block_size: u64, blocks: u64) -> Option<u64> {
     if block_size == 0 {
         return None;

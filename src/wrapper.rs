@@ -8461,6 +8461,7 @@ exit 0
     /// because reports rely on these schema-9 fields.
     #[test]
     fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
+        let _ = crate::verify_compare::take_last_report();
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().join("cache"));
         let store_put = StorePutResult {
@@ -8501,7 +8502,7 @@ exit 0
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 15);
+        assert_eq!(event.schema, 16);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);
@@ -8515,6 +8516,10 @@ exit 0
         assert!(
             event.store_error.is_empty(),
             "a successful store records no failure reason"
+        );
+        assert!(
+            event.verify_compare.is_empty(),
+            "verify off must not invent a verify_compare class"
         );
     }
 
@@ -8551,6 +8556,7 @@ exit 0
     /// (kunobi-ninja/kache#629).
     #[test]
     fn log_event_with_store_outcome_persists_the_store_failure_reason() {
+        let _ = crate::verify_compare::take_last_report();
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().join("cache"));
 
@@ -8583,10 +8589,15 @@ exit 0
             event.store_error,
             "refusing to cache zero-byte artifact: libfoo.rlib"
         );
+        assert!(
+            event.verify_compare.is_empty(),
+            "a store-failure miss must not invent a verify_compare class"
+        );
     }
 
     #[test]
     fn log_event_persists_same_key_lookup_rejection() {
+        let _ = crate::verify_compare::take_last_report();
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().join("cache"));
 
@@ -8617,18 +8628,77 @@ exit 0
         let event = &events[0];
         assert_eq!(event.result, EventResult::Miss);
         assert_eq!(event.cache_key, "same-key");
-        assert_eq!(event.schema, 15);
+        assert_eq!(event.schema, 16);
         assert_eq!(
             event.lookup_rejection,
             "matching entry lacks dep-info required by this invocation"
         );
         assert!(event.store_error.is_empty());
+        assert!(
+            event.verify_compare.is_empty(),
+            "lookup rejection must not invent a verify_compare class"
+        );
+    }
+
+    /// Schema 16 writes `verify_compare` from the hit-qualification stash.
+    /// Empty when verify did not run; the class string when it did.
+    #[test]
+    fn log_event_persists_verify_compare_class_on_hit() {
+        let _ = crate::verify_compare::take_last_report();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+
+        log_event(
+            &config,
+            "/repo",
+            "foo",
+            EventResult::LocalHit,
+            1,
+            20,
+            30,
+            "hit-key",
+            0,
+            0,
+            0,
+            0,
+        );
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events[0].schema, 16);
+        assert_eq!(events[0].result, EventResult::LocalHit);
+        assert!(
+            events[0].verify_compare.is_empty(),
+            "no qualification run must leave verify_compare empty"
+        );
+
+        crate::verify_compare::record_report("content: libfoo.rlib (byte mismatch)".to_string());
+        log_event(
+            &config,
+            "/repo",
+            "foo",
+            EventResult::LocalHit,
+            2,
+            20,
+            30,
+            "hit-key",
+            0,
+            0,
+            1,
+            0,
+        );
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].schema, 16);
+        assert_eq!(
+            events[1].verify_compare,
+            "content: libfoo.rlib (byte mismatch)"
+        );
     }
 
     /// Passthrough events intentionally omit cache timings but preserve the
     /// structured reason, fallback marker, and compiler exit code.
     #[test]
     fn log_passthrough_event_persists_reason_fallback_and_exit_code() {
+        let _ = crate::verify_compare::take_last_report();
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().join("cache"));
         let output = PassthroughOutput {
@@ -8657,6 +8727,10 @@ exit 0
         assert!(event.fallback);
         assert_eq!(event.exit_code, Some(42));
         assert_eq!(event.cache_key, "");
+        assert!(
+            event.verify_compare.is_empty(),
+            "passthrough must not invent a verify_compare class"
+        );
     }
 
     /// The emit gate must reject a missing requested output kind, while

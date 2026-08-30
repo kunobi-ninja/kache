@@ -5,10 +5,11 @@
 # CARGO_TARGET_DIR, building overlapping dependencies with the same
 # features. Without coalescing every process compiles the shared deps
 # itself and any dedup happens after the fact. kache's contract is
-# stronger: the first wrapper to reach a unit claims its key
-# (store::claim_build), concurrent wrappers block on the claim
-# (wait_for_committed) and restore the winner's artifact — one compile
-# per unit ACROSS ALL processes, even on a stone-cold cache.
+# stronger: the first wrapper to miss a unit joins a flight and claims
+# its key; concurrent wrappers wait on that flight and restore the
+# winner's artifact — one compile per unit ACROSS ALL processes, even
+# on a stone-cold cache. Distinct CARGO_TARGET_DIR values remain
+# required; Kache does not wrap Cargo.
 #
 # This script is the fixture's `build` command: two cargo builds of the
 # same workspace, launched simultaneously against distinct target dirs.

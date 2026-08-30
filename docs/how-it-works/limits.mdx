@@ -1,0 +1,16 @@
+---
+title: Limits
+description: How Kache paces concurrent compiler processes without wrapping Cargo
+---
+
+## Several Cargo builds at once
+
+Kache is a compiler wrapper, not a build frontend. Keep running `cargo`. Give each live build its own `CARGO_TARGET_DIR` (or `kache cargo`) so Cargo's fingerprints stay isolated.
+
+After a local and remote miss, the wrapper joins a machine-wide flight for the invocation identity — crate name, output kind, and compiler — then takes a memory-weighted permit before the per-key build lock. Hits and passthroughs never wait.
+
+The permit pool size is `std::thread::available_parallelism()`, with a floor of 1. Unmeasured compiles occupy one slot; unmeasured rustc link invocations occupy two. On Unix, a real compile records the child's peak RSS by crate name. Later invocations of that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
+
+If the scheduler directory cannot be used, compilation continues without a permit. Set `KACHE_SCHEDULER=0` or `[cache] scheduler = false` to turn it off.
+
+Two cargo processes that miss the same crate still share one real compile when the first stores an entry the second can restore. Distinct target directories remain required.

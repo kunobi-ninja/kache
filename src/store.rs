@@ -932,7 +932,7 @@ impl StoreLock {
         Self::finish(file)
     }
 
-    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+    pub(crate) fn try_acquire(path: &Path) -> Result<Option<Self>> {
         let file = Self::open(path)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self::finish(file)?)),
@@ -5921,6 +5921,7 @@ mod tests {
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
+            scheduler: true,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),

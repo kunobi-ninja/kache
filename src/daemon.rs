@@ -9520,6 +9520,7 @@ mod tests {
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
+            scheduler: true,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),

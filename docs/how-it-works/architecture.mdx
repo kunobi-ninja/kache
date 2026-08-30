@@ -13,12 +13,12 @@ For an eligible compiler invocation, the wrapper:
 2. computes a BLAKE3 cache key
 3. checks the local store
 4. asks the daemon for an exact remote result after a local miss
-5. takes a per-key lock and checks locally again
+5. on a miss, joins a machine-wide flight and takes a memory-weighted permit, then takes a per-key lock and checks locally again
 6. runs the compiler if the entry is still absent
 7. stores outputs as content-addressed blobs
 8. queues a remote upload when a writable remote is configured
 
-The second local check prevents duplicate work when another process fills the same key while this process waits for the lock.
+The second local check prevents duplicate work when another process fills the same key while this process waits for the lock. Hits and passthroughs never join a flight or wait for a permit. See [Limits](/docs/how-it-works/limits).
 
 | Result | Compiler ran | Meaning |
 | --- | ---: | --- |

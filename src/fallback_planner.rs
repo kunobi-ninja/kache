@@ -54,6 +54,20 @@ struct LocalPlannerSource<'a> {
     daemon: &'a Arc<Daemon>,
 }
 
+fn manifest_entry_candidate(
+    entry: crate::remote::ManifestEntry,
+    index: usize,
+) -> PrefetchCandidate {
+    PrefetchCandidate {
+        cache_key: entry.cache_key,
+        crate_name: entry.crate_name,
+        compile_time_ms: (entry.compile_time_ms > 0).then_some(entry.compile_time_ms),
+        size_bytes: (entry.artifact_size > 0).then_some(entry.artifact_size),
+        source: kache_core::CandidateSource::Manifest,
+        demand_index: u32::try_from(index).ok(),
+    }
+}
+
 #[async_trait]
 impl PlannerDataSource for LocalPlannerSource<'_> {
     async fn shard_candidates(
@@ -154,16 +168,7 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
                     );
                     for (index, entry) in manifest.entries.into_iter().enumerate() {
                         if seen.insert(entry.cache_key.clone()) {
-                            candidates.push(PrefetchCandidate {
-                                cache_key: entry.cache_key,
-                                crate_name: entry.crate_name,
-                                compile_time_ms: (entry.compile_time_ms > 0)
-                                    .then_some(entry.compile_time_ms),
-                                size_bytes: (entry.artifact_size > 0)
-                                    .then_some(entry.artifact_size),
-                                source: kache_core::CandidateSource::Manifest,
-                                demand_index: u32::try_from(index).ok(),
-                            });
+                            candidates.push(manifest_entry_candidate(entry, index));
                         }
                     }
                     break;
@@ -179,6 +184,38 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_entry_zero_measurements_remain_unknown() {
+        let candidate = manifest_entry_candidate(
+            crate::remote::ManifestEntry {
+                cache_key: "key".into(),
+                crate_name: "crate".into(),
+                compile_time_ms: 0,
+                artifact_size: 0,
+            },
+            7,
+        );
+        assert_eq!(candidate.compile_time_ms, None);
+        assert_eq!(candidate.size_bytes, None);
+        assert_eq!(candidate.demand_index, Some(7));
+    }
+
+    #[test]
+    fn manifest_entry_positive_measurements_are_preserved() {
+        let candidate = manifest_entry_candidate(
+            crate::remote::ManifestEntry {
+                cache_key: "key".into(),
+                crate_name: "crate".into(),
+                compile_time_ms: 12,
+                artifact_size: 34,
+            },
+            0,
+        );
+        assert_eq!(candidate.compile_time_ms, Some(12));
+        assert_eq!(candidate.size_bytes, Some(34));
+        assert_eq!(candidate.demand_index, Some(0));
+    }
 
     /// Composition is reported only when a cap actually dropped something
     /// (#616): always logging would drown the interesting case, never logging

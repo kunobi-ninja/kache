@@ -759,14 +759,16 @@ mod tests {
             identity_key: None,
         };
 
-        let plan = build_prefetch_plan(&source, &intent, "fallback")
-            .await
-            .unwrap();
+        let (plan, composition) =
+            build_prefetch_plan_with_limits(&source, &intent, "fallback", PlanLimits::default())
+                .await
+                .unwrap();
 
         assert_eq!(plan.disposition, PrefetchDisposition::Execute);
         assert_eq!(plan.planner.as_deref(), Some("fallback"));
         assert_eq!(plan.candidates.len(), 1);
         assert_eq!(plan.candidates[0].cache_key, "from-shard");
+        assert_eq!(composition.from_shards, 1);
     }
 
     #[cfg(feature = "planning")]

@@ -604,6 +604,17 @@ fn probe_forward_compiler() -> String {
 /// After a local+remote miss: join a machine-wide flight, then take a
 /// permit. Lock order is flight → permit → the caller's `claim_build`.
 /// Hits and passthroughs must not call this.
+fn take_recheck_hit(
+    store: &Store,
+    cache_key: &str,
+    entry_ok: &impl Fn(&EntryMeta) -> bool,
+) -> Option<EntryMeta> {
+    match store.get(cache_key) {
+        Ok(Some(meta)) if entry_ok(&meta) => Some(meta),
+        _ => None,
+    }
+}
+
 fn admit_scheduler_miss(
     config: &Config,
     store: &Store,
@@ -618,12 +629,11 @@ fn admit_scheduler_miss(
     }
     loop {
         match scheduler::begin_miss(&config.cache_dir, true, &identity, crate_name, is_link) {
-            scheduler::BeginMiss::Recheck => match store.get(cache_key) {
-                Ok(Some(meta)) if entry_ok(&meta) => {
+            scheduler::BeginMiss::Recheck => {
+                if let Some(meta) = take_recheck_hit(store, cache_key, &entry_ok) {
                     return (MissGuard::empty(), Some(meta));
                 }
-                _ => {}
-            },
+            }
             scheduler::BeginMiss::Compile(guard) => return (guard, None),
         }
     }
@@ -900,7 +910,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         FlightIdentity::cc(&crate_name),
         &crate_name,
         false,
-        |meta| !meta.files.is_empty() && cc_cache_entry_rejection_reason(&parsed, meta).is_none(),
+        |meta| cc_scheduled_hit_ok(&parsed, meta),
     );
 
     let mut committed = scheduled_hit;
@@ -919,10 +929,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     .unwrap_or(false)
                     .then(|| store.get(&cache_key).ok().flatten())
                     .flatten()
-                    .filter(|meta| {
-                        !meta.files.is_empty()
-                            && cc_cache_entry_rejection_reason(&parsed, meta).is_none()
-                    });
+                    .filter(|meta| cc_scheduled_hit_ok(&parsed, meta));
             }
             Err(e) => {
                 tracing::debug!("cc claim_build failed ({e:#}); compiling without a key lock");
@@ -930,9 +937,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         }
     }
 
-    if let Some(meta) = committed.filter(|meta| {
-        !meta.files.is_empty() && cc_cache_entry_rejection_reason(&parsed, meta).is_none()
-    }) {
+    if let Some(meta) = committed.filter(|meta| cc_scheduled_hit_ok(&parsed, meta)) {
         let restore_start = std::time::Instant::now();
         if let Err(e) = restore_cc_from_cache(&store, &parsed, &meta) {
             if e.downcast_ref::<PartialCcRestore>().is_some() {
@@ -970,12 +975,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             0,
         );
         print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
-        if !meta.stdout.is_empty() {
-            print!("{}", meta.stdout);
-        }
-        if !meta.stderr.is_empty() {
-            eprint!("{}", meta.stderr);
-        }
+        replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
         compiler.commit_preprocess_memo(&file_hasher);
         return Ok(0);
     }
@@ -1196,6 +1196,17 @@ pub(crate) fn refuse_legacy_cc_blob_outputs(
         }
     }
     Ok(())
+}
+
+fn cache_entry_has_files(meta: &crate::store::EntryMeta) -> bool {
+    !meta.files.is_empty()
+}
+
+fn cc_scheduled_hit_ok(
+    parsed: &crate::compiler::cc::CcArgs,
+    meta: &crate::store::EntryMeta,
+) -> bool {
+    cache_entry_has_files(meta) && cc_cache_entry_rejection_reason(parsed, meta).is_none()
 }
 
 #[cfg(test)]
@@ -2277,7 +2288,7 @@ fn run_parsed_rustc(
         FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()),
         crate_name,
         args.emits_link(),
-        |meta| !meta.files.is_empty(),
+        cache_entry_has_files,
     );
     let (lock, committed) = if let Some(meta) = scheduled_hit {
         (None, Some(meta))
@@ -5744,6 +5755,20 @@ mod tests {
             compile_time_ms: 0,
             emit_kinds: vec![],
         }
+    }
+
+    fn entry_meta_with_files(names: &[&str]) -> crate::store::EntryMeta {
+        let mut meta = meta_with_diagnostics("", "");
+        meta.files = names
+            .iter()
+            .map(|name| crate::store::CachedFile {
+                name: (*name).to_string(),
+                size: 1,
+                hash: "0123456789abcdef".to_string(),
+                executable: false,
+            })
+            .collect();
+        meta
     }
 
     #[test]
@@ -9490,5 +9515,243 @@ exit 0
             std::env::set_var("KACHE_EVENT_ROOT", "");
         }
         assert_eq!(event_root_override(), None);
+    }
+
+    #[test]
+    fn cache_entry_has_files_rejects_empty_entries() {
+        assert!(!cache_entry_has_files(&entry_meta_with_files(&[])));
+        assert!(cache_entry_has_files(&entry_meta_with_files(&[
+            "libfoo.rlib"
+        ])));
+    }
+
+    #[test]
+    fn cc_scheduled_hit_ok_rejects_empty_files_and_incomplete_entries() {
+        let with_depinfo = CcCompiler::new()
+            .parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", "-MMD"]))
+            .unwrap();
+        let object_only = CcCompiler::new()
+            .parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o"]))
+            .unwrap();
+
+        assert!(
+            !cc_scheduled_hit_ok(&object_only, &entry_meta_with_files(&[])),
+            "an empty file list must not restore"
+        );
+        assert!(
+            !cc_scheduled_hit_ok(&with_depinfo, &entry_meta_with_files(&["foo.o"])),
+            "a rejection reason must not restore"
+        );
+        assert!(cc_scheduled_hit_ok(
+            &object_only,
+            &entry_meta_with_files(&["foo.o"])
+        ));
+        assert!(cc_scheduled_hit_ok(
+            &with_depinfo,
+            &entry_meta_with_files(&["foo.o", "foo.d"])
+        ));
+    }
+
+    fn seed_store_entry(dir: &std::path::Path, key: &str) -> (Config, Store, EntryMeta) {
+        let config = test_config(dir.to_path_buf());
+        let store = Store::open(&config).unwrap();
+        let artifact = dir.join("seed.rlib");
+        std::fs::write(&artifact, b"cached-bytes").unwrap();
+        store
+            .put(
+                key,
+                "seed",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(artifact, "libseed.rlib".to_string())],
+                "stdout-diag",
+                "stderr-diag",
+            )
+            .unwrap();
+        let meta = store.get(key).unwrap().expect("seeded entry");
+        (config, store, meta)
+    }
+
+    #[test]
+    fn take_recheck_hit_returns_only_entries_the_predicate_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "recheck-key";
+        let (_config, store, meta) = seed_store_entry(dir.path(), key);
+
+        let hit = take_recheck_hit(&store, key, &|_| true).expect("accepted meta");
+        assert_eq!(hit.cache_key, meta.cache_key);
+        assert!(
+            take_recheck_hit(&store, key, &|_| false).is_none(),
+            "a rejecting predicate must not return the stored meta"
+        );
+        assert!(take_recheck_hit(&store, "missing", &|_| true).is_none());
+    }
+
+    #[test]
+    fn admit_scheduler_miss_off_returns_empty_without_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().to_path_buf());
+        config.scheduler = false;
+        let store = Store::open(&config).unwrap();
+        let (guard, hit) = admit_scheduler_miss(
+            &config,
+            &store,
+            "key",
+            FlightIdentity::cc("a.c"),
+            "a.c",
+            false,
+            |_| true,
+        );
+        assert!(guard.is_empty());
+        assert!(hit.is_none());
+        assert!(
+            !dir.path().join("scheduler").exists(),
+            "off switch must not create lease files"
+        );
+    }
+
+    #[test]
+    fn admit_scheduler_miss_on_owns_the_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().to_path_buf());
+        let store = Store::open(&config).unwrap();
+        let (guard, hit) = admit_scheduler_miss(
+            &config,
+            &store,
+            "key",
+            FlightIdentity::rustc("owned", &["lib".into()], false),
+            "owned",
+            false,
+            |_| true,
+        );
+        assert!(hit.is_none());
+        assert!(
+            !guard.is_empty(),
+            "an enabled miss must take a flight and permit"
+        );
+    }
+
+    fn spawn_flight_holder(dir: &std::path::Path, crate_name: &str) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "wrapper::tests::hold_scheduler_flight_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_SCHEDULER_ROOT", dir)
+            .env("KACHE_TEST_FLIGHT_CRATE", crate_name)
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_flight_ready(dir: &std::path::Path, child: &mut std::process::Child) {
+        let ready = dir.join("lock-ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "scheduler fixture exited before becoming ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "scheduler fixture did not become ready");
+    }
+
+    #[test]
+    fn admit_scheduler_miss_recheck_returns_accepted_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let crate_name = "recheck_accept";
+        let key = "recheck-accept-key";
+        let (_config, store, seeded) = seed_store_entry(dir.path(), key);
+        let expected_key = seeded.cache_key.clone();
+        drop(store);
+        let mut child = spawn_flight_holder(dir.path(), crate_name);
+        wait_flight_ready(dir.path(), &mut child);
+
+        let cache = dir.path().to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            let config = test_config(cache);
+            let store = Store::open(&config).unwrap();
+            admit_scheduler_miss(
+                &config,
+                &store,
+                key,
+                FlightIdentity::rustc(crate_name, &["lib".into()], false),
+                crate_name,
+                false,
+                |_| true,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::fs::write(dir.path().join("go"), b"go").unwrap();
+        let (guard, hit) = waiter.join().unwrap();
+        assert!(
+            guard.is_empty(),
+            "a Recheck hit must not keep the flight or permit"
+        );
+        let hit = hit.expect("accepted Recheck meta");
+        assert_eq!(hit.cache_key, expected_key);
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn admit_scheduler_miss_recheck_skips_rejected_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let crate_name = "recheck_reject";
+        let key = "recheck-reject-key";
+        let (_config, store, _seeded) = seed_store_entry(dir.path(), key);
+        drop(store);
+        let mut child = spawn_flight_holder(dir.path(), crate_name);
+        wait_flight_ready(dir.path(), &mut child);
+
+        let cache = dir.path().to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            let config = test_config(cache);
+            let store = Store::open(&config).unwrap();
+            admit_scheduler_miss(
+                &config,
+                &store,
+                key,
+                FlightIdentity::rustc(crate_name, &["lib".into()], false),
+                crate_name,
+                false,
+                |_| false,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::fs::write(dir.path().join("go"), b"go").unwrap();
+        let (guard, hit) = waiter.join().unwrap();
+        assert!(
+            hit.is_none(),
+            "a rejecting predicate must not restore the stored meta"
+        );
+        assert!(
+            !guard.is_empty(),
+            "rejected Recheck must loop and compile as the next owner"
+        );
+        let _ = child.wait();
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for admit_scheduler_miss recheck tests"]
+    fn hold_scheduler_flight_fixture() {
+        let root =
+            PathBuf::from(std::env::var_os("KACHE_TEST_SCHEDULER_ROOT").expect("fixture root"));
+        let crate_name = std::env::var("KACHE_TEST_FLIGHT_CRATE").expect("fixture crate name");
+        let identity = FlightIdentity::rustc(&crate_name, &["lib".into()], false);
+        let guard = match scheduler::begin_miss(&root, true, &identity, &crate_name, false) {
+            scheduler::BeginMiss::Compile(guard) => guard,
+            scheduler::BeginMiss::Recheck => panic!("fixture must own the flight"),
+        };
+        std::fs::write(root.join("lock-ready"), b"ready").unwrap();
+        let go = root.join("go");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !go.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(guard);
     }
 }

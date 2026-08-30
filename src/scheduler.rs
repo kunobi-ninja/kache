@@ -105,28 +105,16 @@ pub enum BeginMiss {
 /// Locks held by the process that will run the compiler.
 ///
 /// Acquire order is flight then permit (then the caller's key lock).
-/// Drop releases the permit before the flight.
+/// Permit is declared before flight so the slot is released before a
+/// waiter can become the next flight owner.
 pub struct MissGuard {
-    permit: Option<Permit>,
-    flight: Option<StoreLock>,
+    _permit: Option<Permit>,
+    _flight: Option<StoreLock>,
     weights_dir: Option<PathBuf>,
 }
 
 struct Permit {
-    slots: Vec<StoreLock>,
-}
-
-impl Drop for MissGuard {
-    fn drop(&mut self) {
-        self.permit.take();
-        self.flight.take();
-    }
-}
-
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.slots.clear();
-    }
+    _slots: Vec<StoreLock>,
 }
 
 struct Scheduler {
@@ -139,18 +127,24 @@ struct Scheduler {
 impl MissGuard {
     pub fn empty() -> Self {
         Self {
-            permit: None,
-            flight: None,
+            _permit: None,
+            _flight: None,
             weights_dir: None,
         }
     }
 
     fn compiling(permit: Option<Permit>, flight: StoreLock, weights_dir: PathBuf) -> Self {
         Self {
-            permit,
-            flight: Some(flight),
+            _permit: permit,
+            _flight: Some(flight),
             weights_dir: Some(weights_dir),
         }
+    }
+
+    /// True when this miss did not take a flight lock or permit.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self._permit.is_none() && self._flight.is_none()
     }
 
     /// Record the waited-for compiler child's peak RSS under `crate_name`.
@@ -296,7 +290,7 @@ impl Scheduler {
         let start = std::time::Instant::now();
         loop {
             match try_collect_slots(self, need) {
-                Ok(Some(slots)) => return Some(Permit { slots }),
+                Ok(Some(slots)) => return Some(Permit { _slots: slots }),
                 Ok(None) => {}
                 Err(error) => {
                     tracing::debug!(
@@ -348,7 +342,7 @@ fn wait_for_lock(path: &Path, timeout: Duration, poll: Duration) -> Result<bool>
     }
 }
 
-fn weight_from_rss(rss_bytes: u64, pool_size: u32) -> u32 {
+pub(crate) fn weight_from_rss(rss_bytes: u64, pool_size: u32) -> u32 {
     let slots = rss_bytes.div_ceil(RSS_BYTES_PER_SLOT);
     u32::try_from(slots).unwrap_or(u32::MAX).clamp(1, pool_size)
 }
@@ -373,20 +367,25 @@ fn write_weight(weights_dir: &Path, crate_name: &str, rss: u64) -> Result<bool> 
     })
 }
 
+/// Interpret `getrusage` output as peak child RSS in bytes.
+#[cfg(unix)]
+fn rss_from_getrusage(rc: i32, ru_maxrss: i64) -> Option<u64> {
+    if rc != 0 {
+        return None;
+    }
+    if ru_maxrss <= 0 {
+        return None;
+    }
+    Some(rss_units_to_bytes(ru_maxrss as u64))
+}
+
 fn peak_child_rss_bytes() -> Option<u64> {
     #[cfg(unix)]
     {
         // SAFETY: `rusage` is a C POD written fully by `getrusage` on success.
         let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
         let rc = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) };
-        if rc != 0 {
-            return None;
-        }
-        let rss = usage.ru_maxrss;
-        if rss <= 0 {
-            return None;
-        }
-        Some(rss_units_to_bytes(rss as u64))
+        rss_from_getrusage(rc, usage.ru_maxrss)
     }
     #[cfg(not(unix))]
     {
@@ -443,8 +442,12 @@ mod tests {
     }
 
     #[test]
-    fn default_pool_size_is_at_least_one() {
-        assert!(default_pool_size() >= 1);
+    fn default_pool_size_follows_available_parallelism() {
+        let expected = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        assert_eq!(default_pool_size(), expected);
+        assert!(expected >= 1);
     }
 
     #[test]
@@ -506,24 +509,40 @@ mod tests {
 
     #[test]
     fn weight_from_rss_uses_512mib_slots() {
-        assert_eq!(weight_from_rss(1, 8), 1);
-        assert_eq!(weight_from_rss(RSS_BYTES_PER_SLOT, 8), 1);
-        assert_eq!(weight_from_rss(RSS_BYTES_PER_SLOT + 1, 8), 2);
-        assert_eq!(weight_from_rss(RSS_BYTES_PER_SLOT * 4, 8), 4);
-        assert_eq!(weight_from_rss(RSS_BYTES_PER_SLOT * 100, 8), 8);
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(weight_from_rss(512 * MIB, 8), 1);
+        assert_eq!(weight_from_rss(513 * MIB, 8), 2);
         assert_eq!(weight_from_rss(0, 8), 1);
+        assert_eq!(weight_from_rss(1, 8), 1);
+        assert_eq!(weight_from_rss(512 * MIB * 4, 8), 4);
+        assert_eq!(weight_from_rss(512 * MIB * 100, 8), 8);
+    }
+
+    #[test]
+    fn weight_for_maps_measured_rss_to_512mib_slots() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 8);
+        write_weight(&scheduler.weights_dir(), "lib", 512 * MIB).unwrap();
+        assert_eq!(scheduler.weight_for("lib", false), 1);
+        write_weight(&scheduler.weights_dir(), "lib", 513 * MIB).unwrap();
+        assert_eq!(scheduler.weight_for("lib", false), 2);
+        assert_eq!(
+            scheduler.weight_for("unknown", false),
+            UNMEASURED_COMPILE_WEIGHT
+        );
+        assert_eq!(
+            scheduler.weight_for("unknown", true),
+            UNMEASURED_LINK_WEIGHT
+        );
     }
 
     #[test]
     fn weight_ledger_overrides_unmeasured_floor() {
+        const MIB: u64 = 1024 * 1024;
         let dir = temp_cache();
         let scheduler = test_scheduler(dir.path(), 8);
-        write_weight(
-            &scheduler.weights_dir(),
-            "serde",
-            RSS_BYTES_PER_SLOT * 3 + 1,
-        )
-        .unwrap();
+        write_weight(&scheduler.weights_dir(), "serde", 512 * MIB * 3 + 1).unwrap();
         assert_eq!(scheduler.weight_for("serde", false), 4);
         assert_eq!(scheduler.weight_for("serde", true), 4);
         assert_eq!(scheduler.weight_for("other", false), 1);
@@ -549,8 +568,8 @@ mod tests {
         let identity = FlightIdentity::rustc("serde", &["lib".into()], true);
         match begin_miss(dir.path(), false, &identity, "serde", true) {
             BeginMiss::Compile(guard) => {
-                assert!(guard.flight.is_none());
-                assert!(guard.permit.is_none());
+                assert!(guard._flight.is_none());
+                assert!(guard._permit.is_none());
             }
             BeginMiss::Recheck => panic!("disabled scheduler must not wait"),
         }
@@ -567,8 +586,8 @@ mod tests {
         let identity = FlightIdentity::cc("foo.c");
         match begin_miss(dir.path(), true, &identity, "foo.c", false) {
             BeginMiss::Compile(guard) => {
-                assert!(guard.flight.is_none());
-                assert!(guard.permit.is_none());
+                assert!(guard._flight.is_none());
+                assert!(guard._permit.is_none());
             }
             BeginMiss::Recheck => panic!("unusable scheduler must not wait"),
         }
@@ -580,8 +599,8 @@ mod tests {
         let identity = FlightIdentity::rustc("app", &["bin".into()], true);
         match begin_miss(dir.path(), true, &identity, "app", true) {
             BeginMiss::Compile(guard) => {
-                assert!(guard.flight.is_some(), "first miss must own the flight");
-                assert!(guard.permit.is_some(), "first miss must take a permit");
+                assert!(guard._flight.is_some(), "first miss must own the flight");
+                assert!(guard._permit.is_some(), "first miss must take a permit");
             }
             BeginMiss::Recheck => panic!("empty scheduler must admit the first compile"),
         }
@@ -589,6 +608,34 @@ mod tests {
             dir.path().join("scheduler").is_dir(),
             "an enabled miss must create the lease directory"
         );
+    }
+
+    #[test]
+    fn dropping_miss_guard_releases_flight_and_permit() {
+        let dir = temp_cache();
+        let identity = FlightIdentity::rustc("drop", &["lib".into()], false);
+        {
+            match begin_miss(dir.path(), true, &identity, "drop", false) {
+                BeginMiss::Compile(guard) => {
+                    assert!(guard._flight.is_some());
+                    assert!(guard._permit.is_some());
+                }
+                BeginMiss::Recheck => panic!("empty scheduler must admit the first compile"),
+            }
+        }
+        match begin_miss(dir.path(), true, &identity, "drop", false) {
+            BeginMiss::Compile(guard) => {
+                assert!(
+                    guard._flight.is_some(),
+                    "dropped owner must free the flight"
+                );
+                assert!(
+                    guard._permit.is_some(),
+                    "dropped owner must free the permit"
+                );
+            }
+            BeginMiss::Recheck => panic!("a dropped owner must not leave a waiter"),
+        }
     }
 
     #[test]
@@ -705,6 +752,76 @@ mod tests {
         }
         fs::write(root.join("artifact"), b"compiled").unwrap();
         drop(lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rss_from_getrusage_requires_success_and_positive_rss() {
+        assert_eq!(rss_from_getrusage(1, 8), None);
+        assert_eq!(rss_from_getrusage(-1, 8), None);
+        assert_eq!(rss_from_getrusage(0, 0), None);
+        assert_eq!(rss_from_getrusage(0, -5), None);
+        let bytes = rss_from_getrusage(0, 8).expect("successful positive RSS");
+        #[cfg(target_os = "macos")]
+        assert_eq!(bytes, 8);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(bytes, 8 * 1024);
+        assert_ne!(bytes, 0);
+        assert_ne!(bytes, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rss_units_to_bytes_match_platform_units() {
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(rss_units_to_bytes(0), 0);
+            assert_eq!(rss_units_to_bytes(1), 1);
+            assert_eq!(rss_units_to_bytes(4096), 4096);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(rss_units_to_bytes(0), 0);
+            assert_eq!(rss_units_to_bytes(1), 1024);
+            assert_eq!(rss_units_to_bytes(2), 2048);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peak_child_rss_bytes_samples_a_waited_child() {
+        assert!(
+            Command::new("true").status().unwrap().success(),
+            "need a waited-for child so RUSAGE_CHILDREN is populated"
+        );
+        let rss = peak_child_rss_bytes().expect("waited-for child must report RSS");
+        assert!(
+            rss > 1024,
+            "peak RSS must be a real sample, not a placeholder; got {rss}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_compile_rss_persists_child_sample() {
+        let dir = temp_cache();
+        let identity = FlightIdentity::rustc("measured", &["lib".into()], false);
+        let guard = match begin_miss(dir.path(), true, &identity, "measured", false) {
+            BeginMiss::Compile(guard) => guard,
+            BeginMiss::Recheck => panic!("empty scheduler must admit the first compile"),
+        };
+        assert!(
+            Command::new("true").status().unwrap().success(),
+            "need a waited-for child so RUSAGE_CHILDREN is populated"
+        );
+        guard.record_compile_rss("measured");
+        drop(guard);
+        let rss = read_weight(&dir.path().join("scheduler").join("weights"), "measured")
+            .expect("admitted compile must persist a peak RSS sample");
+        assert!(
+            rss > 1024,
+            "recorded RSS must be a real sample, not a placeholder; got {rss}"
+        );
     }
 
     #[test]

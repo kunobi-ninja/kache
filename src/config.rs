@@ -29,6 +29,15 @@ pub const DEFAULT_MIN_STORE_COMPILE_MS: u64 = 0;
 /// would immediately delete previously valid cold entries.
 pub const DEFAULT_GC_MAX_AGE_HOURS: u64 = 0;
 
+/// Disk-share store budget when `KACHE_MAX_SIZE` / `[cache] local_max_size`
+/// are unset. 5% of the volume that holds the store, rounded to the nearest
+/// GiB, then clamped to 5GiB..=100GiB. A failed size probe falls back to
+/// 50GiB so the store stays bounded.
+pub const DISK_SHARE_PERCENT: u64 = 5;
+pub const DISK_SHARE_FLOOR: u64 = 5 * 1024 * 1024 * 1024;
+pub const DISK_SHARE_CAP: u64 = 100 * 1024 * 1024 * 1024;
+pub const DISK_SHARE_FALLBACK: u64 = 50 * 1024 * 1024 * 1024;
+
 /// Remote resilience (kunobi-ninja/kache#327, #564). The daemon-side operation
 /// deadline matches `DEFAULT_PREFETCH_DEADLINE_SECS`: generous enough that no
 /// legitimate background transfer changes behavior while still bounding a
@@ -1081,16 +1090,16 @@ impl Config {
 
         let max_size = env_or_ignored("KACHE_MAX_SIZE", ignore_env)
             .ok()
-            .and_then(|s| parse_size_checked(&s, "KACHE_MAX_SIZE"))
+            .and_then(|s| parse_local_max_size(&s, "KACHE_MAX_SIZE"))
             .or_else(|| {
                 file_config
                     .as_ref()
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.local_max_size.as_ref())
-                    .and_then(|s| parse_size_checked(s, "[cache] local_max_size"))
+                    .and_then(|s| parse_local_max_size(s, "[cache] local_max_size"))
             })
-            .unwrap_or(50 * 1024 * 1024 * 1024); // 50 GiB
+            .unwrap_or_else(|| disk_share_budget(crate::cache_fs::probe(&cache_dir).total_bytes));
 
         let cache_executables = env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env)
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2544,6 +2553,54 @@ pub(crate) fn parse_size(s: &str) -> Option<u64> {
     s.parse::<ByteSize>().ok().map(|b| b.as_u64())
 }
 
+/// Store budget derived from the volume that holds the cache directory.
+///
+/// Pure so tests pin floor / cap / rounding without touching a real disk.
+/// `None` or `0` (probe failed) uses [`DISK_SHARE_FALLBACK`].
+pub(crate) fn disk_share_budget(filesystem_bytes: Option<u64>) -> u64 {
+    let Some(total) = filesystem_bytes.filter(|&n| n > 0) else {
+        return DISK_SHARE_FALLBACK;
+    };
+    let raw = total.saturating_mul(DISK_SHARE_PERCENT) / 100;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let rounded = raw.saturating_add(GIB / 2) / GIB * GIB;
+    rounded.clamp(DISK_SHARE_FLOOR, DISK_SHARE_CAP)
+}
+
+/// Phrase the effective store limit for stats / gc / doctor.
+///
+/// When the effective cap matches the disk-share default for this volume, say
+/// so. An explicit env/TOML value that happens to equal that number is labelled
+/// the same way; that collision is rare and still names a real bound.
+pub(crate) fn describe_max_size(max_size: u64, filesystem_bytes: Option<u64>) -> String {
+    let derived = disk_share_budget(filesystem_bytes);
+    if max_size != derived {
+        return ByteSize(max_size).to_string();
+    }
+    match filesystem_bytes.filter(|&n| n > 0) {
+        Some(total) => format!(
+            "{} (5% of {}, floor 5GiB, cap 100GiB)",
+            ByteSize(max_size),
+            ByteSize(total)
+        ),
+        None => format!("{} (default; disk size unknown)", ByteSize(max_size)),
+    }
+}
+
+/// Like [`parse_size_checked`], but `"none"` is not a size: unbounded stores
+/// are the thing GC exists to stop, so the value is ignored and the disk-share
+/// default applies.
+fn parse_local_max_size(value: &str, source: &str) -> Option<u64> {
+    if value.trim().eq_ignore_ascii_case("none") {
+        tracing::warn!(
+            "{source}={value:?} is not allowed: the store must stay bounded. \
+             Ignoring it and using the disk-share default"
+        );
+        return None;
+    }
+    parse_size_checked(value, source)
+}
+
 /// Parse a human size string, warning loudly when it is set but malformed.
 ///
 /// A value `ByteSize` can't parse (a typo'd unit like `100 gigs`, digit
@@ -3035,6 +3092,107 @@ remote_key_cache_refresh_secs = 900
             parse_size_checked("2GiB", "KACHE_MAX_SIZE"),
             Some(2 * 1024 * 1024 * 1024)
         );
+    }
+
+    #[test]
+    fn disk_share_budget_floors_caps_and_rounds() {
+        const GIB: u64 = 1 << 30;
+        // Independent of DISK_SHARE_* so mutating `*` in those constants
+        // cannot change both sides of the assertion.
+        assert_eq!(disk_share_budget(None), 50 << 30);
+        assert_eq!(disk_share_budget(Some(0)), 50 << 30);
+        // 10GiB disk: 5% is 0.5GiB, rounds to 1GiB, then floor 5GiB.
+        assert_eq!(disk_share_budget(Some(10 * GIB)), 5 << 30);
+        // 200GiB disk: 5% is exactly 10GiB.
+        assert_eq!(disk_share_budget(Some(200 * GIB)), 10 * GIB);
+        // 256GiB disk: 5% is 12.8GiB, nearest GiB is 13GiB.
+        assert_eq!(disk_share_budget(Some(256 * GIB)), 13 * GIB);
+        // 4TiB disk: 5% is 204.8GiB, cap 100GiB.
+        assert_eq!(disk_share_budget(Some(4 * 1024 * GIB)), 100 << 30);
+        // Exactly at the cap: 2000GiB * 5% = 100GiB.
+        assert_eq!(disk_share_budget(Some(2000 * GIB)), 100 << 30);
+    }
+
+    #[test]
+    fn parse_local_max_size_rejects_none_without_unbounding() {
+        assert_eq!(parse_local_max_size("none", "KACHE_MAX_SIZE"), None);
+        assert_eq!(parse_local_max_size("None", "[cache] local_max_size"), None);
+        assert_eq!(
+            parse_local_max_size("2GiB", "KACHE_MAX_SIZE"),
+            Some(2 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn describe_max_size_names_the_disk_share_when_derived() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let disk = Some(200 * GIB);
+        let derived = disk_share_budget(disk);
+        let text = describe_max_size(derived, disk);
+        assert!(text.contains("5%"), "{text}");
+        assert!(text.contains(&ByteSize(200 * GIB).to_string()), "{text}");
+        assert_eq!(
+            describe_max_size(2 * GIB, disk),
+            ByteSize(2 * GIB).to_string()
+        );
+        assert!(
+            describe_max_size(DISK_SHARE_FALLBACK, None).contains("disk size unknown"),
+            "{}",
+            describe_max_size(DISK_SHARE_FALLBACK, None)
+        );
+        assert!(
+            describe_max_size(DISK_SHARE_FALLBACK, Some(0)).contains("disk size unknown"),
+            "a zero-byte probe is unknown, not 5% of 0: {}",
+            describe_max_size(DISK_SHARE_FALLBACK, Some(0))
+        );
+    }
+
+    #[test]
+    fn load_uses_disk_share_budget_when_max_size_is_unset() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "[cache]\n").unwrap();
+        let cache_dir = dir.path().join("store");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let _cfg = set_kache_config_for_test(&cfg_path);
+        let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(cache_dir.as_os_str()));
+        let _max = set_env_for_test("KACHE_MAX_SIZE", None);
+        let loaded = Config::load().unwrap();
+        let expected = disk_share_budget(crate::cache_fs::probe(&cache_dir).total_bytes);
+        assert_eq!(loaded.max_size, expected);
+    }
+
+    #[test]
+    fn load_explicit_max_size_wins_over_disk_share() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "[cache]\n").unwrap();
+        let cache_dir = dir.path().join("store");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let _cfg = set_kache_config_for_test(&cfg_path);
+        let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(cache_dir.as_os_str()));
+        let _max = set_env_for_test("KACHE_MAX_SIZE", Some(std::ffi::OsStr::new("2GiB")));
+        let loaded = Config::load().unwrap();
+        assert_eq!(loaded.max_size, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn load_none_max_size_does_not_unbound_the_store() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "[cache]\nlocal_max_size = \"none\"\n").unwrap();
+        let cache_dir = dir.path().join("store");
+        std::fs::create_dir(&cache_dir).unwrap();
+        let _cfg = set_kache_config_for_test(&cfg_path);
+        let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(cache_dir.as_os_str()));
+        let _max = set_env_for_test("KACHE_MAX_SIZE", None);
+        let loaded = Config::load().unwrap();
+        let expected = disk_share_budget(crate::cache_fs::probe(&cache_dir).total_bytes);
+        assert_eq!(loaded.max_size, expected);
+        assert_ne!(loaded.max_size, 0);
     }
 
     #[test]

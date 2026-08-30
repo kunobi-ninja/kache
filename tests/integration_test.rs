@@ -2911,6 +2911,7 @@ cache_executables = true
 local_only = true
 local_max_size = "{gc_budget}B"
 auto_gc = true
+gc_evict_shared = true
 cache_executables = true
 "#
     );

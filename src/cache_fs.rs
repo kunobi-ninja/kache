@@ -46,6 +46,10 @@ pub struct FsProbe {
     /// Whether the filesystem is host-local. `None` means "could not tell" and
     /// must not be read as either answer.
     pub is_local: Option<bool>,
+    /// Total bytes of the volume that holds the path. `None` when the probe
+    /// could not measure it. Used for the disk-share store budget, not for
+    /// locality classification.
+    pub total_bytes: Option<u64>,
 }
 
 impl FsProbe {
@@ -129,7 +133,47 @@ pub fn advisory_for(probe: &FsProbe, cache_dir: &Path) -> Option<String> {
 /// [`FsProbe::unknown`], which classifies to [`CacheFsVerdict::Unknown`] and
 /// stays silent. This runs at wrapper startup, so it must never fail a build.
 pub fn probe(path: &Path) -> FsProbe {
-    probe_impl(path)
+    #[cfg(target_os = "macos")]
+    let probe = probe_macos(path);
+    #[cfg(target_os = "linux")]
+    let probe = probe_linux(path);
+    #[cfg(windows)]
+    let probe = probe_windows(path);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    let probe = probe_unsupported(path);
+    probe
+}
+
+/// Volume size from a `statfs` block size and block count.
+///
+/// A zero block size is `None` (the kernel did not report a size), not a
+/// zero-byte disk. Overflow is `None`. Pure so the cases are tested on every
+/// platform, not only the OS whose `statfs` produced the numbers.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn disk_bytes(block_size: u64, blocks: u64) -> Option<u64> {
+    if block_size == 0 {
+        return None;
+    }
+    block_size.checked_mul(blocks)
+}
+
+/// Linux `statfs` fragment size: `f_frsize` when the kernel reports it, else
+/// `f_bsize`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_fragment_bytes(frsize: u64, bsize: u64) -> u64 {
+    if frsize > 0 { frsize } else { bsize }
+}
+
+/// Windows `GetDiskFreeSpaceExW` reports success as a nonzero BOOL. A zero
+/// total is treated as a failed probe, not a zero-byte disk.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn accepted_volume_total(ok: bool, total: u64) -> Option<u64> {
+    (ok && total > 0).then_some(total)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn win32_succeeded(ok: i32) -> bool {
+    ok != 0
 }
 
 // ── macOS ───────────────────────────────────────────────────────────────────
@@ -138,13 +182,14 @@ pub fn probe(path: &Path) -> FsProbe {
 // "this filesystem is local" bit (the same one `df -l` filters on), and
 // `f_fstypename` names it. No magic-number table needed.
 #[cfg(target_os = "macos")]
-fn probe_impl(path: &Path) -> FsProbe {
+fn probe_macos(path: &Path) -> FsProbe {
     let Some(stat) = statfs_of(path) else {
         return FsProbe::unknown();
     };
     FsProbe {
         name: c_str_field_to_string(&stat.f_fstypename),
         is_local: Some(stat.f_flags & (libc::MNT_LOCAL as u32) != 0),
+        total_bytes: statfs_total_bytes_macos(&stat),
     }
 }
 
@@ -164,7 +209,7 @@ fn c_str_field_to_string(field: &[libc::c_char]) -> Option<String> {
 
 // ── Linux ───────────────────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
-fn probe_impl(path: &Path) -> FsProbe {
+fn probe_linux(path: &Path) -> FsProbe {
     let Some(stat) = statfs_of(path) else {
         return FsProbe::unknown();
     };
@@ -175,7 +220,9 @@ fn probe_impl(path: &Path) -> FsProbe {
     // rather than "cleaned up" into a musl build failure.
     #[allow(clippy::unnecessary_cast)]
     let magic = stat.f_type as i64;
-    classify_linux_magic(magic)
+    let mut probe = classify_linux_magic(magic);
+    probe.total_bytes = statfs_total_bytes_linux(&stat);
+    probe
 }
 
 /// Linux superblock magics, from the kernel's `include/uapi/linux/magic.h`.
@@ -233,6 +280,7 @@ fn classify_linux_magic(magic: i64) -> FsProbe {
     let named = |name: &str, is_local: bool| FsProbe {
         name: Some(name.to_string()),
         is_local: Some(is_local),
+        total_bytes: None,
     };
 
     match magic {
@@ -263,6 +311,18 @@ fn classify_linux_magic(magic: i64) -> FsProbe {
         magic::OVERLAYFS => named("overlayfs", true),
         _ => FsProbe::unknown(),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn statfs_total_bytes_macos(stat: &libc::statfs) -> Option<u64> {
+    disk_bytes(u64::from(stat.f_bsize), stat.f_blocks)
+}
+
+#[cfg(target_os = "linux")]
+fn statfs_total_bytes_linux(stat: &libc::statfs) -> Option<u64> {
+    let frsize = u64::try_from(stat.f_frsize).unwrap_or(0);
+    let bsize = u64::try_from(stat.f_bsize).unwrap_or(0);
+    disk_bytes(linux_fragment_bytes(frsize, bsize), stat.f_blocks)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -298,7 +358,7 @@ fn nearest_existing(path: &Path) -> Option<std::path::PathBuf> {
 // drive), and a UNC path (`\\server\share`) is remote by construction — it has
 // no drive letter for `GetDriveTypeW` to classify, so it is checked first.
 #[cfg(windows)]
-fn probe_impl(path: &Path) -> FsProbe {
+fn probe_windows(path: &Path) -> FsProbe {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
 
@@ -316,6 +376,7 @@ fn probe_impl(path: &Path) -> FsProbe {
         return FsProbe {
             name: Some("a network share (UNC path)".to_string()),
             is_local: Some(false),
+            total_bytes: volume_total_bytes_windows(&target),
         };
     }
 
@@ -359,7 +420,29 @@ fn probe_impl(path: &Path) -> FsProbe {
         String::from_utf16_lossy(&fs_name[..len])
     });
 
-    FsProbe { name, is_local }
+    FsProbe {
+        name,
+        is_local,
+        total_bytes: volume_total_bytes_windows(&target),
+    }
+}
+
+#[cfg(windows)]
+fn volume_total_bytes_windows(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut total: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut total,
+            std::ptr::null_mut(),
+        )
+    };
+    accepted_volume_total(win32_succeeded(ok), total)
 }
 
 /// Volume mount root (`C:\`) holding `path`. Mirrors `link::windows_volume_root`
@@ -395,7 +478,7 @@ fn is_unc_path(path: &Path) -> bool {
 
 // ── Unsupported targets ─────────────────────────────────────────────────────
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn probe_impl(_path: &Path) -> FsProbe {
+fn probe_unsupported(_path: &Path) -> FsProbe {
     FsProbe::unknown()
 }
 
@@ -408,6 +491,7 @@ mod tests {
         let probe = FsProbe {
             name: Some("apfs".to_string()),
             is_local: Some(true),
+            total_bytes: None,
         };
         assert_eq!(classify(&probe), CacheFsVerdict::Local);
     }
@@ -417,6 +501,7 @@ mod tests {
         let probe = FsProbe {
             name: Some("nfs".to_string()),
             is_local: Some(false),
+            total_bytes: None,
         };
         assert_eq!(
             classify(&probe),
@@ -431,6 +516,7 @@ mod tests {
         let probe = FsProbe {
             name: None,
             is_local: Some(false),
+            total_bytes: None,
         };
         let CacheFsVerdict::NotLocal { name } = classify(&probe) else {
             panic!("a non-local filesystem must warn even when unnamed");
@@ -448,6 +534,7 @@ mod tests {
         let named_but_unplaced = FsProbe {
             name: Some("weirdfs".to_string()),
             is_local: None,
+            total_bytes: None,
         };
         assert_eq!(classify(&named_but_unplaced), CacheFsVerdict::Unknown);
     }
@@ -488,6 +575,7 @@ mod tests {
             &FsProbe {
                 name: Some("nfs".to_string()),
                 is_local: Some(false),
+                total_bytes: None,
             },
             dir,
         );
@@ -502,6 +590,7 @@ mod tests {
             FsProbe {
                 name: Some("apfs".to_string()),
                 is_local: Some(true),
+                total_bytes: None,
             },
             FsProbe::unknown(),
         ] {
@@ -511,6 +600,47 @@ mod tests {
                 "must stay silent for {quiet:?}"
             );
         }
+    }
+
+    #[test]
+    fn disk_bytes_rejects_zero_block_size_and_multiplies() {
+        assert_eq!(disk_bytes(0, 100), None);
+        assert_eq!(disk_bytes(4096, 0), Some(0));
+        assert_eq!(disk_bytes(4096, 2), Some(8192));
+        assert_eq!(disk_bytes(u64::MAX, 2), None);
+    }
+
+    #[test]
+    fn linux_fragment_bytes_prefers_frsize_when_nonzero() {
+        assert_eq!(linux_fragment_bytes(4096, 512), 4096);
+        assert_eq!(linux_fragment_bytes(0, 512), 512);
+        assert_eq!(linux_fragment_bytes(0, 0), 0);
+    }
+
+    #[test]
+    fn accepted_volume_total_requires_success_and_nonzero() {
+        assert_eq!(accepted_volume_total(false, 99), None);
+        assert_eq!(accepted_volume_total(true, 0), None);
+        assert_eq!(accepted_volume_total(true, 1), Some(1));
+        assert_eq!(accepted_volume_total(false, 0), None);
+        assert!(win32_succeeded(1));
+        assert!(!win32_succeeded(0));
+    }
+
+    #[test]
+    fn probe_reports_a_positive_volume_size_for_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let probed = probe(dir.path());
+        assert!(
+            probed.total_bytes.is_some_and(|n| n > 1_000_000),
+            "a real directory must yield a volume size, got {:?}",
+            probed.total_bytes
+        );
+        assert_ne!(
+            probed,
+            FsProbe::default(),
+            "a real local probe must not be the empty default"
+        );
     }
 
     #[test]

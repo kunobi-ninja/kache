@@ -1474,12 +1474,7 @@ fn cc_try_remote_hit(
         0,
     );
     print_progress(crate_name, event_result, elapsed, size);
-    if !meta.stdout.is_empty() {
-        print!("{}", meta.stdout);
-    }
-    if !meta.stderr.is_empty() {
-        eprint!("{}", meta.stderr);
-    }
+    replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
     compiler.commit_preprocess_memo(file_hasher);
     Ok(Some(0))
 }
@@ -4822,8 +4817,12 @@ fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
 mod tests {
     use super::*;
     use crate::cache_key::FileHasher;
+    use crate::transport::{ListenerOptions, socket_name};
     use std::ffi::OsString;
+    use std::io::{Read, Write};
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct TestEnvGuard {
         key: &'static str,
@@ -7630,6 +7629,119 @@ exit 0
         )
     }
 
+    /// Answers `RemoteCheck` with a fixed `found` flag. `send_remote_check`
+    /// probes reachability before the real request, so the accept loop must
+    /// survive empty connections.
+    struct RemoteCheckReplyDaemon {
+        stop: Arc<AtomicBool>,
+        requests: Arc<AtomicUsize>,
+        handle: Option<std::thread::JoinHandle<()>>,
+        socket_path: PathBuf,
+    }
+
+    impl RemoteCheckReplyDaemon {
+        fn spawn(socket_path: PathBuf, found: bool) -> Self {
+            if let Some(parent) = socket_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let name = socket_name(&socket_path).expect("fake remote-check socket name");
+            let listener = ListenerOptions::new()
+                .name(name)
+                .create_sync()
+                .expect("bind fake remote-check daemon");
+            let stop = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let stop_thread = Arc::clone(&stop);
+            let requests_thread = Arc::clone(&requests);
+            let handle = std::thread::spawn(move || {
+                use crate::transport::prelude::*;
+                while !stop_thread.load(Ordering::SeqCst) {
+                    let mut stream = match listener.accept() {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    if stop_thread.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.contains(&b'\n') {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if buf.is_empty() {
+                        continue;
+                    }
+                    requests_thread.fetch_add(1, Ordering::SeqCst);
+                    let body = format!("{}\n", serde_json::json!({ "ok": true, "found": found }));
+                    let _ = stream.write_all(body.as_bytes());
+                }
+            });
+            Self {
+                stop,
+                requests,
+                handle: Some(handle),
+                socket_path,
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for RemoteCheckReplyDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = crate::transport::is_reachable(&self.socket_path);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn wait_until_reachable(path: &Path) {
+        let start = std::time::Instant::now();
+        while !crate::transport::is_reachable(path) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "fake remote-check daemon did not become reachable at {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn try_cc_remote_hit(
+        config: &Config,
+        store: &Store,
+        parsed: &crate::compiler::cc::CcArgs,
+        cache_key: &str,
+    ) -> Option<i32> {
+        cc_try_remote_hit(
+            config,
+            store,
+            &CcCompiler::new(),
+            parsed,
+            &FileHasher::new(),
+            cache_key,
+            "foo.c",
+            "foo.c",
+            std::time::Instant::now(),
+            0,
+            0,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn clang_cl_debug_does_not_bypass_local_admission() {
         let mut config = test_config(PathBuf::from("cache"));
@@ -7678,6 +7790,63 @@ exit 0
         assert!(
             cc_should_enqueue_upload(&config, true),
             "readonly is enforced inside send_upload_job, matching rustc"
+        );
+    }
+
+    #[test]
+    fn cc_try_remote_hit_skips_the_daemon_when_enqueue_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"cc-remote-skip-enqueue").to_hex().to_string();
+        seed_cc_object_entry(&store, &key, dir.path());
+
+        let output = dir.path().join("restored.o");
+        let output_arg = output.to_string_lossy().into_owned();
+        let parsed = parse_cc(&["gcc", "-c", "foo.c", "-o", &output_arg]);
+
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+        wait_until_reachable(&config.socket_path());
+        let requests_before = daemon.request_count();
+
+        assert!(try_cc_remote_hit(&config, &store, &parsed, &key).is_none());
+        assert_eq!(
+            daemon.request_count(),
+            requests_before,
+            "enqueue=false must not send RemoteCheck"
+        );
+        assert!(
+            !output.exists(),
+            "skipping the daemon must not restore a local store entry"
+        );
+    }
+
+    #[test]
+    fn cc_try_remote_hit_does_not_restore_on_a_remote_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"cc-remote-miss-no-restore")
+            .to_hex()
+            .to_string();
+        seed_cc_object_entry(&store, &key, dir.path());
+
+        let output = dir.path().join("restored.o");
+        let output_arg = output.to_string_lossy().into_owned();
+        let parsed = parse_cc(&["gcc", "-c", "foo.c", "-o", &output_arg]);
+
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+        wait_until_reachable(&config.socket_path());
+
+        assert!(try_cc_remote_hit(&config, &store, &parsed, &key).is_none());
+        assert!(
+            daemon.request_count() >= 1,
+            "a configured remote must still ask the daemon"
+        );
+        assert!(
+            !output.exists(),
+            "found=false must not restore even when the local store already has the entry"
         );
     }
 

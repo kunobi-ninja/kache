@@ -11,7 +11,17 @@ struct WorkspaceDiscovery {
 }
 
 pub fn discover(args: Option<&RustcArgs>) -> Option<BuildIntent> {
-    let discovery = discover_workspace(args)?;
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let cwd = std::env::current_dir().ok();
+    discover_with_context(args, manifest_dir.as_deref(), cwd.as_deref())
+}
+
+fn discover_with_context(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Option<BuildIntent> {
+    let discovery = discover_workspace(args, manifest_dir, cwd)?;
     let crate_names = discovery.crate_names;
     if crate_names.is_empty() {
         return None;
@@ -75,8 +85,12 @@ fn load_cargo_lock_deps(lock_path: &Path) -> Option<Vec<(String, String)>> {
         .ok()
 }
 
-fn discover_workspace(args: Option<&RustcArgs>) -> Option<WorkspaceDiscovery> {
-    let lock_path = find_lock_path(args);
+fn discover_workspace(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Option<WorkspaceDiscovery> {
+    let lock_path = find_lock_path(args, manifest_dir, cwd);
     if let Some(lock_path) = lock_path.as_ref() {
         let crate_names = crate_names_from_lock(lock_path)?;
         let workspace_root = lock_path.parent().map(Path::to_path_buf);
@@ -87,7 +101,7 @@ fn discover_workspace(args: Option<&RustcArgs>) -> Option<WorkspaceDiscovery> {
         });
     }
 
-    for manifest_path in candidate_manifest_paths(args) {
+    for manifest_path in candidate_manifest_paths(args, manifest_dir, cwd) {
         if let Some(discovery) = run_cargo_metadata(Some(&manifest_path)) {
             return Some(discovery);
         }
@@ -107,8 +121,12 @@ fn crate_names_from_lock(lock_path: &Path) -> Option<Vec<String>> {
     if names.is_empty() { None } else { Some(names) }
 }
 
-fn find_lock_path(args: Option<&RustcArgs>) -> Option<PathBuf> {
-    for start in candidate_roots(args) {
+fn find_lock_path(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    for start in candidate_roots(args, manifest_dir, cwd) {
         for ancestor in start.ancestors() {
             let lock = ancestor.join("Cargo.lock");
             if lock.is_file() {
@@ -119,24 +137,22 @@ fn find_lock_path(args: Option<&RustcArgs>) -> Option<PathBuf> {
     None
 }
 
-fn candidate_roots(args: Option<&RustcArgs>) -> Vec<PathBuf> {
+fn candidate_roots(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(args) = args {
-        if let Some(root) = args.workspace_root() {
-            push_unique(&mut roots, root);
-        }
-        if let Some(out_dir) = args.out_dir.as_deref()
-            && let Some(manifest) = manifest_from_target_out_dir(out_dir)
-            && let Some(parent) = manifest.parent()
-        {
-            push_unique(&mut roots, parent.to_path_buf());
-        }
+    if let (Some(args), Some(cwd)) = (args, cwd)
+        && let Some(root) = args.verified_workspace_root(cwd)
+    {
+        push_unique(&mut roots, root);
     }
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        push_unique(&mut roots, PathBuf::from(manifest_dir));
+    if let Some(manifest_dir) = manifest_dir {
+        push_unique(&mut roots, manifest_dir.to_path_buf());
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        push_unique(&mut roots, cwd);
+    if let Some(cwd) = cwd {
+        push_unique(&mut roots, cwd.to_path_buf());
     }
     roots
 }
@@ -147,33 +163,19 @@ fn push_unique(roots: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn candidate_manifest_paths(args: Option<&RustcArgs>) -> Vec<PathBuf> {
+fn candidate_manifest_paths(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-
-    if let Some(out_dir) = args.and_then(|a| a.out_dir.as_deref())
-        && let Some(path) = manifest_from_target_out_dir(out_dir)
-        && path.is_file()
-    {
-        candidates.push(path);
-    }
-
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let path = PathBuf::from(manifest_dir).join("Cargo.toml");
+    for root in candidate_roots(args, manifest_dir, cwd) {
+        let path = root.join("Cargo.toml");
         if path.is_file() && !candidates.iter().any(|existing| existing == &path) {
             candidates.push(path);
         }
     }
-
     candidates
-}
-
-fn manifest_from_target_out_dir(out_dir: &Path) -> Option<PathBuf> {
-    for ancestor in out_dir.ancestors() {
-        if ancestor.file_name().and_then(|name| name.to_str()) == Some("target") {
-            return ancestor.parent().map(|root| root.join("Cargo.toml"));
-        }
-    }
-    None
 }
 
 fn run_cargo_metadata(manifest_path: Option<&Path>) -> Option<WorkspaceDiscovery> {
@@ -244,29 +246,6 @@ mod tests {
         std::fs::write(root.join("Cargo.lock"), body).unwrap();
     }
 
-    #[test]
-    fn test_manifest_from_target_out_dir_uses_target_parent() {
-        let manifest = manifest_from_target_out_dir(Path::new(
-            "/repo/apps/tauri/src-tauri/target/release/deps",
-        ))
-        .unwrap();
-
-        assert_eq!(manifest, Path::new("/repo/apps/tauri/src-tauri/Cargo.toml"));
-    }
-
-    #[test]
-    fn test_manifest_from_target_out_dir_without_target_is_none() {
-        assert!(manifest_from_target_out_dir(Path::new("/repo/src/deps")).is_none());
-    }
-
-    #[test]
-    fn test_manifest_from_target_out_dir_picks_nearest_target() {
-        let manifest =
-            manifest_from_target_out_dir(Path::new("/work/target/x/inner/target/release/deps"))
-                .unwrap();
-        assert_eq!(manifest, Path::new("/work/target/x/inner/Cargo.toml"));
-    }
-
     /// Build a two-member cargo workspace under a temp dir and return its root.
     fn scaffold_workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -309,7 +288,8 @@ mod tests {
         ])
         .unwrap();
 
-        let intent = discover(Some(&args)).expect("discover should resolve the workspace");
+        let intent = discover_with_context(Some(&args), Some(root), Some(root))
+            .expect("discover should resolve the workspace");
         assert!(intent.crate_names.contains(&"app".to_string()));
         assert!(intent.crate_names.contains(&"dep".to_string()));
         assert!(intent.namespace.is_none());
@@ -342,7 +322,7 @@ mod tests {
         ])
         .unwrap();
 
-        let intent = discover(Some(&args)).unwrap();
+        let intent = discover_with_context(Some(&args), Some(root), Some(root)).unwrap();
         assert!(!intent.crate_names.contains(&"unrelated".to_string()));
     }
 
@@ -378,6 +358,82 @@ mod tests {
     #[test]
     fn load_cargo_lock_deps_returns_none_for_missing_lockfile() {
         assert!(load_cargo_lock_deps(Path::new("/nonexistent/Cargo.lock")).is_none());
+    }
+
+    fn rustc_args_for_out_dir(out_dir: &Path) -> RustcArgs {
+        RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--out-dir".to_string(),
+            out_dir.to_string_lossy().into_owned(),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn find_lock_path_walks_from_out_dir_to_the_workspace_lock() {
+        let ws = scaffold_workspace();
+        write_lock(ws.path(), &[("app", "0.1.0")]);
+        let out_dir = ws.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let found = find_lock_path(
+            Some(&rustc_args_for_out_dir(&out_dir)),
+            Some(ws.path()),
+            Some(ws.path()),
+        )
+        .unwrap();
+        assert_eq!(found, ws.path().join("Cargo.lock"));
+    }
+
+    #[test]
+    fn candidate_roots_are_nonempty_and_push_unique_dedupes() {
+        let ws = scaffold_workspace();
+        let out_dir = ws.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let roots = candidate_roots(
+            Some(&rustc_args_for_out_dir(&out_dir)),
+            Some(ws.path()),
+            Some(ws.path()),
+        );
+        assert!(
+            roots.iter().any(|root| root == ws.path()),
+            "expected workspace root in {roots:?}"
+        );
+
+        let mut paths = vec![PathBuf::from("/a")];
+        push_unique(&mut paths, PathBuf::from("/a"));
+        push_unique(&mut paths, PathBuf::from("/b"));
+        assert_eq!(paths, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn external_target_directory_cannot_supply_the_workspace_lock() {
+        let ws = scaffold_workspace();
+        write_lock(ws.path(), &[("app", "0.1.0"), ("dep", "0.1.0")]);
+        let member = ws.path().join("app");
+
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        write_lock(external.path(), &[("wrong", "9.9.9")]);
+        let out_dir = external.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let found = find_lock_path(
+            Some(&rustc_args_for_out_dir(&out_dir)),
+            Some(&member),
+            Some(&member),
+        )
+        .unwrap();
+        assert_eq!(found, ws.path().join("Cargo.lock"));
+    }
+
+    #[test]
+    fn cargo_metadata_discovers_a_workspace_without_a_lockfile() {
+        let ws = scaffold_workspace();
+        let discovery = run_cargo_metadata(Some(&ws.path().join("Cargo.toml")))
+            .expect("metadata should resolve the workspace");
+        assert!(discovery.crate_names.contains(&"app".to_string()));
+        assert!(discovery.crate_names.contains(&"dep".to_string()));
+        assert_eq!(discovery.workspace_root.as_deref(), Some(ws.path()));
     }
 
     #[test]

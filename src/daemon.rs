@@ -1820,7 +1820,7 @@ const RECENT_TRANSFERS_CAP: usize = 50;
 pub(crate) struct ActivePlan {
     pub session_id: String,
     pub plan_id: String,
-    /// `advisory` | `fallback`.
+    /// `none` while only tracking a session, then `advisory` or `fallback`.
     pub plan_source: &'static str,
     pub candidates: HashSet<String>,
     /// Distinct keys demanded via RemoteCheck while this plan was active —
@@ -4953,11 +4953,12 @@ impl Daemon {
         identity_key: Option<String>,
     ) {
         let _ = self.prefetch_cancel.send(false);
+        let candidates: HashSet<String> = candidates.collect();
         let mut plan = ActivePlan::new(
             session_id.to_string(),
             plan_id.to_string(),
             plan_source,
-            candidates.collect(),
+            candidates,
             self.prefetch_stats
                 .list_requests_total
                 .load(Ordering::Relaxed),
@@ -4968,7 +4969,58 @@ impl Daemon {
         plan.identity_key = identity_key;
         let prev = {
             let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(existing) = slot.as_mut()
+                && existing.session_id == session_id
+            {
+                existing.plan_id = plan.plan_id;
+                existing.plan_source = plan.plan_source;
+                existing.candidates = plan.candidates;
+                existing.cancelled = false;
+                existing.last_activity_ms = plan.last_activity_ms;
+                if plan.identity_key.is_some() {
+                    existing.identity_key = plan.identity_key;
+                }
+                return;
+            }
             slot.replace(plan)
+        };
+        if let Some(prev) = prev {
+            self.emit_plan_summary(prev, "superseded");
+        }
+    }
+
+    /// Start tracking a build even when planning produces no candidates. The
+    /// session still owns the exact identity needed to publish its completed
+    /// events for the next cold build.
+    fn ensure_active_session(&self, req: &BuildStartedRequest) {
+        if req.session_id.trim().is_empty() {
+            return;
+        }
+        let mut plan = ActivePlan::new(
+            req.session_id.clone(),
+            String::new(),
+            "none",
+            HashSet::new(),
+            self.prefetch_stats
+                .list_requests_total
+                .load(Ordering::Relaxed),
+            self.prefetch_stats
+                .list_duration_ms_total
+                .load(Ordering::Relaxed),
+        );
+        plan.identity_key = req.intent.identity_key.clone();
+        let prev = {
+            let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+            match slot.as_mut() {
+                Some(existing) if existing.session_id == req.session_id => {
+                    if plan.identity_key.is_some() {
+                        existing.identity_key = plan.identity_key;
+                    }
+                    existing.last_activity_ms = epoch_ms();
+                    return;
+                }
+                _ => slot.replace(plan),
+            }
         };
         if let Some(prev) = prev {
             self.emit_plan_summary(prev, "superseded");
@@ -5001,7 +5053,7 @@ impl Daemon {
         let event = crate::events::BuildSummaryEvent {
             ts: chrono::Utc::now(),
             schema: 1,
-            session_id: plan.session_id,
+            session_id: plan.session_id.clone(),
             root: String::new(),
             plan_source: plan.plan_source.to_string(),
             plan_id: plan.plan_id,
@@ -5031,13 +5083,16 @@ impl Daemon {
         if let Err(e) = crate::events::log_summary(&path, &event) {
             tracing::debug!("failed to write build summary: {e}");
         }
-        self.maybe_publish_identity_manifest(plan.identity_key.as_deref());
+        self.maybe_publish_identity_manifest(
+            plan.identity_key.as_deref(),
+            plan.session_id.as_str(),
+        );
     }
 
     /// Best-effort rank-0 publish when a session ends. Failures must not
     /// affect the daemon: the next `save-manifest` still writes the same
     /// events.
-    fn maybe_publish_identity_manifest(&self, identity_key: Option<&str>) {
+    fn maybe_publish_identity_manifest(&self, identity_key: Option<&str>, session_id: &str) {
         let Some(identity_key) = identity_key
             .map(str::trim)
             .filter(|key| !key.is_empty())
@@ -5045,14 +5100,17 @@ impl Daemon {
         else {
             return;
         };
+        let session_id = session_id.trim().to_string();
+        if session_id.is_empty() {
+            return;
+        }
         if self.config.remote.is_none() || self.config.remote_readonly {
             return;
         }
         let config = self.config.clone();
-        let namespace = std::env::var("KACHE_NAMESPACE").ok();
         let publish = move || {
             if let Err(error) =
-                crate::cli::save_manifest_auto(&config, Some(&identity_key), namespace.as_deref())
+                crate::cli::save_manifest_auto_for_session(&config, &identity_key, &session_id)
             {
                 tracing::debug!("identity manifest auto-publish failed: {error:#}");
             }
@@ -5070,26 +5128,10 @@ impl Daemon {
         let Some(_remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
+        self.ensure_active_session(req);
         if speculative_prefetch_disabled(self.config.prefetch_enabled) {
             tracing::debug!("build-started: speculative prefetch disabled");
             return Response::ok();
-        }
-
-        // A new session supersedes the previous plan even when THIS build ends
-        // up with no plan (DoNothing, empty candidates, planning failure) —
-        // otherwise the old plan would keep absorbing the new build's demands,
-        // never go inactive, and never finalize (cross-family review finding).
-        {
-            let prev = {
-                let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
-                match slot.as_ref() {
-                    Some(p) if p.session_id != req.session_id => slot.take(),
-                    _ => None,
-                }
-            };
-            if let Some(prev) = prev {
-                self.emit_plan_summary(prev, "superseded");
-            }
         }
 
         match crate::planner_client::resolve_prefetch_plan(&req.intent).await {
@@ -6515,8 +6557,7 @@ async fn manifest_prefetch(
     let identity = crate::identity::profile_from_env().and_then(|profile| {
         crate::identity::identity_key(lock_path, &crate::identity::host_target_triple(), &profile)
     });
-    let from_identity =
-        identity_manifest_prefetch(daemon, backend.as_ref(), remote, identity.as_deref()).await;
+    let from_identity = identity_manifest_prefetch(daemon, identity.as_deref()).await;
     if from_identity > 0 {
         return from_identity;
     }
@@ -6666,16 +6707,11 @@ async fn shard_prefetch_for_deps(
 }
 
 /// Rank-0 prefetch: identity key, then the legacy host triple.
-async fn identity_manifest_prefetch(
-    daemon: &Arc<Daemon>,
-    backend: &dyn crate::remote_backend::RemoteBackend,
-    remote: &crate::config::RemoteConfig,
-    identity_key: Option<&str>,
-) -> usize {
+async fn identity_manifest_prefetch(daemon: &Arc<Daemon>, identity_key: Option<&str>) -> usize {
     let mut manifest = None;
     let mut manifest_key = String::new();
     for key in crate::identity::manifest_lookup_keys(identity_key) {
-        match crate::remote::try_download_manifest(backend, &remote.prefix, &key).await {
+        match daemon.download_planner_manifest(&key).await {
             Ok(Some(found)) => {
                 manifest_key = key;
                 manifest = Some(found);
@@ -6692,12 +6728,11 @@ async fn identity_manifest_prefetch(
         return 0;
     };
 
-    identity_manifest_prefetch_from(daemon, remote, manifest_key, manifest).await
+    identity_manifest_prefetch_from(daemon, manifest_key, manifest).await
 }
 
 async fn identity_manifest_prefetch_from(
     daemon: &Arc<Daemon>,
-    _remote: &crate::config::RemoteConfig,
     manifest_key: String,
     manifest: crate::remote::BuildManifest,
 ) -> usize {
@@ -8879,6 +8914,38 @@ mod tests {
         assert!(plan.cancelled);
         // ...and never again for the same plan.
         assert!(!plan.record_demand("k10"));
+    }
+
+    #[test]
+    fn planned_candidates_upgrade_the_tracked_session_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let summary_path = config.summary_log_path();
+        let daemon = Daemon::new(config);
+        let req = BuildStartedRequest {
+            intent: kache_core::BuildIntent {
+                identity_key: Some("id/session".into()),
+                ..Default::default()
+            },
+            client_epoch: 0,
+            session_id: "session".into(),
+        };
+        daemon.ensure_active_session(&req);
+        daemon.install_plan(
+            "session",
+            "plan",
+            "fallback",
+            ["key".to_string()].into_iter(),
+            req.intent.identity_key.clone(),
+        );
+
+        let plan = daemon.active_plan.lock().unwrap();
+        let plan = plan.as_ref().unwrap();
+        assert_eq!(plan.plan_id, "plan");
+        assert_eq!(plan.plan_source, "fallback");
+        assert_eq!(plan.identity_key.as_deref(), Some("id/session"));
+        assert_eq!(plan.candidates, HashSet::from(["key".to_string()]));
+        assert!(!summary_path.exists());
     }
 
     // Tests use the same cross-platform transport as production. On Unix
@@ -13197,16 +13264,21 @@ mod tests {
                 crate_names: vec!["serde".into(), "tokio".into()],
                 namespace: None,
                 cargo_lock_deps: vec![],
-                identity_key: None,
+                identity_key: Some("id/cold-build".into()),
             },
             client_epoch: 0,
-            session_id: String::new(),
+            session_id: "cold-session".into(),
         };
         let resp = daemon.handle_build_started(&req).await;
         assert!(
             resp.ok,
             "fallback with nothing to prefetch should be ok: {resp:?}"
         );
+        let plan = daemon.active_plan.lock().unwrap();
+        let plan = plan.as_ref().expect("cold build session must be tracked");
+        assert_eq!(plan.session_id, "cold-session");
+        assert_eq!(plan.identity_key.as_deref(), Some("id/cold-build"));
+        assert!(plan.candidates.is_empty());
     }
 
     #[tokio::test]
@@ -14644,9 +14716,10 @@ mod tests {
         let client = test_remote_backend();
         put_test_object(&client, &test_build_manifest_object_key(), &body).await;
         let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(client).is_ok());
 
         // Should complete without panicking and without queuing the cheap crate.
-        identity_manifest_prefetch(&daemon, client.as_ref(), &remote, None).await;
+        identity_manifest_prefetch(&daemon, None).await;
     }
 
     #[tokio::test]
@@ -16785,7 +16858,12 @@ mod tests {
             .await;
 
         assert!(resp.ok);
-        assert!(daemon.active_plan.lock().unwrap().is_none());
+        let plan = daemon.active_plan.lock().unwrap();
+        let plan = plan
+            .as_ref()
+            .expect("disabled prefetch must still track the build session");
+        assert_eq!(plan.session_id, "disabled-prefetch");
+        assert!(plan.candidates.is_empty());
         assert_eq!(
             daemon.prefetch_stats.plans_advisory.load(Ordering::Relaxed),
             0

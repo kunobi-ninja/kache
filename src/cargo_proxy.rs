@@ -118,10 +118,6 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
         }
     }
 
-    if let Some(config) = publish_config_after_cargo() {
-        return run_cargo_and_publish(command, &cargo, config);
-    }
-
     #[cfg(unix)]
     {
         exec_cargo_unix(command, &cargo)
@@ -130,28 +126,6 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
     {
         run_cargo_non_unix(command, &cargo)
     }
-}
-
-fn publish_config_after_cargo() -> Option<crate::config::Config> {
-    let config = crate::config::Config::load().ok()?;
-    (config.remote.is_some() && !config.remote_readonly).then_some(config)
-}
-
-fn run_cargo_and_publish(
-    mut command: Command,
-    cargo: &Path,
-    config: crate::config::Config,
-) -> Result<()> {
-    let status = command
-        .status()
-        .with_context(|| format!("running Cargo program {cargo:?}"))?;
-    if status.success() {
-        let namespace = std::env::var("KACHE_NAMESPACE").ok();
-        if let Err(error) = crate::cli::save_manifest_auto(&config, None, namespace.as_deref()) {
-            tracing::debug!("identity manifest auto-publish after cargo failed: {error:#}");
-        }
-    }
-    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn real_cargo_program() -> Result<PathBuf> {

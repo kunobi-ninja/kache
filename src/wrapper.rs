@@ -504,6 +504,32 @@ fn store_admits_compile(config: &Config, compile_time_ms: u64, publishes_to_remo
         || compile_time_ms >= config.min_store_compile_ms
 }
 
+/// GCC/Clang objects (and clang-cl without CodeView debug) use the rustc
+/// remote pipeline. clang-cl debug objects embed un-remapped paths.
+fn cc_publishes_to_remote(parsed: &crate::compiler::cc::CcArgs) -> bool {
+    !parsed.embeds_codeview_debug()
+}
+
+fn cc_should_enqueue_upload(config: &Config, publishes_to_remote: bool) -> bool {
+    publishes_to_remote && config.remote.is_some()
+}
+
+fn maybe_enqueue_cc_upload(
+    config: &Config,
+    store: &Store,
+    cache_key: &str,
+    crate_name: &str,
+    publishes_to_remote: bool,
+) {
+    if !cc_should_enqueue_upload(config, publishes_to_remote) {
+        return;
+    }
+    let entry_dir = store.entry_dir(cache_key);
+    if let Err(e) = crate::daemon::send_upload_job(config, cache_key, &entry_dir, crate_name) {
+        tracing::warn!("failed to send upload job to daemon: {e}");
+    }
+}
+
 fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
     exit_code == 0 && has_artifacts
 }
@@ -808,6 +834,22 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         }
     }
 
+    if let Some(exit) = cc_try_remote_hit(
+        config,
+        &store,
+        &compiler,
+        &parsed,
+        &file_hasher,
+        &cache_key,
+        &crate_name,
+        &event_root,
+        start,
+        key_ms,
+        lookup_ms,
+    )? {
+        return Ok(exit);
+    }
+
     // ── Cache miss — compile, then store ─────────────────────────
     // Key generation and lookup can take long enough for another process to
     // create an output. Recheck at the last possible wrapper boundary and run
@@ -860,9 +902,8 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     if store_candidate {
         compiler.commit_preprocess_memo(&file_hasher);
     }
-    // The CC path has no remote upload pipeline, so remote configuration must
-    // not bypass its local-store admission threshold.
-    let admitted = store_admits_compile(config, compile_time_ms, false);
+    let publishes_to_remote = cc_publishes_to_remote(&parsed);
+    let admitted = store_admits_compile(config, compile_time_ms, publishes_to_remote);
     let store_decision = cc_store_decision(store_candidate, admitted);
     if store_decision.admission_skipped {
         tracing::debug!(
@@ -898,6 +939,13 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     // Store grew — throttled size check + detached background GC if over
                     // budget (kunobi-ninja/kache#497). Never blocks the compile path.
                     maybe_spawn_auto_gc(config, &store);
+                    maybe_enqueue_cc_upload(
+                        config,
+                        &store,
+                        &cache_key,
+                        &crate_name,
+                        publishes_to_remote,
+                    );
                 }
                 Err(e) => {
                     store_error = store_error_for_event(&e);
@@ -1342,6 +1390,93 @@ fn restore_cc_from_cache(
         )?);
     }
     publish_prepared_cc_artifacts(prepared)
+}
+
+/// After a local miss, ask the daemon for an exact remote entry.
+/// Returns `Some(exit)` when the hit was restored (or the restore fell through
+/// to passthrough). `None` means continue to compile.
+fn cc_try_remote_hit(
+    config: &Config,
+    store: &Store,
+    compiler: &CcCompiler,
+    parsed: &crate::compiler::cc::CcArgs,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    cache_key: &str,
+    crate_name: &str,
+    event_root: &str,
+    start: std::time::Instant,
+    key_ms: u64,
+    lookup_ms: u64,
+) -> Result<Option<i32>> {
+    if !cc_should_enqueue_upload(config, cc_publishes_to_remote(parsed)) {
+        return Ok(None);
+    }
+    let entry_dir = store.entry_dir(cache_key);
+    let Some(result) = crate::daemon::send_remote_check(config, cache_key, &entry_dir, crate_name)
+    else {
+        return Ok(None);
+    };
+    if !result.found {
+        return Ok(None);
+    }
+    let Ok(Some(meta)) = store.get(cache_key) else {
+        return Ok(None);
+    };
+    let event_result = if result.prefetched {
+        tracing::debug!(
+            "cc prefetch cache hit for {} ({})",
+            crate_name,
+            &cache_key[..16]
+        );
+        EventResult::PrefetchHit
+    } else {
+        tracing::debug!(
+            "cc remote cache hit for {} ({})",
+            crate_name,
+            &cache_key[..16]
+        );
+        EventResult::RemoteHit
+    };
+    let restore_start = std::time::Instant::now();
+    if let Err(e) = restore_cc_from_cache(store, parsed, &meta) {
+        if e.downcast_ref::<PartialCcRestore>().is_some() {
+            return Err(e);
+        }
+        tracing::warn!(
+            "restoring cc remote cache hit for {} failed: {} — recompiling",
+            crate_name,
+            e
+        );
+        return Ok(Some(cc_passthrough_with_event(
+            config,
+            parsed,
+            crate_name,
+            event_root,
+            start,
+            format!("restore failed: {e}"),
+        )?));
+    }
+    let restore_ms = restore_start.elapsed().as_millis() as u64;
+    let elapsed = start.elapsed().as_millis() as u64;
+    let size: u64 = meta.files.iter().map(|f| f.size).sum();
+    log_event(
+        config,
+        event_root,
+        crate_name,
+        event_result,
+        elapsed,
+        meta.compile_time_ms,
+        size,
+        cache_key,
+        key_ms,
+        lookup_ms,
+        restore_ms,
+        0,
+    );
+    print_progress(crate_name, event_result, elapsed, size);
+    replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+    compiler.commit_preprocess_memo(file_hasher);
+    Ok(Some(0))
 }
 
 /// Run kache in RUSTC_WRAPPER mode.
@@ -4682,8 +4817,12 @@ fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
 mod tests {
     use super::*;
     use crate::cache_key::FileHasher;
+    use crate::transport::{ListenerOptions, socket_name};
     use std::ffi::OsString;
+    use std::io::{Read, Write};
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct TestEnvGuard {
         key: &'static str,
@@ -7425,6 +7564,352 @@ exit 0
                 "exit={exit_code}, artifacts={has_artifacts}"
             );
         }
+    }
+
+    fn parse_cc(args: &[&str]) -> crate::compiler::cc::CcArgs {
+        crate::compiler::cc::CcArgs::parse(&s(args)).unwrap()
+    }
+
+    fn spool_intent_count(config: &Config) -> usize {
+        let dir = config.upload_spool_dir();
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => entries.filter_map(Result::ok).count(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("reading upload spool {}: {error}", dir.display()),
+        }
+    }
+
+    fn seed_cc_object_entry(store: &Store, cache_key: &str, dir: &Path) {
+        let object = dir.join("foo.o");
+        std::fs::write(&object, b"object bytes").unwrap();
+        store
+            .put_with_compile_time_independent(
+                cache_key,
+                "foo.c",
+                &[],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "",
+                &[(object, "foo.o".to_string())],
+                "",
+                "",
+                12,
+            )
+            .unwrap();
+    }
+
+    /// Keep auto-start from `send_upload_job` off the developer's daemon.
+    /// Persist uses the test `Config`; daemon spawn reloads `KACHE_CONFIG`.
+    fn isolate_daemon_autostart(dir: &Path) -> (TestEnvGuard, TestEnvGuard) {
+        let config_path = dir.join("isolated-kache.toml");
+        let cache_dir = dir.join("isolated-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let store = toml::Value::String(cache_dir.to_string_lossy().into_owned());
+        std::fs::write(
+            &config_path,
+            format!(
+                "[cache]\n\
+                 local_only = true\n\
+                 ignore_env = true\n\
+                 local_store = {store}\n\
+                 runtime_dir = {store}\n\
+                 daemon_idle_timeout_secs = 1\n"
+            ),
+        )
+        .unwrap();
+        (
+            TestEnvGuard::set(
+                "KACHE_CONFIG",
+                config_path.to_str().expect("utf-8 isolated config path"),
+            ),
+            TestEnvGuard::set(
+                "KACHE_CACHE_DIR",
+                cache_dir.to_str().expect("utf-8 isolated cache path"),
+            ),
+        )
+    }
+
+    /// Answers `RemoteCheck` with a fixed `found` flag. `send_remote_check`
+    /// probes reachability before the real request, so the accept loop must
+    /// survive empty connections.
+    struct RemoteCheckReplyDaemon {
+        stop: Arc<AtomicBool>,
+        requests: Arc<AtomicUsize>,
+        handle: Option<std::thread::JoinHandle<()>>,
+        socket_path: PathBuf,
+    }
+
+    impl RemoteCheckReplyDaemon {
+        fn spawn(socket_path: PathBuf, found: bool) -> Self {
+            if let Some(parent) = socket_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let name = socket_name(&socket_path).expect("fake remote-check socket name");
+            let listener = ListenerOptions::new()
+                .name(name)
+                .create_sync()
+                .expect("bind fake remote-check daemon");
+            let stop = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let stop_thread = Arc::clone(&stop);
+            let requests_thread = Arc::clone(&requests);
+            let handle = std::thread::spawn(move || {
+                use crate::transport::prelude::*;
+                while !stop_thread.load(Ordering::SeqCst) {
+                    let mut stream = match listener.accept() {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    if stop_thread.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.contains(&b'\n') {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if buf.is_empty() {
+                        continue;
+                    }
+                    requests_thread.fetch_add(1, Ordering::SeqCst);
+                    let body = format!("{}\n", serde_json::json!({ "ok": true, "found": found }));
+                    let _ = stream.write_all(body.as_bytes());
+                }
+            });
+            Self {
+                stop,
+                requests,
+                handle: Some(handle),
+                socket_path,
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for RemoteCheckReplyDaemon {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = crate::transport::is_reachable(&self.socket_path);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn wait_until_reachable(path: &Path) {
+        let start = std::time::Instant::now();
+        while !crate::transport::is_reachable(path) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "fake remote-check daemon did not become reachable at {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn try_cc_remote_hit(
+        config: &Config,
+        store: &Store,
+        parsed: &crate::compiler::cc::CcArgs,
+        cache_key: &str,
+    ) -> Option<i32> {
+        cc_try_remote_hit(
+            config,
+            store,
+            &CcCompiler::new(),
+            parsed,
+            &FileHasher::new(),
+            cache_key,
+            "foo.c",
+            "foo.c",
+            std::time::Instant::now(),
+            0,
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn clang_cl_debug_does_not_bypass_local_admission() {
+        let mut config = test_config(PathBuf::from("cache"));
+        config.min_store_compile_ms = 1_000;
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+
+        let cl_debug = parse_cc(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "/Z7"]);
+        assert!(
+            !store_admits_compile(&config, 1, cc_publishes_to_remote(&cl_debug)),
+            "clang-cl debug must keep the local cheap-compile threshold"
+        );
+
+        let gnu = parse_cc(&["gcc", "-c", "foo.c", "-o", "foo.o"]);
+        assert!(
+            store_admits_compile(&config, 1, cc_publishes_to_remote(&gnu)),
+            "publishable cc compiles must store so they can upload"
+        );
+    }
+
+    #[test]
+    fn cc_remote_publication_skips_clang_cl_debug_only() {
+        let gnu = parse_cc(&["gcc", "-c", "foo.c", "-o", "foo.o"]);
+        let gnu_debug = parse_cc(&["gcc", "-c", "foo.c", "-o", "foo.o", "-g2"]);
+        let cl = parse_cc(&["clang-cl", "-c", "foo.c", "-Fofoo.obj"]);
+        let cl_debug = parse_cc(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "/Z7"]);
+        let cl_g = parse_cc(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "-g"]);
+
+        assert!(cc_publishes_to_remote(&gnu));
+        assert!(cc_publishes_to_remote(&gnu_debug));
+        assert!(cc_publishes_to_remote(&cl));
+        assert!(!cc_publishes_to_remote(&cl_debug));
+        assert!(!cc_publishes_to_remote(&cl_g));
+    }
+
+    #[test]
+    fn cc_upload_enqueue_requires_a_configured_remote_and_publication() {
+        let mut config = test_config(PathBuf::from("cache"));
+        assert!(!cc_should_enqueue_upload(&config, true));
+        assert!(!cc_should_enqueue_upload(&config, false));
+
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        assert!(cc_should_enqueue_upload(&config, true));
+        assert!(!cc_should_enqueue_upload(&config, false));
+
+        config.remote_readonly = true;
+        assert!(
+            cc_should_enqueue_upload(&config, true),
+            "readonly is enforced inside send_upload_job, matching rustc"
+        );
+    }
+
+    #[test]
+    fn cc_try_remote_hit_skips_the_daemon_when_enqueue_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"cc-remote-skip-enqueue").to_hex().to_string();
+        seed_cc_object_entry(&store, &key, dir.path());
+
+        let output = dir.path().join("restored.o");
+        let output_arg = output.to_string_lossy().into_owned();
+        let parsed = parse_cc(&["gcc", "-c", "foo.c", "-o", &output_arg]);
+
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+        wait_until_reachable(&config.socket_path());
+        let requests_before = daemon.request_count();
+
+        assert!(try_cc_remote_hit(&config, &store, &parsed, &key).is_none());
+        assert_eq!(
+            daemon.request_count(),
+            requests_before,
+            "enqueue=false must not send RemoteCheck"
+        );
+        assert!(
+            !output.exists(),
+            "skipping the daemon must not restore a local store entry"
+        );
+    }
+
+    #[test]
+    fn cc_try_remote_hit_does_not_restore_on_a_remote_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"cc-remote-miss-no-restore")
+            .to_hex()
+            .to_string();
+        seed_cc_object_entry(&store, &key, dir.path());
+
+        let output = dir.path().join("restored.o");
+        let output_arg = output.to_string_lossy().into_owned();
+        let parsed = parse_cc(&["gcc", "-c", "foo.c", "-o", &output_arg]);
+
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+        wait_until_reachable(&config.socket_path());
+
+        assert!(try_cc_remote_hit(&config, &store, &parsed, &key).is_none());
+        assert!(
+            daemon.request_count() >= 1,
+            "a configured remote must still ask the daemon"
+        );
+        assert!(
+            !output.exists(),
+            "found=false must not restore even when the local store already has the entry"
+        );
+    }
+
+    #[test]
+    fn cc_store_enqueues_an_upload_intent_when_a_writable_remote_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"cc-upload-intent").to_hex().to_string();
+        seed_cc_object_entry(&store, &key, dir.path());
+
+        let _lock = crate::config::config_path_lock();
+        let _isolated = isolate_daemon_autostart(dir.path());
+        maybe_enqueue_cc_upload(&config, &store, &key, "foo.c", true);
+
+        assert_eq!(spool_intent_count(&config), 1);
+        assert!(
+            config
+                .upload_spool_dir()
+                .join(format!("{key}.json"))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn clang_cl_debug_store_does_not_enqueue_an_upload_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"cc-cl-debug-no-upload").to_hex().to_string();
+        seed_cc_object_entry(&store, &key, dir.path());
+
+        let _lock = crate::config::config_path_lock();
+        let _isolated = isolate_daemon_autostart(dir.path());
+        maybe_enqueue_cc_upload(&config, &store, &key, "foo.c", false);
+
+        assert_eq!(spool_intent_count(&config), 0);
+    }
+
+    #[test]
+    fn cc_store_does_not_enqueue_when_remote_is_readonly_or_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = blake3::hash(b"cc-no-upload-gates").to_hex().to_string();
+
+        let mut readonly = test_config(dir.path().join("readonly"));
+        readonly.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        readonly.remote_readonly = true;
+        let readonly_store = Store::open(&readonly).unwrap();
+        seed_cc_object_entry(&readonly_store, &key, dir.path());
+
+        let local = test_config(dir.path().join("local"));
+        let local_store = Store::open(&local).unwrap();
+        seed_cc_object_entry(&local_store, &key, dir.path());
+
+        let _lock = crate::config::config_path_lock();
+        let _isolated = isolate_daemon_autostart(dir.path());
+        maybe_enqueue_cc_upload(&readonly, &readonly_store, &key, "foo.c", true);
+        maybe_enqueue_cc_upload(&local, &local_store, &key, "foo.c", true);
+
+        assert_eq!(spool_intent_count(&readonly), 0);
+        assert_eq!(spool_intent_count(&local), 0);
     }
 
     #[test]

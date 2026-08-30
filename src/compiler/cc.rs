@@ -1038,6 +1038,12 @@ impl CcArgs {
         cc_target_arch(self)
     }
 
+    /// True when this clang-cl compile requests debug info that CodeView
+    /// records with un-remapped paths. Those objects stay in the local store.
+    pub fn embeds_codeview_debug(&self) -> bool {
+        cl_debug_present(self)
+    }
+
     /// The subset of `rest` that identifies the *compile configuration*
     /// — per-translation-unit noise removed: source files, the `-o`
     /// output path, and (under the Gnu dialect only) dependency-file
@@ -6533,9 +6539,17 @@ mod tests {
                 cl_debug_path_inputs(&p).is_some(),
                 "{flag}: cl_debug_path_inputs must recognise a debug compile"
             );
+            assert!(
+                p.embeds_codeview_debug(),
+                "{flag}: clang-cl debug objects stay machine-local"
+            );
         }
         // gcc debug never goes through the cl path-fold path.
         let gnu = CcArgs::parse(&s(&["gcc", "-c", "a.c", "-g2"])).unwrap();
+        assert!(
+            !gnu.embeds_codeview_debug(),
+            "GCC debug objects may publish to a remote"
+        );
         assert_eq!(
             cl_debug_path_inputs(&gnu),
             None,

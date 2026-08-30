@@ -13,9 +13,13 @@
 //!   source and every transitively-included header. The cold probe also writes
 //!   a private complete dependency list; a later local invocation can reuse
 //!   the expansion hash only while every source/header fingerprint matches,
-//!   otherwise it preprocesses again. `-E -P` strips line markers so header
-//!   *paths* don't leak — the object key remains portable across machines and
-//!   worktrees, while the optimization itself is deliberately local.
+//!   otherwise it preprocesses again. The key also digests **names** in
+//!   user include dirs (`-I`, `-iquote`, and the source file's directory)
+//!   so a header that appears in an earlier search dir cannot shadow a
+//!   previously-read one without changing the key. `-E -P` strips line
+//!   markers so header *paths* don't leak — the object key remains portable
+//!   across machines and worktrees, while the optimization itself is
+//!   deliberately local.
 //!
 //! What passes through (refused, see [`CcArgs::refuse_reasons`]):
 //! - Link mode (whole-program caching is a separate, harder problem)
@@ -44,6 +48,8 @@ use regex::Regex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -4252,6 +4258,176 @@ fn cc_trace_name(parsed: &CcArgs) -> String {
         .unwrap_or_else(|| "cc".to_string())
 }
 
+/// Maximum file names walked across every user include dir. A partial
+/// listing could miss the shadowing header the digest exists to catch,
+/// so overflow is fail-closed passthrough rather than a truncated key.
+const CC_INCLUDE_DIR_NAME_CAP: usize = 8192;
+
+const CC_INCLUDE_DIR_NAME_EXTENSIONS: &[&str] = &[
+    "h", "hh", "hpp", "hxx", "h++", "cuh", "c", "cc", "cpp", "cxx", "c++", "m", "mm", "i", "ii",
+    "inl", "inc", "def", "pch", "gch",
+];
+
+fn digest_cc_include_dir_names(parsed: &CcArgs) -> Result<String> {
+    digest_cc_include_dir_names_capped(parsed, CC_INCLUDE_DIR_NAME_CAP)
+}
+
+fn digest_cc_include_dir_names_capped(parsed: &CcArgs, cap: usize) -> Result<String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let exempt = cc_system_include_dirs(parsed, &cwd);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"include_dir_names.v1\n");
+    let mut seen = 0usize;
+    for dir in cc_user_include_dirs(parsed, &cwd) {
+        if exempt.iter().any(|root| dir.starts_with(root)) {
+            continue;
+        }
+        hasher.update(b"dir\n");
+        collect_include_dir_names(&dir, Path::new(""), &mut hasher, &mut seen, cap)?;
+        hasher.update(b"enddir\n");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn cc_user_include_dirs(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |path: PathBuf| {
+        let abs = absolutize_path(cwd, &path);
+        if seen.insert(abs.clone()) {
+            dirs.push(abs);
+        }
+    };
+    if let Some(source) = parsed.sources.first() {
+        let parent = source.parent().filter(|p| !p.as_os_str().is_empty());
+        push(parent.map_or_else(|| cwd.to_path_buf(), Path::to_path_buf));
+    }
+    for value in cc_flag_dir_values(&parsed.rest, "-iquote") {
+        push(PathBuf::from(value));
+    }
+    for include in &parsed.includes {
+        push(include.clone());
+    }
+    dirs
+}
+
+fn cc_system_include_dirs(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |path: PathBuf| {
+        let abs = absolutize_path(cwd, &path);
+        if seen.insert(abs.clone()) {
+            dirs.push(abs);
+        }
+    };
+    for value in cc_flag_dir_values(&parsed.rest, "-isystem") {
+        push(PathBuf::from(value));
+    }
+    for value in cc_flag_dir_values(&parsed.rest, "-isysroot") {
+        push(PathBuf::from(value));
+        push(PathBuf::from(value).join("usr/include"));
+    }
+    if let Ok(sdk) = std::env::var("SDKROOT") {
+        let path = PathBuf::from(sdk);
+        if path.is_dir() {
+            push(path.clone());
+            push(path.join("usr/include"));
+        }
+    }
+    dirs
+}
+
+fn cc_flag_dir_values<'a>(rest: &'a [String], flag: &'a str) -> Vec<&'a str> {
+    let mut values = Vec::new();
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        let Some(suffix) = arg.strip_prefix(flag) else {
+            continue;
+        };
+        if suffix.is_empty() {
+            if let Some(value) = args.next() {
+                values.push(value.as_str());
+            }
+        } else if let Some(value) = suffix.strip_prefix('=')
+            && !value.is_empty()
+        {
+            values.push(value);
+        }
+    }
+    values
+}
+
+fn collect_include_dir_names(
+    dir: &Path,
+    rel: &Path,
+    hasher: &mut blake3::Hasher,
+    seen: &mut usize,
+    cap: usize,
+) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            anyhow::bail!("cc include dir {} is unreadable ({error})", dir.display())
+        }
+    };
+
+    let mut files = Vec::new();
+    let mut subdirs = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", entry.path().display()))?;
+        let name = entry.file_name();
+        if file_type.is_symlink() {
+            // Hash the name (it can shadow) but do not recurse; a
+            // symlink dir can loop.
+            if cc_include_name_counts(&name) {
+                files.push(name);
+            }
+            continue;
+        }
+        if file_type.is_dir() {
+            subdirs.push(name);
+            continue;
+        }
+        if cc_include_name_counts(&name) {
+            files.push(name);
+        }
+    }
+    files.sort();
+    subdirs.sort();
+
+    for name in files {
+        *seen += 1;
+        if *seen > cap {
+            anyhow::bail!("cc include dir name walk exceeded {cap} entries");
+        }
+        let path = rel.join(&name);
+        hasher.update(path.as_os_str().as_encoded_bytes());
+        hasher.update(b"\n");
+    }
+    for name in subdirs {
+        *seen += 1;
+        if *seen > cap {
+            anyhow::bail!("cc include dir name walk exceeded {cap} entries");
+        }
+        collect_include_dir_names(&dir.join(&name), &rel.join(&name), hasher, seen, cap)?;
+    }
+    Ok(())
+}
+
+fn cc_include_name_counts(name: &OsStr) -> bool {
+    let Some(ext) = Path::new(name).extension() else {
+        return true;
+    };
+    let ext = ext.to_string_lossy();
+    CC_INCLUDE_DIR_NAME_EXTENSIONS
+        .iter()
+        .any(|keep| ext.eq_ignore_ascii_case(keep))
+}
+
 struct PendingCcPreprocessMemo {
     memo_key: String,
     preprocessed_hash: String,
@@ -4269,6 +4445,7 @@ pub struct CcCompiler {
     /// cc key probes and the real compiler invocation.
     base_dirs: Vec<String>,
     pending_preprocess_memo: RefCell<Option<PendingCcPreprocessMemo>>,
+    pending_include_dir_digest: RefCell<Option<String>>,
 }
 
 const C_FAMILY_DRIVERS: [(&str, ToolFamily); 7] = [
@@ -4349,6 +4526,7 @@ impl CcCompiler {
             extra_allowlist_flags,
             base_dirs: Vec::new(),
             pending_preprocess_memo: RefCell::new(None),
+            pending_include_dir_digest: RefCell::new(None),
         }
     }
 
@@ -4370,6 +4548,16 @@ impl CcCompiler {
             &pending.preprocessed_hash,
             &pending.fingerprints,
         );
+    }
+
+    /// True when user include-dir names still match the digest folded into
+    /// the key. A new shadowing header during compile must not be published
+    /// under the old key.
+    pub(crate) fn include_dir_names_still_match(&self, parsed: &CcArgs) -> bool {
+        let Ok(now) = digest_cc_include_dir_names(parsed) else {
+            return false;
+        };
+        self.pending_include_dir_digest.borrow().as_deref() == Some(now.as_str())
     }
 
     /// Does this argv invoke a C-family compiler?
@@ -4942,6 +5130,25 @@ impl Compiler for CcCompiler {
                 trace_name
             );
         }
+
+        // Names in user include dirs. Preprocess fingerprints only cover
+        // files that were already read; a header that appears in an earlier
+        // `-I`/`-iquote` dir (or next to the source) can shadow one of those
+        // without changing the fingerprints. Digest names, not contents.
+        // Unreadable dirs and a walk that exceeds the cap fail closed.
+        let include_dir_digest = digest_cc_include_dir_names(parsed)?;
+        self.pending_include_dir_digest
+            .borrow_mut()
+            .replace(include_dir_digest.clone());
+        hasher.update(b"include_dir_names:");
+        hasher.update(include_dir_digest.as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] include_dir_names={}",
+            trace_name,
+            include_dir_digest
+        );
 
         // Preprocessor expansion — the load-bearing input. Captures
         // the source plus every transitively-included header plus
@@ -10141,5 +10348,412 @@ mod tests {
         assert_eq!(comp(&["clang-cl", "-c", "a.c", "-Foa.obj"]), None);
         // gnu debug → None (gnu normalizes via -ffile-prefix-map, not this path).
         assert_eq!(comp(&["gcc", "-c", "a.c", "-g"]), None);
+    }
+
+    #[cfg(unix)]
+    fn include_dir_test_compiler(dir: &Path) -> (CcCompiler, PathBuf, PathBuf) {
+        use std::fs;
+
+        let fake_cc =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_static.sh");
+        let source = dir.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        (CcCompiler::new(), fake_cc, source)
+    }
+
+    #[cfg(unix)]
+    fn include_dir_key_ctx(dir: &Path) -> (crate::cache_key::FileHasher<'static>, PathBuf) {
+        (crate::cache_key::FileHasher::new(), dir.join("cache"))
+    }
+
+    #[test]
+    fn include_dir_digest_changes_when_an_earlier_dir_gains_a_header() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(second.join("header.h"), "#define A 1\n").unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "#include \"header.h\"\nint x;\n").unwrap();
+
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            first.to_str().unwrap(),
+            "-I",
+            second.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let before = digest_cc_include_dir_names(&parsed).unwrap();
+        fs::write(first.join("header.h"), "#define A 2\n").unwrap();
+        let after = digest_cc_include_dir_names(&parsed).unwrap();
+        assert_ne!(
+            before, after,
+            "a header appearing in an earlier -I dir must change the name digest"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_ignores_object_and_dep_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let include = temp.path().join("inc");
+        fs::create_dir(&include).unwrap();
+        fs::write(include.join("header.h"), "int h;\n").unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let before = digest_cc_include_dir_names(&parsed).unwrap();
+        fs::write(include.join("header.o"), "obj").unwrap();
+        fs::write(include.join("header.obj"), "obj").unwrap();
+        fs::write(include.join("header.d"), "deps").unwrap();
+        fs::write(include.join("header.pp"), "deps").unwrap();
+        fs::write(include.join("libfoo.a"), "ar").unwrap();
+        let after = digest_cc_include_dir_names(&parsed).unwrap();
+        assert_eq!(
+            before, after,
+            "sibling compile products must not churn the key"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_overflow_is_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let include = temp.path().join("inc");
+        fs::create_dir(&include).unwrap();
+        for i in 0..3 {
+            fs::write(include.join(format!("h{i}.h")), "int h;\n").unwrap();
+        }
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let err = digest_cc_include_dir_names_capped(&parsed, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeded 2"),
+            "overflow must fail closed, got {err}"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_tracks_iquote_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let quote = temp.path().join("quote");
+        fs::create_dir(&quote).unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-iquote",
+            quote.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let before = digest_cc_include_dir_names(&parsed).unwrap();
+        fs::write(quote.join("local.h"), "int q;\n").unwrap();
+        let after = digest_cc_include_dir_names(&parsed).unwrap();
+        assert_ne!(
+            before, after,
+            "-iquote dirs must participate in the name digest"
+        );
+    }
+
+    #[test]
+    fn cc_flag_dir_values_reads_separated_and_equals_forms() {
+        let rest = [
+            "-iquote".to_string(),
+            "/q".to_string(),
+            "-isystem=/sys".to_string(),
+            "-isysroot".to_string(),
+            "/sdk".to_string(),
+            "-isystem=".to_string(),
+        ];
+        assert_eq!(cc_flag_dir_values(&rest, "-iquote"), ["/q"]);
+        assert_eq!(cc_flag_dir_values(&rest, "-isystem"), ["/sys"]);
+        assert_eq!(cc_flag_dir_values(&rest, "-isysroot"), ["/sdk"]);
+        assert!(cc_flag_dir_values(&rest, "-idirafter").is_empty());
+    }
+
+    #[test]
+    fn include_dir_digest_isystem_on_source_dir_is_exempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let srcdir = temp.path().join("src");
+        fs::create_dir(&srcdir).unwrap();
+        let source = srcdir.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-isystem",
+            srcdir.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let before = digest_cc_include_dir_names(&parsed).unwrap();
+        fs::write(srcdir.join("next_to_source.h"), "int n;\n").unwrap();
+        let after = digest_cc_include_dir_names(&parsed).unwrap();
+        assert_eq!(
+            before, after,
+            "-isystem on the source directory must exempt names next to the source"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_missing_dir_is_empty_not_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("no-such-inc");
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            missing.to_str().unwrap(),
+        ]))
+        .unwrap();
+        digest_cc_include_dir_names(&parsed)
+            .expect("ENOENT include dir must hash as empty, not fail closed");
+    }
+
+    #[test]
+    fn include_dir_digest_accepts_a_walk_that_hits_the_cap_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let include = temp.path().join("inc");
+        fs::create_dir(&include).unwrap();
+        for i in 0..2 {
+            fs::write(include.join(format!("h{i}.h")), "int h;\n").unwrap();
+        }
+        // Source lives in the include dir so the walk is one directory:
+        // unit.c + two headers = 3 names.
+        let source = include.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+        ]))
+        .unwrap();
+        digest_cc_include_dir_names_capped(&parsed, 3)
+            .expect("a walk of exactly `cap` names must succeed");
+    }
+
+    #[test]
+    fn include_dir_digest_counts_nested_directories_toward_the_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let srcdir = temp.path().join("src");
+        let include = temp.path().join("inc");
+        let nested = include.join("nested");
+        fs::create_dir_all(&srcdir).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("h.h"), "int h;\n").unwrap();
+        let source = srcdir.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+        ]))
+        .unwrap();
+        // source parent (unit.c) + include subdir + nested header = 3 names.
+        // Cap 2 must overflow, including if the subdir increment is mutated
+        // to `*=` (which would otherwise stay under the cap).
+        let err = digest_cc_include_dir_names_capped(&parsed, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeded 2"),
+            "the nested directory itself must count, got {err}"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_counts_an_empty_subdir_at_exact_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let include = temp.path().join("inc");
+        fs::create_dir_all(include.join("empty")).unwrap();
+        fs::write(include.join("h.h"), "int h;\n").unwrap();
+        let source = include.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+        ]))
+        .unwrap();
+        // unit.c + h.h + empty/ = 3 names. Cap 3 must succeed; `>= cap`
+        // on the subdir increment would overflow one too early.
+        digest_cc_include_dir_names_capped(&parsed, 3)
+            .expect("file + empty subdir at exact cap must succeed");
+    }
+
+    #[test]
+    fn include_dir_digest_ignores_empty_sdkroot() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap()])).unwrap();
+        unsafe { std::env::remove_var("SDKROOT") };
+        let unset = digest_cc_include_dir_names(&parsed).unwrap();
+        unsafe { std::env::set_var("SDKROOT", "") };
+        let empty = digest_cc_include_dir_names(&parsed).unwrap();
+        unsafe { std::env::remove_var("SDKROOT") };
+        assert_eq!(
+            unset, empty,
+            "empty SDKROOT must not become an include root"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_exempts_an_existing_sdkroot_directory() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let srcdir = temp.path().join("src");
+        fs::create_dir(&sdk).unwrap();
+        fs::create_dir(&srcdir).unwrap();
+        let source = srcdir.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        unsafe { std::env::set_var("SDKROOT", &sdk) };
+        let parsed = CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap()])).unwrap();
+        let before = digest_cc_include_dir_names(&parsed).unwrap();
+        fs::write(sdk.join("sdk.h"), "int s;\n").unwrap();
+        let after = digest_cc_include_dir_names(&parsed).unwrap();
+        unsafe { std::env::remove_var("SDKROOT") };
+        assert_eq!(
+            before, after,
+            "headers under SDKROOT must not change the user include-dir digest"
+        );
+    }
+
+    #[test]
+    fn include_dir_names_still_match_is_false_without_a_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap()])).unwrap();
+        assert!(
+            !CcCompiler::new().include_dir_names_still_match(&parsed),
+            "no key snapshot means the names must not be treated as matching"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_skips_isystem_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let system = temp.path().join("sys");
+        let user = temp.path().join("inc");
+        let srcdir = temp.path().join("src");
+        fs::create_dir(&system).unwrap();
+        fs::create_dir(&user).unwrap();
+        fs::create_dir(&srcdir).unwrap();
+        fs::write(user.join("user.h"), "int u;\n").unwrap();
+        let source = srcdir.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            user.to_str().unwrap(),
+            "-isystem",
+            system.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let before = digest_cc_include_dir_names(&parsed).unwrap();
+        fs::write(system.join("shadow.h"), "int s;\n").unwrap();
+        let after = digest_cc_include_dir_names(&parsed).unwrap();
+        assert_eq!(before, after, "-isystem roots must stay exempt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_dir_digest_unreadable_dir_is_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let include = temp.path().join("inc");
+        fs::create_dir(&include).unwrap();
+        fs::set_permissions(&include, fs::Permissions::from_mode(0o000)).unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let err = digest_cc_include_dir_names(&parsed);
+        fs::set_permissions(&include, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = err.expect_err("unreadable -I dir must fail closed");
+        assert!(err.to_string().contains("unreadable"), "got {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shadowing_header_changes_cc_cache_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let (compiler, fake_cc, source) = include_dir_test_compiler(temp.path());
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(second.join("header.h"), "#define A 1\n").unwrap();
+        let output = temp.path().join("unit.o");
+        let parse = || {
+            compiler
+                .parse(&[
+                    fake_cc.to_string_lossy().into_owned(),
+                    "-c".to_string(),
+                    source.to_string_lossy().into_owned(),
+                    "-o".to_string(),
+                    output.to_string_lossy().into_owned(),
+                    "-I".to_string(),
+                    first.to_string_lossy().into_owned(),
+                    "-I".to_string(),
+                    second.to_string_lossy().into_owned(),
+                ])
+                .unwrap()
+        };
+        let (file_hasher, cache) = include_dir_key_ctx(temp.path());
+        let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+        let ctx = KeyCtx {
+            file_hasher: &file_hasher,
+            path_normalizer: &path_normalizer,
+            cache_dir: &cache,
+            key_salt: None,
+            key_env_vars: &[],
+            extra_inputs_digest: None,
+        };
+        let before = compiler.cache_key(&parse(), &ctx).unwrap();
+        fs::write(first.join("header.h"), "#define A 2\n").unwrap();
+        let after = compiler.cache_key(&parse(), &ctx).unwrap();
+        assert_ne!(
+            before, after,
+            "a shadowing header must change the cc key even when preprocess output is unchanged"
+        );
+        assert!(compiler.include_dir_names_still_match(&parse()));
     }
 }

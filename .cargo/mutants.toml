@@ -150,6 +150,11 @@ gitignore = true
 # replacement; the override resolver and every branch inside the real method
 # remain mutation-tested.
 #
+# Replacing `try_collect_slots` with `Ok(None)` makes every permit unavailable.
+# The wrapper then waits for its 30-minute production deadline, beyond the
+# mutation lane 180-second timeout. Short-timeout scheduler tests cover permit
+# blocking and release; exclude only this whole-body replacement.
+#
 # The packed-prefetch format has three inclusive-boundary operator mutants
 # that cannot change an observable result. A catalog which passed structural
 # validation cannot approach the 64 MiB encode cap: its 65,536 fixed-shape
@@ -208,6 +213,7 @@ exclude_re = [
     "replace report_key_divergence with \\(\\)",
     "delete ! in install_shims",
     "replace Config::socket_path .* with Default::default",
+    "replace try_collect_slots .* with Ok\\(None\\)",
     "src/remote_pack.rs:351:20: replace > with (>=|==) in encode_catalog",
     "src/remote_pack.rs:309:20: replace < with <= in decode_pack",
     "src/remote_pack.rs:324:22: replace > with >= in decode_pack",

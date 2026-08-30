@@ -301,6 +301,16 @@ mod tests {
     }
 
     #[test]
+    fn discover_entrypoint_never_returns_an_empty_default_intent() {
+        let intent = discover(None).expect("the Kache workspace should be discoverable");
+        assert!(
+            intent.crate_names.iter().any(|name| name == "kache"),
+            "expected the current workspace packages, got {:?}",
+            intent.crate_names
+        );
+    }
+
+    #[test]
     fn discover_omits_unrelated_workspace_members_absent_from_the_lock() {
         let ws = scaffold_workspace();
         let root = ws.path();

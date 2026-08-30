@@ -29,7 +29,6 @@ The editor covers common fields and preserves advanced tables it does not expose
 
 ```toml title="~/.config/kache/config.toml"
 [cache]
-local_max_size = "50GiB"
 cache_executables = true
 
 [cache.remote]
@@ -47,7 +46,7 @@ Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem rem
 | `KACHE_CACHE_DIR` | `cache.local_store` | OS cache directory | Persistent store |
 | `KACHE_RUNTIME_DIR` | `cache.runtime_dir` | local store | Socket, locks, logs, state, and session markers |
 | `KACHE_SOCKET_PATH` | none | `<runtime_dir>/daemon.sock` | Absolute daemon endpoint override |
-| `KACHE_MAX_SIZE` | `cache.local_max_size` | `50GiB` | Registered blob bytes allowed before GC |
+| `KACHE_MAX_SIZE` | `cache.local_max_size` | 5% of the cache disk, floored at 5GiB and capped at 100GiB | Registered blob bytes allowed before GC. An explicit size always wins. `none` is not allowed. |
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
 | `KACHE_GC_EVICT_SHARED` | `cache.gc_evict_shared` | `false` | Restore namespace-first GC for entries retained by build outputs |

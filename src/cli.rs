@@ -595,7 +595,10 @@ pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) ->
     lines.push(format!(
         "Store:      {} / {} ({} entries, {:.0}%)",
         ByteSize(snap.total_size),
-        ByteSize(snap.max_size),
+        crate::config::describe_max_size(
+            snap.max_size,
+            crate::cache_fs::probe(&config.cache_dir).total_bytes,
+        ),
         snap.entry_count,
         store_pct,
     ));
@@ -2987,7 +2990,15 @@ pub fn gc(
     let store = Store::open(config)?;
     let total_size = store.total_size()?;
     let entry_count = store.entry_count()?;
-    println!("Store: {} ({} entries)", ByteSize(total_size), entry_count);
+    println!(
+        "Store: {} / {} ({} entries)",
+        ByteSize(total_size),
+        crate::config::describe_max_size(
+            config.max_size,
+            crate::cache_fs::probe(&config.cache_dir).total_bytes,
+        ),
+        entry_count
+    );
 
     Ok(())
 }

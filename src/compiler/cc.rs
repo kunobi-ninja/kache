@@ -10353,17 +10353,9 @@ mod tests {
     #[cfg(unix)]
     fn include_dir_test_compiler(dir: &Path) -> (CcCompiler, PathBuf, PathBuf) {
         use std::fs;
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
 
-        let fake_cc = dir.join("cc");
-        fs::write(
-            &fake_cc,
-            "#!/bin/sh\ncase \"$1\" in\n  --version) printf 'fake gcc 1.0\\n' ;;\n  -###) exit 0 ;;\n  *) printf 'preprocessed unit\\n' ;;\nesac\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(&fake_cc, fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_cc =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_static.sh");
         let source = dir.join("unit.c");
         fs::write(&source, "int x;\n").unwrap();
         (CcCompiler::new(), fake_cc, source)

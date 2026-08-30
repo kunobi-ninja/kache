@@ -183,6 +183,11 @@ gitignore = true
 # lane cannot compile. Their sizing and validation rules are extracted into
 # platform-neutral helpers and stay mutation-tested here; hosted platform tests
 # exercise the real wrappers.
+ #
+# The service repository has no identity-manifest store yet, so its
+# `identity_candidates` implementation returns `Ok(Vec::new())`. Replacing that
+# with `Ok(vec![])` is the same value. The daemon and core planner identity paths
+# remain in scope and are exercised with populated manifests.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -229,4 +234,5 @@ exclude_re = [
     "src/cache_fs.rs:.*replace probe_windows",
     "src/cache_fs.rs:.*replace statfs_total_bytes_macos",
     "src/cache_fs.rs:.*replace volume_total_bytes_windows",
+    "SurrealPlannerRepository>::identity_candidates .* with Ok\\(vec!\\[\\]\\)",
 ]

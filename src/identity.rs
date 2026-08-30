@@ -388,6 +388,22 @@ mod tests {
     }
 
     #[test]
+    fn publish_keys_use_host_target_when_explicit_target_is_blank() {
+        let _lock = crate::config::config_path_lock();
+        let _clear_key = set_env("KACHE_MANIFEST_KEY", None);
+        let _clear_profile = set_env("KACHE_PROFILE", None);
+        let _clear_cargo_profile = set_env("PROFILE", None);
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(&lock, "version = 3\n").unwrap();
+
+        assert_eq!(
+            manifest_publish_keys(&lock, Some("   "), Some("release")),
+            manifest_publish_keys(&lock, None, Some("release"))
+        );
+    }
+
+    #[test]
     fn profile_from_env_prefers_kache_profile() {
         let _lock = crate::config::config_path_lock();
         let _clear_kache = set_env("KACHE_PROFILE", Some("  bench  "));

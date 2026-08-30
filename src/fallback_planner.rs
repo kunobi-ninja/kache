@@ -247,6 +247,33 @@ mod tests {
     };
     use crate::store::Store;
 
+    struct EnvRestore {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn set_env(key: &'static str, value: Option<&str>) -> EnvRestore {
+        let previous = std::env::var_os(key);
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        EnvRestore { key, previous }
+    }
+
     fn test_config(
         cache_dir: std::path::PathBuf,
         remote: Option<crate::config::RemoteConfig>,
@@ -359,6 +386,42 @@ mod tests {
             err.to_string().contains("no remote configured"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn identity_candidates_return_entries_from_the_first_manifest() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key = set_env("KACHE_MANIFEST_KEY", None);
+        let dir = tempfile::tempdir().unwrap();
+        let remote = crate::config::RemoteConfig::test_s3("bucket", "prefix");
+        let config = test_config(dir.path().join("cache"), Some(remote));
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(crate::remote_backend::memory_backend());
+        let manifest = crate::remote::BuildManifest {
+            version: 3,
+            created: "2026-08-30T00:00:00Z".into(),
+            manifest_key: "id/test".into(),
+            entries: vec![crate::remote::ManifestEntry {
+                cache_key: "cache-key".into(),
+                crate_name: "serde".into(),
+                compile_time_ms: 1200,
+                artifact_size: 4096,
+            }],
+        };
+        crate::remote::upload_manifest(backend.as_ref(), "prefix", "id/test", &manifest)
+            .await
+            .unwrap();
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend);
+        let source = LocalPlannerSource { daemon: &daemon };
+
+        let candidates = source.identity_candidates("id/test").await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].cache_key, "cache-key");
+        assert_eq!(candidates[0].crate_name, "serde");
+        assert_eq!(candidates[0].compile_time_ms, Some(1200));
+        assert_eq!(candidates[0].size_bytes, Some(4096));
     }
 
     #[tokio::test]

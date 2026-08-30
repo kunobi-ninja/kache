@@ -2244,6 +2244,23 @@ impl GcRunReport {
     }
 }
 
+fn identity_publish_context(
+    identity_key: Option<&str>,
+    session_id: &str,
+    remote_configured: bool,
+    remote_readonly: bool,
+) -> Option<(String, String)> {
+    if !remote_configured || remote_readonly {
+        return None;
+    }
+    let identity_key = identity_key?.trim();
+    let session_id = session_id.trim();
+    if identity_key.is_empty() || session_id.is_empty() {
+        return None;
+    }
+    Some((identity_key.to_string(), session_id.to_string()))
+}
+
 impl Daemon {
     #[cfg(test)]
     pub fn new(config: Config) -> Self {
@@ -2590,6 +2607,17 @@ impl Daemon {
                 crate::remote_backend::create_backend(remote, self.config.s3_pool_idle_secs).await
             })
             .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_remote_backend_for_test(
+        &self,
+        backend: Arc<dyn crate::remote_backend::RemoteBackend>,
+    ) {
+        assert!(
+            self.remote_backend.set(backend).is_ok(),
+            "test remote backend must be set only once"
+        );
     }
 
     /// Dispatch a parsed request to the appropriate handler (sync-only requests).
@@ -5083,7 +5111,7 @@ impl Daemon {
         if let Err(e) = crate::events::log_summary(&path, &event) {
             tracing::debug!("failed to write build summary: {e}");
         }
-        self.maybe_publish_identity_manifest(
+        let _ = self.maybe_publish_identity_manifest(
             plan.identity_key.as_deref(),
             plan.session_id.as_str(),
         );
@@ -5092,21 +5120,19 @@ impl Daemon {
     /// Best-effort rank-0 publish when a session ends. Failures must not
     /// affect the daemon: the next `save-manifest` still writes the same
     /// events.
-    fn maybe_publish_identity_manifest(&self, identity_key: Option<&str>, session_id: &str) {
-        let Some(identity_key) = identity_key
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .map(str::to_string)
-        else {
-            return;
+    fn maybe_publish_identity_manifest(
+        &self,
+        identity_key: Option<&str>,
+        session_id: &str,
+    ) -> bool {
+        let Some((identity_key, session_id)) = identity_publish_context(
+            identity_key,
+            session_id,
+            self.config.remote.is_some(),
+            self.config.remote_readonly,
+        ) else {
+            return false;
         };
-        let session_id = session_id.trim().to_string();
-        if session_id.is_empty() {
-            return;
-        }
-        if self.config.remote.is_none() || self.config.remote_readonly {
-            return;
-        }
         let config = self.config.clone();
         let publish = move || {
             if let Err(error) =
@@ -5120,6 +5146,7 @@ impl Daemon {
         } else {
             publish();
         }
+        true
     }
 
     pub async fn handle_build_started(self: &Arc<Self>, req: &BuildStartedRequest) -> Response {
@@ -6558,7 +6585,7 @@ async fn manifest_prefetch(
         crate::identity::identity_key(lock_path, &crate::identity::host_target_triple(), &profile)
     });
     let from_identity = identity_manifest_prefetch(daemon, identity.as_deref()).await;
-    if from_identity > 0 {
+    if identity_prefetch_satisfied(from_identity) {
         return from_identity;
     }
 
@@ -6579,6 +6606,10 @@ async fn manifest_prefetch(
     }
 
     0
+}
+
+fn identity_prefetch_satisfied(count: usize) -> bool {
+    count > 0
 }
 
 /// Shard-based prefetch: compute shard hashes from Cargo.lock, download matching shards
@@ -8602,6 +8633,56 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
+    fn identity_publish_context_requires_both_nonempty_values() {
+        assert_eq!(identity_publish_context(None, "session", true, false), None);
+        assert_eq!(
+            identity_publish_context(Some(""), "session", true, false),
+            None
+        );
+        assert_eq!(
+            identity_publish_context(Some("   "), "session", true, false),
+            None
+        );
+        assert_eq!(
+            identity_publish_context(Some("identity"), "", true, false),
+            None
+        );
+        assert_eq!(
+            identity_publish_context(Some("identity"), "   ", true, false),
+            None
+        );
+        assert_eq!(
+            identity_publish_context(Some("identity"), "session", false, false),
+            None
+        );
+        assert_eq!(
+            identity_publish_context(Some("identity"), "session", true, true),
+            None
+        );
+        assert_eq!(
+            identity_publish_context(Some("  identity  "), "  session  ", true, false),
+            Some(("identity".to_string(), "session".to_string()))
+        );
+    }
+
+    #[test]
+    fn identity_prefetch_only_short_circuits_after_queuing_work() {
+        assert!(!identity_prefetch_satisfied(0));
+        assert!(identity_prefetch_satisfied(1));
+    }
+
+    #[test]
+    fn automatic_identity_publish_reports_when_work_was_attempted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let daemon = Daemon::new(config);
+
+        assert!(!daemon.maybe_publish_identity_manifest(None, "session"));
+        assert!(daemon.maybe_publish_identity_manifest(Some("id/test"), "session"));
+    }
+
+    #[test]
     fn target_registration_debounce_expires_at_the_boundary() {
         let last = Instant::now();
         assert!(target_registration_is_recent(
@@ -8946,6 +9027,45 @@ mod tests {
         assert_eq!(plan.identity_key.as_deref(), Some("id/session"));
         assert_eq!(plan.candidates, HashSet::from(["key".to_string()]));
         assert!(!summary_path.exists());
+    }
+
+    #[test]
+    fn active_session_updates_in_place_and_summarizes_on_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let summary_path = config.summary_log_path();
+        let daemon = Daemon::new(config);
+        let request = |session: &str, identity: &str| BuildStartedRequest {
+            intent: kache_core::BuildIntent {
+                identity_key: Some(identity.to_string()),
+                ..Default::default()
+            },
+            client_epoch: 0,
+            session_id: session.to_string(),
+        };
+
+        daemon.ensure_active_session(&request("session-a", "id/a"));
+        daemon.ensure_active_session(&request("session-a", "id/a-updated"));
+        {
+            let plan = daemon.active_plan.lock().unwrap();
+            let plan = plan.as_ref().unwrap();
+            assert_eq!(plan.session_id, "session-a");
+            assert_eq!(plan.identity_key.as_deref(), Some("id/a-updated"));
+        }
+        assert!(!summary_path.exists());
+
+        daemon.ensure_active_session(&request("session-b", "id/b"));
+        {
+            let plan = daemon.active_plan.lock().unwrap();
+            let plan = plan.as_ref().unwrap();
+            assert_eq!(plan.session_id, "session-b");
+            assert_eq!(plan.identity_key.as_deref(), Some("id/b"));
+        }
+        let summaries = crate::events::read_summaries(&summary_path).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].session_id, "session-a");
+        assert_eq!(summaries[0].closure_reason, "superseded");
+        assert_eq!(summaries[0].plan_source, "none");
     }
 
     // Tests use the same cross-platform transport as production. On Unix
@@ -14719,7 +14839,7 @@ mod tests {
         assert!(daemon.remote_backend.set(client).is_ok());
 
         // Should complete without panicking and without queuing the cheap crate.
-        identity_manifest_prefetch(&daemon, None).await;
+        assert_eq!(identity_manifest_prefetch(&daemon, None).await, 0);
     }
 
     #[tokio::test]

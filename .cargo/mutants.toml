@@ -178,6 +178,11 @@ gitignore = true
 # while the diff mutation lane runs on Ubuntu. macOS tests exercise both SDK
 # discovery and the real flag wrapper. Exclude only the platform wrappers; the
 # extracted flag logic and key folding remain mutation-tested on every host.
+#
+# `cache_fs` also has thin macOS and Windows syscall wrappers which this Ubuntu
+# lane cannot compile. Their sizing and validation rules are extracted into
+# platform-neutral helpers and stay mutation-tested here; hosted platform tests
+# exercise the real wrappers.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -221,4 +226,7 @@ exclude_re = [
     "replace run_pull_bench .* with Ok",
     "replace run_sccache_bench .* with Ok",
     "replace run_cold_phase .* with Ok",
+    "src/cache_fs.rs:.*replace probe_windows",
+    "src/cache_fs.rs:.*replace statfs_total_bytes_macos",
+    "src/cache_fs.rs:.*replace volume_total_bytes_windows",
 ]

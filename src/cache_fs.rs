@@ -133,7 +133,15 @@ pub fn advisory_for(probe: &FsProbe, cache_dir: &Path) -> Option<String> {
 /// [`FsProbe::unknown`], which classifies to [`CacheFsVerdict::Unknown`] and
 /// stays silent. This runs at wrapper startup, so it must never fail a build.
 pub fn probe(path: &Path) -> FsProbe {
-    probe_impl(path)
+    #[cfg(target_os = "macos")]
+    let probe = probe_macos(path);
+    #[cfg(target_os = "linux")]
+    let probe = probe_linux(path);
+    #[cfg(windows)]
+    let probe = probe_windows(path);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    let probe = probe_unsupported(path);
+    probe
 }
 
 /// Volume size from a `statfs` block size and block count.
@@ -174,14 +182,14 @@ fn win32_succeeded(ok: i32) -> bool {
 // "this filesystem is local" bit (the same one `df -l` filters on), and
 // `f_fstypename` names it. No magic-number table needed.
 #[cfg(target_os = "macos")]
-fn probe_impl(path: &Path) -> FsProbe {
+fn probe_macos(path: &Path) -> FsProbe {
     let Some(stat) = statfs_of(path) else {
         return FsProbe::unknown();
     };
     FsProbe {
         name: c_str_field_to_string(&stat.f_fstypename),
         is_local: Some(stat.f_flags & (libc::MNT_LOCAL as u32) != 0),
-        total_bytes: statfs_total_bytes(&stat),
+        total_bytes: statfs_total_bytes_macos(&stat),
     }
 }
 
@@ -201,7 +209,7 @@ fn c_str_field_to_string(field: &[libc::c_char]) -> Option<String> {
 
 // ── Linux ───────────────────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
-fn probe_impl(path: &Path) -> FsProbe {
+fn probe_linux(path: &Path) -> FsProbe {
     let Some(stat) = statfs_of(path) else {
         return FsProbe::unknown();
     };
@@ -213,7 +221,7 @@ fn probe_impl(path: &Path) -> FsProbe {
     #[allow(clippy::unnecessary_cast)]
     let magic = stat.f_type as i64;
     let mut probe = classify_linux_magic(magic);
-    probe.total_bytes = statfs_total_bytes(&stat);
+    probe.total_bytes = statfs_total_bytes_linux(&stat);
     probe
 }
 
@@ -306,12 +314,12 @@ fn classify_linux_magic(magic: i64) -> FsProbe {
 }
 
 #[cfg(target_os = "macos")]
-fn statfs_total_bytes(stat: &libc::statfs) -> Option<u64> {
+fn statfs_total_bytes_macos(stat: &libc::statfs) -> Option<u64> {
     disk_bytes(u64::from(stat.f_bsize), stat.f_blocks)
 }
 
 #[cfg(target_os = "linux")]
-fn statfs_total_bytes(stat: &libc::statfs) -> Option<u64> {
+fn statfs_total_bytes_linux(stat: &libc::statfs) -> Option<u64> {
     let frsize = u64::try_from(stat.f_frsize).unwrap_or(0);
     let bsize = u64::try_from(stat.f_bsize).unwrap_or(0);
     disk_bytes(linux_fragment_bytes(frsize, bsize), stat.f_blocks)
@@ -350,7 +358,7 @@ fn nearest_existing(path: &Path) -> Option<std::path::PathBuf> {
 // drive), and a UNC path (`\\server\share`) is remote by construction — it has
 // no drive letter for `GetDriveTypeW` to classify, so it is checked first.
 #[cfg(windows)]
-fn probe_impl(path: &Path) -> FsProbe {
+fn probe_windows(path: &Path) -> FsProbe {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW};
 
@@ -368,7 +376,7 @@ fn probe_impl(path: &Path) -> FsProbe {
         return FsProbe {
             name: Some("a network share (UNC path)".to_string()),
             is_local: Some(false),
-            total_bytes: volume_total_bytes(&target),
+            total_bytes: volume_total_bytes_windows(&target),
         };
     }
 
@@ -415,12 +423,12 @@ fn probe_impl(path: &Path) -> FsProbe {
     FsProbe {
         name,
         is_local,
-        total_bytes: volume_total_bytes(&target),
+        total_bytes: volume_total_bytes_windows(&target),
     }
 }
 
 #[cfg(windows)]
-fn volume_total_bytes(path: &Path) -> Option<u64> {
+fn volume_total_bytes_windows(path: &Path) -> Option<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
@@ -470,7 +478,7 @@ fn is_unc_path(path: &Path) -> bool {
 
 // ── Unsupported targets ─────────────────────────────────────────────────────
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn probe_impl(_path: &Path) -> FsProbe {
+fn probe_unsupported(_path: &Path) -> FsProbe {
     FsProbe::unknown()
 }
 

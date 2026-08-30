@@ -15,6 +15,21 @@ default:
 [group('dev')]
 check: fmt-check lint test-resource-guard-check test
 
+# What a PR must survive before `gh pr create`: `just check`, then the
+# same changed-line mutants job CI runs. Docs-only diffs skip mutants.
+# BASE is the merge base, default `origin/main`.
+[group('dev')]
+pr BASE="origin/main": check
+  #!/usr/bin/env bash
+  set -euo pipefail
+  mkdir -p tmp/mutants
+  git diff --no-ext-diff --unified=1 "{{BASE}}...HEAD" -- '*.rs' > tmp/mutants/pr.diff
+  if [ ! -s tmp/mutants/pr.diff ]; then
+    echo "no Rust diff against {{BASE}}; skipping mutants-diff"
+    exit 0
+  fi
+  just mutants-diff tmp/mutants/pr.diff
+
 # Mirror the repo CI verification flow.
 [group('dev')]
 ci: fmt-check lint image-service-print helm-lint test-resource-guard-check coverage

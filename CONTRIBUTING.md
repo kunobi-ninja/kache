@@ -32,7 +32,8 @@ just install   # installs to $CARGO_HOME/bin (default ~/.cargo/bin) and register
 All common tasks live in the `Justfile` — prefer these over raw `cargo` commands:
 
 ```sh
-just check          # fmt + clippy + tests (run before every PR)
+just check          # fmt + clippy + tests
+just pr             # check + changed-line mutants (run before every PR)
 just ci             # mirrors the GitHub Actions verification flow
 just test           # run all tests
 just lint           # clippy with -D warnings
@@ -85,17 +86,21 @@ cargo install --locked cargo-mutants --version 27.1.0
 just mutants-core
 ```
 
-Run the full check suite before submitting a PR:
+Run the PR gate before submitting. `just check` is fmt, clippy with `-D warnings`, and tests. CI also mutation-tests every changed Rust line; `just pr` runs that too.
 
 ```sh
-just check
+just pr
 ```
+
+Install the same cargo-mutants version as CI first (`cargo install --locked cargo-mutants --version 27.1.0`). A docs-only diff skips mutants.
+
+Clippy on macOS does not type-check `#[cfg(target_os = "linux")]` functions. Identity conversions (`u64::try_from` on a `u64`) and unused Unix-only test helpers fail on Linux CI under `-D warnings` even when `just lint` is green locally.
 
 ## Pull request process
 
 1. **Fork** the repository and create a feature branch from `main`
 2. Make your changes — keep commits focused and use [conventional commit](https://www.conventionalcommits.org/) messages (e.g., `feat:`, `fix:`, `test:`, `docs:`)
-3. Run `just check` and ensure it passes
+3. Run `just pr` and ensure it passes
 4. Open a pull request against `main` (see [Branching and releases](#branching-and-releases))
 5. Describe what the PR does and why — link related issues if any
 

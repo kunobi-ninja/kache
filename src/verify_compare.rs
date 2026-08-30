@@ -283,8 +283,8 @@ fn path_span_covering(bytes: &[u8], mismatch: usize) -> Option<(usize, usize)> {
         .iter()
         .take_while(|byte| is_path_byte(**byte))
         .count();
-    let end = mismatch.checked_add(path_len)?;
-    (end > mismatch).then_some(())?;
+    let path_len = std::num::NonZeroUsize::new(path_len)?;
+    let end = mismatch.checked_add(path_len.get())?;
     looks_like_path(&bytes[start..end]).then_some((start, end))
 }
 

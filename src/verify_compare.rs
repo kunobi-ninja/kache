@@ -241,62 +241,59 @@ pub(crate) fn classify_bytes(name: &str, restored: &[u8], compiled: &[u8]) -> Ar
 /// True when `left` and `right` differ only in embedded absolute-path /
 /// debug-path strings (including kache remap sentinels).
 pub(crate) fn bytes_equal_ignoring_embedded_paths(left: &[u8], right: &[u8]) -> bool {
-    let mut i = 0;
-    let mut j = 0;
-    while i < left.len() && j < right.len() {
-        if left[i] == right[j] {
-            i += 1;
-            j += 1;
-            continue;
-        }
-        let Some((next_i, next_j)) = skip_divergent_paths(left, i, right, j) else {
+    let mut left = left;
+    let mut right = right;
+    loop {
+        let mismatch = left
+            .iter()
+            .zip(right)
+            .position(|(left_byte, right_byte)| left_byte != right_byte);
+        let Some(mismatch) = mismatch else {
+            let common = left.len().min(right.len());
+            return remaining_is_path(left, common) && remaining_is_path(right, common);
+        };
+        let Some((_, left_end)) = path_span_covering(left, mismatch) else {
             return false;
         };
-        if next_i <= i || next_j <= j {
+        let Some(left_end) = std::num::NonZeroUsize::new(left_end) else {
             return false;
-        }
-        i = next_i;
-        j = next_j;
+        };
+        let Some((_, right_end)) = path_span_covering(right, mismatch) else {
+            return false;
+        };
+        let Some(right_end) = std::num::NonZeroUsize::new(right_end) else {
+            return false;
+        };
+        left = &left[left_end.get()..];
+        right = &right[right_end.get()..];
     }
-    remaining_is_path(left, i) && remaining_is_path(right, j)
 }
 
 fn remaining_is_path(bytes: &[u8], index: usize) -> bool {
-    if index >= bytes.len() {
-        return true;
-    }
-    path_span_covering(bytes, index).is_some_and(|(_, end)| end == bytes.len())
-}
-
-fn skip_divergent_paths(left: &[u8], i: usize, right: &[u8], j: usize) -> Option<(usize, usize)> {
-    let (_, left_end) = path_span_covering(left, i)?;
-    let (_, right_end) = path_span_covering(right, j)?;
-    if left_end <= i || right_end <= j {
-        return None;
-    }
-    Some((left_end, right_end))
+    let Some(remaining) = bytes.get(index..) else {
+        return false;
+    };
+    remaining.is_empty()
+        || path_span_covering(bytes, index).is_some_and(|(_, end)| end == bytes.len())
 }
 
 fn path_span_covering(bytes: &[u8], mismatch: usize) -> Option<(usize, usize)> {
     let start = find_path_start(bytes, mismatch)?;
-    let mut end = mismatch.max(start);
-    while end < bytes.len() && is_path_byte(bytes[end]) {
-        end += 1;
-    }
-    if end <= start {
-        return None;
-    }
+    let path_len = bytes[mismatch..]
+        .iter()
+        .take_while(|byte| is_path_byte(**byte))
+        .count();
+    let end = mismatch.checked_add(path_len)?;
+    (end > mismatch).then_some(())?;
     looks_like_path(&bytes[start..end]).then_some((start, end))
 }
 
 fn find_path_start(bytes: &[u8], mismatch: usize) -> Option<usize> {
-    if bytes.is_empty() || mismatch >= bytes.len() {
-        return None;
-    }
-    let mut start = mismatch;
-    while start > 0 && is_path_byte(bytes[start - 1]) {
-        start -= 1;
-    }
+    let prefix = bytes.get(..=mismatch)?;
+    let start = prefix
+        .iter()
+        .rposition(|byte| !is_path_byte(*byte))
+        .map_or(0, |index| index.saturating_add(1));
     (start..=mismatch).find(|&index| is_path_start(bytes, index))
 }
 
@@ -307,7 +304,9 @@ fn is_path_start(bytes: &[u8], index: usize) -> bool {
     match byte {
         b'/' | b'\\' | b'<' => true,
         b'_' => bytes[index..].starts_with(b"__kache"),
-        b'A'..=b'Z' | b'a'..=b'z' => bytes.get(index + 1).copied() == Some(b':'),
+        b'A'..=b'Z' | b'a'..=b'z' => {
+            matches!(bytes.get(index..), Some([_, b':', ..]))
+        }
         _ => false,
     }
 }
@@ -559,6 +558,62 @@ mod tests {
     }
 
     #[test]
+    fn embedded_path_comparison_covers_equal_exhausted_and_non_path_boundaries() {
+        assert!(bytes_equal_ignoring_embedded_paths(b"", b""));
+        assert!(bytes_equal_ignoring_embedded_paths(b"same", b"same"));
+        assert!(bytes_equal_ignoring_embedded_paths(
+            b"prefix",
+            b"prefix/tmp/file"
+        ));
+        assert!(bytes_equal_ignoring_embedded_paths(
+            b"prefix/tmp/file",
+            b"prefix"
+        ));
+        assert!(!bytes_equal_ignoring_embedded_paths(b"prefix", b"prefix!"));
+        assert!(!bytes_equal_ignoring_embedded_paths(b"prefix!", b"prefix"));
+        assert!(!bytes_equal_ignoring_embedded_paths(b"left", b"right"));
+    }
+
+    #[test]
+    fn embedded_path_helpers_reject_out_of_range_and_partial_spans() {
+        let bytes = b"xx/abc.rs";
+        assert_eq!(find_path_start(bytes, 5), Some(2));
+        assert_eq!(path_span_covering(bytes, 5), Some((2, bytes.len())));
+        assert_eq!(path_span_covering(b"/a\0", 2), None);
+        assert_eq!(find_path_start(b"", 0), None);
+        assert_eq!(find_path_start(b"abc", 3), None);
+
+        assert!(remaining_is_path(b"", 0));
+        assert!(remaining_is_path(b"abc", 3));
+        assert!(!remaining_is_path(b"abc", 4));
+        assert!(remaining_is_path(b"/tmp/file", 0));
+        assert!(!remaining_is_path(b"/tmp/file\0", 0));
+        assert!(!remaining_is_path(b"plain", 0));
+    }
+
+    #[test]
+    fn path_start_and_shape_detection_cover_each_supported_form() {
+        assert!(is_path_start(b"/tmp", 0));
+        assert!(is_path_start(b"\\tmp", 0));
+        assert!(is_path_start(b"<WORKSPACE>", 0));
+        assert!(is_path_start(b"__kache_root__", 0));
+        assert!(is_path_start(b"C:\\tmp", 0));
+        assert!(is_path_start(b"z:/tmp", 0));
+        assert!(!is_path_start(b"_other", 0));
+        assert!(!is_path_start(b"C/tmp", 0));
+        assert!(!is_path_start(b"9:\\tmp", 0));
+        assert!(!is_path_start(b"abc", 3));
+
+        assert!(!looks_like_path(b""));
+        assert!(!looks_like_path(b"/"));
+        assert!(!looks_like_path(b"plain"));
+        assert!(!looks_like_path(b"C:plain"));
+        assert!(looks_like_path(b"/tmp"));
+        assert!(looks_like_path(b"C:\\tmp"));
+        assert!(looks_like_path(b"<WORKSPACE>"));
+    }
+
+    #[test]
     fn depinfo_path_rewrite_is_path_debug() {
         let restored = b"__kache_root__/debug/deps/libfoo.rlib: /Users/alice/src/lib.rs\n";
         let compiled = b"/tmp/kache-verify-1/libfoo.rlib: /Users/bob/src/lib.rs\n";
@@ -603,15 +658,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let restored = dir.path().join("out/libfoo.rlib");
         let compiled = dir.path().join("stage/libfoo.rlib");
+        let nested_restored = dir.path().join("out/libbar.rlib");
+        let nested_compiled = dir.path().join("stage/libbar.rlib");
         std::fs::create_dir_all(restored.parent().unwrap()).unwrap();
         std::fs::create_dir_all(compiled.parent().unwrap()).unwrap();
         std::fs::write(&restored, b"same").unwrap();
         std::fs::write(&compiled, b"same").unwrap();
-        let restored_list = vec![("libfoo.rlib".to_string(), restored)];
+        std::fs::write(&nested_restored, b"cached").unwrap();
+        std::fs::write(&nested_compiled, b"fresh!").unwrap();
+        let restored_list = vec![
+            ("libfoo.rlib".to_string(), restored),
+            ("nested/libbar.rlib".to_string(), nested_restored),
+        ];
         let mut compiled_by_name = BTreeMap::new();
         compiled_by_name.insert("libfoo.rlib".to_string(), compiled);
+        compiled_by_name.insert("libbar.rlib".to_string(), nested_compiled);
         let report = compare_named_artifacts(&restored_list, &compiled_by_name);
-        assert_eq!(report.worst(), DivergenceClass::Match);
+        assert_eq!(report.artifacts.len(), 2);
+        assert_eq!(report.artifacts[0].class, DivergenceClass::Match);
+        assert_eq!(report.artifacts[1].name, "nested/libbar.rlib");
+        assert_eq!(report.artifacts[1].class, DivergenceClass::Content);
+        assert_eq!(report.worst(), DivergenceClass::Content);
+    }
+
+    #[test]
+    fn named_compare_reports_missing_recompile_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let restored = dir.path().join("libfoo.rlib");
+        std::fs::write(&restored, b"cached").unwrap();
+        let report =
+            compare_named_artifacts(&[("libfoo.rlib".to_string(), restored)], &BTreeMap::new());
+        assert_eq!(report.artifacts.len(), 1);
+        assert_eq!(report.artifacts[0].class, DivergenceClass::Content);
+        assert_eq!(report.artifacts[0].detail, "missing from recompile");
     }
 
     #[test]

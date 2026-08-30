@@ -3537,13 +3537,7 @@ fn run_verify_recompile(
     let staged_args = retarget_rustc_args_for_staging(args, staging.path());
     let result = crate::opcounts::suspend_spawn_counts(|| compiler.execute(&staged_args))
         .context("running KACHE_VERIFY recompile")?;
-    if result.exit_code != 0 {
-        anyhow::bail!(
-            "rustc exited {}{}",
-            result.exit_code,
-            verify_recompile_stderr_hint(&result.stderr)
-        );
-    }
+    verify_recompile_exit_status(result.exit_code, &result.stderr)?;
     let mut compiled_by_name = std::collections::BTreeMap::new();
     for artifact in result.artifacts.outputs() {
         compiled_by_name.insert(artifact.store_name.clone(), artifact.path.clone());
@@ -3563,6 +3557,16 @@ fn run_verify_recompile(
         restored,
         &compiled_by_name,
     ))
+}
+
+fn verify_recompile_exit_status(exit_code: i32, stderr: &str) -> Result<()> {
+    if exit_code == 0 {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "rustc exited {exit_code}{}",
+        verify_recompile_stderr_hint(stderr)
+    )
 }
 
 fn verify_recompile_stderr_hint(stderr: &str) -> String {
@@ -3599,42 +3603,39 @@ fn retarget_rustc_args_for_staging(args: &RustcArgs, staging: &Path) -> RustcArg
 fn rewrite_output_argv(argv: &[String], staging: &Path) -> Vec<String> {
     let staging_s = staging.display().to_string();
     let mut out = Vec::with_capacity(argv.len());
-    let mut i = 0;
-    while i < argv.len() {
-        let arg = &argv[i];
-        if arg == "--out-dir" {
-            out.push(arg.clone());
-            if i + 1 < argv.len() {
-                out.push(staging_s.clone());
-                i += 2;
-                continue;
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--out-dir" => {
+                out.push(arg.clone());
+                if args.next().is_some() {
+                    out.push(staging_s.clone());
+                }
             }
-        } else if arg.starts_with("--out-dir=") {
-            out.push(format!("--out-dir={staging_s}"));
-            i += 1;
-            continue;
-        } else if arg == "-o" {
-            out.push(arg.clone());
-            if let Some(next) = argv.get(i + 1) {
-                let name = Path::new(next).file_name().unwrap_or_default();
-                out.push(staging.join(name).to_string_lossy().into_owned());
-                i += 2;
-                continue;
+            "-o" => {
+                out.push(arg.clone());
+                if let Some(next) = args.next() {
+                    let name = Path::new(next).file_name().unwrap_or_default();
+                    out.push(staging.join(name).to_string_lossy().into_owned());
+                }
             }
-        } else if arg == "--emit" {
-            out.push(arg.clone());
-            if let Some(next) = argv.get(i + 1) {
-                out.push(rewrite_emit_value(next, staging));
-                i += 2;
-                continue;
+            "--emit" => {
+                out.push(arg.clone());
+                if let Some(next) = args.next() {
+                    out.push(rewrite_emit_value(next, staging));
+                }
             }
-        } else if let Some(value) = arg.strip_prefix("--emit=") {
-            out.push(format!("--emit={}", rewrite_emit_value(value, staging)));
-            i += 1;
-            continue;
+            _ if arg.starts_with("--out-dir=") => {
+                out.push(format!("--out-dir={staging_s}"));
+            }
+            _ => {
+                if let Some(value) = arg.strip_prefix("--emit=") {
+                    out.push(format!("--emit={}", rewrite_emit_value(value, staging)));
+                } else {
+                    out.push(arg.clone());
+                }
+            }
         }
-        out.push(arg.clone());
-        i += 1;
     }
     out
 }
@@ -9535,6 +9536,77 @@ exit 0
     }
 
     #[test]
+    fn verify_recompile_exit_status_reports_the_first_plain_stderr_line() {
+        assert!(verify_recompile_exit_status(0, "error: ignored on success").is_ok());
+
+        let error = verify_recompile_exit_status(
+            2,
+            "\n{\"message\":\"json diagnostic\"}\n  error: compile failed  \n",
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "rustc exited 2 (error: compile failed)");
+        assert_eq!(verify_recompile_stderr_hint(""), "");
+        assert_eq!(
+            verify_recompile_stderr_hint("\n{\"message\":\"json only\"}\n"),
+            ""
+        );
+        assert_eq!(
+            verify_recompile_stderr_hint("\n warning: plain diagnostic \n"),
+            " (warning: plain diagnostic)"
+        );
+    }
+
+    #[test]
+    fn rewrite_output_argv_rewrites_separate_values_without_shifting_other_args() {
+        let staging = Path::new("/tmp/stage");
+        let rewritten = rewrite_output_argv(
+            &[
+                "rustc".into(),
+                "--out-dir".into(),
+                "/old/deps".into(),
+                "-o".into(),
+                "/old/deps/libfoo.rlib".into(),
+                "--emit".into(),
+                "metadata,dep-info=/old/deps/foo.d".into(),
+                "--cfg".into(),
+                "feature=\"x\"".into(),
+            ],
+            staging,
+        );
+        assert_eq!(
+            rewritten,
+            vec![
+                "rustc".to_string(),
+                "--out-dir".to_string(),
+                staging.display().to_string(),
+                "-o".to_string(),
+                staging.join("libfoo.rlib").display().to_string(),
+                "--emit".to_string(),
+                format!("metadata,dep-info={}", staging.join("foo.d").display()),
+                "--cfg".to_string(),
+                "feature=\"x\"".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_output_argv_preserves_dangling_flags_and_empty_emit_paths() {
+        let staging = Path::new("/tmp/stage");
+        for flag in ["--out-dir", "-o", "--emit"] {
+            let argv = vec!["rustc".to_string(), flag.to_string()];
+            assert_eq!(rewrite_output_argv(&argv, staging), argv);
+        }
+        assert_eq!(
+            rewrite_emit_value("metadata,dep-info=", staging),
+            "metadata,dep-info="
+        );
+        assert_eq!(
+            rewrite_emit_value("dep-info=/old/foo.d", staging),
+            format!("dep-info={}", staging.join("foo.d").display())
+        );
+    }
+
+    #[test]
     fn rewrite_output_argv_handles_attached_out_dir_and_emit() {
         let staging = Path::new("/tmp/stage");
         let rewritten = rewrite_output_argv(
@@ -9551,8 +9623,11 @@ exit 0
             rewritten,
             vec![
                 "rustc".to_string(),
-                "--out-dir=/tmp/stage".to_string(),
-                "--emit=metadata,dep-info=/tmp/stage/foo.d".to_string(),
+                format!("--out-dir={}", staging.display()),
+                format!(
+                    "--emit=metadata,dep-info={}",
+                    staging.join("foo.d").display()
+                ),
                 "-C".to_string(),
                 "extra-filename=-abc".to_string(),
             ]

@@ -5323,6 +5323,42 @@ pub fn save_manifest(
     manifest_key: Option<&str>,
     namespace: Option<&str>,
 ) -> Result<()> {
+    save_manifest_impl(config, manifest_key, namespace, None, true, true)
+}
+
+pub(crate) fn save_manifest_auto_for_session(
+    config: &Config,
+    manifest_key: &str,
+    session_id: &str,
+) -> Result<()> {
+    // The daemon does not own the calling workspace's Cargo.lock or namespace.
+    // Publish the exact session manifest only; explicit save-manifest calls own
+    // shard publication because they run from the workspace.
+    save_manifest_impl(
+        config,
+        Some(manifest_key),
+        None,
+        Some(session_id),
+        false,
+        false,
+    )
+}
+
+/// Shards are content-addressed under the first published key only. Later
+/// keys (legacy host triple, extra aliases) get the JSON manifest without
+/// duplicating shard objects.
+fn shard_namespace_for_publish_key(index: usize, namespace: Option<&str>) -> Option<&str> {
+    if index == 0 { namespace } else { None }
+}
+
+fn save_manifest_impl(
+    config: &Config,
+    manifest_key: Option<&str>,
+    namespace: Option<&str>,
+    session_id: Option<&str>,
+    announce: bool,
+    allow_env_namespace: bool,
+) -> Result<()> {
     if config.remote_readonly {
         tracing::debug!("skipping manifest save (read-only mode)");
         return Ok(());
@@ -5334,18 +5370,24 @@ pub fn save_manifest(
         .ok_or_else(|| anyhow::anyhow!("No remote configured"))?;
 
     let events = crate::events::read_events(&config.event_log_path())?;
-    let entries = manifest_entries_from_events(&events);
+    let entries = manifest_entries_from_events(&events, session_id);
 
     if entries.is_empty() {
-        eprintln!("No build events found, skipping manifest save");
+        if announce {
+            eprintln!("No build events found, skipping manifest save");
+        }
         return Ok(());
     }
 
-    let key = manifest_key
-        .map(String::from)
-        .unwrap_or_else(default_manifest_key);
-    let env_namespace = std::env::var("KACHE_NAMESPACE")
-        .ok()
+    let keys = match manifest_key {
+        Some(key) => vec![key.to_string()],
+        None => {
+            crate::identity::manifest_publish_keys(std::path::Path::new("Cargo.lock"), None, None)
+        }
+    };
+    let env_namespace = allow_env_namespace
+        .then(|| std::env::var("KACHE_NAMESPACE").ok())
+        .flatten()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let effective_namespace = namespace
@@ -5361,20 +5403,31 @@ pub fn save_manifest(
 
     let pool_idle_secs = config.s3_pool_idle_secs;
     let entry_count = entries.len();
+    let published = keys.clone();
     rt.block_on(async {
         let backend = crate::remote_backend::create_backend(remote, pool_idle_secs).await?;
-        upload_manifest_and_shards(
-            &backend,
-            remote,
-            &key,
-            effective_namespace.as_deref(),
-            std::path::Path::new("Cargo.lock"),
-            entries,
-        )
-        .await
+        for (index, key) in keys.iter().enumerate() {
+            let shard_namespace =
+                shard_namespace_for_publish_key(index, effective_namespace.as_deref());
+            upload_manifest_and_shards(
+                &backend,
+                remote,
+                key,
+                shard_namespace,
+                std::path::Path::new("Cargo.lock"),
+                entries.clone(),
+            )
+            .await?;
+        }
+        Ok::<(), anyhow::Error>(())
     })?;
 
-    eprintln!("Saved manifest: {entry_count} entries for '{key}'");
+    if announce {
+        eprintln!(
+            "Saved manifest: {entry_count} entries for '{}'",
+            published.join("', '")
+        );
+    }
     Ok(())
 }
 
@@ -5386,9 +5439,14 @@ pub fn save_manifest(
 /// flags). Pure — extracted so the dedup logic is unit-testable without S3.
 fn manifest_entries_from_events(
     events: &[crate::events::BuildEvent],
+    session_id: Option<&str>,
 ) -> Vec<crate::remote::ManifestEntry> {
     let mut by_key = std::collections::HashMap::<String, crate::remote::ManifestEntry>::new();
+    let mut order = Vec::new();
     for e in events {
+        if session_id.is_some_and(|session_id| e.session_id != session_id) {
+            continue;
+        }
         if e.cache_key.is_empty() {
             continue;
         }
@@ -5410,16 +5468,19 @@ fn manifest_entries_from_events(
             },
             artifact_size: e.size,
         };
-        by_key
-            .entry(e.cache_key.clone())
-            .and_modify(|existing| {
-                if entry.compile_time_ms > existing.compile_time_ms {
-                    *existing = entry.clone();
-                }
-            })
-            .or_insert(entry);
+        if let Some(existing) = by_key.get_mut(&e.cache_key) {
+            if entry.compile_time_ms > existing.compile_time_ms {
+                *existing = entry;
+            }
+        } else {
+            order.push(e.cache_key.clone());
+            by_key.insert(e.cache_key.clone(), entry);
+        }
     }
-    by_key.into_values().collect()
+    order
+        .into_iter()
+        .filter_map(|key| by_key.remove(&key))
+        .collect()
 }
 
 /// Upload the monolithic build manifest and, when a namespace is given and a
@@ -5535,20 +5596,6 @@ async fn upload_shards(
     }
 
     Ok(uploaded)
-}
-
-/// Default manifest key: host target triple at runtime.
-pub(crate) fn default_manifest_key() -> String {
-    default_manifest_key_for(std::env::consts::ARCH, std::env::consts::OS)
-}
-
-fn default_manifest_key_for(arch: &str, os: &str) -> String {
-    match os {
-        "linux" => format!("{arch}-unknown-linux-gnu"),
-        "macos" => format!("{arch}-apple-darwin"),
-        "windows" => format!("{arch}-pc-windows-msvc"),
-        _ => format!("{arch}-unknown-{os}"),
-    }
 }
 
 /// Build a workspace crate name filter from Cargo.toml metadata.
@@ -7615,40 +7662,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_manifest_key_matches_host_triple_shape() {
-        let key = default_manifest_key();
-        assert!(key.starts_with(std::env::consts::ARCH), "got {key}");
-        let expected_vendor_os = match std::env::consts::OS {
-            "linux" => "-unknown-linux-gnu",
-            "macos" => "-apple-darwin",
-            "windows" => "-pc-windows-msvc",
-            other => return assert!(key.contains(other)),
-        };
-        assert!(key.ends_with(expected_vendor_os), "got {key}");
-    }
-
-    #[test]
-    fn test_default_manifest_key_for_all_os_arms() {
-        // OS mapper -> linux, macOS, Windows, and fallback triples.
-        assert_eq!(
-            default_manifest_key_for("x86_64", "linux"),
-            "x86_64-unknown-linux-gnu"
-        );
-        assert_eq!(
-            default_manifest_key_for("aarch64", "macos"),
-            "aarch64-apple-darwin"
-        );
-        assert_eq!(
-            default_manifest_key_for("x86_64", "windows"),
-            "x86_64-pc-windows-msvc"
-        );
-        assert_eq!(
-            default_manifest_key_for("riscv64", "freebsd"),
-            "riscv64-unknown-freebsd"
-        );
-    }
-
-    #[test]
     fn test_get_workspace_crate_names_lists_members() {
         // A two-member workspace; `cargo metadata --no-deps` should report both.
         let dir = tempfile::tempdir().unwrap();
@@ -9202,6 +9215,25 @@ mod tests {
     }
 
     #[test]
+    fn automatic_manifest_save_without_remote_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+        let err = save_manifest_auto_for_session(&config, "key", "session")
+            .expect_err("no remote -> error");
+        assert!(
+            err.to_string().contains("No remote configured"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn only_the_primary_manifest_key_publishes_shards() {
+        assert_eq!(shard_namespace_for_publish_key(0, Some("ns")), Some("ns"));
+        assert_eq!(shard_namespace_for_publish_key(1, Some("ns")), None);
+        assert_eq!(shard_namespace_for_publish_key(0, None), None);
+    }
+
+    #[test]
     fn save_manifest_with_no_events_returns_ok_before_touching_remote() {
         // A remote is configured, but the event log is empty, so save_manifest
         // returns Ok early ("No build events found") without creating a remote
@@ -9304,7 +9336,7 @@ mod tests {
             build_event("skip", EventResult::Skipped, 5, 0, 0, "k-s"),
         ];
 
-        let mut entries = manifest_entries_from_events(&events);
+        let mut entries = manifest_entries_from_events(&events, None);
         entries.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
 
         assert_eq!(entries.len(), 2, "only the two cacheable keys survive");
@@ -9314,11 +9346,39 @@ mod tests {
     }
 
     #[test]
+    fn manifest_entry_ties_keep_the_first_observation() {
+        use crate::events::EventResult;
+        let events = vec![
+            build_event("first", EventResult::Miss, 100, 0, 10, "same-key"),
+            build_event("second", EventResult::Miss, 100, 0, 20, "same-key"),
+        ];
+
+        let entries = manifest_entries_from_events(&events, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].crate_name, "first");
+        assert_eq!(entries[0].artifact_size, 10);
+    }
+
+    #[test]
+    fn automatic_manifest_entries_are_scoped_to_the_build_session() {
+        use crate::events::EventResult;
+        let mut current = build_event("current", EventResult::Miss, 100, 0, 10, "current-key");
+        current.session_id = "current-session".into();
+        let mut other = build_event("other", EventResult::Miss, 200, 0, 20, "other-key");
+        other.session_id = "other-session".into();
+
+        let entries = manifest_entries_from_events(&[other, current], Some("current-session"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].crate_name, "current");
+        assert_eq!(entries[0].cache_key, "current-key");
+    }
+
+    #[test]
     fn manifest_entries_from_events_falls_back_to_elapsed_when_no_compile_time() {
         use crate::events::EventResult;
         // compile_time_ms == 0 -> the entry's compile_time_ms uses elapsed_ms.
         let events = vec![build_event("x", EventResult::Miss, 0, 77, 1, "k")];
-        let entries = manifest_entries_from_events(&events);
+        let entries = manifest_entries_from_events(&events, None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].compile_time_ms, 77);
     }
@@ -9340,7 +9400,7 @@ mod tests {
             build_event("error", EventResult::Error, 99, 99, 99, "k-error"),
         ];
 
-        let mut entries = manifest_entries_from_events(&events);
+        let mut entries = manifest_entries_from_events(&events, None);
         entries.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].crate_name, "prefetch");

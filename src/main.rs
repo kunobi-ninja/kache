@@ -18,6 +18,7 @@ mod eviction;
 mod extra_inputs;
 mod fallback_planner;
 mod heartbeat;
+mod identity;
 mod incremental_policy;
 mod link;
 mod machine;
@@ -245,7 +246,7 @@ enum Commands {
 
     /// Save a build manifest for future prefetch warming
     SaveManifest {
-        /// Override manifest key (default: host target triple)
+        /// Override manifest key (default: identity key plus host triple)
         #[arg(long)]
         manifest_key: Option<String>,
         /// Shard namespace: target/rustc_hash/profile. If set and Cargo.lock exists,

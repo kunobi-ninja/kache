@@ -65,6 +65,10 @@ C/C++ caching is separate. Kache must be invoked as the compiler wrapper (`kache
 
 ## Planner
 
-Without a planner service, the daemon can prefetch from manifests, Cargo metadata, remote indexes, and local history. With `cache.planner.endpoint` or `KACHE_PLANNER_ENDPOINT`, it first asks the preview planner for ranked candidates. A fallback response returns the client to its local planning path.
+Without a planner service, the daemon prefetches from a ranked list: the identity
+manifest for this lockfile + target + profile, then lockfile shards, then local
+history, then crate-name guesses. With `cache.planner.endpoint` or
+`KACHE_PLANNER_ENDPOINT`, it first asks the preview planner for ranked
+candidates. A fallback response returns the client to its local planning path.
 
 The planner does not affect local correctness or exact-key lookup. See [Remote service](/docs/remote-service).

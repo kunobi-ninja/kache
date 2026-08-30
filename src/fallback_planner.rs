@@ -25,6 +25,7 @@ pub async fn build_prefetch_plan(
     if should_report_composition(&composition) {
         tracing::info!(
             candidates = plan.candidates.len(),
+            from_identity = composition.from_identity,
             from_shards = composition.from_shards,
             from_history = composition.from_history,
             from_key_cache = composition.from_key_cache,
@@ -51,6 +52,20 @@ fn should_report_composition(composition: &kache_core::PlanComposition) -> bool 
 
 struct LocalPlannerSource<'a> {
     daemon: &'a Arc<Daemon>,
+}
+
+fn manifest_entry_candidate(
+    entry: crate::remote::ManifestEntry,
+    index: usize,
+) -> PrefetchCandidate {
+    PrefetchCandidate {
+        cache_key: entry.cache_key,
+        crate_name: entry.crate_name,
+        compile_time_ms: (entry.compile_time_ms > 0).then_some(entry.compile_time_ms),
+        size_bytes: (entry.artifact_size > 0).then_some(entry.artifact_size),
+        source: kache_core::CandidateSource::Manifest,
+        demand_index: u32::try_from(index).ok(),
+    }
 }
 
 #[async_trait]
@@ -140,11 +155,67 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
         }
         Ok(keys)
     }
+
+    async fn identity_candidates(&self, identity_key: &str) -> Result<Vec<PrefetchCandidate>> {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for key in crate::identity::manifest_lookup_keys(Some(identity_key)) {
+            match self.daemon.download_planner_manifest(&key).await {
+                Ok(Some(manifest)) => {
+                    tracing::info!(
+                        "fallback planner: identity manifest '{key}' has {} entries",
+                        manifest.entries.len()
+                    );
+                    for (index, entry) in manifest.entries.into_iter().enumerate() {
+                        if seen.insert(entry.cache_key.clone()) {
+                            candidates.push(manifest_entry_candidate(entry, index));
+                        }
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!("fallback planner: identity manifest '{key}': {e}"),
+            }
+        }
+        Ok(candidates)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_entry_zero_measurements_remain_unknown() {
+        let candidate = manifest_entry_candidate(
+            crate::remote::ManifestEntry {
+                cache_key: "key".into(),
+                crate_name: "crate".into(),
+                compile_time_ms: 0,
+                artifact_size: 0,
+            },
+            7,
+        );
+        assert_eq!(candidate.compile_time_ms, None);
+        assert_eq!(candidate.size_bytes, None);
+        assert_eq!(candidate.demand_index, Some(7));
+    }
+
+    #[test]
+    fn manifest_entry_positive_measurements_are_preserved() {
+        let candidate = manifest_entry_candidate(
+            crate::remote::ManifestEntry {
+                cache_key: "key".into(),
+                crate_name: "crate".into(),
+                compile_time_ms: 12,
+                artifact_size: 34,
+            },
+            0,
+        );
+        assert_eq!(candidate.compile_time_ms, Some(12));
+        assert_eq!(candidate.size_bytes, Some(34));
+        assert_eq!(candidate.demand_index, Some(0));
+    }
 
     /// Composition is reported only when a cap actually dropped something
     /// (#616): always logging would drown the interesting case, never logging
@@ -175,6 +246,33 @@ mod tests {
         DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS,
     };
     use crate::store::Store;
+
+    struct EnvRestore {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn set_env(key: &'static str, value: Option<&str>) -> EnvRestore {
+        let previous = std::env::var_os(key);
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        EnvRestore { key, previous }
+    }
 
     fn test_config(
         cache_dir: std::path::PathBuf,
@@ -288,6 +386,42 @@ mod tests {
             err.to_string().contains("no remote configured"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn identity_candidates_return_entries_from_the_first_manifest() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key = set_env("KACHE_MANIFEST_KEY", None);
+        let dir = tempfile::tempdir().unwrap();
+        let remote = crate::config::RemoteConfig::test_s3("bucket", "prefix");
+        let config = test_config(dir.path().join("cache"), Some(remote));
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(crate::remote_backend::memory_backend());
+        let manifest = crate::remote::BuildManifest {
+            version: 3,
+            created: "2026-08-30T00:00:00Z".into(),
+            manifest_key: "id/test".into(),
+            entries: vec![crate::remote::ManifestEntry {
+                cache_key: "cache-key".into(),
+                crate_name: "serde".into(),
+                compile_time_ms: 1200,
+                artifact_size: 4096,
+            }],
+        };
+        crate::remote::upload_manifest(backend.as_ref(), "prefix", "id/test", &manifest)
+            .await
+            .unwrap();
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend);
+        let source = LocalPlannerSource { daemon: &daemon };
+
+        let candidates = source.identity_candidates("id/test").await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].cache_key, "cache-key");
+        assert_eq!(candidates[0].crate_name, "serde");
+        assert_eq!(candidates[0].compile_time_ms, Some(1200));
+        assert_eq!(candidates[0].size_bytes, Some(4096));
     }
 
     #[tokio::test]

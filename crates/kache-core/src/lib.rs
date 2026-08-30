@@ -15,6 +15,10 @@ pub struct BuildIntent {
     pub namespace: Option<String>,
     #[serde(default)]
     pub cargo_lock_deps: Vec<(String, String)>,
+    /// Rank-0 prefetch key: lock digest + target + profile. Absent on older
+    /// clients and when no lockfile was visible at session start.
+    #[serde(default)]
+    pub identity_key: Option<String>,
 }
 
 /// Which source produced a candidate, i.e. how much to trust it
@@ -27,6 +31,8 @@ pub struct BuildIntent {
 #[cfg_attr(kani, derive(kani::Arbitrary))]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateSource {
+    /// Recorded action list for this lockfile + target + profile.
+    Manifest,
     /// Exact lockfile-shard match: this build's dependency set produced it.
     Shard,
     /// This machine built this crate before.
@@ -44,10 +50,11 @@ impl CandidateSource {
     /// probabilities and must not be presented as any.
     pub fn confidence_rank(self) -> u8 {
         match self {
-            CandidateSource::Shard => 0,
-            CandidateSource::History => 1,
-            CandidateSource::KeyCache => 2,
-            CandidateSource::Unknown => 3,
+            CandidateSource::Manifest => 0,
+            CandidateSource::Shard => 1,
+            CandidateSource::History => 2,
+            CandidateSource::KeyCache => 3,
+            CandidateSource::Unknown => 4,
         }
     }
 }
@@ -146,12 +153,13 @@ impl Default for PlanLimits {
 
 /// Urgency bucket width, in dependency-order positions (#617).
 ///
-/// Demand order is bucketed rather than used exactly because it comes from a
-/// guppy graph traversal, which only approximates when cargo will actually ask
-/// (cargo reorders for parallelism, build scripts, proc macros, features).
-/// Treating position 40 and 45 as meaningfully different is false precision;
-/// 40 versus 400 is real. Roughly the prefetch concurrency, so one window is
-/// about one wave of downloads.
+/// Demand order is bucketed rather than used exactly because crate-name order
+/// from a lockfile (or a previous graph walk) only approximates when cargo
+/// will actually ask (cargo reorders for parallelism, build scripts, proc
+/// macros, features). Treating position 40 and 45 as meaningfully different
+/// is false precision; 40 versus 400 is real. Roughly the prefetch
+/// concurrency, so one window is about one wave of downloads. Identity
+/// manifests stamp demand_index from last-compile order when they have it.
 #[cfg(feature = "planning")]
 const URGENCY_BUCKET: u32 = 16;
 
@@ -213,6 +221,7 @@ fn cap_to(items: &mut Vec<PrefetchCandidate>, limit: usize) -> usize {
 /// had nothing more to offer (#616).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlanComposition {
+    pub from_identity: usize,
     pub from_shards: usize,
     pub from_history: usize,
     pub from_key_cache: usize,
@@ -242,6 +251,10 @@ pub trait PlannerDataSource {
     async fn history_candidates(&self, crate_names: &[String]) -> Result<Vec<PrefetchCandidate>>;
 
     async fn key_cache_keys_for_crate(&self, crate_name: &str) -> Result<Vec<String>>;
+
+    /// Rank-0: recorded actions for this lock+target+profile. A miss is
+    /// `Ok(vec![])`, not fatal — shards and history still run.
+    async fn identity_candidates(&self, identity_key: &str) -> Result<Vec<PrefetchCandidate>>;
 }
 
 #[cfg(feature = "planning")]
@@ -278,12 +291,40 @@ where
     let mut composition = PlanComposition::default();
 
     // Sources are merged in descending order of confidence, each one filling
-    // only the crates the ones before it left unresolved. Shard lookups used
-    // to RETURN as soon as they produced anything (kunobi-ninja/kache#614),
-    // but a shard hit is exact per bucket: one dependency bump invalidates one
-    // of `NUM_SHARDS` buckets while the rest still match, so a single matching
-    // shard was enough to short-circuit history and key-cache recovery for
-    // every crate in every bucket that missed.
+    // only the crates the ones before it left unresolved.
+    if let Some(identity_key) = intent
+        .identity_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        match source.identity_candidates(identity_key).await {
+            Ok(identity_candidates) => {
+                for (index, candidate) in identity_candidates.into_iter().enumerate() {
+                    resolved_crates.insert(candidate.crate_name.clone());
+                    if seen.insert(candidate.cache_key.clone()) {
+                        let mut candidate = candidate.with_source(CandidateSource::Manifest);
+                        if candidate.demand_index.is_none() {
+                            candidate.demand_index = u32::try_from(index).ok();
+                        }
+                        candidates.push(candidate);
+                    }
+                }
+                composition.from_identity = candidates.len();
+            }
+            Err(_) => {
+                // Not fatal: shards and history still run.
+            }
+        }
+    }
+    let identity_resolved = resolved_crates.clone();
+
+    // Shard lookups used to RETURN as soon as they produced anything
+    // (kunobi-ninja/kache#614), but a shard hit is exact per bucket: one
+    // dependency bump invalidates one of `NUM_SHARDS` buckets while the rest
+    // still match, so a single matching shard was enough to short-circuit
+    // history and key-cache recovery for every crate in every bucket that
+    // missed.
     if let Some(namespace) = intent.namespace.as_deref()
         && !intent.cargo_lock_deps.is_empty()
     {
@@ -293,8 +334,12 @@ where
             .await
         {
             for candidate in order_candidates_by_crate_order(shard_candidates, intent) {
+                if identity_resolved.contains(&candidate.crate_name) {
+                    continue;
+                }
                 resolved_crates.insert(candidate.crate_name.clone());
                 if seen.insert(candidate.cache_key.clone()) {
+                    composition.from_shards += 1;
                     candidates.push(candidate.with_source(CandidateSource::Shard));
                 }
             }
@@ -308,8 +353,6 @@ where
             .cloned()
             .collect()
     };
-
-    composition.from_shards = candidates.len();
 
     let history_query = unresolved(&resolved_crates);
     if !history_query.is_empty() {
@@ -387,8 +430,11 @@ where
 
     // Stamp demand position so the daemon can rank without the intent: it only
     // receives the plan, and `PrefetchRequest::from_plan` drops everything else.
+    // Identity manifests already carry last-compile order; leave those alone.
     for candidate in &mut candidates {
-        candidate.demand_index = demand_index.get(&candidate.crate_name).copied();
+        if candidate.demand_index.is_none() {
+            candidate.demand_index = demand_index.get(&candidate.crate_name).copied();
+        }
     }
 
     // Dispatch order (#617). Stable, so equal keys keep the confidence-merge
@@ -589,6 +635,7 @@ mod tests {
     #[cfg(feature = "planning")]
     #[derive(Default)]
     struct FakePlannerDataSource {
+        identity_candidates: Vec<PrefetchCandidate>,
         shard_candidates: Vec<PrefetchCandidate>,
         shard_error: bool,
         history_candidates: Vec<PrefetchCandidate>,
@@ -632,6 +679,10 @@ mod tests {
         async fn key_cache_keys_for_crate(&self, crate_name: &str) -> Result<Vec<String>> {
             Ok(self.key_cache.get(crate_name).cloned().unwrap_or_default())
         }
+
+        async fn identity_candidates(&self, _identity_key: &str) -> Result<Vec<PrefetchCandidate>> {
+            Ok(self.identity_candidates.clone())
+        }
     }
 
     #[test]
@@ -640,6 +691,7 @@ mod tests {
             crate_names: vec!["serde".into(), "tokio".into()],
             namespace: Some("x86_64/hash/release".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+            identity_key: None,
         };
 
         let json = serde_json::to_string(&intent).unwrap();
@@ -653,6 +705,7 @@ mod tests {
         assert_eq!(parsed.crate_names, vec!["serde"]);
         assert!(parsed.namespace.is_none());
         assert!(parsed.cargo_lock_deps.is_empty());
+        assert!(parsed.identity_key.is_none());
     }
 
     #[test]
@@ -703,16 +756,47 @@ mod tests {
             crate_names: vec!["serde".into()],
             namespace: Some("linux/hash/release".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+            identity_key: None,
+        };
+
+        let (plan, composition) =
+            build_prefetch_plan_with_limits(&source, &intent, "fallback", PlanLimits::default())
+                .await
+                .unwrap();
+
+        assert_eq!(plan.disposition, PrefetchDisposition::Execute);
+        assert_eq!(plan.planner.as_deref(), Some("fallback"));
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].cache_key, "from-shard");
+        assert_eq!(composition.from_shards, 1);
+    }
+
+    #[cfg(feature = "planning")]
+    #[tokio::test]
+    async fn test_build_prefetch_plan_prefers_identity_manifest_over_shards() {
+        let source = FakePlannerDataSource {
+            identity_candidates: vec![PrefetchCandidate::new(
+                "from-identity".into(),
+                "serde".into(),
+            )],
+            shard_candidates: vec![PrefetchCandidate::new("from-shard".into(), "serde".into())],
+            ..Default::default()
+        };
+        let intent = BuildIntent {
+            crate_names: vec!["serde".into()],
+            namespace: Some("linux/hash/release".into()),
+            cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+            identity_key: Some("id/abcd/x86_64-unknown-linux-gnu/release".into()),
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
             .await
             .unwrap();
 
-        assert_eq!(plan.disposition, PrefetchDisposition::Execute);
-        assert_eq!(plan.planner.as_deref(), Some("fallback"));
         assert_eq!(plan.candidates.len(), 1);
-        assert_eq!(plan.candidates[0].cache_key, "from-shard");
+        assert_eq!(plan.candidates[0].cache_key, "from-identity");
+        assert_eq!(plan.candidates[0].source, CandidateSource::Manifest);
+        assert_eq!(plan.candidates[0].demand_index, Some(0));
     }
 
     #[cfg(feature = "planning")]
@@ -732,6 +816,7 @@ mod tests {
             crate_names: vec!["serde".into(), "tokio".into()],
             namespace: Some("linux/hash/debug".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+            identity_key: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
@@ -759,6 +844,7 @@ mod tests {
             crate_names: vec!["dep".into(), "middle".into(), "app".into()],
             namespace: Some("linux/hash/debug".into()),
             cargo_lock_deps: vec![("dep".into(), "1.0.0".into())],
+            identity_key: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
@@ -798,6 +884,7 @@ mod tests {
             crate_names: vec!["dep".into(), "middle".into(), "app".into()],
             namespace: Some("linux/hash/debug".into()),
             cargo_lock_deps: vec![("dep".into(), "1.0.0".into())],
+            identity_key: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
@@ -838,6 +925,7 @@ mod tests {
             crate_names: vec!["serde".into()],
             namespace: Some("linux/hash/debug".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+            identity_key: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
@@ -867,6 +955,7 @@ mod tests {
             crate_names: vec!["dep".into(), "middle".into(), "app".into()],
             namespace: None,
             cargo_lock_deps: vec![],
+            identity_key: None,
         };
 
         let plan = build_prefetch_plan(&source, &intent, "fallback")
@@ -981,6 +1070,9 @@ mod tests {
     #[test]
     fn test_confidence_rank_orders_sources() {
         assert!(
+            CandidateSource::Manifest.confidence_rank() < CandidateSource::Shard.confidence_rank()
+        );
+        assert!(
             CandidateSource::Shard.confidence_rank() < CandidateSource::History.confidence_rank()
         );
         assert!(
@@ -1037,8 +1129,9 @@ mod tests {
         );
     }
 
-    /// Positions inside one bucket are treated as equally urgent: guppy order
-    /// only approximates demand time, so finer distinctions are false precision.
+    /// Positions inside one bucket are treated as equally urgent: lockfile
+    /// order only approximates demand time, so finer distinctions are false
+    /// precision.
     #[cfg(feature = "planning")]
     #[test]
     fn test_dispatch_order_buckets_nearby_positions_together() {

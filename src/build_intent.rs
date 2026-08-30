@@ -1,18 +1,28 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::args::RustcArgs;
-use guppy::graph::{DependencyDirection, PackageGraph};
+use crate::identity;
 use kache_core::BuildIntent;
 
-struct MetadataDiscovery {
+struct WorkspaceDiscovery {
     crate_names: Vec<String>,
     workspace_root: Option<PathBuf>,
+    lock_path: Option<PathBuf>,
 }
 
 pub fn discover(args: Option<&RustcArgs>) -> Option<BuildIntent> {
-    let metadata = discover_metadata(args)?;
-    let crate_names = metadata.crate_names;
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let cwd = std::env::current_dir().ok();
+    discover_with_context(args, manifest_dir.as_deref(), cwd.as_deref())
+}
+
+fn discover_with_context(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Option<BuildIntent> {
+    let discovery = discover_workspace(args, manifest_dir, cwd)?;
+    let crate_names = discovery.crate_names;
     if crate_names.is_empty() {
         return None;
     }
@@ -22,20 +32,31 @@ pub fn discover(args: Option<&RustcArgs>) -> Option<BuildIntent> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    let lock_path = metadata
-        .workspace_root
-        .as_deref()
-        .map(|root| root.join("Cargo.lock"))
-        .unwrap_or_else(|| PathBuf::from("Cargo.lock"));
+    let lock_path = discovery.lock_path.clone().unwrap_or_else(|| {
+        discovery
+            .workspace_root
+            .as_deref()
+            .map(|root| root.join("Cargo.lock"))
+            .unwrap_or_else(|| PathBuf::from("Cargo.lock"))
+    });
     let cargo_lock_deps = namespace
         .as_ref()
         .and_then(|_| load_cargo_lock_deps(&lock_path))
         .unwrap_or_default();
 
+    let identity_key = args.and_then(|args| {
+        identity::identity_key(
+            &lock_path,
+            &identity::target_from_rustc_args(args),
+            &identity::profile_from_rustc_args(args),
+        )
+    });
+
     Some(BuildIntent {
         crate_names,
         namespace,
         cargo_lock_deps,
+        identity_key,
     })
 }
 
@@ -64,8 +85,23 @@ fn load_cargo_lock_deps(lock_path: &Path) -> Option<Vec<(String, String)>> {
         .ok()
 }
 
-fn discover_metadata(args: Option<&RustcArgs>) -> Option<MetadataDiscovery> {
-    for manifest_path in candidate_manifest_paths(args) {
+fn discover_workspace(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Option<WorkspaceDiscovery> {
+    let lock_path = find_lock_path(args, manifest_dir, cwd);
+    if let Some(lock_path) = lock_path.as_ref() {
+        let crate_names = crate_names_from_lock(lock_path)?;
+        let workspace_root = lock_path.parent().map(Path::to_path_buf);
+        return Some(WorkspaceDiscovery {
+            crate_names,
+            workspace_root,
+            lock_path: Some(lock_path.clone()),
+        });
+    }
+
+    for manifest_path in candidate_manifest_paths(args, manifest_dir, cwd) {
         if let Some(discovery) = run_cargo_metadata(Some(&manifest_path)) {
             return Some(discovery);
         }
@@ -74,39 +110,78 @@ fn discover_metadata(args: Option<&RustcArgs>) -> Option<MetadataDiscovery> {
     run_cargo_metadata(None)
 }
 
-fn candidate_manifest_paths(args: Option<&RustcArgs>) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Some(out_dir) = args.and_then(|a| a.out_dir.as_deref())
-        && let Some(path) = manifest_from_target_out_dir(out_dir)
-        && path.is_file()
-    {
-        candidates.push(path);
-    }
-
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let path = PathBuf::from(manifest_dir).join("Cargo.toml");
-        if path.is_file() && !candidates.iter().any(|existing| existing == &path) {
-            candidates.push(path);
+fn crate_names_from_lock(lock_path: &Path) -> Option<Vec<String>> {
+    let deps = load_cargo_lock_deps(lock_path)?;
+    let mut names = Vec::new();
+    for (name, _) in deps {
+        if !names.contains(&name) {
+            names.push(name);
         }
     }
-
-    candidates
+    if names.is_empty() { None } else { Some(names) }
 }
 
-fn manifest_from_target_out_dir(out_dir: &Path) -> Option<PathBuf> {
-    for ancestor in out_dir.ancestors() {
-        if ancestor.file_name().and_then(|name| name.to_str()) == Some("target") {
-            return ancestor.parent().map(|root| root.join("Cargo.toml"));
+fn find_lock_path(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    for start in candidate_roots(args, manifest_dir, cwd) {
+        for ancestor in start.ancestors() {
+            let lock = ancestor.join("Cargo.lock");
+            if lock.is_file() {
+                return Some(lock);
+            }
         }
     }
     None
 }
 
-fn run_cargo_metadata(manifest_path: Option<&Path>) -> Option<MetadataDiscovery> {
+fn candidate_roots(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let (Some(args), Some(cwd)) = (args, cwd)
+        && let Some(root) = args.verified_workspace_root(cwd)
+    {
+        push_unique(&mut roots, root);
+    }
+    if let Some(manifest_dir) = manifest_dir {
+        push_unique(&mut roots, manifest_dir.to_path_buf());
+    }
+    if let Some(cwd) = cwd {
+        push_unique(&mut roots, cwd.to_path_buf());
+    }
+    roots
+}
+
+fn push_unique(roots: &mut Vec<PathBuf>, path: PathBuf) {
+    if !roots.iter().any(|existing| existing == &path) {
+        roots.push(path);
+    }
+}
+
+fn candidate_manifest_paths(
+    args: Option<&RustcArgs>,
+    manifest_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for root in candidate_roots(args, manifest_dir, cwd) {
+        let path = root.join("Cargo.toml");
+        if path.is_file() && !candidates.iter().any(|existing| existing == &path) {
+            candidates.push(path);
+        }
+    }
+    candidates
+}
+
+fn run_cargo_metadata(manifest_path: Option<&Path>) -> Option<WorkspaceDiscovery> {
     let mut command = std::process::Command::new("cargo");
     command
-        .args(["metadata", "--format-version", "1"])
+        .args(["metadata", "--format-version", "1", "--no-deps"])
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .stdout(std::process::Stdio::piped())
@@ -122,196 +197,56 @@ fn run_cargo_metadata(manifest_path: Option<&Path>) -> Option<MetadataDiscovery>
         return None;
     }
 
-    parse_metadata_graph(&output.stdout, manifest_path)
+    parse_metadata_packages(&output.stdout)
 }
 
-fn parse_metadata_graph(
-    metadata_json: &[u8],
-    manifest_path: Option<&Path>,
-) -> Option<MetadataDiscovery> {
-    let graph = PackageGraph::from_json(std::str::from_utf8(metadata_json).ok()?).ok()?;
-    let crate_names = graph_crate_order(&graph, manifest_path)?;
-    let workspace_root = Some(graph.workspace().root().as_std_path().to_path_buf());
-
-    Some(MetadataDiscovery {
+fn parse_metadata_packages(metadata_json: &[u8]) -> Option<WorkspaceDiscovery> {
+    let metadata: serde_json::Value = serde_json::from_slice(metadata_json).ok()?;
+    let workspace_root = metadata
+        .get("workspace_root")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let crate_names = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .map(|packages| {
+            let mut names = Vec::new();
+            for package in packages {
+                if let Some(name) = package.get("name").and_then(serde_json::Value::as_str)
+                    && !names.iter().any(|existing| existing == name)
+                {
+                    names.push(name.to_string());
+                }
+            }
+            names
+        })
+        .unwrap_or_default();
+    if crate_names.is_empty() {
+        return None;
+    }
+    let lock_path = workspace_root.as_ref().map(|root| root.join("Cargo.lock"));
+    Some(WorkspaceDiscovery {
         crate_names,
         workspace_root,
+        lock_path,
     })
-}
-
-fn graph_crate_order(graph: &PackageGraph, manifest_path: Option<&Path>) -> Option<Vec<String>> {
-    let package_ids = if let Some(manifest_path) = manifest_path
-        && let Some(package) = graph
-            .packages()
-            .find(|package| paths_match(package.manifest_path().as_std_path(), manifest_path))
-    {
-        vec![package.id().clone()]
-    } else {
-        graph
-            .workspace()
-            .iter()
-            .map(|package| package.id().clone())
-            .collect::<Vec<_>>()
-    };
-
-    let package_set = graph.query_forward(package_ids.iter()).ok()?.resolve();
-    let mut seen = HashSet::new();
-    let mut ordered = Vec::new();
-
-    for package in package_set.packages(DependencyDirection::Reverse) {
-        let name = package.name().to_string();
-        if seen.insert(name.clone()) {
-            ordered.push(name);
-        }
-    }
-
-    Some(ordered)
-}
-
-fn paths_match(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-
-    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_run_cargo_metadata_uses_guppy_graph_and_workspace_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-
-        std::fs::write(
-            root.join("Cargo.toml"),
-            r#"[workspace]
-members = ["app", "dep", "unrelated"]
-resolver = "2"
-"#,
-        )
-        .unwrap();
-
-        std::fs::create_dir_all(root.join("app/src")).unwrap();
-        std::fs::write(
-            root.join("app/Cargo.toml"),
-            r#"[package]
-name = "app"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-dep = { path = "../dep" }
-"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("app/src/lib.rs"), "").unwrap();
-
-        std::fs::create_dir_all(root.join("dep/src")).unwrap();
-        std::fs::write(
-            root.join("dep/Cargo.toml"),
-            r#"[package]
-name = "dep"
-version = "0.1.0"
-edition = "2021"
-"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("dep/src/lib.rs"), "").unwrap();
-
-        std::fs::create_dir_all(root.join("unrelated/src")).unwrap();
-        std::fs::write(
-            root.join("unrelated/Cargo.toml"),
-            r#"[package]
-name = "unrelated"
-version = "0.1.0"
-edition = "2021"
-"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("unrelated/src/lib.rs"), "").unwrap();
-
-        let discovery = run_cargo_metadata(Some(&root.join("app/Cargo.toml"))).unwrap();
-        assert_eq!(discovery.crate_names, vec!["dep", "app"]);
-        assert_eq!(discovery.workspace_root.as_deref(), Some(root));
+    fn write_lock(root: &Path, packages: &[(&str, &str)]) {
+        let mut body = String::from("version = 3\n");
+        for (name, version) in packages {
+            body.push_str(&format!(
+                "\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n"
+            ));
+        }
+        std::fs::write(root.join("Cargo.lock"), body).unwrap();
     }
 
-    #[test]
-    fn test_manifest_from_target_out_dir_uses_target_parent() {
-        let manifest = manifest_from_target_out_dir(Path::new(
-            "/repo/apps/tauri/src-tauri/target/release/deps",
-        ))
-        .unwrap();
-
-        assert_eq!(manifest, Path::new("/repo/apps/tauri/src-tauri/Cargo.toml"));
-    }
-
-    #[test]
-    fn test_manifest_from_target_out_dir_without_target_is_none() {
-        // No `target` component in the path -> nothing to anchor on.
-        assert!(manifest_from_target_out_dir(Path::new("/repo/src/deps")).is_none());
-    }
-
-    #[test]
-    fn test_manifest_from_target_out_dir_picks_nearest_target() {
-        // `ancestors()` walks from the leaf upward, so the *deepest* `target`
-        // wins when the path is nested (e.g. a workspace target inside a repo
-        // that itself sits under another `target`).
-        let manifest =
-            manifest_from_target_out_dir(Path::new("/work/target/x/inner/target/release/deps"))
-                .unwrap();
-        assert_eq!(manifest, Path::new("/work/target/x/inner/Cargo.toml"));
-    }
-
-    #[test]
-    fn test_paths_match_identical_paths() {
-        assert!(paths_match(
-            Path::new("/some/where/Cargo.toml"),
-            Path::new("/some/where/Cargo.toml"),
-        ));
-    }
-
-    #[test]
-    fn test_paths_match_distinct_nonexistent_paths_do_not_match() {
-        // Different paths that can't be canonicalized fall through to false.
-        assert!(!paths_match(
-            Path::new("/nonexistent/a/Cargo.toml"),
-            Path::new("/nonexistent/b/Cargo.toml"),
-        ));
-    }
-
-    // Unix-only: creating a symlink on Windows needs Developer Mode / admin
-    // privileges, which CI runners lack. The canonicalization logic under test
-    // is platform-shared and covered here on Linux/macOS.
-    #[cfg(unix)]
-    #[test]
-    fn test_paths_match_canonicalizes_equivalent_paths() {
-        // A symlink and its target canonicalize to the same real path.
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("Cargo.toml");
-        std::fs::write(&real, "").unwrap();
-        let link = dir.path().join("link.toml");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(paths_match(&link, &real));
-    }
-
-    #[test]
-    fn test_parse_metadata_graph_rejects_invalid_json() {
-        assert!(parse_metadata_graph(b"not json at all", None).is_none());
-    }
-
-    #[test]
-    fn test_parse_metadata_graph_rejects_invalid_utf8() {
-        assert!(parse_metadata_graph(&[0xff, 0xfe, 0x00], None).is_none());
-    }
-
-    /// Build a minimal two-member cargo workspace under a temp dir and return
-    /// its root. `app` depends on `dep`.
+    /// Build a two-member cargo workspace under a temp dir and return its root.
     fn scaffold_workspace() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -339,13 +274,28 @@ edition = "2021"
     }
 
     #[test]
-    fn discover_builds_intent_from_out_dir_args() {
-        // `discover` resolves the manifest from a rustc --out-dir that sits under
-        // a `target/` tree (candidate_manifest_paths -> manifest_from_target_out_dir),
-        // runs cargo metadata, and returns the workspace crate order. Covers
-        // discover + discover_metadata + candidate_manifest_paths end-to-end.
+    fn candidate_manifests_keep_each_distinct_existing_manifest() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let missing = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(second.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        assert_eq!(
+            candidate_manifest_paths(None, Some(first.path()), Some(second.path()),),
+            vec![
+                first.path().join("Cargo.toml"),
+                second.path().join("Cargo.toml")
+            ]
+        );
+        assert!(candidate_manifest_paths(None, Some(missing.path()), None).is_empty());
+    }
+
+    #[test]
+    fn discover_builds_intent_from_lockfile_without_cargo_metadata() {
         let ws = scaffold_workspace();
         let root = ws.path();
+        write_lock(root, &[("app", "0.1.0"), ("dep", "0.1.0")]);
         let out_dir = root.join("target/debug/deps");
         std::fs::create_dir_all(&out_dir).unwrap();
 
@@ -356,25 +306,68 @@ edition = "2021"
         ])
         .unwrap();
 
-        let intent = discover(Some(&args)).expect("discover should resolve the workspace");
-        // dep is a dependency of app, so reverse topo order lists dep before app.
+        let intent = discover_with_context(Some(&args), Some(root), Some(root))
+            .expect("discover should resolve the workspace");
         assert!(intent.crate_names.contains(&"app".to_string()));
         assert!(intent.crate_names.contains(&"dep".to_string()));
-        // No KACHE_NAMESPACE set in the common case -> no namespace, no lock deps.
         assert!(intent.namespace.is_none());
+        let key = intent
+            .identity_key
+            .expect("lockfile yields an identity key");
+        assert!(key.starts_with("id/"), "{key}");
+        assert!(key.ends_with("/debug"), "{key}");
     }
 
     #[test]
-    fn run_cargo_metadata_workspace_manifest_lists_all_members() {
-        // Passing the workspace's *virtual* root manifest (no [package]) means no
-        // single package matches, so graph_crate_order falls to the workspace-iter
-        // branch and returns every member. Covers that else branch.
+    fn discover_entrypoint_never_returns_an_empty_default_intent() {
+        let intent = discover(None).expect("the Kache workspace should be discoverable");
+        assert!(
+            intent.crate_names.iter().any(|name| name == "kache"),
+            "expected the current workspace packages, got {:?}",
+            intent.crate_names
+        );
+    }
+
+    #[test]
+    fn discover_omits_unrelated_workspace_members_absent_from_the_lock() {
         let ws = scaffold_workspace();
-        let discovery = run_cargo_metadata(Some(&ws.path().join("Cargo.toml")))
-            .expect("metadata for workspace");
-        let mut names = discovery.crate_names.clone();
-        names.sort();
-        assert_eq!(names, vec!["app", "dep"]);
+        let root = ws.path();
+        std::fs::create_dir_all(root.join("unrelated/src")).unwrap();
+        std::fs::write(
+            root.join("unrelated/Cargo.toml"),
+            "[package]\nname = \"unrelated\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("unrelated/src/lib.rs"), "").unwrap();
+        write_lock(root, &[("app", "0.1.0"), ("dep", "0.1.0")]);
+
+        let out_dir = root.join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let args = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--out-dir".to_string(),
+            out_dir.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let intent = discover_with_context(Some(&args), Some(root), Some(root)).unwrap();
+        assert!(!intent.crate_names.contains(&"unrelated".to_string()));
+    }
+
+    #[test]
+    fn parse_metadata_packages_reads_workspace_root_and_names() {
+        let json = br#"{
+            "workspace_root": "/ws",
+            "packages": [{"name": "app"}, {"name": "dep"}, {"name": "app"}]
+        }"#;
+        let discovery = parse_metadata_packages(json).unwrap();
+        assert_eq!(discovery.crate_names, vec!["app", "dep"]);
+        assert_eq!(discovery.workspace_root.as_deref(), Some(Path::new("/ws")));
+    }
+
+    #[test]
+    fn parse_metadata_packages_rejects_invalid_json() {
+        assert!(parse_metadata_packages(b"not json at all").is_none());
     }
 
     #[test]
@@ -392,8 +385,98 @@ edition = "2021"
 
     #[test]
     fn load_cargo_lock_deps_returns_none_for_missing_lockfile() {
-        // A missing Cargo.lock surfaces the parse-error -> debug-log -> None arm.
         assert!(load_cargo_lock_deps(Path::new("/nonexistent/Cargo.lock")).is_none());
+    }
+
+    fn rustc_args_for_out_dir(out_dir: &Path) -> RustcArgs {
+        RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--out-dir".to_string(),
+            out_dir.to_string_lossy().into_owned(),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn find_lock_path_walks_from_out_dir_to_the_workspace_lock() {
+        let ws = scaffold_workspace();
+        write_lock(ws.path(), &[("app", "0.1.0")]);
+        let out_dir = ws.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let found = find_lock_path(
+            Some(&rustc_args_for_out_dir(&out_dir)),
+            Some(ws.path()),
+            Some(ws.path()),
+        )
+        .unwrap();
+        assert_eq!(found, ws.path().join("Cargo.lock"));
+    }
+
+    #[test]
+    fn candidate_roots_are_nonempty_and_push_unique_dedupes() {
+        let ws = scaffold_workspace();
+        let out_dir = ws.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let roots = candidate_roots(
+            Some(&rustc_args_for_out_dir(&out_dir)),
+            Some(ws.path()),
+            Some(ws.path()),
+        );
+        assert!(
+            roots.iter().any(|root| root == ws.path()),
+            "expected workspace root in {roots:?}"
+        );
+
+        let mut paths = vec![PathBuf::from("/a")];
+        push_unique(&mut paths, PathBuf::from("/a"));
+        push_unique(&mut paths, PathBuf::from("/b"));
+        assert_eq!(paths, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn external_target_directory_cannot_supply_the_workspace_lock() {
+        let ws = scaffold_workspace();
+        write_lock(ws.path(), &[("app", "0.1.0"), ("dep", "0.1.0")]);
+        let member = ws.path().join("app");
+
+        let external = tempfile::tempdir().unwrap();
+        std::fs::write(external.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        write_lock(external.path(), &[("wrong", "9.9.9")]);
+        let out_dir = external.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let found = find_lock_path(
+            Some(&rustc_args_for_out_dir(&out_dir)),
+            Some(&member),
+            Some(&member),
+        )
+        .unwrap();
+        assert_eq!(found, ws.path().join("Cargo.lock"));
+    }
+
+    #[test]
+    fn cargo_metadata_discovers_a_workspace_without_a_lockfile() {
+        let ws = scaffold_workspace();
+        let discovery = run_cargo_metadata(Some(&ws.path().join("Cargo.toml")))
+            .expect("metadata should resolve the workspace");
+        assert!(discovery.crate_names.contains(&"app".to_string()));
+        assert!(discovery.crate_names.contains(&"dep".to_string()));
+        assert_eq!(discovery.workspace_root.as_deref(), Some(ws.path()));
+    }
+
+    #[test]
+    fn crate_names_from_lock_dedupes_and_rejects_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lock(
+            dir.path(),
+            &[("serde", "1.0.0"), ("serde", "1.0.1"), ("tokio", "1.0.0")],
+        );
+        let names = crate_names_from_lock(&dir.path().join("Cargo.lock")).unwrap();
+        assert_eq!(names, vec!["serde", "tokio"]);
+
+        let empty = tempfile::tempdir().unwrap();
+        write_lock(empty.path(), &[]);
+        assert!(crate_names_from_lock(&empty.path().join("Cargo.lock")).is_none());
     }
 
     #[test]
@@ -402,12 +485,17 @@ edition = "2021"
             crate_names: vec!["serde".into(), "tokio".into()],
             namespace: Some("x86_64/hash/release".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+            identity_key: Some("id/abcd/x86_64-unknown-linux-gnu/release".into()),
         };
 
         let req = into_build_started_request(intent, 42, "sess-test".into());
         assert_eq!(req.intent.crate_names, vec!["serde", "tokio"]);
         assert_eq!(req.intent.namespace.as_deref(), Some("x86_64/hash/release"));
         assert_eq!(req.intent.cargo_lock_deps.len(), 1);
+        assert_eq!(
+            req.intent.identity_key.as_deref(),
+            Some("id/abcd/x86_64-unknown-linux-gnu/release")
+        );
         assert_eq!(req.client_epoch, 42);
     }
 }

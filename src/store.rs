@@ -10340,13 +10340,14 @@ mod tests {
 
         // This test proves publication/removal atomicity, not the production
         // five-second fail-fast policy. A two-core hosted Windows runner can
-        // keep eight WAL writers queued past that timeout, so give these test
-        // connections enough time for every logical operation to commit and
-        // reach the invariant checks below.
+        // keep eight WAL writers queued past that timeout. The full Windows
+        // suite has also exhausted 30 seconds under mutation-runner load, so
+        // give these test connections enough time for every logical operation
+        // to commit and reach the invariant checks below.
         let stores: Vec<_> = (0..THREADS)
             .map(|_| {
                 let store = Store::open(&config).unwrap();
-                store.db.busy_timeout(Duration::from_secs(30)).unwrap();
+                store.db.busy_timeout(Duration::from_secs(60)).unwrap();
                 store
             })
             .collect();

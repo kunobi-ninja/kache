@@ -39,7 +39,8 @@ pub struct BuildEvent {
     /// 12 = per-extern artifact digests (#609),
     /// 13 = store-failure reason (#629),
     /// 14 = compilation-unit identity, own and per-extern (#627),
-    /// 15 = same-key lookup rejection reason (#655).
+    /// 15 = same-key lookup rejection reason (#655),
+    /// 16 = compile-and-compare verify on hits (`verify_compare`).
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -147,6 +148,14 @@ pub struct BuildEvent {
     /// `why-miss` to misdiagnose the event as a cold miss or key mismatch.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lookup_rejection: String,
+    /// Compile-and-compare qualification (`KACHE_VERIFY`) on a cache hit.
+    ///
+    /// Empty when the flag is off. `ok` when the restored artifacts match a
+    /// fresh compile. `path-debug: …` for embedded absolute-path / debug-info
+    /// differences. `content: …` for remaining byte faults. The hit is still
+    /// served (fail-open); this field is the record.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub verify_compare: String,
     /// Whether a configured fallback wrapper handled the passthrough.
     #[serde(default, skip_serializing_if = "is_false")]
     pub fallback: bool,
@@ -1260,6 +1269,7 @@ impl BuildEvent {
             passthrough_reason: String::new(),
             store_error: String::new(),
             lookup_rejection: String::new(),
+            verify_compare: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),
@@ -1333,6 +1343,7 @@ mod tests {
             passthrough_reason: String::new(),
             store_error: String::new(),
             lookup_rejection: String::new(),
+            verify_compare: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),
@@ -1369,6 +1380,24 @@ mod tests {
         value.as_object_mut().unwrap().remove("lookup_rejection");
         let legacy: BuildEvent = serde_json::from_value(value).unwrap();
         assert!(legacy.lookup_rejection.is_empty());
+    }
+
+    #[test]
+    fn verify_compare_round_trips_and_defaults_for_older_events() {
+        let mut event = BuildEvent::new_for_test("foo", EventResult::LocalHit);
+        event.verify_compare = "content: libfoo.rlib (byte mismatch)".to_string();
+
+        let mut value = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            value["verify_compare"],
+            "content: libfoo.rlib (byte mismatch)"
+        );
+        let round_trip: BuildEvent = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip.verify_compare, event.verify_compare);
+
+        value.as_object_mut().unwrap().remove("verify_compare");
+        let legacy: BuildEvent = serde_json::from_value(value).unwrap();
+        assert!(legacy.verify_compare.is_empty());
     }
 
     fn test_heartbeat(crate_name: &str, elapsed_s: u64) -> HeartbeatEvent {

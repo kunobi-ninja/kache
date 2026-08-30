@@ -13,16 +13,51 @@
 //! reliability as a correctness assertion. Wall-clock budgets cannot do
 //! that across the self-hosted / GitHub-hosted runner mix.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 static COMPILER_RUNS: AtomicU32 = AtomicU32::new(0);
 static PREPROCESSOR_RUNS: AtomicU32 = AtomicU32::new(0);
 static PROBE_RUNS: AtomicU32 = AtomicU32::new(0);
 
+thread_local! {
+    static SUSPEND_SPAWN_COUNTS: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static SKIPPED_COMPILER_RUNS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Run `f` without counting compiler/preprocessor/probe spawns toward this
+/// process's event. Compile-and-compare qualification still spawns rustc on
+/// a hit; the hit event must keep `compiler_runs = 0` so warm-cache
+/// assertions stay meaningful.
+pub fn suspend_spawn_counts<T>(f: impl FnOnce() -> T) -> T {
+    SUSPEND_SPAWN_COUNTS.with(|depth| depth.set(depth.get() + 1));
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SUSPEND_SPAWN_COUNTS.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    let _restore = Restore;
+    f()
+}
+
+fn spawn_counts_suspended() -> bool {
+    SUSPEND_SPAWN_COUNTS.with(|depth| depth.get() > 0)
+}
+
 /// Record that kache spawned the underlying compiler — `rustc`, or a
 /// C-family `cc -c` compile. A cache hit must record zero of these; a
 /// miss records one.
 pub fn record_compiler_run() {
+    if spawn_counts_suspended() {
+        #[cfg(test)]
+        SKIPPED_COMPILER_RUNS.with(|count| count.set(count.get() + 1));
+        return;
+    }
     COMPILER_RUNS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -30,6 +65,9 @@ pub fn record_compiler_run() {
 /// done once per C/C++ compile to derive the cache key. Always zero for
 /// rustc, which has no separate preprocess step.
 pub fn record_preprocessor_run() {
+    if spawn_counts_suspended() {
+        return;
+    }
     PREPROCESSOR_RUNS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -48,6 +86,9 @@ pub fn preprocessor_runs() -> u32 {
 /// a build records one of these the first time it sees a compiler and
 /// zero thereafter; a fully warm probe cache records zero.
 pub fn record_probe_run() {
+    if spawn_counts_suspended() {
+        return;
+    }
     PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -184,6 +225,42 @@ mod tests {
         let before = probe_runs();
         record_probe_run();
         assert!(probe_runs() > before);
+    }
+
+    #[test]
+    fn suspend_spawn_counts_skips_compiler_run_on_this_thread() {
+        let skipped_before = SKIPPED_COMPILER_RUNS.with(|count| count.get());
+        assert!(
+            !SUSPEND_SPAWN_COUNTS.with(|depth| depth.get() > 0),
+            "this test thread must start unsuspended"
+        );
+        suspend_spawn_counts(|| {
+            assert!(SUSPEND_SPAWN_COUNTS.with(|depth| depth.get() > 0));
+            record_compiler_run();
+            suspend_spawn_counts(|| {
+                assert!(SUSPEND_SPAWN_COUNTS.with(|depth| depth.get() >= 2));
+            });
+        });
+        assert!(SUSPEND_SPAWN_COUNTS.with(|depth| depth.get() == 0));
+        let skipped = SKIPPED_COMPILER_RUNS.with(|count| count.get());
+        assert_eq!(skipped, skipped_before + 1);
+        record_compiler_run();
+        assert_eq!(
+            SKIPPED_COMPILER_RUNS.with(|count| count.get()),
+            skipped,
+            "an unsuspended compiler run must not count as skipped"
+        );
+    }
+
+    #[test]
+    fn suspend_spawn_counts_restores_after_panic() {
+        let _ = std::panic::catch_unwind(|| {
+            suspend_spawn_counts(|| panic!("qualification compile failed"));
+        });
+        assert!(
+            SUSPEND_SPAWN_COUNTS.with(|depth| depth.get() == 0),
+            "panic inside suspend must not leave spawn counts suppressed"
+        );
     }
 
     #[test]

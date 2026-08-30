@@ -120,6 +120,13 @@ bypass_env = ["SPECIAL_BUILD=1"]
 | `KACHE_PATH_ONLY_ENV_VARS` | `cache.path_only_env_vars` | `[]` | Path locator variables eligible for safe normalization |
 | `KACHE_KEY_ENV_VARS` | `cache.key_env_vars` | `[]` | Environment read by proc macros but not reported by rustc |
 | `KACHE_VERIFY_RESTORES` | none | `off` | Re-hash `sampled` or `always` before restoring |
+| `KACHE_VERIFY` | none | `off` | Recompile each rustc cache hit and compare it to the restored files |
+
+`KACHE_VERIFY` is qualification for cache-key changes. Set it to `1` or `true` to recompile every rustc cache hit into a staging directory and diff those artifacts against the files just restored. Leave it unset (or `0` / `false`) in ordinary builds: each hit pays a full compile. There is no `kache build` command for this.
+
+Path and debug-info bytes that differ only as embedded absolute paths are reported as `path-debug` and do not fail the build. Remaining byte differences are `content`. In both cases the restored files stay in place so the build continues; the wrapper records the class on the hit event as `verify_compare` (and in tracing when logging is on).
+
+`KACHE_VERIFY_RESTORES` still only re-hashes stored blobs before restore. It does not recompile.
 
 Use a key salt when an unobserved toolchain component changes output:
 

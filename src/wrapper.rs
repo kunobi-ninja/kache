@@ -3470,6 +3470,189 @@ fn replay_cached_diagnostics(
     replay_diagnostics(&meta.stdout, &meta.stderr, out, err);
 }
 
+/// When `KACHE_VERIFY` is on, recompile into a staging directory and compare
+/// those artifacts to the files just restored.
+///
+/// Fail-open: never fails the restore, never overwrites restored outputs, and
+/// never prints the qualification rustc's diagnostics onto the hit's
+/// stdout/stderr (cargo fingerprints those streams).
+fn maybe_verify_restored_hit(
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    restored: &[(String, PathBuf)],
+) {
+    if !crate::verify_compare::enabled() {
+        return;
+    }
+    let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    match run_verify_recompile(compiler, args, restored) {
+        Ok(report) => {
+            let summary = report.event_summary();
+            match report.worst() {
+                crate::verify_compare::DivergenceClass::Match => {
+                    tracing::info!(
+                        crate_name,
+                        summary = %summary,
+                        "KACHE_VERIFY: restored artifacts match a fresh compile"
+                    );
+                }
+                crate::verify_compare::DivergenceClass::PathDebug => {
+                    tracing::warn!(
+                        crate_name,
+                        summary = %summary,
+                        "KACHE_VERIFY: path/debug divergence versus a fresh compile"
+                    );
+                }
+                crate::verify_compare::DivergenceClass::Content => {
+                    tracing::error!(
+                        crate_name,
+                        summary = %summary,
+                        "KACHE_VERIFY: content mismatch versus a fresh compile; serving the restored hit"
+                    );
+                }
+            }
+            crate::verify_compare::record_report(summary);
+        }
+        Err(error) => {
+            let summary = format!("recompile-failed: {error:#}");
+            tracing::error!(
+                crate_name,
+                error = %error,
+                "KACHE_VERIFY: recompile failed; serving the restored hit"
+            );
+            crate::verify_compare::record_report(summary);
+        }
+    }
+}
+
+fn run_verify_recompile(
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    restored: &[(String, PathBuf)],
+) -> Result<crate::verify_compare::CompareReport> {
+    let staging = tempfile::Builder::new()
+        .prefix("kache-verify-")
+        .tempdir()
+        .context("creating KACHE_VERIFY staging directory")?;
+    let staged_args = retarget_rustc_args_for_staging(args, staging.path());
+    let result = crate::opcounts::suspend_spawn_counts(|| compiler.execute(&staged_args))
+        .context("running KACHE_VERIFY recompile")?;
+    if result.exit_code != 0 {
+        anyhow::bail!(
+            "rustc exited {}{}",
+            result.exit_code,
+            verify_recompile_stderr_hint(&result.stderr)
+        );
+    }
+    let mut compiled_by_name = std::collections::BTreeMap::new();
+    for artifact in result.artifacts.outputs() {
+        compiled_by_name.insert(artifact.store_name.clone(), artifact.path.clone());
+        if let Some(file_name) = artifact.path.file_name() {
+            compiled_by_name
+                .entry(file_name.to_string_lossy().into_owned())
+                .or_insert_with(|| artifact.path.clone());
+        }
+    }
+    for (name, _) in restored {
+        let staged = staging.path().join(name);
+        if staged.is_file() {
+            compiled_by_name.entry(name.clone()).or_insert(staged);
+        }
+    }
+    Ok(crate::verify_compare::compare_named_artifacts(
+        restored,
+        &compiled_by_name,
+    ))
+}
+
+fn verify_recompile_stderr_hint(stderr: &str) -> String {
+    let line = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('{'))
+        .unwrap_or("");
+    if line.is_empty() {
+        String::new()
+    } else {
+        format!(" ({line})")
+    }
+}
+
+/// Point this invocation's output flags at `staging` without changing the
+/// frozen path-normalization root, so the qualification compile writes a
+/// private tree and does not pre-clean restored artifacts.
+fn retarget_rustc_args_for_staging(args: &RustcArgs, staging: &Path) -> RustcArgs {
+    let mut staged = args.clone();
+    staged.all_args = rewrite_output_argv(&args.all_args, staging);
+    staged.out_dir = args.out_dir.as_ref().map(|_| staging.to_path_buf());
+    if let Some(output) = &args.output {
+        let name = output.file_name().unwrap_or_default();
+        staged.output = Some(staging.join(name));
+    }
+    if let Some(dep) = &args.dep_info_output {
+        let name = dep.file_name().unwrap_or_default();
+        staged.dep_info_output = Some(staging.join(name));
+    }
+    staged
+}
+
+fn rewrite_output_argv(argv: &[String], staging: &Path) -> Vec<String> {
+    let staging_s = staging.display().to_string();
+    let mut out = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        if arg == "--out-dir" {
+            out.push(arg.clone());
+            if i + 1 < argv.len() {
+                out.push(staging_s.clone());
+                i += 2;
+                continue;
+            }
+        } else if arg.starts_with("--out-dir=") {
+            out.push(format!("--out-dir={staging_s}"));
+            i += 1;
+            continue;
+        } else if arg == "-o" {
+            out.push(arg.clone());
+            if let Some(next) = argv.get(i + 1) {
+                let name = Path::new(next).file_name().unwrap_or_default();
+                out.push(staging.join(name).to_string_lossy().into_owned());
+                i += 2;
+                continue;
+            }
+        } else if arg == "--emit" {
+            out.push(arg.clone());
+            if let Some(next) = argv.get(i + 1) {
+                out.push(rewrite_emit_value(next, staging));
+                i += 2;
+                continue;
+            }
+        } else if let Some(value) = arg.strip_prefix("--emit=") {
+            out.push(format!("--emit={}", rewrite_emit_value(value, staging)));
+            i += 1;
+            continue;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    out
+}
+
+fn rewrite_emit_value(value: &str, staging: &Path) -> String {
+    value
+        .split(',')
+        .map(|part| match part.split_once('=') {
+            Some((kind, path)) if !path.is_empty() => {
+                let name = Path::new(path).file_name().unwrap_or_default();
+                format!("{kind}={}", staging.join(name).display())
+            }
+            _ => part.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn restore_from_cache(
     config: &Config,
     compiler: &RustcCompiler,
@@ -3666,6 +3849,7 @@ fn restore_from_cache(
     // Artifacts that came back as verbatim blob copies, each paired with the
     // digest the entry already recorded for it (kunobi-ninja/kache#540).
     let mut exact_restores: Vec<(crate::cache_key::FileFingerprint, &str)> = Vec::new();
+    let mut restored_paths: Vec<(String, PathBuf)> = Vec::with_capacity(meta.files.len());
 
     for cached_file in &meta.files {
         // Defense-in-depth trust-boundary check (kunobi-ninja/kache#211):
@@ -3712,9 +3896,12 @@ fn restore_from_cache(
         if let RestoredBytes::ExactBlobCopy(fingerprint) = restored {
             exact_restores.push((fingerprint, &cached_file.hash));
         }
+        restored_paths.push((cached_file.name.clone(), target_path));
     }
 
     blobs.record_known_file_hashes(&exact_restores);
+
+    maybe_verify_restored_hit(compiler, args, &restored_paths);
 
     Ok(())
 }
@@ -4452,7 +4639,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 15,
+        schema: 16,
         session_id,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
@@ -4478,6 +4665,7 @@ fn log_event_details(
         passthrough_reason,
         store_error,
         lookup_rejection,
+        verify_compare: crate::verify_compare::take_last_report(),
         fallback,
         exit_code,
         key_fields,
@@ -9213,6 +9401,180 @@ exit 0
         .to_string();
 
         assert!(err.contains("no output path"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn retarget_rustc_args_rewrites_out_dir_output_and_emit_paths() {
+        let staging = PathBuf::from("/tmp/kache-verify-stage");
+        let args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--out-dir",
+            "/orig/target/debug/deps",
+            "-o",
+            "/orig/target/debug/deps/libfoo.rlib",
+            "--emit",
+            "dep-info=/orig/target/debug/deps/foo.d,link",
+        ]);
+        let original_root = args.path_normalization_root().map(Path::to_path_buf);
+        let staged = retarget_rustc_args_for_staging(&args, &staging);
+        assert_eq!(staged.out_dir.as_deref(), Some(staging.as_path()));
+        assert_eq!(
+            staged.output.as_deref(),
+            Some(staging.join("libfoo.rlib").as_path())
+        );
+        assert_eq!(
+            staged.dep_info_output.as_deref(),
+            Some(staging.join("foo.d").as_path())
+        );
+        assert_eq!(
+            staged.path_normalization_root(),
+            original_root.as_deref(),
+            "qualification compile must keep the frozen remap root"
+        );
+        assert!(
+            staged
+                .all_args
+                .iter()
+                .any(|arg| arg == staging.to_str().unwrap()),
+            "argv --out-dir value must move to staging: {:?}",
+            staged.all_args
+        );
+        assert!(
+            staged
+                .all_args
+                .iter()
+                .any(|arg| arg.contains("dep-info=") && arg.contains("foo.d")),
+            "explicit dep-info emit path must move to staging: {:?}",
+            staged.all_args
+        );
+        assert!(
+            !staged
+                .all_args
+                .iter()
+                .any(|arg| arg.contains("/orig/target")),
+            "original output paths must not remain in argv: {:?}",
+            staged.all_args
+        );
+    }
+
+    #[test]
+    fn rewrite_output_argv_handles_attached_out_dir_and_emit() {
+        let staging = Path::new("/tmp/stage");
+        let rewritten = rewrite_output_argv(
+            &[
+                "rustc".into(),
+                "--out-dir=/old/deps".into(),
+                "--emit=metadata,dep-info=/old/foo.d".into(),
+                "-C".into(),
+                "extra-filename=-abc".into(),
+            ],
+            staging,
+        );
+        assert_eq!(
+            rewritten,
+            vec![
+                "rustc".to_string(),
+                "--out-dir=/tmp/stage".to_string(),
+                "--emit=metadata,dep-info=/tmp/stage/foo.d".to_string(),
+                "-C".to_string(),
+                "extra-filename=-abc".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_from_cache_with_verify_on_is_fail_open_when_recompile_fails() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let _verify = TestEnvGuard::set("KACHE_VERIFY", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let out_dir = dir.path().join("target/debug/deps");
+        let content = b"restored-bytes";
+        let source = dir.path().join("source.rlib");
+        std::fs::write(&source, content).unwrap();
+        let hash = crate::cache_key::hash_file(&source).unwrap();
+        create_blob(&store, &hash, content);
+
+        let args = rustc_args(&[
+            "/no-such-rustc-kache-verify",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--emit",
+            "link",
+            "--out-dir",
+            &out_dir.to_string_lossy(),
+        ]);
+        let mut file = cached_file("libfoo.rlib", &hash);
+        file.size = content.len() as u64;
+        let meta = entry_meta("verify-fail-open", vec![file], &["link"]);
+
+        restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+            None,
+        )
+        .expect("qualification recompile failure must not fail the restore");
+
+        assert_eq!(std::fs::read(out_dir.join("libfoo.rlib")).unwrap(), content);
+        let summary = crate::verify_compare::take_last_report();
+        assert!(
+            summary.starts_with("recompile-failed:"),
+            "expected a recompile-failed note, got {summary:?}"
+        );
+    }
+
+    #[test]
+    fn restore_from_cache_skips_verify_when_flag_off() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let _verify = TestEnvGuard::remove("KACHE_VERIFY");
+        let _ = crate::verify_compare::take_last_report();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let out_dir = dir.path().join("target/debug/deps");
+        let content = b"off-path-bytes";
+        let source = dir.path().join("source.rlib");
+        std::fs::write(&source, content).unwrap();
+        let hash = crate::cache_key::hash_file(&source).unwrap();
+        create_blob(&store, &hash, content);
+
+        let args = rustc_args(&[
+            "rustc",
+            "src/lib.rs",
+            "--crate-name",
+            "foo",
+            "--emit",
+            "link",
+            "--out-dir",
+            &out_dir.to_string_lossy(),
+        ]);
+        let mut file = cached_file("libfoo.rlib", &hash);
+        file.size = content.len() as u64;
+        let meta = entry_meta("verify-off", vec![file], &["link"]);
+
+        restore_from_cache(
+            &config,
+            &RustcCompiler::new(),
+            &BlobSource::Store(&store),
+            &args,
+            &meta,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(out_dir.join("libfoo.rlib")).unwrap(), content);
+        assert!(
+            crate::verify_compare::take_last_report().is_empty(),
+            "flag off must not stash a verify_compare note"
+        );
     }
 
     #[test]

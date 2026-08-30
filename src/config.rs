@@ -3096,19 +3096,21 @@ remote_key_cache_refresh_secs = 900
 
     #[test]
     fn disk_share_budget_floors_caps_and_rounds() {
-        const GIB: u64 = 1024 * 1024 * 1024;
-        assert_eq!(disk_share_budget(None), DISK_SHARE_FALLBACK);
-        assert_eq!(disk_share_budget(Some(0)), DISK_SHARE_FALLBACK);
+        const GIB: u64 = 1 << 30;
+        // Independent of DISK_SHARE_* so mutating `*` in those constants
+        // cannot change both sides of the assertion.
+        assert_eq!(disk_share_budget(None), 50 << 30);
+        assert_eq!(disk_share_budget(Some(0)), 50 << 30);
         // 10GiB disk: 5% is 0.5GiB, rounds to 1GiB, then floor 5GiB.
-        assert_eq!(disk_share_budget(Some(10 * GIB)), DISK_SHARE_FLOOR);
+        assert_eq!(disk_share_budget(Some(10 * GIB)), 5 << 30);
         // 200GiB disk: 5% is exactly 10GiB.
         assert_eq!(disk_share_budget(Some(200 * GIB)), 10 * GIB);
         // 256GiB disk: 5% is 12.8GiB, nearest GiB is 13GiB.
         assert_eq!(disk_share_budget(Some(256 * GIB)), 13 * GIB);
         // 4TiB disk: 5% is 204.8GiB, cap 100GiB.
-        assert_eq!(disk_share_budget(Some(4 * 1024 * GIB)), DISK_SHARE_CAP);
+        assert_eq!(disk_share_budget(Some(4 * 1024 * GIB)), 100 << 30);
         // Exactly at the cap: 2000GiB * 5% = 100GiB.
-        assert_eq!(disk_share_budget(Some(2000 * GIB)), DISK_SHARE_CAP);
+        assert_eq!(disk_share_budget(Some(2000 * GIB)), 100 << 30);
     }
 
     #[test]
@@ -3137,6 +3139,11 @@ remote_key_cache_refresh_secs = 900
             describe_max_size(DISK_SHARE_FALLBACK, None).contains("disk size unknown"),
             "{}",
             describe_max_size(DISK_SHARE_FALLBACK, None)
+        );
+        assert!(
+            describe_max_size(DISK_SHARE_FALLBACK, Some(0)).contains("disk size unknown"),
+            "a zero-byte probe is unknown, not 5% of 0: {}",
+            describe_max_size(DISK_SHARE_FALLBACK, Some(0))
         );
     }
 

@@ -598,12 +598,43 @@ mod tests {
     }
 
     #[test]
+    fn disk_bytes_rejects_zero_block_size_and_multiplies() {
+        assert_eq!(disk_bytes(0, 100), None);
+        assert_eq!(disk_bytes(4096, 0), Some(0));
+        assert_eq!(disk_bytes(4096, 2), Some(8192));
+        assert_eq!(disk_bytes(u64::MAX, 2), None);
+    }
+
+    #[test]
+    fn linux_fragment_bytes_prefers_frsize_when_nonzero() {
+        assert_eq!(linux_fragment_bytes(4096, 512), 4096);
+        assert_eq!(linux_fragment_bytes(0, 512), 512);
+        assert_eq!(linux_fragment_bytes(0, 0), 0);
+    }
+
+    #[test]
+    fn accepted_volume_total_requires_success_and_nonzero() {
+        assert_eq!(accepted_volume_total(false, 99), None);
+        assert_eq!(accepted_volume_total(true, 0), None);
+        assert_eq!(accepted_volume_total(true, 1), Some(1));
+        assert_eq!(accepted_volume_total(false, 0), None);
+        assert!(win32_succeeded(1));
+        assert!(!win32_succeeded(0));
+    }
+
+    #[test]
     fn probe_reports_a_positive_volume_size_for_a_real_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let total = probe(dir.path()).total_bytes;
+        let probed = probe(dir.path());
         assert!(
-            total.is_some_and(|n| n > 0),
-            "a real directory must yield a volume size, got {total:?}"
+            probed.total_bytes.is_some_and(|n| n > 1_000_000),
+            "a real directory must yield a volume size, got {:?}",
+            probed.total_bytes
+        );
+        assert_ne!(
+            probed,
+            FsProbe::default(),
+            "a real local probe must not be the empty default"
         );
     }
 

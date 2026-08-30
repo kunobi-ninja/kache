@@ -6,9 +6,10 @@
 # axis: two cargo processes building the same workspace at the same instant,
 # each with its own CARGO_TARGET_DIR, against one cold cache. The contract is
 # that the shared units compile ONCE across both processes: the first wrapper
-# to reach a unit claims its key (store::claim_build), the other blocks on the
-# claim (wait_for_committed) and restores the winner's artifact. Coalescing
-# happens BEFORE the duplicate compile, not by deduplicating after it.
+# to miss joins a machine-wide flight (crate + output kind + compiler) and
+# claims the key; the other waits on the flight, then restores. Coalescing
+# happens BEFORE the duplicate compile, not by deduplicating after it. Hits
+# and passthroughs never wait.
 #
 # The cold assertions are the contract. Four units (heavy1..3 + app), two
 # processes, eight wrapper compile events: with the claim, compiler_runs is

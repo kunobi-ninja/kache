@@ -38,6 +38,7 @@ struct PreservedAdvancedConfig {
     daemon_idle_timeout_secs: Option<u64>,
     min_store_compile_ms: Option<u64>,
     gc_max_age_hours: Option<u64>,
+    scheduler: Option<bool>,
 }
 
 impl PreservedAdvancedConfig {
@@ -59,6 +60,7 @@ impl PreservedAdvancedConfig {
             daemon_idle_timeout_secs: cache.and_then(|c| c.daemon_idle_timeout_secs),
             min_store_compile_ms: cache.and_then(|c| c.min_store_compile_ms),
             gc_max_age_hours: cache.and_then(|c| c.gc_max_age_hours),
+            scheduler: cache.and_then(|c| c.scheduler),
         }
     }
 }
@@ -901,6 +903,7 @@ fn fields_to_file_config(
             // retention; preserve both verbatim on save.
             min_store_compile_ms: preserved_advanced.min_store_compile_ms,
             gc_max_age_hours: preserved_advanced.gc_max_age_hours,
+            scheduler: preserved_advanced.scheduler,
             cache_executables: get_bool("cache_executables"),
             clean_incremental: get_bool("clean_incremental"),
             preserve_incremental: get_bool("preserve_incremental"),
@@ -2072,6 +2075,7 @@ mod tests {
                 prefetch_deadline_secs: None,
                 min_store_compile_ms: Some(750),
                 gc_max_age_hours: Some(72),
+                scheduler: Some(false),
                 daemon_idle_timeout_secs: Some(600),
                 s3_pool_idle_secs: None,
                 remote_restore_timeout_secs: Some(180),
@@ -2139,6 +2143,7 @@ mod tests {
         assert_eq!(cache.remote_negative_ttl_secs, Some(45));
         assert_eq!(cache.min_store_compile_ms, Some(750));
         assert_eq!(cache.gc_max_age_hours, Some(72));
+        assert_eq!(cache.scheduler, Some(false));
         assert_eq!(cache.gc_evict_shared, Some(true));
         assert_eq!(cache.daemon_idle_timeout_secs, Some(600));
         // The editor has no planner fields, but a save must preserve the
@@ -2203,6 +2208,7 @@ mod tests {
                 key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 path_only_env_vars: Some(vec!["BUILDCONFIG_RS".to_string()]),
                 daemon_idle_timeout_secs: Some(600),
+                scheduler: Some(false),
                 ..Default::default()
             }),
             ..Default::default()
@@ -2218,6 +2224,7 @@ mod tests {
             Some(&["BUILDCONFIG_RS".to_string()][..])
         );
         assert_eq!(state.preserved_advanced.daemon_idle_timeout_secs, Some(600));
+        assert_eq!(state.preserved_advanced.scheduler, Some(false));
 
         // ...and back out again through the save path.
         let saved = fields_to_file_config(

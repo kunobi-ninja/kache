@@ -38,6 +38,7 @@ mod remote_pack;
 mod remote_plan;
 mod remote_resilience;
 mod report;
+mod scheduler;
 mod service;
 mod shards;
 // Both callers (`clean`'s classifier and `compute_link_stats`) are `cfg(unix)`,

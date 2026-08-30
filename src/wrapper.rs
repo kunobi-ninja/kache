@@ -15,7 +15,8 @@ use crate::config::Config;
 use crate::events::{self, BuildEvent, EventResult};
 use crate::incremental_policy::{AdaptiveUnit, Lease};
 use crate::link;
-use crate::store::{BuildClaim, Store, StorePutResult};
+use crate::scheduler::{self, FlightIdentity, MissGuard};
+use crate::store::{BuildClaim, EntryMeta, Store, StorePutResult};
 
 /// Check whether progress lines should be printed to stderr.
 ///
@@ -600,6 +601,34 @@ fn probe_forward_compiler() -> String {
         .unwrap_or_else(|| "cc".to_string())
 }
 
+/// After a local+remote miss: join a machine-wide flight, then take a
+/// permit. Lock order is flight → permit → the caller's `claim_build`.
+/// Hits and passthroughs must not call this.
+fn admit_scheduler_miss(
+    config: &Config,
+    store: &Store,
+    cache_key: &str,
+    identity: FlightIdentity,
+    crate_name: &str,
+    is_link: bool,
+    entry_ok: impl Fn(&EntryMeta) -> bool,
+) -> (MissGuard, Option<EntryMeta>) {
+    if !config.scheduler {
+        return (MissGuard::empty(), None);
+    }
+    loop {
+        match scheduler::begin_miss(&config.cache_dir, true, &identity, crate_name, is_link) {
+            scheduler::BeginMiss::Recheck => match store.get(cache_key) {
+                Ok(Some(meta)) if entry_ok(&meta) => {
+                    return (MissGuard::empty(), Some(meta));
+                }
+                _ => {}
+            },
+            scheduler::BeginMiss::Compile(guard) => return (guard, None),
+        }
+    }
+}
+
 /// Run kache as a C-family compiler wrapper (`CC=kache cc`,
 /// `CXX=kache c++`, etc.).
 ///
@@ -608,9 +637,8 @@ fn probe_forward_compiler() -> String {
 /// `.o` on hit, or compile + store on dup/miss. Everything else (link
 /// mode, multi-source, unsafe flags) routes through [`cc_passthrough`].
 ///
-/// This is the local-cache path. Remote cache + build-lock
-/// coordination (which `wrapper::run` has for rustc) are deliberate
-/// follow-ups — single-machine caching is the shipped concept.
+/// This is the local-cache path. Remote cache is a separate follow-up;
+/// miss-path flights, permits, and per-key build locks match rustc.
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = std::time::Instant::now();
     let invocation_start_ns = std::time::SystemTime::now()
@@ -864,6 +892,94 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             "output appeared before compiler execution",
         );
     }
+
+    let (miss_guard, scheduled_hit) = admit_scheduler_miss(
+        config,
+        &store,
+        &cache_key,
+        FlightIdentity::cc(&crate_name),
+        &crate_name,
+        false,
+        |meta| !meta.files.is_empty() && cc_cache_entry_rejection_reason(&parsed, meta).is_none(),
+    );
+
+    let mut committed = scheduled_hit;
+    let mut _build_lock = None;
+    if committed.is_none() {
+        match store.claim_build(&cache_key) {
+            Ok(BuildClaim::Acquired(lock)) => _build_lock = Some(lock),
+            Ok(BuildClaim::Committed(meta)) => committed = Some(*meta),
+            Ok(BuildClaim::Contended) => {
+                tracing::debug!(
+                    "waiting for cc {} to be built by another process",
+                    crate_name
+                );
+                committed = store
+                    .wait_for_committed(&cache_key)
+                    .unwrap_or(false)
+                    .then(|| store.get(&cache_key).ok().flatten())
+                    .flatten()
+                    .filter(|meta| {
+                        !meta.files.is_empty()
+                            && cc_cache_entry_rejection_reason(&parsed, meta).is_none()
+                    });
+            }
+            Err(e) => {
+                tracing::debug!("cc claim_build failed ({e:#}); compiling without a key lock");
+            }
+        }
+    }
+
+    if let Some(meta) = committed.filter(|meta| {
+        !meta.files.is_empty() && cc_cache_entry_rejection_reason(&parsed, meta).is_none()
+    }) {
+        let restore_start = std::time::Instant::now();
+        if let Err(e) = restore_cc_from_cache(&store, &parsed, &meta) {
+            if e.downcast_ref::<PartialCcRestore>().is_some() {
+                return Err(e);
+            }
+            tracing::warn!(
+                "restoring cc coalesced hit for {} failed: {} — recompiling",
+                crate_name,
+                e
+            );
+            return cc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                &event_root,
+                start,
+                format!("restore failed: {e}"),
+            );
+        }
+        let restore_ms = restore_start.elapsed().as_millis() as u64;
+        let elapsed = start.elapsed().as_millis() as u64;
+        let size: u64 = meta.files.iter().map(|f| f.size).sum();
+        log_event(
+            config,
+            &event_root,
+            &crate_name,
+            EventResult::LocalHit,
+            elapsed,
+            meta.compile_time_ms,
+            size,
+            &cache_key,
+            key_ms,
+            lookup_ms,
+            restore_ms,
+            0,
+        );
+        print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
+        if !meta.stdout.is_empty() {
+            print!("{}", meta.stdout);
+        }
+        if !meta.stderr.is_empty() {
+            eprint!("{}", meta.stderr);
+        }
+        compiler.commit_preprocess_memo(&file_hasher);
+        return Ok(0);
+    }
+
     let compile_start = std::time::Instant::now();
     let result = match compiler.execute(&parsed) {
         Ok(r) => r,
@@ -882,6 +998,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             );
         }
     };
+    miss_guard.record_compile_rss(&crate_name);
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
 
     if !result.stdout.is_empty() {
@@ -2151,34 +2268,48 @@ fn run_parsed_rustc(
         );
     }
 
-    // 3. Cache miss — claim the key, then re-check under the build lock.
-    let (lock, committed) = match store.claim_build(&cache_key) {
-        Ok(BuildClaim::Acquired(lock)) => (Some(lock), None),
-        Ok(BuildClaim::Committed(meta)) => (None, Some(*meta)),
-        Err(e) => {
-            tracing::warn!(
-                "claiming build for {} failed: {} — recompiling",
-                crate_name,
-                e
-            );
-            return passthrough_with_event(
-                config,
-                args,
-                crate_name,
-                &event_root,
-                start,
-                format!("build claim failed: {e}"),
-            );
-        }
-        Ok(BuildClaim::Contended) => {
-            // Another process is building this key — wait for it
-            tracing::debug!("waiting for {} to be built by another process", crate_name);
-            let committed = store
-                .wait_for_committed(&cache_key)
-                .unwrap_or(false)
-                .then(|| store.get(&cache_key).ok().flatten())
-                .flatten();
-            (None, committed)
+    // 3. Cache miss — join the machine-wide flight, take a permit, then
+    // claim the key and re-check under the build lock.
+    let (miss_guard, scheduled_hit) = admit_scheduler_miss(
+        config,
+        &store,
+        &cache_key,
+        FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()),
+        crate_name,
+        args.emits_link(),
+        |meta| !meta.files.is_empty(),
+    );
+    let (lock, committed) = if let Some(meta) = scheduled_hit {
+        (None, Some(meta))
+    } else {
+        match store.claim_build(&cache_key) {
+            Ok(BuildClaim::Acquired(lock)) => (Some(lock), None),
+            Ok(BuildClaim::Committed(meta)) => (None, Some(*meta)),
+            Err(e) => {
+                tracing::warn!(
+                    "claiming build for {} failed: {} — recompiling",
+                    crate_name,
+                    e
+                );
+                return passthrough_with_event(
+                    config,
+                    args,
+                    crate_name,
+                    &event_root,
+                    start,
+                    format!("build claim failed: {e}"),
+                );
+            }
+            Ok(BuildClaim::Contended) => {
+                // Another process is building this key — wait for it
+                tracing::debug!("waiting for {} to be built by another process", crate_name);
+                let committed = store
+                    .wait_for_committed(&cache_key)
+                    .unwrap_or(false)
+                    .then(|| store.get(&cache_key).ok().flatten())
+                    .flatten();
+                (None, committed)
+            }
         }
     };
 
@@ -2268,6 +2399,7 @@ fn run_parsed_rustc(
             );
         }
     };
+    miss_guard.record_compile_rss(crate_name);
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
 
     // Print rustc output
@@ -5281,6 +5413,7 @@ mod tests {
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
+            scheduler: true,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),

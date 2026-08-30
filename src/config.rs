@@ -341,6 +341,12 @@ pub struct Config {
     /// investigating unexpected misses. Set via `KACHE_EXPLAIN_MISS=1`/`=true`
     /// or `[cache] explain_miss`.
     pub explain_miss: bool,
+    /// Machine-wide miss-path scheduler (default on). After a local and remote
+    /// miss, the wrapper joins a flight and takes a memory-weighted permit
+    /// before the per-key build lock. Hits and passthroughs never wait. Set
+    /// `KACHE_SCHEDULER=0`/`false` or `[cache] scheduler = false` to disable.
+    /// An unusable scheduler directory fails open and compiles without a permit.
+    pub scheduler: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -642,6 +648,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) incremental_crates: Option<Vec<String>>,
     /// Env vars folded into every cache key. See [`Config::key_env_vars`].
     pub(crate) key_env_vars: Option<Vec<String>>,
+    /// Machine-wide miss-path scheduler. See [`Config::scheduler`].
+    pub(crate) scheduler: Option<bool>,
 }
 
 /// Deliberately NOT `deny_unknown_fields`.
@@ -965,6 +973,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_HEARTBEAT_SECS",
     "KACHE_EXPLAIN_MISS",
+    "KACHE_SCHEDULER",
     "KACHE_PLANNER_ENDPOINT",
     "KACHE_PLANNER_TIMEOUT_MS",
     "KACHE_PLANNER_TOKEN",
@@ -1451,6 +1460,7 @@ impl Config {
             })
             .unwrap_or(DEFAULT_HEARTBEAT_SECS);
         let explain_miss = Self::explain_miss_enabled(&file_config);
+        let scheduler = Self::scheduler_enabled(&file_config);
         // A remote that cannot be resolved must NOT fail the build. `Config::load`
         // runs on the rustc-wrapper hot path (`run_wrapper_mode`), where returning
         // an error means the compiler never runs at all — a config typo would
@@ -1491,6 +1501,7 @@ impl Config {
             storage_layout_advice,
             heartbeat_secs,
             explain_miss,
+            scheduler,
             cache_executables,
             clean_incremental,
             preserve_incremental,
@@ -1942,6 +1953,21 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.explain_miss)
             .unwrap_or(false)
+    }
+
+    /// Machine-wide miss-path scheduler: on by default.
+    /// `KACHE_SCHEDULER=0`/`=false` (env wins), else `[cache] scheduler`, else on.
+    fn scheduler_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_SCHEDULER", ignore_env) {
+            return v != "0" && !v.eq_ignore_ascii_case("false");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.scheduler)
+            .unwrap_or(true)
     }
 
     pub fn load_planner_config() -> Option<PlannerConfig> {
@@ -3247,6 +3273,7 @@ remote_key_cache_refresh_secs = 900
                     path: None,
                     atomic_write_dir: None,
                 }),
+                scheduler: None,
             }),
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
@@ -3670,6 +3697,7 @@ remote_key_cache_refresh_secs = 900
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
+            scheduler: true,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
@@ -3724,6 +3752,7 @@ remote_key_cache_refresh_secs = 900
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
+            scheduler: true,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
@@ -3774,6 +3803,7 @@ remote_key_cache_refresh_secs = 900
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
+            scheduler: true,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
@@ -3843,6 +3873,7 @@ remote_key_cache_refresh_secs = 900
             storage_layout_advice: true,
             heartbeat_secs: 30,
             explain_miss: false,
+            scheduler: true,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
@@ -4528,6 +4559,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 remote_restore_timeout_secs: None,
                 remote_negative_ttl_secs: None,
                 remote: None,
+                scheduler: None,
             }),
         };
 
@@ -4811,6 +4843,95 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         assert!(
             !off,
             "KACHE_STORAGE_LAYOUT_ADVICE=0 must mute the advisories"
+        );
+    }
+
+    #[test]
+    fn scheduler_defaults_on_and_file_false_disables() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+        let _missing = NamedEnvGuard::remove("KACHE_SCHEDULER");
+
+        assert!(
+            Config::load().unwrap().scheduler,
+            "scheduler must default ON with no config file"
+        );
+
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            workspace: None,
+            cache: Some(CacheFileConfig {
+                scheduler: Some(false),
+                ..Default::default()
+            }),
+        };
+        Config::save_file_config_to(&file, &config_path).unwrap();
+        assert!(
+            !Config::load().unwrap().scheduler,
+            "[cache] scheduler = false must disable the miss-path scheduler"
+        );
+        assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_SCHEDULER"));
+    }
+
+    #[test]
+    fn scheduler_env_wins_over_file() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+
+        let file = FileConfig {
+            cc: None,
+            paths: None,
+            workspace: None,
+            cache: Some(CacheFileConfig {
+                scheduler: Some(false),
+                ..Default::default()
+            }),
+        };
+        Config::save_file_config_to(&file, &config_path).unwrap();
+
+        let _on = NamedEnvGuard::set("KACHE_SCHEDULER", "1");
+        assert!(
+            Config::load().unwrap().scheduler,
+            "KACHE_SCHEDULER=1 must re-enable despite file=false"
+        );
+        drop(_on);
+
+        let file_on = FileConfig {
+            cc: None,
+            paths: None,
+            workspace: None,
+            cache: Some(CacheFileConfig {
+                scheduler: Some(true),
+                ..Default::default()
+            }),
+        };
+        Config::save_file_config_to(&file_on, &config_path).unwrap();
+        let _off = NamedEnvGuard::set("KACHE_SCHEDULER", "0");
+        assert!(
+            !Config::load().unwrap().scheduler,
+            "KACHE_SCHEDULER=0 must disable despite file=true"
+        );
+        drop(_off);
+        let _false = NamedEnvGuard::set("KACHE_SCHEDULER", "false");
+        assert!(
+            !Config::load().unwrap().scheduler,
+            "KACHE_SCHEDULER=false must disable the scheduler"
+        );
+
+        std::fs::write(
+            &config_path,
+            "[cache]\nignore_env = true\nscheduler = false\n",
+        )
+        .unwrap();
+        let _ignored = NamedEnvGuard::set("KACHE_SCHEDULER", "1");
+        assert!(
+            !Config::load().unwrap().scheduler,
+            "ignore_env must keep [cache] scheduler = false"
         );
     }
 

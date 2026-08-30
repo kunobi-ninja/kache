@@ -58,6 +58,7 @@ Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem rem
 | `KACHE_DISABLED` | none | `false` | Pass all compiler work through when set to `1` or `true` |
 | `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Ignore all remote and planner configuration while keeping local caching |
 | `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes. Untrusted CI (pull requests, tags, unprotected branches) also forces this on; `=0` does not turn that off. |
+| `KACHE_SCHEDULER` | `cache.scheduler` | `true` | Pace real compiler processes across concurrent builds after a miss. Hits and passthroughs never wait. `0` or `false` turns it off. |
 
 On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CACHE_HOME/kache` or `~/.cache/kache`; on Windows it is under `%LOCALAPPDATA%`.
 

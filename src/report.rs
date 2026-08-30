@@ -3159,6 +3159,7 @@ mod tests {
             passthrough_reason: String::new(),
             store_error: String::new(),
             lookup_rejection: String::new(),
+            verify_compare: String::new(),
             fallback: false,
             exit_code: None,
             key_fields: Default::default(),

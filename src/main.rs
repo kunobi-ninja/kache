@@ -54,6 +54,7 @@ mod store;
 mod test_support;
 mod transport;
 mod tui;
+mod verify_compare;
 mod wrapper;
 mod wrapper_config;
 

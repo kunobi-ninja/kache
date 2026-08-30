@@ -384,6 +384,7 @@ fn macos_oso_prefix_flag(
     None
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn macos_oso_prefix_flag_inner(
     parsed: &RustcArgs,
     all_args: &[String],

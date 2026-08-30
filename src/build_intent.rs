@@ -277,16 +277,18 @@ mod tests {
     fn candidate_manifests_keep_each_distinct_existing_manifest() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
+        let missing = tempfile::tempdir().unwrap();
         std::fs::write(first.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(second.path().join("Cargo.toml"), "[workspace]\n").unwrap();
 
         assert_eq!(
-            candidate_manifest_paths(None, Some(first.path()), Some(second.path())),
+            candidate_manifest_paths(None, Some(first.path()), Some(second.path()),),
             vec![
                 first.path().join("Cargo.toml"),
                 second.path().join("Cargo.toml")
             ]
         );
+        assert!(candidate_manifest_paths(None, Some(missing.path()), None).is_empty());
     }
 
     #[test]

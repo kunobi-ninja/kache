@@ -17,7 +17,7 @@ Include before/after numbers for performance changes. -->
 
 ## Checklist
 
-- [ ] `just check` passes locally (fmt + clippy + tests)
+- [ ] `just pr` passes locally (fmt + clippy + tests + changed-line mutants)
 - [ ] New behaviour is covered by tests where it makes sense
 - [ ] Commit messages follow [conventional commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, …)
 - [ ] User-visible changes (CLI, config, output) are reflected in the README or relevant docs

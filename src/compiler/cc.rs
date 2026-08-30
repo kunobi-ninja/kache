@@ -4327,11 +4327,12 @@ fn cc_system_include_dirs(parsed: &CcArgs, cwd: &Path) -> Vec<PathBuf> {
         push(PathBuf::from(value));
         push(PathBuf::from(value).join("usr/include"));
     }
-    if let Ok(sdk) = std::env::var("SDKROOT")
-        && !sdk.is_empty()
-    {
-        push(PathBuf::from(&sdk));
-        push(PathBuf::from(sdk).join("usr/include"));
+    if let Ok(sdk) = std::env::var("SDKROOT") {
+        let path = PathBuf::from(sdk);
+        if path.is_dir() {
+            push(path.clone());
+            push(path.join("usr/include"));
+        }
     }
     dirs
 }
@@ -10629,6 +10630,28 @@ mod tests {
         assert_eq!(
             unset, empty,
             "empty SDKROOT must not become an include root"
+        );
+    }
+
+    #[test]
+    fn include_dir_digest_exempts_an_existing_sdkroot_directory() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let sdk = temp.path().join("sdk");
+        let srcdir = temp.path().join("src");
+        fs::create_dir(&sdk).unwrap();
+        fs::create_dir(&srcdir).unwrap();
+        let source = srcdir.join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        unsafe { std::env::set_var("SDKROOT", &sdk) };
+        let parsed = CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap()])).unwrap();
+        let before = digest_cc_include_dir_names(&parsed).unwrap();
+        fs::write(sdk.join("sdk.h"), "int s;\n").unwrap();
+        let after = digest_cc_include_dir_names(&parsed).unwrap();
+        unsafe { std::env::remove_var("SDKROOT") };
+        assert_eq!(
+            before, after,
+            "headers under SDKROOT must not change the user include-dir digest"
         );
     }
 

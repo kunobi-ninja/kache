@@ -98,21 +98,24 @@ pub struct Shard {
 /// is missing or under-reported.
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
-pub async fn download_manifest(
+pub async fn try_download_manifest(
     backend: &dyn RemoteBackend,
     prefix: &str,
     manifest_key: &str,
-) -> Result<BuildManifest> {
+) -> Result<Option<BuildManifest>> {
     let object_key =
         crate::config::join_remote_key(prefix, &format!("{MANIFEST_PREFIX}/{manifest_key}.json"));
 
-    let fetched = backend
+    let Some(fetched) = backend
         .get(&object_key, Some(MAX_METADATA_BYTES))
         .await
         .context("downloading manifest")?
-        .with_context(|| format!("manifest not found: {}", backend.describe(&object_key)))?;
+    else {
+        return Ok(None);
+    };
 
-    serde_json::from_slice(&fetched.body).context("parsing manifest JSON")
+    let manifest = serde_json::from_slice(&fetched.body).context("parsing manifest JSON")?;
+    Ok(Some(manifest))
 }
 
 pub async fn upload_manifest(
@@ -292,9 +295,10 @@ mod tests {
             .await
             .unwrap();
 
-        let got = download_manifest(&backend, "prefix", "key")
+        let got = try_download_manifest(&backend, "prefix", "key")
             .await
-            .expect("download should succeed");
+            .expect("download should succeed")
+            .expect("manifest present");
         assert_eq!(got.entries.len(), 1);
         assert_eq!(got.entries[0].crate_name, "serde");
     }

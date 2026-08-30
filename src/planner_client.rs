@@ -162,6 +162,7 @@ mod tests {
             crate_names: vec!["serde".into()],
             namespace: Some("ns".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+            identity_key: None,
         };
 
         let plan = resolve_prefetch_plan_with_config(&config, &req)
@@ -190,6 +191,7 @@ mod tests {
             crate_names: vec!["serde".into()],
             namespace: None,
             cargo_lock_deps: vec![],
+            identity_key: None,
         };
 
         let err = resolve_prefetch_plan_with_config(&config, &req)
@@ -217,6 +219,7 @@ mod tests {
             crate_names: vec!["serde".into()],
             namespace: None,
             cargo_lock_deps: vec![],
+            identity_key: None,
         };
 
         let plan = resolve_prefetch_plan_with_config(&config, &req)

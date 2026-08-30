@@ -25,6 +25,7 @@ pub async fn build_prefetch_plan(
     if should_report_composition(&composition) {
         tracing::info!(
             candidates = plan.candidates.len(),
+            from_identity = composition.from_identity,
             from_shards = composition.from_shards,
             from_history = composition.from_history,
             from_key_cache = composition.from_key_cache,
@@ -139,6 +140,39 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
             );
         }
         Ok(keys)
+    }
+
+    async fn identity_candidates(&self, identity_key: &str) -> Result<Vec<PrefetchCandidate>> {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for key in crate::identity::manifest_lookup_keys(Some(identity_key)) {
+            match self.daemon.download_planner_manifest(&key).await {
+                Ok(Some(manifest)) => {
+                    tracing::info!(
+                        "fallback planner: identity manifest '{key}' has {} entries",
+                        manifest.entries.len()
+                    );
+                    for (index, entry) in manifest.entries.into_iter().enumerate() {
+                        if seen.insert(entry.cache_key.clone()) {
+                            candidates.push(PrefetchCandidate {
+                                cache_key: entry.cache_key,
+                                crate_name: entry.crate_name,
+                                compile_time_ms: (entry.compile_time_ms > 0)
+                                    .then_some(entry.compile_time_ms),
+                                size_bytes: (entry.artifact_size > 0)
+                                    .then_some(entry.artifact_size),
+                                source: kache_core::CandidateSource::Manifest,
+                                demand_index: u32::try_from(index).ok(),
+                            });
+                        }
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!("fallback planner: identity manifest '{key}': {e}"),
+            }
+        }
+        Ok(candidates)
     }
 }
 

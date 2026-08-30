@@ -5323,6 +5323,23 @@ pub fn save_manifest(
     manifest_key: Option<&str>,
     namespace: Option<&str>,
 ) -> Result<()> {
+    save_manifest_impl(config, manifest_key, namespace, true)
+}
+
+pub(crate) fn save_manifest_auto(
+    config: &Config,
+    manifest_key: Option<&str>,
+    namespace: Option<&str>,
+) -> Result<()> {
+    save_manifest_impl(config, manifest_key, namespace, false)
+}
+
+fn save_manifest_impl(
+    config: &Config,
+    manifest_key: Option<&str>,
+    namespace: Option<&str>,
+    announce: bool,
+) -> Result<()> {
     if config.remote_readonly {
         tracing::debug!("skipping manifest save (read-only mode)");
         return Ok(());
@@ -5337,13 +5354,18 @@ pub fn save_manifest(
     let entries = manifest_entries_from_events(&events);
 
     if entries.is_empty() {
-        eprintln!("No build events found, skipping manifest save");
+        if announce {
+            eprintln!("No build events found, skipping manifest save");
+        }
         return Ok(());
     }
 
-    let key = manifest_key
-        .map(String::from)
-        .unwrap_or_else(default_manifest_key);
+    let keys = match manifest_key {
+        Some(key) => vec![key.to_string()],
+        None => {
+            crate::identity::manifest_publish_keys(std::path::Path::new("Cargo.lock"), None, None)
+        }
+    };
     let env_namespace = std::env::var("KACHE_NAMESPACE")
         .ok()
         .map(|value| value.trim().to_string())
@@ -5361,20 +5383,34 @@ pub fn save_manifest(
 
     let pool_idle_secs = config.s3_pool_idle_secs;
     let entry_count = entries.len();
+    let published = keys.clone();
     rt.block_on(async {
         let backend = crate::remote_backend::create_backend(remote, pool_idle_secs).await?;
-        upload_manifest_and_shards(
-            &backend,
-            remote,
-            &key,
-            effective_namespace.as_deref(),
-            std::path::Path::new("Cargo.lock"),
-            entries,
-        )
-        .await
+        for (index, key) in keys.iter().enumerate() {
+            let shard_namespace = if index == 0 {
+                effective_namespace.as_deref()
+            } else {
+                None
+            };
+            upload_manifest_and_shards(
+                &backend,
+                remote,
+                key,
+                shard_namespace,
+                std::path::Path::new("Cargo.lock"),
+                entries.clone(),
+            )
+            .await?;
+        }
+        Ok::<(), anyhow::Error>(())
     })?;
 
-    eprintln!("Saved manifest: {entry_count} entries for '{key}'");
+    if announce {
+        eprintln!(
+            "Saved manifest: {entry_count} entries for '{}'",
+            published.join("', '")
+        );
+    }
     Ok(())
 }
 
@@ -5388,6 +5424,7 @@ fn manifest_entries_from_events(
     events: &[crate::events::BuildEvent],
 ) -> Vec<crate::remote::ManifestEntry> {
     let mut by_key = std::collections::HashMap::<String, crate::remote::ManifestEntry>::new();
+    let mut order = Vec::new();
     for e in events {
         if e.cache_key.is_empty() {
             continue;
@@ -5410,16 +5447,19 @@ fn manifest_entries_from_events(
             },
             artifact_size: e.size,
         };
-        by_key
-            .entry(e.cache_key.clone())
-            .and_modify(|existing| {
-                if entry.compile_time_ms > existing.compile_time_ms {
-                    *existing = entry.clone();
-                }
-            })
-            .or_insert(entry);
+        if let Some(existing) = by_key.get_mut(&e.cache_key) {
+            if entry.compile_time_ms > existing.compile_time_ms {
+                *existing = entry;
+            }
+        } else {
+            order.push(e.cache_key.clone());
+            by_key.insert(e.cache_key.clone(), entry);
+        }
     }
-    by_key.into_values().collect()
+    order
+        .into_iter()
+        .filter_map(|key| by_key.remove(&key))
+        .collect()
 }
 
 /// Upload the monolithic build manifest and, when a namespace is given and a
@@ -5535,20 +5575,6 @@ async fn upload_shards(
     }
 
     Ok(uploaded)
-}
-
-/// Default manifest key: host target triple at runtime.
-pub(crate) fn default_manifest_key() -> String {
-    default_manifest_key_for(std::env::consts::ARCH, std::env::consts::OS)
-}
-
-fn default_manifest_key_for(arch: &str, os: &str) -> String {
-    match os {
-        "linux" => format!("{arch}-unknown-linux-gnu"),
-        "macos" => format!("{arch}-apple-darwin"),
-        "windows" => format!("{arch}-pc-windows-msvc"),
-        _ => format!("{arch}-unknown-{os}"),
-    }
 }
 
 /// Build a workspace crate name filter from Cargo.toml metadata.
@@ -7611,40 +7637,6 @@ mod tests {
         assert!(
             err.to_string().contains("parsing"),
             "expected a parse-context error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_default_manifest_key_matches_host_triple_shape() {
-        let key = default_manifest_key();
-        assert!(key.starts_with(std::env::consts::ARCH), "got {key}");
-        let expected_vendor_os = match std::env::consts::OS {
-            "linux" => "-unknown-linux-gnu",
-            "macos" => "-apple-darwin",
-            "windows" => "-pc-windows-msvc",
-            other => return assert!(key.contains(other)),
-        };
-        assert!(key.ends_with(expected_vendor_os), "got {key}");
-    }
-
-    #[test]
-    fn test_default_manifest_key_for_all_os_arms() {
-        // OS mapper -> linux, macOS, Windows, and fallback triples.
-        assert_eq!(
-            default_manifest_key_for("x86_64", "linux"),
-            "x86_64-unknown-linux-gnu"
-        );
-        assert_eq!(
-            default_manifest_key_for("aarch64", "macos"),
-            "aarch64-apple-darwin"
-        );
-        assert_eq!(
-            default_manifest_key_for("x86_64", "windows"),
-            "x86_64-pc-windows-msvc"
-        );
-        assert_eq!(
-            default_manifest_key_for("riscv64", "freebsd"),
-            "riscv64-unknown-freebsd"
         );
     }
 

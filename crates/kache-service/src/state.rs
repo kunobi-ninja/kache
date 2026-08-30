@@ -303,6 +303,13 @@ ORDER BY last_seen_at DESC;
             .take("cache_key")
             .context("decoding crate cache keys")
     }
+
+    async fn identity_candidates(&self, _identity_key: &str) -> Result<Vec<PrefetchCandidate>> {
+        // Identity manifests live on the object store the daemon reads, not in
+        // the planner's Surreal projections. An empty list lets shards/history
+        // fill the plan; the daemon fallback still fetches the object.
+        Ok(Vec::new())
+    }
 }
 
 fn dep_key(name: &str, version: &str) -> String {

@@ -79,7 +79,7 @@ Admission and dispatch are separate concerns and should not share one comparator
 - **Admission** decides what is worth spending a finite budget on: confidence-weighted value
   density.
 - **Dispatch** decides what starts first: coarse urgency windows, value descending inside a
-  window. Coarse because guppy position is a weak proxy for demand time, so treating position
+  window. Coarse because lockfile/crate-name position is a weak proxy for demand time, so treating position
   40 versus 45 as meaningful is false precision while 40 versus 400 is real.
 
 The weights are guardrail constants, not measured probabilities, and they should be versioned

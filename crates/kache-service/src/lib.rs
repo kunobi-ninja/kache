@@ -830,6 +830,7 @@ mod tests {
                             crate_names: vec!["serde".to_string()],
                             namespace: Some("linux/hash/debug".to_string()),
                             cargo_lock_deps: vec![("serde".to_string(), "1.0.0".to_string())],
+                            identity_key: None,
                         })
                         .unwrap(),
                     ))
@@ -883,6 +884,7 @@ mod tests {
                             crate_names: vec!["serde".to_string()],
                             namespace: None,
                             cargo_lock_deps: vec![],
+                            identity_key: None,
                         })
                         .unwrap(),
                     ))
@@ -923,6 +925,7 @@ mod tests {
                             crate_names: vec!["serde".to_string()],
                             namespace: None,
                             cargo_lock_deps: vec![],
+                            identity_key: None,
                         })
                         .unwrap(),
                     ))

@@ -981,8 +981,10 @@ impl PackPrefetchContext {
 
     fn from_intent(intent: &kache_core::BuildIntent) -> Option<Self> {
         let namespace = intent.namespace.as_deref()?;
-        let manifest_key = std::env::var("KACHE_MANIFEST_KEY")
-            .unwrap_or_else(|_| crate::cli::default_manifest_key());
+        let manifest_key = crate::identity::manifest_lookup_keys(intent.identity_key.as_deref())
+            .into_iter()
+            .next()
+            .unwrap_or_else(crate::identity::host_target_triple);
         Self::from_deps(manifest_key, namespace, &intent.cargo_lock_deps).ok()
     }
 }
@@ -1837,6 +1839,8 @@ pub(crate) struct ActivePlan {
     /// Cumulative LIST counters at install time, for per-session deltas.
     pub list_requests_at_install: u64,
     pub list_duration_ms_at_install: u64,
+    /// Rank-0 identity key for this session, if the wrapper sent one.
+    pub identity_key: Option<String>,
 }
 
 impl ActivePlan {
@@ -1863,6 +1867,7 @@ impl ActivePlan {
             last_activity_ms: now,
             list_requests_at_install,
             list_duration_ms_at_install,
+            identity_key: None,
         }
     }
 
@@ -2422,6 +2427,70 @@ impl Daemon {
                     &remote.prefix,
                     namespace,
                     shard_hash,
+                ),
+            )
+            .await;
+        drop(semaphore);
+        match &result {
+            Ok(_) => breaker.success(),
+            Err(error) => {
+                let class = classify_remote_error(error);
+                breaker.failure(class, &format!("{error:#}"));
+            }
+        }
+        result
+    }
+
+    /// Breaker/deadline/semaphore-aware identity-manifest fetch for the
+    /// fallback planner. Missing objects are `Ok(None)`.
+    pub(crate) async fn download_planner_manifest(
+        &self,
+        manifest_key: &str,
+    ) -> Result<Option<crate::remote::BuildManifest>> {
+        let remote = self
+            .config
+            .remote
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
+        let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
+        let breaker = self
+            .remote_breaker
+            .try_acquire(RemoteOperation::ManifestGet)
+            .ok_or_else(|| anyhow::anyhow!("remote read breaker open"))?;
+        let backend = match deadline
+            .run("planner backend initialization", self.get_remote_backend())
+            .await
+        {
+            Ok(backend) => backend,
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                breaker.failure(class, &format!("{error:#}"));
+                return Err(error);
+            }
+        };
+        let semaphore = match deadline
+            .run("planner manifest queue", async {
+                self.s3_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+            })
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                breaker.failure(class, &format!("{error:#}"));
+                return Err(error);
+            }
+        };
+        let result = deadline
+            .run(
+                "planner manifest GET",
+                crate::remote::try_download_manifest(
+                    backend.as_ref(),
+                    &remote.prefix,
+                    manifest_key,
                 ),
             )
             .await;
@@ -4881,9 +4950,10 @@ impl Daemon {
         plan_id: &str,
         plan_source: &'static str,
         candidates: impl Iterator<Item = String>,
+        identity_key: Option<String>,
     ) {
         let _ = self.prefetch_cancel.send(false);
-        let plan = ActivePlan::new(
+        let mut plan = ActivePlan::new(
             session_id.to_string(),
             plan_id.to_string(),
             plan_source,
@@ -4895,6 +4965,7 @@ impl Daemon {
                 .list_duration_ms_total
                 .load(Ordering::Relaxed),
         );
+        plan.identity_key = identity_key;
         let prev = {
             let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
             slot.replace(plan)
@@ -4960,6 +5031,37 @@ impl Daemon {
         if let Err(e) = crate::events::log_summary(&path, &event) {
             tracing::debug!("failed to write build summary: {e}");
         }
+        self.maybe_publish_identity_manifest(plan.identity_key.as_deref());
+    }
+
+    /// Best-effort rank-0 publish when a session ends. Failures must not
+    /// affect the daemon: the next `save-manifest` still writes the same
+    /// events.
+    fn maybe_publish_identity_manifest(&self, identity_key: Option<&str>) {
+        let Some(identity_key) = identity_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        if self.config.remote.is_none() || self.config.remote_readonly {
+            return;
+        }
+        let config = self.config.clone();
+        let namespace = std::env::var("KACHE_NAMESPACE").ok();
+        let publish = move || {
+            if let Err(error) =
+                crate::cli::save_manifest_auto(&config, Some(&identity_key), namespace.as_deref())
+            {
+                tracing::debug!("identity manifest auto-publish failed: {error:#}");
+            }
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(publish);
+        } else {
+            publish();
+        }
     }
 
     pub async fn handle_build_started(self: &Arc<Self>, req: &BuildStartedRequest) -> Response {
@@ -5009,6 +5111,7 @@ impl Daemon {
                             plan_id.as_deref().unwrap_or(""),
                             "advisory",
                             prefetch_req.keys.iter().map(|(k, _)| k.clone()),
+                            req.intent.identity_key.clone(),
                         );
                         let resp = self
                             .handle_prefetch_with_context(
@@ -5095,6 +5198,7 @@ impl Daemon {
             "",
             "fallback",
             prefetch_req.keys.iter().map(|(k, _)| k.clone()),
+            req.intent.identity_key.clone(),
         );
         self.handle_prefetch_with_context(&prefetch_req, pack_context, plan_started_at)
             .await
@@ -6378,12 +6482,11 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
     Ok(count)
 }
 
-/// Download the build manifest from S3 and prefetch expensive crates.
-/// Runs once on daemon startup — filters by cost-benefit (skip cheap crates).
+/// Download recorded actions, then lockfile shards if those were missing.
 ///
-/// If `KACHE_NAMESPACE` is set and Cargo.lock is available, uses shard-based prefetch:
-/// computes shard hashes from Cargo.lock deps, downloads matching shards in parallel,
-/// and collects cache keys from them. Otherwise falls back to the monolithic build manifest.
+/// Rank 0 is the identity manifest (lock + target + profile), with the
+/// legacy host-triple key as a fallback. Rank 1 is content-addressed
+/// shards for a cold first run of this command.
 async fn manifest_prefetch(
     daemon: &Arc<Daemon>,
     namespace: Option<&str>,
@@ -6409,7 +6512,15 @@ async fn manifest_prefetch(
         }
     };
 
-    // Try shard-based prefetch first if namespace is available.
+    let identity = crate::identity::profile_from_env().and_then(|profile| {
+        crate::identity::identity_key(lock_path, &crate::identity::host_target_triple(), &profile)
+    });
+    let from_identity =
+        identity_manifest_prefetch(daemon, backend.as_ref(), remote, identity.as_deref()).await;
+    if from_identity > 0 {
+        return from_identity;
+    }
+
     if let Some(namespace) = namespace {
         if lock_path.exists() {
             match shard_prefetch(daemon, backend, &remote.prefix, namespace, lock_path).await {
@@ -6418,19 +6529,15 @@ async fn manifest_prefetch(
                     return n;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "shard prefetch failed, falling back to monolithic build manifest: {e}"
-                    );
+                    tracing::warn!("shard prefetch failed: {e}");
                 }
             }
         } else {
-            tracing::info!(
-                "KACHE_NAMESPACE set but no Cargo.lock found, falling back to monolithic build manifest"
-            );
+            tracing::info!("KACHE_NAMESPACE set but no Cargo.lock found");
         }
     }
 
-    monolithic_manifest_prefetch(daemon, backend.as_ref(), remote).await
+    0
 }
 
 /// Shard-based prefetch: compute shard hashes from Cargo.lock, download matching shards
@@ -6541,8 +6648,10 @@ async fn shard_prefetch_for_deps(
         keys: prefetch_keys,
         warm_all: false,
     };
-    let manifest_key =
-        std::env::var("KACHE_MANIFEST_KEY").unwrap_or_else(|_| crate::cli::default_manifest_key());
+    let manifest_key = crate::identity::manifest_lookup_keys(None)
+        .into_iter()
+        .next()
+        .unwrap_or_else(crate::identity::host_target_triple);
     let pack_context = PackPrefetchContext::from_deps(manifest_key, namespace, deps).ok();
     let resp = daemon
         .handle_prefetch_with_context(&req, pack_context, plan_started_at)
@@ -6556,65 +6665,46 @@ async fn shard_prefetch_for_deps(
     Ok(count)
 }
 
-/// Monolithic build-manifest prefetch: download the manifest and filter by compile cost.
-async fn monolithic_manifest_prefetch(
+/// Rank-0 prefetch: identity key, then the legacy host triple.
+async fn identity_manifest_prefetch(
     daemon: &Arc<Daemon>,
     backend: &dyn crate::remote_backend::RemoteBackend,
     remote: &crate::config::RemoteConfig,
+    identity_key: Option<&str>,
 ) -> usize {
-    let manifest_key =
-        std::env::var("KACHE_MANIFEST_KEY").unwrap_or_else(|_| crate::cli::default_manifest_key());
+    let mut manifest = None;
+    let mut manifest_key = String::new();
+    for key in crate::identity::manifest_lookup_keys(identity_key) {
+        match crate::remote::try_download_manifest(backend, &remote.prefix, &key).await {
+            Ok(Some(found)) => {
+                manifest_key = key;
+                manifest = Some(found);
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!("manifest prefetch '{key}': {e:#}");
+            }
+        }
+    }
+    let Some(manifest) = manifest else {
+        tracing::info!("manifest prefetch: no identity or legacy manifest, skipping");
+        return 0;
+    };
 
+    identity_manifest_prefetch_from(daemon, remote, manifest_key, manifest).await
+}
+
+async fn identity_manifest_prefetch_from(
+    daemon: &Arc<Daemon>,
+    _remote: &crate::config::RemoteConfig,
+    manifest_key: String,
+    manifest: crate::remote::BuildManifest,
+) -> usize {
     let min_compile_ms: u64 = std::env::var("KACHE_MIN_COMPILE_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
-
-    let Some(breaker) = daemon
-        .remote_breaker
-        .try_acquire(RemoteOperation::ManifestGet)
-    else {
-        tracing::debug!("manifest prefetch suppressed by read breaker");
-        return 0;
-    };
-    let deadline = RemoteDeadline::from_secs(daemon.config.remote_restore_timeout_secs);
-    let semaphore = match deadline
-        .run("manifest GET queue", async {
-            daemon
-                .s3_semaphore
-                .acquire()
-                .await
-                .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
-        })
-        .await
-    {
-        Ok(permit) => permit,
-        Err(error) => {
-            let class = classify_remote_error(&error);
-            breaker.failure(class, &format!("{error:#}"));
-            tracing::warn!("manifest prefetch queue failed: {error:#}");
-            return 0;
-        }
-    };
-    let manifest_result = deadline
-        .run(
-            "manifest GET",
-            crate::remote::download_manifest(backend, &remote.prefix, &manifest_key),
-        )
-        .await;
-    drop(semaphore);
-    let manifest = match manifest_result {
-        Ok(manifest) => {
-            breaker.success();
-            manifest
-        }
-        Err(e) => {
-            let class = classify_remote_error(&e);
-            breaker.failure(class, &format!("{e:#}"));
-            tracing::info!("manifest prefetch: no manifest for '{manifest_key}' ({e}), skipping");
-            return 0;
-        }
-    };
 
     // Cost-benefit filter: skip crates cheaper to recompile than download
     let mut worth_prefetching: Vec<_> = manifest
@@ -6628,7 +6718,7 @@ async fn monolithic_manifest_prefetch(
 
     let skipped = manifest.entries.len() - worth_prefetching.len();
     tracing::info!(
-        "manifest prefetch: {} entries, prefetching {} (skipped {} cheap crates < {}ms)",
+        "manifest prefetch '{manifest_key}': {} entries, prefetching {} (skipped {} cheap crates < {}ms)",
         manifest.entries.len(),
         worth_prefetching.len(),
         skipped,
@@ -12306,6 +12396,7 @@ mod tests {
                     crate_names: vec!["serde".into()],
                     namespace: Some("ns".into()),
                     cargo_lock_deps: vec![],
+                    identity_key: None,
                 },
                 client_epoch: 0,
                 session_id: String::new(),
@@ -12715,7 +12806,7 @@ mod tests {
     fn test_build_manifest_object_key() -> String {
         format!(
             "prefix/_manifests/{}.json",
-            crate::cli::default_manifest_key()
+            crate::identity::host_target_triple()
         )
     }
 
@@ -13106,6 +13197,7 @@ mod tests {
                 crate_names: vec!["serde".into(), "tokio".into()],
                 namespace: None,
                 cargo_lock_deps: vec![],
+                identity_key: None,
             },
             client_epoch: 0,
             session_id: String::new(),
@@ -13319,6 +13411,7 @@ mod tests {
             crate_names: vec!["serde".into()],
             namespace: Some("linux/toolchain/release".into()),
             cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+            identity_key: None,
         };
         let context = PackPrefetchContext::from_intent(&intent)
             .expect("a namespaced lockfile intent must enable catalog discovery");
@@ -13419,7 +13512,7 @@ mod tests {
         assert!(daemon.remote_backend.set(backend.clone()).is_ok());
         let deps = vec![("serde".to_string(), "1.0.0".to_string())];
         let context = PackPrefetchContext::from_deps(
-            crate::cli::default_manifest_key(),
+            crate::identity::host_target_triple(),
             "linux/toolchain/release",
             &deps,
         )
@@ -13509,7 +13602,7 @@ mod tests {
         config.remote = Some(test_remote_config());
         let inner = test_remote_backend();
         let context = PackPrefetchContext::from_deps(
-            crate::cli::default_manifest_key(),
+            crate::identity::host_target_triple(),
             "linux/toolchain/release",
             &[("serde".to_string(), "1.0.0".to_string())],
         )
@@ -13575,7 +13668,7 @@ mod tests {
         let inner = test_remote_backend();
         let deps = vec![("serde".to_string(), "1.0.0".to_string())];
         let context = PackPrefetchContext::from_deps(
-            crate::cli::default_manifest_key(),
+            crate::identity::host_target_triple(),
             "linux/toolchain/release",
             &deps,
         )
@@ -13685,7 +13778,7 @@ mod tests {
         assert!(daemon.remote_backend.set(backend.clone()).is_ok());
         let deps = vec![("serde".to_string(), "1.0.0".to_string())];
         let context = PackPrefetchContext::from_deps(
-            crate::cli::default_manifest_key(),
+            crate::identity::host_target_triple(),
             "linux/toolchain/release",
             &deps,
         )
@@ -13750,7 +13843,7 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config));
         assert!(daemon.remote_backend.set(backend.clone()).is_ok());
         let context = PackPrefetchContext::from_deps(
-            crate::cli::default_manifest_key(),
+            crate::identity::host_target_triple(),
             "linux/toolchain/release",
             &[("serde".to_string(), "1.0.0".to_string())],
         )
@@ -13846,7 +13939,7 @@ mod tests {
         assert!(daemon.remote_backend.set(backend.clone()).is_ok());
         let deps = vec![("serde".to_string(), "1.0.0".to_string())];
         let context = PackPrefetchContext::from_deps(
-            crate::cli::default_manifest_key(),
+            crate::identity::host_target_triple(),
             "linux/toolchain/release",
             &deps,
         )
@@ -14408,6 +14501,7 @@ mod tests {
             "test-plan",
             "test",
             std::iter::once(key.clone()),
+            None,
         );
 
         let response = daemon
@@ -14527,7 +14621,7 @@ mod tests {
     #[tokio::test]
     async fn test_monolithic_manifest_prefetch_downloads_and_filters() {
         // Serve a build manifest whose single entry is below the prefetch cost
-        // threshold, so monolithic_manifest_prefetch downloads + parses it, then
+        // threshold, so identity_manifest_prefetch downloads + parses it, then
         // skips the cheap crate (no prefetch queued). Covers download_manifest +
         // the cost-benefit filter path.
         let dir = tempfile::tempdir().unwrap();
@@ -14538,7 +14632,7 @@ mod tests {
         let manifest = crate::remote::BuildManifest {
             version: 3,
             created: "2025-01-01T00:00:00Z".to_string(),
-            manifest_key: crate::cli::default_manifest_key(),
+            manifest_key: crate::identity::host_target_triple(),
             entries: vec![crate::remote::ManifestEntry {
                 cache_key: "cheapkey".to_string(),
                 crate_name: "cheap".to_string(),
@@ -14552,13 +14646,13 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config));
 
         // Should complete without panicking and without queuing the cheap crate.
-        monolithic_manifest_prefetch(&daemon, client.as_ref(), &remote).await;
+        identity_manifest_prefetch(&daemon, client.as_ref(), &remote, None).await;
     }
 
     #[tokio::test]
     async fn test_manifest_prefetch_skips_when_no_manifest() {
-        // The mock 404s the manifest GET, so download_manifest errors and
-        // monolithic_manifest_prefetch logs + returns early. Covers the
+        // The mock 404s the manifest GET, so identity lookup finds nothing
+        // and shard fallback has no lockfile. Covers the
         // "no manifest, skipping" arm (daemon.rs 2957-2960).
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
@@ -14586,7 +14680,7 @@ mod tests {
         let manifest = crate::remote::BuildManifest {
             version: 3,
             created: "2025-01-01T00:00:00Z".to_string(),
-            manifest_key: crate::cli::default_manifest_key(),
+            manifest_key: crate::identity::host_target_triple(),
             entries: vec![crate::remote::ManifestEntry {
                 cache_key: key.clone(),
                 crate_name: "expensive".to_string(),
@@ -16474,6 +16568,7 @@ mod tests {
                 crate_names: vec!["serde".into(), "tokio".into(), "anyhow".into()],
                 namespace: Some("x86_64/hash/release".into()),
                 cargo_lock_deps: vec![("serde".into(), "1.0.0".into())],
+                identity_key: None,
             },
             client_epoch: 0,
             session_id: String::new(),

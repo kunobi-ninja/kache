@@ -136,6 +136,41 @@ pub fn probe(path: &Path) -> FsProbe {
     probe_impl(path)
 }
 
+/// Volume size from a `statfs` block size and block count.
+///
+/// A zero block size is `None` (the kernel did not report a size), not a
+/// zero-byte disk. Overflow is `None`. Pure so the cases are tested on every
+/// platform, not only the OS whose `statfs` produced the numbers.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
+fn disk_bytes(block_size: u64, blocks: u64) -> Option<u64> {
+    if block_size == 0 {
+        return None;
+    }
+    block_size.checked_mul(blocks)
+}
+
+/// Linux `statfs` fragment size: `f_frsize` when the kernel reports it, else
+/// `f_bsize`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_fragment_bytes(frsize: u64, bsize: u64) -> u64 {
+    if frsize > 0 { frsize } else { bsize }
+}
+
+/// Windows `GetDiskFreeSpaceExW` reports success as a nonzero BOOL. A zero
+/// total is treated as a failed probe, not a zero-byte disk.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn accepted_volume_total(ok: bool, total: u64) -> Option<u64> {
+    (ok && total > 0).then_some(total)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn win32_succeeded(ok: i32) -> bool {
+    ok != 0
+}
+
 // ── macOS ───────────────────────────────────────────────────────────────────
 //
 // `statfs` carries both answers directly: `MNT_LOCAL` is the kernel's own
@@ -275,22 +310,14 @@ fn classify_linux_magic(magic: i64) -> FsProbe {
 
 #[cfg(target_os = "macos")]
 fn statfs_total_bytes(stat: &libc::statfs) -> Option<u64> {
-    let bsize = u64::from(stat.f_bsize);
-    if bsize == 0 {
-        return None;
-    }
-    stat.f_blocks.checked_mul(bsize)
+    disk_bytes(u64::from(stat.f_bsize), stat.f_blocks)
 }
 
 #[cfg(target_os = "linux")]
 fn statfs_total_bytes(stat: &libc::statfs) -> Option<u64> {
-    let frag = if stat.f_frsize > 0 {
-        stat.f_frsize
-    } else {
-        stat.f_bsize
-    };
-    let frag = u64::try_from(frag).ok().filter(|&n| n > 0)?;
-    stat.f_blocks.checked_mul(frag)
+    let frsize = u64::try_from(stat.f_frsize).unwrap_or(0);
+    let bsize = u64::try_from(stat.f_bsize).unwrap_or(0);
+    disk_bytes(linux_fragment_bytes(frsize, bsize), stat.f_blocks)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -410,7 +437,7 @@ fn volume_total_bytes(path: &Path) -> Option<u64> {
             std::ptr::null_mut(),
         )
     };
-    (ok != 0 && total > 0).then_some(total)
+    accepted_volume_total(win32_succeeded(ok), total)
 }
 
 /// Volume mount root (`C:\`) holding `path`. Mirrors `link::windows_volume_root`

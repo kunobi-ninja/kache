@@ -10351,7 +10351,17 @@ mod tests {
             .expect("spawn fake daemon");
         let fake_pid = child.id();
 
-        let found = super::find_daemon_pids();
+        // `Command::spawn` returns after fork, before the child necessarily
+        // completes exec and exposes the fake daemon argv to `pgrep -f`.
+        // Poll that transition instead of racing it once.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let found = loop {
+            let found = super::find_daemon_pids();
+            if found.contains(&fake_pid) || Instant::now() >= deadline {
+                break found;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
 
         child.kill().expect("kill fake daemon");
         child.wait().expect("reap fake daemon");

@@ -1,5 +1,10 @@
-# Don't use kache to build kache (bootstrapping problem).
-export RUSTC_WRAPPER := ""
+# Build kache directly by default. CI may opt into using a released kache as
+# the wrapper; independent bare-build lanes still validate the current source.
+export RUSTC_WRAPPER := if env_var_or_default("KACHE_SELF_HOST", "") == "1" {
+  env_var_or_default("RUSTC_WRAPPER", "")
+} else {
+  ""
+}
 
 # On Windows, `just` runs each recipe line via `sh`, which Git for Windows
 # provides but does not put on PATH — so recipes (e.g. `just bench`) fail with

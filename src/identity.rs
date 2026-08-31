@@ -233,6 +233,8 @@ mod tests {
 
     #[test]
     fn lookup_keys_try_identity_then_legacy() {
+        let _lock = crate::config::config_path_lock();
+        let _guard = set_env("KACHE_MANIFEST_KEY", None);
         let keys = manifest_lookup_keys(Some("id/abcd/x86_64-unknown-linux-gnu/release"));
         assert_eq!(keys[0], "id/abcd/x86_64-unknown-linux-gnu/release");
         assert_eq!(
@@ -244,6 +246,8 @@ mod tests {
 
     #[test]
     fn lookup_keys_dedupe_when_identity_is_the_legacy_triple() {
+        let _lock = crate::config::config_path_lock();
+        let _guard = set_env("KACHE_MANIFEST_KEY", None);
         let legacy = host_target_triple_for(std::env::consts::ARCH, std::env::consts::OS);
         let keys = manifest_lookup_keys(Some(&legacy));
         assert_eq!(keys, vec![legacy]);
@@ -280,6 +284,8 @@ mod tests {
 
     #[test]
     fn lookup_keys_legacy_only_when_identity_is_blank() {
+        let _lock = crate::config::config_path_lock();
+        let _guard = set_env("KACHE_MANIFEST_KEY", None);
         let legacy = host_target_triple_for(std::env::consts::ARCH, std::env::consts::OS);
         assert_eq!(manifest_lookup_keys(None), vec![legacy.clone()]);
         assert_eq!(manifest_lookup_keys(Some("   ")), vec![legacy]);

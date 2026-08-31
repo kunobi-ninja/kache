@@ -5960,8 +5960,6 @@ mod tests {
         previous: Option<std::ffi::OsString>,
     }
 
-    static ENV_VAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(key);
@@ -9295,7 +9293,7 @@ mod tests {
         let blob = store.blob_path(&meta.files[0].hash);
         fs::set_permissions(&blob, fs::Permissions::from_mode(0o000)).unwrap();
 
-        let _env_lock = ENV_VAR_TEST_LOCK.lock().unwrap();
+        let _env_lock = crate::test_support::process_state_test_lock();
         let _verify = EnvVarGuard::set("KACHE_VERIFY_RESTORES", "always");
         let result = store.get("unreadable_key").unwrap();
 
@@ -11789,7 +11787,7 @@ mod tests {
         }
         std::fs::write(&blob, vec![b'X'; meta.files[0].size as usize]).unwrap();
 
-        let _env_lock = ENV_VAR_TEST_LOCK.lock().unwrap();
+        let _env_lock = crate::test_support::process_state_test_lock();
 
         // Guard OFF (default): size matches, content not checked -> still a hit.
         {

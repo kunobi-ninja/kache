@@ -5910,6 +5910,7 @@ mod tests {
     fn adaptive_policy_guard_tracks_kache_semantic_inputs() {
         const ENV_KEY: &str = "KACHE_WRAPPER_POLICY_GUARD_TEST";
 
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path().join("cache"));
         let baseline = adaptive_policy_guard(&config);
@@ -7538,6 +7539,7 @@ mod tests {
     fn stripped_fallback_receives_incremental_disabled_env() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let fallback = dir.path().join("fallback");
         let env_dump = dir.path().join("incremental-env.txt");
@@ -7755,6 +7757,7 @@ exit 0
     /// output; the scoped guard keeps the process-global var restored.
     #[test]
     fn progress_level_parses_supported_env_values() {
+        let _lock = crate::test_support::process_state_test_lock();
         let _guard = TestEnvGuard::remove("KACHE_PROGRESS");
         assert_eq!(progress_level(), 0);
 
@@ -10015,7 +10018,7 @@ exit 0
     #[test]
     fn event_root_override_reads_kache_event_root_env() {
         // KACHE_EVENT_ROOT, when set and non-empty, overrides the event root.
-        // No other unit test reads this var, so a scoped set/restore is safe.
+        let _lock = crate::test_support::process_state_test_lock();
         let _guard = TestEnvGuard::set("KACHE_EVENT_ROOT", "/some/forest/root");
         assert_eq!(
             event_root_override(),

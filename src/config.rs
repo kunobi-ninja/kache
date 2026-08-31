@@ -2627,8 +2627,10 @@ pub(crate) use tests::config_path_lock;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    // Config and compiler tests mutate process-wide env, including PATH. Share
+    // one lock with cache-key tests that read the same state.
+    pub(crate) use crate::test_support::process_state_test_lock as config_path_lock;
     use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
 
     /// kunobi-ninja/kache#319: executables are cached by default only where a
     /// restored binary keeps source-level debugging. Linux embeds DWARF; macOS
@@ -2643,18 +2645,6 @@ pub(crate) mod tests {
             cfg!(target_os = "linux") || cfg!(target_os = "macos"),
             "executables default on for Linux and macOS, off for Windows (see #319)"
         );
-    }
-
-    pub(crate) fn config_path_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        // Poison-tolerant: a test that panics while holding this lock must
-        // not cascade PoisonError panics into every unrelated env-guarded
-        // test behind it (#673). The guarded state is process environment
-        // that the panicking test's drop guards restore on unwind, so the
-        // inner guard is safe to adopt.
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
     }
 
     struct TestEnvGuard {

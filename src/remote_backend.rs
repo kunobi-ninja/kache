@@ -1623,21 +1623,27 @@ mod tests {
     async fn s3_wire_sends_custom_user_agent() {
         let (endpoint, requests) = mock_http_server(vec![http_response("404 Not Found", "")]).await;
 
-        struct ScopedEnvVar(&'static str);
+        struct ScopedEnvVar {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+
         impl ScopedEnvVar {
             fn set(key: &'static str, val: &str) -> Self {
+                let previous = std::env::var_os(key);
                 unsafe { std::env::set_var(key, val) };
-                Self(key)
-            }
-        }
-        impl Drop for ScopedEnvVar {
-            fn drop(&mut self) {
-                unsafe { std::env::remove_var(self.0) };
+                Self { key, previous }
             }
         }
 
-        let _access = ScopedEnvVar::set("KACHE_S3_ACCESS_KEY", "mock-access-key");
-        let _secret = ScopedEnvVar::set("KACHE_S3_SECRET_KEY", "mock-secret-key");
+        impl Drop for ScopedEnvVar {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(previous) => unsafe { std::env::set_var(self.key, previous) },
+                    None => unsafe { std::env::remove_var(self.key) },
+                }
+            }
+        }
 
         let config = S3RemoteConfig {
             bucket: "bucket".to_string(),
@@ -1646,7 +1652,12 @@ mod tests {
             profile: None,
             user_agent: Some("kache-custom-agent/9.9".to_string()),
         };
-        let operator = create_s3_operator(&config, 30).unwrap();
+        let operator = {
+            let _lock = crate::test_support::process_state_test_lock();
+            let _access = ScopedEnvVar::set("KACHE_S3_ACCESS_KEY", "mock-access-key");
+            let _secret = ScopedEnvVar::set("KACHE_S3_SECRET_KEY", "mock-secret-key");
+            create_s3_operator(&config, 30).unwrap()
+        };
         let backend = OpenDalBackend::new(operator, "s3://bucket".to_string());
 
         assert!(

@@ -215,7 +215,7 @@ mod tests {
     /// series than the panels expect.
     #[test]
     fn all_outcome_series_exist_before_any_request() {
-        let rendered = metrics().render();
+        let rendered = Metrics::new().render();
         for outcome in Outcome::ALL {
             let series = format!(
                 "kache_planner_requests_total{{outcome=\"{}\"}}",
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn recording_a_request_increments_its_outcome_only() {
-        let m = metrics();
+        let m = Metrics::new();
         m.record_request(Outcome::Execute, 0.01);
         let rendered = m.render();
         assert!(rendered.contains("kache_planner_requests_total{outcome=\"execute\"} 1"));
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn ready_gauge_tracks_both_directions() {
-        let m = metrics();
+        let m = Metrics::new();
 
         m.set_ready(false);
         assert_eq!(
@@ -284,7 +284,7 @@ mod tests {
     /// signal describing how much work a plan saves silently stayed empty.
     #[test]
     fn recording_plan_candidates_observes_the_histogram() {
-        let m = metrics();
+        let m = Metrics::new();
         let before = sample(&m.render(), "kache_planner_plan_candidates_count").unwrap_or(0.0);
         let sum_before = sample(&m.render(), "kache_planner_plan_candidates_sum").unwrap_or(0.0);
 

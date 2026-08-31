@@ -129,6 +129,12 @@ fn router(state: AppState) -> Router {
 pub async fn serve(config: PlannerConfig) -> Result<()> {
     let bind = config.bind;
     let planner_name = normalize_name(config.planner_name.clone());
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("binding planner listener on {bind}"))?;
+    let local_addr = listener
+        .local_addr()
+        .context("reading planner local address")?;
     let state = AppState {
         token: normalize_optional(config.token.clone()),
         planner_name: planner_name.clone(),
@@ -139,21 +145,27 @@ pub async fn serve(config: PlannerConfig) -> Result<()> {
     let (ha_done_tx, ha_done_rx) = watch::channel(false);
 
     if config.ha.enabled {
-        let leader = run_leader(config.clone(), state, |namespace, lease_name| async move {
-            let client = kube::Client::try_default()
-                .await
-                .context("creating Kubernetes client for HA leader election")?;
-            let leader =
-                kunobi_ha::leader::LeaderElection::builder(client, namespace, lease_name).build();
-            let mut guard = leader
-                .acquire()
-                .await
-                .context("acquiring kache planner leadership")?;
+        let leader = run_leader(
+            config.clone(),
+            state,
+            |namespace, lease_name| async move {
+                let client = kube::Client::try_default()
+                    .await
+                    .context("creating Kubernetes client for HA leader election")?;
+                let leader =
+                    kunobi_ha::leader::LeaderElection::builder(client, namespace, lease_name)
+                        .build();
+                let mut guard = leader
+                    .acquire()
+                    .await
+                    .context("acquiring kache planner leadership")?;
 
-            Ok::<_, anyhow::Error>(async move {
-                guard.lost().await;
-            })
-        });
+                Ok::<_, anyhow::Error>(async move {
+                    guard.lost().await;
+                })
+            },
+            |config| async move { load_repository(&config).await },
+        );
         spawn_leader_future(leader, ha_done_tx);
     } else {
         let repository = load_repository(&config).await?;
@@ -161,13 +173,6 @@ pub async fn serve(config: PlannerConfig) -> Result<()> {
         state.ready.store(true, Ordering::Release);
         metrics::metrics().set_ready(true);
     }
-
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("binding planner listener on {bind}"))?;
-    let local_addr = listener
-        .local_addr()
-        .context("reading planner local address")?;
 
     tracing::info!(bind = %local_addr, planner = %planner_name, "planner listening");
 
@@ -206,15 +211,18 @@ fn spawn_leader_future(
     });
 }
 
-async fn run_leader<Acquire, AcquireFuture, LeadershipLost>(
+async fn run_leader<Acquire, AcquireFuture, LeadershipLost, LoadRepository, LoadRepositoryFuture>(
     config: PlannerConfig,
     state: AppState,
     acquire: Acquire,
+    load: LoadRepository,
 ) -> Result<()>
 where
     Acquire: FnOnce(String, String) -> AcquireFuture,
     AcquireFuture: Future<Output = Result<LeadershipLost>>,
     LeadershipLost: Future<Output = ()>,
+    LoadRepository: FnOnce(PlannerConfig) -> LoadRepositoryFuture,
+    LoadRepositoryFuture: Future<Output = Result<Option<SharedPlannerDataSource>>>,
 {
     let namespace = ha_namespace(&config.ha)?;
     let lease_name = normalize_name(config.ha.lease_name.clone());
@@ -223,7 +231,7 @@ where
     let leadership_lost = acquire(namespace.clone(), lease_name.clone()).await?;
     tracing::info!(namespace = %namespace, lease = %lease_name, "acquired kache planner leadership");
 
-    let repository = load_repository(&config).await?;
+    let repository = load(config).await?;
     *state.repository.write().await = repository;
     state.ready.store(true, Ordering::Release);
     metrics::metrics().set_ready(true);
@@ -467,6 +475,34 @@ mod tests {
     use std::collections::HashMap;
     use tower::util::ServiceExt;
 
+    struct EmptyPlannerDataSource;
+
+    #[async_trait::async_trait]
+    impl PlannerDataSource for EmptyPlannerDataSource {
+        async fn shard_candidates(
+            &self,
+            _namespace: &str,
+            _deps: &[(String, String)],
+        ) -> Result<Vec<PrefetchCandidate>> {
+            Ok(Vec::new())
+        }
+
+        async fn history_candidates(
+            &self,
+            _crate_names: &[String],
+        ) -> Result<Vec<PrefetchCandidate>> {
+            Ok(Vec::new())
+        }
+
+        async fn key_cache_keys_for_crate(&self, _crate_name: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn identity_candidates(&self, _identity_key: &str) -> Result<Vec<PrefetchCandidate>> {
+            Ok(Vec::new())
+        }
+    }
+
     fn test_config(db_path: PathBuf) -> PlannerConfig {
         PlannerConfig {
             bind: "127.0.0.1:8080".parse().unwrap(),
@@ -596,14 +632,20 @@ mod tests {
         let acquisition_from_task = Arc::clone(&acquisition);
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let leader = tokio::spawn(run_leader(config, state, move |namespace, lease_name| {
-            *acquisition_from_task.lock().unwrap() = Some((namespace, lease_name));
-            async move {
-                Ok(async move {
-                    let _ = release_rx.await;
-                })
-            }
-        }));
+        let repository: SharedPlannerDataSource = Arc::new(EmptyPlannerDataSource);
+        let leader = tokio::spawn(run_leader(
+            config,
+            state,
+            move |namespace, lease_name| {
+                *acquisition_from_task.lock().unwrap() = Some((namespace, lease_name));
+                async move {
+                    Ok(async move {
+                        let _ = release_rx.await;
+                    })
+                }
+            },
+            move |_| async move { Ok(Some(repository)) },
+        ));
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while acquisition.lock().unwrap().is_none() {

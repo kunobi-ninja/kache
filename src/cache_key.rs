@@ -1410,6 +1410,14 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] unstable:{}", crate_name, z);
     }
 
+    // Parallel frontend compilation changes the compiler execution mode and
+    // can affect emitted artifacts. Preserve occurrence order because rustc
+    // applies repeated values last-wins.
+    for jobs in &args.frontend_jobs {
+        fold_field(&mut hasher, b"frontend_jobs.v1:", jobs.as_bytes());
+        tracing::trace!("[key:{}] frontend_jobs:{}", crate_name, jobs);
+    }
+
     // Residual argv tokens (kunobi-ninja/kache#324): flags kache does not model
     // explicitly still reach rustc and can affect codegen (for example a
     // future flag), yet were previously invisible to the key — the `_ => {}`
@@ -6131,6 +6139,35 @@ mod tests {
         assert_ne!(
             shorthand_then_explicit, explicit_then_shorthand,
             "rustc applies optimization flags last-wins, so opposite orders must not collide"
+        );
+    }
+
+    #[test]
+    fn frontend_jobs_spellings_share_a_key_and_values_remain_ordered() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+        let none = key_of_flags(&flag_base(&source, &[]));
+        let separated = key_of_flags(&flag_base(&source, &["--jobs-frontend", "16"]));
+        let attached = key_of_flags(&flag_base(&source, &["--jobs-frontend=16"]));
+        let different = key_of_flags(&flag_base(&source, &["--jobs-frontend=8"]));
+        let order_4_8 = key_of_flags(&flag_base(
+            &source,
+            &["--jobs-frontend=4", "--jobs-frontend=8"],
+        ));
+        let order_8_4 = key_of_flags(&flag_base(
+            &source,
+            &["--jobs-frontend=8", "--jobs-frontend=4"],
+        ));
+
+        assert_ne!(none, attached, "frontend jobs must affect the key");
+        assert_eq!(separated, attached, "both rustc spellings are equivalent");
+        assert_ne!(attached, different, "worker count must affect the key");
+        assert_ne!(
+            order_4_8, order_8_4,
+            "repeated last-wins values must preserve argv order"
         );
     }
 

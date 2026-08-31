@@ -234,7 +234,13 @@ use std::path::{Path, PathBuf};
 // WASM admission is explicit for rustc-bundled self-contained targets.
 // Shared with the cc recipe, so local and remote Rust/C entries from v28
 // are unreachable; `kache gc --stale-schema` reclaims them.
-pub(crate) const CACHE_KEY_VERSION: u32 = 29;
+//
+// v30: native Windows MSVC links now pin the validated link.exe/lld-link and
+// cl banners, selected architecture, MSVC/SDK/UCRT versions, and hashes of
+// the selected CRT/UCRT libraries. Windows GNU, cross-target, and metadata
+// invocations remain unprobed. Existing Windows linked-output keys did not
+// contain this identity, so invalidate them rather than mix schemas.
+pub(crate) const CACHE_KEY_VERSION: u32 = 30;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -1368,10 +1374,12 @@ pub fn compute_cache_key(
     // Resolve each `static=` lib against the kept build-script search dirs and
     // fold its content hash. Phase 1 is deliberately narrow — only `static=`
     // (the bundled, output-affecting case) and only build-script `native=`/bare
-    // dirs (the OUT_DIR false-hit trigger). `dylib=` is referenced, not bundled,
-    // so its content does not change this output and is left name-only; an
-    // unresolved lib (system libs, custom layouts) also falls back to name-only,
-    // never a false hit.
+    // dirs (the OUT_DIR false-hit trigger). `dylib=` is normally referenced
+    // rather than bundled and is left name-only here. Direct command-line
+    // native Windows MSVC libraries are handled separately below: their
+    // import-library bytes affect the executable and are hashed as part of the
+    // host link identity. Libraries inherited only through rlib metadata are
+    // not exposed in this argv and are outside that direct-input identity.
     // Linker order/section-order/map files and opaque response files require
     // side-input/output handling beyond the archive key. Fail closed instead
     // of caching an invocation whose auxiliary behavior cannot be reproduced.
@@ -1513,13 +1521,13 @@ pub fn compute_cache_key(
 
     // Linker identity for bin/dylib targets
     hasher.set_group("link");
-    if args.is_executable_output()
-        && let Some(linker_id) = get_linker_identity(args)
-    {
-        hasher.update(b"linker:");
-        hasher.update(linker_id.as_bytes());
-        hasher.update(b"\n");
-    }
+    let native_windows_msvc = is_native_windows_msvc_link(
+        args,
+        &rustc_version,
+        cfg!(target_os = "windows"),
+        get_rustc_version,
+    )?;
+    fold_generic_linker_identity(&mut hasher, args, native_windows_msvc, get_linker_identity);
 
     // A native Linux linked artifact also depends on the host libc ABI. The
     // rustc host triple does not include the libc version, so two machines with
@@ -1556,6 +1564,31 @@ pub fn compute_cache_key(
             None => anyhow::bail!("the macOS SDK could not be identified"),
         },
         std::env::var("MACOSX_DEPLOYMENT_TARGET").ok(),
+    )?;
+
+    // Native Windows MSVC links depend on the selected COFF linker/compiler,
+    // the architecture-specific MSVC/SDK/UCRT environment, and the runtime
+    // import/static libraries. The probe is strictly host-native: metadata,
+    // cross-target links, and windows-gnu links must remain portable and must
+    // not execute or inspect host tools. A failed probe bubbles out so the
+    // wrapper passes through rather than sharing an unidentified executable.
+    fold_native_windows_msvc_identity(
+        &mut hasher,
+        args,
+        &rustc_version,
+        cfg!(target_os = "windows"),
+        |linker, architecture| {
+            let search_dirs = windows_native_link_search_dirs(args)?;
+            crate::native_link_key::probe_windows_msvc_identity_with_library_dirs(
+                linker,
+                architecture,
+                &search_dirs.rustc,
+                &search_dirs.linker,
+                &args.link_libs,
+                |path| file_hasher.hash_static_lib(path),
+            )
+            .map(|identity| identity.encode())
+        },
     )?;
 
     // Path remapping status: kache injects multi-prefix
@@ -3930,7 +3963,7 @@ fn native_linux_libc_family(
         .with_context(|| format!("unsupported native Linux libc in rustc host triple {host}"))
 }
 
-fn rustc_version_for_libc<'a, F>(
+fn rustc_version_for_native_link<'a, F>(
     args: &RustcArgs,
     outer_rustc_version: &'a str,
     load_version: F,
@@ -3941,7 +3974,7 @@ where
     match args.inner_rustc.as_deref() {
         Some(inner) => load_version(inner)
             .map(Cow::Owned)
-            .context("reading inner rustc version for native Linux libc key"),
+            .context("reading inner rustc version for native host link key"),
         None => Ok(Cow::Borrowed(outer_rustc_version)),
     }
 }
@@ -3968,7 +4001,7 @@ where
     if !running_on_linux || !args.is_executable_output() || !emits_link {
         return Ok(());
     }
-    let rustc_version = rustc_version_for_libc(args, rustc_version, get_rustc_version)?;
+    let rustc_version = rustc_version_for_native_link(args, rustc_version, get_rustc_version)?;
 
     let Some(family) = native_linux_libc_family(args, &rustc_version, running_on_linux)? else {
         return Ok(());
@@ -4017,7 +4050,7 @@ where
     if !running_on_linux && !running_on_macos {
         return Ok(());
     }
-    let rustc_version = rustc_version_for_libc(args, rustc_version, get_rustc_version)?;
+    let rustc_version = rustc_version_for_native_link(args, rustc_version, get_rustc_version)?;
     let host = rustc_host_triple(&rustc_version)
         .context("wrapped rustc -vV output has no host triple; cannot key native link runtime")?;
     let effective_target = args.target.as_deref().unwrap_or(host);
@@ -4056,6 +4089,178 @@ where
             );
         }
     }
+    Ok(())
+}
+
+/// Extract the effective native library search directories that can shadow
+/// the MSVC/SDK defaults. `-L native/all` entries are already parsed by rustc;
+/// `/LIBPATH` is accepted only in an unambiguous single-argument form.
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsNativeLinkSearchDirs {
+    /// Directories rustc searches before passing a library name to LINK.
+    rustc: Vec<PathBuf>,
+    /// Directories emitted to LINK before the LIB environment paths.
+    linker: Vec<PathBuf>,
+}
+
+fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLinkSearchDirs> {
+    const KNOWN_L_KINDS: [&str; 5] = ["dependency", "crate", "native", "framework", "all"];
+    let mut rustc = Vec::new();
+    for spec in &args.link_search {
+        let (kind, path) = match spec.split_once('=') {
+            Some((kind, path)) if KNOWN_L_KINDS.contains(&kind) => (Some(kind), path),
+            _ => (None, spec.as_str()),
+        };
+        if matches!(kind, Some("dependency") | Some("crate")) {
+            continue;
+        }
+        if matches!(kind, None | Some("native") | Some("all")) {
+            rustc.push(PathBuf::from(path));
+        }
+    }
+    let mut linker = rustc.clone();
+    for (key, value) in &args.codegen_opts {
+        if !matches!(key.as_str(), "link-arg" | "link-args") {
+            continue;
+        }
+        let Some(value) = value.as_deref() else {
+            continue;
+        };
+        if windows_link_arg_has_unmodeled_library(value) {
+            anyhow::bail!("explicit Windows .lib/DEFAULTLIB linker arguments are not cacheable");
+        }
+        if let Some(path) = windows_libpath_argument(value)? {
+            linker.push(PathBuf::from(path));
+        }
+    }
+    Ok(WindowsNativeLinkSearchDirs { rustc, linker })
+}
+
+fn windows_libpath_argument(value: &str) -> Result<Option<String>> {
+    let value = value.trim();
+    let value = value.strip_prefix("-Wl,").unwrap_or(value);
+    let upper = value.to_ascii_uppercase();
+    let marker = ["/LIBPATH:", "/LIBPATH=", "-LIBPATH:", "-LIBPATH="]
+        .into_iter()
+        .find(|marker| upper.starts_with(*marker));
+    let Some(marker) = marker else {
+        if upper.contains("/LIBPATH") || upper.contains("-LIBPATH") {
+            anyhow::bail!("ambiguous Windows /LIBPATH linker argument");
+        }
+        return Ok(None);
+    };
+    let path = value[marker.len()..].trim();
+    let path = if let Some(quoted) = path.strip_prefix('"') {
+        let closing = quoted
+            .find('"')
+            .context("unterminated quoted Windows /LIBPATH linker argument")?;
+        if !quoted[closing + 1..].trim().is_empty() {
+            anyhow::bail!("ambiguous Windows /LIBPATH linker argument");
+        }
+        quoted[..closing].trim()
+    } else {
+        if path.contains('"') || path.chars().any(char::is_whitespace) {
+            anyhow::bail!("ambiguous Windows /LIBPATH linker argument");
+        }
+        path
+    };
+    if path.is_empty() {
+        anyhow::bail!("empty Windows /LIBPATH linker argument");
+    }
+    Ok(Some(path.to_string()))
+}
+
+fn windows_link_arg_has_unmodeled_library(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains(".lib") || value.contains("/defaultlib") || value.contains("-defaultlib")
+}
+
+fn fold_generic_linker_identity<H, Get>(
+    hasher: &mut H,
+    args: &RustcArgs,
+    native_windows_msvc: bool,
+    get_identity: Get,
+) where
+    H: KeyFold,
+    Get: FnOnce(&RustcArgs) -> Option<String>,
+{
+    if args.is_executable_output()
+        && args.emits_link()
+        && !native_windows_msvc
+        && let Some(linker_id) = get_identity(args)
+    {
+        hasher.update(b"linker:");
+        hasher.update(linker_id.as_bytes());
+        hasher.update(b"\n");
+    }
+}
+
+/// Native Windows MSVC links use the complete toolchain/runtime identity below
+/// as their sole linker signal. Folding the generic `cc --version` probe too
+/// would make the key depend on an unrelated Unix-style driver that happens to
+/// be on PATH.
+fn is_native_windows_msvc_link<Load>(
+    args: &RustcArgs,
+    rustc_version: &str,
+    running_on_windows: bool,
+    load_version: Load,
+) -> Result<bool>
+where
+    Load: FnOnce(&Path) -> Result<String>,
+{
+    if !running_on_windows || !args.is_executable_output() || !args.emits_link() {
+        return Ok(false);
+    }
+    let rustc_version = rustc_version_for_native_link(args, rustc_version, load_version)?;
+    let host = rustc_host_triple(&rustc_version)
+        .context("wrapped rustc -vV output has no host triple; cannot key native Windows link")?;
+    let effective_target = args.target.as_deref().unwrap_or(host);
+    Ok(effective_target == host && crate::native_link_key::is_windows_msvc_target(host))
+}
+
+/// Fold the selected native Windows MSVC link identity into a linked-output
+/// key. The probe is injected so the admission gate can be tested without a
+/// Windows toolchain; production supplies the real tool/library discovery.
+fn fold_native_windows_msvc_identity<H, Probe>(
+    hasher: &mut H,
+    args: &RustcArgs,
+    rustc_version: &str,
+    running_on_windows: bool,
+    probe: Probe,
+) -> Result<()>
+where
+    H: KeyFold,
+    Probe: FnOnce(Option<&Path>, &str) -> Result<String>,
+{
+    if !running_on_windows || !args.is_executable_output() || !args.emits_link() {
+        return Ok(());
+    }
+    let rustc_version = rustc_version_for_native_link(args, rustc_version, get_rustc_version)?;
+    let host = rustc_host_triple(&rustc_version)
+        .context("wrapped rustc -vV output has no host triple; cannot key native Windows link")?;
+    let effective_target = args.target.as_deref().unwrap_or(host);
+    if effective_target != host {
+        if crate::native_link_key::is_windows_msvc_target(effective_target) {
+            anyhow::bail!(
+                "cross-target Windows MSVC link identity is not modeled; passing through"
+            );
+        }
+        return Ok(());
+    }
+    if !crate::native_link_key::is_windows_msvc_target(host) {
+        return Ok(());
+    }
+    let architecture = crate::native_link_key::windows_msvc_architecture(host)
+        .context("native Windows MSVC host has an unsupported architecture")?;
+    let linker = args.get_codegen_opt("linker").map(Path::new);
+    let identity =
+        probe(linker, architecture).context("determining native Windows MSVC link identity")?;
+    fold_field(&mut *hasher, b"host_windows_msvc.v1:", identity.as_bytes());
+    tracing::trace!(
+        "[key:{}] host_windows_msvc={}",
+        args.crate_name.as_deref().unwrap_or("unknown"),
+        identity.replace('\n', ",")
+    );
     Ok(())
 }
 
@@ -4456,7 +4661,7 @@ mod tests {
     fn double_wrapper_uses_inner_rustc_host_banner() {
         let mut bin = parsed_crate_type("bin", None);
         bin.inner_rustc = Some(PathBuf::from("/toolchain/bin/rustc"));
-        let version = rustc_version_for_libc(&bin, "clippy 0.1.90\n", |path| {
+        let version = rustc_version_for_native_link(&bin, "clippy 0.1.90\n", |path| {
             assert_eq!(path, Path::new("/toolchain/bin/rustc"));
             Ok(GNU_RUSTC_VERSION.to_string())
         })
@@ -4661,6 +4866,306 @@ mod tests {
         assert_ne!(
             old, with_dt,
             "MACOSX_DEPLOYMENT_TARGET must re-key when set"
+        );
+    }
+
+    const WINDOWS_RUSTC_VERSION: &str =
+        "rustc 1.90.0\nhost: x86_64-pc-windows-msvc\nrelease: 1.90.0\n";
+
+    fn windows_fold_key_on_host(
+        args: &RustcArgs,
+        version: &str,
+        identity: &str,
+        running_on_windows: bool,
+    ) -> Result<String> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"base-key");
+        fold_native_windows_msvc_identity(
+            &mut hasher,
+            args,
+            version,
+            running_on_windows,
+            |_, _| Ok(identity.to_string()),
+        )?;
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    fn windows_fold_key(args: &RustcArgs, version: &str, identity: &str) -> Result<String> {
+        windows_fold_key_on_host(args, version, identity, true)
+    }
+
+    #[test]
+    fn native_windows_msvc_identity_keys_only_native_link_outputs() {
+        let bin = parsed_crate_type("bin", None);
+        let old = windows_fold_key(&bin, WINDOWS_RUSTC_VERSION, "toolset=14.4").unwrap();
+        let new = windows_fold_key(&bin, WINDOWS_RUSTC_VERSION, "toolset=14.5").unwrap();
+        assert_ne!(old, new);
+
+        let mut metadata = bin.clone();
+        metadata.emit = vec!["metadata".into()];
+        assert_eq!(
+            windows_fold_key(&metadata, WINDOWS_RUSTC_VERSION, "probe must not run").unwrap(),
+            windows_fold_key(&metadata, WINDOWS_RUSTC_VERSION, "anything").unwrap()
+        );
+
+        let cross = parsed_crate_type("bin", Some("aarch64-pc-windows-msvc"));
+        assert!(
+            windows_fold_key(&cross, WINDOWS_RUSTC_VERSION, "probe must not run").is_err(),
+            "cross-target Windows MSVC links must pass through until target identity is modeled"
+        );
+
+        let gnu = parsed_crate_type("bin", Some("x86_64-pc-windows-gnu"));
+        assert_eq!(
+            windows_fold_key(&gnu, WINDOWS_RUSTC_VERSION, "probe must not run").unwrap(),
+            windows_fold_key(&gnu, WINDOWS_RUSTC_VERSION, "anything").unwrap()
+        );
+
+        let rlib = parsed_crate_type("rlib", None);
+        assert_eq!(
+            windows_fold_key(&rlib, WINDOWS_RUSTC_VERSION, "probe must not run").unwrap(),
+            windows_fold_key(&rlib, WINDOWS_RUSTC_VERSION, "anything").unwrap()
+        );
+
+        assert_eq!(
+            windows_fold_key_on_host(&bin, WINDOWS_RUSTC_VERSION, "probe must not run", false)
+                .unwrap(),
+            windows_fold_key_on_host(&bin, WINDOWS_RUSTC_VERSION, "anything", false).unwrap(),
+            "a non-Windows host must not probe native MSVC inputs"
+        );
+    }
+
+    #[test]
+    fn native_windows_msvc_detection_requires_a_windows_linked_executable() {
+        let bin = parsed_crate_type("bin", None);
+        let mut metadata = bin.clone();
+        metadata.emit = vec!["metadata".into()];
+        let rlib = parsed_crate_type("rlib", None);
+
+        for (args, running_on_windows) in [(&bin, false), (&metadata, true), (&rlib, true)] {
+            assert!(
+                !is_native_windows_msvc_link(
+                    args,
+                    WINDOWS_RUSTC_VERSION,
+                    running_on_windows,
+                    |_| unreachable!("the supplied rustc version must be reused"),
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn native_windows_msvc_ignores_unrelated_generic_cc_identity() {
+        let bin = parsed_crate_type("bin", None);
+        assert!(
+            is_native_windows_msvc_link(&bin, WINDOWS_RUSTC_VERSION, true, |_| unreachable!(
+                "non-nested rustc must use the supplied version"
+            ),)
+            .unwrap()
+        );
+
+        let fold = |identity: &str| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"base-key");
+            fold_generic_linker_identity(&mut hasher, &bin, true, |_| Some(identity.to_string()));
+            hasher.finalize()
+        };
+        assert_eq!(
+            fold("unrelated MinGW cc"),
+            fold("no cc installed"),
+            "native MSVC keys must not depend on an unrelated generic cc probe"
+        );
+
+        let mut generic = blake3::Hasher::new();
+        generic.update(b"base-key");
+        fold_generic_linker_identity(&mut generic, &bin, false, |_| {
+            Some("actual generic linker".into())
+        });
+        assert_ne!(generic.finalize(), fold("anything"));
+    }
+
+    #[test]
+    fn native_windows_msvc_identity_probe_failure_is_cache_failure() {
+        let bin = parsed_crate_type("bin", None);
+        let mut hasher = blake3::Hasher::new();
+        let error = fold_native_windows_msvc_identity(
+            &mut hasher,
+            &bin,
+            WINDOWS_RUSTC_VERSION,
+            true,
+            |_, _| anyhow::bail!("ambiguous toolchain"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native Windows MSVC link identity")
+        );
+    }
+
+    #[test]
+    fn windows_native_link_search_dirs_include_l_and_libpath_and_reject_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir.path().join("native");
+        let libpath = dir.path().join("libpath");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::create_dir_all(&libpath).unwrap();
+        let args = RustcArgs::parse(&[
+            "rustc".into(),
+            "--crate-type=bin".into(),
+            "-L".into(),
+            format!("native={}", native.display()),
+            format!("-Clink-arg=/LIBPATH:{}", libpath.display()),
+        ])
+        .unwrap();
+        assert_eq!(
+            windows_native_link_search_dirs(&args).unwrap(),
+            WindowsNativeLinkSearchDirs {
+                rustc: vec![native.clone()],
+                linker: vec![native, libpath],
+            }
+        );
+
+        let ambiguous = RustcArgs::parse(&[
+            "rustc".into(),
+            "--crate-type=bin".into(),
+            "-Clink-args=/DEFAULTLIB:foo /LIBPATH".into(),
+        ])
+        .unwrap();
+        assert!(windows_native_link_search_dirs(&ambiguous).is_err());
+
+        for linker_arg in [
+            "foo.lib",
+            "/DEFAULTLIB:foo",
+            "-defaultlib:foo",
+            "/DEFAULTLIB:foo.lib",
+        ] {
+            let args = RustcArgs::parse(&[
+                "rustc".into(),
+                "--crate-type=bin".into(),
+                format!("-Clink-arg={linker_arg}"),
+            ])
+            .unwrap();
+            assert!(
+                windows_native_link_search_dirs(&args).is_err(),
+                "unmodeled Windows library argument must fail closed: {linker_arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_libpath_parser_accepts_one_exact_argument() {
+        for (argument, expected) in [
+            (r"/LIBPATH:C:\sdk\lib", r"C:\sdk\lib"),
+            (r"/libpath=C:\sdk\lib", r"C:\sdk\lib"),
+            (r"-LIBPATH:C:\lld\lib", r"C:\lld\lib"),
+            (r"-libpath=C:\lld\lib", r"C:\lld\lib"),
+            (
+                r#"/LIBPATH:"C:\Program Files\SDK\lib""#,
+                r"C:\Program Files\SDK\lib",
+            ),
+            (
+                r#"-Wl,/LIBPATH:"C:\Program Files\SDK\lib""#,
+                r"C:\Program Files\SDK\lib",
+            ),
+            (
+                r#"-Wl,-LiBpAtH:"C:\Program Files\LLVM\lib""#,
+                r"C:\Program Files\LLVM\lib",
+            ),
+        ] {
+            assert_eq!(
+                windows_libpath_argument(argument).unwrap().as_deref(),
+                Some(expected),
+                "{argument}"
+            );
+        }
+        assert_eq!(windows_libpath_argument("/DEBUG").unwrap(), None);
+
+        for argument in [
+            "/LIBPATH:",
+            r#"/LIBPATH:"C:\unterminated"#,
+            r#"/LIBPATH:"C:\sdk\lib" /DEBUG"#,
+            r"/LIBPATH:C:\Program Files\SDK\lib",
+            r"/DEBUG /LIBPATH:C:\sdk\lib",
+            r"/DEBUG -LIBPATH:C:\lld\lib",
+            r"-Wl,/DEBUG,-LIBPATH:C:\lld\lib",
+        ] {
+            assert!(
+                windows_libpath_argument(argument).is_err(),
+                "ambiguous or empty argument must fail closed: {argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_lld_libpath_preserves_shadowing_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("lld-first");
+        let second = directory.path().join("link-second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("shadowed.lib"), b"first").unwrap();
+        std::fs::write(second.join("shadowed.lib"), b"second").unwrap();
+        let args = RustcArgs::parse(&[
+            "rustc".into(),
+            "--crate-type=bin".into(),
+            format!("-Clink-arg=-LIBPATH:{}", first.display()),
+            format!("-Clink-arg=/LIBPATH:{}", second.display()),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            windows_native_link_search_dirs(&args).unwrap(),
+            WindowsNativeLinkSearchDirs {
+                rustc: Vec::new(),
+                linker: vec![first, second],
+            }
+        );
+    }
+
+    #[test]
+    fn windows_native_link_search_dirs_honor_only_linker_visible_l_kinds() {
+        let directory = tempfile::tempdir().unwrap();
+        let native = directory.path().join("native");
+        let all = directory.path().join("all");
+        let bare = directory.path().join("bare");
+        let libpath = directory.path().join("path with spaces");
+        let unknown = format!("custom={}", directory.path().join("unknown").display());
+        for path in [&native, &all, &bare, &libpath] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let args = RustcArgs::parse(&[
+            "rustc".into(),
+            "--crate-type=bin".into(),
+            "-L".into(),
+            format!("native={}", native.display()),
+            format!("-Lall={}", all.display()),
+            format!("-L{}", bare.display()),
+            format!("-L{unknown}"),
+            format!(
+                "-Ldependency={}",
+                directory.path().join("dependency").display()
+            ),
+            format!("-Lcrate={}", directory.path().join("crate").display()),
+            format!(
+                "-Lframework={}",
+                directory.path().join("framework").display()
+            ),
+            format!(r#"-Clink-arg=/LIBPATH:"{}""#, libpath.display()),
+            "-Clink-arg=/DEBUG".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            windows_native_link_search_dirs(&args).unwrap(),
+            WindowsNativeLinkSearchDirs {
+                rustc: vec![
+                    native.clone(),
+                    all.clone(),
+                    bare.clone(),
+                    PathBuf::from(unknown.clone())
+                ],
+                linker: vec![native, all, bare, PathBuf::from(unknown), libpath],
+            }
         );
     }
 

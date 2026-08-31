@@ -183,6 +183,13 @@ gitignore = true
 # lane cannot compile. Their sizing and validation rules are extracted into
 # platform-neutral helpers and stay mutation-tested here; hosted platform tests
 # exercise the real wrappers.
+#
+# Installed MSVC discovery is a Windows-only adapter around find-msvc-tools.
+# The Ubuntu mutation lane cannot compile that body, while replacing the
+# non-Windows stub with `Ok(())` is value-identical. Keep only that whole-body
+# replacement out of this lane. Cross-platform tests cover the environment
+# guard and composition helpers; the hosted Windows test runs the real adapter
+# without requiring a developer prompt.
  #
 # The service repository has no identity-manifest store yet, so its
 # `identity_candidates` implementation returns `Ok(Vec::new())`. Replacing that
@@ -234,5 +241,6 @@ exclude_re = [
     "src/cache_fs.rs:.*replace probe_windows",
     "src/cache_fs.rs:.*replace statfs_total_bytes_macos",
     "src/cache_fs.rs:.*replace volume_total_bytes_windows",
+    "src/native_link_key.rs:.*replace WindowsProbeEnvironment::augment_from_installed_msvc .* with Ok",
     "SurrealPlannerRepository>::identity_candidates .* with Ok\\(vec!\\[\\]\\)",
 ]

@@ -460,7 +460,7 @@ impl RemoteBreaker {
         Self::with_policy(REMOTE_FAILURE_THRESHOLD, REMOTE_DEGRADED_FOR)
     }
 
-    fn with_policy(threshold: u32, cooldown: Duration) -> Self {
+    pub(crate) fn with_policy(threshold: u32, cooldown: Duration) -> Self {
         let make = |direction| {
             Arc::new(DirectionBreaker {
                 direction,
@@ -515,6 +515,38 @@ impl RemoteBreaker {
             probe,
             finished: false,
         })
+    }
+
+    /// Admit speculative work only while the direction is fully closed.
+    /// Lookahead must not consume the one half-open probe needed by demand or
+    /// by work selected after the lookahead result is known.
+    pub(crate) fn try_acquire_speculative(
+        &self,
+        operation: RemoteOperation,
+    ) -> Option<BreakerPermit> {
+        let breaker = Arc::clone(self.direction(operation.direction()));
+        let state = breaker.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !matches!(state.mode, BreakerMode::Closed) {
+            return None;
+        }
+        let epoch = state.epoch;
+        drop(state);
+        Some(BreakerPermit {
+            breaker,
+            operation,
+            epoch,
+            probe: false,
+            finished: false,
+        })
+    }
+
+    /// Cheap first-pass check for optional work. Callers must still use
+    /// [`Self::try_acquire_speculative`] immediately before dispatch because
+    /// the direction can degrade while they wait for other admission gates.
+    pub(crate) fn can_attempt_speculative(&self, operation: RemoteOperation) -> bool {
+        let breaker = self.direction(operation.direction());
+        let state = breaker.state.lock().unwrap_or_else(|p| p.into_inner());
+        matches!(state.mode, BreakerMode::Closed)
     }
 
     pub(crate) fn is_direction_degraded(&self, direction: RemoteDirection) -> bool {

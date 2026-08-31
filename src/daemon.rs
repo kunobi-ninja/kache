@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,10 +16,16 @@ use tokio::sync::{Notify, RwLock};
 use crate::config::{Config, UPLOAD_SPOOL_MAX_JOBS};
 use crate::events;
 use crate::remote_resilience::{
-    KeyedSingleflight, NegativeKeyCache, RemoteBreaker, RemoteDeadline, RemoteErrorClass,
-    RemoteOperation, SingleflightClaim, classify_remote_error,
+    BreakerPermit, KeyedSingleflight, NegativeKeyCache, RemoteBreaker, RemoteDeadline,
+    RemoteErrorClass, RemoteOperation, SingleflightClaim, classify_remote_error,
 };
 use crate::store::Store;
+
+#[derive(Debug)]
+pub(crate) enum SpeculativeManifestOutcome {
+    Completed(Option<crate::remote::BuildManifest>),
+    NotAdmitted,
+}
 
 const KEY_CACHE_AUTHORITATIVE_MULTIPLIER: u64 = 5;
 // A slower LIST cadence must not let stale negative entries suppress exact
@@ -2464,16 +2471,109 @@ impl Daemon {
         &self,
         manifest_key: &str,
     ) -> Result<Option<crate::remote::BuildManifest>> {
+        if self.config.remote.is_none() {
+            return Err(anyhow::anyhow!("no remote configured"));
+        }
+        let breaker = self
+            .remote_breaker
+            .try_acquire(RemoteOperation::ManifestGet)
+            .ok_or_else(|| anyhow::anyhow!("remote read breaker open"))?;
+        self.download_planner_manifest_with_permit(manifest_key, breaker)
+            .await
+    }
+
+    /// Attempt a speculative identity-manifest fetch without taking the read
+    /// breaker's half-open recovery probe. A typed `NotAdmitted` result lets
+    /// fallback planning perform the ordinary lookup without conflating it
+    /// with a completed remote miss.
+    pub(crate) async fn download_planner_manifest_speculative(
+        &self,
+        manifest_key: &str,
+    ) -> Result<SpeculativeManifestOutcome> {
+        let remote = self
+            .config
+            .remote
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
+        if !self
+            .remote_breaker
+            .can_attempt_speculative(RemoteOperation::ManifestGet)
+        {
+            return Ok(SpeculativeManifestOutcome::NotAdmitted);
+        }
+
+        let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
+        let backend = deadline
+            .run("planner backend initialization", self.get_remote_backend())
+            .await?;
+
+        // Identity lookahead is speculative work. Put it behind the same
+        // daemon-wide gate as artifact prefetch so the S3 pool's demand
+        // reserve remains available even across concurrent BuildStarted hints.
+        let gate = deadline
+            .run("planner speculative gate", async {
+                self.prefetch_gate
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("prefetch gate closed"))
+            })
+            .await?;
+        let semaphore = deadline
+            .run("planner manifest queue", async {
+                self.s3_semaphore
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+            })
+            .await?;
+
+        // Revalidate only after every awaitable admission step. A permit
+        // acquired before either queue could outlive an open transition and
+        // dispatch stale speculative work against a degraded remote.
+        let Some(breaker) = self
+            .remote_breaker
+            .try_acquire_speculative(RemoteOperation::ManifestGet)
+        else {
+            drop(semaphore);
+            drop(gate);
+            return Ok(SpeculativeManifestOutcome::NotAdmitted);
+        };
+        let result = deadline
+            .run(
+                "planner manifest GET",
+                crate::remote::try_download_manifest(
+                    backend.as_ref(),
+                    &remote.prefix,
+                    manifest_key,
+                ),
+            )
+            .await;
+        drop(semaphore);
+        drop(gate);
+        match result {
+            Ok(manifest) => {
+                breaker.success();
+                Ok(SpeculativeManifestOutcome::Completed(manifest))
+            }
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                breaker.failure(class, &format!("{error:#}"));
+                Err(error)
+            }
+        }
+    }
+
+    async fn download_planner_manifest_with_permit(
+        &self,
+        manifest_key: &str,
+        breaker: BreakerPermit,
+    ) -> Result<Option<crate::remote::BuildManifest>> {
         let remote = self
             .config
             .remote
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
         let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
-        let breaker = self
-            .remote_breaker
-            .try_acquire(RemoteOperation::ManifestGet)
-            .ok_or_else(|| anyhow::anyhow!("remote read breaker open"))?;
         let backend = match deadline
             .run("planner backend initialization", self.get_remote_backend())
             .await
@@ -5150,6 +5250,44 @@ impl Daemon {
     }
 
     pub async fn handle_build_started(self: &Arc<Self>, req: &BuildStartedRequest) -> Response {
+        self.handle_build_started_with_planner(
+            req,
+            crate::planner_client::resolve_prefetch_plan(&req.intent),
+        )
+        .await
+    }
+
+    async fn handle_build_started_with_planner<F>(
+        self: &Arc<Self>,
+        req: &BuildStartedRequest,
+        planner_lookup: F,
+    ) -> Response
+    where
+        F: Future<Output = Result<Option<PrefetchPlan>>>,
+    {
+        self.handle_build_started_with_planner_and_prefetch(
+            req,
+            planner_lookup,
+            |daemon, prefetch_req, pack_context, plan_started_at| async move {
+                daemon
+                    .handle_prefetch_with_context(&prefetch_req, pack_context, plan_started_at)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn handle_build_started_with_planner_and_prefetch<F, E, EFut>(
+        self: &Arc<Self>,
+        req: &BuildStartedRequest,
+        planner_lookup: F,
+        execute_prefetch: E,
+    ) -> Response
+    where
+        F: Future<Output = Result<Option<PrefetchPlan>>>,
+        E: Fn(Arc<Self>, PrefetchRequest, Option<PackPrefetchContext>, Instant) -> EFut,
+        EFut: Future<Output = Response>,
+    {
         let plan_started_at = Instant::now();
         let pack_context = PackPrefetchContext::from_intent(&req.intent);
         let Some(_remote) = &self.config.remote else {
@@ -5161,7 +5299,31 @@ impl Daemon {
             return Response::ok();
         }
 
-        match crate::planner_client::resolve_prefetch_plan(&req.intent).await {
+        // Identity resolution only reads the small manifest metadata. Start it
+        // while the advisory planner is in flight, but do not start artifact
+        // downloads until the planner disposition is known. Keep the identity
+        // future owned so the selected advisory plan can cancel it before
+        // taking artifact-prefetch capacity.
+        let mut identity_lookup = Some(Box::pin(
+            crate::fallback_planner::resolve_identity_candidates_speculative(self, &req.intent),
+        ));
+        tokio::pin!(planner_lookup);
+        let mut early_identity_resolution = None;
+        let planner_result = tokio::select! {
+            resolution = identity_lookup
+                .as_mut()
+                .expect("identity lookup is present")
+                .as_mut() => {
+                early_identity_resolution = Some(resolution);
+                planner_lookup.await
+            }
+            result = &mut planner_lookup => result,
+        };
+        if early_identity_resolution.is_some() {
+            identity_lookup.take();
+        }
+
+        match planner_result {
             Ok(Some(plan)) => {
                 let plan_id = plan.plan_id.clone();
                 let planner = plan.planner.clone();
@@ -5174,7 +5336,13 @@ impl Daemon {
                         );
                     }
                     PrefetchDisposition::Execute => {
+                        // The speculative metadata GET may hold both a
+                        // prefetch-gate permit and an S3 permit. Cancel it
+                        // before artifact prefetch so lookahead cannot reduce
+                        // the capacity available to the selected plan.
+                        drop(identity_lookup.take());
                         let prefetch_req = PrefetchRequest::from_plan(plan);
+                        let candidate_count = prefetch_req.keys.len();
                         self.install_plan(
                             &req.session_id,
                             plan_id.as_deref().unwrap_or(""),
@@ -5182,24 +5350,24 @@ impl Daemon {
                             prefetch_req.keys.iter().map(|(k, _)| k.clone()),
                             req.intent.identity_key.clone(),
                         );
-                        let resp = self
-                            .handle_prefetch_with_context(
-                                &prefetch_req,
-                                pack_context.clone(),
-                                plan_started_at,
-                            )
-                            .await;
+                        let resp = execute_prefetch(
+                            Arc::clone(self),
+                            prefetch_req,
+                            pack_context.clone(),
+                            plan_started_at,
+                        )
+                        .await;
                         if resp.ok {
                             self.prefetch_stats
                                 .plans_advisory
                                 .fetch_add(1, Ordering::Relaxed);
                             self.prefetch_stats
                                 .last_plan_candidates
-                                .store(prefetch_req.keys.len() as u64, Ordering::Relaxed);
+                                .store(candidate_count as u64, Ordering::Relaxed);
                             tracing::info!(
                                 plan_id = ?plan_id,
                                 planner = ?planner,
-                                candidate_count = prefetch_req.keys.len(),
+                                candidate_count,
                                 "build-started: using advisory planner plan"
                             );
                             return resp;
@@ -5218,6 +5386,7 @@ impl Daemon {
                         );
                     }
                     PrefetchDisposition::DoNothing => {
+                        drop(identity_lookup.take());
                         tracing::info!(
                             plan_id = ?plan_id,
                             planner = ?planner,
@@ -5235,11 +5404,26 @@ impl Daemon {
             }
         }
 
-        let fallback_plan =
-            match crate::fallback_planner::build_prefetch_plan(self, &req.intent).await {
-                Ok(plan) => plan,
-                Err(e) => return Response::err(format!("fallback planning failed: {e}")),
-            };
+        let resolved_identity = match early_identity_resolution {
+            Some(resolution) => resolution,
+            None => {
+                // Fallback is now selected. Cancel unresolved speculative
+                // work and retry its exact keys through ordinary demand
+                // admission, including after an advisory execution failure.
+                drop(identity_lookup.take());
+                crate::fallback_planner::retry_identity_with_ordinary_admission(&req.intent)
+            }
+        };
+        let fallback_plan = match crate::fallback_planner::build_prefetch_plan_with_identity(
+            self,
+            &req.intent,
+            resolved_identity,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(e) => return Response::err(format!("fallback planning failed: {e}")),
+        };
 
         if fallback_plan.candidates.is_empty() {
             tracing::debug!(
@@ -12992,6 +13176,116 @@ mod tests {
         Arc::new(crate::remote_backend::memory_backend())
     }
 
+    struct BlockingIdentityBackend {
+        inner: Arc<dyn crate::remote_backend::RemoteBackend>,
+        identity_gets: AtomicU64,
+        identity_cancellations: AtomicU64,
+        artifact_gets: AtomicU64,
+        artifact_started_before_identity_cancel: AtomicBool,
+        identity_started: Notify,
+        block_identity: AtomicBool,
+    }
+
+    struct PendingIdentityGuard<'a> {
+        cancellations: &'a AtomicU64,
+    }
+
+    impl Drop for PendingIdentityGuard<'_> {
+        fn drop(&mut self) {
+            self.cancellations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for BlockingIdentityBackend {
+        async fn head(&self, key: &str) -> Result<bool> {
+            self.inner.head(key).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            if key.contains("/_manifests/") {
+                self.identity_gets.fetch_add(1, Ordering::Relaxed);
+                self.identity_started.notify_one();
+                if self.block_identity.load(Ordering::Acquire) {
+                    let _pending = PendingIdentityGuard {
+                        cancellations: &self.identity_cancellations,
+                    };
+                    std::future::pending::<()>().await;
+                }
+            } else {
+                if self.identity_cancellations.load(Ordering::Acquire) == 0 {
+                    self.artifact_started_before_identity_cancel
+                        .store(true, Ordering::Release);
+                }
+                self.artifact_gets.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.get(key, max_bytes).await
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+            self.inner.put(key, body, content_type).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+
+        fn describe(&self, key: &str) -> String {
+            self.inner.describe(key)
+        }
+    }
+
+    struct FailingIdentityBackend {
+        inner: Arc<dyn crate::remote_backend::RemoteBackend>,
+        kind: std::io::ErrorKind,
+        identity_keys: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for FailingIdentityBackend {
+        async fn head(&self, key: &str) -> Result<bool> {
+            self.inner.head(key).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            if key.contains("/_manifests/") {
+                self.identity_keys.lock().unwrap().push(key.to_string());
+                return Err(std::io::Error::new(self.kind, "classified manifest failure").into());
+            }
+            self.inner.get(key, max_bytes).await
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+            self.inner.put(key, body, content_type).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+
+        fn describe(&self, key: &str) -> String {
+            self.inner.describe(key)
+        }
+    }
+
+    async fn wait_for_test_condition(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test condition must become true");
+    }
+
     fn test_manifest_object_key(cache_key: &str, crate_name: &str) -> String {
         format!("prefix/v3/manifests/{crate_name}/{cache_key}.json")
     }
@@ -17002,6 +17296,902 @@ mod tests {
             daemon.prefetch_stats.plans_fallback.load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn do_nothing_cancels_identity_resolution_started_with_planner_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner: test_remote_backend(),
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(true),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+
+        let planner_backend = backend.clone();
+        let planner_lookup = async move {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                planner_backend.identity_started.notified(),
+            )
+            .await
+            .expect("identity metadata lookup must start before the planner returns");
+            Ok(Some(PrefetchPlan {
+                plan_id: Some("no-prefetch".into()),
+                planner: Some("test".into()),
+                disposition: PrefetchDisposition::DoNothing,
+                candidates: Vec::new(),
+            }))
+        };
+        let request = BuildStartedRequest {
+            intent: kache_core::BuildIntent {
+                identity_key: Some("id/test".into()),
+                crate_names: vec!["serde".into()],
+                ..Default::default()
+            },
+            client_epoch: 0,
+            session_id: "do-nothing".into(),
+        };
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            daemon.handle_build_started_with_planner(&request, planner_lookup),
+        )
+        .await
+        .expect("do_nothing must cancel the blocked metadata read");
+
+        assert!(response.ok);
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.identity_cancellations.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.artifact_gets.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            daemon.prefetch_stats.plans_advisory.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            daemon.prefetch_stats.plans_fallback.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_cancels_pending_identity_before_artifact_prefetch_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner: test_remote_backend(),
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(true),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+
+        let planner_backend = backend.clone();
+        let planner_lookup = async move {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                planner_backend.identity_started.notified(),
+            )
+            .await
+            .expect("identity metadata lookup must start before the planner returns");
+            Ok(Some(PrefetchPlan {
+                plan_id: Some("execute".into()),
+                planner: Some("test".into()),
+                disposition: PrefetchDisposition::Execute,
+                candidates: vec![kache_core::PrefetchCandidate::new(
+                    "a".repeat(64),
+                    "serde".into(),
+                )],
+            }))
+        };
+        let request = BuildStartedRequest {
+            intent: kache_core::BuildIntent {
+                identity_key: Some("id/test".into()),
+                crate_names: vec!["serde".into()],
+                ..Default::default()
+            },
+            client_epoch: 0,
+            session_id: "execute".into(),
+        };
+
+        let response = daemon
+            .handle_build_started_with_planner(&request, planner_lookup)
+            .await;
+        wait_for_test_condition(|| backend.artifact_gets.load(Ordering::Relaxed) > 0).await;
+
+        assert!(response.ok);
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.identity_cancellations.load(Ordering::Relaxed), 1);
+        assert!(
+            backend.artifact_gets.load(Ordering::Relaxed) > 0,
+            "the advisory plan must reach the artifact backend"
+        );
+        assert!(
+            !backend
+                .artifact_started_before_identity_cancel
+                .load(Ordering::Acquire),
+            "artifact GET started before the pending identity GET was cancelled"
+        );
+        assert_eq!(
+            daemon.prefetch_stats.plans_advisory.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn execute_failure_retries_cancelled_identity_through_ordinary_fallback() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key_env = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let inner = test_remote_backend();
+        crate::remote::upload_manifest(
+            inner.as_ref(),
+            "prefix",
+            "id/test",
+            &crate::remote::BuildManifest {
+                version: 3,
+                created: "2026-08-31T00:00:00Z".into(),
+                manifest_key: "id/test".into(),
+                entries: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner,
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(true),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+        let planner_backend = backend.clone();
+        let planner_lookup = async move {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                planner_backend.identity_started.notified(),
+            )
+            .await
+            .expect("identity metadata lookup must start before the planner returns");
+            Ok(Some(PrefetchPlan {
+                plan_id: Some("execute-then-fail".into()),
+                planner: Some("test".into()),
+                disposition: PrefetchDisposition::Execute,
+                candidates: vec![kache_core::PrefetchCandidate::new(
+                    "a".repeat(64),
+                    "serde".into(),
+                )],
+            }))
+        };
+        let request = BuildStartedRequest {
+            intent: kache_core::BuildIntent {
+                identity_key: Some("id/test".into()),
+                crate_names: vec!["serde".into()],
+                ..Default::default()
+            },
+            client_epoch: 0,
+            session_id: "execute-failure".into(),
+        };
+        let executor_backend = backend.clone();
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            daemon.handle_build_started_with_planner_and_prefetch(
+                &request,
+                planner_lookup,
+                move |_daemon, _request, _pack_context, _plan_started_at| {
+                    let backend = executor_backend.clone();
+                    async move {
+                        assert_eq!(
+                            backend.identity_cancellations.load(Ordering::Acquire),
+                            1,
+                            "identity lookahead must be cancelled before advisory execution"
+                        );
+                        backend.block_identity.store(false, Ordering::Release);
+                        Response::err("forced advisory execution failure")
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("fallback after advisory failure must not await cancelled speculation");
+
+        assert!(response.ok);
+        assert_eq!(backend.identity_cancellations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            backend.identity_gets.load(Ordering::Relaxed),
+            2,
+            "fallback must retry the cancelled lookup once through ordinary admission"
+        );
+        assert_eq!(backend.artifact_gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn speculative_identity_does_not_consume_half_open_read_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner: test_remote_backend(),
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(false),
+        });
+        let mut daemon = Daemon::new(config);
+        daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(1, Duration::ZERO));
+        daemon
+            .remote_breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Timeout, "open read direction");
+        let daemon = Arc::new(daemon);
+        daemon.set_remote_backend_for_test(backend.clone());
+
+        let planner_lookup = async {
+            tokio::task::yield_now().await;
+            Ok(Some(PrefetchPlan {
+                plan_id: Some("no-prefetch".into()),
+                planner: Some("test".into()),
+                disposition: PrefetchDisposition::DoNothing,
+                candidates: Vec::new(),
+            }))
+        };
+        let request = BuildStartedRequest {
+            intent: kache_core::BuildIntent {
+                identity_key: Some("id/test".into()),
+                ..Default::default()
+            },
+            client_epoch: 0,
+            session_id: "half-open-do-nothing".into(),
+        };
+
+        let response = daemon
+            .handle_build_started_with_planner(&request, planner_lookup)
+            .await;
+
+        assert!(response.ok);
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 0);
+        assert!(
+            daemon
+                .remote_breaker
+                .is_direction_degraded(crate::remote_resilience::RemoteDirection::Read)
+        );
+        let probe = daemon
+            .remote_breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .expect("the demand path must retain the half-open probe");
+        probe.success();
+    }
+
+    #[tokio::test]
+    async fn open_breaker_rejects_speculative_identity_before_saturated_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.s3_concurrency = 1;
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner: test_remote_backend(),
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(false),
+        });
+        let mut daemon = Daemon::new(config);
+        daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(1, Duration::from_secs(60)));
+        daemon
+            .remote_breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Timeout, "open read direction");
+        let daemon = Arc::new(daemon);
+        daemon.set_remote_backend_for_test(backend.clone());
+        let held_gate = daemon.prefetch_gate.clone().acquire_owned().await.unwrap();
+        assert_eq!(daemon.prefetch_gate.available_permits(), 0);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            daemon.download_planner_manifest_speculative("id/test"),
+        )
+        .await
+        .expect("an open breaker must reject before waiting on the speculative gate")
+        .unwrap();
+
+        assert!(matches!(outcome, SpeculativeManifestOutcome::NotAdmitted));
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 0);
+        assert_eq!(daemon.prefetch_gate.available_permits(), 0);
+        drop(held_gate);
+    }
+
+    #[tokio::test]
+    async fn aborting_build_started_cancels_identity_lookup_and_releases_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.s3_concurrency = 1;
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner: test_remote_backend(),
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(true),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+        let request = BuildStartedRequest {
+            intent: kache_core::BuildIntent {
+                identity_key: Some("id/test".into()),
+                ..Default::default()
+            },
+            client_epoch: 0,
+            session_id: "cancelled-handler".into(),
+        };
+
+        let task_daemon = daemon.clone();
+        let task = tokio::spawn(async move {
+            task_daemon
+                .handle_build_started_with_planner(
+                    &request,
+                    std::future::pending::<Result<Option<PrefetchPlan>>>(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), backend.identity_started.notified())
+            .await
+            .expect("identity lookup must start");
+        assert_eq!(daemon.s3_semaphore.available_permits(), 0);
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(backend.identity_cancellations.load(Ordering::Relaxed), 1);
+        assert_eq!(daemon.s3_semaphore.available_permits(), 1);
+        assert_eq!(daemon.prefetch_gate.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn planner_selected_fallback_uses_reserve_while_lookahead_is_saturated() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key_env = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.s3_concurrency = 4;
+        let inner = test_remote_backend();
+        let manifest_key = crate::identity::manifest_lookup_keys(Some("id/test"))
+            .into_iter()
+            .next()
+            .expect("identity lookup must have a primary key");
+        crate::remote::upload_manifest(
+            inner.as_ref(),
+            "prefix",
+            &manifest_key,
+            &crate::remote::BuildManifest {
+                version: 3,
+                created: "2026-08-31T00:00:00Z".into(),
+                manifest_key: manifest_key.clone(),
+                entries: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner,
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(true),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+        let intent = kache_core::BuildIntent {
+            identity_key: Some("id/test".into()),
+            ..Default::default()
+        };
+
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let daemon = daemon.clone();
+            let intent = intent.clone();
+            tasks.push(tokio::spawn(async move {
+                crate::fallback_planner::resolve_identity_candidates_speculative(&daemon, &intent)
+                    .await
+            }));
+        }
+        wait_for_test_condition(|| backend.identity_gets.load(Ordering::Relaxed) == 3).await;
+
+        assert_eq!(daemon.prefetch_gate.available_permits(), 0);
+        assert_eq!(daemon.s3_semaphore.available_permits(), 1);
+        let demand_permit = daemon
+            .s3_semaphore
+            .try_acquire()
+            .expect("one S3 permit must remain available for demand");
+        drop(demand_permit);
+
+        // Existing speculative GETs stay blocked, but a newly admitted
+        // ordinary fallback GET may complete through the reserved S3 permit.
+        backend.block_identity.store(false, Ordering::Release);
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            daemon.handle_build_started_with_planner(
+                &BuildStartedRequest {
+                    intent: intent.clone(),
+                    client_epoch: 0,
+                    session_id: "reserved-fallback".into(),
+                },
+                async {
+                    Ok(Some(PrefetchPlan {
+                        plan_id: Some("fallback".into()),
+                        planner: Some("test".into()),
+                        disposition: PrefetchDisposition::UseFallback,
+                        candidates: Vec::new(),
+                    }))
+                },
+            ),
+        )
+        .await
+        .expect("selected fallback must not wait on the saturated speculative gate");
+        assert!(response.ok);
+        assert_eq!(
+            backend.identity_gets.load(Ordering::Relaxed),
+            4,
+            "fallback must perform one ordinary manifest GET through the reserve"
+        );
+        assert_eq!(daemon.prefetch_gate.available_permits(), 0);
+        assert_eq!(daemon.s3_semaphore.available_permits(), 1);
+
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(backend.identity_cancellations.load(Ordering::Relaxed), 3);
+        assert_eq!(daemon.s3_semaphore.available_permits(), 4);
+        assert_eq!(daemon.prefetch_gate.available_permits(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn fallback_reuses_early_identity_candidates_without_second_manifest_get() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key_env = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let inner = test_remote_backend();
+        let manifest = crate::remote::BuildManifest {
+            version: 3,
+            created: "2026-08-31T00:00:00Z".into(),
+            manifest_key: "id/test".into(),
+            entries: vec![crate::remote::ManifestEntry {
+                cache_key: "a".repeat(64),
+                crate_name: "serde".into(),
+                compile_time_ms: 1200,
+                artifact_size: 4096,
+            }],
+        };
+        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest)
+            .await
+            .unwrap();
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner,
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(false),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+        let intent = kache_core::BuildIntent {
+            identity_key: Some("id/test".into()),
+            crate_names: vec!["serde".into()],
+            ..Default::default()
+        };
+
+        let early =
+            crate::fallback_planner::resolve_identity_candidates_speculative(&daemon, &intent)
+                .await;
+        assert!(matches!(
+            &early,
+            crate::fallback_planner::SpeculativeIdentityOutcome::Resolved(candidates)
+                if candidates.len() == 1
+        ));
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 1);
+        let plan =
+            crate::fallback_planner::build_prefetch_plan_with_identity(&daemon, &intent, early)
+                .await
+                .unwrap();
+
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 1);
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].cache_key, "a".repeat(64));
+    }
+
+    #[tokio::test]
+    async fn queued_speculative_identity_rechecks_breaker_before_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.s3_concurrency = 1;
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner: test_remote_backend(),
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(false),
+        });
+        let mut daemon = Daemon::new(config);
+        daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(1, Duration::from_secs(60)));
+        let daemon = Arc::new(daemon);
+        daemon.set_remote_backend_for_test(backend.clone());
+        let held_s3 = daemon.s3_semaphore.clone().acquire_owned().await.unwrap();
+        let intent = kache_core::BuildIntent {
+            identity_key: Some("id/test".into()),
+            ..Default::default()
+        };
+
+        let task_daemon = daemon.clone();
+        let task = tokio::spawn(async move {
+            crate::fallback_planner::resolve_identity_candidates_speculative(&task_daemon, &intent)
+                .await
+        });
+        wait_for_test_condition(|| daemon.prefetch_gate.available_permits() == 0).await;
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 0);
+        daemon
+            .remote_breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Timeout, "open while lookahead is queued");
+        drop(held_s3);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("queued lookahead must finish after the S3 permit is released")
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            crate::fallback_planner::SpeculativeIdentityOutcome::NotAdmitted(keys)
+                if !keys.is_empty()
+        ));
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 0);
+        assert!(
+            daemon
+                .remote_breaker
+                .is_direction_degraded(crate::remote_resilience::RemoteDirection::Read),
+            "queued speculative work must not recover or bypass the open breaker"
+        );
+        assert_eq!(daemon.s3_semaphore.available_permits(), 1);
+        assert_eq!(daemon.prefetch_gate.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn denied_speculative_identity_is_retried_by_ordinary_fallback_lookup() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key_env = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let inner = test_remote_backend();
+        let cache_key = "d".repeat(64);
+        let manifest = crate::remote::BuildManifest {
+            version: 3,
+            created: "2026-08-31T00:00:00Z".into(),
+            manifest_key: "id/test".into(),
+            entries: vec![crate::remote::ManifestEntry {
+                cache_key: cache_key.clone(),
+                crate_name: "serde".into(),
+                compile_time_ms: 1200,
+                artifact_size: 4096,
+            }],
+        };
+        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest)
+            .await
+            .unwrap();
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner,
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(false),
+        });
+        let mut daemon = Daemon::new(config);
+        daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(1, Duration::ZERO));
+        daemon
+            .remote_breaker
+            .try_acquire(RemoteOperation::DemandGet)
+            .unwrap()
+            .failure(RemoteErrorClass::Timeout, "open read direction");
+        let daemon = Arc::new(daemon);
+        daemon.set_remote_backend_for_test(backend.clone());
+        let intent = kache_core::BuildIntent {
+            identity_key: Some("id/test".into()),
+            crate_names: vec!["serde".into()],
+            ..Default::default()
+        };
+
+        let speculative =
+            crate::fallback_planner::resolve_identity_candidates_speculative(&daemon, &intent)
+                .await;
+        assert!(matches!(
+            &speculative,
+            crate::fallback_planner::SpeculativeIdentityOutcome::NotAdmitted(keys)
+                if !keys.is_empty()
+        ));
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 0);
+
+        let plan = crate::fallback_planner::build_prefetch_plan_with_identity(
+            &daemon,
+            &intent,
+            speculative,
+        )
+        .await
+        .expect("ordinary fallback lookup must use the half-open probe");
+
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 1);
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].cache_key, cache_key);
+        assert!(
+            !daemon
+                .remote_breaker
+                .is_direction_degraded(crate::remote_resilience::RemoteDirection::Read)
+        );
+    }
+
+    #[tokio::test]
+    async fn speculative_error_class_controls_retry_without_repeating_permanent_failures() {
+        let intent = kache_core::BuildIntent {
+            identity_key: Some("id/test".into()),
+            crate_names: vec!["serde".into()],
+            ..Default::default()
+        };
+
+        let transient_dir = tempfile::tempdir().unwrap();
+        let mut transient_config = test_config(transient_dir.path());
+        transient_config.remote = Some(test_remote_config());
+        let transient_backend = Arc::new(FailingIdentityBackend {
+            inner: test_remote_backend(),
+            kind: std::io::ErrorKind::ConnectionReset,
+            identity_keys: Mutex::new(Vec::new()),
+        });
+        let mut transient_daemon = Daemon::new(transient_config);
+        transient_daemon.remote_breaker =
+            Arc::new(RemoteBreaker::with_policy(1, Duration::from_secs(60)));
+        let transient_daemon = Arc::new(transient_daemon);
+        transient_daemon.set_remote_backend_for_test(transient_backend.clone());
+
+        let transient = crate::fallback_planner::resolve_identity_candidates_speculative(
+            &transient_daemon,
+            &intent,
+        )
+        .await;
+        assert!(matches!(
+            &transient,
+            crate::fallback_planner::SpeculativeIdentityOutcome::NotAdmitted(keys)
+                if !keys.is_empty()
+        ));
+        assert_eq!(transient_backend.identity_keys.lock().unwrap().len(), 1);
+        assert!(
+            transient_daemon
+                .remote_breaker
+                .is_direction_degraded(crate::remote_resilience::RemoteDirection::Read)
+        );
+        let plan = crate::fallback_planner::build_prefetch_plan_with_identity(
+            &transient_daemon,
+            &intent,
+            transient,
+        )
+        .await
+        .unwrap();
+        assert!(plan.candidates.is_empty());
+        assert_eq!(
+            transient_backend.identity_keys.lock().unwrap().len(),
+            1,
+            "the ordinary retry must be suppressed while threshold=1 keeps the breaker open"
+        );
+
+        let permanent_dir = tempfile::tempdir().unwrap();
+        let mut permanent_config = test_config(permanent_dir.path());
+        permanent_config.remote = Some(test_remote_config());
+        let permanent_backend = Arc::new(FailingIdentityBackend {
+            inner: test_remote_backend(),
+            kind: std::io::ErrorKind::PermissionDenied,
+            identity_keys: Mutex::new(Vec::new()),
+        });
+        let permanent_daemon = Arc::new(Daemon::new(permanent_config));
+        permanent_daemon.set_remote_backend_for_test(permanent_backend.clone());
+
+        let permanent = crate::fallback_planner::resolve_identity_candidates_speculative(
+            &permanent_daemon,
+            &intent,
+        )
+        .await;
+        assert!(matches!(
+            &permanent,
+            crate::fallback_planner::SpeculativeIdentityOutcome::NonRetryableFailures(failures)
+                if !failures.is_empty()
+                    && failures.iter().all(|(_, class)| !matches!(
+                        class,
+                        RemoteErrorClass::Transient | RemoteErrorClass::Timeout
+                    ))
+        ));
+        let attempted_keys = permanent_backend.identity_keys.lock().unwrap().clone();
+        assert!(!attempted_keys.is_empty());
+        assert_eq!(
+            attempted_keys.iter().collect::<HashSet<_>>().len(),
+            attempted_keys.len(),
+            "each identity alias may be tried once, but none may be repeated"
+        );
+        assert!(
+            !permanent_daemon
+                .remote_breaker
+                .is_direction_degraded(crate::remote_resilience::RemoteDirection::Read)
+        );
+        let plan = crate::fallback_planner::build_prefetch_plan_with_identity(
+            &permanent_daemon,
+            &intent,
+            permanent,
+        )
+        .await
+        .unwrap();
+        assert!(plan.candidates.is_empty());
+        assert_eq!(
+            permanent_backend.identity_keys.lock().unwrap().as_slice(),
+            attempted_keys.as_slice(),
+            "authentication/permanent failures must be authoritative for this plan"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn speculative_timeout_is_not_retried_within_build_started() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = Arc::new(FailingIdentityBackend {
+            inner: test_remote_backend(),
+            kind: std::io::ErrorKind::TimedOut,
+            identity_keys: Mutex::new(Vec::new()),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+        let intent = kache_core::BuildIntent {
+            identity_key: Some("id/test".into()),
+            crate_names: vec!["serde".into()],
+            ..Default::default()
+        };
+
+        let outcome =
+            crate::fallback_planner::resolve_identity_candidates_speculative(&daemon, &intent)
+                .await;
+        assert!(matches!(
+            &outcome,
+            crate::fallback_planner::SpeculativeIdentityOutcome::NonRetryableFailures(failures)
+                if failures.len() == 1 && failures[0].1 == RemoteErrorClass::Timeout
+        ));
+        assert_eq!(backend.identity_keys.lock().unwrap().len(), 1);
+
+        let plan =
+            crate::fallback_planner::build_prefetch_plan_with_identity(&daemon, &intent, outcome)
+                .await
+                .unwrap();
+        assert!(plan.candidates.is_empty());
+        assert_eq!(
+            backend.identity_keys.lock().unwrap().len(),
+            1,
+            "a timed-out speculative GET must not start a second manifest deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn identity_first_handler_fallback_reuses_manifest_candidates() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key_env = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let inner = test_remote_backend();
+        let cache_key = "b".repeat(64);
+        let manifest = crate::remote::BuildManifest {
+            version: 3,
+            created: "2026-08-31T00:00:00Z".into(),
+            manifest_key: "id/test".into(),
+            entries: vec![crate::remote::ManifestEntry {
+                cache_key: cache_key.clone(),
+                crate_name: "serde".into(),
+                compile_time_ms: 1200,
+                artifact_size: 4096,
+            }],
+        };
+        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest)
+            .await
+            .unwrap();
+        let backend = Arc::new(BlockingIdentityBackend {
+            inner,
+            identity_gets: AtomicU64::new(0),
+            identity_cancellations: AtomicU64::new(0),
+            artifact_gets: AtomicU64::new(0),
+            artifact_started_before_identity_cancel: AtomicBool::new(false),
+            identity_started: Notify::new(),
+            block_identity: AtomicBool::new(false),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+        let planner_backend = backend.clone();
+        let planner_lookup = async move {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                planner_backend.identity_started.notified(),
+            )
+            .await
+            .expect("speculative identity lookup must start before fallback is selected");
+            Ok(Some(PrefetchPlan {
+                plan_id: Some("fallback".into()),
+                planner: Some("test".into()),
+                disposition: PrefetchDisposition::UseFallback,
+                candidates: Vec::new(),
+            }))
+        };
+        let request = BuildStartedRequest {
+            intent: kache_core::BuildIntent {
+                identity_key: Some("id/test".into()),
+                crate_names: vec!["serde".into()],
+                ..Default::default()
+            },
+            client_epoch: 0,
+            session_id: "identity-first-fallback".into(),
+        };
+
+        let response = daemon
+            .handle_build_started_with_planner(&request, planner_lookup)
+            .await;
+
+        assert!(response.ok);
+        assert_eq!(backend.identity_gets.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            daemon.prefetch_stats.plans_fallback.load(Ordering::Relaxed),
+            1
+        );
+        let plan = daemon.active_plan.lock().unwrap();
+        let plan = plan.as_ref().expect("fallback plan must be installed");
+        assert_eq!(plan.plan_source, "fallback");
+        assert_eq!(plan.candidates, HashSet::from([cache_key]));
     }
 
     #[test]

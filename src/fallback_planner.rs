@@ -6,14 +6,133 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use kache_core::{BuildIntent, PlannerDataSource, PrefetchCandidate, PrefetchPlan};
 
-use crate::daemon::Daemon;
+use crate::daemon::{Daemon, SpeculativeManifestOutcome};
+use crate::remote_resilience::{RemoteErrorClass, classify_remote_error};
 
-pub async fn build_prefetch_plan(
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SpeculativeIdentityOutcome {
+    Resolved(Vec<PrefetchCandidate>),
+    NotAdmitted(Vec<String>),
+    RetryableFailures(Vec<(String, RemoteErrorClass)>),
+    NonRetryableFailures(Vec<(String, RemoteErrorClass)>),
+}
+
+/// Convert an unresolved speculative lookup into exact keys for the ordinary
+/// fallback path. Once fallback is selected, it must use demand admission
+/// rather than remain queued behind the speculative prefetch gate.
+pub(crate) fn retry_identity_with_ordinary_admission(
+    intent: &BuildIntent,
+) -> SpeculativeIdentityOutcome {
+    let Some(identity_key) = intent
+        .identity_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return SpeculativeIdentityOutcome::Resolved(Vec::new());
+    };
+    SpeculativeIdentityOutcome::NotAdmitted(crate::identity::manifest_lookup_keys(Some(
+        identity_key,
+    )))
+}
+
+/// Resolve identity metadata as lookahead without consuming a half-open
+/// remote-breaker probe. Admission denial and retryable transport failure stay
+/// distinct from an authoritative hit or miss.
+pub async fn resolve_identity_candidates_speculative(
     daemon: &Arc<Daemon>,
     intent: &BuildIntent,
+) -> SpeculativeIdentityOutcome {
+    let Some(identity_key) = intent
+        .identity_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return SpeculativeIdentityOutcome::Resolved(Vec::new());
+    };
+
+    let lookup_keys = crate::identity::manifest_lookup_keys(Some(identity_key));
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let mut retryable_failures: Vec<(String, RemoteErrorClass)> = Vec::new();
+    let mut non_retryable_failures: Vec<(String, RemoteErrorClass)> = Vec::new();
+    for (key_index, key) in lookup_keys.iter().enumerate() {
+        match daemon.download_planner_manifest_speculative(key).await {
+            Ok(SpeculativeManifestOutcome::Completed(Some(manifest))) => {
+                tracing::info!(
+                    "fallback planner: identity manifest '{key}' has {} entries",
+                    manifest.entries.len()
+                );
+                for (index, entry) in manifest.entries.into_iter().enumerate() {
+                    if seen.insert(entry.cache_key.clone()) {
+                        candidates.push(manifest_entry_candidate(entry, index));
+                    }
+                }
+                return SpeculativeIdentityOutcome::Resolved(candidates);
+            }
+            Ok(SpeculativeManifestOutcome::Completed(None)) => {}
+            Ok(SpeculativeManifestOutcome::NotAdmitted) => {
+                let mut retry_keys = retryable_failures
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                retry_keys.extend(lookup_keys[key_index..].iter().cloned());
+                return SpeculativeIdentityOutcome::NotAdmitted(retry_keys);
+            }
+            Err(e) => {
+                let class = classify_remote_error(&e);
+                match class {
+                    RemoteErrorClass::Transient => {
+                        retryable_failures.push((key.clone(), class));
+                    }
+                    RemoteErrorClass::Timeout => {
+                        return SpeculativeIdentityOutcome::NonRetryableFailures(vec![(
+                            key.clone(),
+                            class,
+                        )]);
+                    }
+                    _ => non_retryable_failures.push((key.clone(), class)),
+                }
+                tracing::debug!(
+                    ?class,
+                    "fallback planner: speculative identity manifest '{key}': {e}"
+                );
+            }
+        }
+    }
+    if !retryable_failures.is_empty() {
+        SpeculativeIdentityOutcome::RetryableFailures(retryable_failures)
+    } else if !non_retryable_failures.is_empty() {
+        SpeculativeIdentityOutcome::NonRetryableFailures(non_retryable_failures)
+    } else {
+        SpeculativeIdentityOutcome::Resolved(candidates)
+    }
+}
+
+/// Build the fallback plan, reusing identity candidates resolved while the
+/// advisory planner was in flight. Only denied or retryable lookahead performs
+/// the ordinary lookup; an empty resolved set is authoritative for this plan.
+pub async fn build_prefetch_plan_with_identity(
+    daemon: &Arc<Daemon>,
+    intent: &BuildIntent,
+    identity_outcome: SpeculativeIdentityOutcome,
 ) -> Result<PrefetchPlan> {
+    let (identity_candidates, identity_lookup_keys) = match identity_outcome {
+        SpeculativeIdentityOutcome::Resolved(candidates) => (Some(candidates), None),
+        SpeculativeIdentityOutcome::NotAdmitted(keys) => (None, Some(keys)),
+        SpeculativeIdentityOutcome::RetryableFailures(failures) => (
+            None,
+            Some(failures.into_iter().map(|(key, _)| key).collect()),
+        ),
+        SpeculativeIdentityOutcome::NonRetryableFailures(_) => (Some(Vec::new()), None),
+    };
     let (plan, composition) = kache_core::build_prefetch_plan_with_limits(
-        &LocalPlannerSource { daemon },
+        &LocalPlannerSource {
+            daemon,
+            identity_candidates,
+            identity_lookup_keys,
+        },
         intent,
         "fallback",
         kache_core::PlanLimits::default(),
@@ -52,6 +171,8 @@ fn should_report_composition(composition: &kache_core::PlanComposition) -> bool 
 
 struct LocalPlannerSource<'a> {
     daemon: &'a Arc<Daemon>,
+    identity_candidates: Option<Vec<PrefetchCandidate>>,
+    identity_lookup_keys: Option<Vec<String>>,
 }
 
 fn manifest_entry_candidate(
@@ -157,9 +278,17 @@ impl PlannerDataSource for LocalPlannerSource<'_> {
     }
 
     async fn identity_candidates(&self, identity_key: &str) -> Result<Vec<PrefetchCandidate>> {
+        if let Some(candidates) = &self.identity_candidates {
+            return Ok(candidates.clone());
+        }
+
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
-        for key in crate::identity::manifest_lookup_keys(Some(identity_key)) {
+        let lookup_keys = self
+            .identity_lookup_keys
+            .clone()
+            .unwrap_or_else(|| crate::identity::manifest_lookup_keys(Some(identity_key)));
+        for key in lookup_keys {
             match self.daemon.download_planner_manifest(&key).await {
                 Ok(Some(manifest)) => {
                     tracing::info!(
@@ -246,6 +375,48 @@ mod tests {
         DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS,
     };
     use crate::store::Store;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct FailFirstManifestGetBackend {
+        inner: Arc<dyn crate::remote_backend::RemoteBackend>,
+        manifest_gets: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for FailFirstManifestGetBackend {
+        async fn head(&self, key: &str) -> Result<bool> {
+            self.inner.head(key).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            if key.contains("/_manifests/")
+                && self.manifest_gets.fetch_add(1, Ordering::Relaxed) == 0
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "transient speculative manifest failure",
+                )
+                .into());
+            }
+            self.inner.get(key, max_bytes).await
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+            self.inner.put(key, body, content_type).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+
+        fn describe(&self, key: &str) -> String {
+            self.inner.describe(key)
+        }
+    }
 
     struct EnvRestore {
         key: &'static str,
@@ -353,7 +524,11 @@ mod tests {
         seed_entry(&config, "key_serde_1", "serde", dir.path());
 
         let daemon = Arc::new(Daemon::new(config));
-        let source = LocalPlannerSource { daemon: &daemon };
+        let source = LocalPlannerSource {
+            daemon: &daemon,
+            identity_candidates: None,
+            identity_lookup_keys: None,
+        };
 
         let candidates = source
             .history_candidates(&["serde".to_string()])
@@ -376,7 +551,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().join("cache"), None); // remote = None
         let daemon = Arc::new(Daemon::new(config));
-        let source = LocalPlannerSource { daemon: &daemon };
+        let source = LocalPlannerSource {
+            daemon: &daemon,
+            identity_candidates: None,
+            identity_lookup_keys: None,
+        };
 
         let err = source
             .shard_candidates("ns", &[("serde".to_string(), "1.0.0".to_string())])
@@ -414,7 +593,11 @@ mod tests {
             .unwrap();
         let daemon = Arc::new(Daemon::new(config));
         daemon.set_remote_backend_for_test(backend);
-        let source = LocalPlannerSource { daemon: &daemon };
+        let source = LocalPlannerSource {
+            daemon: &daemon,
+            identity_candidates: None,
+            identity_lookup_keys: None,
+        };
 
         let candidates = source.identity_candidates("id/test").await.unwrap();
         assert_eq!(candidates.len(), 1);
@@ -424,6 +607,162 @@ mod tests {
         assert_eq!(candidates[0].size_bytes, Some(4096));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn speculative_identity_falls_back_to_the_legacy_alias_after_a_miss() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key = set_env("KACHE_MANIFEST_KEY", None);
+        let dir = tempfile::tempdir().unwrap();
+        let remote = crate::config::RemoteConfig::test_s3("bucket", "prefix");
+        let config = test_config(dir.path().join("cache"), Some(remote));
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(crate::remote_backend::memory_backend());
+        let cache_key = "f".repeat(64);
+        let legacy = crate::identity::host_target_triple();
+        let manifest = crate::remote::BuildManifest {
+            version: 3,
+            created: "2026-08-31T00:00:00Z".into(),
+            manifest_key: legacy.clone(),
+            entries: vec![crate::remote::ManifestEntry {
+                cache_key: cache_key.clone(),
+                crate_name: "serde".into(),
+                compile_time_ms: 1200,
+                artifact_size: 4096,
+            }],
+        };
+        crate::remote::upload_manifest(backend.as_ref(), "prefix", &legacy, &manifest)
+            .await
+            .unwrap();
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend);
+        let intent = BuildIntent {
+            identity_key: Some("id/test".into()),
+            ..Default::default()
+        };
+
+        let outcome = resolve_identity_candidates_speculative(&daemon, &intent).await;
+
+        assert!(matches!(
+            outcome,
+            SpeculativeIdentityOutcome::Resolved(candidates)
+                if candidates.len() == 1 && candidates[0].cache_key == cache_key
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn speculative_manifest_error_is_retried_by_ordinary_fallback_lookup() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key = set_env("KACHE_MANIFEST_KEY", Some("id/test"));
+        let dir = tempfile::tempdir().unwrap();
+        let remote = crate::config::RemoteConfig::test_s3("bucket", "prefix");
+        let config = test_config(dir.path().join("cache"), Some(remote));
+        let inner: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(crate::remote_backend::memory_backend());
+        let cache_key = "e".repeat(64);
+        let manifest = crate::remote::BuildManifest {
+            version: 3,
+            created: "2026-08-31T00:00:00Z".into(),
+            manifest_key: "id/test".into(),
+            entries: vec![crate::remote::ManifestEntry {
+                cache_key: cache_key.clone(),
+                crate_name: "serde".into(),
+                compile_time_ms: 1200,
+                artifact_size: 4096,
+            }],
+        };
+        crate::remote::upload_manifest(inner.as_ref(), "prefix", "id/test", &manifest)
+            .await
+            .unwrap();
+        let backend = Arc::new(FailFirstManifestGetBackend {
+            inner,
+            manifest_gets: AtomicU64::new(0),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+        let intent = BuildIntent {
+            identity_key: Some("id/test".into()),
+            crate_names: vec!["serde".into()],
+            ..Default::default()
+        };
+
+        let speculative = resolve_identity_candidates_speculative(&daemon, &intent).await;
+        assert_eq!(
+            speculative,
+            SpeculativeIdentityOutcome::RetryableFailures(vec![(
+                "id/test".into(),
+                RemoteErrorClass::Transient,
+            )])
+        );
+        assert_eq!(backend.manifest_gets.load(Ordering::Relaxed), 1);
+
+        let plan = build_prefetch_plan_with_identity(&daemon, &intent, speculative)
+            .await
+            .expect("ordinary fallback lookup must retry the inconclusive lookahead");
+
+        assert_eq!(backend.manifest_gets.load(Ordering::Relaxed), 2);
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].cache_key, cache_key);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn successful_speculative_miss_is_authoritative() {
+        let _lock = crate::config::config_path_lock();
+        let _manifest_key = set_env("KACHE_MANIFEST_KEY", Some("id/test"));
+        let dir = tempfile::tempdir().unwrap();
+        let remote = crate::config::RemoteConfig::test_s3("bucket", "prefix");
+        let config = test_config(dir.path().join("cache"), Some(remote));
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(crate::remote_backend::memory_backend());
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend);
+        let intent = BuildIntent {
+            identity_key: Some("id/test".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_identity_candidates_speculative(&daemon, &intent).await,
+            SpeculativeIdentityOutcome::Resolved(Vec::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_plan_reuses_preloaded_identity_candidates_without_a_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"), None);
+        let daemon = Arc::new(Daemon::new(config));
+        let candidate = PrefetchCandidate {
+            cache_key: "a".repeat(64),
+            crate_name: "serde".into(),
+            compile_time_ms: Some(1_200),
+            size_bytes: Some(4_096),
+            source: kache_core::CandidateSource::Manifest,
+            demand_index: Some(0),
+        };
+        let intent = BuildIntent {
+            identity_key: Some("id/test".into()),
+            crate_names: vec!["serde".into()],
+            ..Default::default()
+        };
+
+        let plan = build_prefetch_plan_with_identity(
+            &daemon,
+            &intent,
+            SpeculativeIdentityOutcome::Resolved(vec![candidate.clone(), candidate]),
+        )
+        .await
+        .expect("preloaded identity metadata must not need a configured remote");
+
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].cache_key, "a".repeat(64));
+        assert_eq!(
+            plan.candidates[0].source,
+            kache_core::CandidateSource::Manifest
+        );
+    }
+
     #[tokio::test]
     async fn key_cache_keys_for_crate_is_empty_until_populated() {
         // A fresh daemon's remote key cache is unpopulated, so the planner source
@@ -431,7 +770,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().join("cache"), None);
         let daemon = Arc::new(Daemon::new(config));
-        let source = LocalPlannerSource { daemon: &daemon };
+        let source = LocalPlannerSource {
+            daemon: &daemon,
+            identity_candidates: None,
+            identity_lookup_keys: None,
+        };
 
         let keys = source.key_cache_keys_for_crate("serde").await.unwrap();
         assert!(keys.is_empty());

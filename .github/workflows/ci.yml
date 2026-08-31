@@ -22,17 +22,9 @@ env:
   KACHE_LOG: kache=debug
 
 jobs:
-  docs:
-    name: Documentation
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - name: Check routes and source parity
-        run: bash scripts/check-docs.sh
-
-  # Skip the build matrix on docs-only PRs (*.md, *.mdx, docs/**); the `docs`
-  # job still validates them. Heavy jobs gate on `code`. We use a job-level `if`, not trigger
+  # Skip the build matrix on docs-only PRs (*.md, *.mdx, docs/**); the
+  # `version-consistency` job still validates them. Heavy jobs gate on `code`.
+  # We use a job-level `if`, not trigger
   # `paths-ignore`: the required checks must still report, and a *skipped* job
   # counts as success while a never-created one wedges branch protection at
   # "pending". Fails open (runs everything) on non-PR events or any API error.
@@ -563,22 +555,24 @@ jobs:
           echo "Satisfied reachability covers: $covers"
           test "$covers" -eq "$count"
 
-  # Fast, hermetic version gate (no nix / no cargo / no network). Runs on every
-  # push & PR in internal mode (the shipping manifests must agree), and on a v*
-  # tag additionally asserts the tag matches the manifest BEFORE the release job
-  # builds anything. It is a `release` need (below), so a drifted tag — e.g. the
-  # v0.5.0-rc.* tags that were cut against a 0.4.1 manifest — fails here in
-  # seconds and never reaches the irreversible binary build / GitHub Release.
+  # Fast repository checks with one checkout (no nix / no cargo / no network).
+  # The version gate runs on every push and PR, and on a v* tag additionally
+  # asserts the tag matches the manifest BEFORE the release job builds anything.
+  # It is a `release` need (below), so a drifted tag — e.g. the v0.5.0-rc.* tags
+  # that were cut against a 0.4.1 manifest — fails here in seconds and never
+  # reaches the irreversible binary build / GitHub Release.
   # The old "Check Nix package version matches Cargo" step lived in nix-package
   # but compared two values both derived from Cargo.toml (tautological); this
   # gate replaces it. The publish floor re-runs the script directly (not by
   # matching a job name), so no job-name coupling is required.
   version-consistency:
-    name: Version consistency
+    name: Repository consistency
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Check routes and source parity
+        run: bash scripts/check-docs.sh
       - name: Manifests agree (and match the tag on a v* tag)
         # Pass the ref via a quoted env var (not `${{ }}` interpolated into the
         # script) — a tag name can legally contain shell metacharacters.

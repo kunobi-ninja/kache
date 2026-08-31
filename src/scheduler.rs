@@ -16,6 +16,9 @@
 //! wrappers record the child's peak RSS by crate name; later invocations of
 //! that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
 //!
+//! Linux cgroup-v2 resources are logged for diagnostics. Resource-aware
+//! admission needs a shared namespace policy and remains future work.
+//!
 //! If the scheduler directory cannot be used, compilation continues without
 //! a permit. [`Config::scheduler`] / `KACHE_SCHEDULER=0` turns the module off.
 
@@ -42,9 +45,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Defaults to `std::thread::available_parallelism()`, with a floor of 1
 /// when the OS cannot report it.
 pub fn default_pool_size() -> u32 {
-    std::thread::available_parallelism()
+    let available = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
-        .unwrap_or(1)
+        .unwrap_or(1);
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        ResourceSnapshot::discover().trace_diagnostics(available);
+    }
+    available
 }
 
 /// Identity used to join a flight without the finished cache key.
@@ -407,10 +414,478 @@ fn rss_units_to_bytes(ru_maxrss: u64) -> u64 {
     }
 }
 
+/// Resource limits and usage visible to the current process.
+///
+/// This snapshot is diagnostic input only. The scheduler's permit files are
+/// shared, while cgroup capacity can differ by process. Resource-aware
+/// admission therefore needs a shared namespace policy and remains future
+/// work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResourceSnapshot {
+    /// `None` also means an ancestor `memory.max` was unreadable or malformed,
+    /// so diagnostics do not report a partial scan as a complete limit.
+    pub(crate) memory_limit_bytes: Option<u64>,
+    pub(crate) cpu_limit: Option<CpuLimit>,
+    pub(crate) cpuset_cpus: Option<u32>,
+    pub(crate) memory_current_bytes: Option<u64>,
+    pub(crate) memory_headroom_bytes: Option<u64>,
+    /// False when the visible cgroup mount starts below the hierarchy root,
+    /// so a tighter limit may exist above it.
+    pub(crate) ancestor_limits_complete: bool,
+    /// Counters for the current cgroup. Parent counters include descendants,
+    /// so summing ancestors would double-count events.
+    pub(crate) current_memory_events: Option<MemoryEvents>,
+}
+
+impl ResourceSnapshot {
+    pub(crate) fn unsupported() -> Self {
+        Self {
+            memory_limit_bytes: None,
+            cpu_limit: None,
+            cpuset_cpus: None,
+            memory_current_bytes: None,
+            memory_headroom_bytes: None,
+            ancestor_limits_complete: false,
+            current_memory_events: None,
+        }
+    }
+
+    /// Discover the current process' cgroup-v2 resources where supported.
+    pub(crate) fn discover() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::from_domain(ResourceDomain::from_files(
+                Path::new("/proc/self/cgroup"),
+                Path::new("/proc/self/mountinfo"),
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::unsupported()
+        }
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
+    fn from_domain(domain: Option<ResourceDomain>) -> Self {
+        domain
+            .map(|domain| domain.snapshot())
+            .unwrap_or_else(Self::unsupported)
+    }
+
+    fn trace_diagnostics(&self, available: u32) {
+        let events = self.current_memory_events.unwrap_or_default();
+        tracing::debug!(
+            available,
+            cpu_quota_us = self.cpu_limit.map(|limit| limit.quota_us),
+            cpu_period_us = self.cpu_limit.map(|limit| limit.period_us),
+            cpu_rounded_cpus = self.cpu_limit.map(CpuLimit::rounded_cpus),
+            cpuset_cpus = self.cpuset_cpus,
+            memory_limit_bytes = self.memory_limit_bytes,
+            memory_current_bytes = self.memory_current_bytes,
+            memory_headroom_bytes = self.memory_headroom_bytes,
+            ancestor_limits_complete = self.ancestor_limits_complete,
+            current_memory_events_known = self.current_memory_events.is_some(),
+            current_memory_low = events.low,
+            current_memory_high = events.high,
+            current_memory_max = events.max,
+            current_memory_oom = events.oom,
+            current_memory_oom_kill = events.oom_kill,
+            current_memory_oom_group_kill = events.oom_group_kill,
+            "scheduler resource snapshot; resource-aware admission is future work"
+        );
+    }
+}
+
+/// A parsed cgroup-v2 CPU quota and period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CpuLimit {
+    pub(crate) quota_us: u64,
+    pub(crate) period_us: u64,
+}
+
+impl CpuLimit {
+    /// The quota rounded up to a whole CPU. A fractional CPU still needs one
+    /// worker to make progress.
+    pub(crate) fn rounded_cpus(self) -> u32 {
+        self.quota_us
+            .div_ceil(self.period_us)
+            .min(u64::from(u32::MAX)) as u32
+    }
+}
+
+/// Counters exposed by cgroup-v2 `memory.events`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MemoryEvents {
+    pub(crate) low: u64,
+    pub(crate) high: u64,
+    pub(crate) max: u64,
+    pub(crate) oom: u64,
+    pub(crate) oom_kill: u64,
+    pub(crate) oom_group_kill: u64,
+}
+
+/// The current cgroup and its cgroup-v2 ancestor chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) struct ResourceDomain {
+    mount_point: PathBuf,
+    current: PathBuf,
+    ancestor_limits_complete: bool,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl ResourceDomain {
+    /// Construct a domain from injectable proc-style files.
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn from_files(cgroup_file: &Path, mountinfo_file: &Path) -> Option<Self> {
+        let cgroup = fs::read_to_string(cgroup_file).ok()?;
+        let mountinfo = fs::read_to_string(mountinfo_file).ok()?;
+        Self::from_proc_text(&cgroup, &mountinfo)
+    }
+
+    /// Construct a domain from proc-style contents.
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn from_proc_text(cgroup: &str, mountinfo: &str) -> Option<Self> {
+        let relative = parse_cgroup_v2_path(cgroup)?;
+        parse_cgroup2_mounts(mountinfo)
+            .into_iter()
+            .filter_map(|(mount_root, mount_point)| {
+                let current = cgroup_path(&mount_root, &mount_point, &relative)?;
+                let depth = mount_root.components().count();
+                Some((
+                    depth,
+                    Self {
+                        mount_point,
+                        current,
+                        ancestor_limits_complete: mount_root == Path::new("/"),
+                    },
+                ))
+            })
+            // Prefer the mount that exposes the most ancestors. A subtree
+            // bind mount can hide tighter limits above its mount root.
+            .min_by_key(|(depth, _)| *depth)
+            .map(|(_, domain)| domain)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn current_path(&self) -> &Path {
+        &self.current
+    }
+
+    pub(crate) fn snapshot(&self) -> ResourceSnapshot {
+        let mut memory_limit_bytes: Option<u64> = None;
+        let mut memory_headroom_bytes: Option<u64> = None;
+        let mut memory_limits_complete = self.ancestor_limits_complete;
+        let mut memory_headroom_complete = true;
+        let mut cpu_limit: Option<CpuLimit> = None;
+        let mut cpu_limits_complete = self.ancestor_limits_complete;
+        for path in self.ancestors() {
+            let is_mount_root = path == self.mount_point;
+            let memory_max = path.join("memory.max");
+            match read_memory_limit(&memory_max) {
+                Some(Some(limit)) => {
+                    memory_limit_bytes = Some(match memory_limit_bytes {
+                        Some(current) => current.min(limit),
+                        None => limit,
+                    });
+                    if let Some(current) = read_u64_file(&path.join("memory.current")) {
+                        let headroom = limit.saturating_sub(current);
+                        memory_headroom_bytes = Some(match memory_headroom_bytes {
+                            Some(current) => current.min(headroom),
+                            None => headroom,
+                        });
+                    } else {
+                        memory_headroom_complete = false;
+                    }
+                }
+                Some(None) => {}
+                None if is_mount_root && matches!(memory_max.try_exists(), Ok(false)) => {}
+                None => memory_limits_complete = false,
+            }
+            let cpu_max = path.join("cpu.max");
+            match read_cpu_limit(&cpu_max) {
+                Some(Some(limit)) => {
+                    cpu_limit = Some(match cpu_limit {
+                        Some(current) if cpu_limit_is_tighter(current, limit) => current,
+                        _ => limit,
+                    });
+                }
+                Some(None) => {}
+                None if is_mount_root && matches!(cpu_max.try_exists(), Ok(false)) => {}
+                None => cpu_limits_complete = false,
+            }
+        }
+        if !memory_limits_complete {
+            memory_limit_bytes = None;
+            memory_headroom_bytes = None;
+        } else if !memory_headroom_complete {
+            memory_headroom_bytes = None;
+        }
+        if !cpu_limits_complete {
+            cpu_limit = None;
+        }
+
+        let memory_current_bytes = read_u64_file(&self.current.join("memory.current"));
+        let current_memory_events = fs::read_to_string(self.current.join("memory.events"))
+            .ok()
+            .and_then(|text| parse_memory_events(&text));
+
+        ResourceSnapshot {
+            memory_limit_bytes,
+            cpu_limit,
+            cpuset_cpus: fs::read_to_string(self.current.join("cpuset.cpus.effective"))
+                .ok()
+                .and_then(|text| parse_cpuset_cpus(&text)),
+            memory_current_bytes,
+            memory_headroom_bytes,
+            ancestor_limits_complete: self.ancestor_limits_complete,
+            current_memory_events,
+        }
+    }
+
+    fn ancestors(&self) -> impl Iterator<Item = PathBuf> {
+        let mut paths = Vec::new();
+        let mut path = self.current.clone();
+        while path.starts_with(&self.mount_point) {
+            paths.push(path.clone());
+            if path == self.mount_point {
+                break;
+            }
+            if !path.pop() {
+                break;
+            }
+        }
+        paths.into_iter()
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_cgroup_v2_path(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        // `str::lines` removes the proc line ending. Keep the field itself
+        // byte-for-byte: spaces are valid in cgroup directory names.
+        let path = fields.next()?;
+        if hierarchy == "0" && controllers.is_empty() && path.starts_with('/') {
+            valid_cgroup_relative(path).then(|| path.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn valid_cgroup_relative(path: &str) -> bool {
+    path == "/"
+        || path.strip_prefix('/').is_some_and(|path| {
+            path.split('/')
+                .all(|part| !part.is_empty() && part != "." && part != "..")
+        })
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_cgroup2_mounts(text: &str) -> Vec<(PathBuf, PathBuf)> {
+    text.lines()
+        .filter_map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let fields: Vec<_> = left.split_whitespace().collect();
+            let mut right_fields = right.split_whitespace();
+            let filesystem = right_fields.next()?;
+            right_fields.next()?;
+            right_fields.next()?;
+            if fields.len() < 6 || filesystem != "cgroup2" {
+                return None;
+            }
+            let root = decode_mountinfo_field(fields[3])?;
+            let mount_point = decode_mountinfo_field(fields[4])?;
+            let root = PathBuf::from(root);
+            let mount_point = PathBuf::from(mount_point);
+            (valid_absolute_path(&root) && valid_absolute_path(&mount_point))
+                .then_some((root, mount_point))
+        })
+        .collect()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn valid_absolute_path(path: &Path) -> bool {
+    use std::path::Component;
+
+    path.is_absolute()
+        && path
+            .components()
+            .all(|part| !matches!(part, Component::CurDir | Component::ParentDir))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn decode_mountinfo_field(field: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut bytes = field.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            decoded.push(byte);
+            continue;
+        }
+        let escape = [bytes.next()?, bytes.next()?, bytes.next()?];
+        decoded.push(match escape {
+            [b'0', b'1', b'1'] => b'\t',
+            [b'0', b'1', b'2'] => b'\n',
+            [b'0', b'4', b'0'] => b' ',
+            [b'1', b'3', b'4'] => b'\\',
+            _ => return None,
+        });
+    }
+    String::from_utf8(decoded).ok()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn cgroup_path(root: &Path, mount_point: &Path, relative: &str) -> Option<PathBuf> {
+    let relative = Path::new(relative);
+    let suffix = relative.strip_prefix(root).ok()?;
+    let current = mount_point.join(suffix);
+    current.starts_with(mount_point).then_some(current)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn read_u64_file(path: &Path) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Outer `None` is an unreadable/malformed file; inner `None` is the valid
+/// cgroup-v2 `max` value (unlimited).
+#[cfg(any(test, target_os = "linux"))]
+fn read_memory_limit(path: &Path) -> Option<Option<u64>> {
+    let text = fs::read_to_string(path).ok()?;
+    let value = text.trim();
+    if value == "max" {
+        Some(None)
+    } else {
+        Some(Some(value.parse().ok()?))
+    }
+}
+
+/// Outer `None` is an unreadable/malformed file; inner `None` is a valid
+/// unlimited quota.
+#[cfg(any(test, target_os = "linux"))]
+fn read_cpu_limit(path: &Path) -> Option<Option<CpuLimit>> {
+    let text = fs::read_to_string(path).ok()?;
+    parse_cpu_limit(&text)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_cpu_limit(text: &str) -> Option<Option<CpuLimit>> {
+    let fields: Vec<_> = text.split_whitespace().collect();
+    if fields.len() != 2 {
+        return None;
+    }
+    let period_us = fields[1].parse().ok()?;
+    if period_us == 0 {
+        return None;
+    }
+    if fields[0] == "max" {
+        return Some(None);
+    }
+    let quota_us = fields[0].parse().ok()?;
+    (quota_us > 0).then_some(Some(CpuLimit {
+        quota_us,
+        period_us,
+    }))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn cpu_limit_is_tighter(left: CpuLimit, right: CpuLimit) -> bool {
+    u128::from(left.quota_us) * u128::from(right.period_us)
+        <= u128::from(right.quota_us) * u128::from(left.period_us)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn parse_cpuset_cpus(text: &str) -> Option<u32> {
+    let mut ranges = Vec::new();
+    for item in text.trim().split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return None;
+        }
+        let (start, end) = match item.split_once('-') {
+            Some((start, end)) => (start.trim().parse().ok()?, end.trim().parse().ok()?),
+            None => {
+                let cpu = item.parse().ok()?;
+                (cpu, cpu)
+            }
+        };
+        if start > end {
+            return None;
+        }
+        ranges.push((start, end));
+    }
+    ranges.sort_unstable();
+    let mut count = 0u64;
+    let mut merged: Option<(u32, u32)> = None;
+    for (start, end) in ranges {
+        match merged {
+            Some((merged_start, merged_end)) if start <= merged_end => {
+                merged = Some((merged_start, merged_end.max(end)));
+            }
+            Some((merged_start, merged_end)) => {
+                count = count.checked_add(u64::from(merged_end) - u64::from(merged_start) + 1)?;
+                merged = Some((start, end));
+            }
+            None => merged = Some((start, end)),
+        }
+    }
+    if let Some((start, end)) = merged {
+        count = count.checked_add(u64::from(end) - u64::from(start) + 1)?;
+    }
+    u32::try_from(count).ok()
+}
+
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn parse_memory_events(text: &str) -> Option<MemoryEvents> {
+    let mut events = MemoryEvents::default();
+    let mut found = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let key = fields.next()?;
+        let value = fields.next()?.parse().ok()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        found = true;
+        match key {
+            "low" => events.low = value,
+            "high" => events.high = value,
+            "max" => events.max = value,
+            "oom" => events.oom = value,
+            "oom_kill" => events.oom_kill = value,
+            "oom_group_kill" => events.oom_group_kill = value,
+            _ => {}
+        }
+    }
+    found.then_some(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    struct TraceWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn temp_cache() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -439,6 +914,503 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(ready.exists(), "scheduler fixture did not become ready");
+    }
+
+    fn fixture_domain(root: &Path, cgroup: &str) -> ResourceDomain {
+        let mount = root.join("cgroup");
+        fs::create_dir_all(&mount).unwrap();
+        ResourceDomain {
+            current: mount.join(cgroup.strip_prefix('/').unwrap()),
+            mount_point: mount,
+            ancestor_limits_complete: true,
+        }
+    }
+
+    #[test]
+    fn resource_snapshot_takes_tightest_nested_limits() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/build/worker");
+        let mount = dir.path().join("cgroup");
+        fs::write(mount.join("memory.max"), b"8589934592\n").unwrap();
+        fs::write(mount.join("cpu.max"), b"400000 100000\n").unwrap();
+        fs::create_dir_all(mount.join("build")).unwrap();
+        fs::write(mount.join("build/memory.max"), b"4294967296\n").unwrap();
+        fs::write(mount.join("build/cpu.max"), b"250000 100000\n").unwrap();
+        fs::create_dir_all(mount.join("build/worker")).unwrap();
+        fs::write(mount.join("build/worker/memory.max"), b"max\n").unwrap();
+        fs::write(mount.join("build/worker/cpu.max"), b"max 100000\n").unwrap();
+
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.memory_limit_bytes, Some(4 << 30));
+        assert_eq!(snapshot.cpu_limit.unwrap().rounded_cpus(), 3);
+    }
+
+    #[test]
+    fn resource_snapshot_accepts_child_limits_without_root_controller_files() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job");
+        let current = dir.path().join("cgroup/job");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("memory.max"), b"1073741824\n").unwrap();
+        fs::write(current.join("memory.current"), b"268435456\n").unwrap();
+        fs::write(current.join("cpu.max"), b"150000 100000\n").unwrap();
+
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.memory_limit_bytes, Some(1 << 30));
+        assert_eq!(snapshot.memory_current_bytes, Some(256 << 20));
+        assert_eq!(snapshot.memory_headroom_bytes, Some(768 << 20));
+        assert_eq!(
+            snapshot.cpu_limit,
+            Some(CpuLimit {
+                quota_us: 150_000,
+                period_us: 100_000,
+            })
+        );
+        assert_eq!(snapshot.cpu_limit.unwrap().rounded_cpus(), 2);
+    }
+
+    #[test]
+    fn resource_snapshot_rejects_missing_non_root_controller_files() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job/leaf");
+        let leaf = dir.path().join("cgroup/job/leaf");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(leaf.join("memory.max"), b"1073741824\n").unwrap();
+        fs::write(leaf.join("memory.current"), b"268435456\n").unwrap();
+        fs::write(leaf.join("cpu.max"), b"150000 100000\n").unwrap();
+
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.memory_limit_bytes, None);
+        assert_eq!(snapshot.memory_headroom_bytes, None);
+        assert_eq!(snapshot.cpu_limit, None);
+        assert_eq!(snapshot.memory_current_bytes, Some(256 << 20));
+    }
+
+    #[test]
+    fn resource_snapshot_reads_current_headroom_and_saturates() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job");
+        let current = dir.path().join("cgroup/job");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(dir.path().join("cgroup/memory.max"), b"100\n").unwrap();
+        fs::write(dir.path().join("cgroup/memory.current"), b"125\n").unwrap();
+        fs::write(current.join("memory.max"), b"max\n").unwrap();
+        fs::write(current.join("memory.current"), b"125\n").unwrap();
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.memory_current_bytes, Some(125));
+        assert_eq!(snapshot.memory_headroom_bytes, Some(0));
+    }
+
+    #[test]
+    fn resource_snapshot_uses_each_ancestor_usage_for_headroom() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job/leaf");
+        let mount = dir.path().join("cgroup");
+        let leaf = mount.join("job/leaf");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(mount.join("memory.max"), b"100\n").unwrap();
+        fs::write(mount.join("memory.current"), b"90\n").unwrap();
+        fs::write(mount.join("job/memory.max"), b"max\n").unwrap();
+        fs::write(leaf.join("memory.max"), b"max\n").unwrap();
+        fs::write(leaf.join("memory.current"), b"10\n").unwrap();
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.memory_limit_bytes, Some(100));
+        assert_eq!(snapshot.memory_current_bytes, Some(10));
+        assert_eq!(snapshot.memory_headroom_bytes, Some(10));
+    }
+
+    #[test]
+    fn resource_snapshot_with_unknown_bounded_usage_has_no_headroom() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job/leaf");
+        let mount = dir.path().join("cgroup");
+        let leaf = mount.join("job/leaf");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(mount.join("memory.max"), b"100\n").unwrap();
+        fs::write(mount.join("memory.current"), b"20\n").unwrap();
+        fs::write(mount.join("job/memory.max"), b"max\n").unwrap();
+        fs::write(leaf.join("memory.max"), b"50\n").unwrap();
+        fs::write(leaf.join("memory.current"), b"malformed\n").unwrap();
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.memory_limit_bytes, Some(50));
+        assert_eq!(snapshot.memory_headroom_bytes, None);
+    }
+
+    #[test]
+    fn resource_snapshot_with_malformed_ancestor_cpu_has_no_quota() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job");
+        let mount = dir.path().join("cgroup");
+        let current = mount.join("job");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(mount.join("cpu.max"), b"200000 100000\n").unwrap();
+        fs::write(current.join("cpu.max"), b"malformed\n").unwrap();
+
+        assert_eq!(domain.snapshot().cpu_limit, None);
+    }
+
+    #[test]
+    fn resource_snapshot_keeps_leaf_quota_when_ancestor_ratio_ties() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job");
+        let mount = dir.path().join("cgroup");
+        let current = mount.join("job");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(mount.join("cpu.max"), b"200000 200000\n").unwrap();
+        fs::write(current.join("cpu.max"), b"100000 100000\n").unwrap();
+
+        assert_eq!(
+            domain.snapshot().cpu_limit,
+            Some(CpuLimit {
+                quota_us: 100_000,
+                period_us: 100_000,
+            })
+        );
+    }
+
+    #[test]
+    fn resource_snapshot_uses_tighter_ancestor_cpu_quota() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job");
+        let mount = dir.path().join("cgroup");
+        let current = mount.join("job");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(mount.join("cpu.max"), b"150000 100000\n").unwrap();
+        fs::write(current.join("cpu.max"), b"400000 100000\n").unwrap();
+
+        assert_eq!(
+            domain.snapshot().cpu_limit,
+            Some(CpuLimit {
+                quota_us: 150_000,
+                period_us: 100_000,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_ancestor_memory_clears_limit_and_headroom() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job");
+        let mount = dir.path().join("cgroup");
+        let current = mount.join("job");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(mount.join("memory.max"), b"malformed\n").unwrap();
+        fs::write(current.join("memory.max"), b"1073741824\n").unwrap();
+        fs::write(current.join("memory.current"), b"268435456\n").unwrap();
+
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.memory_limit_bytes, None);
+        assert_eq!(snapshot.memory_headroom_bytes, None);
+        assert_eq!(snapshot.memory_current_bytes, Some(256 << 20));
+    }
+
+    #[test]
+    fn resource_snapshot_reads_cpuset_ranges_and_memory_events() {
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job");
+        let current = dir.path().join("cgroup/job");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("cpuset.cpus.effective"), b"0-3, 5, 7-8\n").unwrap();
+        fs::write(
+            current.join("memory.events"),
+            b"low 1\nhigh 2\nmax 3\noom 4\noom_kill 5\noom_group_kill 6\n",
+        )
+        .unwrap();
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.cpuset_cpus, Some(7));
+        assert_eq!(
+            snapshot.current_memory_events,
+            Some(MemoryEvents {
+                low: 1,
+                high: 2,
+                max: 3,
+                oom: 4,
+                oom_kill: 5,
+                oom_group_kill: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn trace_diagnostics_emits_resource_snapshot_fields() {
+        let snapshot = ResourceSnapshot {
+            memory_limit_bytes: Some(1 << 30),
+            cpu_limit: Some(CpuLimit {
+                quota_us: 150_000,
+                period_us: 100_000,
+            }),
+            cpuset_cpus: Some(3),
+            memory_current_bytes: Some(256 << 20),
+            memory_headroom_bytes: Some(768 << 20),
+            ancestor_limits_complete: true,
+            current_memory_events: Some(MemoryEvents {
+                low: 1,
+                high: 2,
+                max: 3,
+                oom: 4,
+                oom_kill: 5,
+                oom_group_kill: 6,
+            }),
+        };
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(move || TraceWriter(Arc::clone(&writer_output)))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || snapshot.trace_diagnostics(8));
+
+        let rendered = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        for expected in [
+            "scheduler resource snapshot; resource-aware admission is future work",
+            "available=8",
+            "cpu_quota_us=150000",
+            "cpu_period_us=100000",
+            "cpu_rounded_cpus=2",
+            "cpuset_cpus=3",
+            "memory_limit_bytes=1073741824",
+            "memory_current_bytes=268435456",
+            "memory_headroom_bytes=805306368",
+            "ancestor_limits_complete=true",
+            "current_memory_events_known=true",
+            "current_memory_low=1",
+            "current_memory_high=2",
+            "current_memory_max=3",
+            "current_memory_oom=4",
+            "current_memory_oom_kill=5",
+            "current_memory_oom_group_kill=6",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "{expected} missing from trace: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_limit_reader_distinguishes_unlimited_and_malformed() {
+        let dir = temp_cache();
+        let path = dir.path().join("memory.max");
+
+        fs::write(&path, b"max\n").unwrap();
+        assert_eq!(read_memory_limit(&path), Some(None));
+        fs::write(&path, b"1073741824\n").unwrap();
+        assert_eq!(read_memory_limit(&path), Some(Some(1 << 30)));
+        fs::write(&path, b"not-a-limit\n").unwrap();
+        assert_eq!(read_memory_limit(&path), None);
+    }
+
+    #[test]
+    fn cpu_parser_rejects_zero_and_rounds_fractional_capacity_up() {
+        assert_eq!(parse_cpu_limit("max 100000\n"), Some(None));
+        assert_eq!(parse_cpu_limit("0 100000\n"), None);
+        assert_eq!(parse_cpu_limit("100000 0\n"), None);
+        assert_eq!(parse_cpu_limit("100000 nope\n"), None);
+        assert_eq!(parse_cpu_limit("100000 100000 extra\n"), None);
+
+        let half = parse_cpu_limit("50000 100000\n").unwrap().unwrap();
+        let fraction_over_one = parse_cpu_limit("100001 100000\n").unwrap().unwrap();
+        assert_eq!(half.rounded_cpus(), 1);
+        assert_eq!(fraction_over_one.rounded_cpus(), 2);
+    }
+
+    #[test]
+    fn equal_cpu_ratios_are_tied_in_both_directions() {
+        let left = CpuLimit {
+            quota_us: 100_000,
+            period_us: 50_000,
+        };
+        let right = CpuLimit {
+            quota_us: 400_000,
+            period_us: 200_000,
+        };
+        assert!(cpu_limit_is_tighter(left, right));
+        assert!(cpu_limit_is_tighter(right, left));
+    }
+
+    #[test]
+    fn cpuset_parser_merges_overlap_and_rejects_overflow() {
+        assert_eq!(parse_cpuset_cpus("3,1-2,2-4,6,5"), Some(6));
+        assert_eq!(parse_cpuset_cpus("0,2"), Some(2));
+        assert_eq!(parse_cpuset_cpus("4294967295"), Some(1));
+        assert_eq!(parse_cpuset_cpus("0-4294967295"), None);
+        assert_eq!(parse_cpuset_cpus("3-1"), None);
+        assert_eq!(parse_cpuset_cpus(""), None);
+    }
+
+    #[test]
+    fn memory_event_parser_rejects_bad_rows_and_empty_input() {
+        assert_eq!(parse_memory_events("oom nope\n"), None);
+        assert_eq!(parse_memory_events("oom 1 extra\n"), None);
+        assert_eq!(parse_memory_events("\n"), None);
+    }
+
+    #[test]
+    fn proc_cgroup_parser_rejects_ambiguous_or_escaping_paths() {
+        assert_eq!(
+            parse_cgroup_v2_path("5:cpu:/legacy\n0::/user.slice/job\n"),
+            Some("/user.slice/job".to_string())
+        );
+        assert_eq!(parse_cgroup_v2_path("0:cpu:/job\n"), None);
+        assert_eq!(parse_cgroup_v2_path("0::relative\n"), None);
+        assert_eq!(parse_cgroup_v2_path("0::/job/../escape\n"), None);
+        assert_eq!(parse_cgroup_v2_path("0::/job//leaf\n"), None);
+    }
+
+    #[test]
+    fn proc_cgroup_parser_preserves_path_whitespace() {
+        assert_eq!(
+            parse_cgroup_v2_path("0::/job with trailing space \n"),
+            Some("/job with trailing space ".to_string())
+        );
+    }
+
+    #[test]
+    fn mountinfo_decoder_accepts_kernel_escapes_and_utf8() {
+        assert_eq!(
+            decode_mountinfo_field(r"/a\040b\011c\012d\134e-é"),
+            Some("/a b\tc\nd\\e-é".to_string())
+        );
+        assert_eq!(decode_mountinfo_field(r"/bad\057path"), None);
+        assert_eq!(decode_mountinfo_field(r"/bad\04"), None);
+        assert_eq!(decode_mountinfo_field(r"/bad\xyz"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_domain_resolves_mount_root_and_injected_files() {
+        let dir = temp_cache();
+        let cgroup_file = dir.path().join("self-cgroup");
+        let mountinfo_file = dir.path().join("mountinfo");
+        let mount = dir.path().join("cgroup");
+        fs::create_dir_all(&mount).unwrap();
+        fs::write(&cgroup_file, b"0::/slice/job\n").unwrap();
+        fs::write(
+            &mountinfo_file,
+            format!(
+                "1 2 0:1 / {}/host rw - cgroup2 cgroup rw\n\
+                 2 3 0:2 /slice {} rw - cgroup2 cgroup rw\n",
+                mount.display(),
+                mount.display()
+            ),
+        )
+        .unwrap();
+        let domain = ResourceDomain::from_files(&cgroup_file, &mountinfo_file).unwrap();
+        assert_eq!(domain.current_path(), mount.join("host/slice/job"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_domain_prefers_the_mount_that_exposes_parent_limits() {
+        let dir = temp_cache();
+        let full = dir.path().join("full");
+        let subtree = dir.path().join("subtree");
+        let current = full.join("parent/child/job");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(subtree.join("job")).unwrap();
+        let mountinfo = format!(
+            "1 2 0:1 / {} rw - cgroup2 cgroup rw\n\
+             2 3 0:2 /parent/child {} rw - cgroup2 cgroup rw\n",
+            full.display(),
+            subtree.display()
+        );
+        let domain = ResourceDomain::from_proc_text("0::/parent/child/job\n", &mountinfo).unwrap();
+        assert_eq!(domain.current_path(), current);
+
+        for path in [&full, &full.join("parent/child"), &current] {
+            fs::write(path.join("memory.max"), b"max\n").unwrap();
+            fs::write(path.join("cpu.max"), b"max 100000\n").unwrap();
+        }
+        let parent = full.join("parent");
+        fs::write(parent.join("memory.max"), b"100\n").unwrap();
+        fs::write(parent.join("memory.current"), b"90\n").unwrap();
+        fs::write(parent.join("cpu.max"), b"50000 100000\n").unwrap();
+        fs::write(current.join("memory.current"), b"10\n").unwrap();
+
+        let snapshot = domain.snapshot();
+        assert!(snapshot.ancestor_limits_complete);
+        assert_eq!(snapshot.memory_limit_bytes, Some(100));
+        assert_eq!(snapshot.memory_headroom_bytes, Some(10));
+        assert_eq!(snapshot.cpu_limit.unwrap().rounded_cpus(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_domain_marks_a_subtree_only_mount_incomplete() {
+        let dir = temp_cache();
+        let mount = dir.path().join("subtree");
+        let current = mount.join("job");
+        fs::create_dir_all(&current).unwrap();
+        let mountinfo = format!(
+            "1 2 0:1 /parent/child {} rw - cgroup2 cgroup rw\n",
+            mount.display()
+        );
+        let domain = ResourceDomain::from_proc_text("0::/parent/child/job\n", &mountinfo).unwrap();
+        fs::write(mount.join("memory.max"), b"100\n").unwrap();
+        fs::write(mount.join("memory.current"), b"90\n").unwrap();
+        fs::write(mount.join("cpu.max"), b"50000 100000\n").unwrap();
+        fs::write(current.join("memory.max"), b"max\n").unwrap();
+        fs::write(current.join("memory.current"), b"10\n").unwrap();
+        fs::write(current.join("cpu.max"), b"max 100000\n").unwrap();
+
+        let snapshot = domain.snapshot();
+        assert!(!snapshot.ancestor_limits_complete);
+        assert_eq!(snapshot.memory_limit_bytes, None);
+        assert_eq!(snapshot.memory_headroom_bytes, None);
+        assert_eq!(snapshot.cpu_limit, None);
+        assert_eq!(snapshot.memory_current_bytes, Some(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_domain_decodes_mountinfo_path_escapes() {
+        let dir = temp_cache();
+        let mount = dir.path().join("cgroup space");
+        fs::create_dir_all(&mount).unwrap();
+        let encoded_mount = mount.to_string_lossy().replace(' ', r"\040");
+        let mountinfo = format!("1 2 0:1 / {encoded_mount} rw - cgroup2 cgroup rw\n");
+
+        let domain = ResourceDomain::from_proc_text("0::/job\n", &mountinfo).unwrap();
+        assert_eq!(domain.current_path(), mount.join("job"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mountinfo_parser_rejects_relative_and_parent_paths() {
+        assert!(parse_cgroup2_mounts("1 2 0:1 / relative rw - cgroup2 cgroup rw\n").is_empty());
+        assert!(
+            parse_cgroup2_mounts("1 2 0:1 / /sys/../escape rw - cgroup2 cgroup rw\n").is_empty()
+        );
+        assert!(parse_cgroup2_mounts("1 2 0:1 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n").is_empty());
+        assert!(parse_cgroup2_mounts("1 2 0:1 / /sys/fs/cgroup - cgroup2 cgroup rw\n").is_empty());
+        assert!(parse_cgroup2_mounts("1 2 0:1 / /sys/fs/cgroup rw - cgroup2\n").is_empty());
+    }
+
+    #[test]
+    fn resource_discovery_failure_returns_unsupported_snapshot() {
+        let dir = temp_cache();
+        let missing_cgroup = dir.path().join("missing-cgroup");
+        let missing_mountinfo = dir.path().join("missing-mountinfo");
+        assert_eq!(
+            ResourceSnapshot::from_domain(ResourceDomain::from_files(
+                &missing_cgroup,
+                &missing_mountinfo,
+            )),
+            ResourceSnapshot::unsupported()
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn unsupported_resource_snapshot_is_empty() {
+        assert_eq!(
+            ResourceSnapshot::unsupported(),
+            ResourceSnapshot::discover()
+        );
     }
 
     #[test]

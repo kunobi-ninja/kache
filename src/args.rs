@@ -268,6 +268,9 @@ pub struct RustcArgs {
     /// Unstable `-Z` flags. Can change codegen (e.g. `-Zsanitizer`,
     /// `-Zshare-generics`) and arrive on argv outside RUSTFLAGS.
     pub unstable_flags: Vec<String>,
+    /// Frontend worker counts from `--jobs-frontend`. Stored in argv order
+    /// because repeated occurrences use the last value.
+    pub frontend_jobs: Vec<String>,
     /// Direct rustc `--remap-path-prefix FROM=TO` values in argv order.
     /// The key normalizes known machine-local FROM prefixes while retaining
     /// unrelated FROM values, TO values, and occurrence order.
@@ -389,6 +392,7 @@ impl RustcArgs {
             link_search: Vec::new(),
             link_libs: Vec::new(),
             unstable_flags: Vec::new(),
+            frontend_jobs: Vec::new(),
             remap_path_prefixes: Vec::new(),
             inner_rustc,
             all_args: rustc_args.to_vec(),
@@ -547,6 +551,17 @@ impl RustcArgs {
                 }
                 _ if arg.starts_with("-l") && arg.len() > 2 => {
                     parsed.link_libs.push(arg["-l".len()..].to_string());
+                }
+                "--jobs-frontend" => {
+                    i += 1;
+                    parsed
+                        .frontend_jobs
+                        .push(rustc_args.get(i).cloned().unwrap_or_default());
+                }
+                _ if arg.starts_with("--jobs-frontend=") => {
+                    parsed
+                        .frontend_jobs
+                        .push(arg["--jobs-frontend=".len()..].to_string());
                 }
                 "-Z" => {
                     i += 1;
@@ -1010,6 +1025,7 @@ mod tests {
         link_search: Vec<String>,
         link_libs: Vec<String>,
         unstable_flags: Vec<String>,
+        frontend_jobs: Vec<String>,
         remap_path_prefixes: Vec<String>,
         inner_rustc: Option<PathBuf>,
         all_args: Vec<String>,
@@ -1057,6 +1073,7 @@ mod tests {
             link_search: parsed.link_search.clone(),
             link_libs: parsed.link_libs.clone(),
             unstable_flags: parsed.unstable_flags.clone(),
+            frontend_jobs: parsed.frontend_jobs.clone(),
             remap_path_prefixes: parsed.remap_path_prefixes.clone(),
             inner_rustc: parsed.inner_rustc.clone(),
             all_args: parsed.all_args.clone(),
@@ -1166,6 +1183,25 @@ mod tests {
                 parsed.residual_args
             );
         }
+    }
+
+    #[test]
+    fn frontend_jobs_capture_both_spellings_and_preserve_order() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["rustc".to_string()];
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            RustcArgs::parse(&argv).unwrap()
+        };
+
+        let separated = parse(&["--jobs-frontend", "16"]);
+        let attached = parse(&["--jobs-frontend=16"]);
+        assert_eq!(separated.frontend_jobs, ["16"]);
+        assert_eq!(attached.frontend_jobs, separated.frontend_jobs);
+        assert!(separated.residual_args.is_empty());
+        assert!(attached.residual_args.is_empty());
+
+        let repeated = parse(&["--jobs-frontend=4", "--jobs-frontend", "8"]);
+        assert_eq!(repeated.frontend_jobs, ["4", "8"]);
     }
 
     /// The two sides of the #627 join have to agree: what a producer records

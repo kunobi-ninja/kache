@@ -99,15 +99,25 @@ jobs:
       # KACHE_RUNTIME_DIR into the job env, and the test suite is not yet
       # hermetic against it (integration tests read events.jsonl from the
       # cache dir; daemon unit tests would share one runtime dir).
-      - uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
+      # Use the latest stable release to accelerate ordinary verification.
+      # E2E, mutation, Kani, and platform jobs below still build this commit
+      # directly. Add `[no-kache]` to a PR title to diagnose cache-related CI.
+      - id: stable_kache
+        if: github.event_name != 'pull_request' || !contains(github.event.pull_request.title, '[no-kache]')
+        uses: kunobi-ninja/kache-action@49398d37113c616fdb61be434cb497e3c2c8f3e6 # v1
         with:
           github-cache: "true"
           cache-executables: "false"
+          # The old key contains no compiler outputs because Justfile disabled
+          # the wrapper. Start a new immutable Actions cache with real entries.
+          cache-key-prefix: kache-self-build
       - name: Clean bootstrap cache artifacts
         run: cargo clean
       - name: Run repo verification
         # kache-action exports the installed release version; self-checks must
         # compile with Cargo.toml's version from this PR.
+        env:
+          KACHE_SELF_HOST: ${{ steps.stable_kache.outcome == 'success' && '1' || '0' }}
         run: env -u KACHE_VERSION ./scripts/with-test-resources.sh just ci
         timeout-minutes: 30
       - name: Check crates.io package metadata

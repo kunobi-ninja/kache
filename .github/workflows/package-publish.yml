@@ -151,7 +151,7 @@ jobs:
           KMS_KEY: ${{ secrets.PGP_SIGN_KMS_KEY_VERSION }}
           CERT_PATH: ${{ steps.pgp-kms.outputs.cert-path }}
           APT_CHANNEL: ${{ needs.resolve.outputs.channel }}
-          CONF_DIR: ./apt_config
+          CONF_DIR: ./packaging/apt
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
@@ -415,11 +415,11 @@ jobs:
             }
 
   # ---------------------------------------------------------------------------
-  # aur — publish official Arch User Repository packages. Each aur/<name>/ folder
+  # aur — publish official Arch User Repository packages. Each packaging/aur/<name>/ folder
   # is one AUR package (a tiny git repo hosted by the AUR itself,
   # ssh://aur@aur.archlinux.org/<name>.git — NOT a GitHub repo, just
   # PKGBUILD + .SRCINFO). Enable/disable a flavor per project by adding/removing
-  # its aur/<name>/ folder. Versioned packages (-bin, source) get pkgver
+  # its packaging/aur/<name>/ folder. Versioned packages (-bin, source) get pkgver
   # refreshed to the release; VCS packages (-git) get theirs computed from git
   # as <latest tag>.r<commits>.g<sha> by scripts/aur/vcs-pkgver.sh, matching what
   # their own pkgver() recomputes at build time. That value moves every release,
@@ -439,7 +439,7 @@ jobs:
       - id: list
         run: |
           set -euo pipefail
-          PKGS=$(ls -d aur/*/ 2>/dev/null | xargs -rn1 basename | jq -R . | jq -sc . || echo '[]')
+          PKGS=$(ls -d packaging/aur/*/ 2>/dev/null | xargs -rn1 basename | jq -R . | jq -sc . || echo '[]')
           echo "pkgs=${PKGS:-[]}" >> "$GITHUB_OUTPUT"
           echo "AUR packages: ${PKGS:-[]}"
 
@@ -483,20 +483,20 @@ jobs:
               PKGVER="$(./scripts/aur/vcs-pkgver.sh .)"
             else
               echo "::warning::scripts/aur/vcs-pkgver.sh not present at this ref — leaving ${PKG} pkgver untouched"
-              echo "--- aur/${PKG}/PKGBUILD (unchanged) ---"; cat "aur/${PKG}/PKGBUILD"
+              echo "--- packaging/aur/${PKG}/PKGBUILD (unchanged) ---"; cat "packaging/aur/${PKG}/PKGBUILD"
               exit 0
             fi
           else
             PKGVER="$VERSION"
           fi
-          sed -i -e "s/^pkgver=.*/pkgver=${PKGVER}/" -e "s/^pkgrel=.*/pkgrel=1/" "aur/${PKG}/PKGBUILD"
-          echo "--- aur/${PKG}/PKGBUILD ---"; cat "aur/${PKG}/PKGBUILD"
+          sed -i -e "s/^pkgver=.*/pkgver=${PKGVER}/" -e "s/^pkgrel=.*/pkgrel=1/" "packaging/aur/${PKG}/PKGBUILD"
+          echo "--- packaging/aur/${PKG}/PKGBUILD ---"; cat "packaging/aur/${PKG}/PKGBUILD"
 
       - name: Publish ${{ matrix.pkg }} to the AUR
         uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
         with:
           pkgname: ${{ matrix.pkg }}
-          pkgbuild: aur/${{ matrix.pkg }}/PKGBUILD
+          pkgbuild: packaging/aur/${{ matrix.pkg }}/PKGBUILD
           commit_username: kunobi
           commit_email: feedback@kunobi.ninja
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}

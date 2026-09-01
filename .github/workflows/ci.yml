@@ -1292,7 +1292,7 @@ jobs:
   # Publish the Helm chart to the OCI registry, tag-only.
   #
   # Until now the chart was never published at all: Flux read
-  # ./charts/kache-service straight from the git revision, so there was no
+  # ./packaging/charts/kache-service straight from the git revision, so there was no
   # versioned artifact and no way to say which chart a cluster ran. That is the
   # same shape as tracking a mutable `:latest` image — which is how a build the
   # planner could not start from reached production and sat there for 13 days.
@@ -1356,7 +1356,7 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           helm registry login registry-1.docker.io -u "$DOCKERHUB_USER" -p "$DOCKERHUB_TOKEN"
-          helm package charts/kache-service
+          helm package packaging/charts/kache-service
           # Explicit name, not kache-*.tgz: that glob would also match a stray
           # kache-<version>.tgz and silently push to the image's repository.
           helm push kache-service-*.tgz oci://registry-1.docker.io/zondax

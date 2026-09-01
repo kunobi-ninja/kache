@@ -142,6 +142,6 @@ cd kache
 cargo test --workspace --all-features
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+See [CONTRIBUTING.md](.github/CONTRIBUTING.md) before opening a pull request.
 
 Kache is licensed under the [Apache License 2.0](LICENSE).

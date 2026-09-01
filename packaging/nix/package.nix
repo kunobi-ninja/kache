@@ -6,7 +6,7 @@
   stdenv,
 }:
 let
-  cargoToml = builtins.fromTOML (builtins.readFile ../Cargo.toml);
+  cargoToml = builtins.fromTOML (builtins.readFile ../../Cargo.toml);
 
   fetchurlWithCratesUserAgent =
     args:
@@ -31,19 +31,19 @@ buildRustPackage {
   version = cargoToml.package.version;
 
   src = lib.fileset.toSource {
-    root = ../.;
+    root = ../../.;
     fileset = lib.fileset.unions [
-      ../Cargo.toml
-      ../Cargo.lock
-      ../assets
-      ../crates
-      ../src
-      ../tests/fixtures
+      ../../Cargo.toml
+      ../../Cargo.lock
+      ../../assets
+      ../../crates
+      ../../src
+      ../../tests/fixtures
     ];
   };
 
   cargoLock = {
-    lockFile = ../Cargo.lock;
+    lockFile = ../../Cargo.lock;
     outputHashes = {
       "kunobi-auth-0.2.0" = "sha256-5qwhst8gt6KY9A37j0loEHBICzIAaVuyvtdOjTjRbdk=";
       "kunobi-ha-0.5.0" = "sha256-S7i/hlpqfWnyv/3n8dyD90sMuICM/C4ouFLk536oc5k=";

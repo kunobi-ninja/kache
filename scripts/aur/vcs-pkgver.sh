@@ -2,7 +2,7 @@
 # Compute the pkgver for a VCS (-git) AUR package.
 #
 # Emits `<version>.r<count>.g<sha>`, byte-identical to what the pkgver()
-# function inside aur/*-git/PKGBUILD produces at build time. The two must
+# function inside packaging/aur/*-git/PKGBUILD produces at build time. The two must
 # agree: the AUR advertises this value as metadata, makepkg recomputes it on
 # the user's machine, and if the formats diverge then version comparison
 # between "what the AUR says" and "what got installed" stops meaning anything.
@@ -38,7 +38,7 @@ if ! git -C "$repo" rev-parse HEAD >/dev/null 2>&1; then
   exit 1
 fi
 
-# Mirrors aur/*-git/PKGBUILD's pkgver() exactly, including the 0.0.0 fallback
+# Mirrors packaging/aur/*-git/PKGBUILD's pkgver() exactly, including the 0.0.0 fallback
 # for a repo with no tags yet.
 version="$(git -C "$repo" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
 [ -n "$version" ] || version="0.0.0"

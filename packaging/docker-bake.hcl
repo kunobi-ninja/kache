@@ -1,7 +1,7 @@
 # Docker Bake configuration for kache service
-# Build:     docker buildx bake -f docker-bake.hcl
-# Dry run:   docker buildx bake -f docker-bake.hcl --print
-# Push (CI): docker buildx bake -f docker-bake.hcl release
+# Build:     docker buildx bake -f packaging/docker-bake.hcl
+# Dry run:   docker buildx bake -f packaging/docker-bake.hcl --print
+# Push (CI): docker buildx bake -f packaging/docker-bake.hcl release
 
 variable "REGISTRY" {
   default = "zondax"
@@ -71,7 +71,7 @@ group "release" {
 }
 
 target "service" {
-  dockerfile = "docker/service.Dockerfile"
+  dockerfile = "packaging/docker/service.Dockerfile"
   context    = "."
   platforms  = [PLATFORM]
   tags       = tags("kache")

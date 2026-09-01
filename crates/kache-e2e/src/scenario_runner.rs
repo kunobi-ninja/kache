@@ -90,6 +90,26 @@ struct Args {
     warm_same_tree: bool,
 }
 
+impl Args {
+    /// Was any clone-benchmark-only option supplied?
+    ///
+    /// These options mean nothing to a fixture scenario, so passing one without
+    /// selecting a clone scenario is a mistake worth reporting rather than
+    /// silently ignoring — the caller would otherwise believe a flag took
+    /// effect when it did not. Every benchmark option belongs on this list;
+    /// forgetting to add a new one is how a flag becomes silently inert.
+    fn has_bench_options(&self) -> bool {
+        self.git_ref.is_some()
+            || self.work_dir.is_some()
+            || self.skip_clone
+            || self.force_setup
+            || self.retry
+            || self.trace_keys
+            || self.warm_same_tree
+            || self.cache_backend != CacheBackend::Kache
+    }
+}
+
 pub fn main() -> Result<()> {
     let args = Args::parse();
     let mut select = args.select.clone();
@@ -133,14 +153,7 @@ pub fn main() -> Result<()> {
     if args.deny_missing_tools && clone_selected {
         bail!("--deny-missing-tools is only valid for fixture scenarios");
     }
-    let bench_flags = args.git_ref.is_some()
-        || args.work_dir.is_some()
-        || args.skip_clone
-        || args.force_setup
-        || args.retry
-        || args.trace_keys
-        || args.warm_same_tree
-        || args.cache_backend != CacheBackend::Kache;
+    let bench_flags = args.has_bench_options();
     if bench_flags && !clone_selected {
         bail!("benchmark options were provided, but no clone scenario was selected");
     }
@@ -221,6 +234,38 @@ fn profile_hint(name: &str, cache_backend: CacheBackend) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every clone-benchmark option, on its own, must be recognised as one.
+    /// The check is a long disjunction, and a term that stops contributing
+    /// makes its flag silently inert against a fixture selection instead of
+    /// producing the "no clone scenario was selected" error.
+    #[test]
+    fn every_benchmark_option_is_recognised_on_its_own() {
+        let plain = Args::parse_from(["kache-scenario", "--select", "suite:e2e"]);
+        assert!(
+            !plain.has_bench_options(),
+            "a selection with no benchmark option must not look like one"
+        );
+
+        for option in [
+            vec!["--ref", "797e8a9"],
+            vec!["--work-dir", "tmp/bench/x"],
+            vec!["--skip-clone"],
+            vec!["--force-setup"],
+            vec!["--retry"],
+            vec!["--trace-keys"],
+            vec!["--warm-same-tree"],
+            vec!["--cache-backend", "sccache"],
+        ] {
+            let mut argv = vec!["kache-scenario", "--select", "suite:e2e"];
+            argv.extend(option.iter().copied());
+            let args = Args::parse_from(&argv);
+            assert!(
+                args.has_bench_options(),
+                "{option:?} must count as a benchmark option"
+            );
+        }
+    }
 
     #[test]
     fn profile_hint_matches_bench_recipe_arguments() {

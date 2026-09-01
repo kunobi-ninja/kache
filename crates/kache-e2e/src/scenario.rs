@@ -722,6 +722,50 @@ min_hit_rate_pct = 50.0
         assert_eq!(measure.min_hit_rate_pct, Some(50.0));
     }
 
+    /// The same-worktree warm phase has its OWN gate tables, distinct from the
+    /// cross-clone `warm` ones. Both `for_phase` lookups must return them
+    /// rather than falling through to "no spec configured": a validity gate
+    /// that silently stops binding is a validity gate that no longer runs.
+    #[test]
+    fn warm_same_tree_phase_gates_bind() {
+        let checks: ScenarioChecks = toml::from_str(
+            r#"
+[assert.warm-same-tree]
+max_passthrough_pct = 40.0
+min_hits = 100
+min_restored_bytes = 67108864
+
+[assert.warm]
+min_key_stability_pct = 50.0
+min_hits = 7
+
+[measure.warm-same-tree]
+max_wall_s = 300
+
+[measure.warm]
+max_wall_s = 900
+"#,
+        )
+        .unwrap();
+
+        let assert = checks
+            .assertions
+            .for_phase("warm-same-tree")
+            .expect("warm-same-tree assert gate must bind");
+        assert_eq!(assert.max_passthrough_pct, Some(40.0));
+        assert_eq!(assert.min_hits, Some(100));
+        assert_eq!(assert.min_restored_bytes, Some(67_108_864));
+        // And it is not the cross-clone table: that one declares a different
+        // min_hits and a key-stability floor this phase cannot have.
+        assert_eq!(assert.min_key_stability_pct, None);
+
+        let measure = checks
+            .measure
+            .for_phase("warm-same-tree")
+            .expect("warm-same-tree measure gate must bind");
+        assert_eq!(measure.max_wall_s, Some(300));
+    }
+
     #[test]
     fn scenario_checks_reject_misspelled_fields() {
         for raw in [

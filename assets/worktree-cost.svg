@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t d" viewBox="0 0 720 254" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
+<title id="t">Second worktree cost, same machine</title>
+<desc id="d">kache about 3 GB of new bytes versus sccache 16.7 GB as an independent copy.</desc>
+<rect width="720" height="254" rx="12" fill="#0d1117"/>
+<text x="32" y="34" fill="#e6edf3" font-size="22" font-weight="700">Cost of a second worktree, same machine</text>
+<text x="32" y="54" fill="#8b949e" font-size="13">New bytes a second worktree adds to disk. Firefox on APFS.</text>
+<text x="106" y="106.0" fill="#e6edf3" font-size="14" text-anchor="end">kache</text>
+<rect x="120" y="72" width="560" height="58" rx="6" fill="#21262d"/>
+<rect x="120" y="72" width="100.6" height="58" rx="6" fill="#3fb950"/>
+<text x="232.6" y="107.0" fill="#e6edf3" font-size="16" font-weight="700" text-anchor="start">~3 GB new  (13.5 GB more reflinked, shared)</text>
+<text x="106" y="186.0" fill="#e6edf3" font-size="14" text-anchor="end">sccache</text>
+<rect x="120" y="152" width="560" height="58" rx="6" fill="#21262d"/>
+<rect x="120" y="152" width="560.0" height="58" rx="6" fill="#d29922"/>
+<text x="668.0" y="187.0" fill="#0d1117" font-size="16" font-weight="700" text-anchor="end">16.7 GB new  (independent copy)</text>
+</svg>

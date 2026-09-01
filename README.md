@@ -2,10 +2,13 @@
 [![Bench](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml/badge.svg)](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml)
 [![Crates.io](https://img.shields.io/crates/v/kache.svg)](https://crates.io/crates/kache)
 [![Documentation](https://img.shields.io/badge/docs-kunobi.ninja-blue)](https://kunobi.ninja/docs/kache)
+[![Product page](https://img.shields.io/badge/product-kunobi.ninja-orange)](https://kunobi.ninja/product/kache)
 
 # Kache
 
 Kache is a local-first compiler cache for Rust and C/C++. It stores build outputs by content, reuses them across worktrees, and can copy them to S3-compatible or filesystem remotes.
+
+![One content-addressed store shared by four Firefox worktrees. Outputs are restored by reflink, so the second and later checkouts add no copied bytes and 27.4 GB is shared rather than duplicated.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/store-worktrees.svg)
 
 ## Install
 
@@ -44,6 +47,8 @@ This wraps rustc only. C and C++ compilations remain uncached.
 | Local storage | Built in | Content-addressed store with garbage collection |
 | S3-compatible remote storage | Built in | Includes AWS S3, MinIO, and Cloudflare R2 |
 | Filesystem remote storage | Built in | Useful for shared disks and CI volumes |
+
+[![Bytes a second Firefox worktree adds to disk on APFS: about 3 GB for Kache, which reflinks the other 13.5 GB, against 16.7 GB for sccache, which writes an independent copy.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/worktree-cost.svg)](https://kunobi.ninja/blog/kache-storage-worktrees)
 
 Need to choose between compiler caches? Read [Kache or sccache?](https://kunobi.ninja/docs/kache/getting-started/comparison).
 
@@ -115,6 +120,7 @@ Run `kache help <command>` for exact flags. The [command reference](https://kuno
 
 ## Documentation
 
+- [Product page](https://kunobi.ninja/product/kache)
 - [Install Kache](https://kunobi.ninja/docs/kache/getting-started/installation)
 - [Quick start](https://kunobi.ninja/docs/kache/getting-started/quick-start)
 - [C and C++](https://kunobi.ninja/docs/kache/getting-started/c-cpp)

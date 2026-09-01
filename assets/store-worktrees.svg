@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">kache: one store, many worktrees</title>
+  <desc id="desc">Technical blog cover showing multiple worktree object directories connected by zero-copy reflinks to one central content-addressed kache store, with 27.4 GB saved.</desc>
+  <defs>
+    <style>
+      .font{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+      .bg{fill:#0d1117}
+      .panel{fill:#161b22;stroke:#21262d;stroke-width:2}
+      .panel2{fill:#111820;stroke:#21262d;stroke-width:2}
+      .text{fill:#e6edf3}
+      .muted{fill:#8b949e}
+      .green{fill:#3fb950}
+      .blue{fill:#58a6ff}
+      .greenStroke{stroke:#3fb950}
+      .blueStroke{stroke:#58a6ff}
+      .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+    </style>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#21262d" stroke-width="1" opacity=".42"/>
+    </pattern>
+    <linearGradient id="storeGlow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#58a6ff" stop-opacity=".28"/>
+      <stop offset="1" stop-color="#3fb950" stop-opacity=".22"/>
+    </linearGradient>
+    <filter id="softGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="18" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.20  0 0 0 0 0.75  0 0 0 0 0.45  0 0 0 .45 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="8.8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M1 1L9 5L1 9Z" fill="#3fb950"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="8.8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M1 1L9 5L1 9Z" fill="#58a6ff"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1200" height="675"/>
+  <rect width="1200" height="675" fill="url(#grid)" opacity=".7"/>
+  <circle cx="790" cy="335" r="220" fill="url(#storeGlow)" opacity=".65"/>
+
+  <g class="font">
+    <text x="72" y="82" class="text" font-size="28" font-weight="720">kache: one store, many worktrees</text>
+    <text x="72" y="124" class="muted" font-size="18">content-addressed build cache • reflink restore • copy-on-write blocks</text>
+
+    <g transform="translate(74 178)">
+      <g>
+        <rect class="panel" x="0" y="0" width="322" height="86" rx="8"/>
+        <circle cx="30" cy="27" r="8" fill="#f85149"/>
+        <circle cx="54" cy="27" r="8" fill="#d29922"/>
+        <circle cx="78" cy="27" r="8" fill="#3fb950"/>
+        <text x="104" y="34" class="text" font-size="20" font-weight="700">firefox-main</text>
+        <text x="24" y="64" class="muted mono" font-size="15">main/obj-kache-bench</text>
+      </g>
+      <g transform="translate(0 112)">
+        <rect class="panel" x="0" y="0" width="322" height="86" rx="8"/>
+        <circle cx="30" cy="27" r="8" fill="#f85149"/>
+        <circle cx="54" cy="27" r="8" fill="#d29922"/>
+        <circle cx="78" cy="27" r="8" fill="#3fb950"/>
+        <text x="104" y="34" class="text" font-size="20" font-weight="700">firefox-patch-a</text>
+        <text x="24" y="64" class="muted mono" font-size="15">a/obj-kache-bench</text>
+      </g>
+      <g transform="translate(0 224)">
+        <rect class="panel" x="0" y="0" width="322" height="86" rx="8"/>
+        <circle cx="30" cy="27" r="8" fill="#f85149"/>
+        <circle cx="54" cy="27" r="8" fill="#d29922"/>
+        <circle cx="78" cy="27" r="8" fill="#3fb950"/>
+        <text x="104" y="34" class="text" font-size="20" font-weight="700">firefox-patch-b</text>
+        <text x="24" y="64" class="muted mono" font-size="15">b/obj-kache-bench</text>
+      </g>
+      <g transform="translate(0 336)">
+        <rect class="panel" x="0" y="0" width="322" height="86" rx="8"/>
+        <circle cx="30" cy="27" r="8" fill="#f85149"/>
+        <circle cx="54" cy="27" r="8" fill="#d29922"/>
+        <circle cx="78" cy="27" r="8" fill="#3fb950"/>
+        <text x="104" y="34" class="text" font-size="20" font-weight="700">firefox-exp</text>
+        <text x="24" y="64" class="muted mono" font-size="15">exp/obj-kache-bench</text>
+      </g>
+    </g>
+
+    <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M404 221C489 224 554 248 633 291" class="greenStroke" stroke-width="4" marker-end="url(#arrowGreen)"/>
+      <path d="M404 333C495 333 557 331 635 329" class="blueStroke" stroke-width="4" marker-end="url(#arrowBlue)"/>
+      <path d="M404 445C493 439 558 413 633 371" class="greenStroke" stroke-width="4" marker-end="url(#arrowGreen)"/>
+      <path d="M404 557C510 536 584 472 661 404" class="blueStroke" stroke-width="4" marker-end="url(#arrowBlue)"/>
+    </g>
+
+    <g>
+      <g transform="translate(480 222)">
+        <rect x="0" y="0" width="112" height="30" rx="15" fill="#13281c" stroke="#2ea043" stroke-width="1.5"/>
+        <text x="56" y="20" class="green mono" font-size="14" text-anchor="middle" font-weight="700">0 B copied</text>
+      </g>
+      <g transform="translate(480 319)">
+        <rect x="0" y="0" width="122" height="30" rx="15" fill="#0f2235" stroke="#388bfd" stroke-width="1.5"/>
+        <text x="61" y="20" class="blue mono" font-size="14" text-anchor="middle" font-weight="700">reflink</text>
+      </g>
+      <g transform="translate(480 422)">
+        <rect x="0" y="0" width="112" height="30" rx="15" fill="#13281c" stroke="#2ea043" stroke-width="1.5"/>
+        <text x="56" y="20" class="green mono" font-size="14" text-anchor="middle" font-weight="700">0 B copied</text>
+      </g>
+      <g transform="translate(510 503)">
+        <rect x="0" y="0" width="122" height="30" rx="15" fill="#0f2235" stroke="#388bfd" stroke-width="1.5"/>
+        <text x="61" y="20" class="blue mono" font-size="14" text-anchor="middle" font-weight="700">reflink</text>
+      </g>
+    </g>
+
+    <g transform="translate(675 182)" filter="url(#softGlow)">
+      <rect class="panel2" x="0" y="0" width="382" height="306" rx="10"/>
+      <rect x="24" y="28" width="334" height="58" rx="8" fill="#0d1117" stroke="#21262d" stroke-width="2"/>
+      <text x="48" y="64" class="text" font-size="26" font-weight="760">kache store</text>
+      <text x="244" y="64" class="green mono" font-size="16" font-weight="700">blake3</text>
+
+      <g transform="translate(34 112)">
+        <rect x="0" y="0" width="314" height="42" rx="7" fill="#101923" stroke="#21262d"/>
+        <text x="18" y="27" class="blue mono" font-size="15">7db8b375</text>
+        <rect x="118" y="11" width="68" height="20" rx="10" fill="#13281c"/>
+        <text x="152" y="26" class="green mono" font-size="12" text-anchor="middle">blocks</text>
+        <text x="288" y="27" class="muted mono" font-size="13" text-anchor="end">677 MB</text>
+      </g>
+      <g transform="translate(34 166)">
+        <rect x="0" y="0" width="314" height="42" rx="7" fill="#101923" stroke="#21262d"/>
+        <text x="18" y="27" class="blue mono" font-size="15">4d316599</text>
+        <rect x="118" y="11" width="68" height="20" rx="10" fill="#13281c"/>
+        <text x="152" y="26" class="green mono" font-size="12" text-anchor="middle">blocks</text>
+        <text x="288" y="27" class="muted mono" font-size="13" text-anchor="end">575 MB</text>
+      </g>
+      <g transform="translate(34 220)">
+        <rect x="0" y="0" width="314" height="42" rx="7" fill="#101923" stroke="#21262d"/>
+        <text x="18" y="27" class="blue mono" font-size="15">12c4db77</text>
+        <rect x="118" y="11" width="68" height="20" rx="10" fill="#13281c"/>
+        <text x="152" y="26" class="green mono" font-size="12" text-anchor="middle">blocks</text>
+        <text x="288" y="27" class="muted mono" font-size="13" text-anchor="end">346 MB</text>
+      </g>
+    </g>
+
+    <g transform="translate(690 528)">
+      <rect x="0" y="0" width="352" height="86" rx="10" fill="#13281c" stroke="#2ea043" stroke-width="2"/>
+      <text x="28" y="34" class="muted" font-size="16" font-weight="650">copy-on-write sharing</text>
+      <text x="28" y="66" class="text" font-size="34" font-weight="820">27.4 GB saved</text>
+      <path d="M286 24h34m-17-17v34" stroke="#3fb950" stroke-width="5" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

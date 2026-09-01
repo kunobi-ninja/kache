@@ -11,18 +11,13 @@ Kache is a local-first compiler cache for Rust and C/C++. It stores build output
 
 ```bash
 cargo install kache
-kache init
+kache init --check   # print the proposed changes
+kache init           # apply them
 ```
 
-`kache init` sets `rustc-wrapper` in Cargo's config, and on Unix the `[env]` keys that route build-script C and C++ through the cache. Review the proposed changes without applying them:
+`kache init` sets `rustc-wrapper` in Cargo's config. On Unix it also adds the `[env]` keys for build-script C and C++. Use `kache init --no-service` if you want persistent Cargo configuration without an OS service.
 
-```bash
-kache init --check
-```
-
-Use `kache init --no-service` if you want persistent Cargo configuration without an OS service.
-
-Then keep running `cargo build`.
+Your Cargo commands do not change.
 
 ## Try it without changing your setup
 
@@ -37,7 +32,7 @@ kache stats
 
 `cargo clean` is only for this demonstration. Kache normally helps when Cargo would otherwise compile an input it has seen before, such as in another worktree or after changing toolchains and changing back.
 
-This wraps rustc and nothing else. C and C++ compilations still run uncached, so it understates a configured setup.
+This wraps rustc only. C and C++ compilations remain uncached.
 
 ## What Kache caches
 
@@ -45,7 +40,7 @@ This wraps rustc and nothing else. C and C++ compilations still run uncached, so
 | --- | --- | --- |
 | Rust libraries and build scripts | Supported | Use `RUSTC_WRAPPER=kache` or `kache init` |
 | Rust executables | Supported on Linux and macOS | Disabled by default on Windows |
-| C and C++ object files | Supported | Enabled by `kache init`, compiler shims, or `CC`/`CXX` |
+| C and C++ object files | Supported | Build scripts via `kache init`; other builds via shims or `CC`/`CXX` |
 | Local storage | Built in | Content-addressed store with garbage collection |
 | S3-compatible remote storage | Built in | Includes AWS S3, MinIO, and Cloudflare R2 |
 | Filesystem remote storage | Built in | Useful for shared disks and CI volumes |

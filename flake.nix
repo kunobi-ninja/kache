@@ -71,7 +71,7 @@
         root = ./.;
         fileset = lib.fileset.unions [
           ./flake.nix
-          ./nix
+          ./packaging/nix
         ];
       };
 

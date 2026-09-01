@@ -43,9 +43,29 @@ KACHE_PROGRESS=hits RUSTC_WRAPPER=kache cargo build
 kache stats
 ```
 
+For one command, let the Cargo proxy set the wrapper:
+
+```bash
+kache cargo -- build
+```
+
 The first build fills the local cache. `cargo clean` makes Cargo request the same outputs again, so the second build can demonstrate restores. Do not add `cargo clean` to a normal build workflow.
 
 This trial does not edit Cargo configuration or install a service. It wraps rustc only; C and C++ compilations remain uncached.
+
+## Mutation testing
+
+`cargo-mutants` normally builds in copied workspaces with separate target
+directories. Kache normalizes those temporary paths, so unchanged dependencies
+and previously tested mutants can hit across workers and later runs:
+
+```bash
+kache cargo -- mutants
+```
+
+Projects configured by `kache init` can keep using `cargo mutants` directly.
+Small or first-time runs may spend more time populating the cache than they
+save. The largest gains come from expensive dependencies and repeated runs.
 
 ## Check the setup
 

@@ -109,9 +109,9 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run Cargo with canonical duplicate Cargo-home rustflags collapsed once
+    /// Run Cargo through Kache with guarded Cargo configuration normalization
     Cargo {
-        /// Built-in build/check arguments passed verbatim to Cargo (use `--` first)
+        /// Arguments passed verbatim to Cargo (use `--` first)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<std::ffi::OsString>,
     },

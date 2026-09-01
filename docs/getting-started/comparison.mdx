@@ -12,7 +12,7 @@ This page describes the current projects; it does not claim that one cache is un
 | Question | Kache | sccache |
 | --- | --- | --- |
 | Primary workflow | Local-first cache with optional explicit remote synchronization | Client-server compiler cache with local and remote storage |
-| Rust setup | `RUSTC_WRAPPER=kache`, `kache init`, or `kache cargo` | `RUSTC_WRAPPER=sccache` |
+| Rust setup | `RUSTC_WRAPPER=kache`, `kache init`, or `kache cargo -- <command>` | `RUSTC_WRAPPER=sccache` |
 | C/C++ setup | PATH compiler-name shims (`kache install-shims`) or `CC="kache cc"` | Prefix wrapper (`sccache gcc`); no ccache-style PATH farm |
 | Remote backends | S3-compatible storage and filesystem paths | S3, Redis, Memcached, GCS, Azure, GitHub Actions, WebDAV, and others listed by sccache |
 | Inspection | `monitor`, `stats`, `why-miss`, `report`, `list`, and `doctor` | `--show-stats`, logs, and server commands |

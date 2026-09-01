@@ -33,9 +33,26 @@ KACHE_PROGRESS=hits RUSTC_WRAPPER=kache cargo build
 kache stats
 ```
 
+For one command, the Cargo proxy sets the wrapper itself:
+
+```bash
+kache cargo -- build
+```
+
 `cargo clean` is only for this demonstration. Kache normally helps when Cargo would otherwise compile an input it has seen before, such as in another worktree or after changing toolchains and changing back.
 
 This wraps rustc only. C and C++ compilations remain uncached.
+
+Cargo subcommands inherit the wrapper too. With cargo-mutants, Kache reuses
+unchanged dependencies and previously seen mutants across scratch directories
+and repeated runs:
+
+```bash
+kache cargo -- mutants
+```
+
+Small or first-time runs may spend more time populating the cache than they
+save. The largest gains come from expensive dependencies and repeated runs.
 
 ## What Kache caches
 

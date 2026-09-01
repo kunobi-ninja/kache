@@ -48,16 +48,18 @@ enum PlanDecision {
     Refused(String),
 }
 
-/// Run Cargo with canonical duplicate `$CARGO_HOME` rustflags collapsed once.
+/// Run Cargo through Kache with canonical duplicate `$CARGO_HOME` rustflags
+/// collapsed once.
 ///
-/// Every ambiguous case fails closed by launching Cargo unchanged. That keeps
-/// this command a conservative convenience rather than a second, incomplete
-/// Cargo config implementation.
+/// Every ambiguous config case fails closed by leaving Cargo's configuration
+/// untouched. That keeps this command a conservative convenience rather than a
+/// second, incomplete Cargo config implementation.
 pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the Cargo working directory")?;
     let cargo = real_cargo_program()?;
     let mut command = Command::new(&cargo);
     command.args(&cargo_args).current_dir(&cwd);
+    configure_kache_wrapper(&mut command)?;
 
     // Cargo owns freshness before RUSTC_WRAPPER runs. Sharing its intermediate
     // fingerprint directory across worktrees can therefore declare the wrong
@@ -85,7 +87,7 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
             if !plan_is_current(&plan) {
                 eprintln!(
                     "kache: Cargo config changed while it was being inspected; \
-                     running Cargo unchanged"
+                     retaining Cargo's configuration"
                 );
             } else {
                 tracing::info!(
@@ -98,7 +100,7 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
         PlanDecision::Refused(reason) => {
             eprintln!(
                 "kache: safe Cargo config normalization is unavailable: \
-                 {reason}; running Cargo unchanged"
+                 {reason}; retaining Cargo's configuration"
             );
         }
         PlanDecision::Passthrough => {}
@@ -126,6 +128,17 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
     {
         run_cargo_non_unix(command, &cargo)
     }
+}
+
+/// Make `kache cargo -- ...` a complete one-shot setup, including Cargo
+/// subcommands such as `cargo mutants` that launch further Cargo processes.
+/// Those descendants inherit the wrapper and share Kache across their
+/// otherwise-isolated target directories.
+fn configure_kache_wrapper(command: &mut Command) -> Result<()> {
+    let current_exe =
+        std::env::current_exe().context("resolving the Kache executable for the Cargo wrapper")?;
+    command.env("RUSTC_WRAPPER", current_exe);
+    Ok(())
 }
 
 fn real_cargo_program() -> Result<PathBuf> {
@@ -554,6 +567,24 @@ fn revalidate_sources(sources: &[ConfigSource]) -> std::result::Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_proxy_forces_the_current_kache_as_rustc_wrapper() {
+        let mut command = Command::new("cargo");
+        command.env("RUSTC_WRAPPER", "another-wrapper");
+
+        configure_kache_wrapper(&mut command).unwrap();
+
+        let wrapper = command
+            .get_envs()
+            .find_map(|(name, value)| (name == "RUSTC_WRAPPER").then_some(value))
+            .flatten();
+        assert_eq!(
+            wrapper,
+            Some(std::env::current_exe().unwrap().as_os_str()),
+            "an explicit `kache cargo` invocation must use this Kache binary"
+        );
+    }
 
     #[test]
     fn command_gate_accepts_only_unambiguous_builtin_build_and_check() {

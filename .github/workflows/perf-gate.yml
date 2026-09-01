@@ -14,6 +14,11 @@ name: Perf gate
 # blocking context is a separate, deliberate decision for the maintainer once
 # the first few runs have shown what its noise floor actually is.
 #
+# Only the two `kache` binaries vary with the pull request. The measuring
+# instrument — the benchmark engine, the scenario, the threshold — comes from
+# the DEFAULT BRANCH, the same place this file does. See the "Build the
+# measuring instrument" step for why, and for what that costs.
+#
 # ── Runner topology ─────────────────────────────────────────────────────────
 # The measurement runs on the kunobi self-hosted Linux ARC runner — the
 # `kunobi-runners` gha-runner-scale-set in tenant-int-dev/zur1-builder1,
@@ -239,38 +244,79 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve the merge base
-        id: mergebase
+      - name: Resolve the merge base and the instrument commit
+        id: commits
         env:
           BASE_REF: ${{ needs.authorize.outputs.base_ref }}
           HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           # `origin/<base>` rather than the base branch's tip at PR creation:
           # the merge base is what this PR is actually a delta against, and it
           # is the only commit whose numbers are a fair "before". `fetch-depth:
-          # 0` above is what makes the base branch present locally.
-          if ! git rev-parse --verify --quiet "origin/$BASE_REF^{commit}" >/dev/null; then
-            echo "::error::perf gate: origin/$BASE_REF is not present — the checkout was not deep enough"
-            exit 1
-          fi
+          # 0` above is what makes both branches present locally.
+          for ref in "$BASE_REF" "$DEFAULT_BRANCH"; do
+            if ! git rev-parse --verify --quiet "origin/$ref^{commit}" >/dev/null; then
+              echo "::error::perf gate: origin/$ref is not present — the checkout was not deep enough"
+              exit 1
+            fi
+          done
           base="$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")"
+          # Resolve the instrument commit ONCE, here. `origin/<default>` is a
+          # local ref frozen by this job's own checkout, so it cannot move under
+          # a measurement that runs for half an hour — and pinning it to a SHA
+          # puts the instrument's identity in the log rather than leaving it as
+          # "whatever the default branch was at the time".
+          instrument="$(git rev-parse "origin/$DEFAULT_BRANCH")"
           echo "Merge base with origin/$BASE_REF: $base"
-          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          echo "Instrument from origin/$DEFAULT_BRANCH: $instrument"
+          {
+            echo "merge_base=$base"
+            echo "instrument=$instrument"
+          } >> "$GITHUB_OUTPUT"
 
-      # Two kache binaries, ONE measuring instrument.
+      # Two kache binaries under test, ONE measuring instrument — and the
+      # instrument comes from the DEFAULT BRANCH, not from either side.
       #
-      # `kache-scenario` — the benchmark engine, the scenario TOML it reads, and
-      # the comparison script — is built once, from the PR head, and used for
-      # both sides. If each side ran its own engine, an engine change in the PR
-      # would show up as a subject regression and nobody could tell the two
-      # apart. The consequence to know about: if a PR changes the `kache report
-      # --format json` shape the engine parses, the base binary's report will
-      # fail to parse and this job fails loudly. That is the correct outcome —
-      # such a PR needs its baseline taken by hand.
+      # The instrument is `kache-scenario` (the benchmark engine), the scenario
+      # TOML describing the subject, and the comparison script that applies the
+      # threshold. All three are staged into `$RUNNER_TEMP` here, and nothing
+      # afterwards reads them from the worktree, so none of the `git switch`
+      # calls below can change what is doing the measuring.
+      #
+      # Taking them from the default branch rather than the PR head is what
+      # makes that true. This workflow file is always the default branch's copy
+      # (`workflow_run`), so a PR-head instrument means the file and the tool it
+      # drives come from different commits: a branch that forked before an
+      # engine change gets a new command line handed to an old binary. Not
+      # hypothetical — it is how the first live run failed, with
+      # `unexpected argument '--warm-same-tree'`.
+      #
+      # The trade, deliberately made: a PR that changes the engine, the
+      # scenario, or the threshold is NOT measured by its own version of them.
+      # Those changes take effect for the pull requests that come after they
+      # land. That is the right behaviour for a measuring instrument, and it is
+      # why a PR touching the engine is reviewed on its tests rather than on
+      # this gate. A PR that changes the `kache report --format json` shape the
+      # engine parses will fail both sides here, loudly, and needs its baseline
+      # taken by hand.
+      - name: Build the measuring instrument from the default branch
+        env:
+          INSTRUMENT: ${{ steps.commits.outputs.instrument }}
+          RUSTC_WRAPPER: ""
+        run: |
+          set -euo pipefail
+          git switch --detach "$INSTRUMENT"
+          cargo build --release -p kache-e2e --bin kache-scenario
+          mkdir -p "$RUNNER_TEMP/instrument"
+          cp target/release/kache-scenario "$RUNNER_TEMP/instrument/kache-scenario"
+          cp -R scenarios "$RUNNER_TEMP/instrument/scenarios"
+          cp scripts/perf-gate-compare.sh "$RUNNER_TEMP/instrument/perf-gate-compare.sh"
+
       - name: Build kache from the merge base
         env:
-          MERGE_BASE: ${{ steps.mergebase.outputs.sha }}
+          MERGE_BASE: ${{ steps.commits.outputs.merge_base }}
           RUSTC_WRAPPER: ""
         run: |
           set -euo pipefail
@@ -278,7 +324,7 @@ jobs:
           cargo build --release -p kache
           cp target/release/kache "$RUNNER_TEMP/kache-base"
 
-      - name: Build kache and the benchmark engine from the PR head
+      - name: Build kache from the PR head
         env:
           HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
           RUSTC_WRAPPER: ""
@@ -286,9 +332,7 @@ jobs:
           set -euo pipefail
           git switch --detach "$HEAD_SHA"
           cargo build --release -p kache
-          cargo build --release -p kache-e2e --bin kache-scenario
           cp target/release/kache "$RUNNER_TEMP/kache-head"
-          cp target/release/kache-scenario "$RUNNER_TEMP/kache-scenario"
           "$RUNNER_TEMP/kache-base" --version
           "$RUNNER_TEMP/kache-head" --version
 
@@ -306,8 +350,9 @@ jobs:
           RUSTUP_TOOLCHAIN: ""
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/kache-scenario" \
+          "$RUNNER_TEMP/instrument/kache-scenario" \
             --kache "$RUNNER_TEMP/kache-base" \
+            --scenarios "$RUNNER_TEMP/instrument/scenarios" \
             --select suite:bench --select backend:kache \
             --profile "$BENCH_PROFILE" \
             --warm-same-tree \
@@ -326,8 +371,9 @@ jobs:
           RUSTUP_TOOLCHAIN: ""
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/kache-scenario" \
+          "$RUNNER_TEMP/instrument/kache-scenario" \
             --kache "$RUNNER_TEMP/kache-head" \
+            --scenarios "$RUNNER_TEMP/instrument/scenarios" \
             --select suite:bench --select backend:kache \
             --profile "$BENCH_PROFILE" \
             --warm-same-tree \
@@ -346,7 +392,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/report"
           status=0
-          ./scripts/perf-gate-compare.sh \
+          "$RUNNER_TEMP/instrument/perf-gate-compare.sh" \
             "$RUNNER_TEMP/base.json" \
             "$RUNNER_TEMP/head.json" \
             "$RUNNER_TEMP/report/perf-gate.md" || status=$?
@@ -409,6 +455,31 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+
+          # Three outcomes, not two. "The gate could not run" and "the gate ran
+          # and the numbers are bad" are different facts, and a reviewer who
+          # reads a crashed runner as a performance regression will go looking
+          # for a slowdown that is not there. The commit-status API already has
+          # the vocabulary: `failure` is a check that failed, `error` is a check
+          # that could not be carried out.
+          if [ -f perf-gate/report/perf-gate.md ]; then
+            # The report's first line is the verdict headline the comparison
+            # script wrote, e.g. "## Perf gate: FAIL — warm build +10.0%
+            # (limit +5.0%)". Reusing it keeps the status and the comment from
+            # ever disagreeing about what happened. GitHub truncates a status
+            # description at 140 characters.
+            headline="$(head -n 1 perf-gate/report/perf-gate.md | sed -e 's/^#\{1,\} *//' -e 's/^Perf gate: *//')"
+            description="$(printf '%.140s' "$headline")"
+            if [ "$MEASURE_RESULT" = "success" ]; then
+              state=success
+            else
+              state=failure
+            fi
+          else
+            state=error
+            description="the gate could not run — no measurement was taken (job: $MEASURE_RESULT)"
+          fi
+
           body_file="$(mktemp)"
           # An HTML marker makes the comment sticky: the next run edits this one
           # instead of adding a new comment to every push.
@@ -417,9 +488,12 @@ jobs:
             cat perf-gate/report/perf-gate.md >> "$body_file"
           else
             {
-              echo "## Perf gate: no numbers"
+              echo "## Perf gate: could not run"
               echo
-              echo "The measurement job ended as \`$MEASURE_RESULT\` before it produced a report."
+              echo "The measurement job ended as \`$MEASURE_RESULT\` before it produced a"
+              echo "report, so **no numbers were taken**. This is a problem with the gate"
+              echo "or the runner, not a performance result — nothing here says this pull"
+              echo "request is slower."
             } >> "$body_file"
           fi
           printf '\n[Run details](%s)\n' "$RUN_URL" >> "$body_file"
@@ -433,13 +507,6 @@ jobs:
             gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@"$body_file" >/dev/null
           fi
 
-          if [ "$MEASURE_RESULT" = "success" ]; then
-            state=success
-            description="warm build within budget"
-          else
-            state=failure
-            description="warm build regressed or the run was invalid"
-          fi
           gh api -X POST "repos/$REPO/statuses/$HEAD_SHA" \
             -f state="$state" \
             -f context="perf-gate/warm" \

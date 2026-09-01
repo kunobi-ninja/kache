@@ -27,6 +27,8 @@ make_repo() {
   git -C "$root" init -q -b main
   git -C "$root" config user.email t@example.com
   git -C "$root" config user.name t
+  git -C "$root" config --local commit.gpgSign false
+  git -C "$root" config --local tag.gpgSign false
   for i in $(seq 1 "$commits"); do
     echo "$i" >"$root/f"
     git -C "$root" add f

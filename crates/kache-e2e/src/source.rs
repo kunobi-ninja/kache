@@ -446,6 +446,7 @@ mod tests {
         git(&["init", "-q"], &upstream);
         git(&["config", "user.email", "t@t"], &upstream);
         git(&["config", "user.name", "t"], &upstream);
+        git(&["config", "--local", "commit.gpgSign", "false"], &upstream);
         std::fs::write(upstream.join("f"), "a").unwrap();
         git(&["add", "."], &upstream);
         git(&["commit", "-qm", "a"], &upstream);
@@ -501,6 +502,7 @@ mod tests {
         git(&["init", "-q"], &upstream);
         git(&["config", "user.email", "t@t"], &upstream);
         git(&["config", "user.name", "t"], &upstream);
+        git(&["config", "--local", "commit.gpgSign", "false"], &upstream);
         std::fs::write(upstream.join("f"), "pinned").unwrap();
         git(&["add", "."], &upstream);
         git(&["commit", "-qm", "pinned"], &upstream);

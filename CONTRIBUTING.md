@@ -33,7 +33,7 @@ All common tasks live in the `Justfile` — prefer these over raw `cargo` comman
 
 ```sh
 just check          # fmt + clippy + tests
-just pr             # check + changed-line mutants (run before every PR)
+just pr             # check + bounded changed-line mutants (run before every PR)
 just ci             # mirrors the GitHub Actions verification flow
 just test           # run all tests
 just lint           # clippy with -D warnings
@@ -88,13 +88,13 @@ just mutants-core
 
 Coding agents: read [AGENTS.md](./AGENTS.md) before opening a PR. The usual CI failure is Mutation testing after a push that only ran `just check`.
 
-Run the PR gate before submitting. `just check` is fmt, clippy with `-D warnings`, and tests. CI also mutation-tests every changed Rust line; `just pr` runs that too.
+Run the PR gate before submitting. `just check` is fmt, clippy with `-D warnings`, and tests. CI also mutation-tests every changed Rust line; `just pr` runs that too without repeating the baseline.
 
 ```sh
 just pr
 ```
 
-Install the same cargo-mutants version as CI first (`cargo install --locked cargo-mutants --version 27.1.0`). A docs-only diff skips mutants.
+Install the same cargo-mutants version as CI first (`cargo install --locked cargo-mutants --version 27.1.0`). A docs-only diff skips mutants. On macOS, mutation recipes default to one cargo-mutants job and two Rust test threads; set `CARGO_MUTANTS_JOBS` or `RUST_TEST_THREADS` to override those limits.
 
 Clippy on macOS does not type-check `#[cfg(target_os = "linux")]` functions. Identity conversions (`u64::try_from` on a `u64`) and unused Unix-only test helpers fail on Linux CI under `-D warnings` even when `just lint` is green locally.
 

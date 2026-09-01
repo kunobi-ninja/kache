@@ -8,13 +8,15 @@
 just pr
 ```
 
-That is `just check` (fmt, clippy `-D warnings`, tests) plus `just mutants-diff` against `origin/main`. Docs-only diffs skip mutants.
+That is `just check` (fmt, clippy `-D warnings`, tests) plus `just mutants-diff` against `origin/main`. Docs-only diffs skip mutants. The PR gate reuses the baseline that `just check` just established; standalone `just mutants-diff` still runs its own baseline.
 
 ```sh
 cargo install --locked cargo-mutants --version 27.1.0
 ```
 
-Do not invoke `cargo mutants` with `RUSTC_WRAPPER=kache`. The Justfile clears it. Hand-running mutants without `just` wraps kache in itself and the unmutated baseline dies.
+Do not invoke `cargo mutants` with `RUSTC_WRAPPER=kache`. Every Just mutation recipe clears it, including when `KACHE_SELF_HOST=1`. Hand-running mutants without `just` wraps kache in itself and the unmutated baseline dies.
+
+On macOS, the mutation recipes default to one cargo-mutants job and two Rust test threads. Set `CARGO_MUTANTS_JOBS` or `RUST_TEST_THREADS` explicitly when the machine can handle more.
 
 Do not open the PR until `just pr` exits 0.
 

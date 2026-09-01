@@ -18,7 +18,7 @@ default:
 
 # Run all local quality checks.
 [group('dev')]
-check: fmt-check lint test-resource-guard-check test
+check: fmt-check lint test-resource-guard-check mutation-runner-check test
 
 # What a PR must survive before `gh pr create`: `just check`, then the
 # same changed-line mutants job CI runs. Docs-only diffs skip mutants.
@@ -33,7 +33,9 @@ pr BASE="origin/main": check
     echo "no Rust diff against {{BASE}}; skipping mutants-diff"
     exit 0
   fi
-  just mutants-diff tmp/mutants/pr.diff
+  # `check` just ran the same unmutated tests. Do not pay for that baseline
+  # again before the first changed-line mutant.
+  just mutants-diff tmp/mutants/pr.diff skip
 
 # Mirror the repo CI verification flow.
 [group('dev')]
@@ -88,6 +90,11 @@ test:
 test-resource-guard-check:
   ./scripts/test-with-test-resources.sh
 
+# Verify mutation runs clear self-hosting and remain bounded on macOS.
+[group('dev')]
+mutation-runner-check:
+  ./scripts/test-run-cargo-mutants.sh
+
 # Model-check the bounded planner and artifact-range invariants. Install with:
 # cargo install --locked kani-verifier --version 0.67.0 && cargo kani setup
 [group('dev')]
@@ -118,20 +125,20 @@ fuzz-native-archive SECONDS="600":
 # tool with: cargo install --locked cargo-mutants --version 27.1.0
 [group('dev')]
 mutants-core *ARGS:
-  cargo mutants --package kache-core --all-features --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/core {{ARGS}}
+  ./scripts/run-cargo-mutants.sh --package kache-core --all-features --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/core {{ARGS}}
 
 # Mutation-test the complete remote service crate.
 [group('dev')]
 mutants-service *ARGS:
-  cargo mutants --package kache-service --all-features --baseline run --caught --timeout 300 --build-timeout 600 --output tmp/mutants/service {{ARGS}}
+  ./scripts/run-cargo-mutants.sh --package kache-service --all-features --baseline run --caught --timeout 300 --build-timeout 600 --output tmp/mutants/service {{ARGS}}
 
 # Mutation-test changed Rust lines outside the crates covered completely by
 # mutants-core and mutants-service. The proof-only crate runs under Kani, not
 # ordinary tests, so it is deliberately outside mutation discovery. DIFF must
 # describe the current working tree.
 [group('dev')]
-mutants-diff DIFF *ARGS:
-  ./scripts/with-test-resources.sh cargo mutants --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --exclude 'crates/kache-proofs/**' --baseline run --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
+mutants-diff DIFF BASELINE="run" *ARGS:
+  ./scripts/run-cargo-mutants.sh --workspace --all-features --in-diff "{{DIFF}}" --exclude 'crates/kache-core/**' --exclude 'crates/kache-service/**' --exclude 'crates/kache-proofs/**' --baseline "{{BASELINE}}" --timeout 300 --build-timeout 600 --output tmp/mutants/diff {{ARGS}}
 
 # Audit dependencies with cargo-deny (advisories + licenses + bans +
 # sources; config and documented exceptions in `deny.toml`). Runs once

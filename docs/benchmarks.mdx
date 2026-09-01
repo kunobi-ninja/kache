@@ -32,6 +32,8 @@ It measures one mid-size subject — `bench-pr-cargo`, the `rust-lang/cargo` tre
 
 The pull request head and its merge base are both measured, back to back on the same runner, so the report is a delta rather than a comparison against a stored figure from another machine. A warm build more than 5% slower than the merge base fails the gate. Cold and cross-worktree deltas are reported without failing while their noise floor is still being established. The numbers land as a comment on the pull request.
 
+Only the two `kache` binaries come from the pull request. The benchmark engine, the pinned subject, and the threshold all come from the default branch, so both sides are measured with the same instrument. One consequence to expect: a pull request that changes the engine or the scenario is not measured by its own version of them, and those changes take effect for the pull requests that follow.
+
 The gate runs only for branches in this repository: the benchmark needs a self-hosted runner, and fork code never touches one. It is not a required check.
 
 ## Run a scenario

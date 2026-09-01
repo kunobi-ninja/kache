@@ -905,7 +905,11 @@ mod tests {
 
     fn wait_ready(dir: &Path, child: &mut std::process::Child) {
         let ready = dir.join("lock-ready");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // The fixture is a second copy of this debug test binary; on a loaded
+        // machine the spawn alone can take several seconds. The deadline only
+        // bounds the failure case: a ready fixture returns as soon as the file
+        // appears, and an early exit is still reported at once below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while !ready.exists() && std::time::Instant::now() < deadline {
             assert!(
                 child.try_wait().unwrap().is_none(),

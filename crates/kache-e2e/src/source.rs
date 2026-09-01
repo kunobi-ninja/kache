@@ -66,6 +66,13 @@ pub fn clone_ref_path(work_dir: &Path) -> PathBuf {
 
 /// Materialize `clone_a` and `clone_b` at `git_ref` as git worktrees off a
 /// locally-cached shallow reference clone.
+///
+/// `git_ref` is normally a tag or branch, materialized by a `--depth 1
+/// --branch` clone. A full 40-char commit SHA takes the fetch-by-SHA path
+/// instead (`git init` + `fetch --depth 1 origin <sha>`, the same mechanism
+/// [`clone_worktrees_pull`] uses) because `git clone --branch` does not accept
+/// a commit. Short SHAs are not fetchable-by-SHA and are treated as a ref name,
+/// which fails loudly at clone time.
 pub fn clone_worktrees(
     repo: &str,
     git_ref: &str,
@@ -73,7 +80,9 @@ pub fn clone_worktrees(
     clone_a: &Path,
     clone_b: &Path,
 ) -> Result<()> {
-    if clone_ref_at_ref(clone_ref, git_ref)? {
+    if is_full_commit_sha(git_ref) {
+        fetch_commit_into_clone_ref(repo, git_ref, clone_ref)?;
+    } else if clone_ref_at_ref(clone_ref, git_ref)? {
         eprintln!("\n[bench] reusing clone-ref at {git_ref} (no network)");
     } else {
         if clone_ref.exists() {
@@ -126,6 +135,47 @@ pub fn clone_worktrees(
             .arg(d)
             .arg(git_ref))?;
     }
+    Ok(())
+}
+
+/// Is this a full 40-character hex commit SHA — the only form GitHub will
+/// serve to a fetch-by-SHA request?
+fn is_full_commit_sha(git_ref: &str) -> bool {
+    git_ref.len() == 40 && git_ref.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Make `sha` available in `clone_ref` without a checkout, creating the
+/// reference repo if it does not exist yet.
+///
+/// Unlike the tag/branch path this never wipes `clone_ref`: an existing one
+/// already holds the objects, and re-fetching a commit that is already present
+/// is a cheap negotiation rather than a re-download.
+fn fetch_commit_into_clone_ref(repo: &str, sha: &str, clone_ref: &Path) -> Result<()> {
+    if !clone_ref.join(".git").exists() {
+        eprintln!("\n[bench] no clone-ref yet — fetching {repo} @ {sha} (one-time cost)");
+        if let Some(parent) = clone_ref.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        run(Command::new("git").args(["init", "-q"]).arg(clone_ref))?;
+        run(Command::new("git")
+            .arg("-C")
+            .arg(clone_ref)
+            .args(["remote", "add", "origin", repo]))?;
+    } else {
+        eprintln!("\n[bench] clone-ref present — refreshing {sha}");
+        // The pinned repo can change between scenario edits; keep the remote
+        // authoritative rather than trusting whatever a previous run set.
+        run(Command::new("git")
+            .arg("-C")
+            .arg(clone_ref)
+            .args(["remote", "set-url", "origin", repo]))?;
+    }
+    run(Command::new("git")
+        .args(["-c", "core.longpaths=true"])
+        .arg("-C")
+        .arg(clone_ref)
+        .args(["fetch", "--depth", "1", "origin", sha]))?;
     Ok(())
 }
 
@@ -431,6 +481,68 @@ mod tests {
             .success();
         assert!(ok);
         assert_eq!(std::fs::read_to_string(clone_a.join("f")).unwrap(), "b");
+    }
+
+    #[test]
+    fn clone_worktrees_accepts_a_full_commit_sha() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"], &upstream);
+        git(&["config", "user.email", "t@t"], &upstream);
+        git(&["config", "user.name", "t"], &upstream);
+        std::fs::write(upstream.join("f"), "pinned").unwrap();
+        git(&["add", "."], &upstream);
+        git(&["commit", "-qm", "pinned"], &upstream);
+        let sha = rev_parse(&upstream, "HEAD");
+        // A later commit exists on the branch tip: checking out the pinned SHA
+        // (not the tip) is the whole point of pinning by commit.
+        std::fs::write(upstream.join("f"), "moved on").unwrap();
+        git(&["commit", "-aqm", "moved on"], &upstream);
+
+        let clone_ref = tmp.path().join("ref");
+        let clone_a = tmp.path().join("clone-a");
+        let clone_b = tmp.path().join("clone-b");
+        clone_worktrees(
+            upstream.to_str().unwrap(),
+            &sha,
+            &clone_ref,
+            &clone_a,
+            &clone_b,
+        )
+        .unwrap();
+
+        for clone in [&clone_a, &clone_b] {
+            assert_eq!(
+                std::fs::read_to_string(clone.join("f")).unwrap(),
+                "pinned",
+                "{} must be at the pinned commit, not the branch tip",
+                clone.display()
+            );
+        }
+    }
+
+    #[test]
+    fn full_commit_sha_is_told_apart_from_a_tag() {
+        assert!(is_full_commit_sha(
+            "797e8a9bca276c1c9f9f738d2a20f484fa4eea9d"
+        ));
+        // Short SHAs are not fetchable-by-SHA, so they must NOT take that path.
+        assert!(!is_full_commit_sha("797e8a9"));
+        assert!(!is_full_commit_sha("0.99.0"));
+        assert!(!is_full_commit_sha("FIREFOX_151_0_RELEASE"));
+        // 40 chars, but not hex.
+        assert!(!is_full_commit_sha(&"z".repeat(40)));
     }
 
     fn rev_parse(dir: &std::path::Path, r: &str) -> String {

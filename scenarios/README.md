@@ -93,10 +93,27 @@ max_errors = 0
 ```
 
 `checks.assert` drives the bench verdict and exit code; omitted assertion
-fields are not evaluated. `checks.measure` warnings are advisory only.
+fields are not evaluated. The fields are `min_key_stability_pct`,
+`max_passthrough_pct`, `max_errors`, `min_hits`, and `min_restored_bytes`. The
+last two are validity floors: a phase that recompiled everything reports no hits
+and restores no bytes, and without them its wall-clock reads as a flatteringly
+fast build. `checks.measure` warnings are advisory only.
 `{cache}` expands to the selected compiler-cache binary (`kache` by default,
 `sccache` with `--cache-backend sccache`); `{kache}` remains supported for
 older scenarios.
+
+### The same-worktree warm phase
+
+`--warm-same-tree` adds a third phase between `cold` and the cross-clone `warm`:
+clone-a is rebuilt in place with its objdir wiped and the store left warm. Same
+absolute path, so it measures restore cost with the path-portability question
+held constant — the everyday "I cleaned my `target/`" case. Its own gate is
+`[checks.assert.warm-same-tree]`, evaluated separately from `[checks.assert.warm]`
+and folded into the same exit code.
+
+Off by default: it costs a third full build the nightly scenarios do not read.
+`bench-pr-cargo` is the scenario built for it — see the per-PR perf gate in
+`.github/workflows/perf-gate.yml`, and `just bench-pr` to run one side locally.
 
 Every benchmark keeps root-level `report-*`, `build-*`, `wrapper-*`, and result
 JSON files as the latest run for `--retry`, and also archives those artifacts to

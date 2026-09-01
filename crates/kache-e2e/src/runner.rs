@@ -818,6 +818,9 @@ fn run_phase(
             .as_ref()
             .map(|spec| apply_metric_assertions(spec, &delta, &phase_misses_by_crate, new_events))
             .unwrap_or_default(),
+        // Clone-benchmark-only phase: `fixture_phases()` never emits it, and
+        // fixtures have no `[assertions.warm-same-tree]` table to apply.
+        Phase::WarmSameTree => Vec::new(),
     };
 
     // Differential check: a cache-hit phase's restored artifact must
@@ -839,7 +842,12 @@ fn run_phase(
                             &bytes,
                         ));
                     }
-                    Phase::Noop | Phase::RelocateNoop | Phase::RelocateModified => {}
+                    // `WarmSameTree` is clone-benchmark-only and never reaches
+                    // the fixture harness; it records no diff baseline either.
+                    Phase::Noop
+                    | Phase::RelocateNoop
+                    | Phase::RelocateModified
+                    | Phase::WarmSameTree => {}
                 },
                 Err(e) => {
                     if matches!(

@@ -1,0 +1,447 @@
+name: Perf gate
+
+# Per-pull-request performance regression gate — the review-time counterpart to
+# the nightly `bench.yml`. Where the nightly measures the giants (Firefox, LLVM,
+# Substrate, SurrealDB, Lance, OpenDAL) for hours and reports absolute numbers,
+# this measures ONE mid-size subject twice — the PR head and its merge base,
+# back to back on the same machine — and reports the delta between them. Nothing
+# is compared against a stored historical figure: numbers from two different
+# runner generations are not comparable, and this repo has no way to pin one.
+#
+# NOT A REQUIRED CHECK. The repo's required contexts are managed outside this
+# file, and nothing here adds itself to them. This workflow reports a
+# `perf-gate/warm` commit status and a PR comment; promoting that status to a
+# blocking context is a separate, deliberate decision for the maintainer once
+# the first few runs have shown what its noise floor actually is.
+#
+# ── Runner topology ─────────────────────────────────────────────────────────
+# The measurement runs on the kunobi self-hosted Linux ARC runner — the
+# `kunobi-runners` gha-runner-scale-set in tenant-int-dev/zur1-builder1,
+# targeted by its INSTALLATION NAME as a single `runs-on` label, not by a
+# `[self-hosted, Linux, X64, …]` label set (see bench.yml's header). Pods are
+# ephemeral with an emptyDir `_work`, so there is no state to isolate and no
+# clone cache between runs, and the image is minimal — the base toolchain is
+# installed below. The two unprivileged jobs (`authorize`, `report`) stay on
+# GitHub-hosted runners so an ineligible PR never claims a self-hosted pod.
+#
+# ── Fork safety ─────────────────────────────────────────────────────────────
+# `workflow_run` is flagged by static analysis because a careless consumer
+# checks out and executes the triggering PR's code with a write-capable token.
+# That is precisely what this workflow is structured to prevent, and it is the
+# only trigger that gives us default-branch code:
+#
+#   1. `perf-gate-preflight.yml` runs on `pull_request`. Its file comes from the
+#      PR, so nothing it says is trusted; all it contributes is a PR number.
+#   2. This workflow is triggered by that run. A `workflow_run` workflow ALWAYS
+#      executes the default branch's copy of itself, so everything below is
+#      code a maintainer reviewed.
+#   3. `authorize` re-derives every fact from the GitHub API and refuses unless
+#      the PR's head repository IS this repository. A fork PR therefore never
+#      reaches step 4, whatever the artifact claimed.
+#   4. Only then does `measure` start on the self-hosted runner, checking out
+#      the head SHA the API confirmed.
+#
+# Same-repo-only is the conservative line: a branch in this repository can only
+# be pushed by someone who already has write access, which is the same trust
+# boundary `ci.yml`'s tag-gated release job relies on. Runner-group policy must
+# enforce that boundary independently — this file is not the only thing standing
+# between a fork and a private runner.
+on:
+  # zizmor: ignore[dangerous-triggers]
+  # Justification: `workflow_run` is the only trigger that guarantees this file
+  # runs from the default branch, which is what makes the fork check below
+  # trustworthy. The usual hazard — checking out and executing the triggering
+  # PR's code with a write-capable token — does not apply: the `authorize` job
+  # refuses anything that is not a same-repository branch, and the only job that
+  # holds write scopes (`report`) never checks out any code. See the header.
+  workflow_run:
+    workflows: ["Perf gate (preflight)"]
+    types: [completed]
+
+concurrency:
+  # One measurement per head branch. Superseding an in-flight run is right here
+  # (the numbers belong to a specific head commit), unlike the nightly bench,
+  # which must never cancel a multi-hour run. The head repository is part of the
+  # key so a fork branch that happens to share a name cannot cancel a real run.
+  group: >-
+    ${{ github.workflow }}-${{ github.event.workflow_run.head_repository.full_name }}-${{
+    github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Selects scenarios/bench-pr-cargo. Kept here so the scenario name appears
+  # once, not in every step that references it.
+  BENCH_PROFILE: pr-cargo
+  BENCH_SCENARIO: bench-pr-cargo
+
+jobs:
+  # ── Trusted validation ──────────────────────────────────────────────────────
+  # Runs from the default branch (see the header) on a disposable runner. This
+  # is the only place that decides whether a self-hosted job may start.
+  authorize:
+    name: Authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A failed or cancelled preflight, or a preflight that somehow fired on a
+    # non-PR event, produces no measurement.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    permissions:
+      contents: read
+      # Reading an artifact from the triggering run.
+      actions: read
+      pull-requests: read
+    outputs:
+      eligible: ${{ steps.check.outputs.eligible }}
+      pr: ${{ steps.pr.outputs.number }}
+      head_sha: ${{ steps.check.outputs.head_sha }}
+      base_ref: ${{ steps.check.outputs.base_ref }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: perf-gate-request
+          path: request
+          # Cross-run download: the artifact belongs to the preflight run that
+          # triggered this one, not to this run.
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      # The artifact came from a workflow file the PR author controls, so treat
+      # its contents as hostile input: keep the digits, drop everything else,
+      # and bound the length. Anything that is not a plausible PR number stops
+      # the run here rather than reaching an API call or a shell.
+      - name: Read the pull-request number
+        id: pr
+        run: |
+          set -euo pipefail
+          raw="$(tr -cd '0-9' < request/pr-number.txt | head -c 9)"
+          if [ -z "$raw" ]; then
+            echo "::error::perf gate: the preflight artifact carried no pull-request number"
+            exit 1
+          fi
+          echo "number=$raw" >> "$GITHUB_OUTPUT"
+
+      # Everything the privileged job acts on is re-derived here, from the API,
+      # by default-branch code. `head.repo.full_name` is the fork check; the
+      # head-SHA comparison ties the PR to the run that actually triggered us,
+      # so a stale or hand-crafted PR number cannot redirect the measurement at
+      # a different commit.
+      - name: Validate the pull request
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          TRIGGER_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh api "repos/$REPO/pulls/$PR")"
+          head_repo="$(jq -r '.head.repo.full_name // empty' <<<"$pr_json")"
+          head_sha="$(jq -r '.head.sha // empty' <<<"$pr_json")"
+          base_ref="$(jq -r '.base.ref // empty' <<<"$pr_json")"
+          state="$(jq -r '.state // empty' <<<"$pr_json")"
+          draft="$(jq -r '.draft' <<<"$pr_json")"
+
+          skip() {
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::perf gate skipped: $1"
+            { echo "### Perf gate skipped"; echo; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          [ "$head_repo" = "$REPO" ] || skip \
+            "PR #$PR comes from a fork ($head_repo). Fork code is never run on the self-hosted benchmark runner."
+          [ "$head_sha" = "$TRIGGER_SHA" ] || skip \
+            "PR #$PR is now at $head_sha but this run was triggered for $TRIGGER_SHA — a newer push supersedes it."
+          [ "$state" = "open" ] || skip "PR #$PR is $state."
+          [ "$draft" != "true" ] || skip "PR #$PR is a draft."
+          [ -n "$base_ref" ] || skip "PR #$PR has no base branch."
+
+          {
+            echo "eligible=true"
+            echo "head_sha=$head_sha"
+            echo "base_ref=$base_ref"
+          } >> "$GITHUB_OUTPUT"
+
+  # ── The measurement ─────────────────────────────────────────────────────────
+  measure:
+    name: Measure head vs merge base
+    needs: authorize
+    if: needs.authorize.outputs.eligible == 'true'
+    # gha-runner-scale-set: match by the scale-set's installation name (single
+    # label), not a `[self-hosted, …]` set. See the header.
+    runs-on: kunobi-runners
+    # Six builds of the subject (three phases x two commits) plus two builds of
+    # kache itself. Normal runs land well inside this; the cap exists so a stall
+    # is killed in an hour rather than at GitHub's 6h default.
+    timeout-minutes: 100
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        timeout-minutes: 10
+        with:
+          ref: ${{ needs.authorize.outputs.head_sha }}
+          # The merge base has to be reachable locally, and a shallow checkout
+          # cannot compute one.
+          fetch-depth: 0
+          # Nothing here pushes or fetches after checkout, so leaving a token in
+          # the worktree's git config would be a credential sitting on a
+          # long-lived runner for no reason.
+          persist-credentials: false
+
+      # The ARC image is minimal. This is bench.yml's prerequisite list trimmed
+      # to what `bench-pr-cargo` actually needs: a C toolchain and pkg-config
+      # for the cc-rs build scripts (libgit2-sys, libssh2-sys, libz-sys,
+      # curl-sys), OpenSSL headers for openssl-sys/libgit2, git + curl for the
+      # clone and for mise, and jq for the comparison script. No protoc, no
+      # ninja, no python — nothing in this subject needs them.
+      - name: Install build prerequisites (apt)
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev \
+            git curl ca-certificates jq
+
+      # mise installs rust (per rust-toolchain.toml) and just. The SUBJECT pins
+      # its own toolchain through the rust-toolchain.toml the scenario injects,
+      # honoured because RUSTUP_TOOLCHAIN is cleared for the benchmark steps.
+      - name: Install tools via mise
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          # Pin mise CLI — see ci.yml (v2026.6.10 regression).
+          version: 2026.6.9
+          install_args: --force rust github:casey/just
+          cache: false
+          reshim: false
+
+      # Disk-full mid-build is the worst failure mode on the emptyDir-backed
+      # work volume. Each side needs two debug objdirs plus a store; the base
+      # side's scratch is deleted before the head side starts (see below), so
+      # the floor covers one side plus kache's own target tree with headroom.
+      - name: Free-disk precheck
+        run: |
+          set -euo pipefail
+          avail_gb=$(df -BG --output=avail . | awk 'NR==2 {gsub(/G/,"",$1); print $1}')
+          echo "Free disk: ${avail_gb} GB (need >= 40 GB)"
+          if [ "${avail_gb:-0}" -lt 40 ]; then
+            echo "::error::perf gate: insufficient free disk (${avail_gb} GB < 40 GB)"
+            exit 1
+          fi
+
+      - name: Resolve the merge base
+        id: mergebase
+        env:
+          BASE_REF: ${{ needs.authorize.outputs.base_ref }}
+          HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          # `origin/<base>` rather than the base branch's tip at PR creation:
+          # the merge base is what this PR is actually a delta against, and it
+          # is the only commit whose numbers are a fair "before". `fetch-depth:
+          # 0` above is what makes the base branch present locally.
+          if ! git rev-parse --verify --quiet "origin/$BASE_REF^{commit}" >/dev/null; then
+            echo "::error::perf gate: origin/$BASE_REF is not present — the checkout was not deep enough"
+            exit 1
+          fi
+          base="$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")"
+          echo "Merge base with origin/$BASE_REF: $base"
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+
+      # Two kache binaries, ONE measuring instrument.
+      #
+      # `kache-scenario` — the benchmark engine, the scenario TOML it reads, and
+      # the comparison script — is built once, from the PR head, and used for
+      # both sides. If each side ran its own engine, an engine change in the PR
+      # would show up as a subject regression and nobody could tell the two
+      # apart. The consequence to know about: if a PR changes the `kache report
+      # --format json` shape the engine parses, the base binary's report will
+      # fail to parse and this job fails loudly. That is the correct outcome —
+      # such a PR needs its baseline taken by hand.
+      - name: Build kache from the merge base
+        env:
+          MERGE_BASE: ${{ steps.mergebase.outputs.sha }}
+          RUSTC_WRAPPER: ""
+        run: |
+          set -euo pipefail
+          git switch --detach "$MERGE_BASE"
+          cargo build --release -p kache
+          cp target/release/kache "$RUNNER_TEMP/kache-base"
+
+      - name: Build kache and the benchmark engine from the PR head
+        env:
+          HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          RUSTC_WRAPPER: ""
+        run: |
+          set -euo pipefail
+          git switch --detach "$HEAD_SHA"
+          cargo build --release -p kache
+          cargo build --release -p kache-e2e --bin kache-scenario
+          cp target/release/kache "$RUNNER_TEMP/kache-head"
+          cp target/release/kache-scenario "$RUNNER_TEMP/kache-scenario"
+          "$RUNNER_TEMP/kache-base" --version
+          "$RUNNER_TEMP/kache-head" --version
+
+      # The merge base runs FIRST and its scratch is deleted before the head
+      # side starts, so peak disk is one side, not two. Ordering is fixed rather
+      # than randomised: with a fixed order any thermal or cache-warmth drift
+      # biases every PR the same way, which is easier to reason about than a
+      # bias that changes run to run.
+      - name: Benchmark the merge base
+        timeout-minutes: 40
+        env:
+          RUSTC_WRAPPER: ""
+          # The subject pins its own toolchain via the rust-toolchain.toml the
+          # scenario injects; a forced RUSTUP_TOOLCHAIN would override it.
+          RUSTUP_TOOLCHAIN: ""
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/kache-scenario" \
+            --kache "$RUNNER_TEMP/kache-base" \
+            --select suite:bench --select backend:kache \
+            --profile "$BENCH_PROFILE" \
+            --warm-same-tree \
+            --work-dir "tmp/perf-gate/base"
+          cp "tmp/perf-gate/base/$BENCH_SCENARIO.json" "$RUNNER_TEMP/base.json"
+          mkdir -p "$RUNNER_TEMP/logs/base"
+          cp tmp/perf-gate/base/*.log "$RUNNER_TEMP/logs/base/" || true
+          # Free the objdirs, worktrees and store before the head side runs.
+          # `clone-ref` is a SIBLING of the work dir, so it needs its own rm.
+          rm -rf tmp/perf-gate/base tmp/perf-gate/base-clone-ref
+
+      - name: Benchmark the PR head
+        timeout-minutes: 40
+        env:
+          RUSTC_WRAPPER: ""
+          RUSTUP_TOOLCHAIN: ""
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/kache-scenario" \
+            --kache "$RUNNER_TEMP/kache-head" \
+            --select suite:bench --select backend:kache \
+            --profile "$BENCH_PROFILE" \
+            --warm-same-tree \
+            --work-dir "tmp/perf-gate/head"
+          cp "tmp/perf-gate/head/$BENCH_SCENARIO.json" "$RUNNER_TEMP/head.json"
+          mkdir -p "$RUNNER_TEMP/logs/head"
+          cp tmp/perf-gate/head/*.log "$RUNNER_TEMP/logs/head/" || true
+
+      # The threshold and the validity gates live in the script, so `just`
+      # users and CI apply exactly the same rules. Non-zero exit = regression or
+      # invalid measurement; either way the markdown is written first so the
+      # reviewer sees why.
+      - name: Compare and gate
+        id: compare
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/report"
+          status=0
+          ./scripts/perf-gate-compare.sh \
+            "$RUNNER_TEMP/base.json" \
+            "$RUNNER_TEMP/head.json" \
+            "$RUNNER_TEMP/report/perf-gate.md" || status=$?
+          # The script writes the markdown before it decides the exit code, so
+          # the summary is there for both outcomes. Guard anyway: an argument or
+          # environment failure exits before writing anything, and losing the
+          # real exit code to a missing file would be the wrong failure to show.
+          if [ -f "$RUNNER_TEMP/report/perf-gate.md" ]; then
+            cat "$RUNNER_TEMP/report/perf-gate.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+      # always(): a failed comparison is exactly when the per-phase reports and
+      # build logs are worth reading.
+      - name: Upload perf-gate artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: perf-gate
+          path: |
+            ${{ runner.temp }}/base.json
+            ${{ runner.temp }}/head.json
+            ${{ runner.temp }}/report/perf-gate.md
+            ${{ runner.temp }}/logs/
+          retention-days: 14
+          if-no-files-found: warn
+
+  # ── Reporting ───────────────────────────────────────────────────────────────
+  # Separate job, and back on a GitHub-hosted runner, so the write-capable token
+  # this needs is never present on the self-hosted runner while third-party
+  # build scripts are executing.
+  report:
+    name: Report
+    needs: [authorize, measure]
+    if: always() && needs.authorize.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      # `perf-gate/warm` on the head commit. Not a required context today; it
+      # exists so making it one later is a branch-protection edit and nothing
+      # else.
+      statuses: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: perf-gate
+          path: perf-gate
+        continue-on-error: true
+
+      - name: Post the numbers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.authorize.outputs.pr }}
+          HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          MEASURE_RESULT: ${{ needs.measure.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body_file="$(mktemp)"
+          # An HTML marker makes the comment sticky: the next run edits this one
+          # instead of adding a new comment to every push.
+          printf '%s\n\n' '<!-- kache-perf-gate -->' > "$body_file"
+          if [ -f perf-gate/report/perf-gate.md ]; then
+            cat perf-gate/report/perf-gate.md >> "$body_file"
+          else
+            {
+              echo "## Perf gate: no numbers"
+              echo
+              echo "The measurement job ended as \`$MEASURE_RESULT\` before it produced a report."
+            } >> "$body_file"
+          fi
+          printf '\n[Run details](%s)\n' "$RUN_URL" >> "$body_file"
+
+          existing="$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq 'map(select(.body | startswith("<!-- kache-perf-gate -->"))) | .[0].id // empty' \
+            | head -n 1)"
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@"$body_file" >/dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@"$body_file" >/dev/null
+          fi
+
+          if [ "$MEASURE_RESULT" = "success" ]; then
+            state=success
+            description="warm build within budget"
+          else
+            state=failure
+            description="warm build regressed or the run was invalid"
+          fi
+          gh api -X POST "repos/$REPO/statuses/$HEAD_SHA" \
+            -f state="$state" \
+            -f context="perf-gate/warm" \
+            -f description="$description" \
+            -f target_url="$RUN_URL" >/dev/null

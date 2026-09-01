@@ -9,6 +9,13 @@ use serde::Deserialize;
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
     Cold,
+    /// Clone benchmarks only: rebuild the SAME worktree `cold` just built, with
+    /// the objdir wiped and the store left warm. This is the plain
+    /// "my `target/` was cleaned" case, with no path change in play — it splits
+    /// restore cost away from the path-portability question the cross-clone
+    /// [`Phase::Warm`] answers. Opt-in (`--warm-same-tree`), so the nightly
+    /// scenarios do not pay for a third full build.
+    WarmSameTree,
     Warm,
     Pull,
     Noop,
@@ -21,6 +28,7 @@ impl Phase {
     pub fn name(self) -> &'static str {
         match self {
             Phase::Cold => "cold",
+            Phase::WarmSameTree => "warm-same-tree",
             Phase::Warm => "warm",
             Phase::Pull => "pull",
             Phase::Noop => "noop",
@@ -53,5 +61,13 @@ mod tests {
         assert!(Phase::Pull.cleans_first());
         // The rebuilt tree must still pass runtime verification.
         assert!(Phase::Pull.runs_verify());
+    }
+
+    #[test]
+    fn warm_same_tree_phase_name_is_artifact_stable() {
+        // The name is the artifact/report suffix the PR perf gate reads
+        // (`report-warm-same-tree.json`) and the `[checks.assert.…]` table key.
+        assert_eq!(Phase::WarmSameTree.name(), "warm-same-tree");
+        assert!(Phase::WarmSameTree.cleans_first());
     }
 }

@@ -14,6 +14,15 @@
 //!   off a locally-cached reference clone so re-runs don't pay the
 //!   network cost twice.
 //!
+//! `--warm-same-tree` inserts a third phase between those two:
+//!
+//! - **warm-same-tree**: clone-a rebuilt in place with its objdir wiped and the
+//!   store left warm. Same absolute path, so it measures restore cost with the
+//!   path-portability question held constant — the everyday "I cleaned my
+//!   `target/`" case. Off by default; the nightly scenarios would pay for a
+//!   third full build they do not read. Added for the per-PR perf gate, which
+//!   needs cold, warm, and cross-worktree as three separate numbers.
+//!
 //! The *project-specific* parts — which repo, how to wire kache in, how
 //! to build — live in benchmark scenarios under `scenarios/bench-*`;
 //! this binary is the project-agnostic measurement engine. See
@@ -110,6 +119,10 @@ pub struct BenchRunConfig {
     pub force_setup: bool,
     pub retry: bool,
     pub trace_keys: bool,
+    /// Insert the same-worktree warm phase between `cold` and the cross-clone
+    /// `warm`. Off by default — the nightly scenarios would pay for a third
+    /// full build they do not use. See [`Phase::WarmSameTree`].
+    pub warm_same_tree: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -130,6 +143,9 @@ impl CacheBackend {
 pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     if config.cache_backend == CacheBackend::Sccache && config.trace_keys {
         bail!("--trace-keys is only supported with --cache-backend kache");
+    }
+    if config.cache_backend == CacheBackend::Sccache && config.warm_same_tree {
+        bail!("--warm-same-tree is only supported with --cache-backend kache");
     }
     let cache_tool_arg = match config.cache_backend {
         CacheBackend::Kache => &config.kache,
@@ -252,6 +268,12 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         if config.cache_backend != CacheBackend::Kache {
             bail!("pull scenarios (`ref_next`) are only supported with --cache-backend kache");
         }
+        if config.warm_same_tree {
+            // A pull scenario already rebuilds clone-a a second time, at a
+            // different ref. Adding the same-tree warm phase would silently
+            // change what `pull` measures.
+            bail!("--warm-same-tree is not supported for pull scenarios (`ref_next`)");
+        }
         return run_pull_bench(
             &profile,
             &kache,
@@ -314,7 +336,12 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // run: on `--retry` cold is restored from a snapshot rather than built, so
     // the delta would not cover the cold pool. Clones already exist at this
     // point; the cache and objdirs do not (cold wipes the cache first).
-    let disk_free_before = if config.retry {
+    //
+    // `--warm-same-tree` also opts out: it wipes and refills clone-a's objdir a
+    // second time, so the volume's free-space delta no longer maps onto the
+    // three-pool (clone-a/obj + clone-b/obj + store) model the estimate checks,
+    // and the comparison would raise a spurious accounting warning.
+    let disk_free_before = if config.retry || config.warm_same_tree {
         None
     } else {
         available_bytes(&work_dir)
@@ -357,13 +384,62 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         )?
     };
 
+    // warm-same-tree (opt-in): rebuild clone-a — the tree cold just built — with
+    // its objdir wiped and the store left warm. Same absolute path, so the
+    // measurement isolates restore cost from the path-portability question the
+    // cross-clone warm phase answers next. It runs BEFORE that phase because
+    // cold's cache snapshot (`cache-after-cold`, used by `--retry`) is already
+    // on disk, and because clone-b must stay untouched until it is built once.
+    //
+    // Anything this rebuild stores (a passthrough that cold did not reach) also
+    // benefits the cross-clone warm phase below; that is the same direction the
+    // cache already works in and is noted in the summary.
+    let warm_same_tree_metrics = if config.warm_same_tree {
+        reset_event_log(&event_log)?;
+        daemon::start(&kache, &cache_dir, &kache_config);
+        let wall_s = build(
+            &profile,
+            &clone_a,
+            Phase::WarmSameTree.name(),
+            &cache_dir,
+            &kache_config,
+            &kache,
+            &work_dir,
+            CacheBackend::Kache,
+            config.trace_keys,
+            &sh,
+        )?;
+        write_cache_otlp_or_warn(
+            &kache,
+            &cache_dir,
+            &kache_config,
+            &work_dir.join("cache-otlp-warm-same-tree"),
+            &profile.name,
+            Phase::WarmSameTree.name(),
+        );
+        daemon::stop(&kache, &cache_dir);
+        let (report, raw) = capture_report(
+            &kache,
+            &cache_dir,
+            &work_dir,
+            Phase::WarmSameTree.name(),
+            &clone_a,
+        )?;
+        let events = read_event_log(&event_log);
+        let (leaks, _) = scan_leak_warnings(
+            &work_dir.join(format!("wrapper-{}.log", Phase::WarmSameTree.name())),
+        );
+        Some(PhaseMetrics::from_report(
+            &report, &raw, wall_s, events, leaks,
+        ))
+    } else {
+        None
+    };
+
     // Reset the event log so warm's report covers only the warm build.
     // Only the observability log is removed — the cache store (`store/`,
     // `index.db`) stays, so warm still hits everything cold populated.
-    if event_log.exists() {
-        std::fs::remove_file(&event_log)
-            .with_context(|| format!("resetting {}", event_log.display()))?;
-    }
+    reset_event_log(&event_log)?;
 
     // warm: same cache, fresh clone at a different path → served from
     // what cold populated. Bring the daemon up first so the restore uses the
@@ -411,6 +487,16 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     } else {
         0.0
     };
+    // Same-tree speedup against the SAME run's cold build — the "did the warm
+    // build actually beat the cold one that seeded it" number a timing gate
+    // needs before it trusts a wall-clock delta. Present only when the phase ran.
+    let warm_same_tree_speedup = warm_same_tree_metrics.as_ref().map(|m| {
+        if m.wall_s > 0 {
+            round2(cold_metrics.wall_s as f64 / m.wall_s as f64)
+        } else {
+            0.0
+        }
+    });
 
     // Cross-clone cache-key stability: for the deterministic correctness
     // signal, see how many crates produced an identical key in both
@@ -423,6 +509,23 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         &warm_metrics,
         profile.checks.assertions.for_phase(Phase::Warm.name()),
     );
+    // The same-tree phase gets its OWN verdict from
+    // `[checks.assert.warm-same-tree]`, kept beside the cross-clone one rather
+    // than folded into it: `verdict` is the shape the nightly telemetry and the
+    // report JSON already publish, and both phases name the same checks. Key
+    // stability is cross-clone by definition, so it is passed as "nothing
+    // compared" — `Verdict::evaluate` skips that check when the denominator is
+    // zero. Both verdicts drive the exit code (see the end of this function).
+    let warm_same_tree_verdict = warm_same_tree_metrics.as_ref().map(|metrics| {
+        Verdict::evaluate(
+            &KeyStability::default(),
+            metrics,
+            profile
+                .checks
+                .assertions
+                .for_phase(Phase::WarmSameTree.name()),
+        )
+    });
     let mut measure_warnings = bench_measure_warnings(
         &warm_metrics,
         speedup,
@@ -490,6 +593,25 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         None
     };
 
+    let mut reports = vec![
+        "report-cold.json".to_string(),
+        "report-cold.md".to_string(),
+        "report-warm.json".to_string(),
+        "report-warm.md".to_string(),
+        "build-cold.log".to_string(),
+        "build-warm.log".to_string(),
+        "wrapper-cold.log".to_string(),
+        "wrapper-warm.log".to_string(),
+    ];
+    if warm_same_tree_metrics.is_some() {
+        reports.extend([
+            "report-warm-same-tree.json".to_string(),
+            "report-warm-same-tree.md".to_string(),
+            "build-warm-same-tree.log".to_string(),
+            "wrapper-warm-same-tree.log".to_string(),
+        ]);
+    }
+
     let result = BenchResult {
         project: profile.name.clone(),
         git_ref: profile.git_ref.clone(),
@@ -498,8 +620,10 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         artifact_dir: run_archive_dir.display().to_string(),
         cache_tool_version: cache_tool_version.clone(),
         cold: cold_metrics,
+        warm_same_tree: warm_same_tree_metrics,
         warm: warm_metrics,
         speedup: round2(speedup),
+        warm_same_tree_speedup,
         cache_size_mb: round1(dir_size_kb(&cache_dir) as f64 / 1024.0),
         cold_objdir_bytes,
         warm_objdir_bytes,
@@ -507,20 +631,10 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         key_stability: stability,
         warm_leak_samples,
         verdict,
+        warm_same_tree_verdict,
         measure_warnings,
         key_diff_top: key_diff_top.clone(),
-        reports: [
-            "report-cold.json",
-            "report-cold.md",
-            "report-warm.json",
-            "report-warm.md",
-            "build-cold.log",
-            "build-warm.log",
-            "wrapper-cold.log",
-            "wrapper-warm.log",
-        ]
-        .map(String::from)
-        .to_vec(),
+        reports,
     };
 
     let out = work_dir.join(format!("{}.json", profile.name));
@@ -550,8 +664,14 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     eprintln!("[bench] summary written to {}", out.display());
 
     // Preserve the existing manual-bench contract: clone-scale correctness
-    // assertions still fail the run, while measurements only warn.
-    if !result.verdict.ok {
+    // assertions still fail the run, while measurements only warn. The
+    // same-tree phase's own verdict is held to the same contract, so a PR gate
+    // reading these numbers cannot be handed a phase that measured nothing.
+    let same_tree_ok = result
+        .warm_same_tree_verdict
+        .as_ref()
+        .is_none_or(|verdict| verdict.ok);
+    if !result.verdict.ok || !same_tree_ok {
         std::process::exit(1);
     }
     Ok(())
@@ -1657,6 +1777,18 @@ fn capture_sccache_report(
     Ok(SccachePhaseMetrics::from_raw(&raw, wall_s))
 }
 
+/// Drop the event log so the next phase's report covers only that phase.
+///
+/// Only the observability log goes; the cache store (`store/`, `index.db`)
+/// stays, so the next build still hits everything its predecessor populated.
+fn reset_event_log(event_log: &Path) -> Result<()> {
+    if event_log.exists() {
+        std::fs::remove_file(event_log)
+            .with_context(|| format!("resetting {}", event_log.display()))?;
+    }
+    Ok(())
+}
+
 /// Parse the raw event log (`events.jsonl`) for one phase.
 ///
 /// `kache report` filters `passthrough` and `skipped` events out of its
@@ -2518,8 +2650,27 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
         "  cold build : {}   (empty cache, baseline)",
         fmt(r.cold.wall_s)
     );
+    // Only when `--warm-same-tree` ran: the plain "cleaned my target/" case,
+    // same absolute path, printed between cold and the cross-clone warm so the
+    // three wall-clocks read in the order they were measured.
+    if let Some(same_tree) = &r.warm_same_tree {
+        eprintln!(
+            "  same-tree  : {}   (clone-a rebuilt, objdir wiped, cache populated by cold)",
+            fmt(same_tree.wall_s)
+        );
+        eprintln!(
+            "               {} hits / {} misses, {:.1}% hit rate, restored {}{}",
+            same_tree.hits,
+            same_tree.misses,
+            same_tree.hit_rate_pct,
+            human_bytes(same_tree.storage.restored_bytes),
+            r.warm_same_tree_speedup
+                .map(|s| format!("   {s:.2}x vs cold"))
+                .unwrap_or_default(),
+        );
+    }
     eprintln!(
-        "  warm build : {}   (cache populated by cold)",
+        "  warm build : {}   (cache populated by cold; DIFFERENT worktree path)",
         fmt(r.warm.wall_s)
     );
     eprintln!("  speedup    : {:.2}x", r.speedup);
@@ -2707,6 +2858,16 @@ fn print_summary(r: &BenchResult, work_dir: &Path) {
             eprintln!("    - {issue}");
         }
     }
+    if let Some(same_tree) = &r.warm_same_tree_verdict {
+        if same_tree.ok {
+            eprintln!("  VERDICT (same-tree): ok — the phase validly consumed the cache.");
+        } else {
+            eprintln!("  VERDICT (same-tree): DEGRADED — that phase measured nothing real:");
+            for issue in &same_tree.issues {
+                eprintln!("    - {issue}");
+            }
+        }
+    }
     if !r.measure_warnings.is_empty() {
         eprintln!("  MEASURE WARNINGS:");
         for warning in &r.measure_warnings {
@@ -2771,9 +2932,17 @@ struct BenchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_tool_version: Option<String>,
     cold: PhaseMetrics,
+    /// The same-worktree warm rebuild, present only under `--warm-same-tree`.
+    /// Absent from every nightly scenario's JSON, so downstream readers must
+    /// treat it as optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warm_same_tree: Option<PhaseMetrics>,
     warm: PhaseMetrics,
     /// Cold wall-clock divided by warm wall-clock.
     speedup: f64,
+    /// Cold wall-clock divided by the same-tree warm wall-clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warm_same_tree_speedup: Option<f64>,
     cache_size_mb: f64,
     /// Apparent bytes of clone-a's objdir after the cold build.
     cold_objdir_bytes: u64,
@@ -2796,6 +2965,10 @@ struct BenchResult {
     warm_leak_samples: Vec<String>,
     /// Whether the run validly exercised kache (drives the exit code).
     verdict: Verdict,
+    /// The same-tree phase's own verdict, from
+    /// `[checks.assert.warm-same-tree]`. Also drives the exit code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warm_same_tree_verdict: Option<Verdict>,
     /// Advisory measurement threshold warnings. Never drives exit code.
     measure_warnings: Vec<String>,
     /// Top diverging key-input field across clones, set only when the
@@ -3075,8 +3248,14 @@ struct Verdict {
 
 impl Verdict {
     /// Gate thresholds. A run is degraded if cross-clone key stability
-    /// collapsed (the warm phase measured nothing real) or if most compiles
-    /// never reached the cache.
+    /// collapsed (the warm phase measured nothing real), if most compiles never
+    /// reached the cache, or if the phase reported no hits / restored no bytes.
+    ///
+    /// Applied to one phase's metrics at a time: the cross-clone `warm` phase
+    /// against `[checks.assert.warm]`, and — when `--warm-same-tree` ran — the
+    /// same-tree phase against `[checks.assert.warm-same-tree]`. Pass a default
+    /// [`KeyStability`] for the latter; a zero denominator skips the
+    /// cross-clone-only stability check.
     ///
     /// `max_errors` is intentionally NOT a degradation trigger. kache's
     /// `EventResult::Error` counts only wrapped-compiler non-zero exits — never
@@ -3126,6 +3305,46 @@ impl Verdict {
                     actual: format!("{:.1}", stability.stable_pct),
                     passed: true,
                 });
+            }
+        }
+
+        // Did this phase measure anything at all? A phase that reported zero
+        // hits, or hits that restored no bytes, recompiled the world — its
+        // wall-clock is a build time, not a cache time, and a comparison
+        // against it would be a flattering number rather than a measurement.
+        if let Some(min_hits) = spec.min_hits {
+            let passed = warm.hits >= min_hits;
+            checks.push(AssertionCheck {
+                name: "min_hits",
+                expected: format!(">= {min_hits}"),
+                actual: warm.hits.to_string(),
+                passed,
+            });
+            if !passed {
+                issues.push(format!(
+                    "{} cache hits (need >= {min_hits}) — this phase did not consume \
+                     the cache, so its wall-clock measures a rebuild, not a restore",
+                    warm.hits
+                ));
+            }
+        }
+
+        if let Some(min_restored_bytes) = spec.min_restored_bytes {
+            let restored = warm.storage.restored_bytes;
+            let passed = restored >= min_restored_bytes;
+            checks.push(AssertionCheck {
+                name: "min_restored_bytes",
+                expected: format!(">= {min_restored_bytes}"),
+                actual: restored.to_string(),
+                passed,
+            });
+            if !passed {
+                issues.push(format!(
+                    "{} restored from the store (need >= {}) — the phase reported hits \
+                     but no output files landed in the build tree",
+                    human_bytes(restored),
+                    human_bytes(min_restored_bytes),
+                ));
             }
         }
 
@@ -3333,6 +3552,7 @@ mod tests {
             min_key_stability_pct: Some(50.0),
             max_passthrough_pct: Some(40.0),
             max_errors: Some(0),
+            ..Default::default()
         };
 
         let verdict = Verdict::evaluate(&stability, &warm, Some(&spec));
@@ -3740,6 +3960,7 @@ mod tests {
             min_key_stability_pct: None,
             max_passthrough_pct: None,
             max_errors: Some(0),
+            ..Default::default()
         };
 
         let verdict = Verdict::evaluate(&stability, &warm, Some(&spec));
@@ -3765,6 +3986,7 @@ mod tests {
             min_key_stability_pct: Some(80.0),
             max_passthrough_pct: Some(20.0),
             max_errors: Some(0),
+            ..Default::default()
         };
 
         let verdict = Verdict::evaluate(&stability, &warm, Some(&spec));
@@ -3777,6 +3999,89 @@ mod tests {
             .map(|check| check.name)
             .collect();
         assert_eq!(failed, vec!["min_key_stability_pct", "max_passthrough_pct"]);
+    }
+
+    /// The PR perf gate's core safety property: a phase that recompiled the
+    /// world must be rejected, not reported as a fast build. Zero hits and zero
+    /// restored bytes are the two ways "this measured nothing" shows up.
+    #[test]
+    fn verdict_rejects_a_phase_that_consumed_no_cache() {
+        let spec = ScenarioAssertSpec {
+            min_hits: Some(1),
+            min_restored_bytes: Some(1024),
+            ..Default::default()
+        };
+        let measured_nothing = PhaseMetrics::default();
+
+        // A default `KeyStability` is how the same-tree phase is evaluated:
+        // stability is cross-clone only, so it must stay out of the verdict.
+        let verdict = Verdict::evaluate(&KeyStability::default(), &measured_nothing, Some(&spec));
+
+        assert!(!verdict.ok, "a zero-hit phase must not pass");
+        let failed: Vec<&str> = verdict
+            .checks
+            .iter()
+            .filter(|check| !check.passed)
+            .map(|check| check.name)
+            .collect();
+        assert_eq!(failed, vec!["min_hits", "min_restored_bytes"]);
+        assert!(
+            verdict
+                .checks
+                .iter()
+                .all(|check| check.name != "min_key_stability_pct"),
+            "stability must be skipped when nothing was compared"
+        );
+    }
+
+    /// A phase that hit the cache and pulled real bytes out of it passes both
+    /// validity checks.
+    #[test]
+    fn verdict_accepts_a_phase_that_hit_and_restored() {
+        let spec = ScenarioAssertSpec {
+            min_hits: Some(1),
+            min_restored_bytes: Some(1024),
+            ..Default::default()
+        };
+        let measured = PhaseMetrics {
+            hits: 412,
+            storage: StorageInfo {
+                restored_bytes: 64 * 1024 * 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let verdict = Verdict::evaluate(&KeyStability::default(), &measured, Some(&spec));
+
+        assert!(verdict.ok, "{:?}", verdict.issues);
+        assert_eq!(verdict.checks.len(), 2);
+    }
+
+    /// Hits without bytes is the subtler failure: kache answered every query,
+    /// but nothing landed in the build tree, so the wall-clock is not a restore.
+    #[test]
+    fn verdict_rejects_hits_that_restored_nothing() {
+        let spec = ScenarioAssertSpec {
+            min_hits: Some(1),
+            min_restored_bytes: Some(1024),
+            ..Default::default()
+        };
+        let hollow = PhaseMetrics {
+            hits: 412,
+            ..Default::default()
+        };
+
+        let verdict = Verdict::evaluate(&KeyStability::default(), &hollow, Some(&spec));
+
+        assert!(!verdict.ok);
+        let failed: Vec<&str> = verdict
+            .checks
+            .iter()
+            .filter(|check| !check.passed)
+            .map(|check| check.name)
+            .collect();
+        assert_eq!(failed, vec!["min_restored_bytes"]);
     }
 
     #[test]

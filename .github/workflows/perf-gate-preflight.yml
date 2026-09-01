@@ -1,0 +1,90 @@
+name: Perf gate (preflight)
+
+# Untrusted half of the per-PR performance gate. It does exactly one privileged
+# thing: nothing. It runs on a disposable GitHub-hosted runner with a read-only
+# token, records which pull request asked for a measurement, and hands that
+# number to `perf-gate.yml` through an artifact.
+#
+# Why this workflow exists at all: the measurement runs on the self-hosted
+# kunobi ARC runner, and a `pull_request` job from a fork must never reach one.
+# For a `pull_request` event GitHub uses the workflow file AS IT EXISTS IN THE
+# PR, so nothing decided here can be trusted — a fork can rewrite this file.
+# `perf-gate.yml` is therefore triggered by `workflow_run`, which always
+# executes the DEFAULT BRANCH's copy of itself, and it re-derives every fact
+# about the PR from the GitHub API before any privileged job starts. Treat the
+# artifact below as a hint, never as authorization.
+#
+# The eligibility check here is a courtesy: it puts the reason a fork PR gets no
+# perf numbers on the PR itself, instead of leaving the contributor to guess.
+# It never fails the check — an ineligible PR is skipped, not rejected.
+#
+# Docs-only pull requests are filtered out at the trigger. This gate is NOT a
+# required check (see perf-gate.yml), so a never-created run cannot wedge branch
+# protection the way it would for `ci.yml`.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "**.md"
+      - "**.mdx"
+      - "docs/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Record the perf-gate request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The PR number is the whole payload. Everything else — head SHA, base
+      # branch, fork status, draft status — is looked up again from the API by
+      # the trusted half, so there is nothing here worth forging.
+      - name: Record the pull-request number
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          mkdir -p perf-gate-request
+          printf '%s\n' "$PR_NUMBER" > perf-gate-request/pr-number.txt
+
+      # Report eligibility to the contributor. The same conditions are enforced
+      # for real, from the API, in perf-gate.yml's `authorize` job.
+      - name: Report eligibility
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Perf gate"
+            if [ "$HEAD_REPO" != "$THIS_REPO" ]; then
+              echo
+              echo "This pull request comes from a fork (\`$HEAD_REPO\`), so the"
+              echo "performance gate will not run: the benchmark needs a self-hosted"
+              echo "runner, and fork code must not execute on one. A maintainer can"
+              echo "get numbers by pushing the same commits to a branch in"
+              echo "\`$THIS_REPO\`."
+            elif [ "$IS_DRAFT" = "true" ]; then
+              echo
+              echo "This pull request is a draft, so the performance gate is skipped."
+              echo "Mark it ready for review to get numbers."
+            else
+              echo
+              echo "Eligible. The measurement runs in the \`Perf gate\` workflow and"
+              echo "posts its numbers back here as a comment."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: perf-gate-request
+          path: perf-gate-request/
+          retention-days: 1
+          if-no-files-found: error

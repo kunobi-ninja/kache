@@ -1,0 +1,129 @@
+# Per-PR perf-gate benchmark scenario for kache-scenario.
+#
+# The nightly bench giants (Firefox, LLVM, Substrate, SurrealDB, Lance,
+# OpenDAL) take tens of minutes to hours each. A gate that runs on every pull
+# request has to finish in minutes AND still be sensitive enough that a warm
+# regression shows up above noise, so it needs a subject with real dependency
+# depth rather than a toy.
+#
+# Why rust-lang/cargo:
+#   * 550 packages in its lockfile — a deep, wide, realistic Rust graph, not a
+#     handful of leaf crates whose warm phase is dominated by process startup.
+#   * Genuine C content compiled by build scripts through cc-rs: libgit2-sys
+#     (vendored libgit2), libssh2-sys, libz-sys (vendored zlib), curl-sys
+#     (vendored curl when no system libcurl is present) and ring's asm/C. Wiring
+#     CC/CXX through kache below puts those object compiles in the cache too, so
+#     the gate covers both compiler families the way the mixed nightly
+#     scenarios do — the Rust-only scenarios cannot see a cc-path regression.
+#   * Its own build.rs shells out to git and embeds the commit hash, which is
+#     identical in both worktrees — so it does not, by itself, break the
+#     cross-worktree comparison the way a timestamp would.
+#   * Small enough on disk (a shallow clone plus a debug target tree) that two
+#     independent runs — PR head and merge base — fit on one runner.
+#
+# Pinned by COMMIT SHA, not by tag: a tag can be repointed, and a gate whose
+# subject silently changed under it reports a delta that is really a subject
+# change. `clone_worktrees` takes the fetch-by-SHA path for a full 40-char SHA.
+name = "bench-pr-cargo"
+
+# `tier:pr` (not the implicit `tier:nightly`) keeps this out of any
+# tier-selected nightly sweep. The perf-gate workflow selects it by name.
+tags = [
+  "suite:bench",
+  "project:cargo",
+  "backend:kache",
+  "lang:rust",
+  "lang:cc",
+  "tier:pr",
+]
+
+requires = ["cargo", "rustc", "cc"]
+
+# The C halves need a compiler and pkg-config; libgit2/curl want an OpenSSL
+# development package on Linux. The perf-gate workflow installs these (mirroring
+# .github/workflows/bench.yml); the echo documents them for a local run.
+setup = [
+  "echo '[bench] bench-pr-cargo needs: a C compiler, pkg-config, and OpenSSL headers (libgit2-sys/curl-sys). Debian: apt install build-essential pkg-config libssl-dev. macOS: xcode-select --install && brew install openssl@3 pkg-config.'",
+]
+
+# Build the `cargo` binary at the DEV profile, not release. Two reasons:
+#   * Time. The gate runs the subject three times per side and twice per PR
+#     (head + merge base) on one machine. A release build of this graph is the
+#     difference between a gate that lands in minutes and one nobody waits for.
+#   * Sensitivity. Debug artifacts are far larger than release ones, so the warm
+#     phases move many more bytes out of the store — which is exactly the cost a
+#     warm-path regression shows up in.
+# `--locked` pins the resolved graph to the checked-in Cargo.lock, so a crates.io
+# release cannot change what is compiled between the head and base runs.
+#
+# The prefix maps, SOURCE_DATE_EPOCH and KACHE_BASE_DIR are the cross-worktree
+# portability knobs the other cargo-based scenarios use (see bench-opendal /
+# bench-surrealdb): each worktree builds at a different absolute path, and these
+# keep that path out of the cache key and out of the C compilers' output.
+build = """
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+export KACHE_BASE_DIR="$repo"
+
+cargo build --locked
+"""
+
+# Route the build scripts' C/C++ compiles through kache as well as the rustc
+# ones the engine wires via RUSTC_WRAPPER. cc-rs honours a multi-token `CC` on
+# Unix (the e2e-rust-c-ffi fixture relies on the same form); the gate runs on
+# Linux only, so the Windows `check_exe` mangling that fixture documents does
+# not apply here.
+[env]
+CC = "{kache} cc"
+CXX = "{kache} c++"
+
+[source]
+kind = "clone"
+repo = "https://github.com/rust-lang/cargo.git"
+# rust-lang/cargo 0.99.0 — the cargo that ships with Rust 1.98. Bump this
+# together with the injected toolchain pin below, and re-baseline expectations
+# when you do: a subject bump moves every absolute number in the report.
+ref    = "797e8a9bca276c1c9f9f738d2a20f484fa4eea9d"
+objdir = "target"
+
+# cargo ships no rust-toolchain.toml, so rustup would otherwise pick up whatever
+# the host default is — and the gate would compare two runs that could, in
+# principle, use different compilers. Writing one pins the subject's toolchain
+# independently of kache's own `rust-toolchain.toml`. `write` is correct here
+# precisely because the repo does not own this file. 1.98.0 clears cargo
+# 0.99.0's 1.96 MSRV.
+[[file]]
+path = "rust-toolchain.toml"
+content = """
+[toolchain]
+channel = "1.98.0"
+profile = "minimal"
+"""
+
+# Validity floors, not regression bounds. Their job is to make a run that
+# measured NOTHING fail loudly instead of reporting a flatteringly fast warm
+# build: a phase that recompiled the world would report zero hits and restore
+# zero bytes, and its wall-clock would look great next to a cold build.
+#
+# The numbers are deliberately far below what a healthy run produces (~550
+# packages, well over a gigabyte of debug artifacts restored) so an ordinary
+# dependency-graph shift cannot trip them — only a genuinely broken run can.
+[checks.assert.warm-same-tree]
+max_passthrough_pct = 40.0
+max_errors = 0
+min_hits = 100
+min_restored_bytes = 67108864 # 64 MiB
+
+# The cross-worktree phase adds the path-portability check: if the cache key
+# carries an absolute path, this phase misses everything and key stability
+# collapses. Same floors as above.
+[checks.assert.warm]
+min_key_stability_pct = 50.0
+max_passthrough_pct = 40.0
+max_errors = 0
+min_hits = 100
+min_restored_bytes = 67108864 # 64 MiB

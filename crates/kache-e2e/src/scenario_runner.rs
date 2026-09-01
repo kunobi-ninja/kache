@@ -82,6 +82,12 @@ struct Args {
     /// Enable cache-key trace logging for clone benchmark scenarios.
     #[arg(long)]
     trace_keys: bool,
+
+    /// Add a same-worktree warm rebuild between the cold and cross-clone
+    /// phases (clone-a again, objdir wiped, store left warm). Off by default:
+    /// it costs a third full build, which only the PR perf gate wants.
+    #[arg(long)]
+    warm_same_tree: bool,
 }
 
 pub fn main() -> Result<()> {
@@ -133,6 +139,7 @@ pub fn main() -> Result<()> {
         || args.force_setup
         || args.retry
         || args.trace_keys
+        || args.warm_same_tree
         || args.cache_backend != CacheBackend::Kache;
     if bench_flags && !clone_selected {
         bail!("benchmark options were provided, but no clone scenario was selected");
@@ -163,6 +170,7 @@ pub fn main() -> Result<()> {
             force_setup: args.force_setup,
             retry: args.retry,
             trace_keys: args.trace_keys,
+            warm_same_tree: args.warm_same_tree,
         })?;
     }
 

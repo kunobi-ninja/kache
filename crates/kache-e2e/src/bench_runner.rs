@@ -91,7 +91,7 @@ use std::fs::File;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::assertions::{AssertionCheck, all_passed};
 use crate::bench_profile::BenchProfile;
@@ -391,7 +391,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     let warm_same_tree_metrics = if config.warm_same_tree {
         reset_event_log(&event_log)?;
         daemon::start(&kache, &cache_dir, &kache_config);
-        let wall_s = build(
+        let wall_ms = build(
             &profile,
             &clone_a,
             Phase::WarmSameTree.name(),
@@ -424,7 +424,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
             &work_dir.join(format!("wrapper-{}.log", Phase::WarmSameTree.name())),
         );
         Some(PhaseMetrics::from_report(
-            &report, &raw, wall_s, events, leaks,
+            &report, &raw, wall_ms, events, leaks,
         ))
     } else {
         None
@@ -440,7 +440,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // async file-hash prefetch path instead of hashing every input inline
     // (cold's daemon was stopped before its report capture).
     daemon::start(&kache, &cache_dir, &kache_config);
-    let warm_s = build(
+    let warm_ms = build(
         &profile,
         &clone_b,
         Phase::Warm.name(),
@@ -476,6 +476,9 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         _ => None,
     };
 
+    // Speedups stay on whole seconds: the nightly JSON and the kartero payload
+    // carry them, and the perf gate reads `wall_ms` directly instead.
+    let warm_s = whole_seconds(warm_ms);
     let speedup = if warm_s > 0 {
         cold_metrics.wall_s as f64 / warm_s as f64
     } else {
@@ -493,7 +496,8 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // clones. A path leak in the key shows up here as a near-zero rate.
     let stability = key_stability(&cold_raw, &warm_raw);
 
-    let warm_metrics = PhaseMetrics::from_report(&warm, &warm_raw, warm_s, warm_events, warm_leaks);
+    let warm_metrics =
+        PhaseMetrics::from_report(&warm, &warm_raw, warm_ms, warm_events, warm_leaks);
     let verdict = Verdict::evaluate(
         &stability,
         &warm_metrics,
@@ -681,15 +685,60 @@ fn measures_disk_footprint(retry: bool, warm_same_tree: bool) -> bool {
 /// Speedup of a warm phase against the cold build that seeded it, rounded for
 /// the report.
 ///
-/// Zero when the phase's wall-clock rounded down to zero seconds: the engine
-/// times whole seconds, and dividing by zero yields an infinity that is not a
-/// number any report should carry.
+/// Taken on the whole-second `wall_s`, the value the nightly JSON and its
+/// telemetry have always carried; the perf gate does not read speedups, it
+/// compares `wall_ms` directly. Zero when the phase rounded down to zero
+/// seconds: dividing by zero yields an infinity that is not a number any
+/// report should carry.
 fn phase_speedup(cold_wall_s: u64, phase_wall_s: u64) -> f64 {
     if phase_wall_s > 0 {
         round2(cold_wall_s as f64 / phase_wall_s as f64)
     } else {
         0.0
     }
+}
+
+/// The whole-second view of a millisecond wall clock, truncated the way
+/// `Duration::as_secs` truncates. `wall_s` is derived from `wall_ms` through
+/// this, so the nightly JSON and the kartero payload keep the values the
+/// engine recorded back when it timed seconds only.
+fn whole_seconds(wall_ms: u64) -> u64 {
+    wall_ms / 1000
+}
+
+/// A build's elapsed time as the `wall_ms` the phase metrics record.
+/// `as_millis` is `u128`; saturate rather than wrap on a wall clock no build
+/// reaches.
+fn elapsed_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// `<m>m <ss>.<t>s` for a summary line, from milliseconds. Tenths are
+/// truncated, not rounded, so the seconds shown agree with the whole-second
+/// `wall_s` next to them in the JSON.
+fn fmt_wall_clock(wall_ms: u64) -> String {
+    let s = whole_seconds(wall_ms);
+    format!("{}m {:02}.{}s", s / 60, s % 60, (wall_ms % 1000) / 100)
+}
+
+/// Deserialize a phase's metrics from a result JSON a previous run wrote.
+///
+/// `wall_ms` arrived after `wall_s`. A `--retry` against a snapshot from an
+/// engine that timed whole seconds only has no milliseconds for cold, so they
+/// are backfilled from the seconds here; a serde default cannot read a sibling
+/// field. The backfilled value is a floor (a recorded 14s was anything up to
+/// 14.999s), which is what a whole-second record can give.
+fn load_saved_phase<T: serde::de::DeserializeOwned>(mut saved: serde_json::Value) -> Result<T> {
+    if let Some(phase) = saved.as_object_mut()
+        && !phase.contains_key("wall_ms")
+        && let Some(wall_s) = phase.get("wall_s").and_then(serde_json::Value::as_u64)
+    {
+        phase.insert(
+            "wall_ms".to_string(),
+            serde_json::Value::from(wall_s.saturating_mul(1000)),
+        );
+    }
+    Ok(serde_json::from_value(saved)?)
 }
 
 /// Did any configured assertion say this run is not a valid measurement?
@@ -1006,8 +1055,13 @@ fn run_setup(
     Ok(())
 }
 
-/// Build the project in `clone` with kache wired in; return wall-clock
-/// seconds.
+/// Build the project in `clone` with kache wired in; return the build's wall
+/// clock in milliseconds.
+///
+/// Milliseconds because the per-PR perf gate compares two of these against a
+/// 5% threshold on a warm build of about 15s: a whole-second tick would be 7%
+/// of that, more than the threshold itself. The timer starts after the objdir
+/// wipe and stops when the build command exits.
 ///
 /// kache writes wrapper-mode diagnostics — in particular
 /// `PathNormalizer`'s residual-path leak detector — directly to
@@ -1133,7 +1187,7 @@ fn build(
             log_path.display()
         );
     }
-    Ok(started.elapsed().as_secs())
+    Ok(elapsed_ms(started.elapsed()))
 }
 
 /// Capture kache's report for the phase that just finished: write the
@@ -1207,7 +1261,7 @@ fn run_cold_phase(
     }
     std::fs::create_dir_all(cache_dir)?;
     daemon::start(kache, cache_dir, kache_config);
-    let cold_s = build(
+    let cold_ms = build(
         profile,
         clone_a,
         Phase::Cold.name(),
@@ -1241,7 +1295,7 @@ fn run_cold_phase(
     source::snapshot_dir(cache_dir, &work_dir.join("cache-after-cold"))?;
 
     Ok((
-        PhaseMetrics::from_report(&cold, &cold_raw, cold_s, cold_events, cold_leaks),
+        PhaseMetrics::from_report(&cold, &cold_raw, cold_ms, cold_events, cold_leaks),
         cold_raw,
     ))
 }
@@ -1275,13 +1329,12 @@ fn retry_load_cold(
 
     let cold_raw: serde_json::Value = read_json(&report_cold)?;
     let prev: serde_json::Value = read_json(&result_json)?;
-    let cold_metrics: PhaseMetrics =
-        serde_json::from_value(prev["cold"].clone()).with_context(|| {
-            format!(
-                "loading previous cold metrics from {}",
-                result_json.display()
-            )
-        })?;
+    let cold_metrics: PhaseMetrics = load_saved_phase(prev["cold"].clone()).with_context(|| {
+        format!(
+            "loading previous cold metrics from {}",
+            result_json.display()
+        )
+    })?;
     Ok((cold_metrics, cold_raw))
 }
 
@@ -1355,7 +1408,7 @@ fn run_pull_bench(
     // the start of every phase (unconditionally), so this is a from-scratch
     // rebuild at ref_next and kache is asked about every TU.
     daemon::start(kache, cache_dir, kache_config);
-    let pull_s = build(
+    let pull_ms = build(
         profile,
         clone_a,
         Phase::Pull.name(),
@@ -1381,7 +1434,8 @@ fn run_pull_bench(
     let pull_events = read_event_log(event_log);
     let (pull_leaks, _pull_leak_samples) =
         scan_leak_warnings(&work_dir.join(format!("wrapper-{}.log", Phase::Pull.name())));
-    let pull_metrics = PhaseMetrics::from_report(&pull, &pull_raw, pull_s, pull_events, pull_leaks);
+    let pull_metrics =
+        PhaseMetrics::from_report(&pull, &pull_raw, pull_ms, pull_events, pull_leaks);
 
     // No cross-clone comparison: an empty KeyStability (compared == 0) makes
     // Verdict skip the key-stability check; the pull scenarios also set no
@@ -1493,7 +1547,7 @@ fn run_sccache_bench(
 
     sccache_start(sccache, cache_dir, clone_b)?;
     sccache_zero_stats(sccache, cache_dir, clone_b)?;
-    let warm_s = build(
+    let warm_ms = build(
         profile,
         clone_b,
         Phase::Warm.name(),
@@ -1511,7 +1565,7 @@ fn run_sccache_bench(
         clone_b,
         work_dir,
         Phase::Warm.name(),
-        warm_s,
+        warm_ms,
     )?;
     sccache_stop(sccache, cache_dir);
     ensure_sccache_cache_location(&warm_metrics, cache_dir, Phase::Warm.name())?;
@@ -1521,6 +1575,8 @@ fn run_sccache_bench(
         (Some(before), Some(after)) => before.checked_sub(after),
         _ => None,
     };
+    // Whole seconds, as for the kache path: the speedup is a nightly value.
+    let warm_s = whole_seconds(warm_ms);
     let speedup = if warm_s > 0 {
         cold_metrics.wall_s as f64 / warm_s as f64
     } else {
@@ -1621,7 +1677,7 @@ fn run_sccache_cold_phase(
     std::fs::create_dir_all(cache_dir)?;
     sccache_start(sccache, cache_dir, clone_a)?;
     sccache_zero_stats(sccache, cache_dir, clone_a)?;
-    let cold_s = build(
+    let cold_ms = build(
         profile,
         clone_a,
         Phase::Cold.name(),
@@ -1639,7 +1695,7 @@ fn run_sccache_cold_phase(
         clone_a,
         work_dir,
         Phase::Cold.name(),
-        cold_s,
+        cold_ms,
     )?;
     sccache_stop(sccache, cache_dir);
 
@@ -1669,7 +1725,7 @@ fn retry_load_sccache_cold(
     source::snapshot_dir(&snapshot, cache_dir)?;
 
     let prev: serde_json::Value = read_json(&result_json)?;
-    serde_json::from_value(prev["cold"].clone()).with_context(|| {
+    load_saved_phase(prev["cold"].clone()).with_context(|| {
         format!(
             "loading previous cold sccache metrics from {}",
             result_json.display()
@@ -1770,7 +1826,7 @@ fn capture_sccache_report(
     base_dir: &Path,
     out_dir: &Path,
     phase: &str,
-    wall_s: u64,
+    wall_ms: u64,
 ) -> Result<SccachePhaseMetrics> {
     let output = sccache_command(sccache, cache_dir, Some(base_dir))
         .args(["--show-stats", "--stats-format", "json"])
@@ -1799,7 +1855,7 @@ fn capture_sccache_report(
             .with_context(|| format!("writing {}", adv_path.display()))?;
     }
 
-    Ok(SccachePhaseMetrics::from_raw(&raw, wall_s))
+    Ok(SccachePhaseMetrics::from_raw(&raw, wall_ms))
 }
 
 /// Drop the event log so the next phase's report covers only that phase.
@@ -2430,7 +2486,9 @@ struct SccacheBenchResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SccachePhaseMetrics {
+    /// Whole seconds, truncated from `wall_ms`; see [`PhaseMetrics::wall_s`].
     wall_s: u64,
+    wall_ms: u64,
     compile_requests: u64,
     requests_executed: u64,
     requests_not_compile: u64,
@@ -2457,7 +2515,7 @@ struct SccachePhaseMetrics {
 }
 
 impl SccachePhaseMetrics {
-    fn from_raw(raw: &serde_json::Value, wall_s: u64) -> Self {
+    fn from_raw(raw: &serde_json::Value, wall_ms: u64) -> Self {
         let stats = &raw["stats"];
         let cache_hits = sum_count_values(&stats["cache_hits"]["counts"]);
         let cache_misses = sum_count_values(&stats["cache_misses"]["counts"]);
@@ -2468,7 +2526,8 @@ impl SccachePhaseMetrics {
             0.0
         };
         SccachePhaseMetrics {
-            wall_s,
+            wall_s: whole_seconds(wall_ms),
+            wall_ms,
             compile_requests: stats["compile_requests"].as_u64().unwrap_or(0),
             requests_executed: stats["requests_executed"].as_u64().unwrap_or(0),
             requests_not_compile: stats["requests_not_compile"].as_u64().unwrap_or(0),
@@ -2665,16 +2724,16 @@ fn print_sccache_summary(r: &SccacheBenchResult, work_dir: &Path) {
 /// Render the end-of-run benchmark summary a human reads.
 ///
 /// Writes rather than prints so the numbers it reports can be asserted in a
-/// test. That matters for the three wall-clocks at the top: the per-PR perf
-/// gate compares exactly those, and a summary that quietly stopped reporting
-/// one of them would leave the gate reading a blank.
+/// test. That matters for the three wall-clocks at the top: they are the
+/// numbers the per-PR perf gate compares (from the result JSON, in
+/// milliseconds), and a summary that quietly stopped reporting one of them
+/// would leave a reviewer without the number the gate acted on.
 fn write_summary(
     out: &mut dyn std::io::Write,
     r: &BenchResult,
     work_dir: &Path,
 ) -> std::io::Result<()> {
     let bar = "=".repeat(64);
-    let fmt = |s: u64| format!("{}m {:02}s", s / 60, s % 60);
     writeln!(out, "\n{bar}")?;
     writeln!(out, "  kache benchmark: {} — {}", r.project, r.git_ref)?;
     if let Some(version) = &r.cache_tool_version {
@@ -2684,7 +2743,7 @@ fn write_summary(
     writeln!(
         out,
         "  cold build : {}   (empty cache, baseline)",
-        fmt(r.cold.wall_s)
+        fmt_wall_clock(r.cold.wall_ms)
     )?;
     // Only when `--warm-same-tree` ran: the plain "cleaned my target/" case,
     // same absolute path, printed between cold and the cross-clone warm so the
@@ -2693,7 +2752,7 @@ fn write_summary(
         writeln!(
             out,
             "  same-tree  : {}   (clone-a rebuilt, objdir wiped, cache populated by cold)",
-            fmt(same_tree.wall_s)
+            fmt_wall_clock(same_tree.wall_ms)
         )?;
         writeln!(
             out,
@@ -2710,7 +2769,7 @@ fn write_summary(
     writeln!(
         out,
         "  warm build : {}   (cache populated by cold; DIFFERENT worktree path)",
-        fmt(r.warm.wall_s)
+        fmt_wall_clock(r.warm.wall_ms)
     )?;
     writeln!(out, "  speedup    : {:.2}x", r.speedup)?;
     writeln!(
@@ -2904,6 +2963,8 @@ fn write_summary(
             out,
             "  costliest warm misses (recompiled despite the cache):"
         )?;
+        // Whole seconds: kache's report carries a miss's compile time as such.
+        let fmt = |s: u64| format!("{}m {:02}s", s / 60, s % 60);
         for m in r.warm.top_misses.iter().take(5) {
             writeln!(out, "    {:>8}  {}", fmt(m.compile_time_s), m.crate_name)?;
         }
@@ -3084,7 +3145,15 @@ struct PullBenchResult {
 /// alone — no cumulative bleed.
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct PhaseMetrics {
+    /// Wall clock in whole seconds, truncated from `wall_ms` the way
+    /// `Duration::as_secs` truncates. The nightly JSON and the kartero payload
+    /// carry this field and keep the values they always had.
     wall_s: u64,
+    /// Wall clock in milliseconds. The per-PR perf gate compares on this
+    /// field: at the ~15s warm build its subject takes on the gate's runner, a
+    /// whole-second tick is 7%, more than the gate's 5% threshold, so `wall_s`
+    /// alone cannot resolve a delta there.
+    wall_ms: u64,
     total_crates: u64,
     hits: u64,
     dups: u64,
@@ -3119,7 +3188,7 @@ impl PhaseMetrics {
     fn from_report(
         report: &report::KacheReport,
         raw: &serde_json::Value,
-        wall_s: u64,
+        wall_ms: u64,
         event_log: EventLogStats,
         leak_warnings: u64,
     ) -> Self {
@@ -3139,7 +3208,8 @@ impl PhaseMetrics {
             })
             .unwrap_or_default();
         PhaseMetrics {
-            wall_s,
+            wall_s: whole_seconds(wall_ms),
+            wall_ms,
             total_crates: s.total_crates,
             hits: s.total_hits(),
             dups: s.dups,
@@ -3968,6 +4038,7 @@ mod tests {
     fn phase_metrics_for_verdict(errors: u64) -> PhaseMetrics {
         PhaseMetrics {
             wall_s: 1,
+            wall_ms: 1_000,
             total_crates: 10,
             hits: 6,
             dups: 0,
@@ -4372,8 +4443,9 @@ mod tests {
     }
 
     fn bench_result_fixture() -> BenchResult {
-        let phase = |wall_s: u64, hits: u64| PhaseMetrics {
-            wall_s,
+        let phase = |wall_ms: u64, hits: u64| PhaseMetrics {
+            wall_s: whole_seconds(wall_ms),
+            wall_ms,
             hits,
             ..Default::default()
         };
@@ -4384,9 +4456,9 @@ mod tests {
             run_id: "20260901T000000Z-kache-1".to_string(),
             artifact_dir: "tmp/perf-gate/head/runs/x".to_string(),
             cache_tool_version: Some("kache 0.16.1".to_string()),
-            cold: phase(300, 0),
-            warm_same_tree: Some(phase(100, 412)),
-            warm: phase(120, 400),
+            cold: phase(300_000, 0),
+            warm_same_tree: Some(phase(100_400, 412)),
+            warm: phase(120_900, 400),
             speedup: 2.5,
             warm_same_tree_speedup: Some(3.0),
             cache_size_mb: 1024.0,
@@ -4411,15 +4483,15 @@ mod tests {
         let text = summary_text(&bench_result_fixture());
 
         assert!(
-            text.contains("cold build : 5m 00s"),
+            text.contains("cold build : 5m 00.0s"),
             "cold wall-clock missing:\n{text}"
         );
         assert!(
-            text.contains("same-tree  : 1m 40s"),
+            text.contains("same-tree  : 1m 40.4s"),
             "same-tree wall-clock missing:\n{text}"
         );
         assert!(
-            text.contains("warm build : 2m 00s"),
+            text.contains("warm build : 2m 00.9s"),
             "cross-clone wall-clock missing:\n{text}"
         );
         assert!(
@@ -4451,8 +4523,8 @@ mod tests {
 
         let text = summary_text(&result);
 
-        assert!(text.contains("cold build : 5m 00s"), "{text}");
-        assert!(text.contains("warm build : 2m 00s"), "{text}");
+        assert!(text.contains("cold build : 5m 00.0s"), "{text}");
+        assert!(text.contains("warm build : 2m 00.9s"), "{text}");
         assert!(!text.contains("same-tree"), "{text}");
     }
 
@@ -4535,12 +4607,15 @@ mod tests {
         let mut noisy = bench_result_fixture();
         noisy.warm.top_misses = vec![MissEntry {
             crate_name: "libgit2-sys".to_string(),
-            compile_time_s: 71,
+            compile_time_s: 125,
         }];
         noisy.measure_warnings = vec!["warm hit rate 12.0% below threshold 50.0%".to_string()];
         let text = summary_text(&noisy);
         assert!(text.contains("costliest warm misses"), "{text}");
-        assert!(text.contains("libgit2-sys"), "{text}");
+        // A miss's compile time is whole seconds from kache's report, shown as
+        // minutes and zero-padded seconds. 125 rather than 71 because
+        // 71 - 60 == 71 % 60, which would let a wrong operator print the same.
+        assert!(text.contains("2m 05s  libgit2-sys"), "{text}");
         assert!(text.contains("MEASURE WARNINGS"), "{text}");
         assert!(text.contains("warm hit rate 12.0%"), "{text}");
     }
@@ -4593,5 +4668,240 @@ mod tests {
             j.get("warm").is_none(),
             "pull result must not carry a warm phase"
         );
+    }
+
+    /// `wall_s` is the truncated whole-second view of `wall_ms`, the same
+    /// rounding `Duration::as_secs` applied when the engine recorded seconds
+    /// only, so the nightly JSON and the kartero payload keep their values.
+    #[test]
+    fn whole_seconds_truncates_like_as_secs() {
+        assert_eq!(whole_seconds(0), 0);
+        assert_eq!(whole_seconds(999), 0);
+        assert_eq!(whole_seconds(1_000), 1);
+        // The first live gate run's warm build: 14.9s is 14s, not 15s.
+        assert_eq!(whole_seconds(14_900), 14);
+        assert_eq!(
+            whole_seconds(14_900),
+            Duration::from_millis(14_900).as_secs()
+        );
+        assert_eq!(whole_seconds(112_400), 112);
+    }
+
+    #[test]
+    fn elapsed_ms_reports_milliseconds_and_saturates() {
+        assert_eq!(elapsed_ms(Duration::from_millis(0)), 0);
+        assert_eq!(elapsed_ms(Duration::from_millis(1_499)), 1_499);
+        assert_eq!(elapsed_ms(Duration::from_micros(1_499_999)), 1_499);
+        assert_eq!(elapsed_ms(Duration::MAX), u64::MAX);
+    }
+
+    /// One decimal, truncated: the tenths must agree with the whole seconds
+    /// `wall_s` carries, so 14.96s reads as 14.9s beside a `wall_s` of 14.
+    #[test]
+    fn fmt_wall_clock_prints_minutes_seconds_and_truncated_tenths() {
+        assert_eq!(fmt_wall_clock(0), "0m 00.0s");
+        assert_eq!(fmt_wall_clock(14_600), "0m 14.6s");
+        assert_eq!(fmt_wall_clock(14_960), "0m 14.9s");
+        assert_eq!(fmt_wall_clock(100_400), "1m 40.4s");
+        assert_eq!(fmt_wall_clock(300_000), "5m 00.0s");
+        assert_eq!(fmt_wall_clock(3_661_050), "61m 01.0s");
+    }
+
+    /// The wall clock enters the metrics once, in milliseconds; the whole
+    /// seconds are derived, never recorded separately.
+    #[test]
+    fn from_report_records_milliseconds_and_derives_whole_seconds() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "summary": {
+                "hit_rate_pct": 100.0,
+                "total_crates": 783,
+                "local_hits": 783,
+                "prefetch_hits": 0,
+                "remote_hits": 0,
+                "dups": 0,
+                "misses": 0,
+                "errors": 0,
+                "weighted_hit_rate_pct": 100.0,
+                "time_saved_ms": 95_500
+            },
+            "top_misses": []
+        });
+        let report: report::KacheReport =
+            serde_json::from_value(raw.clone()).expect("a minimal report parses");
+
+        let metrics = PhaseMetrics::from_report(&report, &raw, 14_600, EventLogStats::default(), 0);
+
+        assert_eq!(metrics.wall_ms, 14_600);
+        assert_eq!(metrics.wall_s, 14);
+        assert_eq!(metrics.hits, 783);
+        assert_eq!(metrics.time_saved_s, 95);
+    }
+
+    #[test]
+    fn sccache_metrics_record_milliseconds_and_derive_whole_seconds() {
+        let raw = serde_json::json!({
+            "stats": {
+                "compile_requests": 10,
+                "cache_hits": { "counts": { "Rust": 8 } },
+                "cache_misses": { "counts": { "Rust": 2 } }
+            }
+        });
+
+        let metrics = SccachePhaseMetrics::from_raw(&raw, 95_400);
+
+        assert_eq!(metrics.wall_ms, 95_400);
+        assert_eq!(metrics.wall_s, 95);
+        assert_eq!(metrics.cache_hits, 8);
+        assert_eq!(metrics.hit_rate_pct, 80.0);
+    }
+
+    /// The result JSON is the perf gate's input: both wall clocks must be
+    /// there, under these names, for every phase the gate reads.
+    #[test]
+    fn result_json_carries_both_wall_clocks_for_every_phase() {
+        let j = serde_json::to_value(bench_result_fixture()).unwrap();
+
+        assert_eq!(j["cold"]["wall_ms"], 300_000);
+        assert_eq!(j["cold"]["wall_s"], 300);
+        assert_eq!(j["warm_same_tree"]["wall_ms"], 100_400);
+        assert_eq!(j["warm_same_tree"]["wall_s"], 100);
+        assert_eq!(j["warm"]["wall_ms"], 120_900);
+        assert_eq!(j["warm"]["wall_s"], 120);
+    }
+
+    /// `--retry` reuses cold from the previous run's JSON. A snapshot written
+    /// before the engine timed milliseconds has only `wall_s`; the milliseconds
+    /// are backfilled from it rather than read as zero, and a snapshot that has
+    /// them keeps its own value.
+    #[test]
+    fn a_saved_phase_without_wall_ms_is_backfilled_from_its_seconds() {
+        let mut saved = serde_json::to_value(PhaseMetrics {
+            wall_s: 14,
+            wall_ms: 14_600,
+            hits: 783,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let current: PhaseMetrics = load_saved_phase(saved.clone()).unwrap();
+        assert_eq!(current.wall_ms, 14_600, "a recorded value is kept as is");
+        assert_eq!(current.wall_s, 14);
+
+        saved.as_object_mut().unwrap().remove("wall_ms");
+        let older: PhaseMetrics = load_saved_phase(saved).unwrap();
+        assert_eq!(older.wall_ms, 14_000, "backfilled from wall_s, as a floor");
+        assert_eq!(older.wall_s, 14);
+        assert_eq!(older.hits, 783);
+    }
+
+    /// `--retry` restores cold from the previous run: the cache snapshot goes
+    /// back into place and cold's metrics come from the result JSON. The JSON
+    /// that matters is one an engine timing whole seconds wrote, since that
+    /// is what the first retry after the millisecond wall clock finds on disk.
+    #[test]
+    fn retry_load_cold_restores_the_snapshot_and_an_older_results_wall_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let work_dir = dir.path().join("work");
+        let cache_dir = dir.path().join("cache");
+        let kache = dir.path().join("no-such-kache");
+
+        let missing = retry_load_cold("pr-cargo", &kache, &cache_dir, &work_dir)
+            .expect_err("nothing to retry from")
+            .to_string();
+        assert!(
+            missing.contains("--retry: required artifact missing"),
+            "{missing}"
+        );
+
+        let snapshot = work_dir.join("cache-after-cold");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("index.db"), b"cold store").unwrap();
+        std::fs::write(
+            work_dir.join("report-cold.json"),
+            r#"{"summary": {"total_crates": 783}}"#,
+        )
+        .unwrap();
+        // Cold as a whole-second engine wrote it: `wall_s` only.
+        let mut previous_cold = serde_json::to_value(PhaseMetrics {
+            wall_s: 112,
+            wall_ms: 0,
+            total_crates: 783,
+            ..Default::default()
+        })
+        .unwrap();
+        previous_cold.as_object_mut().unwrap().remove("wall_ms");
+        std::fs::write(
+            work_dir.join("pr-cargo.json"),
+            serde_json::json!({ "cold": previous_cold }).to_string(),
+        )
+        .unwrap();
+
+        let (cold, cold_raw) = retry_load_cold("pr-cargo", &kache, &cache_dir, &work_dir)
+            .expect("a complete set of artifacts loads");
+
+        assert_eq!(cold.wall_s, 112);
+        assert_eq!(
+            cold.wall_ms, 112_000,
+            "backfilled from the seconds the older engine recorded"
+        );
+        assert_eq!(cold.total_crates, 783);
+        assert_eq!(cold_raw["summary"]["total_crates"], 783);
+        assert_eq!(
+            std::fs::read(cache_dir.join("index.db")).unwrap(),
+            b"cold store",
+            "the cold-state cache is restored into the cache dir"
+        );
+    }
+
+    /// `build` is what the gate times. It must report the build command's own
+    /// wall clock in milliseconds, wipe the objdir before the timer starts,
+    /// and leave the logs the failure path points at.
+    #[cfg(unix)]
+    #[test]
+    fn build_times_the_build_command_in_milliseconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_path = dir.path().join("sleeper.toml");
+        std::fs::write(
+            &profile_path,
+            r#"
+name = "sleeper"
+repo = "https://example.com/sleeper.git"
+ref = "v1"
+objdir = "target"
+build = "sleep 0.2"
+"#,
+        )
+        .unwrap();
+        let profile = BenchProfile::load(&profile_path).unwrap();
+        let clone = dir.path().join("clone");
+        let stale = clone.join("target").join("stale.o");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"left by a previous phase").unwrap();
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let sh = posix_sh().unwrap();
+
+        let wall_ms = build(
+            &profile,
+            &clone,
+            "cold",
+            &dir.path().join("cache"),
+            &dir.path().join("kache.toml"),
+            &dir.path().join("kache"),
+            &work_dir,
+            CacheBackend::Kache,
+            false,
+            &sh,
+        )
+        .unwrap();
+
+        assert!(
+            (200..60_000).contains(&wall_ms),
+            "a 200ms sleep must time as at least 200ms, got {wall_ms}ms"
+        );
+        assert!(!stale.exists(), "the objdir is wiped before the build");
+        assert!(work_dir.join("build-cold.log").exists());
+        assert!(work_dir.join("wrapper-cold.log").exists());
     }
 }

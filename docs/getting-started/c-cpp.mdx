@@ -7,7 +7,7 @@ Kache caches conservative, single-source C and C++ object compilations. If it ca
 
 ## Cargo build scripts
 
-`RUSTC_WRAPPER` wraps rustc only, so a build script that compiles C through the `cc` crate is not cached until one of the two routes below is in place.
+`RUSTC_WRAPPER` wraps rustc only. To cache the objects a build script compiles through the `cc` crate, run `kache init` or put a shim on `PATH`.
 
 `kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config (and `CC_KNOWN_WRAPPER_CUSTOM=kache`). It does not set `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
 

@@ -30,7 +30,7 @@ export RUSTC_WRAPPER=kache
 rustc-wrapper = "kache"
 ```
 
-That covers Rust. Cargo's C and C++ compiles need the `[env]` keys `init` writes, or a shim on `PATH`.
+For Cargo build scripts that compile C or C++, add the `[env]` keys `kache init` writes, or put a shim on `PATH`.
 
 ## Try Kache without changing configuration
 
@@ -45,7 +45,7 @@ kache stats
 
 The first build fills the local cache. `cargo clean` makes Cargo request the same outputs again, so the second build can demonstrate restores. Do not add `cargo clean` to a normal build workflow.
 
-This trial does not edit Cargo configuration or install a service. It also wraps rustc and nothing else, so C and C++ compilations run uncached and the result understates a configured setup.
+This trial does not edit Cargo configuration or install a service. It wraps rustc only; C and C++ compilations remain uncached.
 
 ## Check the setup
 

@@ -29,6 +29,12 @@
 /e2e-results/
 *.profraw
 
+# Store staging scratch a test wrote into the repo root rather than the
+# cache directory. Four of these were committed once. The store's real
+# staging directory lives under the cache root, so a `stage-*.tmp` here
+# is always leftover test state.
+/stage-*.tmp
+
 # Nix
 /result
 

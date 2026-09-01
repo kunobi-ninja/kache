@@ -7,13 +7,24 @@
 
 Kache is a local-first compiler cache for Rust and C/C++. It stores build outputs by content, reuses them across worktrees, and can copy them to S3-compatible or filesystem remotes.
 
-## Try it without changing your setup
-
-Install Kache:
+## Install
 
 ```bash
 cargo install kache
+kache init
 ```
+
+`kache init` sets `rustc-wrapper` in Cargo's config, and on Unix the `[env]` keys that route build-script C and C++ through the cache. Review the proposed changes without applying them:
+
+```bash
+kache init --check
+```
+
+Use `kache init --no-service` if you want persistent Cargo configuration without an OS service.
+
+Then keep running `cargo build`.
+
+## Try it without changing your setup
 
 Run two clean builds from a Rust project:
 
@@ -26,19 +37,7 @@ kache stats
 
 `cargo clean` is only for this demonstration. Kache normally helps when Cargo would otherwise compile an input it has seen before, such as in another worktree or after changing toolchains and changing back.
 
-The commands above do not edit Cargo configuration or install a service. To keep Kache enabled:
-
-```bash
-kache init
-```
-
-Review the proposed changes without applying them:
-
-```bash
-kache init --check
-```
-
-Use `kache init --no-service` if you want persistent Cargo configuration without an OS service.
+This wraps rustc and nothing else. C and C++ compilations still run uncached, so it understates a configured setup.
 
 ## What Kache caches
 
@@ -46,7 +45,7 @@ Use `kache init --no-service` if you want persistent Cargo configuration without
 | --- | --- | --- |
 | Rust libraries and build scripts | Supported | Use `RUSTC_WRAPPER=kache` or `kache init` |
 | Rust executables | Supported on Linux and macOS | Disabled by default on Windows |
-| C and C++ object files | Supported | Use compiler shims or set the compiler launcher |
+| C and C++ object files | Supported | Enabled by `kache init`, compiler shims, or `CC`/`CXX` |
 | Local storage | Built in | Content-addressed store with garbage collection |
 | S3-compatible remote storage | Built in | Includes AWS S3, MinIO, and Cloudflare R2 |
 | Filesystem remote storage | Built in | Useful for shared disks and CI volumes |

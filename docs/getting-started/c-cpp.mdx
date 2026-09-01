@@ -5,6 +5,14 @@ description: Cache supported GCC, Clang, and clang-cl object compilations
 
 Kache caches conservative, single-source C and C++ object compilations. If it cannot prove that an invocation is safe to cache, it runs the real compiler unchanged.
 
+## Cargo build scripts
+
+`RUSTC_WRAPPER` wraps rustc only, so a build script that compiles C through the `cc` crate is not cached until one of the two routes below is in place.
+
+`kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config (and `CC_KNOWN_WRAPPER_CUSTOM=kache`). It does not set `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
+
+PATH shims also cover Cargo's C bits when the crate invokes `cc` or `gcc` from `PATH` without `HOST_CC`.
+
 ## Make, CMake, autotools, PKGBUILD
 
 The Unix path is the same idea as ccache's masquerade method: put a directory of compiler-named symlinks first on `PATH`. `make`, CMake, autotools, and Arch PKGBUILDs that call `gcc` or `clang` by name then go through Kache. There is no `CC=` edit and no shell wrapper.
@@ -43,12 +51,6 @@ This is a native symlink to the `kache` binary. Do not wrap Kache in a shell scr
 Kache is a larger process than ccache. On a tree of many tiny `.c` files, measure both before replacing ccache.
 
 `kache doctor` reports whether a compiler name on `PATH` is a Kache shim. The check is informational, so a Rust-only setup does not fail doctor for skipping it.
-
-## Cargo build scripts
-
-`kache init` sets `HOST_CC` and `HOST_CXX` in Cargo's config (and `CC_KNOWN_WRAPPER_CUSTOM=kache`). It does not set `CC` or `CXX`, so `cargo build --target` keeps the cross compiler the `cc` crate would have found.
-
-PATH shims also cover Cargo's C bits when the crate invokes `cc` or `gcc` from `PATH` without `HOST_CC`.
 
 ## Prefix method
 

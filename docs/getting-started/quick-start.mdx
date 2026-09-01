@@ -1,24 +1,9 @@
 ---
 title: Quick start
-description: Try Kache safely, then choose whether to enable it permanently
+description: Enable Kache, then verify the setup
 ---
 
-## Try Kache in one shell
-
-From a Rust project:
-
-```bash
-RUSTC_WRAPPER=kache cargo build
-cargo clean
-KACHE_PROGRESS=hits RUSTC_WRAPPER=kache cargo build
-kache stats
-```
-
-The first build fills the local cache. `cargo clean` makes Cargo request the same outputs again, so the second build can demonstrate restores. Do not add `cargo clean` to a normal build workflow.
-
-This trial does not edit Cargo configuration or install a service.
-
-## Enable Kache permanently
+## Enable Kache
 
 ```bash
 kache init
@@ -44,6 +29,23 @@ export RUSTC_WRAPPER=kache
 [build]
 rustc-wrapper = "kache"
 ```
+
+That covers Rust. Cargo's C and C++ compiles need the `[env]` keys `init` writes, or a shim on `PATH`.
+
+## Try Kache without changing configuration
+
+From a Rust project:
+
+```bash
+RUSTC_WRAPPER=kache cargo build
+cargo clean
+KACHE_PROGRESS=hits RUSTC_WRAPPER=kache cargo build
+kache stats
+```
+
+The first build fills the local cache. `cargo clean` makes Cargo request the same outputs again, so the second build can demonstrate restores. Do not add `cargo clean` to a normal build workflow.
+
+This trial does not edit Cargo configuration or install a service. It also wraps rustc and nothing else, so C and C++ compilations run uncached and the result understates a configured setup.
 
 ## Check the setup
 

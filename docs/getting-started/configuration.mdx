@@ -183,10 +183,13 @@ Workspace rules are accepted only from the `.kache.toml` beside the active Cargo
 | `KACHE_S3_USER_AGENT` | `cache.remote.user_agent` | none | Custom HTTP User-Agent |
 | none | `cache.remote.path` | none | Filesystem remote root |
 | none | `cache.remote.atomic_write_dir` | `<path>/.kache-tmp` | Same-filesystem staging directory |
+| `KACHE_REMOTE_MAX_SIZE` | `cache.remote.max_size` | 25% of the remote disk, floored at 10GiB and capped at 500GiB | Size cap `kache gc --remote` holds a filesystem remote under. An explicit size always wins. `none` disables the budget. Rejected on an S3 remote. |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Concurrent operations for either backend |
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | S3 connection pool idle time |
 | `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; wrapper demand remains capped at three seconds |
 | `KACHE_REMOTE_NEGATIVE_TTL_SECS` | `cache.remote_negative_ttl_secs` | `60` | Cache definitive remote 404 results |
+
+`cache.remote.max_size` bounds a shared folder the way a bucket lifecycle rule bounds S3. Nothing enforces it automatically: run `kache gc --remote` from cron or a systemd timer on one machine that mounts the folder, and preview it first with `kache gc --remote --dry-run`. Unlike `cache.local_max_size`, `none` is accepted here — a remote is a path you chose and may already be bounded by a quota, a lifecycle-managed mount, or your own pruning job.
 
 Credentials resolve from explicit `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, standard AWS variables, the selected AWS profile, web identity, container credentials, then instance credentials.
 

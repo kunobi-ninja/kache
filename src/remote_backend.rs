@@ -1038,6 +1038,7 @@ mod tests {
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
                 atomic_write_dir: atomic_write_dir.clone(),
+                budget: crate::config::RemoteBudget::Default,
             }),
         };
         let backend = create_backend(&remote, 30).await.unwrap();
@@ -1092,6 +1093,7 @@ mod tests {
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
                 atomic_write_dir: root.path().join(".staging"),
+                budget: crate::config::RemoteBudget::Default,
             }),
         };
         let backend = create_backend(&remote, 30).await.unwrap();
@@ -1158,6 +1160,7 @@ mod tests {
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
                 atomic_write_dir: root.path().join(".staging"),
+                budget: crate::config::RemoteBudget::Default,
             }),
         };
         let backend = create_backend(&remote, 30).await.unwrap();
@@ -1491,6 +1494,7 @@ mod tests {
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
                 atomic_write_dir: root.path().join(".kache-tmp"),
+                budget: crate::config::RemoteBudget::Default,
             }),
         };
         let backend = create_backend(&remote, 30).await.unwrap();
@@ -1561,6 +1565,7 @@ mod tests {
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
                 atomic_write_dir: root.path().join(".kache-tmp"),
+                budget: crate::config::RemoteBudget::Default,
             }),
         };
         let backend = create_backend(&remote, 30).await.unwrap();
@@ -1588,6 +1593,7 @@ mod tests {
             backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                 root: root.path().to_path_buf(),
                 atomic_write_dir: root.path().join(".kache-tmp"),
+                budget: crate::config::RemoteBudget::Default,
             }),
         };
         let backend = create_backend(&remote, 30).await.unwrap();

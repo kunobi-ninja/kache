@@ -55,15 +55,31 @@ Interactive output uses `KACHE_PAGER`, then `PAGER`, then a platform default. `-
 kache gc
 kache gc --max-age 7d
 kache gc --stale-schema
+kache gc --remote --dry-run
+kache gc --remote
 ```
 
 A bare run enforces configured size and age policies. `--max-age` runs the requested age policy. `--stale-schema` removes entries created with old or unrecorded key schemas and conflicts with `--max-age`.
 
-GC affects only the local store.
+`--remote` collects a filesystem remote instead of the local store, holding it under `cache.remote.max_size`. `--dry-run` prints the computed budget and what the sweep would remove without removing it, and requires `--remote`. Both conflict with `--max-age` and `--stale-schema`, which are local policies.
+
+There is no daemon-side remote sweep: run `kache gc --remote` from cron or a systemd timer on one machine that mounts the folder. Concurrent runs are safe — a sweep takes an advisory lock (`.kache-remote-gc.lock` at the remote root) and a second one declines.
+
+An S3 remote is not swept. Bound it with a bucket lifecycle rule; `kache gc --remote` says so rather than emulating one.
 
 GC reports store bytes removed separately from bytes reclaimed on disk. It keeps an entry when its last store blob is still cloned into a build output, because unlinking that blob would free no disk and destroy a usable hit. This can leave the registered store size above `cache.local_max_size`; remove stale targets to reclaim the blocks.
 
 Set `cache.gc_evict_shared = true` or `KACHE_GC_EVICT_SHARED=1` to restore the older namespace-first policy. That lowers the registered store size but does not reclaim blocks retained by target directories, and the discarded entry becomes a future miss. See [Configuration: GC and shared build outputs](/docs/getting-started/configuration#gc-and-shared-build-outputs).
+
+### What a remote sweep evicts, and in what order
+
+A remote sweep ranks whole cache entries — a v3 manifest and its pack together — least-recently-read first, with a size tiebreak, the same ranking the local store uses under size pressure. It fires above `max_size` and stops at 90% of it.
+
+Read recency comes from `atime`, so the mount option decides how good the signal is. Under `relatime` (the Linux default) `atime` advances at most once a day, which is enough to separate a hot set from a cold tail. Under `noatime` it never advances past the write, and the sweep falls back to ranking by write time and prints a warning saying so. Remount `relatime` if you want read-recency eviction.
+
+Two things are removed regardless of the budget: a pack whose manifest is gone, and a manifest whose pack is gone. Both are unreachable, and objects younger than an hour are left alone so an upload in flight is never swept. Prefetch packs are shared between catalogs and are reference-counted: one is removed only when the last catalog naming it is evicted.
+
+Entries read or written in the last five minutes are skipped, because a build may be downloading them. If that leaves the remote over budget, the sweep says so instead of deleting them anyway.
 
 ## `kache purge`
 

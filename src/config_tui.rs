@@ -193,7 +193,7 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
         .filter(|value| !value.trim().is_empty())
         .or_else(|| {
             remote.and_then(|r| {
-                if r.path.is_some() || r.atomic_write_dir.is_some() {
+                if r.path.is_some() || r.atomic_write_dir.is_some() || r.max_size.is_some() {
                     Some("filesystem".to_string())
                 } else if r.bucket.is_some()
                     || r.endpoint.is_some()
@@ -484,6 +484,17 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             env_locked: false,
         },
         FormField {
+            key: "fs_max_size",
+            label: "Remote max size",
+            kind: FieldKind::Text,
+            value: remote.and_then(|r| r.max_size.clone()).unwrap_or_default(),
+            env_var: "KACHE_REMOTE_MAX_SIZE",
+            env_value: env_val("KACHE_REMOTE_MAX_SIZE"),
+            default_hint: "(default: 25% of the remote disk; \"none\" for unbounded)",
+            validation_error: None,
+            env_locked: false,
+        },
+        FormField {
             key: "remote_prefix",
             label: "Prefix",
             kind: FieldKind::Text,
@@ -541,11 +552,11 @@ fn build_sections() -> Vec<Section> {
         },
         Section {
             label: "Remote",
-            fields: 10..19,
+            fields: 10..20,
         },
         Section {
             label: "Advanced",
-            fields: 19..21,
+            fields: 20..22,
         },
     ]
 }
@@ -612,7 +623,7 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
     ]
     .iter()
     .any(|key| is_set(key));
-    let has_filesystem_fields = ["fs_path", "fs_atomic_write_dir"]
+    let has_filesystem_fields = ["fs_path", "fs_atomic_write_dir", "fs_max_size"]
         .iter()
         .any(|key| is_set(key));
     let has_remote_fields = has_s3_fields || has_filesystem_fields || is_set("remote_prefix");
@@ -624,6 +635,7 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
         "s3_user_agent",
         "fs_path",
         "fs_atomic_write_dir",
+        "fs_max_size",
         "remote_prefix",
     ]
     .iter()
@@ -663,7 +675,7 @@ fn validate_cross_field(fields: &[FormField]) -> Vec<(usize, String)> {
             {
                 errors.push((idx, "Bucket required for S3 backend".to_string()));
             }
-            for key in ["fs_path", "fs_atomic_write_dir"] {
+            for key in ["fs_path", "fs_atomic_write_dir", "fs_max_size"] {
                 if is_set(key)
                     && let Some(idx) = index(key)
                 {
@@ -841,6 +853,7 @@ fn fields_to_file_config(
     let user_agent = get("s3_user_agent");
     let path = get("fs_path");
     let atomic_write_dir = get("fs_atomic_write_dir");
+    let max_size = get("fs_max_size");
     let remote_type = get("remote_type")
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
@@ -852,7 +865,8 @@ fn fields_to_file_config(
         || profile.is_some()
         || user_agent.is_some()
         || path.is_some()
-        || atomic_write_dir.is_some();
+        || atomic_write_dir.is_some()
+        || max_size.is_some();
 
     let remote = if has_remote {
         Some(RemoteFileConfig {
@@ -865,6 +879,7 @@ fn fields_to_file_config(
             user_agent,
             path,
             atomic_write_dir,
+            max_size,
         })
     } else {
         None
@@ -1546,13 +1561,63 @@ mod tests {
     fn test_build_fields_count() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        assert_eq!(fields.len(), 21);
+        assert_eq!(fields.len(), 22);
 
         let sections = build_sections();
         assert_eq!(sections[0].fields, 0..3);
         assert_eq!(sections[1].fields, 3..10);
-        assert_eq!(sections[2].fields, 10..19);
-        assert_eq!(sections[3].fields, 19..21);
+        assert_eq!(sections[2].fields, 10..20);
+        assert_eq!(sections[3].fields, 20..22);
+    }
+
+    /// A config predating `type` is classified by which fields it sets. Each
+    /// filesystem field has to imply "filesystem" on its own, or the editor
+    /// silently reopens a shared-folder remote as an S3 one — including
+    /// `max_size`, which only a filesystem remote accepts
+    /// (kunobi-ninja/kache#774).
+    #[test]
+    fn remote_type_is_inferred_from_any_single_backend_field() {
+        let inferred = |remote: RemoteFileConfig| {
+            let config = FileConfig {
+                cache: Some(CacheFileConfig {
+                    remote: Some(remote),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            build_fields(&config, &empty_env())
+                .into_iter()
+                .find(|field| field.key == "remote_type")
+                .expect("the form has a backend-type field")
+                .value
+        };
+
+        for filesystem_only in [
+            RemoteFileConfig {
+                path: Some("/mnt/kache".to_string()),
+                ..Default::default()
+            },
+            RemoteFileConfig {
+                atomic_write_dir: Some("/mnt/kache-tmp".to_string()),
+                ..Default::default()
+            },
+            RemoteFileConfig {
+                max_size: Some("80GiB".to_string()),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(inferred(filesystem_only), "filesystem");
+        }
+
+        assert_eq!(
+            inferred(RemoteFileConfig {
+                bucket: Some("builds".to_string()),
+                ..Default::default()
+            }),
+            "s3",
+            "configs predating the type field were always S3"
+        );
+        assert_eq!(inferred(RemoteFileConfig::default()), "");
     }
 
     #[test]
@@ -2090,6 +2155,7 @@ mod tests {
                     user_agent: Some("custom-ua/1.0".to_string()),
                     path: None,
                     atomic_write_dir: None,
+                    max_size: None,
                 }),
             }),
         };
@@ -2270,6 +2336,7 @@ mod tests {
                     prefix: Some("shared/artifacts".to_string()),
                     path: Some("/var/cache/kache".to_string()),
                     atomic_write_dir: Some("/var/cache/kache-tmp".to_string()),
+                    max_size: None,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2362,6 +2429,59 @@ mod tests {
         assert!(remote.profile.is_none());
         assert!(remote.path.is_none());
         assert!(remote.atomic_write_dir.is_none());
+        assert!(remote.max_size.is_none());
+    }
+
+    /// Every filesystem field on its own has to create the `[cache.remote]`
+    /// section, or saving from the editor silently drops it. `max_size` is the
+    /// newest of them (kunobi-ninja/kache#774).
+    #[test]
+    fn test_fields_to_file_config_persists_a_remote_for_any_filesystem_field() {
+        for (key, value) in [
+            ("fs_path", "/mnt/kache"),
+            ("fs_atomic_write_dir", "/mnt/kache-tmp"),
+            ("fs_max_size", "80GiB"),
+        ] {
+            let mut fields = build_fields(&FileConfig::default(), &empty_env());
+            fields
+                .iter_mut()
+                .find(|field| field.key == key)
+                .unwrap_or_else(|| panic!("the form has a {key} field"))
+                .value = value.to_string();
+
+            let result = fields_to_file_config(
+                &fields,
+                None,
+                None,
+                None,
+                PreservedAdvancedConfig::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let remote = result
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.remote.as_ref())
+                .unwrap_or_else(|| panic!("{key} alone must create a remote section"));
+            let saved = match key {
+                "fs_path" => remote.path.as_deref(),
+                "fs_atomic_write_dir" => remote.atomic_write_dir.as_deref(),
+                _ => remote.max_size.as_deref(),
+            };
+            assert_eq!(saved, Some(value));
+        }
     }
 
     #[test]

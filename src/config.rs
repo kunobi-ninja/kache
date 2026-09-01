@@ -38,6 +38,21 @@ pub const DISK_SHARE_FLOOR: u64 = 5 * 1024 * 1024 * 1024;
 pub const DISK_SHARE_CAP: u64 = 100 * 1024 * 1024 * 1024;
 pub const DISK_SHARE_FALLBACK: u64 = 50 * 1024 * 1024 * 1024;
 
+/// Disk-share budget for a filesystem remote when `KACHE_REMOTE_MAX_SIZE` /
+/// `[cache.remote] max_size` are unset (kunobi-ninja/kache#774). Same shape as
+/// the local budget above, different share: a developer's store competes with
+/// everything else on that laptop, so it takes 5%, whereas a shared remote
+/// folder is usually the reason its volume exists. It is still rarely the only
+/// thing on that volume — the remote in #774 sat on the root filesystem and
+/// took it to 94% — so a quarter, not all of it. Floor 10GiB so a small
+/// builder is not left with a remote too small to hold one workspace; cap
+/// 500GiB because past that an operator is running a deliberate archive and
+/// should name a number. A failed size probe falls back to 100GiB.
+pub const REMOTE_DISK_SHARE_PERCENT: u64 = 25;
+pub const REMOTE_DISK_SHARE_FLOOR: u64 = 10 * 1024 * 1024 * 1024;
+pub const REMOTE_DISK_SHARE_CAP: u64 = 500 * 1024 * 1024 * 1024;
+pub const REMOTE_DISK_SHARE_FALLBACK: u64 = 100 * 1024 * 1024 * 1024;
+
 /// Remote resilience (kunobi-ninja/kache#327, #564). The daemon-side operation
 /// deadline matches `DEFAULT_PREFETCH_DEADLINE_SECS`: generous enough that no
 /// legitimate background transfer changes behavior while still bounding a
@@ -395,6 +410,51 @@ pub struct FilesystemRemoteConfig {
     pub root: PathBuf,
     /// Staging directory used for atomic write-then-rename completion.
     pub atomic_write_dir: PathBuf,
+    /// Size cap `kache gc --remote` enforces (kunobi-ninja/kache#774).
+    pub budget: RemoteBudget,
+}
+
+/// What `[cache.remote] max_size` / `KACHE_REMOTE_MAX_SIZE` resolved to.
+///
+/// Three states rather than `Option<u64>` because "unset" and "explicitly
+/// unbounded" are different answers here, and only the first may be replaced
+/// by a derived default.
+///
+/// **`"none"` is accepted for the remote, unlike `[cache] local_max_size`.**
+/// The local budget forbids it because every kache install has a local store
+/// on a disk the user did not choose for it, so an unbounded one is the
+/// failure GC exists to prevent, silently, on a machine nobody is watching. A
+/// filesystem remote is a path an operator picked and owns, and it is
+/// routinely already bounded by something kache cannot see: a dedicated
+/// volume, an LVM/ZFS quota, a lifecycle-managed object-store mount, or the
+/// operator's own pruning timer (which is exactly what #774 reports doing).
+/// Refusing `"none"` would make those operators write a fictitious huge
+/// number to express "not your job". The asymmetry is also cheap: remote
+/// eviction only ever runs when someone types `kache gc --remote`, so an
+/// unbounded remote cannot regress a machine that never asked for a sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteBudget {
+    /// Nothing configured: derive from the volume holding the remote root.
+    Default,
+    /// An explicit byte cap. Always wins over the derived default.
+    Bytes(u64),
+    /// Explicitly unbounded: `kache gc --remote` reports and evicts nothing.
+    Unbounded,
+}
+
+impl RemoteBudget {
+    /// The effective cap in bytes, or `None` when the remote is unbounded.
+    ///
+    /// `filesystem_bytes` is the size of the volume holding the remote root,
+    /// as [`crate::cache_fs::probe`] measured it; `None` means the probe
+    /// failed and [`REMOTE_DISK_SHARE_FALLBACK`] applies.
+    pub fn resolve(self, filesystem_bytes: Option<u64>) -> Option<u64> {
+        match self {
+            Self::Default => Some(remote_disk_share_budget(filesystem_bytes)),
+            Self::Bytes(bytes) => Some(bytes),
+            Self::Unbounded => None,
+        }
+    }
 }
 
 impl Config {
@@ -692,6 +752,10 @@ pub(crate) struct RemoteFileConfig {
     pub(crate) path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) atomic_write_dir: Option<String>,
+    /// Filesystem-remote size budget (kunobi-ninja/kache#774). See
+    /// [`RemoteBudget`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_size: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -1632,8 +1696,13 @@ impl Config {
                 .into_iter()
                 .any(|v| v.as_deref().is_some_and(|v| !v.trim().is_empty()))
         });
+        // `max_size` counts as a filesystem field (kunobi-ninja/kache#774): an
+        // S3 remote is bounded by a bucket lifecycle rule, so accepting the key
+        // there would promise a sweep kache does not run. Listing it here makes
+        // `max_size` next to `bucket` an explicit "mixes S3 and filesystem
+        // fields" error instead of a silently ignored setting.
         let file_has_filesystem_fields = file_remote.is_some_and(|r| {
-            [&r.path, &r.atomic_write_dir]
+            [&r.path, &r.atomic_write_dir, &r.max_size]
                 .into_iter()
                 .any(|v| v.as_deref().is_some_and(|v| !v.trim().is_empty()))
         });
@@ -1650,7 +1719,8 @@ impl Config {
             Some("s3") => {
                 if file_has_filesystem_fields {
                     anyhow::bail!(
-                        "[cache.remote] type = \"s3\" cannot include path or atomic_write_dir"
+                        "[cache.remote] type = \"s3\" cannot include path, atomic_write_dir, or \
+                         max_size; bound an S3 remote with a bucket lifecycle rule"
                     );
                 }
                 false
@@ -1712,11 +1782,22 @@ impl Config {
                 anyhow::bail!("{problem}");
             }
 
+            let budget = env_or_ignored("KACHE_REMOTE_MAX_SIZE", ignore_env)
+                .ok()
+                .map(|value| parse_remote_max_size(&value, "KACHE_REMOTE_MAX_SIZE"))
+                .or_else(|| {
+                    file_remote
+                        .and_then(|r| r.max_size.as_deref())
+                        .map(|value| parse_remote_max_size(value, "[cache.remote] max_size"))
+                })
+                .unwrap_or(RemoteBudget::Default);
+
             return Ok(Some(RemoteConfig {
                 prefix,
                 backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                     root,
                     atomic_write_dir,
+                    budget,
                 }),
             }));
         }
@@ -2559,13 +2640,44 @@ pub(crate) fn parse_size(s: &str) -> Option<u64> {
 /// Pure so tests pin floor / cap / rounding without touching a real disk.
 /// `None` or `0` (probe failed) uses [`DISK_SHARE_FALLBACK`].
 pub(crate) fn disk_share_budget(filesystem_bytes: Option<u64>) -> u64 {
+    disk_share(
+        filesystem_bytes,
+        DISK_SHARE_PERCENT,
+        DISK_SHARE_FLOOR,
+        DISK_SHARE_CAP,
+        DISK_SHARE_FALLBACK,
+    )
+}
+
+/// Budget for a filesystem remote derived from the volume that holds its root
+/// (kunobi-ninja/kache#774). The local store's rule with the remote's share;
+/// see [`REMOTE_DISK_SHARE_PERCENT`] for why the share differs.
+pub(crate) fn remote_disk_share_budget(filesystem_bytes: Option<u64>) -> u64 {
+    disk_share(
+        filesystem_bytes,
+        REMOTE_DISK_SHARE_PERCENT,
+        REMOTE_DISK_SHARE_FLOOR,
+        REMOTE_DISK_SHARE_CAP,
+        REMOTE_DISK_SHARE_FALLBACK,
+    )
+}
+
+/// `percent` of `filesystem_bytes`, rounded to the nearest GiB, clamped to
+/// `floor..=cap`. A missing or zero probe yields `fallback`.
+fn disk_share(
+    filesystem_bytes: Option<u64>,
+    percent: u64,
+    floor: u64,
+    cap: u64,
+    fallback: u64,
+) -> u64 {
     let Some(total) = filesystem_bytes.filter(|&n| n > 0) else {
-        return DISK_SHARE_FALLBACK;
+        return fallback;
     };
-    let raw = total.saturating_mul(DISK_SHARE_PERCENT) / 100;
+    let raw = total.saturating_mul(percent) / 100;
     const GIB: u64 = 1024 * 1024 * 1024;
     let rounded = raw.saturating_add(GIB / 2) / GIB * GIB;
-    rounded.clamp(DISK_SHARE_FLOOR, DISK_SHARE_CAP)
+    rounded.clamp(floor, cap)
 }
 
 /// Phrase the effective store limit for stats / gc / doctor.
@@ -2585,6 +2697,48 @@ pub(crate) fn describe_max_size(max_size: u64, filesystem_bytes: Option<u64>) ->
             ByteSize(total)
         ),
         None => format!("{} (default; disk size unknown)", ByteSize(max_size)),
+    }
+}
+
+/// Phrase a filesystem remote's budget for `kache gc --remote`
+/// (kunobi-ninja/kache#774). The counterpart to [`describe_max_size`], with
+/// the extra "explicitly unbounded" state the remote allows.
+pub(crate) fn describe_remote_budget(
+    budget: RemoteBudget,
+    filesystem_bytes: Option<u64>,
+) -> String {
+    match budget {
+        RemoteBudget::Unbounded => "unbounded (max_size = \"none\")".to_string(),
+        RemoteBudget::Bytes(bytes) => format!("{} (configured)", ByteSize(bytes)),
+        RemoteBudget::Default => match filesystem_bytes.filter(|&n| n > 0) {
+            Some(total) => format!(
+                "{} ({REMOTE_DISK_SHARE_PERCENT}% of {}, floor {}, cap {})",
+                ByteSize(remote_disk_share_budget(filesystem_bytes)),
+                ByteSize(total),
+                ByteSize(REMOTE_DISK_SHARE_FLOOR),
+                ByteSize(REMOTE_DISK_SHARE_CAP),
+            ),
+            None => format!(
+                "{} (default; disk size unknown)",
+                ByteSize(REMOTE_DISK_SHARE_FALLBACK)
+            ),
+        },
+    }
+}
+
+/// Parse `[cache.remote] max_size` / `KACHE_REMOTE_MAX_SIZE`.
+///
+/// Unlike [`parse_local_max_size`], `"none"` is a legitimate answer here; see
+/// [`RemoteBudget`] for why. A malformed value warns through
+/// [`parse_size_checked`] and leaves the budget at its derived default rather
+/// than silently unbounding the remote.
+fn parse_remote_max_size(value: &str, source: &str) -> RemoteBudget {
+    if value.trim().eq_ignore_ascii_case("none") {
+        return RemoteBudget::Unbounded;
+    }
+    match parse_size_checked(value, source) {
+        Some(bytes) => RemoteBudget::Bytes(bytes),
+        None => RemoteBudget::Default,
     }
 }
 
@@ -3421,6 +3575,7 @@ remote_key_cache_refresh_secs = 900
                     user_agent: None,
                     path: None,
                     atomic_write_dir: None,
+                    max_size: None,
                 }),
                 scheduler: None,
             }),
@@ -5459,6 +5614,223 @@ exclude = ["src/generated/**", "vendor/problem/**"]
             .expect("an empty prefix must be usable")
             .expect("remote");
         assert_eq!(remote.prefix, "");
+    }
+
+    /// kunobi-ninja/kache#774. Independent literals on the right-hand side so
+    /// mutating a `REMOTE_DISK_SHARE_*` product cannot move both sides at once.
+    #[test]
+    fn remote_disk_share_budget_floors_caps_and_rounds() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(remote_disk_share_budget(None), 100 << 30);
+        assert_eq!(remote_disk_share_budget(Some(0)), 100 << 30);
+        // 20GiB volume: 25% is 5GiB, then the 10GiB floor.
+        assert_eq!(remote_disk_share_budget(Some(20 * GIB)), 10 << 30);
+        // 400GiB volume: 25% is exactly 100GiB.
+        assert_eq!(remote_disk_share_budget(Some(400 * GIB)), 100 * GIB);
+        // 250GiB volume: 25% is 62.5GiB, nearest GiB is 63GiB.
+        assert_eq!(remote_disk_share_budget(Some(250 * GIB)), 63 * GIB);
+        // 8TiB volume: 25% is 2TiB, capped at 500GiB.
+        assert_eq!(remote_disk_share_budget(Some(8 * 1024 * GIB)), 500 << 30);
+        // Exactly at the cap.
+        assert_eq!(remote_disk_share_budget(Some(2000 * GIB)), 500 << 30);
+        // The remote takes a bigger share of the same disk than the store does.
+        assert!(remote_disk_share_budget(Some(400 * GIB)) > disk_share_budget(Some(400 * GIB)));
+    }
+
+    /// Unlike `local_max_size`, `"none"` is a legitimate answer for a remote an
+    /// operator owns; see [`RemoteBudget`].
+    #[test]
+    fn parse_remote_max_size_accepts_none_and_rejects_garbage() {
+        assert_eq!(
+            parse_remote_max_size("none", "[cache.remote] max_size"),
+            RemoteBudget::Unbounded
+        );
+        assert_eq!(
+            parse_remote_max_size("  NONE  ", "KACHE_REMOTE_MAX_SIZE"),
+            RemoteBudget::Unbounded
+        );
+        assert_eq!(
+            parse_remote_max_size("80GiB", "[cache.remote] max_size"),
+            RemoteBudget::Bytes(80 << 30)
+        );
+        assert_eq!(
+            parse_remote_max_size("80 gigs", "[cache.remote] max_size"),
+            RemoteBudget::Default,
+            "a typo must fall back to the derived default, never to unbounded"
+        );
+    }
+
+    #[test]
+    fn remote_budget_resolves_explicit_bytes_none_and_the_disk_share() {
+        const GIB: u64 = 1 << 30;
+        let disk = Some(400 * GIB);
+        assert_eq!(RemoteBudget::Bytes(7).resolve(disk), Some(7));
+        assert_eq!(RemoteBudget::Unbounded.resolve(disk), None);
+        assert_eq!(
+            RemoteBudget::Default.resolve(disk),
+            Some(remote_disk_share_budget(disk))
+        );
+        assert_eq!(
+            RemoteBudget::Default.resolve(None),
+            Some(REMOTE_DISK_SHARE_FALLBACK)
+        );
+    }
+
+    #[test]
+    fn describe_remote_budget_names_how_the_number_was_reached() {
+        const GIB: u64 = 1 << 30;
+        let derived = describe_remote_budget(RemoteBudget::Default, Some(400 * GIB));
+        assert!(derived.contains("25%"), "{derived}");
+        assert!(
+            derived.contains(&ByteSize(400 * GIB).to_string()),
+            "{derived}"
+        );
+        assert!(
+            derived.contains(&ByteSize(100 * GIB).to_string()),
+            "{derived}"
+        );
+
+        let unknown = describe_remote_budget(RemoteBudget::Default, Some(0));
+        assert!(unknown.contains("disk size unknown"), "{unknown}");
+        assert!(
+            unknown.contains(&ByteSize(REMOTE_DISK_SHARE_FALLBACK).to_string()),
+            "{unknown}"
+        );
+        assert_eq!(
+            describe_remote_budget(RemoteBudget::Default, None),
+            unknown,
+            "a failed probe and a zero-byte probe read the same"
+        );
+
+        let explicit = describe_remote_budget(RemoteBudget::Bytes(80 << 30), Some(400 * GIB));
+        assert!(explicit.contains("configured"), "{explicit}");
+        assert!(
+            explicit.contains(&ByteSize(80u64 << 30).to_string()),
+            "{explicit}"
+        );
+
+        let off = describe_remote_budget(RemoteBudget::Unbounded, Some(400 * GIB));
+        assert!(off.contains("unbounded") && off.contains("none"), "{off}");
+    }
+
+    /// An explicit `[cache.remote] max_size` always wins over the derived
+    /// default, and an unset one leaves it to be derived at sweep time.
+    #[test]
+    fn filesystem_remote_reads_an_explicit_max_size() {
+        let _guard = config_path_lock();
+        let _env = set_env_for_test("KACHE_REMOTE_MAX_SIZE", None);
+        let root = tempfile::tempdir().unwrap();
+        let load = |max_size: Option<&str>| {
+            let file = FileConfig {
+                cache: Some(CacheFileConfig {
+                    remote: Some(RemoteFileConfig {
+                        _type: Some("filesystem".to_string()),
+                        path: Some(root.path().to_string_lossy().into_owned()),
+                        max_size: max_size.map(str::to_string),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let remote = Config::load_remote_config(&Ok(file))
+                .expect("valid filesystem config")
+                .expect("filesystem remote");
+            let RemoteBackendConfig::Filesystem(fs) = remote.backend else {
+                panic!("expected filesystem remote");
+            };
+            fs.budget
+        };
+
+        assert_eq!(load(Some("80GiB")), RemoteBudget::Bytes(80 << 30));
+        assert_eq!(load(Some("none")), RemoteBudget::Unbounded);
+        assert_eq!(load(None), RemoteBudget::Default);
+    }
+
+    #[test]
+    fn remote_max_size_env_overrides_the_file() {
+        let _guard = config_path_lock();
+        let _env = set_env_var_for_test("KACHE_REMOTE_MAX_SIZE", "3GiB");
+        let root = tempfile::tempdir().unwrap();
+        let file = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("filesystem".to_string()),
+                    path: Some(root.path().to_string_lossy().into_owned()),
+                    max_size: Some("80GiB".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let remote = Config::load_remote_config(&Ok(file))
+            .expect("valid filesystem config")
+            .expect("filesystem remote");
+        let RemoteBackendConfig::Filesystem(fs) = remote.backend else {
+            panic!("expected filesystem remote");
+        };
+        assert_eq!(fs.budget, RemoteBudget::Bytes(3 << 30));
+    }
+
+    /// An S3 remote is bounded by a bucket lifecycle rule, so `max_size` there
+    /// is a promise kache would not keep. Explicitly typed it is its own error;
+    /// untyped alongside a bucket it is the existing mixed-fields error.
+    #[test]
+    fn remote_max_size_is_rejected_on_an_s3_remote() {
+        let typed = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    _type: Some("s3".to_string()),
+                    bucket: Some("builds".to_string()),
+                    max_size: Some("80GiB".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = Config::load_remote_config(&Ok(typed))
+            .expect_err("max_size must not be accepted on an S3 remote")
+            .to_string();
+        assert!(error.contains("max_size"), "{error}");
+        assert!(error.contains("lifecycle rule"), "{error}");
+
+        let untyped = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    bucket: Some("builds".to_string()),
+                    max_size: Some("80GiB".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = Config::load_remote_config(&Ok(untyped))
+            .expect_err("an untyped mix must be rejected")
+            .to_string();
+        assert!(error.contains("mixes S3 and filesystem fields"), "{error}");
+    }
+
+    /// `max_size` alone is a filesystem field, so it demands a path rather than
+    /// being silently ignored on the S3 path.
+    #[test]
+    fn remote_max_size_alone_still_requires_a_filesystem_path() {
+        let file = FileConfig {
+            cache: Some(CacheFileConfig {
+                remote: Some(RemoteFileConfig {
+                    max_size: Some("80GiB".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = Config::load_remote_config(&Ok(file))
+            .expect_err("max_size without a path must be reported")
+            .to_string();
+        assert!(error.contains("requires a non-empty path"), "{error}");
     }
 
     #[test]

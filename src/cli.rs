@@ -3003,6 +3003,223 @@ pub fn gc(
     Ok(())
 }
 
+/// Lines `kache gc --remote` prints for a plan. Split out from the command so
+/// the reporting is testable without a configured remote or a real sweep.
+fn render_remote_gc(
+    describe: &str,
+    budget_text: &str,
+    plan: &crate::remote_eviction::RemotePlan,
+    stats: Option<&crate::remote_eviction::RemoteGcStats>,
+    scan: &crate::remote_eviction::RemoteScan,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("Remote: {describe}"),
+        // #882 printed the derived local budget on every `kache gc`; a remote
+        // dry run has to answer the same "what number am I being held to?".
+        format!("Remote budget: {budget_text}"),
+        format!(
+            "Remote size: {} ({} objects)",
+            ByteSize(plan.total_bytes),
+            plan.object_count
+        ),
+    ];
+
+    match stats {
+        None => {
+            lines.push(format!(
+                "Dry run: would evict {} entr{} and {} orphan{}, freeing {}.",
+                plan.victims.len(),
+                if plan.victims.len() == 1 { "y" } else { "ies" },
+                plan.orphans.len(),
+                if plan.orphans.len() == 1 { "" } else { "s" },
+                ByteSize(plan.bytes_freed()),
+            ));
+            for victim in plan.victims.iter().take(REMOTE_GC_PREVIEW) {
+                lines.push(format!(
+                    "  evict {} ({})",
+                    victim.id,
+                    ByteSize(victim.freed)
+                ));
+            }
+            for orphan in plan.orphans.iter().take(REMOTE_GC_PREVIEW) {
+                lines.push(format!(
+                    "  remove {} ({}, {})",
+                    orphan.path.display(),
+                    ByteSize(orphan.bytes),
+                    orphan.reason.label(),
+                ));
+            }
+            let shown = plan
+                .victims
+                .len()
+                .min(REMOTE_GC_PREVIEW)
+                .saturating_add(plan.orphans.len().min(REMOTE_GC_PREVIEW));
+            let total = plan.victims.len().saturating_add(plan.orphans.len());
+            if total > shown {
+                lines.push(format!("  ... and {} more", total - shown));
+            }
+            lines.push("Nothing was removed. Re-run without --dry-run to apply.".to_string());
+        }
+        Some(stats) => {
+            lines.push(format!(
+                "Evicted {} entries and {} orphans ({} objects), freeing {}.",
+                stats.groups_evicted,
+                stats.orphans_removed,
+                stats.objects_removed,
+                ByteSize(stats.bytes_freed),
+            ));
+            if stats.delete_failures > 0 {
+                lines.push(format!(
+                    "{} objects could not be removed (a peer is reading them, or removed them \
+                     first); the next sweep re-measures.",
+                    stats.delete_failures
+                ));
+            }
+        }
+    }
+
+    lines.push(format!(
+        "Remote size after: {}",
+        ByteSize(plan.projected_bytes)
+    ));
+    if plan.pinned > 0 {
+        lines.push(format!(
+            "{} entries were skipped because a build may be restoring them right now.",
+            plan.pinned
+        ));
+    }
+    if plan.still_over_budget() {
+        lines.push(format!(
+            "Still over budget: the remainder is pinned entries plus {} that eviction does not \
+             own (build manifests and shards). Raise max_size or re-run later.",
+            ByteSize(scan.unclassified_bytes),
+        ));
+    }
+    if let Some(advisory) = crate::remote_eviction::atime_advisory(scan) {
+        lines.push(format!("warning: {advisory}"));
+    }
+    lines
+}
+
+/// How many victims and orphans `--dry-run` names before summarizing. A remote
+/// sweep can select thousands; the preview exists to make the ranking legible,
+/// not to enumerate it.
+const REMOTE_GC_PREVIEW: usize = 20;
+
+/// Collect the filesystem remote, holding it under its size budget
+/// (kunobi-ninja/kache#774).
+///
+/// Only filesystem remotes are swept. An S3 remote is bounded out of band with
+/// a bucket lifecycle rule, and emulating one from a client that may not even
+/// have `DeleteObject` would be a worse answer than pointing at the rule.
+pub fn gc_remote(config: &Config, dry_run: bool, json: bool) -> Result<()> {
+    let remote = config.require_remote()?;
+    let crate::config::RemoteBackendConfig::Filesystem(fs_remote) = &remote.backend else {
+        anyhow::bail!(
+            "`kache gc --remote` only collects a filesystem remote; this one is {}. Bound an S3 \
+             bucket with a lifecycle rule instead.",
+            remote.describe()
+        );
+    };
+
+    // Several machines share a filesystem remote by definition, so a sweep
+    // takes the same kind of advisory lock every local GC driver takes before
+    // it plans anything. Declining is the right answer for the loser: the
+    // winner's plan already covers the whole remote.
+    let _lock = match crate::remote_eviction::try_lock(fs_remote)? {
+        Some(lock) => lock,
+        None => {
+            if json {
+                return crate::machine::emit("gc", RemoteGcJson::skipped(), Vec::new());
+            }
+            println!("Another remote GC is already running; skipping.");
+            return Ok(());
+        }
+    };
+
+    let scan =
+        crate::remote_eviction::scan(fs_remote, &remote.prefix, std::time::SystemTime::now())
+            .with_context(|| format!("scanning remote {}", remote.describe()))?;
+    let budget = crate::remote_eviction::resolve_budget(fs_remote);
+    let plan = crate::remote_eviction::plan(&scan, budget);
+    let stats = (!dry_run).then(|| crate::remote_eviction::apply(&plan));
+
+    if json {
+        return crate::machine::emit(
+            "gc",
+            RemoteGcJson::report(&remote.describe(), dry_run, &plan, stats.as_ref()),
+            Vec::new(),
+        );
+    }
+
+    for line in render_remote_gc(
+        &remote.describe(),
+        &crate::remote_eviction::describe_budget(fs_remote),
+        &plan,
+        stats.as_ref(),
+        &scan,
+    ) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+#[derive(Default, serde::Serialize)]
+struct RemoteGcJson {
+    skipped: bool,
+    dry_run: bool,
+    remote: String,
+    budget_bytes: Option<u64>,
+    remote_bytes: u64,
+    objects: usize,
+    entries_evicted: usize,
+    orphans_removed: usize,
+    bytes_freed: u64,
+    entries_pinned: usize,
+    remote_bytes_after: u64,
+    still_over_budget: bool,
+    /// False when nothing in the remote showed a read newer than its write, so
+    /// the ranking used write time (a `noatime` mount).
+    read_recency_available: bool,
+}
+
+impl RemoteGcJson {
+    /// The body emitted when a peer already holds the remote GC lock. Mirrors
+    /// the local `kache gc --json` convention, where `skipped` is the only
+    /// meaningful field of a sweep that never ran.
+    fn skipped() -> Self {
+        Self {
+            skipped: true,
+            ..Self::default()
+        }
+    }
+
+    /// A dry run reports what the plan *would* do; a live sweep reports what it
+    /// actually did, which can be smaller when a peer removed an object first.
+    fn report(
+        remote: &str,
+        dry_run: bool,
+        plan: &crate::remote_eviction::RemotePlan,
+        stats: Option<&crate::remote_eviction::RemoteGcStats>,
+    ) -> Self {
+        Self {
+            skipped: false,
+            dry_run,
+            remote: remote.to_string(),
+            budget_bytes: plan.budget,
+            remote_bytes: plan.total_bytes,
+            objects: plan.object_count,
+            entries_evicted: stats.map_or(plan.victims.len(), |s| s.groups_evicted),
+            orphans_removed: stats.map_or(plan.orphans.len(), |s| s.orphans_removed),
+            bytes_freed: stats.map_or(plan.bytes_freed(), |s| s.bytes_freed),
+            entries_pinned: plan.pinned,
+            remote_bytes_after: plan.projected_bytes,
+            still_over_budget: plan.still_over_budget(),
+            read_recency_available: plan.atime_advanced,
+        }
+    }
+}
+
 /// Wipe the entire cache or entries for a specific crate.
 pub fn purge(config: &Config, crate_filter: Option<&str>) -> Result<()> {
     let store = Store::open(config)?;
@@ -10811,6 +11028,424 @@ mod tests {
         // a remote client or making any calls.
         save_manifest(&config, Some("mykey"), None)
             .expect("save_manifest should succeed by doing nothing");
+    }
+
+    // ── Remote GC (kunobi-ninja/kache#774) ──────────────────────────────────
+
+    fn remote_gc_fixture(root: &std::path::Path) -> crate::config::RemoteConfig {
+        crate::config::RemoteConfig {
+            prefix: "artifacts".to_string(),
+            backend: crate::config::RemoteBackendConfig::Filesystem(
+                crate::config::FilesystemRemoteConfig {
+                    root: root.to_path_buf(),
+                    atomic_write_dir: root.join(".kache-tmp"),
+                    budget: crate::config::RemoteBudget::Bytes(1),
+                },
+            ),
+        }
+    }
+
+    /// Write one v3 entry and backdate both objects past the recency grace so a
+    /// sweep can actually select it.
+    fn write_aged_remote_entry(root: &std::path::Path, crate_name: &str, key: &str, bytes: usize) {
+        let age = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+        for (rel, size) in [
+            (
+                format!("artifacts/v3/manifests/{crate_name}/{key}.json"),
+                64usize,
+            ),
+            (
+                format!("artifacts/v3/packs/{crate_name}/{key}.tar.zst"),
+                bytes,
+            ),
+        ] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![3u8; size]).unwrap();
+            let stamp = filetime::FileTime::from_system_time(age);
+            filetime::set_file_times(&path, stamp, stamp).unwrap();
+        }
+    }
+
+    /// A dry run must name the computed budget, the way #882 made `kache gc`
+    /// name the local one, and must say plainly that it removed nothing.
+    #[test]
+    fn remote_gc_dry_run_reports_the_budget_and_removes_nothing() {
+        let plan = crate::remote_eviction::RemotePlan {
+            total_bytes: 319 * (1 << 30),
+            object_count: 7_556,
+            budget: Some(80 * (1 << 30)),
+            target: Some(72 * (1 << 30)),
+            victims: vec![crate::remote_eviction::PlannedVictim {
+                id: "v3:serde/abc".into(),
+                objects: vec![std::path::PathBuf::from("/srv/kache/p")],
+                freed: 1 << 20,
+            }],
+            orphans: vec![crate::remote_eviction::RemoteOrphan {
+                path: std::path::PathBuf::from("/srv/kache/orphan"),
+                bytes: 4096,
+                reason: crate::remote_eviction::OrphanReason::PackWithoutManifest,
+            }],
+            pinned: 2,
+            projected_bytes: 71 * (1 << 30),
+            atime_advanced: true,
+        };
+        let scan = crate::remote_eviction::RemoteScan {
+            object_count: 7_556,
+            atime_advanced: true,
+            ..Default::default()
+        };
+
+        let text = render_remote_gc(
+            "file:///srv/kache/artifacts",
+            "80.0 GiB (configured)",
+            &plan,
+            None,
+            &scan,
+        )
+        .join("\n");
+
+        assert!(
+            text.contains("Remote: file:///srv/kache/artifacts"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Remote budget: 80.0 GiB (configured)"),
+            "{text}"
+        );
+        assert!(text.contains("7556 objects"), "{text}");
+        assert!(
+            text.contains("Dry run: would evict 1 entry and 1 orphan"),
+            "{text}"
+        );
+        assert!(text.contains("evict v3:serde/abc"), "{text}");
+        assert!(text.contains("pack without manifest"), "{text}");
+        assert!(text.contains("Nothing was removed"), "{text}");
+        assert!(text.contains("2 entries were skipped"), "{text}");
+        assert!(
+            !text.contains("noatime"),
+            "read recency was available: {text}"
+        );
+    }
+
+    /// An applied sweep reports what it did, flags an unremovable object, and
+    /// warns when the mount never recorded a read.
+    #[test]
+    fn remote_gc_reports_an_applied_sweep_and_the_noatime_fallback() {
+        let plan = crate::remote_eviction::RemotePlan {
+            total_bytes: 1_000,
+            object_count: 4,
+            budget: Some(100),
+            target: Some(90),
+            projected_bytes: 400,
+            ..Default::default()
+        };
+        let stats = crate::remote_eviction::RemoteGcStats {
+            groups_evicted: 3,
+            orphans_removed: 1,
+            objects_removed: 7,
+            bytes_freed: 600,
+            delete_failures: 2,
+        };
+        let scan = crate::remote_eviction::RemoteScan {
+            object_count: 4,
+            atime_advanced: false,
+            unclassified_bytes: 350,
+            ..Default::default()
+        };
+
+        let text = render_remote_gc(
+            "file:///srv",
+            "1.0 GiB (configured)",
+            &plan,
+            Some(&stats),
+            &scan,
+        )
+        .join("\n");
+        assert!(
+            text.contains("Evicted 3 entries and 1 orphans (7 objects), freeing 600 B"),
+            "{text}"
+        );
+        assert!(text.contains("2 objects could not be removed"), "{text}");
+        assert!(text.contains("Remote size after: 400 B"), "{text}");
+        assert!(text.contains("Still over budget"), "{text}");
+        assert!(text.contains("350 B that eviction does not own"), "{text}");
+        assert!(text.contains("noatime"), "{text}");
+    }
+
+    /// A sweep can select thousands of objects; the preview names the first
+    /// twenty of each kind and counts the rest.
+    #[test]
+    fn remote_gc_dry_run_truncates_a_long_preview() {
+        let plan = crate::remote_eviction::RemotePlan {
+            total_bytes: 5_000,
+            object_count: 60,
+            budget: Some(1_000),
+            target: Some(900),
+            victims: (0..25)
+                .map(|i| crate::remote_eviction::PlannedVictim {
+                    id: format!("v3:serde/k{i}"),
+                    objects: vec![std::path::PathBuf::from(format!("/srv/{i}"))],
+                    freed: 100,
+                })
+                .collect(),
+            orphans: (0..30)
+                .map(|i| crate::remote_eviction::RemoteOrphan {
+                    path: std::path::PathBuf::from(format!("/srv/orphan{i}")),
+                    bytes: 10,
+                    reason: crate::remote_eviction::OrphanReason::UnreferencedPrefetchPack,
+                })
+                .collect(),
+            projected_bytes: 800,
+            atime_advanced: true,
+            ..Default::default()
+        };
+        let scan = crate::remote_eviction::RemoteScan {
+            object_count: 60,
+            atime_advanced: true,
+            ..Default::default()
+        };
+
+        let lines = render_remote_gc("file:///srv", "1.0 KiB (configured)", &plan, None, &scan);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("would evict 25 entries and 30 orphans"),
+            "plurals must follow the counts: {text}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("  evict ")).count(),
+            REMOTE_GC_PREVIEW
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("  remove ")).count(),
+            REMOTE_GC_PREVIEW
+        );
+        // 55 selected, 40 shown.
+        assert!(text.contains("... and 15 more"), "{text}");
+        assert!(!text.contains("Still over budget"), "{text}");
+    }
+
+    /// End to end on a real folder: `--dry-run` leaves every object in place,
+    /// and the same command without it holds the remote under its budget.
+    #[test]
+    fn remote_gc_dry_run_then_apply_on_a_real_filesystem_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..4 {
+            write_aged_remote_entry(root, "serde", &format!("key{i}"), 4_000);
+        }
+        let config = save_manifest_config(root.join("store"), Some(remote_gc_fixture(root)));
+
+        let before = walk_bytes(&root.join("artifacts"));
+        assert!(before > 0, "the fixture must have written objects");
+        gc_remote(&config, true, false).expect("dry run");
+        assert_eq!(
+            walk_bytes(&root.join("artifacts")),
+            before,
+            "a dry run must not delete anything"
+        );
+
+        gc_remote(&config, false, false).expect("live sweep");
+        let remaining: u64 = walk_bytes(&root.join("artifacts"));
+        assert!(
+            remaining <= 1,
+            "the sweep must hold the remote under its 1-byte budget, got {remaining}"
+        );
+    }
+
+    fn walk_bytes(dir: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| match entry.file_type() {
+                Ok(kind) if kind.is_dir() => walk_bytes(&entry.path()),
+                Ok(kind) if kind.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// A second collector on the same folder declines instead of planning
+    /// against a snapshot the first is deleting from.
+    #[test]
+    fn remote_gc_declines_while_a_peer_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_aged_remote_entry(root, "serde", "key0", 8_000);
+        let remote = remote_gc_fixture(root);
+        let crate::config::RemoteBackendConfig::Filesystem(fs_remote) = &remote.backend else {
+            unreachable!("fixture is a filesystem remote");
+        };
+        let held = crate::remote_eviction::try_lock(fs_remote)
+            .unwrap()
+            .expect("peer takes the lock first");
+
+        let config = save_manifest_config(root.join("store"), Some(remote.clone()));
+        gc_remote(&config, false, false).expect("a contended sweep is not an error");
+        assert!(
+            root.join("artifacts/v3/packs/serde/key0.tar.zst").exists(),
+            "a sweep that could not take the lock must not delete anything"
+        );
+
+        drop(held);
+        gc_remote(&config, false, false).expect("the lock is free now");
+        assert!(!root.join("artifacts/v3/packs/serde/key0.tar.zst").exists());
+    }
+
+    /// An S3 remote is bounded with a bucket lifecycle rule; the command says so
+    /// rather than pretending to sweep it.
+    #[test]
+    fn remote_gc_refuses_an_s3_remote_and_points_at_lifecycle_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(
+            dir.path().to_path_buf(),
+            Some(crate::config::RemoteConfig::test_s3("builds", "artifacts")),
+        );
+        let error = gc_remote(&config, true, false)
+            .expect_err("an S3 remote has no filesystem sweep")
+            .to_string();
+        assert!(
+            error.contains("only collects a filesystem remote"),
+            "{error}"
+        );
+        assert!(error.contains("lifecycle rule"), "{error}");
+    }
+
+    #[test]
+    fn remote_gc_reports_a_missing_remote_rather_than_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+        assert!(gc_remote(&config, true, false).is_err());
+    }
+
+    /// A clean applied sweep says nothing about failures, pinned entries, the
+    /// budget, or the mount — every conditional line stays off.
+    #[test]
+    fn remote_gc_stays_quiet_when_there_is_nothing_to_qualify() {
+        let plan = crate::remote_eviction::RemotePlan {
+            total_bytes: 1_000,
+            object_count: 2,
+            budget: Some(1_000),
+            target: Some(900),
+            projected_bytes: 900,
+            atime_advanced: true,
+            ..Default::default()
+        };
+        let stats = crate::remote_eviction::RemoteGcStats {
+            groups_evicted: 1,
+            bytes_freed: 100,
+            objects_removed: 2,
+            ..Default::default()
+        };
+        let scan = crate::remote_eviction::RemoteScan {
+            object_count: 2,
+            atime_advanced: true,
+            ..Default::default()
+        };
+
+        let text = render_remote_gc(
+            "file:///srv",
+            "1.0 KiB (configured)",
+            &plan,
+            Some(&stats),
+            &scan,
+        )
+        .join("\n");
+        assert!(!text.contains("could not be removed"), "{text}");
+        assert!(!text.contains("were skipped"), "{text}");
+        assert!(
+            !text.contains("Still over budget"),
+            "exactly at the cap is not over it: {text}"
+        );
+        assert!(!text.contains("noatime"), "{text}");
+    }
+
+    /// A short preview names everything and adds no "and N more" tail.
+    #[test]
+    fn remote_gc_dry_run_without_truncation_adds_no_tail() {
+        let plan = crate::remote_eviction::RemotePlan {
+            budget: Some(10),
+            target: Some(9),
+            victims: vec![crate::remote_eviction::PlannedVictim {
+                id: "v3:serde/a".into(),
+                objects: vec![std::path::PathBuf::from("/srv/a")],
+                freed: 5,
+            }],
+            ..Default::default()
+        };
+        let text = render_remote_gc(
+            "file:///srv",
+            "10 B (configured)",
+            &plan,
+            None,
+            &crate::remote_eviction::RemoteScan::default(),
+        )
+        .join("\n");
+        assert!(text.contains("would evict 1 entry and 0 orphans"), "{text}");
+        assert!(!text.contains("... and"), "{text}");
+    }
+
+    #[test]
+    fn remote_gc_json_reports_the_plan_for_a_dry_run_and_the_stats_for_a_sweep() {
+        let plan = crate::remote_eviction::RemotePlan {
+            total_bytes: 5_000,
+            object_count: 9,
+            budget: Some(1_000),
+            target: Some(900),
+            victims: vec![crate::remote_eviction::PlannedVictim {
+                id: "v3:serde/a".into(),
+                objects: vec![std::path::PathBuf::from("/srv/a")],
+                freed: 4_000,
+            }],
+            orphans: vec![crate::remote_eviction::RemoteOrphan {
+                path: std::path::PathBuf::from("/srv/o"),
+                bytes: 100,
+                reason: crate::remote_eviction::OrphanReason::ManifestWithoutPack,
+            }],
+            pinned: 3,
+            projected_bytes: 1_500,
+            atime_advanced: true,
+        };
+
+        let dry = RemoteGcJson::report("file:///srv", true, &plan, None);
+        assert!(!dry.skipped && dry.dry_run);
+        assert_eq!(dry.remote, "file:///srv");
+        assert_eq!(dry.budget_bytes, Some(1_000));
+        assert_eq!(dry.remote_bytes, 5_000);
+        assert_eq!(dry.objects, 9);
+        assert_eq!(dry.entries_evicted, 1);
+        assert_eq!(dry.orphans_removed, 1);
+        assert_eq!(dry.bytes_freed, 4_100);
+        assert_eq!(dry.entries_pinned, 3);
+        assert_eq!(dry.remote_bytes_after, 1_500);
+        assert!(dry.still_over_budget);
+        assert!(dry.read_recency_available);
+
+        // A live sweep reports what it managed, not what it intended.
+        let stats = crate::remote_eviction::RemoteGcStats {
+            groups_evicted: 0,
+            orphans_removed: 0,
+            objects_removed: 0,
+            bytes_freed: 0,
+            delete_failures: 2,
+        };
+        let applied = RemoteGcJson::report("file:///srv", false, &plan, Some(&stats));
+        assert!(!applied.dry_run);
+        assert_eq!(applied.entries_evicted, 0);
+        assert_eq!(applied.orphans_removed, 0);
+        assert_eq!(applied.bytes_freed, 0);
+    }
+
+    #[test]
+    fn remote_gc_json_marks_a_contended_sweep_as_skipped() {
+        let body = RemoteGcJson::skipped();
+        assert!(body.skipped);
+        assert!(!body.dry_run);
+        assert_eq!(body.bytes_freed, 0);
+        assert_eq!(body.budget_bytes, None);
+        assert_eq!(body.remote, "");
     }
 }
 

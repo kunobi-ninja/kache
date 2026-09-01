@@ -34,6 +34,7 @@ mod policy;
 mod probe;
 mod remote;
 mod remote_backend;
+mod remote_eviction;
 mod remote_layout;
 mod remote_pack;
 mod remote_plan;
@@ -133,12 +134,21 @@ enum Commands {
     /// Run garbage collection
     Gc {
         /// Evict entries older than this duration (e.g. 7d, 24h)
-        #[arg(long, conflicts_with = "stale_schema")]
+        #[arg(long, conflicts_with_all = ["stale_schema", "remote"])]
         max_age: Option<String>,
 
         /// Remove entries from old or unrecorded cache-key schemas
-        #[arg(long)]
+        #[arg(long, conflicts_with = "remote")]
         stale_schema: bool,
+
+        /// Collect the filesystem remote instead of the local store, holding it
+        /// under `[cache.remote] max_size` (kunobi-ninja/kache#774)
+        #[arg(long)]
+        remote: bool,
+
+        /// Report what a remote sweep would remove without removing anything
+        #[arg(long, short = 'n', requires = "remote")]
+        dry_run: bool,
     },
 
     /// Wipe entire cache or entries for a specific crate
@@ -645,18 +655,24 @@ fn main() -> Result<()> {
         Some(Commands::Gc {
             max_age,
             stale_schema,
+            remote,
+            dry_run,
         }) => {
-            let hours = max_age
-                .as_deref()
-                .map(|value| {
-                    parse_duration_hours(value).ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "invalid --max-age {value:?}; expected hours or a duration like 24h or 7d"
-                        )
+            if remote {
+                cli::gc_remote(&config, dry_run, json)
+            } else {
+                let hours = max_age
+                    .as_deref()
+                    .map(|value| {
+                        parse_duration_hours(value).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "invalid --max-age {value:?}; expected hours or a duration like 24h or 7d"
+                            )
+                        })
                     })
-                })
-                .transpose()?;
-            cli::gc(&config, hours, stale_schema, json)
+                    .transpose()?;
+                cli::gc(&config, hours, stale_schema, json)
+            }
         }
         Some(Commands::Purge { crate_name }) => {
             if json {

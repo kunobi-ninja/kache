@@ -896,7 +896,7 @@ mod tests {
     }
 
     struct TestCacheDirGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::test_support::ProcessStateTestGuard,
         previous: Option<std::ffi::OsString>,
     }
 

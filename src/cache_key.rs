@@ -8417,7 +8417,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
     /// `compute_cache_key` reading process-global env directly.
     /// Keep the local name used throughout this large test module while the
     /// underlying lock remains shared with other process-state observers.
-    fn key_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn key_test_lock() -> crate::test_support::ProcessStateTestGuard {
         process_state_test_lock()
     }
 

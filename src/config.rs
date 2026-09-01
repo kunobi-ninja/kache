@@ -289,7 +289,8 @@ pub struct Config {
     /// protocol mismatch) falls back to the fully local path — the daemon is
     /// never a hard dependency. Off by default. Set via
     /// `KACHE_LOCAL_HIT_DAEMON=1`/`=true` or `[cache] local_hit_daemon`; env
-    /// wins over the file. See `notes/design/daemon-local-hit.md`.
+    /// wins over the file. `daemon_local` documents the ordering invariant the
+    /// lookup path depends on.
     pub local_hit_daemon: bool,
     /// Windows only: restore cache hits via HARDLINK instead of copy (#429).
     /// Off by default — and only relevant on a non-CoW volume (NTFS), where the

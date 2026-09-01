@@ -4,7 +4,7 @@
 //! mutex: probes run on dedicated threads that each own a read-only SQLite
 //! connection, and the pin/accounting write goes through a single batched
 //! writer thread that commits BEFORE the hit reply is sent. That ordering is
-//! the safety invariant (see `notes/design/daemon-local-hit.md`): the
+//! the safety invariant: the
 //! `last_accessed` touch is what `remove_entry_guarded`'s idle-grace check
 //! reads — cross-process, so a separate `kache gc` respects it too — and a
 //! deferred touch would let GC evict blobs between our reply and the

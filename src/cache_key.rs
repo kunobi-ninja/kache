@@ -3386,10 +3386,99 @@ fn system_time_ns(time: Option<std::time::SystemTime>) -> Option<i64> {
     )
 }
 
+/// Build the argv for the dep-info pre-pass from the original rustc argv.
+///
+/// The pre-pass reuses everything that shapes the source closure (features,
+/// cfgs, edition, target, `--extern`, codegen opts) and replaces only the
+/// output configuration: `--emit dep-info -o <dep_file>`. Dropped on the way:
+///
+/// - `--emit` / `--out-dir` / `-o`, superseded by the pre-pass's own pair.
+/// - `-C extra-filename`, which names output artifacts the pre-pass never
+///   produces. rustc warns "ignoring -C extra-filename flag due to -o flag"
+///   whenever both are present, and because that warning is emitted while the
+///   session is built it lands *first* on stderr — ahead of any real
+///   diagnostic. That made a failing pre-pass look like the flag combination
+///   was the cause (kunobi-ninja/kache#896). `--out-dir` is the only other flag
+///   rustc reports as ignored due to `-o`, and it is already dropped here.
+/// - the source file, re-added as the leading positional argument.
+/// - `-C incremental`, via the same canonical filter the real compilation path
+///   uses.
+fn dep_info_pass_args(source_file: &Path, rustc_args: &[String], dep_file: &Path) -> Vec<String> {
+    let source_str = source_file.to_string_lossy();
+    let rustc_args = crate::compile::strip_incremental_flags(rustc_args);
+    let mut dep_args = vec![source_str.to_string()];
+
+    let mut remaining = rustc_args.iter().peekable();
+    while let Some(arg) = remaining.next() {
+        match arg.as_str() {
+            "--emit" | "--out-dir" | "-o" => {
+                remaining.next(); // drop the flag's value too
+            }
+            // Two-arg codegen form: `-C extra-filename=<hash>`.
+            "-C" | "--codegen"
+                if remaining
+                    .peek()
+                    .is_some_and(|value| value.starts_with("extra-filename=")) =>
+            {
+                remaining.next();
+            }
+            _ if arg.starts_with("--emit=") || arg.starts_with("--out-dir=") => {}
+            // Joined codegen forms: `-Cextra-filename=…`, `--codegen=extra-filename=…`.
+            _ if arg.starts_with("-Cextra-filename=")
+                || arg.starts_with("--codegen=extra-filename=") => {}
+            // Skip the source file — already added as the first positional arg.
+            _ if arg.as_str() == source_str.as_ref() => {}
+            _ => dep_args.push((*arg).clone()),
+        }
+    }
+
+    dep_args.push("--emit".to_string());
+    dep_args.push("dep-info".to_string());
+    dep_args.push("-o".to_string());
+    dep_args.push(dep_file.to_string_lossy().into_owned());
+
+    dep_args
+}
+
+/// Pick the stderr line that explains why the dep-info pre-pass failed.
+///
+/// rustc writes diagnostics in the order it produces them, so session-level
+/// warnings precede the error that actually aborted the run. Reporting
+/// `stderr.lines().next()` therefore blames whichever warning happened to come
+/// first: in kunobi-ninja/kache#896 the stated reason a pre-pass exited 1 was
+/// "ignoring -C extra-filename flag due to -o flag", a warning that on every
+/// rustc from 1.97 to 1.98 leaves the exit status at 0. The real error was
+/// never printed, and the crate stayed a passthrough with no way to diagnose
+/// it.
+///
+/// Prefer the first error-level line in either `--error-format=json` or human
+/// form, and fall back to the first non-empty line when nothing looks like an
+/// error (`rustc` can die on a signal, or a wrapper can fail before rustc runs).
+pub(crate) fn first_rustc_error_line(stderr: &str) -> Option<&str> {
+    let mut fallback = None;
+    for line in stderr.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // JSON: `{"$message_type":"diagnostic",…,"level":"error",…}`.
+        // Human: `error: …` or `error[E0433]: …` at column 0 — indented lines
+        // are snippet/note continuations, never the diagnostic header.
+        if line.contains(r#""level":"error""#)
+            || line.starts_with("error:")
+            || line.starts_with("error[")
+        {
+            return Some(line);
+        }
+        fallback.get_or_insert(line);
+    }
+    fallback
+}
+
 /// Run `rustc --emit=dep-info` as a pre-pass to discover source files and env deps.
 ///
-/// This is the I/O layer — it invokes rustc and reads the output file.
-/// Parsing is delegated to `parse_dep_info()` and `parse_env_dep_info()` (pure functions).
+/// This is the I/O layer — it invokes rustc and reads the output file. Building
+/// the pre-pass argv is delegated to `dep_info_pass_args()`, and parsing to
+/// `parse_dep_info()` / `parse_env_dep_info()` (all pure functions).
 ///
 /// Returns `Err` on any failure (rustc non-zero exit, missing/unreadable dep
 /// file, etc.). The caller MUST treat that as non-cacheable: `compute_cache_key`
@@ -3413,42 +3502,7 @@ pub fn run_dep_info_pass(
         cmd.arg(inner_rustc);
     }
 
-    let source_str = source_file.to_string_lossy();
-    let rustc_args = crate::compile::strip_incremental_flags(rustc_args);
-    let mut dep_args = vec![source_str.to_string()];
-
-    // Filter out --emit, --out-dir, -o, and the source file (already added
-    // above) from original args. Incremental flags were removed above by the
-    // same canonical filter used by the real compilation path.
-    // Everything else (features, cfg, edition, target, codegen opts) is kept.
-    let mut i = 0;
-    while i < rustc_args.len() {
-        let arg = rustc_args[i];
-        match arg.as_str() {
-            "--emit" | "--out-dir" | "-o" => {
-                i += 2; // skip flag + value
-                continue;
-            }
-            _ if arg.starts_with("--emit=") || arg.starts_with("--out-dir=") => {
-                i += 1;
-                continue;
-            }
-            _ if arg.as_str() == source_str.as_ref() => {
-                // Skip the source file — already added as the first positional arg
-                i += 1;
-                continue;
-            }
-            _ => {
-                dep_args.push(arg.clone());
-            }
-        }
-        i += 1;
-    }
-
-    dep_args.push("--emit".to_string());
-    dep_args.push("dep-info".to_string());
-    dep_args.push("-o".to_string());
-    dep_args.push(dep_file.to_string_lossy().into_owned());
+    let dep_args = dep_info_pass_args(source_file, rustc_args, &dep_file);
 
     let response_file = if use_response_file {
         let response = crate::compile::RustcResponseFile::new(
@@ -3481,7 +3535,7 @@ pub fn run_dep_info_pass(
         anyhow::bail!(
             "dep-info pre-pass failed (exit {}): {}",
             output.status.code().unwrap_or(-1),
-            stderr.lines().next().unwrap_or("(no output)")
+            first_rustc_error_line(&stderr).unwrap_or("(no output)")
         );
     }
 
@@ -7977,6 +8031,273 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             rendered.contains("error"),
             "the cause must carry rustc's own first stderr line: {rendered}"
         );
+    }
+
+    #[test]
+    fn dep_info_pass_args_drops_output_naming_flags() {
+        // Cargo's real lib-target argv, plus the `-C extra-filename` the
+        // pre-pass used to carry into its own `-o` invocation
+        // (kunobi-ninja/kache#896).
+        let args: Vec<String> = [
+            "--crate-name",
+            "mylib",
+            "--edition=2021",
+            "mylib/src/lib.rs",
+            "--error-format=json",
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,metadata,link",
+            "-C",
+            "metadata=1b2c9f1c31209a4a",
+            "-C",
+            "extra-filename=-02749d16b52ff8b3",
+            "--out-dir",
+            "/w/target/debug/deps",
+            "-C",
+            "incremental=/w/target/debug/incremental",
+            "-L",
+            "dependency=/w/target/debug/deps",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+
+        let dep_args = dep_info_pass_args(
+            Path::new("mylib/src/lib.rs"),
+            &args,
+            Path::new("/tmp/kache-depinfo/deps.d"),
+        );
+
+        assert_eq!(
+            dep_args.first().map(String::as_str),
+            Some("mylib/src/lib.rs"),
+            "the source file leads the argv exactly once: {dep_args:?}"
+        );
+        assert_eq!(
+            dep_args.iter().filter(|a| a.contains("lib.rs")).count(),
+            1,
+            "cargo's own positional source must not be re-added: {dep_args:?}"
+        );
+        assert!(
+            !dep_args.iter().any(|a| a.contains("extra-filename")),
+            "-C extra-filename names outputs the pre-pass discards, and rustc \
+             warns about it as soon as -o is present: {dep_args:?}"
+        );
+        assert!(
+            !dep_args.iter().any(|a| a.contains("incremental")),
+            "incremental flags go through the canonical filter: {dep_args:?}"
+        );
+        assert!(
+            !dep_args.iter().any(|a| a.starts_with("--emit=")),
+            "cargo's --emit is superseded by the pre-pass's own: {dep_args:?}"
+        );
+        assert!(
+            !dep_args.iter().any(|a| a == "--out-dir"),
+            "--out-dir is the other flag rustc reports as ignored due to -o: {dep_args:?}"
+        );
+        assert!(
+            !dep_args.iter().any(|a| a.starts_with("/w/target")),
+            "--out-dir's value must go with it: {dep_args:?}"
+        );
+
+        // Everything that shapes the source closure survives.
+        for kept in [
+            "--crate-name",
+            "mylib",
+            "--edition=2021",
+            "--error-format=json",
+            "--crate-type",
+            "lib",
+            "-C",
+            "metadata=1b2c9f1c31209a4a",
+            "-L",
+            "dependency=/w/target/debug/deps",
+        ] {
+            assert!(
+                dep_args.iter().any(|a| a == kept),
+                "{kept} shapes the input set and must survive: {dep_args:?}"
+            );
+        }
+        assert_eq!(
+            dep_args.iter().filter(|a| a.as_str() == "-C").count(),
+            1,
+            "only extra-filename's own -C is dropped, not every -C: {dep_args:?}"
+        );
+
+        let tail = &dep_args[dep_args.len() - 4..];
+        assert_eq!(
+            tail,
+            [
+                "--emit",
+                "dep-info",
+                "-o",
+                "/tmp/kache-depinfo/deps.d".to_string().as_str()
+            ]
+            .map(String::from),
+            "the pre-pass appends exactly one output configuration"
+        );
+    }
+
+    #[test]
+    fn dep_info_pass_args_drops_every_extra_filename_spelling() {
+        // rustc accepts four spellings of a codegen option; RUSTFLAGS and
+        // hand-rolled invocations use the joined ones cargo never emits.
+        for spelling in [
+            vec!["-C", "extra-filename=-abc123"],
+            vec!["-Cextra-filename=-abc123"],
+            vec!["--codegen", "extra-filename=-abc123"],
+            vec!["--codegen=extra-filename=-abc123"],
+        ] {
+            let mut args: Vec<String> = vec!["--crate-type".into(), "lib".into()];
+            args.extend(spelling.iter().map(|arg| (*arg).to_string()));
+            args.push("--crate-name".into());
+            args.push("mylib".into());
+
+            let dep_args =
+                dep_info_pass_args(Path::new("src/lib.rs"), &args, Path::new("/tmp/deps.d"));
+
+            assert!(
+                !dep_args.iter().any(|a| a.contains("extra-filename")),
+                "{spelling:?} must be dropped: {dep_args:?}"
+            );
+            assert!(
+                dep_args.iter().any(|a| a == "--crate-name"),
+                "{spelling:?} must not swallow the following flag: {dep_args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dep_info_pass_args_keeps_bare_trailing_codegen_flag() {
+        // A trailing `-C` with no value is malformed, but the pre-pass must
+        // hand it to rustc unchanged rather than guess — rustc's own error is
+        // the honest outcome.
+        let args = vec![
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "-C".to_string(),
+        ];
+
+        let dep_args = dep_info_pass_args(Path::new("src/lib.rs"), &args, Path::new("/tmp/deps.d"));
+
+        assert!(
+            dep_args.iter().any(|a| a == "-C"),
+            "a valueless -C is not an extra-filename: {dep_args:?}"
+        );
+    }
+
+    #[test]
+    fn dep_info_pass_prepass_succeeds_with_extra_filename() {
+        // End-to-end regression for kunobi-ninja/kache#896: a lib-target argv
+        // shaped like cargo's, carrying `-C extra-filename`, must produce a
+        // clean pre-pass and the crate's full source closure — not a refusal.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), b"mod server;\npub fn hello() {}").unwrap();
+        std::fs::write(src.join("server.rs"), b"pub fn serve() {}").unwrap();
+
+        let rustc = std::path::PathBuf::from("rustc");
+        let source = src.join("lib.rs");
+        let out_dir = dir.path().join("deps");
+        let args: Vec<String> = vec![
+            "--crate-name".into(),
+            "testcrate".into(),
+            "--edition=2021".into(),
+            source.to_string_lossy().into_owned(),
+            "--error-format=json".into(),
+            "--crate-type".into(),
+            "lib".into(),
+            "--emit=dep-info,metadata,link".into(),
+            "-C".into(),
+            "metadata=92ee3169a2c3b7b0".into(),
+            "-C".into(),
+            "extra-filename=-2cb6bc2ef2b88725".into(),
+            "--out-dir".into(),
+            out_dir.to_string_lossy().into_owned(),
+            "-C".into(),
+            "incremental=/nonexistent/incremental".into(),
+        ];
+
+        let dep_info = run_dep_info_pass(&rustc, None, &source, &args, false)
+            .expect("a cargo-shaped lib argv must not fail the pre-pass");
+
+        assert!(
+            dep_info.source_files.iter().any(|p| p.ends_with("lib.rs")),
+            "expected the crate root: {:?}",
+            dep_info.source_files
+        );
+        assert!(
+            dep_info
+                .source_files
+                .iter()
+                .any(|p| p.ends_with("server.rs")),
+            "an incomplete source list is what makes a crate uncacheable: {:?}",
+            dep_info.source_files
+        );
+    }
+
+    #[test]
+    fn first_rustc_error_line_skips_leading_json_warnings() {
+        // The exact shape of the kunobi-ninja/kache#896 report: rustc emits
+        // session-level warnings before any crate diagnostic, so the first
+        // line is never the reason the run aborted.
+        let stderr = concat!(
+            r#"{"$message_type":"diagnostic","message":"ignoring -C extra-filename flag due to -o flag","level":"warning"}"#,
+            "\n",
+            r#"{"$message_type":"diagnostic","message":"cannot find macro `frobnicate`","level":"error"}"#,
+            "\n",
+            r#"{"$message_type":"diagnostic","message":"aborting due to 1 previous error","level":"error"}"#,
+            "\n",
+        );
+
+        let line = first_rustc_error_line(stderr).expect("an error line is present");
+
+        assert!(
+            line.contains("cannot find macro"),
+            "the first error-level diagnostic wins: {line}"
+        );
+    }
+
+    #[test]
+    fn first_rustc_error_line_skips_leading_human_warnings() {
+        let stderr = "warning: ignoring -C extra-filename flag due to -o flag\n\
+                      \n\
+                      error[E0433]: failed to resolve: use of undeclared crate `nope`\n\
+                      error: aborting due to 1 previous error\n";
+
+        let line = first_rustc_error_line(stderr).expect("an error line is present");
+
+        assert_eq!(
+            line,
+            "error[E0433]: failed to resolve: use of undeclared crate `nope`"
+        );
+    }
+
+    #[test]
+    fn first_rustc_error_line_matches_unnumbered_human_errors() {
+        let stderr = "warning: unused import: `std::io`\nerror: expected one of `!` or `::`\n";
+
+        let line = first_rustc_error_line(stderr).expect("an error line is present");
+
+        assert_eq!(line, "error: expected one of `!` or `::`");
+    }
+
+    #[test]
+    fn first_rustc_error_line_falls_back_to_the_first_content_line() {
+        // rustc killed by a signal, or a wrapper that failed before rustc ran,
+        // leaves no error-level diagnostic. Report something rather than
+        // "(no output)" — a refusal with no stated cause is what
+        // kunobi-ninja/kache#431 was about.
+        let line = first_rustc_error_line("\n\nwarning: something odd\nnote: more\n");
+
+        assert_eq!(line, Some("warning: something odd"));
+        assert_eq!(
+            first_rustc_error_line("   \n \n"),
+            None,
+            "blank is no cause"
+        );
+        assert_eq!(first_rustc_error_line(""), None);
     }
 
     // --- cache key module-change detection test ---

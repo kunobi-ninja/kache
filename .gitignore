@@ -14,6 +14,9 @@
 #                    raw coverage data stays under target/llvm-cov-target/
 #                    (already covered by /target above).
 #   tmp/mutants/  — cargo-mutants logs, outcomes, and tested diffs.
+#   tmp/perf-gate/ — per-PR perf-gate scratch: one benchmark work dir per
+#                    side (merge base, PR head). The base side is deleted
+#                    before the head side runs, so peak disk is one side.
 #
 # To recover disk: `rm -rf tmp/` — tools regenerate what they need.
 /tmp/

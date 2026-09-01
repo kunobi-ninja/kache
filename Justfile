@@ -281,6 +281,24 @@ bench-trace PROFILE="" *ARGS:
     ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --select backend:kache --profile "{{PROFILE}}" --trace-keys {{ARGS}}; \
   fi
 
+# Run ONE side of the per-PR perf gate locally: the mid-size `bench-pr-cargo`
+# scenario with the extra same-worktree warm phase enabled, so the run reports
+# all three numbers the gate compares (cold, warm same-tree, cross-worktree).
+# Minutes, not hours — unlike the nightly giants above.
+#
+# This is one side only. The gate measures the PR head AND its merge base on the
+# same machine and compares them; see .github/workflows/perf-gate.yml. To
+# reproduce that locally, run this once per commit with a different
+# `--work-dir`, then diff the two result JSONs with
+# `scripts/perf-gate-compare.sh`.
+[group('bench')]
+bench-pr *ARGS:
+  cargo build --release -p kache
+  cargo build --release -p kache-e2e --bin kache-scenario
+  ./target/release/kache-scenario --kache ./target/release/kache \
+    --select suite:bench --select backend:kache --profile pr-cargo \
+    --warm-same-tree {{ARGS}}
+
 # Same cold/warm clone benchmark, but with sccache as the compiler cache.
 # Omit PROFILE to list sccache-backed profiles.
 # Use `just bench-sccache firefox` for the Firefox comparison.

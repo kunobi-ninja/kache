@@ -18,6 +18,22 @@ Jobs upload their reports, Perfetto traces, and logs even when a benchmark fails
 
 A scheduled run is not automatically a valid result. Check that the individual job succeeded and that its benchmark verdict is `ok` before using its timing or hit-rate numbers.
 
+## Per-pull-request perf gate
+
+The nightly matrix reports absolute numbers hours after a change lands. The [Perf gate workflow](https://github.com/kunobi-ninja/kache/actions/workflows/perf-gate.yml) answers a narrower question at review time: is this pull request slower than the commit it is a delta against?
+
+It measures one mid-size subject — `bench-pr-cargo`, the `rust-lang/cargo` tree pinned by commit — in three phases per side:
+
+| phase | store | build tree |
+| --- | --- | --- |
+| cold | empty | fresh |
+| warm | populated by cold | fresh, same path |
+| cross-worktree | populated by cold | fresh, different path |
+
+The pull request head and its merge base are both measured, back to back on the same runner, so the report is a delta rather than a comparison against a stored figure from another machine. A warm build more than 5% slower than the merge base fails the gate. Cold and cross-worktree deltas are reported without failing while their noise floor is still being established. The numbers land as a comment on the pull request.
+
+The gate runs only for branches in this repository: the benchmark needs a self-hosted runner, and fork code never touches one. It is not a required check.
+
 ## Run a scenario
 
 ```bash
@@ -29,6 +45,8 @@ just bench opendal
 just bench llvm
 just bench-retry firefox   # reuse the saved cold state
 just bench-trace firefox   # include key-diff artifacts
+
+just bench-pr              # one side of the per-PR perf gate
 
 just bench-sccache
 just bench-sccache firefox

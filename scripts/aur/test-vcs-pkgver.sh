@@ -109,7 +109,7 @@ expect_failure "a missing path is refused" "does not exist" "/nonexistent/nope"
 # installs another, and version comparison stops meaning anything. Run the
 # real pkgver() from the shipped PKGBUILD against the same repo and demand
 # byte-identical output.
-pkgbuild="$(echo "$repo_root"/aur/*-git/PKGBUILD)"
+pkgbuild="$(echo "$repo_root"/packaging/aur/*-git/PKGBUILD)"
 if [ -f "$pkgbuild" ]; then
   # pkgver() does `cd "$srcdir/<name>"`, where <name> comes from the PKGBUILD's
   # own source= line. Derive it rather than hardcoding, so this file stays
@@ -136,7 +136,7 @@ if [ -f "$pkgbuild" ]; then
     fi
   fi
 else
-  no "an aur/*-git/PKGBUILD is present" "not found under $repo_root/aur"
+  no "a packaging/aur/*-git/PKGBUILD is present" "not found under $repo_root/packaging/aur"
 fi
 
 echo

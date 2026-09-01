@@ -65,17 +65,17 @@ build-service:
 # Build the service container image locally.
 [group('docker')]
 image-service:
-  docker buildx bake -f docker-bake.hcl service
+  docker buildx bake -f packaging/docker-bake.hcl service
 
 # Print the resolved service image bake plan.
 [group('docker')]
 image-service-print:
-  docker buildx bake -f docker-bake.hcl --print service
+  docker buildx bake -f packaging/docker-bake.hcl --print service
 
 # Build and push the release service image.
 [group('docker')]
 image-service-release:
-  docker buildx bake -f docker-bake.hcl release
+  docker buildx bake -f packaging/docker-bake.hcl release
 
 # Run the full workspace test suite.
 [group('dev')]
@@ -203,7 +203,7 @@ e2e:
 # kache-scenario (e.g. `just e2e-docker --select name:e2e-cc-cl-xclang-deps`).
 [group('dev')]
 e2e-docker *ARGS:
-  docker build -f docker/e2e.Dockerfile -t kache-e2e:local .
+  docker build -f packaging/docker/e2e.Dockerfile -t kache-e2e:local .
   mkdir -p {{justfile_directory()}}/tmp/e2e
   docker run --rm \
     -v {{justfile_directory()}}:/src:ro \
@@ -329,7 +329,7 @@ fmt-check:
   cargo fmt --all -- --check
   cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
-# Format flake.nix and nix/ with nixfmt. Deliberately not part of `check`
+# Format flake.nix and packaging/nix/ with nixfmt. Deliberately not part of `check`
 # or `ci`: nix isn't in mise.toml, so requiring it would break contributors
 # who only have the mise toolchain. CI gates it in the `nix-package` job.
 [group('dev')]
@@ -347,7 +347,7 @@ fmt-nix-check:
 # Lint the deployable Helm chart.
 [group('deploy')]
 helm-lint:
-  helm lint charts/kache-service
+  helm lint packaging/charts/kache-service
 
 # Run cargo-llvm-cov and emit JSON + HTML reports under tmp/llvm-cov/.
 # JSON drives the CI threshold check; HTML is uploaded as a CI artifact
@@ -439,8 +439,8 @@ bump VERSION:
   # the app the chart deploys, `version` is the chart's own identity in the OCI
   # registry, and publish-chart ships it from the same `v*` tag. A chart-only
   # fix is therefore a patch release of the whole thing.
-  perl -i -pe 's/^version:.*$/version: {{VERSION}}/' charts/kache-service/Chart.yaml
-  perl -i -pe 's/^appVersion:.*$/appVersion: "{{VERSION}}"/' charts/kache-service/Chart.yaml
+  perl -i -pe 's/^version:.*$/version: {{VERSION}}/' packaging/charts/kache-service/Chart.yaml
+  perl -i -pe 's/^appVersion:.*$/appVersion: "{{VERSION}}"/' packaging/charts/kache-service/Chart.yaml
   # NO --locked: set-version rewrites the lock's version entries, so --locked
   # would error "lock file needs updating". Plain check settles the lock for the
   # local crates only (it does not advance kunobi-* / registry deps).

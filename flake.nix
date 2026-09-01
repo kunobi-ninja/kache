@@ -55,7 +55,7 @@
           };
         in
         {
-          kache = final.callPackage ./nix/package.nix {
+          kache = final.callPackage ./packaging/nix/package.nix {
             inherit rustPlatform;
           };
 
@@ -71,7 +71,7 @@
         root = ./.;
         fileset = lib.fileset.unions [
           ./flake.nix
-          ./nix
+          ./packaging/nix
         ];
       };
 
@@ -84,7 +84,7 @@
           programs.nixfmt.enable = true;
         };
 
-      # Wraps ./nix/module.nix so the exported module works on its own. Without
+      # Wraps ./packaging/nix/module.nix so the exported module works on its own. Without
       # this, the option default falls back to nixpkgs' rustPlatform, whose
       # rustc is below the crate's rust-version, and cargo refuses to build it.
       # `pkgs.kache` comes first so a consumer who applied the overlay keeps
@@ -106,13 +106,13 @@
     in
     {
       nixosModules = {
-        kache = moduleFor ./nix/module.nix;
+        kache = moduleFor ./packaging/nix/module.nix;
         default = self.nixosModules.kache;
       };
 
       # The same module works for nix-darwin (launchd vs systemd is handled internally).
       darwinModules = {
-        kache = moduleFor ./nix/module.nix;
+        kache = moduleFor ./packaging/nix/module.nix;
         default = self.darwinModules.kache;
       };
 

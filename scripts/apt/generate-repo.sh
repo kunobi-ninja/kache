@@ -13,7 +13,7 @@ set -euo pipefail
 # Optional env vars:
 #   DEBS_DIR      - directory containing .deb files (default: /tmp/debs)
 #   APT_REPO_DIR  - output repo directory (default: /tmp/apt-repo)
-#   CONF_DIR      - directory containing distributions config (default: ./apt_config)
+#   CONF_DIR      - directory containing distributions config (default: ./packaging/apt)
 #   APT_STATE_DIR - directory for persistent db (local testing only)
 #
 # R2 db persistence (download only):
@@ -28,7 +28,7 @@ set -euo pipefail
 
 DEBS_DIR="${DEBS_DIR:-/tmp/debs}"
 APT_REPO_DIR="${APT_REPO_DIR:-/tmp/apt-repo}"
-CONF_DIR="${CONF_DIR:-./apt_config}"
+CONF_DIR="${CONF_DIR:-./packaging/apt}"
 
 export REPREPRO_BASE_DIR="${APT_REPO_DIR}"
 mkdir -p "${APT_REPO_DIR}/conf"

@@ -117,7 +117,7 @@ if kache_version != core_version:
 # a mismatch has to fail here — before the push, not after.
 #
 # Plain line reads rather than a yaml dependency: this gate stays hermetic.
-chart_path = root / "charts" / "kache-service" / "Chart.yaml"
+chart_path = root / "packaging" / "charts" / "kache-service" / "Chart.yaml"
 chart = chart_path.read_text()
 
 
@@ -129,7 +129,7 @@ def chart_field(name):
 for field in ("version", "appVersion"):
     value = chart_field(field)
     if value is None:
-        errors.append(f"charts/kache-service/Chart.yaml has no `{field}:`")
+        errors.append(f"packaging/charts/kache-service/Chart.yaml has no `{field}:`")
     elif value != kache_version:
         errors.append(
             f"Chart.yaml {field} {value!r} != workspace version {kache_version!r}"

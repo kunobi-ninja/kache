@@ -357,6 +357,18 @@ jobs:
           retention-days: 3
           if-no-files-found: warn
 
+      # Only the arms that pass `--warm-same-tree` write this directory; the
+      # step is skipped elsewhere so a missing phase never reads as a warning.
+      - name: Upload cache telemetry (warm-same-tree)
+        if: always() && contains(matrix.cmd, '--warm-same-tree')
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: telemetry-otlp-v1-cache-${{ matrix.name }}-warm-same-tree
+          path: tmp/bench/${{ matrix.dir }}/cache-otlp-warm-same-tree/
+          retention-days: 3
+          if-no-files-found: warn
+
   # Firefox compile-cache bench on the self-hosted Windows runner (clang-cl +
   # MSVC under MozillaBuild). Separate from the `bench` matrix above: that runs
   # on the ephemeral Linux ARC (`kunobi-runners`); this needs the persistent

@@ -3122,6 +3122,27 @@ pub fn gc_remote(config: &Config, dry_run: bool, json: bool) -> Result<()> {
         );
     };
 
+    // Read-only mode (`cache.remote_readonly`, `KACHE_REMOTE_READONLY`, or the
+    // untrusted-CI policy in `crate::policy`) means this process may not change
+    // what other machines share, and a sweep deletes more than any upload
+    // writes. Refuse before the lock so a pull-request job never touches the
+    // remote, not even its lock file. A dry run only plans, so it stays
+    // available: it is how a read-only machine previews the sweep.
+    if config.remote_readonly && !dry_run {
+        let reason = remote_readonly_reason(crate::policy::forced_remote_readonly());
+        if json {
+            crate::machine::emit(
+                "gc",
+                RemoteGcJson::skipped(&remote.describe(), &reason),
+                vec![remote_gc_preview_action()],
+            )?;
+        }
+        anyhow::bail!(
+            "`kache gc --remote` will not delete from the remote in read-only mode: {reason}. \
+             `kache gc --remote --dry-run` still shows the plan."
+        );
+    }
+
     // Several machines share a filesystem remote by definition, so a sweep
     // takes the same kind of advisory lock every local GC driver takes before
     // it plans anything. Declining is the right answer for the loser: the
@@ -3130,7 +3151,11 @@ pub fn gc_remote(config: &Config, dry_run: bool, json: bool) -> Result<()> {
         Some(lock) => lock,
         None => {
             if json {
-                return crate::machine::emit("gc", RemoteGcJson::skipped(), Vec::new());
+                return crate::machine::emit(
+                    "gc",
+                    RemoteGcJson::skipped(&remote.describe(), REMOTE_GC_CONTENDED),
+                    Vec::new(),
+                );
             }
             println!("Another remote GC is already running; skipping.");
             return Ok(());
@@ -3164,9 +3189,39 @@ pub fn gc_remote(config: &Config, dry_run: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The reason a contended sweep reports under `--json`.
+const REMOTE_GC_CONTENDED: &str = "another remote GC is already running";
+
+/// Why remote writes are off for this process, worded the way `kache doctor`
+/// reports it: the CI policy's own reason when the policy forced read-only,
+/// otherwise the setting that turned it on.
+fn remote_readonly_reason(forced: Option<crate::policy::ForcedReadonly>) -> String {
+    match forced {
+        Some(forced) => forced.reason,
+        None => "KACHE_REMOTE_READONLY or cache.remote_readonly is set".to_string(),
+    }
+}
+
+/// The follow-up a refused sweep offers: the preview is still allowed.
+fn remote_gc_preview_action() -> crate::machine::NextAction {
+    crate::machine::NextAction {
+        argv: vec![
+            "kache".into(),
+            "gc".into(),
+            "--remote".into(),
+            "--dry-run".into(),
+        ],
+        why: "a read-only process may still preview what a sweep would remove".into(),
+    }
+}
+
 #[derive(Default, serde::Serialize)]
 struct RemoteGcJson {
     skipped: bool,
+    /// Why nothing ran. Present only when `skipped` is true: a peer holds the
+    /// lock, or this process is read-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
     dry_run: bool,
     remote: String,
     budget_bytes: Option<u64>,
@@ -3184,12 +3239,15 @@ struct RemoteGcJson {
 }
 
 impl RemoteGcJson {
-    /// The body emitted when a peer already holds the remote GC lock. Mirrors
-    /// the local `kache gc --json` convention, where `skipped` is the only
-    /// meaningful field of a sweep that never ran.
-    fn skipped() -> Self {
+    /// The body of a sweep that never ran, because a peer holds the remote GC
+    /// lock or because this process is read-only. Mirrors the local
+    /// `kache gc --json` convention, where `skipped` is the only meaningful
+    /// counter of a sweep that never ran; `reason` says which case it was.
+    fn skipped(remote: &str, reason: &str) -> Self {
         Self {
             skipped: true,
+            reason: Some(reason.to_string()),
+            remote: remote.to_string(),
             ..Self::default()
         }
     }
@@ -3204,6 +3262,7 @@ impl RemoteGcJson {
     ) -> Self {
         Self {
             skipped: false,
+            reason: None,
             dry_run,
             remote: remote.to_string(),
             budget_bytes: plan.budget,
@@ -11411,6 +11470,7 @@ mod tests {
 
         let dry = RemoteGcJson::report("file:///srv", true, &plan, None);
         assert!(!dry.skipped && dry.dry_run);
+        assert_eq!(dry.reason, None, "a sweep that ran has nothing to excuse");
         assert_eq!(dry.remote, "file:///srv");
         assert_eq!(dry.budget_bytes, Some(1_000));
         assert_eq!(dry.remote_bytes, 5_000);
@@ -11440,12 +11500,157 @@ mod tests {
 
     #[test]
     fn remote_gc_json_marks_a_contended_sweep_as_skipped() {
-        let body = RemoteGcJson::skipped();
+        let body = RemoteGcJson::skipped("file:///srv", REMOTE_GC_CONTENDED);
         assert!(body.skipped);
+        assert_eq!(body.reason.as_deref(), Some(REMOTE_GC_CONTENDED));
+        assert_eq!(body.remote, "file:///srv");
         assert!(!body.dry_run);
         assert_eq!(body.bytes_freed, 0);
         assert_eq!(body.budget_bytes, None);
-        assert_eq!(body.remote, "");
+    }
+
+    // ── Remote GC under the read-only policy ────────────────────────────────
+
+    fn read_only_remote_gc_config(root: &std::path::Path, entries: usize) -> Config {
+        for i in 0..entries {
+            write_aged_remote_entry(root, "serde", &format!("key{i}"), 4_000);
+        }
+        let mut config = save_manifest_config(root.join("store"), Some(remote_gc_fixture(root)));
+        config.remote_readonly = true;
+        config
+    }
+
+    /// A pull-request job, a tag build, or any machine with
+    /// `KACHE_REMOTE_READONLY=1` shares the folder with writers it must not
+    /// disturb. A live sweep is refused before the lock, so the remote is left
+    /// untouched down to its lock file, and the error says how to preview.
+    #[test]
+    fn remote_gc_refuses_to_sweep_a_read_only_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = read_only_remote_gc_config(root, 4);
+        let before = walk_bytes(&root.join("artifacts"));
+        assert!(before > 0, "the fixture must have written objects");
+
+        let error = gc_remote(&config, false, false)
+            .expect_err("a read-only process must not sweep")
+            .to_string();
+        assert!(error.contains("read-only"), "{error}");
+        assert!(error.contains("--dry-run"), "{error}");
+        assert_eq!(
+            walk_bytes(&root.join("artifacts")),
+            before,
+            "a refused sweep must not delete anything"
+        );
+        for i in 0..4 {
+            assert!(
+                root.join(format!("artifacts/v3/packs/serde/key{i}.tar.zst"))
+                    .exists()
+            );
+            assert!(
+                root.join(format!("artifacts/v3/manifests/serde/key{i}.json"))
+                    .exists()
+            );
+        }
+        assert!(
+            !root
+                .join(crate::remote_eviction::REMOTE_GC_LOCK_FILE)
+                .exists(),
+            "the refusal must come before the lock is taken"
+        );
+    }
+
+    /// `--dry-run` is how a read-only machine sees what a sweep would take, so
+    /// the policy leaves it alone. The lock file it leaves behind is the proof
+    /// it got past the guard and planned; the objects prove it removed nothing.
+    #[test]
+    fn remote_gc_dry_run_is_allowed_on_a_read_only_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = read_only_remote_gc_config(root, 4);
+        let before = walk_bytes(&root.join("artifacts"));
+
+        gc_remote(&config, true, false).expect("a read-only dry run reports the plan");
+        gc_remote(&config, true, true).expect("a read-only dry run reports the plan as json");
+        assert!(
+            root.join(crate::remote_eviction::REMOTE_GC_LOCK_FILE)
+                .exists(),
+            "a dry run plans under the lock like any sweep"
+        );
+        assert_eq!(
+            walk_bytes(&root.join("artifacts")),
+            before,
+            "a dry run must not delete anything, read-only or not"
+        );
+        for i in 0..4 {
+            assert!(
+                root.join(format!("artifacts/v3/packs/serde/key{i}.tar.zst"))
+                    .exists()
+            );
+        }
+    }
+
+    /// The guard keys off the effective setting, so a writable process still
+    /// holds the remote under budget.
+    #[test]
+    fn remote_gc_sweeps_a_writable_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut config = read_only_remote_gc_config(root, 1);
+        config.remote_readonly = false;
+
+        gc_remote(&config, false, false).expect("a writable sweep runs");
+        assert!(
+            !root.join("artifacts/v3/packs/serde/key0.tar.zst").exists(),
+            "a writable sweep must still delete"
+        );
+    }
+
+    /// `--json` reports the refusal on stdout as a skipped sweep that names the
+    /// reason and offers the preview as the next action, and still fails.
+    #[test]
+    fn remote_gc_json_refusal_names_the_reason_and_the_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = read_only_remote_gc_config(root, 1);
+
+        assert!(
+            gc_remote(&config, false, true).is_err(),
+            "json output does not turn a refusal into success"
+        );
+        assert!(root.join("artifacts/v3/packs/serde/key0.tar.zst").exists());
+        assert!(
+            !root
+                .join(crate::remote_eviction::REMOTE_GC_LOCK_FILE)
+                .exists()
+        );
+
+        let body = RemoteGcJson::skipped("file:///srv", "the remote is read-only");
+        assert!(body.skipped);
+        assert_eq!(body.reason.as_deref(), Some("the remote is read-only"));
+        assert_eq!(body.remote, "file:///srv");
+        assert!(!body.dry_run);
+        assert_eq!(body.bytes_freed, 0);
+
+        let next = remote_gc_preview_action();
+        assert_eq!(next.argv, ["kache", "gc", "--remote", "--dry-run"]);
+        assert!(next.why.contains("read-only"), "{}", next.why);
+    }
+
+    /// The reason is the CI policy's own when the policy forced read-only,
+    /// otherwise the setting that turned it on, the way `kache doctor` words it.
+    #[test]
+    fn remote_readonly_reason_prefers_the_policy_reason() {
+        let forced = crate::policy::ForcedReadonly {
+            reason: "GitHub Actions pull_request (branch) is not a protected-branch push".into(),
+        };
+        assert_eq!(
+            remote_readonly_reason(Some(forced)),
+            "GitHub Actions pull_request (branch) is not a protected-branch push"
+        );
+        let configured = remote_readonly_reason(None);
+        assert!(configured.contains("KACHE_REMOTE_READONLY"), "{configured}");
+        assert!(configured.contains("cache.remote_readonly"), "{configured}");
     }
 }
 

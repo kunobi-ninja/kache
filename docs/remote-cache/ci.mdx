@@ -46,7 +46,7 @@ env:
 
 GitHub withholds secrets and OIDC tokens from fork pull-request jobs, so those runs cannot publish unless you also pass a write credential another way. Same-repository pull requests do receive secrets; the CI policy above is what stops them writing.
 
-Pull-request jobs can still restore entries a trusted branch already published.
+Pull-request jobs can still restore entries a trusted branch already published. They cannot sweep a filesystem remote either: `kache gc --remote` refuses in a read-only process, and only `kache gc --remote --dry-run` runs there.
 
 C and C++ objects publish through the same remote as Rust. A daemon-backed compile restores them on miss; `kache sync --pull --all` also warms them in the local store. clang-cl debug objects stay on the machine and are not published.
 

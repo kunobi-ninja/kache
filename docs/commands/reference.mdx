@@ -67,6 +67,8 @@ There is no daemon-side remote sweep: run `kache gc --remote` from cron or a sys
 
 An S3 remote is not swept. Bound it with a bucket lifecycle rule; `kache gc --remote` says so rather than emulating one.
 
+A read-only process does not sweep. When `cache.remote_readonly` or `KACHE_REMOTE_READONLY` is set, or the [CI policy](/docs/remote-cache/ci#who-may-write) has made a pull-request, tag, or unprotected-branch job read-only, `kache gc --remote` refuses with the reason and exits non-zero. `--dry-run` is still allowed and still shows the plan.
+
 GC reports store bytes removed separately from bytes reclaimed on disk. It keeps an entry when its last store blob is still cloned into a build output, because unlinking that blob would free no disk and destroy a usable hit. This can leave the registered store size above `cache.local_max_size`; remove stale targets to reclaim the blocks.
 
 Set `cache.gc_evict_shared = true` or `KACHE_GC_EVICT_SHARED=1` to restore the older namespace-first policy. That lowers the registered store size but does not reclaim blocks retained by target directories, and the discarded entry becomes a future miss. See [Configuration: GC and shared build outputs](/docs/getting-started/configuration#gc-and-shared-build-outputs).

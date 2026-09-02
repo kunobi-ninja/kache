@@ -13,6 +13,12 @@ use predicates::prelude::PredicateBooleanExt;
 use std::path::Path;
 use tempfile::TempDir;
 
+// Only the env plumbing is shared; this file drives the Cargo-built binary,
+// so the bootstrap helpers in `common` stay unused here.
+#[allow(dead_code)]
+mod common;
+use common::hermetic_command;
+
 /// Path to the binary under test. Cargo sets `CARGO_BIN_EXE_kache` to the
 /// artifact it built for this integration test — under `cargo llvm-cov` that
 /// is the instrumented binary, so spawning it counts toward coverage.
@@ -22,19 +28,18 @@ const KACHE_BIN: &str = env!("CARGO_BIN_EXE_kache");
 /// config path, and HOME/CARGO_HOME so nothing touches the developer's real
 /// setup and no background daemon is contacted.
 fn kache(home: &Path, cache_dir: &Path) -> Command {
-    let mut cmd = Command::new(KACHE_BIN);
-    cmd.env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", cache_dir.join("config.toml"))
-        .env("KACHE_LOG", "off")
+    let mut cmd = Command::from(hermetic_command(
+        KACHE_BIN,
+        cache_dir,
+        Some(&cache_dir.join("config.toml")),
+    ));
+    cmd.env("KACHE_LOG", "off")
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
         // Daemons spawned during tests must self-exit quickly instead of
         // lingering indefinitely — otherwise, under `just coverage`,
         // they pile up and CPU-starve the rest of the suite.
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")
-        // Never let a real wrapper config leak into the spawned process.
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "3");
     cmd
 }
 
@@ -64,21 +69,23 @@ impl Env {
     /// Run `cargo build --lib` for `project` through the kache rustc wrapper,
     /// wired to this env's isolated cache/config/HOME. Returns the build output.
     fn wrapper_build(&self, project: &Path, target_dir: &Path) -> std::process::Output {
-        std::process::Command::new(env!("CARGO"))
-            .args(["build", "--lib"])
-            .current_dir(project)
-            .env("RUSTC_WRAPPER", KACHE_BIN)
-            .env("KACHE_CACHE_DIR", &self.cache)
-            .env("KACHE_CONFIG", self.cache.join("config.toml"))
-            .env("KACHE_LOG", "off")
-            .env("HOME", &self.home)
-            // Short idle timeout so the build-spawned daemon doesn't linger and
-            // pile up across tests (see kache() for rationale).
-            .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")
-            .env("CARGO_TARGET_DIR", target_dir)
-            .env("CARGO_INCREMENTAL", "0")
-            .output()
-            .expect("run cargo build with kache wrapper")
+        hermetic_command(
+            env!("CARGO"),
+            &self.cache,
+            Some(&self.cache.join("config.toml")),
+        )
+        .args(["build", "--lib"])
+        .current_dir(project)
+        .env("RUSTC_WRAPPER", KACHE_BIN)
+        .env("KACHE_LOG", "off")
+        .env("HOME", &self.home)
+        // Short idle timeout so the build-spawned daemon doesn't linger and
+        // pile up across tests (see kache() for rationale).
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("CARGO_INCREMENTAL", "0")
+        .output()
+        .expect("run cargo build with kache wrapper")
     }
 }
 
@@ -896,12 +903,10 @@ fn doctor_reports_reachable_daemon_version() {
     let e = env();
     let project = scaffold_lib("kachedoc", "pub fn d() -> u8 { 1 }\n");
     let target_dir = project.path().join("target");
-    let build = std::process::Command::new(env!("CARGO"))
+    let build = hermetic_command(env!("CARGO"), &e.cache, Some(&e.cache.join("config.toml")))
         .args(["build", "--lib"])
         .current_dir(project.path())
         .env("RUSTC_WRAPPER", KACHE_BIN)
-        .env("KACHE_CACHE_DIR", &e.cache)
-        .env("KACHE_CONFIG", e.cache.join("config.toml"))
         .env("KACHE_LOG", "off")
         .env("HOME", &e.home)
         .env("KACHE_DAEMON_IDLE_TIMEOUT", "30") // keep the daemon alive for doctor
@@ -1631,15 +1636,13 @@ fn workspace_wrapper_via_cargo_build_env_and_path() {
         new_path.push(p);
     }
 
-    let build = std::process::Command::new(env!("CARGO"))
+    let build = hermetic_command(env!("CARGO"), &e.cache, Some(&e.cache.join("config.toml")))
         .args(["build", "--lib"])
         .current_dir(project.path())
         .env("PATH", new_path)
         .env("RUSTC_WRAPPER", KACHE_BIN)
         .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "mydriver")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env("KACHE_CACHE_DIR", &e.cache)
-        .env("KACHE_CONFIG", e.cache.join("config.toml"))
         .env("KACHE_LOG", "off")
         .env("HOME", &e.home)
         .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")
@@ -1683,15 +1686,13 @@ fn workspace_wrapper_via_cargo_config_and_path() {
         new_path.push(p);
     }
 
-    let build = std::process::Command::new(env!("CARGO"))
+    let build = hermetic_command(env!("CARGO"), &e.cache, Some(&e.cache.join("config.toml")))
         .args(["build", "--lib"])
         .current_dir(project.path())
         .env("PATH", new_path)
         .env("RUSTC_WRAPPER", KACHE_BIN)
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
-        .env("KACHE_CACHE_DIR", &e.cache)
-        .env("KACHE_CONFIG", e.cache.join("config.toml"))
         .env("KACHE_LOG", "off")
         .env("HOME", &e.home)
         .env("KACHE_DAEMON_IDLE_TIMEOUT", "3")

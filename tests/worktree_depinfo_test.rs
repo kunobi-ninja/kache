@@ -12,7 +12,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 
 fn write_package(root: &Path, package: &str, manifest: &str, source: &str, name: &str) {
     let package = root.join(package);
@@ -98,18 +98,15 @@ embedded = { path = "../embedded" }
 }
 
 fn cargo_build(workspace: &Path, target: &Path, cache: &Path) -> Output {
-    Command::new("cargo")
+    hermetic_command("cargo", cache, Some(&isolated_config_path(cache)))
         .args(["build", "--offline", "--workspace", "--verbose"])
         .current_dir(workspace)
         .env("RUSTC_WRAPPER", kache_binary())
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TERM_COLOR", "never")
-        .env("KACHE_CACHE_DIR", cache)
         .env("KACHE_BASE_DIR", workspace)
-        .env("KACHE_CONFIG", isolated_config_path(cache))
         .env("KACHE_LOG", "off")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("KACHE_DISABLED")
         .output()

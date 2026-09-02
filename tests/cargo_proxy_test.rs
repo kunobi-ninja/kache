@@ -11,19 +11,26 @@ use std::process::{Command, Output};
 
 const KACHE_BIN: &str = env!("CARGO_BIN_EXE_kache");
 
-fn cargo_env(command: &mut Command, home: &Path, cache: &Path, target: &Path) {
+// Only the env plumbing is shared; this file drives the Cargo-built binary,
+// so the bootstrap helpers in `common` stay unused here.
+#[allow(dead_code)]
+mod common;
+use common::hermetic_command;
+
+/// `kache cargo` wired to a throwaway HOME, cache, and target directory.
+fn proxied_cargo(home: &Path, cache: &Path, target: &Path) -> Command {
+    let mut command = hermetic_command(KACHE_BIN, cache, Some(&cache.join("config.toml")));
     command
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_INCREMENTAL", "0")
         .env("RUSTC_WRAPPER", KACHE_BIN)
-        .env("KACHE_CACHE_DIR", cache)
-        .env("KACHE_CONFIG", cache.join("config.toml"))
         .env("KACHE_LOG", "off")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("CARGO_BUILD_RUSTFLAGS");
+    command
 }
 
 #[test]
@@ -49,11 +56,10 @@ fn canonical_cargo_home_alias_keeps_existing_cargo_unit_fresh() {
     )
     .unwrap();
 
-    let mut cold = Command::new(KACHE_BIN);
+    let mut cold = proxied_cargo(&home, &cache, &cold_target);
     cold.args(["cargo", "--", "check", "--quiet"])
         .current_dir(&project)
         .env("KACHE_REAL_CARGO", env!("CARGO"));
-    cargo_env(&mut cold, &home, &cache, &cold_target);
     let cold = cold.output().unwrap();
     assert!(
         cold.status.success(),
@@ -63,12 +69,11 @@ fn canonical_cargo_home_alias_keeps_existing_cargo_unit_fresh() {
 
     std::os::unix::fs::symlink(&cargo_home, home.join("work/.cargo")).unwrap();
 
-    let mut warm = Command::new(KACHE_BIN);
+    let mut warm = proxied_cargo(&home, &cache, &cold_target);
     warm.args(["cargo", "--", "check", "--verbose", "--color=never"])
         .current_dir(&project)
         .env("KACHE_REAL_CARGO", env!("CARGO"))
         .env("CARGO_TERM_COLOR", "always");
-    cargo_env(&mut warm, &home, &cache, &cold_target);
     let warm = warm.output().unwrap();
     assert!(
         warm.status.success(),
@@ -124,12 +129,11 @@ fn explicit_rustflags_keep_their_cargo_precedence() {
     .unwrap();
     std::os::unix::fs::symlink(&cargo_home, home.join("work/.cargo")).unwrap();
 
-    let mut command = Command::new(KACHE_BIN);
+    let mut command = proxied_cargo(&home, &cache, &target);
     command
         .args(["cargo", "--", "check", "--quiet"])
         .current_dir(&project)
         .env("KACHE_REAL_CARGO", env!("CARGO"));
-    cargo_env(&mut command, &home, &cache, &target);
     command.env("RUSTFLAGS", "--cfg from_env");
     let output = command.output().unwrap();
     assert!(
@@ -253,13 +257,12 @@ fn write_shared_target_project(root: &Path, value: &str) {
 }
 
 fn proxied_shared_target_build(project: &Path, home: &Path, cache: &Path, target: &Path) -> Output {
-    let mut command = Command::new(KACHE_BIN);
+    let mut command = proxied_cargo(home, cache, target);
     command
         .args(["cargo", "--", "build", "--quiet"])
         .current_dir(project)
         .env("KACHE_REAL_CARGO", env!("CARGO"))
         .env("KACHE_CACHE_EXECUTABLES", "1");
-    cargo_env(&mut command, home, cache, target);
     command.output().unwrap()
 }
 

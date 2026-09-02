@@ -8,7 +8,7 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 
 const INPUT_ENV: &str = "KACHE_TEST_368_INPUT";
 const BIN_INPUT_ENV: &str = "KACHE_TEST_368_BIN_INPUT";
@@ -170,20 +170,17 @@ fn cargo_build(workspace: &Path, target: &Path, cache: &Path) -> Output {
     // Keep the shared helper linked in this test binary, but deliberately do
     // not pin it: project discovery must select `<workspace>/.kache.toml`.
     let _unused_machine_config = isolated_config_path(cache);
-    Command::new("cargo")
+    hermetic_command("cargo", cache, None)
         .args(["build", "--offline", "--workspace", "--verbose"])
         .current_dir(workspace)
         .env("RUSTC_WRAPPER", kache_binary())
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TERM_COLOR", "never")
-        .env("KACHE_CACHE_DIR", cache)
         .env("KACHE_CACHE_EXECUTABLES", "1")
         .env("KACHE_LOG", "kache=debug")
         .env(INPUT_ENV, workspace.join("shared/value.txt"))
         .env(BIN_INPUT_ENV, workspace.join("shared/bin-value.txt"))
-        .env_remove("KACHE_CONFIG")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("KACHE_DISABLED")
         .output()

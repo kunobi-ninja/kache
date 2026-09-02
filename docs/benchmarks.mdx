@@ -14,6 +14,7 @@ The [Bench workflow](https://github.com/kunobi-ninja/kache/actions/workflows/ben
 - Firefox through sccache for comparison
 - Firefox source-update builds on Linux and Windows
 - hk cold, warm and next-commit builds on Linux: a mid-size Rust CLI whose build scripts compile C and assembly through cc-rs, wired the way `kache init` configures a machine
+- The same hk build through mbx at its latest release, for a side-by-side comparison
 
 Jobs upload their reports, Perfetto traces, and logs even when a benchmark fails. GitHub retains those artifacts for 30 days.
 

@@ -1,0 +1,47 @@
+# hk (jdx/hk) through mbx: the same subject, commit, toolchain and build
+# command as bench-hk, driven by mbx instead of kache, so the two arms read
+# side by side. mbx fronts Cargo and installs its own C shims for build
+# scripts, so this scenario sets no compiler wiring; the harness puts its
+# `cargo` shim on PATH and points MBX_CACHE_DIR at the store.
+#
+# Cold and warm only (the external arms have no same-tree phase). Nightly
+# arm: hk-mbx in bench.yml, mbx at its latest release through mise.
+name = "bench-hk-mbx"
+tags = ["suite:bench", "project:hk", "backend:mbx", "lang:rust", "lang:cc"]
+
+requires = ["cargo", "rustc", "cc"]
+
+setup = [
+  "echo '[bench] bench-hk-mbx needs a C compiler (aws-lc-sys cc builder, vendored libgit2); cmake only as the aws-lc-sys fallback.'",
+]
+
+# Same portability knobs as bench-hk so the two arms build identical
+# inputs; the store location comes from the harness.
+build = """
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+
+cargo build --locked
+"""
+
+[source]
+kind   = "clone"
+repo   = "https://github.com/jdx/hk.git"
+ref    = "fc29ead1456ba7c1f62826c284126410a4014b00"
+objdir = "target"
+
+[[file]]
+path = "rust-toolchain.toml"
+content = """
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+"""
+
+# Advisory only, as for the sccache arm: the number is the point.
+[checks.measure.warm]
+min_hit_rate_pct = 50.0

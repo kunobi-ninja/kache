@@ -20,6 +20,9 @@ struct Args {
     /// Path to the sccache binary when running `--cache-backend sccache`.
     #[arg(long, default_value = "sccache")]
     sccache: PathBuf,
+    /// Path to the mbx binary when running `--cache-backend mbx`.
+    #[arg(long, default_value = "mbx")]
+    mbx: PathBuf,
 
     /// Compiler-cache backend for clone benchmark scenarios.
     #[arg(long, value_enum, default_value_t = CacheBackend::Kache)]
@@ -174,6 +177,7 @@ pub fn main() -> Result<()> {
         bench_runner::run_bench(BenchRunConfig {
             kache: args.kache,
             sccache: args.sccache,
+            mbx: args.mbx,
             cache_backend: args.cache_backend,
             scenarios: args.scenarios,
             select,
@@ -211,6 +215,7 @@ fn cache_backend_label(cache_backend: CacheBackend) -> &'static str {
     match cache_backend {
         CacheBackend::Kache => "kache",
         CacheBackend::Sccache => "sccache",
+        CacheBackend::Mbx => "mbx",
     }
 }
 
@@ -218,13 +223,24 @@ fn benchmark_recipe_hint(cache_backend: CacheBackend) -> &'static str {
     match cache_backend {
         CacheBackend::Kache => "just bench <profile>",
         CacheBackend::Sccache => "just bench-sccache <profile>",
+        CacheBackend::Mbx => "just bench-mbx <profile>",
+    }
+}
+
+/// The `-<backend>` suffix a comparison scenario carries in its name; the
+/// recipe argument is the bare subject.
+fn backend_suffix(cache_backend: CacheBackend) -> Option<&'static str> {
+    match cache_backend {
+        CacheBackend::Kache => None,
+        CacheBackend::Sccache => Some("-sccache"),
+        CacheBackend::Mbx => Some("-mbx"),
     }
 }
 
 fn profile_hint(name: &str, cache_backend: CacheBackend) -> String {
     let mut profile = name.strip_prefix("bench-").unwrap_or(name).to_string();
-    if cache_backend == CacheBackend::Sccache
-        && let Some(stripped) = profile.strip_suffix("-sccache")
+    if let Some(suffix) = backend_suffix(cache_backend)
+        && let Some(stripped) = profile.strip_suffix(suffix)
     {
         profile = stripped.to_string();
     }
@@ -280,6 +296,33 @@ mod tests {
         assert_eq!(
             profile_hint("bench-firefox-sccache", CacheBackend::Sccache),
             "firefox"
+        );
+        assert_eq!(profile_hint("bench-hk-mbx", CacheBackend::Mbx), "hk");
+        // The label and the recipe are what a `--list` reader types next;
+        // both name the backend they were asked about.
+        for (backend, label, recipe, suffix) in [
+            (CacheBackend::Kache, "kache", "just bench <profile>", None),
+            (
+                CacheBackend::Sccache,
+                "sccache",
+                "just bench-sccache <profile>",
+                Some("-sccache"),
+            ),
+            (
+                CacheBackend::Mbx,
+                "mbx",
+                "just bench-mbx <profile>",
+                Some("-mbx"),
+            ),
+        ] {
+            assert_eq!(cache_backend_label(backend), label);
+            assert_eq!(benchmark_recipe_hint(backend), recipe);
+            assert_eq!(backend_suffix(backend), suffix);
+        }
+        assert_eq!(
+            profile_hint("bench-hk-mbx", CacheBackend::Kache),
+            "hk-mbx",
+            "only the selected backend's suffix is stripped"
         );
     }
 }

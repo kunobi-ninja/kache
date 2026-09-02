@@ -1277,6 +1277,21 @@ mod tests {
         path
     }
 
+    /// The name a tool reports in diagnostics is the name the parser
+    /// recognises on disk; a drifting spelling would make an error message
+    /// name a tool `windows_tool_from_name` cannot find.
+    #[test]
+    fn windows_tool_names_round_trip_through_the_parser() {
+        for (tool, name) in [
+            (WindowsTool::Link, "link.exe"),
+            (WindowsTool::LldLink, "lld-link.exe"),
+            (WindowsTool::Cl, "cl.exe"),
+        ] {
+            assert_eq!(tool.name(), name);
+            assert_eq!(windows_tool_from_name(Path::new(tool.name())), Some(tool));
+        }
+    }
+
     fn compiler_banner(architecture: &str) -> String {
         format!("Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35207 for {architecture}")
     }

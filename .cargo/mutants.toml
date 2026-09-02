@@ -172,7 +172,13 @@ gitignore = true
 # Keep only the whole-body replacements out of this lane: their parsing,
 # selection, measurement, verdict, artifact, and OTLP helpers remain in scope.
 # `run_cold_phase` is the same shape: a full clone/build that this lane cannot
-# drive. The dump it now calls (`write_cache_otlp_or_warn`) stays in scope.
+# drive. The dump it now calls (`write_cache_otlp_or_warn`) stays in scope. The
+# mbx arm's entry point is the same shape as the sccache one, and
+# `print_mbx_summary` writes the human summary to the e2e driver's
+# stderr, the `report_key_divergence` shape above: an in-process test cannot
+# observe those bytes. Every number it prints is computed by helpers that are
+# tested directly (`external_measure_warnings`, `phase_speedup`, `disk_delta`,
+# `bytes_to_mib`, `MbxPhaseMetrics::from_report`).
 #
 # macOS SDK discovery and `macos_oso_prefix_flag` are compiled only on macOS,
 # while the diff mutation lane runs on Ubuntu. macOS tests exercise both SDK
@@ -237,6 +243,8 @@ exclude_re = [
     "replace run_bench .* with Ok",
     "replace run_pull_bench .* with Ok",
     "replace run_sccache_bench .* with Ok",
+    "replace run_mbx_bench .* with Ok",
+    "replace print_mbx_summary with \\(\\)",
     "replace run_cold_phase .* with Ok",
     "src/cache_fs.rs:.*replace probe_windows",
     "src/cache_fs.rs:.*replace statfs_total_bytes_macos",

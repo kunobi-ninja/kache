@@ -110,6 +110,8 @@ const SCCACHE_BENCH_IDLE_TIMEOUT_SECS: &str = "43200";
 pub struct BenchRunConfig {
     pub kache: PathBuf,
     pub sccache: PathBuf,
+    /// Path to the mbx binary when running `--cache-backend mbx`.
+    pub mbx: PathBuf,
     pub cache_backend: CacheBackend,
     pub scenarios: PathBuf,
     pub select: Vec<String>,
@@ -129,6 +131,10 @@ pub struct BenchRunConfig {
 pub enum CacheBackend {
     Kache,
     Sccache,
+    /// mbx, a Cargo-front build cache. Driven through the same `cargo` shim
+    /// its `setup` installs, with its own C shims, so the scenario's build
+    /// command runs unchanged.
+    Mbx,
 }
 
 impl CacheBackend {
@@ -136,20 +142,27 @@ impl CacheBackend {
         match self {
             CacheBackend::Kache => "kache",
             CacheBackend::Sccache => "sccache",
+            CacheBackend::Mbx => "mbx",
         }
+    }
+
+    /// A backend other than kache: only cold and warm, no key tracing.
+    fn is_external(self) -> bool {
+        !matches!(self, CacheBackend::Kache)
     }
 }
 
 pub fn run_bench(config: BenchRunConfig) -> Result<()> {
-    if config.cache_backend == CacheBackend::Sccache && config.trace_keys {
+    if config.cache_backend.is_external() && config.trace_keys {
         bail!("--trace-keys is only supported with --cache-backend kache");
     }
-    if config.cache_backend == CacheBackend::Sccache && config.warm_same_tree {
+    if config.cache_backend.is_external() && config.warm_same_tree {
         bail!("--warm-same-tree is only supported with --cache-backend kache");
     }
     let cache_tool_arg = match config.cache_backend {
         CacheBackend::Kache => &config.kache,
         CacheBackend::Sccache => &config.sccache,
+        CacheBackend::Mbx => &config.mbx,
     };
     let cache_tool_path = resolve_binary(cache_tool_arg);
     let kache = de_verbatim(cache_tool_path.canonicalize().with_context(|| {
@@ -341,22 +354,45 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         None
     };
 
-    if config.cache_backend == CacheBackend::Sccache {
-        return run_sccache_bench(
-            &profile,
-            &kache,
-            &cache_dir,
-            &clone_a,
-            &clone_b,
-            &work_dir,
-            config.retry,
-            &sh,
-            disk_free_before,
-            &objdir,
-            &run_id,
-            &run_archive_dir,
-            cache_tool_version.as_deref(),
-        );
+    // Every backend other than kache has its own two-phase arm; matching
+    // exhaustively keeps the dispatch from depending on a comparison that
+    // could quietly select the wrong one.
+    match config.cache_backend {
+        CacheBackend::Sccache => {
+            return run_sccache_bench(
+                &profile,
+                &kache,
+                &cache_dir,
+                &clone_a,
+                &clone_b,
+                &work_dir,
+                config.retry,
+                &sh,
+                disk_free_before,
+                &objdir,
+                &run_id,
+                &run_archive_dir,
+                cache_tool_version.as_deref(),
+            );
+        }
+        CacheBackend::Mbx => {
+            return run_mbx_bench(
+                &profile,
+                &kache,
+                &cache_dir,
+                &clone_a,
+                &clone_b,
+                &work_dir,
+                config.retry,
+                &sh,
+                disk_free_before,
+                &objdir,
+                &run_id,
+                &run_archive_dir,
+                cache_tool_version.as_deref(),
+            );
+        }
+        CacheBackend::Kache => {}
     }
 
     // cold: either run it fresh (full run) or restore the snapshot saved
@@ -471,10 +507,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // compression-honest). `checked_sub` guards the rare case where background
     // activity freed more than the builds wrote, which would not be a usable
     // measurement.
-    let disk_measured_bytes = match (disk_free_before, available_bytes(&work_dir)) {
-        (Some(before), Some(after)) => before.checked_sub(after),
-        _ => None,
-    };
+    let disk_measured_bytes = disk_delta(disk_free_before, available_bytes(&work_dir));
 
     // Speedups stay on whole seconds: the nightly JSON and the kartero payload
     // carry them, and the perf gate reads `wall_ms` directly instead.
@@ -693,6 +726,22 @@ fn measures_disk_footprint(retry: bool, warm_same_tree: bool) -> bool {
 /// compares `wall_ms` directly. Zero when the phase rounded down to zero
 /// seconds: dividing by zero yields an infinity that is not a number any
 /// report should carry.
+/// Space the run consumed: free space before minus free space after, when
+/// both readings exist. `None` when either is missing, and when the tree
+/// grew back (other activity freed more than the builds wrote), which is not
+/// a usable measurement.
+fn disk_delta(before: Option<u64>, after: Option<u64>) -> Option<u64> {
+    match (before, after) {
+        (Some(before), Some(after)) => before.checked_sub(after),
+        _ => None,
+    }
+}
+
+/// Bytes as mebibytes to one decimal, the unit the bench JSON reports.
+fn bytes_to_mib(bytes: u64) -> f64 {
+    round1(bytes as f64 / (1024.0 * 1024.0))
+}
+
 fn phase_speedup(cold_wall_s: u64, phase_wall_s: u64) -> f64 {
     if phase_wall_s > 0 {
         round2(cold_wall_s as f64 / phase_wall_s as f64)
@@ -1182,6 +1231,20 @@ fn build(
                 .env("SCCACHE_BASEDIRS", clone)
                 .env("SCCACHE_ERROR_LOG", &wrapper_log_path);
         }
+        CacheBackend::Mbx => {
+            // `cargo` resolves to the shim, which execs mbx in Cargo-shim
+            // mode; mbx then excludes the shim directory from PATH to find
+            // the real Cargo, installs its own compiler shims, and writes
+            // the session report at exit. No RUSTC_WRAPPER: mbx is the
+            // wrapper.
+            let shim_dir = install_mbx_cargo_shim(work_dir, kache)?;
+            cmd.env("PATH", prepend_to_path(&shim_dir)?)
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env("MBX_CACHE_DIR", cache_dir)
+                .env("MBX_STATS_REPORT", mbx_report_path(work_dir, phase))
+                .env("MBX_SUMMARY", "full");
+        }
     }
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -1597,10 +1660,7 @@ fn run_sccache_bench(
     ensure_sccache_cache_location(&warm_metrics, cache_dir, Phase::Warm.name())?;
     ensure_sccache_base_dirs(&warm_metrics, clone_b, Phase::Warm.name())?;
 
-    let disk_measured_bytes = match (disk_free_before, available_bytes(work_dir)) {
-        (Some(before), Some(after)) => before.checked_sub(after),
-        _ => None,
-    };
+    let disk_measured_bytes = disk_delta(disk_free_before, available_bytes(work_dir));
     // Whole seconds, as for the kache path: the speedup is a nightly value.
     let warm_s = whole_seconds(warm_ms);
     let speedup = if warm_s > 0 {
@@ -2480,6 +2540,449 @@ fn human_bytes(b: u64) -> String {
     } else {
         format!("{b} B")
     }
+}
+
+// ── mbx arm ─────────────────────────────────────────────────────────────────
+//
+// mbx fronts Cargo instead of wrapping rustc, so the harness drives it the
+// way its `setup` does: a `cargo` shim on PATH that execs mbx in shim mode.
+// The store lives in `MBX_CACHE_DIR`; the per-build counters come from the
+// versioned JSON it writes to `MBX_STATS_REPORT` when the session ends.
+
+/// The `cargo` shim `mbx setup` installs, minus the install-dir lookup: the
+/// target path is written next to it.
+const MBX_CARGO_SHIM: &str = r#"#!/bin/sh
+shim_dir=$(cd -- "$(dirname -- "$0")" && pwd -P)
+IFS= read -r mbx_executable <"$shim_dir/mbx-target"
+if [ -z "$mbx_executable" ] || [ ! -x "$mbx_executable" ]; then
+  echo 'mbx cargo shim: mbx-target does not name an executable' >&2
+  exit 127
+fi
+MBX_CARGO_SHIM_MODE=1
+MBX_CARGO_SHIM_PATH="$shim_dir/cargo"
+export MBX_CARGO_SHIM_MODE MBX_CARGO_SHIM_PATH
+exec "$mbx_executable" "$@"
+"#;
+
+/// Write the `cargo` shim and its target file under `work_dir`; returns the
+/// directory to prepend to PATH. Rewritten every build so a changed binary
+/// path never runs a stale shim.
+fn install_mbx_cargo_shim(work_dir: &Path, mbx: &Path) -> Result<PathBuf> {
+    let shim_dir = work_dir.join("mbx-shim");
+    std::fs::create_dir_all(&shim_dir)
+        .with_context(|| format!("creating {}", shim_dir.display()))?;
+    let target = shim_dir.join("mbx-target");
+    std::fs::write(&target, format!("{}\n", mbx.display()))
+        .with_context(|| format!("writing {}", target.display()))?;
+    let shim = shim_dir.join("cargo");
+    std::fs::write(&shim, MBX_CARGO_SHIM).with_context(|| format!("writing {}", shim.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("making {} executable", shim.display()))?;
+    }
+    Ok(shim_dir)
+}
+
+/// `dir` in front of the current PATH, in the platform's separator.
+fn prepend_to_path(dir: &Path) -> Result<std::ffi::OsString> {
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let entries = std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&current));
+    std::env::join_paths(entries).context("prepending the mbx shim directory to PATH")
+}
+
+fn mbx_report_path(work_dir: &Path, phase: &str) -> PathBuf {
+    work_dir.join(format!("report-{phase}.mbx.json"))
+}
+
+/// One phase of the mbx arm, reduced from its stats report (version 4).
+/// Field names follow the report; durations are converted to seconds.
+#[derive(Debug, Serialize, Deserialize)]
+struct MbxPhaseMetrics {
+    /// Whole seconds, truncated from `wall_ms`; see [`PhaseMetrics::wall_s`].
+    wall_s: u64,
+    wall_ms: u64,
+    #[serde(default)]
+    report_version: u64,
+    lookups: u64,
+    hits: u64,
+    misses: u64,
+    unconsulted: u64,
+    /// Bypass reason -> count, as reported.
+    #[serde(default)]
+    bypasses: BTreeMap<String, u64>,
+    bypassed: u64,
+    compiler_invocations_avoided: u64,
+    /// Compiler time the report says its hits avoided, in seconds.
+    time_saved_s: u64,
+    hit_rate_pct: f64,
+    restored_output_files: u64,
+    restored_output_bytes: u64,
+    reflinked_output_bytes: u64,
+    copied_output_bytes: u64,
+    stored_bytes: u64,
+}
+
+impl MbxPhaseMetrics {
+    fn from_report(raw: &serde_json::Value, wall_ms: u64) -> Self {
+        let count = |key: &str| raw[key].as_u64().unwrap_or(0);
+        let hits = count("hits");
+        let misses = count("misses");
+        let denominator = hits.saturating_add(misses);
+        let hit_rate_pct = if denominator > 0 {
+            hits as f64 / denominator as f64 * 100.0
+        } else {
+            0.0
+        };
+        let bypasses: BTreeMap<String, u64> = raw["bypasses"]
+            .as_object()
+            .map(|reasons| {
+                reasons
+                    .iter()
+                    .map(|(reason, n)| (reason.clone(), n.as_u64().unwrap_or(0)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let bypassed = bypasses
+            .values()
+            .fold(0u64, |acc, n| acc.saturating_add(*n));
+        MbxPhaseMetrics {
+            wall_s: whole_seconds(wall_ms),
+            wall_ms,
+            report_version: count("version"),
+            lookups: count("lookups"),
+            hits,
+            misses,
+            unconsulted: count("unconsulted"),
+            bypasses,
+            bypassed,
+            compiler_invocations_avoided: count("compiler_invocations_avoided"),
+            time_saved_s: count("estimated_compiler_duration_avoided_ns") / 1_000_000_000,
+            hit_rate_pct: round1(hit_rate_pct),
+            restored_output_files: count("restored_output_files"),
+            restored_output_bytes: count("restored_output_bytes"),
+            reflinked_output_bytes: count("reflinked_output_bytes"),
+            copied_output_bytes: count("copied_output_bytes"),
+            stored_bytes: count("stored_bytes"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MbxBenchResult {
+    project: String,
+    git_ref: String,
+    platform: String,
+    cache_backend: String,
+    run_id: String,
+    artifact_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_tool_version: Option<String>,
+    cold: MbxPhaseMetrics,
+    warm: MbxPhaseMetrics,
+    speedup: f64,
+    cache_size_mb: f64,
+    cache_dir_bytes: u64,
+    cold_objdir_bytes: u64,
+    warm_objdir_bytes: u64,
+    sum_apparent_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_measured_bytes: Option<u64>,
+    measure_warnings: Vec<String>,
+    reports: Vec<String>,
+}
+
+/// Read the report mbx wrote for `phase`. Absent means the session never
+/// reached its exit path, which is a failed run, not a zero.
+fn capture_mbx_report(work_dir: &Path, phase: &str, wall_ms: u64) -> Result<MbxPhaseMetrics> {
+    let path = mbx_report_path(work_dir, phase);
+    let raw: serde_json::Value = read_json(&path).with_context(|| {
+        format!(
+            "mbx wrote no stats report at {} (MBX_STATS_REPORT); the build did not finish through mbx",
+            path.display()
+        )
+    })?;
+    Ok(MbxPhaseMetrics::from_report(&raw, wall_ms))
+}
+
+fn otlp_mbx_phase(
+    name: &'static str,
+    metrics: &MbxPhaseMetrics,
+    objdir_bytes: u64,
+) -> crate::bench_otlp::OtlpPhase {
+    crate::bench_otlp::OtlpPhase {
+        name,
+        wall_s: metrics.wall_s,
+        time_saved_s: Some(metrics.time_saved_s),
+        hits: metrics.hits,
+        dups: None,
+        misses: metrics.misses,
+        errors: None,
+        total: Some(metrics.lookups),
+        hit_rate_pct: metrics.hit_rate_pct,
+        weighted_hit_rate_pct: None,
+        leak_warnings: None,
+        objdir_bytes,
+    }
+}
+
+/// The warm-phase advisory checks every external arm shares: wall clock,
+/// hit rate and speedup against the scenario's `measure` block.
+fn external_measure_warnings(
+    wall_s: u64,
+    hit_rate_pct: f64,
+    speedup: f64,
+    measure: Option<&MeasureSpec>,
+) -> Vec<String> {
+    let Some(measure) = measure else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    if let Some(max) = measure.max_wall_s
+        && wall_s > max
+    {
+        warnings.push(format!(
+            "warm wall time {wall_s}s exceeded configured warning threshold {max}s"
+        ));
+    }
+    if let Some(min) = measure.min_hit_rate_pct
+        && hit_rate_pct < min
+    {
+        warnings.push(format!(
+            "warm hit rate {hit_rate_pct:.1}% below configured warning threshold {min:.1}%"
+        ));
+    }
+    if let Some(min) = measure.min_speedup
+        && speedup < min
+    {
+        warnings.push(format!(
+            "speedup {speedup:.2}x below configured warning threshold {min:.2}x"
+        ));
+    }
+    warnings
+}
+
+fn run_mbx_cold_phase(
+    profile: &BenchProfile,
+    mbx: &Path,
+    cache_dir: &Path,
+    clone_a: &Path,
+    work_dir: &Path,
+    sh: &Path,
+) -> Result<MbxPhaseMetrics> {
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(cache_dir).context("clearing mbx cache dir")?;
+    }
+    std::fs::create_dir_all(cache_dir)?;
+    let cold_ms = build(
+        profile,
+        clone_a,
+        Phase::Cold.name(),
+        cache_dir,
+        &work_dir.join("mbx-config-unused.toml"),
+        mbx,
+        work_dir,
+        CacheBackend::Mbx,
+        false,
+        sh,
+    )?;
+    let cold_metrics = capture_mbx_report(work_dir, Phase::Cold.name(), cold_ms)?;
+    source::snapshot_dir(cache_dir, &work_dir.join("cache-after-cold"))?;
+    Ok(cold_metrics)
+}
+
+fn retry_load_mbx_cold(
+    profile_name: &str,
+    cache_dir: &Path,
+    work_dir: &Path,
+) -> Result<MbxPhaseMetrics> {
+    let snapshot = work_dir.join("cache-after-cold");
+    let result_json = work_dir.join(format!("{profile_name}.json"));
+    for required in [&snapshot, &result_json] {
+        if !required.exists() {
+            bail!(
+                "--retry: required artifact missing — {} (run `just bench-mbx {profile_name}` once first)",
+                required.display()
+            );
+        }
+    }
+    eprintln!(
+        "\n[bench] [retry] restoring cold-state mbx cache dir from {}",
+        snapshot.display()
+    );
+    source::snapshot_dir(&snapshot, cache_dir)?;
+    let prev: serde_json::Value = read_json(&result_json)?;
+    load_saved_phase(prev["cold"].clone()).with_context(|| {
+        format!(
+            "loading previous cold mbx metrics from {}",
+            result_json.display()
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mbx_bench(
+    profile: &BenchProfile,
+    mbx: &Path,
+    cache_dir: &Path,
+    clone_a: &Path,
+    clone_b: &Path,
+    work_dir: &Path,
+    retry: bool,
+    sh: &Path,
+    disk_free_before: Option<u64>,
+    objdir: &str,
+    run_id: &str,
+    run_archive_dir: &Path,
+    cache_tool_version: Option<&str>,
+) -> Result<()> {
+    if cfg!(windows) {
+        bail!(
+            "--cache-backend mbx drives mbx through a POSIX `cargo` shim; not supported on Windows"
+        );
+    }
+    let cold_metrics = if retry {
+        retry_load_mbx_cold(&profile.name, cache_dir, work_dir)?
+    } else {
+        run_mbx_cold_phase(profile, mbx, cache_dir, clone_a, work_dir, sh)?
+    };
+
+    let warm_ms = build(
+        profile,
+        clone_b,
+        Phase::Warm.name(),
+        cache_dir,
+        &work_dir.join("mbx-config-unused.toml"),
+        mbx,
+        work_dir,
+        CacheBackend::Mbx,
+        false,
+        sh,
+    )?;
+    let warm_metrics = capture_mbx_report(work_dir, Phase::Warm.name(), warm_ms)?;
+
+    let disk_measured_bytes = disk_delta(disk_free_before, available_bytes(work_dir));
+    let speedup = phase_speedup(cold_metrics.wall_s, warm_metrics.wall_s);
+    let measure_warnings = external_measure_warnings(
+        warm_metrics.wall_s,
+        warm_metrics.hit_rate_pct,
+        speedup,
+        profile.checks.measure.for_phase(Phase::Warm.name()),
+    );
+    let cold_objdir_bytes = dir_size_kb(&clone_a.join(objdir)).saturating_mul(1024);
+    let warm_objdir_bytes = dir_size_kb(&clone_b.join(objdir)).saturating_mul(1024);
+    let cache_dir_bytes = dir_size_kb(cache_dir).saturating_mul(1024);
+    let sum_apparent_bytes = cold_objdir_bytes
+        .saturating_add(warm_objdir_bytes)
+        .saturating_add(cache_dir_bytes);
+
+    let result = MbxBenchResult {
+        project: profile.name.clone(),
+        git_ref: profile.git_ref.clone(),
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        cache_backend: CacheBackend::Mbx.label().to_string(),
+        run_id: run_id.to_string(),
+        artifact_dir: run_archive_dir.display().to_string(),
+        cache_tool_version: cache_tool_version.map(ToString::to_string),
+        cold: cold_metrics,
+        warm: warm_metrics,
+        speedup,
+        cache_size_mb: bytes_to_mib(cache_dir_bytes),
+        cache_dir_bytes,
+        cold_objdir_bytes,
+        warm_objdir_bytes,
+        sum_apparent_bytes,
+        disk_measured_bytes,
+        measure_warnings,
+        reports: [
+            "report-cold.mbx.json",
+            "report-warm.mbx.json",
+            "build-cold.log",
+            "build-warm.log",
+        ]
+        .map(String::from)
+        .to_vec(),
+    };
+
+    let out = work_dir.join(format!("{}.json", profile.name));
+    std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
+        .with_context(|| format!("writing {}", out.display()))?;
+    write_otlp_or_warn(
+        work_dir,
+        crate::bench_otlp::OtlpRun {
+            project: result.project.clone(),
+            git_ref: result.git_ref.clone(),
+            cache_tool: "mbx",
+            time_unix_nano: crate::bench_otlp::OtlpRun::now_unix_nano(),
+            verdict_ok: true,
+            speedup: Some(result.speedup),
+            cache_size_bytes: result.cache_dir_bytes,
+            key_stability_pct: None,
+            disk_measured_bytes: result.disk_measured_bytes,
+            phases: vec![
+                otlp_mbx_phase("cold", &result.cold, result.cold_objdir_bytes),
+                otlp_mbx_phase("warm", &result.warm, result.warm_objdir_bytes),
+            ],
+        },
+    );
+    archive_run_artifacts(work_dir, run_archive_dir)?;
+    print_mbx_summary(&result, run_archive_dir);
+    eprintln!("[bench] summary written to {}", out.display());
+    Ok(())
+}
+
+fn print_mbx_summary(r: &MbxBenchResult, archive_dir: &Path) {
+    let bar = "=".repeat(64);
+    let fmt = |s: u64| format!("{}m {:02}s", s / 60, s % 60);
+    eprintln!("\n{bar}");
+    eprintln!("  mbx benchmark: {} — {}", r.project, r.git_ref);
+    if let Some(version) = &r.cache_tool_version {
+        eprintln!("  cache tool : {version}");
+    }
+    eprintln!("{bar}");
+    eprintln!(
+        "  cold build : {}   (empty cache, baseline)",
+        fmt(r.cold.wall_s)
+    );
+    eprintln!(
+        "  warm build : {}   (cache populated by cold)",
+        fmt(r.warm.wall_s)
+    );
+    eprintln!("  speedup    : {:.2}x", r.speedup);
+    eprintln!(
+        "  warm cache : {} hits / {} misses / {} unconsulted / {} bypassed   {:.1}% hit rate",
+        r.warm.hits, r.warm.misses, r.warm.unconsulted, r.warm.bypassed, r.warm.hit_rate_pct
+    );
+    eprintln!(
+        "  restored   : {} files, {}   ({} reflinked, {} copied)",
+        r.warm.restored_output_files,
+        human_bytes(r.warm.restored_output_bytes),
+        human_bytes(r.warm.reflinked_output_bytes),
+        human_bytes(r.warm.copied_output_bytes)
+    );
+    eprintln!(
+        "  time saved : {}   (their estimate)",
+        fmt(r.warm.time_saved_s)
+    );
+    eprintln!("{bar}");
+    eprintln!(
+        "  disk: cold obj {} + warm obj {} + cache {} = {} apparent{}",
+        human_bytes(r.cold_objdir_bytes),
+        human_bytes(r.warm_objdir_bytes),
+        human_bytes(r.cache_dir_bytes),
+        human_bytes(r.sum_apparent_bytes),
+        r.disk_measured_bytes
+            .map(|measured| format!(", {} measured", human_bytes(measured)))
+            .unwrap_or_default()
+    );
+    // One line per warning, no heading: an empty list prints nothing without
+    // a guard to get wrong.
+    for warning in &r.measure_warnings {
+        eprintln!("  warning    : {warning}");
+    }
+    eprintln!("  artifacts  : {}", archive_dir.display());
+    eprintln!("{bar}\n");
 }
 
 #[derive(Debug, Serialize)]
@@ -4437,6 +4940,7 @@ mod tests {
         let config = |cache_backend, warm_same_tree| BenchRunConfig {
             kache: missing.clone(),
             sccache: missing.clone(),
+            mbx: missing.clone(),
             cache_backend,
             scenarios: PathBuf::from("./scenarios"),
             select: vec!["suite:bench".to_string()],
@@ -4699,6 +5203,231 @@ mod tests {
     /// `wall_s` is the truncated whole-second view of `wall_ms`, the same
     /// rounding `Duration::as_secs` applied when the engine recorded seconds
     /// only, so the nightly JSON and the kartero payload keep their values.
+    /// The mbx report maps onto the phase metrics field by field; the hit
+    /// rate is hits over hits plus misses, bypasses are summed by reason,
+    /// and the avoided compiler time is reduced to whole seconds.
+    #[test]
+    fn mbx_phase_metrics_reduce_the_stats_report() {
+        let raw = serde_json::json!({
+            "version": 4,
+            "lookups": 300,
+            "hits": 240,
+            "misses": 60,
+            "unconsulted": 12,
+            "compiler_invocations_avoided": 240,
+            "estimated_compiler_duration_avoided_ns": 95_500_000_000u64,
+            "bypasses": { "incremental": 5, "native-link": 2 },
+            "restored_output_files": 700,
+            "restored_output_bytes": 400_000_000u64,
+            "reflinked_output_bytes": 390_000_000u64,
+            "copied_output_bytes": 10_000_000u64,
+            "stored_bytes": 123u64
+        });
+        let m = MbxPhaseMetrics::from_report(&raw, 19_400);
+        assert_eq!((m.wall_s, m.wall_ms), (19, 19_400));
+        assert_eq!(m.report_version, 4);
+        assert_eq!(
+            (m.lookups, m.hits, m.misses, m.unconsulted),
+            (300, 240, 60, 12)
+        );
+        assert_eq!(m.hit_rate_pct, 80.0);
+        assert_eq!(m.bypassed, 7);
+        assert_eq!(m.bypasses["native-link"], 2);
+        assert_eq!(m.compiler_invocations_avoided, 240);
+        assert_eq!(m.time_saved_s, 95, "nanoseconds round down to seconds");
+        assert_eq!(m.restored_output_files, 700);
+        assert_eq!(m.restored_output_bytes, 400_000_000);
+        assert_eq!(m.reflinked_output_bytes, 390_000_000);
+        assert_eq!(m.copied_output_bytes, 10_000_000);
+        assert_eq!(m.stored_bytes, 123);
+
+        let empty = MbxPhaseMetrics::from_report(&serde_json::json!({}), 0);
+        assert_eq!(
+            empty.hit_rate_pct, 0.0,
+            "no lookups is not a division by zero"
+        );
+        assert!(empty.bypasses.is_empty());
+    }
+
+    /// The shim is what `mbx setup` installs: it names the mbx binary from
+    /// the target file next to it, sets shim mode, and execs. Rewriting it
+    /// with a new binary path replaces the target.
+    #[test]
+    fn mbx_cargo_shim_points_at_the_given_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim_dir = install_mbx_cargo_shim(dir.path(), Path::new("/opt/first/mbx")).unwrap();
+        assert_eq!(shim_dir, dir.path().join("mbx-shim"));
+        let shim = std::fs::read_to_string(shim_dir.join("cargo")).unwrap();
+        assert!(shim.starts_with("#!/bin/sh\n"));
+        assert!(shim.contains("MBX_CARGO_SHIM_MODE=1"));
+        assert!(shim.contains("MBX_CARGO_SHIM_PATH=\"$shim_dir/cargo\""));
+        assert!(shim.trim_end().ends_with("exec \"$mbx_executable\" \"$@\""));
+        assert_eq!(
+            std::fs::read_to_string(shim_dir.join("mbx-target")).unwrap(),
+            "/opt/first/mbx\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(shim_dir.join("cargo"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "the shim must be executable");
+        }
+
+        install_mbx_cargo_shim(dir.path(), Path::new("/opt/second/mbx")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(shim_dir.join("mbx-target")).unwrap(),
+            "/opt/second/mbx\n"
+        );
+    }
+
+    #[test]
+    fn mbx_shim_directory_goes_first_on_path() {
+        let joined = prepend_to_path(Path::new("/tmp/mbx-shim")).unwrap();
+        let first = std::env::split_paths(&joined).next().unwrap();
+        assert_eq!(first, Path::new("/tmp/mbx-shim"));
+        assert!(
+            std::env::split_paths(&joined).count() >= 2 || std::env::var_os("PATH").is_none(),
+            "the existing PATH must follow"
+        );
+    }
+
+    /// Every backend's label is the name its recipe, scenario tag and OTLP
+    /// `cache_tool` attribute use; a drifting one silently mislabels a run.
+    #[test]
+    fn cache_backend_labels_are_the_names_the_arms_are_selected_by() {
+        assert_eq!(CacheBackend::Kache.label(), "kache");
+        assert_eq!(CacheBackend::Sccache.label(), "sccache");
+        assert_eq!(CacheBackend::Mbx.label(), "mbx");
+        assert!(!CacheBackend::Kache.is_external());
+        assert!(CacheBackend::Sccache.is_external());
+        assert!(CacheBackend::Mbx.is_external());
+    }
+
+    #[test]
+    fn disk_delta_is_the_drop_in_free_space_or_nothing() {
+        assert_eq!(disk_delta(Some(900), Some(300)), Some(600));
+        assert_eq!(
+            disk_delta(Some(300), Some(900)),
+            None,
+            "free space that grew is not a measurement of this run"
+        );
+        assert_eq!(disk_delta(Some(300), Some(300)), Some(0));
+        assert_eq!(disk_delta(None, Some(300)), None);
+        assert_eq!(disk_delta(Some(300), None), None);
+    }
+
+    #[test]
+    fn bytes_to_mib_divides_and_rounds() {
+        assert_eq!(bytes_to_mib(1024 * 1024), 1.0);
+        assert_eq!(bytes_to_mib(3 * 1024 * 1024 / 2), 1.5);
+        assert_eq!(bytes_to_mib(0), 0.0);
+        // Not a value a multiply or a kilobyte divisor would produce.
+        assert_eq!(bytes_to_mib(157_286_400), 150.0);
+    }
+
+    /// `--retry` reuses the previous cold phase, so it must refuse when
+    /// either artifact is missing and accept when both are present.
+    #[test]
+    fn retry_load_mbx_cold_requires_both_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let missing_both = retry_load_mbx_cold("bench-hk-mbx", &cache, &work).unwrap_err();
+        assert!(
+            missing_both.to_string().contains("cache-after-cold"),
+            "{missing_both:#}"
+        );
+
+        let snapshot = work.join("cache-after-cold");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("blob"), b"cold store").unwrap();
+        let missing_json = retry_load_mbx_cold("bench-hk-mbx", &cache, &work).unwrap_err();
+        assert!(
+            missing_json.to_string().contains("bench-hk-mbx.json"),
+            "{missing_json:#}"
+        );
+
+        std::fs::write(
+            work.join("bench-hk-mbx.json"),
+            serde_json::json!({
+                "cold": { "wall_s": 94, "wall_ms": 94_200, "lookups": 300, "hits": 0,
+                          "misses": 300, "unconsulted": 0, "bypassed": 0,
+                          "compiler_invocations_avoided": 0, "time_saved_s": 0,
+                          "hit_rate_pct": 0.0, "restored_output_files": 0,
+                          "restored_output_bytes": 0, "reflinked_output_bytes": 0,
+                          "copied_output_bytes": 0, "stored_bytes": 0 }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cold = retry_load_mbx_cold("bench-hk-mbx", &cache, &work).unwrap();
+        assert_eq!((cold.wall_s, cold.misses), (94, 300));
+        assert!(
+            cache.join("blob").exists(),
+            "the snapshot must be restored into the cache dir"
+        );
+    }
+
+    #[test]
+    fn mbx_report_path_is_per_phase() {
+        assert_eq!(
+            mbx_report_path(Path::new("/w"), "warm"),
+            Path::new("/w/report-warm.mbx.json")
+        );
+    }
+
+    /// Each threshold fires alone, and the message carries the number.
+    #[test]
+    fn external_measure_warnings_fire_per_threshold() {
+        let spec = MeasureSpec {
+            max_wall_s: Some(20),
+            min_hit_rate_pct: Some(90.0),
+            min_speedup: Some(3.0),
+        };
+        assert!(external_measure_warnings(20, 90.0, 3.0, Some(&spec)).is_empty());
+        let wall = external_measure_warnings(21, 90.0, 3.0, Some(&spec));
+        assert_eq!(wall.len(), 1);
+        assert!(wall[0].contains("21s") && wall[0].contains("20s"));
+        let rate = external_measure_warnings(20, 89.9, 3.0, Some(&spec));
+        assert_eq!(rate.len(), 1);
+        assert!(rate[0].contains("89.9%"));
+        let speed = external_measure_warnings(20, 90.0, 2.99, Some(&spec));
+        assert_eq!(speed.len(), 1);
+        assert!(speed[0].contains("2.99x"));
+        assert_eq!(
+            external_measure_warnings(99, 0.0, 0.0, Some(&spec)).len(),
+            3
+        );
+        assert!(external_measure_warnings(99, 0.0, 0.0, None).is_empty());
+    }
+
+    /// The mbx OTLP phase carries the report's own time-saved estimate and
+    /// its lookups as the total; kache-only gauges stay absent.
+    #[test]
+    fn otlp_mbx_phase_maps_lookups_and_time_saved() {
+        let m = MbxPhaseMetrics::from_report(
+            &serde_json::json!({"lookups": 10, "hits": 8, "misses": 2,
+                "estimated_compiler_duration_avoided_ns": 3_000_000_000u64}),
+            4_000,
+        );
+        let phase = otlp_mbx_phase("warm", &m, 77);
+        assert_eq!(
+            (phase.name, phase.wall_s, phase.objdir_bytes),
+            ("warm", 4, 77)
+        );
+        assert_eq!((phase.hits, phase.misses, phase.total), (8, 2, Some(10)));
+        assert_eq!(phase.time_saved_s, Some(3));
+        assert_eq!(phase.hit_rate_pct, 80.0);
+        assert!(
+            phase.dups.is_none() && phase.errors.is_none() && phase.weighted_hit_rate_pct.is_none()
+        );
+    }
+
     #[test]
     fn whole_seconds_truncates_like_as_secs() {
         assert_eq!(whole_seconds(0), 0);

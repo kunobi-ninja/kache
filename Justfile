@@ -321,6 +321,18 @@ bench-sccache PROFILE="" *ARGS:
     ./target/release/kache-scenario --cache-backend sccache --select suite:bench --select backend:sccache --profile "{{PROFILE}}" {{ARGS}}; \
   fi
 
+# Same shape through mbx (`mbx` on PATH, e.g. from mise `mr-boxington`):
+# `just bench-mbx hk` runs scenarios/bench-hk-mbx.
+[group('bench')]
+bench-mbx PROFILE="" *ARGS:
+  @if [ -z "{{PROFILE}}" ]; then \
+    cargo build -q --release -p kache-e2e --bin kache-scenario; \
+    ./target/release/kache-scenario --list --cache-backend mbx --select suite:bench --select backend:mbx; \
+  else \
+    cargo build --release -p kache-e2e --bin kache-scenario; \
+    ./target/release/kache-scenario --cache-backend mbx --select suite:bench --select backend:mbx --profile "{{PROFILE}}" {{ARGS}}; \
+  fi
+
 # Run clippy with deny warnings.
 [group('dev')]
 lint:

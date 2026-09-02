@@ -646,10 +646,13 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
             cache_size_bytes: crate::bench_otlp::OtlpRun::bytes_from_mib(result.cache_size_mb),
             key_stability_pct: Some(result.key_stability.stable_pct),
             disk_measured_bytes: result.disk_measured_bytes,
-            phases: vec![
-                otlp_phase("cold", &result.cold, result.cold_objdir_bytes),
-                otlp_phase("warm", &result.warm, result.warm_objdir_bytes),
-            ],
+            phases: otlp_phases(
+                &result.cold,
+                result.warm_same_tree.as_ref(),
+                &result.warm,
+                result.cold_objdir_bytes,
+                result.warm_objdir_bytes,
+            ),
         },
     );
 
@@ -800,6 +803,29 @@ fn is_run_artifact(name: &str) -> bool {
         || (name.starts_with("bench-") && name.ends_with(".json"))
         || name == crate::bench_otlp::METRICS_FILE
         || name == crate::bench_otlp::SCHEMA_VERSION_FILE
+}
+
+/// The phase dimension of the bench gauges, in run order: cold, the same-tree
+/// warm when `--warm-same-tree` ran, then the cross-clone warm. The same-tree
+/// rebuild happens in the cold clone's objdir, so it reports that directory's
+/// size; without the phase the vector is what it always was.
+fn otlp_phases(
+    cold: &PhaseMetrics,
+    warm_same_tree: Option<&PhaseMetrics>,
+    warm: &PhaseMetrics,
+    cold_objdir_bytes: u64,
+    warm_objdir_bytes: u64,
+) -> Vec<crate::bench_otlp::OtlpPhase> {
+    let mut phases = vec![otlp_phase(Phase::Cold.name(), cold, cold_objdir_bytes)];
+    if let Some(same_tree) = warm_same_tree {
+        phases.push(otlp_phase(
+            Phase::WarmSameTree.name(),
+            same_tree,
+            cold_objdir_bytes,
+        ));
+    }
+    phases.push(otlp_phase(Phase::Warm.name(), warm, warm_objdir_bytes));
+    phases
 }
 
 fn otlp_phase(
@@ -4903,5 +4929,41 @@ build = "sleep 0.2"
         assert!(!stale.exists(), "the objdir is wiped before the build");
         assert!(work_dir.join("build-cold.log").exists());
         assert!(work_dir.join("wrapper-cold.log").exists());
+    }
+
+    /// The same-tree warm is a phase of the same gauges, present only when it
+    /// ran, between cold and the cross-clone warm, and measured on the cold
+    /// clone's objdir.
+    #[test]
+    fn otlp_phases_carry_the_same_tree_warm_only_when_it_ran() {
+        let cold = PhaseMetrics {
+            wall_s: 100,
+            ..Default::default()
+        };
+        let same_tree = PhaseMetrics {
+            wall_s: 20,
+            ..Default::default()
+        };
+        let warm = PhaseMetrics {
+            wall_s: 30,
+            ..Default::default()
+        };
+
+        let without = otlp_phases(&cold, None, &warm, 7, 9);
+        assert_eq!(
+            without
+                .iter()
+                .map(|phase| (phase.name, phase.wall_s, phase.objdir_bytes))
+                .collect::<Vec<_>>(),
+            vec![("cold", 100, 7), ("warm", 30, 9)]
+        );
+
+        let with = otlp_phases(&cold, Some(&same_tree), &warm, 7, 9);
+        assert_eq!(
+            with.iter()
+                .map(|phase| (phase.name, phase.wall_s, phase.objdir_bytes))
+                .collect::<Vec<_>>(),
+            vec![("cold", 100, 7), ("warm-same-tree", 20, 7), ("warm", 30, 9)]
+        );
     }
 }

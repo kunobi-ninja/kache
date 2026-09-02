@@ -1998,7 +1998,10 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("Include/10.0.22000.0")).unwrap();
-        std::fs::create_dir_all(root.path().join("Include/not-a-version")).unwrap();
+        // Rejected as versions: no digits, one component, a non-numeric one.
+        for stray in ["not-a-version", "10", "1.2.beta"] {
+            std::fs::create_dir_all(root.path().join("Include").join(stray)).unwrap();
+        }
         let mut sdk_environment = WindowsProbeEnvironment::default();
         sdk_environment.variables.insert(
             "WindowsSdkDir".into(),
@@ -2015,6 +2018,21 @@ mod tests {
             .unwrap(),
             "10.0.22000.0"
         );
+        // A malformed environment value is an error in its own right; only an
+        // absent one falls back to the SDK root.
+        sdk_environment
+            .variables
+            .insert("WindowsSDKVersion".into(), "not-a-version".into());
+        let malformed = version_from_environment_or_path(
+            &sdk_environment,
+            &["WindowsSDKVersion"],
+            "WindowsSdkDir",
+            "Include",
+            "SDK",
+        )
+        .unwrap_err();
+        assert!(malformed.to_string().contains("malformed"), "{malformed:#}");
+        sdk_environment.variables.remove("WindowsSDKVersion");
         std::fs::create_dir_all(root.path().join("Include/10.0.26100.0")).unwrap();
         assert!(
             version_from_environment_or_path(
@@ -2026,6 +2044,27 @@ mod tests {
             )
             .is_err(),
             "two installed versions without an environment selection are ambiguous"
+        );
+    }
+
+    /// A missing library is "absent"; anything else the filesystem says is an
+    /// error, never a silent absence. A path through a regular file is the
+    /// portable way to get a non-NotFound error on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn existing_windows_library_reports_absence_but_not_other_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("foo.lib");
+        std::fs::write(&file, b"lib").unwrap();
+        assert!(existing_windows_library(&file).unwrap());
+        assert!(!existing_windows_library(&root.path().join("missing.lib")).unwrap());
+        assert!(
+            existing_windows_library(root.path()).is_err(),
+            "a directory is not a library"
+        );
+        assert!(
+            existing_windows_library(&file.join("child.lib")).is_err(),
+            "a stat error other than NotFound must not read as absent"
         );
     }
 
@@ -2268,6 +2307,11 @@ mod tests {
             windows_link_library_filenames("raw-dylib=foo").unwrap(),
             None
         );
+        // `-verbatim` is a real modifier that restores the default lookup.
+        assert_eq!(
+            windows_link_library_filenames("static:-verbatim=foo").unwrap(),
+            windows_link_library_filenames("static=foo").unwrap()
+        );
 
         let root = tempfile::tempdir().unwrap();
         let rustc_first = root.path().join("rustc-first");
@@ -2319,6 +2363,13 @@ mod tests {
             "static=foo:renamed:again",
             "dylib:+unknown=foo",
             "dylib:+verbatim,-verbatim=foo",
+            // Each of these fails exactly one of the name checks.
+            "static=:renamed",
+            "static=foo:",
+            "static=dir/foo",
+            "static=dir\\foo",
+            "static=foo:sub/renamed",
+            "static=foo:sub\\renamed",
         ] {
             assert!(
                 windows_link_library_filenames(specification).is_err(),

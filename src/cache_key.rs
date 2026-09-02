@@ -4881,6 +4881,8 @@ mod tests {
 
     const WINDOWS_RUSTC_VERSION: &str =
         "rustc 1.90.0\nhost: x86_64-pc-windows-msvc\nrelease: 1.90.0\n";
+    const WINDOWS_GNU_RUSTC_VERSION: &str =
+        "rustc 1.90.0\nhost: x86_64-pc-windows-gnu\nrelease: 1.90.0\n";
 
     fn windows_fold_key_on_host(
         args: &RustcArgs,
@@ -4960,6 +4962,24 @@ mod tests {
                     |_| unreachable!("the supplied rustc version must be reused"),
                 )
                 .unwrap()
+            );
+        }
+
+        // Both halves of the admission must hold: the target must be the host
+        // and the host must be MSVC. A cross target on an MSVC host and a
+        // native build on a GNU host each fail one half.
+        let cross = parsed_crate_type("bin", Some("x86_64-unknown-linux-gnu"));
+        for (args, version) in [
+            (&cross, WINDOWS_RUSTC_VERSION),
+            (&bin, WINDOWS_GNU_RUSTC_VERSION),
+        ] {
+            assert!(
+                !is_native_windows_msvc_link(args, version, true, |_| unreachable!(
+                    "the supplied rustc version must be reused"
+                ))
+                .unwrap(),
+                "{version:?} must not admit {:?}",
+                args.target
             );
         }
     }
@@ -6111,6 +6131,10 @@ mod tests {
 
     /// H1: build-script `-l` link libs reach rustc on argv (not via
     /// RUSTFLAGS); a different native lib must diverge the key.
+    /// Generic `-l` keying, checked on hosts that do not probe native MSVC
+    /// inputs. On a Windows host the library must exist (fail closed), so the
+    /// Windows shape lives in the `windows_*` tests with an injected probe.
+    #[cfg(not(windows))]
     #[test]
     fn link_lib_changes_key() {
         let _lock = key_test_lock();
@@ -6651,6 +6675,10 @@ mod tests {
 
     /// A `dylib=` lib is referenced at runtime, not bundled into the output, so
     /// its content must NOT enter the key (guards against over-keying).
+    /// Generic `-l` keying, checked on hosts that do not probe native MSVC
+    /// inputs. On a Windows host the library must exist (fail closed), so the
+    /// Windows shape lives in the `windows_*` tests with an injected probe.
+    #[cfg(not(windows))]
     #[test]
     fn native_dylib_content_does_not_change_key() {
         let _lock = key_test_lock();
@@ -6975,6 +7003,10 @@ mod tests {
     /// H1: a build-script native search path must diverge the key, but
     /// cargo's redundant `-L dependency=` (covered by content-hashed
     /// `--extern`) must NOT — else every target-dir move busts the cache.
+    /// Generic `-l` keying, checked on hosts that do not probe native MSVC
+    /// inputs. On a Windows host the library must exist (fail closed), so the
+    /// Windows shape lives in the `windows_*` tests with an injected probe.
+    #[cfg(not(windows))]
     #[test]
     fn link_search_native_keys_but_dependency_does_not() {
         let _lock = key_test_lock();

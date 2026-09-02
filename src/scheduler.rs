@@ -258,7 +258,10 @@ impl Scheduler {
                     output_kind = %identity.output_kind,
                     "waiting for in-flight compile"
                 );
-                match wait_for_lock(&path, self.wait_timeout, self.poll_interval) {
+                let waited = std::time::Instant::now();
+                let outcome = wait_for_lock(&path, self.wait_timeout, self.poll_interval);
+                crate::opcounts::record_flight_wait(waited.elapsed());
+                match outcome {
                     Ok(true) => FlightJoin::Waited,
                     Ok(false) => {
                         tracing::debug!(
@@ -292,7 +295,17 @@ impl Scheduler {
         }
     }
 
+    /// Take `weight` slots, blocking up to the wait timeout. The whole call is
+    /// attributed to `permit_wait_ms`: an immediately free pool costs
+    /// microseconds, a saturated one costs the wait.
     fn acquire_permit(&self, weight: u32) -> Option<Permit> {
+        let started = std::time::Instant::now();
+        let permit = self.wait_for_permit(weight);
+        crate::opcounts::record_permit_wait(started.elapsed());
+        permit
+    }
+
+    fn wait_for_permit(&self, weight: u32) -> Option<Permit> {
         let need = weight.clamp(1, self.pool_size) as usize;
         let start = std::time::Instant::now();
         loop {
@@ -1649,6 +1662,7 @@ mod tests {
 
         let identity = FlightIdentity::rustc("shared", &["lib".into()], true);
         let cache = dir.path().to_path_buf();
+        let flight_wait_before = crate::opcounts::flight_wait_ms();
         let waiter =
             std::thread::spawn(move || begin_miss(&cache, true, &identity, "shared", false));
         // The child holds the flight until `go` exists. Give the waiter time
@@ -1663,6 +1677,12 @@ mod tests {
             dir.path().join("artifact").exists(),
             "waiter must observe the owner's stored artifact"
         );
+        // The common production path: the owner finishes and the waiter
+        // rechecks. Its blocked time must be attributed like the timeout's.
+        assert!(
+            crate::opcounts::flight_wait_ms() > flight_wait_before,
+            "a released flight's wait must reach flight_wait_ms"
+        );
         let _ = child.wait();
     }
 
@@ -1674,6 +1694,7 @@ mod tests {
 
         let scheduler = test_scheduler(dir.path(), 1);
         let started = std::time::Instant::now();
+        let permit_wait_before = crate::opcounts::permit_wait_ms();
         let permit = scheduler.acquire_permit(1);
         assert!(
             permit.is_some(),
@@ -1683,7 +1704,41 @@ mod tests {
             started.elapsed() >= Duration::from_millis(50),
             "parent must have waited for the child-held slot"
         );
+        assert!(
+            crate::opcounts::permit_wait_ms() >= permit_wait_before + 50,
+            "the wait must be attributed to permit_wait_ms"
+        );
         let _ = child.wait();
+    }
+
+    #[test]
+    fn flight_wait_is_attributed_even_when_it_times_out() {
+        let dir = temp_cache();
+        // A short timeout: the waiter fails open after at least 80ms blocked
+        // on a flight this test holds itself. Separate descriptors on one
+        // path conflict under flock and LockFileEx alike, so no fixture
+        // process is needed.
+        let scheduler = Scheduler::open_with(
+            dir.path(),
+            2,
+            Duration::from_millis(80),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let identity = FlightIdentity::rustc("held", &["lib".into()], true);
+        let _owner = StoreLock::try_acquire(&scheduler.flight_path(&identity))
+            .unwrap()
+            .expect("the first acquisition owns the flight");
+        let flight_wait_before = crate::opcounts::flight_wait_ms();
+        match scheduler.join_flight(&identity) {
+            FlightJoin::FailOpen => {}
+            FlightJoin::Owner(_) => panic!("the flight is still held"),
+            FlightJoin::Waited => panic!("the flight is never released within the timeout"),
+        }
+        assert!(
+            crate::opcounts::flight_wait_ms() >= flight_wait_before + 80,
+            "the blocked time must be attributed to flight_wait_ms"
+        );
     }
 
     #[test]

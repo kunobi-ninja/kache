@@ -135,7 +135,18 @@
         "total_key_ms",
         "total_lookup_ms",
         "total_restore_ms",
-        "total_store_ms"
+        "total_store_ms",
+        "total_startup_ms",
+        "avg_startup_ms",
+        "total_dep_info_ms",
+        "dep_info_runs",
+        "avg_dep_info_ms",
+        "total_wait_ms",
+        "total_flight_wait_ms",
+        "total_permit_wait_ms",
+        "avg_wait_ms",
+        "total_unattributed_ms",
+        "avg_unattributed_ms"
       ],
       "properties": {
         "hit_time_ms": { "type": "integer", "minimum": 0 },
@@ -151,7 +162,18 @@
         "total_key_ms": { "type": "integer", "minimum": 0 },
         "total_lookup_ms": { "type": "integer", "minimum": 0 },
         "total_restore_ms": { "type": "integer", "minimum": 0 },
-        "total_store_ms": { "type": "integer", "minimum": 0 }
+        "total_store_ms": { "type": "integer", "minimum": 0 },
+        "total_startup_ms": { "type": "integer", "minimum": 0, "description": "Process start to wrapper entry, summed over cacheable crates. Zero for events written before schema 17." },
+        "avg_startup_ms": { "type": "number", "minimum": 0.0 },
+        "total_dep_info_ms": { "type": "integer", "minimum": 0, "description": "Time in the rustc dep-info pre-pass. Already inside total_key_ms." },
+        "dep_info_runs": { "type": "integer", "minimum": 0, "description": "Dep-info pre-pass spawns." },
+        "avg_dep_info_ms": { "type": "number", "minimum": 0.0, "description": "Mean per pre-pass run." },
+        "total_wait_ms": { "type": "integer", "minimum": 0, "description": "Scheduler wait: flight join plus permit acquisition." },
+        "total_flight_wait_ms": { "type": "integer", "minimum": 0 },
+        "total_permit_wait_ms": { "type": "integer", "minimum": 0 },
+        "avg_wait_ms": { "type": "number", "minimum": 0.0 },
+        "total_unattributed_ms": { "type": "integer", "minimum": 0, "description": "Wrapper overhead no measured phase accounts for: overhead minus startup, key, lookup, wait, restore and store, clamped at zero per event." },
+        "avg_unattributed_ms": { "type": "number", "minimum": 0.0 }
       }
     },
     "storage": {
@@ -474,7 +496,18 @@
         "probe_runs",
         "store_output_blobs",
         "store_duplicate_blobs",
-        "store_new_blobs"
+        "store_new_blobs",
+        "startup_ms",
+        "key_ms",
+        "dep_info_ms",
+        "dep_info_runs",
+        "lookup_ms",
+        "wait_ms",
+        "flight_wait_ms",
+        "permit_wait_ms",
+        "restore_ms",
+        "store_ms",
+        "unattributed_ms"
       ],
       "properties": {
         "crate_name": { "type": "string" },
@@ -493,6 +526,17 @@
         "store_output_blobs": { "type": "integer", "minimum": 0 },
         "store_duplicate_blobs": { "type": "integer", "minimum": 0 },
         "store_new_blobs": { "type": "integer", "minimum": 0 },
+        "startup_ms": { "type": "integer", "minimum": 0, "description": "Process start to wrapper entry." },
+        "key_ms": { "type": "integer", "minimum": 0 },
+        "dep_info_ms": { "type": "integer", "minimum": 0, "description": "Rustc dep-info pre-pass time, inside key_ms." },
+        "dep_info_runs": { "type": "integer", "minimum": 0 },
+        "lookup_ms": { "type": "integer", "minimum": 0 },
+        "wait_ms": { "type": "integer", "minimum": 0, "description": "flight_wait_ms + permit_wait_ms." },
+        "flight_wait_ms": { "type": "integer", "minimum": 0 },
+        "permit_wait_ms": { "type": "integer", "minimum": 0 },
+        "restore_ms": { "type": "integer", "minimum": 0 },
+        "store_ms": { "type": "integer", "minimum": 0 },
+        "unattributed_ms": { "type": "integer", "minimum": 0, "description": "overhead_ms minus every measured phase, clamped at zero. The trace output draws this as the gap after the last nested phase slice." },
         "exit_code": { "type": ["integer", "null"] }
       }
     },

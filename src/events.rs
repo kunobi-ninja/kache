@@ -20,6 +20,9 @@ pub struct BuildEvent {
     #[serde(default)]
     pub version: String,
     pub result: EventResult,
+    /// Wall time cargo waited for this wrapper process (ms). From schema 17
+    /// it is anchored at process start, so `startup_ms` lies inside it;
+    /// older wrappers started the clock at wrapper entry.
     pub elapsed_ms: u64,
     /// Estimated compile cost for this invocation.
     ///
@@ -40,7 +43,8 @@ pub struct BuildEvent {
     /// 13 = store-failure reason (#629),
     /// 14 = compilation-unit identity, own and per-extern (#627),
     /// 15 = same-key lookup rejection reason (#655),
-    /// 16 = compile-and-compare verify on hits (`verify_compare`).
+    /// 16 = compile-and-compare verify on hits (`verify_compare`),
+    /// 17 = wrapper phase timings: startup, dep-info pre-pass, scheduler wait.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -73,6 +77,30 @@ pub struct BuildEvent {
     /// Store put time — tar + compress + dedup + SQLite (dup/miss only, ms).
     #[serde(default)]
     pub store_ms: u64,
+    /// Process start to wrapper entry (ms): argv handling, logging setup and
+    /// config load, everything before the first cache decision. Zero when
+    /// the process did not go through `main` (unit tests). Schema 17.
+    #[serde(default)]
+    pub startup_ms: u64,
+    /// Time in the `rustc --emit=dep-info` pre-pass spawns (ms). Already part
+    /// of `key_ms`; split out because it is a full extra compiler start per
+    /// invocation, hit or miss. Zero for cc and passthroughs. Schema 17.
+    #[serde(default)]
+    pub dep_info_ms: u64,
+    /// Dep-info pre-pass spawns for this invocation: 1 on the rustc key path,
+    /// 0 on every path that never computes a rustc key. Schema 17.
+    #[serde(default)]
+    pub dep_info_runs: u32,
+    /// Time blocked joining a machine-wide flight another process already
+    /// owned for the same compile (ms). Zero on a hit served at first
+    /// lookup; a hit taken on the recheck after the owner finished carries
+    /// the wait. Schema 17.
+    #[serde(default)]
+    pub flight_wait_ms: u64,
+    /// Time blocked acquiring scheduler permit slots (ms). Misses only.
+    /// Schema 17.
+    #[serde(default)]
+    pub permit_wait_ms: u64,
     /// Unique output blobs handled by store put (compiled outcomes only).
     #[serde(default)]
     pub store_output_blobs: u32,
@@ -231,6 +259,49 @@ pub struct BuildEvent {
     /// that suffix simply has no entry and the walk falls back to name matching.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub extern_units: std::collections::BTreeMap<String, String>,
+}
+
+impl BuildEvent {
+    /// Served from cache. `compile_time_ms` on a hit is the stored compile
+    /// cost, not time this process spent.
+    pub fn is_hit(&self) -> bool {
+        matches!(
+            self.result,
+            EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit
+        )
+    }
+
+    /// Wrapper time minus the compile it ran, if it ran one.
+    pub fn overhead_ms(&self) -> u64 {
+        if self.is_hit() {
+            self.elapsed_ms
+        } else {
+            self.elapsed_ms.saturating_sub(self.compile_time_ms)
+        }
+    }
+
+    /// Scheduler wait: flight join plus permit acquisition.
+    pub fn wait_ms(&self) -> u64 {
+        self.flight_wait_ms + self.permit_wait_ms
+    }
+
+    /// Overhead a measured phase accounts for. `dep_info_ms` is inside
+    /// `key_ms` and is not added again.
+    pub fn attributed_ms(&self) -> u64 {
+        self.startup_ms
+            + self.key_ms
+            + self.lookup_ms
+            + self.wait_ms()
+            + self.restore_ms
+            + self.store_ms
+    }
+
+    /// Overhead no phase accounts for: argument parsing, store open,
+    /// build-lock waits, dep-info staging, process exit. Clamped at zero, so
+    /// an event whose phases overlap cannot go negative.
+    pub fn unattributed_ms(&self) -> u64 {
+        self.overhead_ms().saturating_sub(self.attributed_ms())
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1091,6 +1162,18 @@ pub struct EventStats {
     pub total_lookup_ms: u64,
     pub total_restore_ms: u64,
     pub total_store_ms: u64,
+    /// Process start to wrapper entry, summed over cacheable outcomes.
+    pub total_startup_ms: u64,
+    /// Dep-info pre-pass time (inside `total_key_ms`) and spawn count.
+    pub total_dep_info_ms: u64,
+    pub total_dep_info_runs: u64,
+    /// Scheduler waits, kept apart so a saturated pool and a shared flight
+    /// stay distinguishable.
+    pub total_flight_wait_ms: u64,
+    pub total_permit_wait_ms: u64,
+    /// Wrapper overhead no phase accounts for (see
+    /// [`BuildEvent::unattributed_ms`]).
+    pub total_unattributed_ms: u64,
     pub store_output_blobs: u32,
     pub store_duplicate_blobs: u32,
     pub store_new_blobs: u32,
@@ -1139,6 +1222,12 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         total_lookup_ms: 0,
         total_restore_ms: 0,
         total_store_ms: 0,
+        total_startup_ms: 0,
+        total_dep_info_ms: 0,
+        total_dep_info_runs: 0,
+        total_flight_wait_ms: 0,
+        total_permit_wait_ms: 0,
+        total_unattributed_ms: 0,
         store_output_blobs: 0,
         store_duplicate_blobs: 0,
         store_new_blobs: 0,
@@ -1204,6 +1293,12 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         stats.total_lookup_ms += event.lookup_ms;
         stats.total_restore_ms += event.restore_ms;
         stats.total_store_ms += event.store_ms;
+        stats.total_startup_ms += event.startup_ms;
+        stats.total_dep_info_ms += event.dep_info_ms;
+        stats.total_dep_info_runs += u64::from(event.dep_info_runs);
+        stats.total_flight_wait_ms += event.flight_wait_ms;
+        stats.total_permit_wait_ms += event.permit_wait_ms;
+        stats.total_unattributed_ms += event.unattributed_ms();
         stats.store_output_blobs += event.store_output_blobs;
         stats.store_duplicate_blobs += event.store_duplicate_blobs;
         stats.store_new_blobs += event.store_new_blobs;
@@ -1254,6 +1349,11 @@ impl BuildEvent {
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
+            startup_ms: 0,
+            dep_info_ms: 0,
+            dep_info_runs: 0,
+            flight_wait_ms: 0,
+            permit_wait_ms: 0,
             store_output_blobs: 0,
             store_duplicate_blobs: 0,
             store_new_blobs: 0,
@@ -1328,6 +1428,11 @@ mod tests {
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
+            startup_ms: 0,
+            dep_info_ms: 0,
+            dep_info_runs: 0,
+            flight_wait_ms: 0,
+            permit_wait_ms: 0,
             store_output_blobs: 0,
             store_duplicate_blobs: 0,
             store_new_blobs: 0,
@@ -1361,6 +1466,153 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].crate_name, "serde");
         assert_eq!(events[0].result, EventResult::LocalHit);
+    }
+
+    /// Phase arithmetic for the report and the trace: overhead excludes a
+    /// compile this process ran but keeps a hit's stored compile cost; the
+    /// dep-info pass is inside key time; the remainder never goes negative.
+    #[test]
+    fn phase_arithmetic_attributes_overhead_and_clamps_the_remainder() {
+        // Powers of two, so any swapped operator changes the sum.
+        let mut miss = BuildEvent::new_for_test("m", EventResult::Miss);
+        miss.elapsed_ms = 300;
+        miss.compile_time_ms = 100;
+        miss.startup_ms = 1;
+        miss.key_ms = 2;
+        miss.dep_info_ms = 2;
+        miss.dep_info_runs = 1;
+        miss.lookup_ms = 4;
+        miss.flight_wait_ms = 8;
+        miss.permit_wait_ms = 16;
+        miss.restore_ms = 32;
+        miss.store_ms = 64;
+        assert!(!miss.is_hit());
+        assert_eq!(miss.overhead_ms(), 200);
+        assert_eq!(miss.wait_ms(), 24);
+        assert_eq!(miss.attributed_ms(), 127);
+        assert_eq!(miss.unattributed_ms(), 73);
+
+        for result in [
+            EventResult::LocalHit,
+            EventResult::PrefetchHit,
+            EventResult::RemoteHit,
+        ] {
+            let mut hit = miss.clone();
+            hit.result = result;
+            assert!(hit.is_hit(), "{result:?} is served from cache");
+            assert_eq!(
+                hit.overhead_ms(),
+                300,
+                "{result:?}: stored compile cost was not spent here"
+            );
+        }
+        let mut hit = miss.clone();
+        hit.result = EventResult::PrefetchHit;
+        assert_eq!(
+            hit.overhead_ms(),
+            300,
+            "a hit's compile cost was not spent here"
+        );
+        assert_eq!(hit.unattributed_ms(), 173);
+
+        let mut dup = miss.clone();
+        dup.result = EventResult::Dup;
+        assert!(!dup.is_hit());
+        assert_eq!(dup.overhead_ms(), 200);
+
+        let mut overlapping = miss.clone();
+        overlapping.elapsed_ms = 120;
+        assert_eq!(overlapping.overhead_ms(), 20);
+        assert_eq!(
+            overlapping.unattributed_ms(),
+            0,
+            "phases summing past the overhead clamp at zero"
+        );
+
+        let mut short = miss.clone();
+        short.elapsed_ms = 50;
+        assert_eq!(short.overhead_ms(), 0, "compile longer than elapsed clamps");
+    }
+
+    #[test]
+    fn compute_stats_totals_the_wrapper_phases_of_cacheable_outcomes() {
+        let mut hit = BuildEvent::new_for_test("h", EventResult::LocalHit);
+        hit.elapsed_ms = 40;
+        hit.startup_ms = 3;
+        hit.key_ms = 10;
+        hit.dep_info_ms = 6;
+        hit.dep_info_runs = 1;
+        hit.lookup_ms = 2;
+        hit.restore_ms = 5;
+        // 40 - (3 + 10 + 2 + 5) = 20
+        let mut miss = BuildEvent::new_for_test("m", EventResult::Miss);
+        miss.elapsed_ms = 500;
+        miss.compile_time_ms = 400;
+        miss.startup_ms = 4;
+        miss.key_ms = 20;
+        miss.dep_info_ms = 9;
+        miss.dep_info_runs = 1;
+        miss.lookup_ms = 1;
+        miss.flight_wait_ms = 7;
+        miss.permit_wait_ms = 11;
+        miss.store_ms = 30;
+        // 100 - (4 + 20 + 1 + 18 + 30) = 27
+        let mut passthrough = BuildEvent::new_for_test("p", EventResult::Passthrough);
+        passthrough.elapsed_ms = 1000;
+        passthrough.startup_ms = 100;
+        passthrough.dep_info_ms = 100;
+        passthrough.dep_info_runs = 100;
+        passthrough.flight_wait_ms = 100;
+        passthrough.permit_wait_ms = 100;
+
+        let stats = compute_stats(&[hit, miss, passthrough]);
+        assert_eq!(stats.total_startup_ms, 7);
+        assert_eq!(stats.total_dep_info_ms, 15);
+        assert_eq!(stats.total_dep_info_runs, 2);
+        assert_eq!(stats.total_flight_wait_ms, 7);
+        assert_eq!(stats.total_permit_wait_ms, 11);
+        assert_eq!(stats.total_unattributed_ms, 47);
+    }
+
+    #[test]
+    fn phase_fields_round_trip_and_default_for_older_events() {
+        let mut event = BuildEvent::new_for_test("foo", EventResult::Miss);
+        event.startup_ms = 5;
+        event.dep_info_ms = 6;
+        event.dep_info_runs = 1;
+        event.flight_wait_ms = 7;
+        event.permit_wait_ms = 8;
+
+        let mut value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["startup_ms"], 5);
+        assert_eq!(value["dep_info_ms"], 6);
+        assert_eq!(value["dep_info_runs"], 1);
+        assert_eq!(value["flight_wait_ms"], 7);
+        assert_eq!(value["permit_wait_ms"], 8);
+        let round_trip: BuildEvent = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(round_trip.startup_ms, 5);
+        assert_eq!(round_trip.dep_info_ms, 6);
+        assert_eq!(round_trip.dep_info_runs, 1);
+        assert_eq!(round_trip.flight_wait_ms, 7);
+        assert_eq!(round_trip.permit_wait_ms, 8);
+
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "startup_ms",
+            "dep_info_ms",
+            "dep_info_runs",
+            "flight_wait_ms",
+            "permit_wait_ms",
+        ] {
+            object.remove(field);
+        }
+        let legacy: BuildEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.startup_ms, 0);
+        assert_eq!(legacy.dep_info_ms, 0);
+        assert_eq!(legacy.dep_info_runs, 0);
+        assert_eq!(legacy.flight_wait_ms, 0);
+        assert_eq!(legacy.permit_wait_ms, 0);
+        assert_eq!(legacy.wait_ms(), 0);
     }
 
     #[test]

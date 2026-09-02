@@ -226,6 +226,10 @@ kache report --format trace --output trace.json
 
 `trace`, `perfetto`, and `chrome-trace` select the same trace representation. The JSON contract is documented by [`report.schema.json`](https://github.com/kunobi-ninja/kache/blob/main/docs/commands/report.schema.json).
 
+Every report format totals the wrapper's phases per crate: startup (process start to wrapper entry), key computation with the rustc dep-info pre-pass split out by time and run count, lookup, scheduler wait (flight join plus permit acquisition), restore or store, and the unattributed remainder. Unattributed is wrapper overhead minus every measured phase, where overhead excludes the compile on a compiled crate and is the whole wrapper time on a hit. Events written by wrappers before schema 17 report zero startup, dep-info and wait time.
+
+In the trace output each crate slice carries these numbers in its `args` and nests one `X` slice per phase on the same lane, in the order `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice.
+
 ## `kache config`
 
 ```bash

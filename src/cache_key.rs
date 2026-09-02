@@ -3526,11 +3526,16 @@ pub fn run_dep_info_pass(
 
     tracing::trace!("dep-info pre-pass: {:?}", cmd);
 
+    let spawned = std::time::Instant::now();
     let output = cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output()
         .context("running rustc --emit=dep-info")?;
+    // One extra rustc start per invocation, hit or miss. Counted and timed so
+    // the event log can show what removing it would buy (`dep_info_runs`,
+    // `dep_info_ms`); it stays inside `key_ms` too.
+    crate::opcounts::record_dep_info_run(spawned.elapsed());
     drop(response_file);
 
     if !output.status.success() {
@@ -7985,7 +7990,15 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             "2021".to_string(),
         ];
 
+        let runs_before = crate::opcounts::dep_info_runs();
+        let ms_before = crate::opcounts::dep_info_ms();
         let dep_info = run_dep_info_pass(&rustc, None, &source, &args, false).unwrap();
+        // The pre-pass is a real rustc start; the event log must see it.
+        assert!(crate::opcounts::dep_info_runs() > runs_before);
+        assert!(
+            crate::opcounts::dep_info_ms() > ms_before,
+            "a rustc spawn takes more than a millisecond"
+        );
 
         assert!(
             dep_info.source_files.len() >= 2,
@@ -8024,9 +8037,14 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             "2021".to_string(),
         ];
 
+        let runs_before = crate::opcounts::dep_info_runs();
         let Err(err) = run_dep_info_pass(&rustc, None, &source, &args, false) else {
             panic!("expected Err on a failing dep-info pass (source has a syntax error)");
         };
+        assert!(
+            crate::opcounts::dep_info_runs() > runs_before,
+            "a failed pre-pass still spawned rustc and must be counted"
+        );
         // The error must CARRY rustc's own reason, not just say the pass
         // failed: the wrapper logs `{e:#}`, and a diagnostic that drops the
         // cause is how the substrate bench's 60 refusals stayed unexplained

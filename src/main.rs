@@ -542,6 +542,9 @@ fn init_logging(mode: LogMode) {
 }
 
 fn main() -> Result<()> {
+    // First, before argv or config: `startup_ms` on every build event is
+    // measured from here.
+    opcounts::mark_process_start();
     if std::env::var_os("KACHE_FAMILY_PROBE_ACTIVE").is_some() {
         // Prevent unbounded recursion when a probed wrapper calls back into kache.
         return Ok(());

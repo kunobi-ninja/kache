@@ -50,7 +50,14 @@ mod tests {
 
     #[test]
     fn dropping_the_guard_restores_the_current_directory() {
-        let original = std::env::current_dir().unwrap();
+        // Read the baseline under the lock: every holder restores the
+        // directory on drop, so under the lock it is always the process's
+        // original one, whereas an unlocked read could observe another test
+        // mid-change.
+        let original = {
+            let _lock = process_state_test_lock();
+            std::env::current_dir().unwrap()
+        };
         let scratch = tempfile::tempdir().unwrap();
 
         {

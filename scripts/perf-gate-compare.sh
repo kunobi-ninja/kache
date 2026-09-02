@@ -164,8 +164,10 @@ cold_pct="$(pct "$base_cold" "$head_cold")"
 warm_pct="$(pct "$base_warm" "$head_warm")"
 cross_pct="$(pct "$base_cross" "$head_cross")"
 
-regressed="$(awk -v d="$warm_pct" -v lim="$WARM_REGRESSION_LIMIT_PCT" \
-    'BEGIN { print (d != "n/a" && d + 0 > lim + 0) ? "yes" : "no" }')"
+# Decide on the raw milliseconds, not on the one-decimal percent printed
+# above: rounding would let a +5.04% head pass a +5.0% limit.
+regressed="$(awk -v b="$base_warm" -v h="$head_warm" -v lim="$WARM_REGRESSION_LIMIT_PCT" \
+    'BEGIN { print (b + 0 > 0 && (h - b) * 100.0 / b > lim + 0) ? "yes" : "no" }')"
 
 # The workflow's report step parses this first line into the commit status:
 # it strips the leading `## Perf gate: ` and keeps the rest. Keep the grammar.

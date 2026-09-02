@@ -112,6 +112,14 @@ result "$work/head.json" 108100 15345 16200
 run_gate "$work/base.json" "$work/head.json"
 expect_status "+5.1% is a regression" 1
 
+# The decision is taken on the milliseconds, not on the rounded percent the
+# headline prints: +5.04% rounds to +5.0% for display and is still over.
+result "$work/head.json" 108100 15336 16200
+run_gate "$work/base.json" "$work/head.json"
+expect_status "+5.04% is a regression even though it prints as +5.0%" 1
+expect_headline "the headline still shows the rounded delta" \
+    "## Perf gate: FAIL — warm build +5.0% (limit +5.0%)"
+
 # A faster head is never a failure.
 result "$work/head.json" 108100 13000 16200
 run_gate "$work/base.json" "$work/head.json"

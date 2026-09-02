@@ -299,6 +299,15 @@ bench-pr *ARGS:
     --select suite:bench --select backend:kache --profile pr-cargo \
     --warm-same-tree {{ARGS}}
 
+# The comparison script decides the `perf-gate/warm` commit status on every
+# pull request, and the workflow parses its first line into that status. The
+# tests run it on fixture JSON in the engine's shape: threshold, floor, and
+# the validity rejections, each by exit code and headline. Seconds to run.
+# Test scripts/perf-gate-compare.sh on fixture results
+[group('bench')]
+test-perf-gate-compare:
+  @./scripts/test-perf-gate-compare.sh
+
 # Same cold/warm clone benchmark, but with sccache as the compiler cache.
 # Omit PROFILE to list sccache-backed profiles.
 # Use `just bench-sccache firefox` for the Firefox comparison.

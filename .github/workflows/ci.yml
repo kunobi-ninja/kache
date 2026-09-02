@@ -592,6 +592,13 @@ jobs:
       - name: AUR -git pkgver tests
         run: ./scripts/aur/test-vcs-pkgver.sh
 
+      # The perf gate's comparison script sets a commit status on every pull
+      # request from two JSON files. Same fixture-driven shape as the pkgver
+      # tests above: run it on results the engine could have written and check
+      # the exit code and the headline the workflow parses.
+      - name: Perf gate comparison tests
+        run: ./scripts/test-perf-gate-compare.sh
+
   # --- Dependency policy audit ---
   # Runs `cargo deny check` (via `just audit`) on every push and non-docs PR:
   # RustSec advisories PLUS license / bans / sources policy, matching the

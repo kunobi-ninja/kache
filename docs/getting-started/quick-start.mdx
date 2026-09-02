@@ -75,6 +75,8 @@ kache cargo -- build
 
 Otherwise set a distinct `CARGO_TARGET_DIR` per live worktree.
 
+Tools that copy the workspace to a temporary directory and build there, such as cargo-mutants, need no extra setup. See [Mutation testing](/docs/getting-started/mutation-testing).
+
 ## Executables and incremental builds
 
 Kache caches eligible Rust executables by default on Linux and macOS. The default is off on Windows because executable debug information still refers to an external PDB path. Override the policy with `KACHE_CACHE_EXECUTABLES` or `cache.cache_executables`.

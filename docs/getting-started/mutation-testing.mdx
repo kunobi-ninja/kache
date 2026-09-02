@@ -1,0 +1,54 @@
+---
+title: Mutation testing
+description: Run cargo-mutants after kache init and know what the cache saves
+---
+
+Run `kache init` once, then run `cargo mutants` as you normally would. There is no Kache command to put in front of it: Cargo invokes Kache as its `rustc-wrapper` inside every build directory cargo-mutants creates.
+
+```bash
+kache init
+cargo mutants
+```
+
+## Why the copies share one cache
+
+cargo-mutants copies the source tree to a temporary directory and builds there, one build directory per `--jobs` job. Kache maps each build's workspace root to the same `<WORKSPACE>` sentinel, and applies that rule before the temporary-directory rule, so the copy's path never enters a cache key. The root comes from rustc's own arguments: the parent of the target directory Cargo passes in `--out-dir`, accepted only when a `Cargo.toml` sits there and the compiler's working directory is beneath it.
+
+Cargo's `-C metadata` and `-C extra-filename` hashes enter the key verbatim. For path packages inside the workspace, Cargo derives them from workspace-relative package identity, so they are the same in every copy. That is what makes cross-copy hits possible at all.
+
+## What hits
+
+- registry crates
+- workspace crates no mutant touched, and their proc-macros
+- test binaries and build-script binaries of those crates (Kache caches executables by default on Linux and macOS; see [Configuration](/docs/getting-started/configuration))
+
+These hit in every build directory, including all of them under `--jobs N`, and again on later runs. When several build directories miss the same key at the same time, one compiles it and the others wait for its entry and restore it.
+
+## What rebuilds
+
+The mutated crate rebuilds, together with every crate downstream of it and their test binaries. A dependent's key includes the content hash of each `--extern` artifact, so a changed rlib changes every key above it.
+
+For the unit that misses on every mutant, Kache keeps rustc's incremental compilation instead of caching. Adaptive incremental mode notices a Cargo unit that misses twice in a short window with only its sources or dependencies changed, and gives it a private incremental directory for a while. To pin that to the crate you are mutating:
+
+```bash
+KACHE_INCREMENTAL_CRATES=my_crate cargo mutants
+```
+
+## What to expect
+
+- The baseline build in each copy can reuse entries your ordinary `cargo test` runs stored, as long as the flags match.
+- With `cap_lints` enabled, cargo-mutants adds `--cap-lints=warn` to `RUSTFLAGS`. Cargo folds rustflags into `extra-filename`, so the first run after enabling it is cold relative to your normal builds. Later runs are warm.
+- Small projects gain little. The per-mutant cost is the mutated crate plus its tests, and nothing caches those. Kache saves the dependency and unchanged-crate builds that each build directory would otherwise repeat.
+- `--copy-target` decides whether the copies rebuild dependencies at all. With the default, each build directory starts from an empty target and Kache restores dependencies instead of compiling them. With `--copy-target=true`, the copy carries Cargo's fingerprints, and Cargo does not invoke the wrapper for units it still considers fresh. Kache only helps when a copy's target is empty or dirty.
+
+## Crates that read `CARGO_MANIFEST_DIR` at compile time
+
+A crate that reads `CARGO_MANIFEST_DIR` during compilation, for example through `env!`, re-keys in every build directory. Kache keeps that value verbatim in the key because the compiled artifact can embed it. Such a crate compiles once per build directory; if its output embeds the path, its dependents follow.
+
+## Check a run
+
+```bash
+kache report --since 1h
+```
+
+Each build directory is its own root. Add `--root <build dir>` to look at one copy. See [`kache report`](/docs/commands/reference).

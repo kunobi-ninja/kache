@@ -53,6 +53,11 @@ Filesystem prefixes cannot contain `:`.
 
 ## Reclaim remote space
 
-Local `kache gc` never deletes remote objects. Remote deletion is manual because no protocol coordinates deletion with in-flight readers and writers.
+Local `kache gc` never deletes remote objects. A filesystem remote is bounded by `cache.remote.max_size` (or `KACHE_REMOTE_MAX_SIZE`) and swept with `kache gc --remote`:
 
-Use one designated deletion job and pause writers when pruning. Delete each manifest and pack pair together. For a small cache, removing the complete `artifacts/` subtree and allowing it to repopulate is safer than an inconsistent partial prune.
+```bash
+kache gc --remote --dry-run   # the computed budget and what a sweep would remove
+kache gc --remote             # remove it
+```
+
+Run the sweep from one machine that mounts the folder, on a timer. Concurrent sweeps are safe: a sweep takes an advisory lock at the remote root and a second one declines. A read-only process, whether `cache.remote_readonly` is set or the [CI policy](/docs/remote-cache/ci#who-may-write) made the job read-only, refuses to sweep and says why; `--dry-run` still shows the plan. See [`kache gc`](/docs/commands/reference#kache-gc) for the details.

@@ -53,6 +53,4 @@ Filesystem prefixes cannot contain `:`.
 
 ## Reclaim remote space
 
-Local `kache gc` never deletes remote objects. Remote deletion is manual because no protocol coordinates deletion with in-flight readers and writers.
-
-Use one designated deletion job and pause writers when pruning. Delete each manifest and pack pair together. For a small cache, removing the complete `artifacts/` subtree and allowing it to repopulate is safer than an inconsistent partial prune.
+kache never deletes remote objects. The owner of the directory runs a prune job; [Bound a remote](/docs/remote-cache/bounding) has the script and the ages that keep manifests and packs consistent.

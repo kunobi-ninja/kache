@@ -1,0 +1,87 @@
+# hk (jdx/hk) nightly compile-cache benchmark: cold, warm-same-tree, warm.
+#
+# Why hk: a mid-size Rust CLI (447 lockfile packages) whose build scripts
+# compile about 750 C and assembly objects through cc-rs: aws-lc-sys (293 .c
+# and 117 .S on x86_64 Linux) and vendored libgit2 (about 330 .c). That is the
+# shape where the C side decides the warm number, and where a benchmark that
+# wires only RUSTC_WRAPPER measures a partial setup: every one of those
+# objects then compiles outside the cache on every fresh target directory.
+#
+# This scenario wires the build-script compilers the way `kache init` does
+# (HOST_CC/HOST_CXX under Cargo [env], CC/CXX untouched), so both compiler
+# families are measured. The same subject at the previous commit is
+# bench-hk-pull, which measures the next-commit rebuild.
+name = "bench-hk"
+tags = ["suite:bench", "project:hk", "backend:kache", "lang:rust", "lang:cc"]
+
+requires = ["cargo", "rustc", "cc"]
+
+# aws-lc-sys uses its cc builder on Linux (cmake is only its fallback, NASM is
+# Windows-only) and hk's git2 has https and ssh off, so no OpenSSL is needed.
+setup = [
+  "echo '[bench] bench-hk needs a C compiler (aws-lc-sys cc builder, vendored libgit2); cmake only as the aws-lc-sys fallback.'",
+]
+
+# Dev profile with --locked, the command a developer runs. hk's [profile.dev]
+# keeps DWARF embedded, so the final binaries restore self-contained. The
+# prefix maps, SOURCE_DATE_EPOCH and KACHE_BASE_DIR are the cross-worktree
+# portability knobs the other cargo scenarios use (see bench-pr-cargo).
+build = """
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+export KACHE_BASE_DIR="$repo"
+
+cargo build --locked
+"""
+
+# Exactly what `kache init` writes into Cargo [env]: host-only wrappers, CC
+# and CXX untouched. For a native build cc-rs consults HOST_CC before CC, so
+# every build-script object goes through kache. cc 1.4.4 (hk's pin) already
+# knows kache as a wrapper; CC_KNOWN_WRAPPER_CUSTOM covers older cc-rs in the
+# graph.
+[env]
+HOST_CC = "{kache} cc"
+HOST_CXX = "{kache} c++"
+CC_KNOWN_WRAPPER_CUSTOM = "kache"
+
+[source]
+kind   = "clone"
+repo   = "https://github.com/jdx/hk.git"
+# hk 1.56.1. Pinned by commit SHA so a repointed tag cannot read as a cache
+# change. bench-hk-pull seeds at this commit's parent and rebuilds this one.
+ref    = "fc29ead1456ba7c1f62826c284126410a4014b00"
+objdir = "target"
+
+# hk ships no rust-toolchain.toml (rust-version 1.91.0). Pin the toolchain so
+# the numbers are comparable across runner images. `write` is right because
+# the subject does not own this file.
+[[file]]
+path = "rust-toolchain.toml"
+content = """
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+"""
+
+# Validity floors, not regression bounds: a phase that recompiled the world
+# must fail loudly rather than report a flattering wall clock. Sized far below
+# a healthy run (about 300 rustc hits plus about 700 cc hits on a warm phase,
+# hundreds of megabytes of debug artifacts restored).
+[checks.assert.warm-same-tree]
+max_passthrough_pct = 40.0
+max_errors = 0
+min_hits = 200
+min_restored_bytes = 67108864 # 64 MiB
+
+# The cross-worktree phase adds the path-portability check: an absolute path
+# in a key misses everything here and key stability collapses.
+[checks.assert.warm]
+min_key_stability_pct = 50.0
+max_passthrough_pct = 40.0
+max_errors = 0
+min_hits = 200
+min_restored_bytes = 67108864 # 64 MiB

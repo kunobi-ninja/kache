@@ -1,0 +1,62 @@
+# hk (jdx/hk) next-commit benchmark: build the parent commit cold, then
+# check out the child in the same worktree, wipe the target directory, and
+# rebuild with the store warm. The child changes one source file (src/git.rs)
+# and adds a test, so everything except the hk crate and its binaries should
+# hit, including every C and assembly object from the build scripts.
+#
+# Same wiring as bench-hk (HOST_CC/HOST_CXX, the way `kache init` writes
+# it); see that scenario for why hk and why the C side is in scope.
+name = "bench-hk-pull"
+tags = ["suite:bench", "project:hk", "backend:kache", "lang:rust", "lang:cc", "scenario:pull"]
+
+requires = ["cargo", "rustc", "cc"]
+
+setup = [
+  "echo '[bench] bench-hk-pull needs a C compiler (aws-lc-sys cc builder, vendored libgit2); cmake only as the aws-lc-sys fallback.'",
+]
+
+build = """
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+export KACHE_BASE_DIR="$repo"
+
+cargo build --locked
+"""
+
+[env]
+HOST_CC = "{kache} cc"
+HOST_CXX = "{kache} c++"
+CC_KNOWN_WRAPPER_CUSTOM = "kache"
+
+[source]
+kind     = "clone"
+repo     = "https://github.com/jdx/hk.git"
+# parent: the cold build and the store seed
+ref      = "27bb615768b85c9ac88e2abf8895219b44462871"
+# child: one commit later; bench-hk builds this commit in isolation
+ref_next = "fc29ead1456ba7c1f62826c284126410a4014b00"
+objdir   = "target"
+
+[[file]]
+path = "rust-toolchain.toml"
+content = """
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+"""
+
+# Pull-phase gates. Errors and unclassified passthroughs are blocking; the
+# floors catch a run that rebuilt everything. The hit rate is advisory while
+# the number is being baselined.
+[checks.assert.pull]
+max_errors          = 0
+max_passthrough_pct = 40.0
+min_hits            = 200
+min_restored_bytes  = 67108864 # 64 MiB
+
+[checks.measure.pull]
+min_hit_rate_pct = 90.0

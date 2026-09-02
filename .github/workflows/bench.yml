@@ -32,7 +32,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, surrealdb, lance, opendal, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows]
+        options: [all, substrate, surrealdb, lance, opendal, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, hk, hk-pull]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -119,6 +119,15 @@ jobs:
           # discovery prefers the exact-name hit). The Windows variant runs in its
           # own job below, on the self-hosted Windows runner.
           firefox_pull='{"name":"firefox-pull","cmd":"bench firefox-pull","dir":"bench-firefox-pull","timeout":480,"job_timeout":525,"min_free_gb":120}'
+          # hk (jdx/hk): a mid-size Rust CLI whose build scripts compile ~750
+          # C/asm objects through cc-rs (aws-lc-sys, vendored libgit2), wired
+          # the way `kache init` does it so both compiler families are measured.
+          # `--warm-same-tree` adds the same-path warm phase between cold and the
+          # cross-clone warm. Minutes, not hours; a C compiler is all it needs.
+          hk='{"name":"hk","cmd":"bench hk --warm-same-tree","dir":"bench-hk","timeout":60,"job_timeout":90,"min_free_gb":30}'
+          # Same subject on the temporal axis: cold at the parent commit, then
+          # rebuild the child in the same worktree with the store warm.
+          hk_pull='{"name":"hk-pull","cmd":"bench hk-pull","dir":"bench-hk-pull","timeout":60,"job_timeout":90,"min_free_gb":30}'
           case "$SCENARIO" in
             substrate)            inc="[$substrate]" ;;
             surrealdb)            inc="[$surrealdb]" ;;
@@ -128,13 +137,15 @@ jobs:
             firefox-sccache)      inc="[$firefox_sccache]" ;;
             llvm)                 inc="[$llvm]" ;;
             firefox-pull)         inc="[$firefox_pull]" ;;
+            hk)                   inc="[$hk]" ;;
+            hk-pull)              inc="[$hk_pull]" ;;
             # Windows-only scenarios are served by their own self-hosted jobs
             # below, so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`
             # and wastefully run the whole Linux `all` matrix alongside.
             firefox-windows)      inc="[]" ;;
             firefox-pull-windows) inc="[]" ;;
-            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull]" ;;
+            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull,$hk,$hk_pull]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
           if [ "$inc" = "[]" ]; then

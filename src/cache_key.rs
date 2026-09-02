@@ -3386,6 +3386,13 @@ fn system_time_ns(time: Option<std::time::SystemTime>) -> Option<i64> {
     )
 }
 
+/// `-C extra-filename=` in either spelling. rustc normalises `-` and `_` in
+/// codegen option names at parse time, so `-C extra_filename=` is the same
+/// option and must be dropped from the pre-pass just the same.
+fn is_extra_filename_option(value: &str) -> bool {
+    value.starts_with("extra-filename=") || value.starts_with("extra_filename=")
+}
+
 /// Build the argv for the dep-info pre-pass from the original rustc argv.
 ///
 /// The pre-pass reuses everything that shapes the source closure (features,
@@ -3418,14 +3425,16 @@ fn dep_info_pass_args(source_file: &Path, rustc_args: &[String], dep_file: &Path
             "-C" | "--codegen"
                 if remaining
                     .peek()
-                    .is_some_and(|value| value.starts_with("extra-filename=")) =>
+                    .is_some_and(|value| is_extra_filename_option(value)) =>
             {
                 remaining.next();
             }
             _ if arg.starts_with("--emit=") || arg.starts_with("--out-dir=") => {}
             // Joined codegen forms: `-Cextra-filename=…`, `--codegen=extra-filename=…`.
-            _ if arg.starts_with("-Cextra-filename=")
-                || arg.starts_with("--codegen=extra-filename=") => {}
+            _ if arg
+                .strip_prefix("-C")
+                .or_else(|| arg.strip_prefix("--codegen="))
+                .is_some_and(is_extra_filename_option) => {}
             // Skip the source file — already added as the first positional arg.
             _ if arg.as_str() == source_str.as_ref() => {}
             _ => dep_args.push((*arg).clone()),
@@ -8147,6 +8156,12 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             vec!["-Cextra-filename=-abc123"],
             vec!["--codegen", "extra-filename=-abc123"],
             vec!["--codegen=extra-filename=-abc123"],
+            // rustc normalises `_` to `-` in option names, so the underscore
+            // spelling reaches the same flag.
+            vec!["-C", "extra_filename=-abc123"],
+            vec!["-Cextra_filename=-abc123"],
+            vec!["--codegen", "extra_filename=-abc123"],
+            vec!["--codegen=extra_filename=-abc123"],
         ] {
             let mut args: Vec<String> = vec!["--crate-type".into(), "lib".into()];
             args.extend(spelling.iter().map(|arg| (*arg).to_string()));
@@ -8157,7 +8172,9 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
                 dep_info_pass_args(Path::new("src/lib.rs"), &args, Path::new("/tmp/deps.d"));
 
             assert!(
-                !dep_args.iter().any(|a| a.contains("extra-filename")),
+                !dep_args
+                    .iter()
+                    .any(|a| a.contains("extra-filename") || a.contains("extra_filename")),
                 "{spelling:?} must be dropped: {dep_args:?}"
             );
             assert!(

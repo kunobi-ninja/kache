@@ -1,4 +1,7 @@
-FROM rust:1.95-bookworm AS builder
+# Keep the tag in step with rust-toolchain.toml. The tree is copied in with
+# that file, so a base image on another version makes rustup download the
+# pinned toolchain on every build instead of using the one in the image.
+FROM rust:1.98-bookworm AS builder
 
 WORKDIR /app
 RUN apt-get update \

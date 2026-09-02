@@ -1,4 +1,9 @@
+# The one Rust pin. rustup reads it directly, mise reads it through
+# `idiomatic_version_file_enable_tools` in mise.toml, and the Nix flake reads it
+# with `fromRustupToolchainFile`, so CI and contributors build with the same
+# compiler. The channel is an exact version: a point release must not move CI
+# without a commit here.
 [toolchain]
-channel = "1.95"
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

@@ -7,7 +7,7 @@ Thank you for your interest in contributing to kache! This document covers the d
 ### Prerequisites
 
 - [mise](https://mise.jdx.dev/) (recommended)
-- Rust **1.95+**
+- Rust, at the version pinned in `rust-toolchain.toml` (rustup and `mise install` both read it)
 - `just`
 
 ### Clone and build

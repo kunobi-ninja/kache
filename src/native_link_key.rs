@@ -6,6 +6,24 @@
 //! resolves those inputs so the cache key can pin them, and fails closed when
 //! the essentials cannot be placed — the wrapper then passes through rather
 //! than sharing a binary neither host identified.
+//!
+//! # Windows MSVC
+//!
+//! A native `*-windows-msvc` link is keyed by the validated `link.exe` or
+//! `lld-link` banner, the `cl.exe` banner, the selected architecture, the
+//! MSVC/SDK/UCRT versions, the bytes of every CRT/vcruntime/UCRT library the
+//! search path exposes, and the bytes of each `-l` library resolved through
+//! `-L`, `/LIBPATH` and `LIB` in the order LINK would use.
+//!
+//! Everything else fails closed to passthrough: `LINK`/`_LINK_` option
+//! variables, a linker other than `link.exe`/`lld-link`, an ambiguous or
+//! missing `-l` library, cross-target and windows-gnu links, and any
+//! `-C link-arg` that hands LINK a file the identity does not hash. That last
+//! group is decided by [`windows_link_argument_has_unmodeled_input`]:
+//! `.lib`/`.a`/`.obj`/`.o`/`.res`/`.def`/`.exp`/`.manifest` inputs and
+//! file-carrying options such as `/DEF:`, `/MANIFESTINPUT:`,
+//! `/MANIFESTFILE:` and `/PDBSTRIPPED:` are only text in the key, so a file
+//! rebuilt under an unchanged name would otherwise restore a stale executable.
 
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -394,6 +412,89 @@ pub(crate) fn is_windows_msvc_target(target: &str) -> bool {
         && target
             .split('-')
             .any(|component| component.eq_ignore_ascii_case("msvc"))
+}
+
+/// Whether a `-C link-arg`/`link-args` value hands the COFF linker an input
+/// the native MSVC identity does not hash.
+///
+/// The key folds the argument *text*, not the bytes of the files that text
+/// names. A `.res`, `.def` or `.obj` rebuilt in place under the same OUT_DIR
+/// name would then restore a stale executable, so every such argument fails
+/// closed and the link passes through. Two shapes are recognised, after the
+/// value is split on the commas and whitespace that `-Wl,` and `link-args`
+/// use to carry several tokens:
+///
+/// - a token naming a linker input by extension (`.lib`, `.a`, `.obj`, `.o`,
+///   `.res`, `.def`, `.exp`, `.manifest`), bare or as an option value;
+/// - a `/OPTION:` or `-OPTION:` (also `=`) whose value is a file the linker
+///   reads or writes beside the executable: `/DEF`, `/DEFAULTLIB`,
+///   `/WHOLEARCHIVE:lib`, `/STUB`, `/KEYFILE`, `/PGD`, `/NATVIS`,
+///   `/SOURCELINK`, `/MANIFESTINPUT`, the CLR `/ASSEMBLY*` inputs, and the
+///   side outputs `/MANIFESTFILE`, `/PDBSTRIPPED`, `/PDB`, `/IMPLIB`, `/ILK`.
+///
+/// Both checks are ASCII case-insensitive because LINK is. `/LIBPATH` is not
+/// listed: its directory is modeled by the caller. `/MAP`, `/ORDER:@file`
+/// and `@response` files are refused earlier by the generic side-file check.
+/// Libraries requested through `-l` never reach this function; they are
+/// resolved and hashed by [`hash_windows_selected_libraries`].
+pub(crate) fn windows_link_argument_has_unmodeled_input(value: &str) -> bool {
+    value
+        .split([',', ' ', '\t', '\n', '\r'])
+        .map(|token| token.trim_matches('"'))
+        .any(|token| {
+            windows_link_token_names_input_file(token) || windows_link_token_is_file_option(token)
+        })
+}
+
+/// A bare or option-value token whose extension marks a linker input file.
+fn windows_link_token_names_input_file(token: &str) -> bool {
+    ends_with_ignore_ascii_case(token, ".lib")
+        || ends_with_ignore_ascii_case(token, ".a")
+        || ends_with_ignore_ascii_case(token, ".obj")
+        || ends_with_ignore_ascii_case(token, ".o")
+        || ends_with_ignore_ascii_case(token, ".res")
+        || ends_with_ignore_ascii_case(token, ".def")
+        || ends_with_ignore_ascii_case(token, ".exp")
+        || ends_with_ignore_ascii_case(token, ".manifest")
+}
+
+/// A `/NAME:value` or `-NAME=value` option whose value is a file the identity
+/// neither hashes nor captures. A bare `/WHOLEARCHIVE` applies to the inputs
+/// rustc already passes and carries no file of its own.
+fn windows_link_token_is_file_option(token: &str) -> bool {
+    let Some(option) = token.strip_prefix(['/', '-']) else {
+        return false;
+    };
+    let (name, value) = match option.split_once([':', '=']) {
+        Some((name, value)) => (name, Some(value)),
+        None => (option, None),
+    };
+    let named = |candidate: &str| name.eq_ignore_ascii_case(candidate);
+    named("DEF")
+        || named("DEFAULTLIB")
+        || (named("WHOLEARCHIVE") && value.is_some())
+        || named("STUB")
+        || named("KEYFILE")
+        || named("PGD")
+        || named("NATVIS")
+        || named("SOURCELINK")
+        || named("MANIFESTINPUT")
+        || named("ASSEMBLYMODULE")
+        || named("ASSEMBLYRESOURCE")
+        || named("ASSEMBLYLINKRESOURCE")
+        || named("MANIFESTFILE")
+        || named("PDBSTRIPPED")
+        || named("PDB")
+        || named("IMPLIB")
+        || named("ILK")
+}
+
+fn ends_with_ignore_ascii_case(token: &str, suffix: &str) -> bool {
+    token
+        .len()
+        .checked_sub(suffix.len())
+        .and_then(|start| token.get(start..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
 fn windows_tool_from_name(path: &Path) -> Option<WindowsTool> {
@@ -2568,5 +2669,140 @@ mod tests {
         assert_eq!(identity.ucrt, sdk_version);
         assert_eq!(identity.libraries.len(), 3);
         assert!(identity.libraries.contains_key("libvcruntime.lib"));
+    }
+
+    #[test]
+    fn windows_link_arguments_naming_input_files_fail_closed() {
+        // One value per extension arm, spelt so that only that arm fires, in
+        // both cases LINK accepts. Quoted, comma-joined (`-Wl,`) and
+        // whitespace-joined (`link-args`) carriers are split first.
+        for argument in [
+            "foo.lib",
+            "FOO.LIB",
+            "libfoo.a",
+            "LIBFOO.A",
+            "extra.obj",
+            "EXTRA.Obj",
+            "extra.o",
+            "EXTRA.O",
+            "app.res",
+            "APP.RES",
+            "exports.def",
+            "EXPORTS.DEF",
+            "exports.exp",
+            "EXPORTS.EXP",
+            "app.manifest",
+            "APP.Manifest",
+            r#""C:\out dir\app.res""#,
+            "-Wl,app.res",
+            "/DEBUG app.res",
+            "/OPT:REF\tapp.res",
+            "/NODEFAULTLIB:libcmt.lib",
+        ] {
+            assert!(
+                windows_link_argument_has_unmodeled_input(argument),
+                "{argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_link_file_options_fail_closed_under_either_prefix_and_case() {
+        // Values avoid every modeled extension so only the option arm fires.
+        for argument in [
+            "/DEF:exports",
+            "-def:exports",
+            "/DeF=exports",
+            "-Wl,/DEF:exports",
+            "/DEFAULTLIB:foo",
+            "-defaultlib:foo",
+            "/WHOLEARCHIVE:foo",
+            "-wholearchive=foo",
+            "/STUB:stub.bin",
+            "-stub:stub.bin",
+            "/KEYFILE:key.snk",
+            "-KeyFile:key.snk",
+            "/PGD:app.pgd",
+            "-pgd:app.pgd",
+            "/NATVIS:types.natvis",
+            "-natvis:types.natvis",
+            "/SOURCELINK:sl.json",
+            "-sourcelink:sl.json",
+            "/MANIFESTINPUT:extra.xml",
+            "-manifestinput:extra.xml",
+            "/ASSEMBLYMODULE:m.netmodule",
+            "-assemblymodule:m.netmodule",
+            "/ASSEMBLYRESOURCE:r.resources",
+            "-assemblyresource:r.resources",
+            "/ASSEMBLYLINKRESOURCE:r.bin",
+            "-assemblylinkresource:r.bin",
+            "/MANIFESTFILE:app.xml",
+            "-manifestfile:app.xml",
+            "/PDBSTRIPPED:public.pdb",
+            "-PdbStripped:public.pdb",
+            "/PDB:app.pdb",
+            "-pdb:app.pdb",
+            "/IMPLIB:app.imp",
+            "-implib:app.imp",
+            "/ILK:app.ilk",
+            "-ilk:app.ilk",
+            "/DEBUG /DEF:exports",
+            r#"/DEF:"C:\out dir\exports""#,
+        ] {
+            assert!(
+                windows_link_argument_has_unmodeled_input(argument),
+                "{argument}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_link_arguments_without_unhashed_files_stay_modeled() {
+        // Plain options, the modeled `/LIBPATH` directory (its `.lib` name is a
+        // directory, not an input), names that are not files, and a bare
+        // `/WHOLEARCHIVE` that only re-scopes rustc's own inputs.
+        for argument in [
+            "",
+            "/DEBUG",
+            "/DEBUG:FULL",
+            "/OPT:REF,ICF",
+            "/SUBSYSTEM:WINDOWS,5.02",
+            "/STACK:0x800000",
+            "/INCLUDE:__foo",
+            "/MANIFEST:NO",
+            "/MANIFESTUAC:level='asInvoker'",
+            "/NODEFAULTLIB",
+            "/NODEFAULTLIB:libcmt",
+            "/WHOLEARCHIVE",
+            "-wholearchive",
+            "/DELAYLOAD:foo.dll",
+            "/PDBALTPATH:%_PDB%",
+            r"/LIBPATH:C:\sdk\lib",
+            r"-libpath:C:\vendor.lib\x64",
+            "-Wl,/OPT:REF",
+            "-fuse-ld=lld",
+            "rlib",
+        ] {
+            assert!(
+                !windows_link_argument_has_unmodeled_input(argument),
+                "{argument}"
+            );
+        }
+
+        // A `.lib` requested through `-l` is not a link argument at all: it is
+        // resolved against the search directories and its bytes are hashed.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("foo.lib"), b"!<arch>\nimport").unwrap();
+        let hashed = hash_windows_selected_libraries(
+            &[root.path().to_path_buf()],
+            &[],
+            &["static=foo".to_string()],
+            hash_placed,
+        )
+        .unwrap();
+        assert_eq!(
+            hashed.get("link:0").map(String::as_str),
+            Some(hash_placed(&root.path().join("foo.lib")).unwrap().as_str())
+        );
     }
 }

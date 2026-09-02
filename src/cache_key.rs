@@ -237,9 +237,14 @@ use std::path::{Path, PathBuf};
 //
 // v30: native Windows MSVC links now pin the validated link.exe/lld-link and
 // cl banners, selected architecture, MSVC/SDK/UCRT versions, and hashes of
-// the selected CRT/UCRT libraries. Windows GNU, cross-target, and metadata
-// invocations remain unprobed. Existing Windows linked-output keys did not
-// contain this identity, so invalidate them rather than mix schemas.
+// the selected CRT/UCRT libraries and of every `-l` library resolved through
+// `-L`/`/LIBPATH`/LIB. Explicit `-C link-arg` input files (`.lib`, `.a`,
+// `.obj`, `.o`, `.res`, `.def`, `.exp`, `.manifest`) and file-carrying LINK
+// options (`/DEF`, `/DEFAULTLIB`, `/MANIFESTINPUT`, `/MANIFESTFILE`,
+// `/PDBSTRIPPED`, ...) are keyed only as text, so they fail closed to
+// passthrough. Windows GNU, cross-target, and metadata invocations remain
+// unprobed. Existing Windows linked-output keys did not contain this
+// identity, so invalidate them rather than mix schemas.
 pub(crate) const CACHE_KEY_VERSION: u32 = 30;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
@@ -1378,8 +1383,12 @@ pub fn compute_cache_key(
     // rather than bundled and is left name-only here. Direct command-line
     // native Windows MSVC libraries are handled separately below: their
     // import-library bytes affect the executable and are hashed as part of the
-    // host link identity. Libraries inherited only through rlib metadata are
-    // not exposed in this argv and are outside that direct-input identity.
+    // host link identity. Files handed to LINK through `-C link-arg` (`.res`,
+    // `.def`, `.obj`, `/DEF:`, `/MANIFESTINPUT:`, ...) are folded only as
+    // text by the generic codegen fold, so that identity refuses them rather
+    // than let a rebuilt file under the same name restore a stale executable.
+    // Libraries inherited only through rlib metadata are not exposed in this
+    // argv and are outside that direct-input identity.
     // Linker order/section-order/map files and opaque response files require
     // side-input/output handling beyond the archive key. Fail closed instead
     // of caching an invocation whose auxiliary behavior cannot be reproduced.
@@ -1571,7 +1580,9 @@ pub fn compute_cache_key(
     // import/static libraries. The probe is strictly host-native: metadata,
     // cross-target links, and windows-gnu links must remain portable and must
     // not execute or inspect host tools. A failed probe bubbles out so the
-    // wrapper passes through rather than sharing an unidentified executable.
+    // wrapper passes through rather than sharing an unidentified executable;
+    // so does any `-C link-arg` that names an input file the identity does
+    // not hash (see `windows_native_link_search_dirs`).
     fold_native_windows_msvc_identity(
         &mut hasher,
         args,
@@ -4126,8 +4137,12 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
         let Some(value) = value.as_deref() else {
             continue;
         };
-        if windows_link_arg_has_unmodeled_library(value) {
-            anyhow::bail!("explicit Windows .lib/DEFAULTLIB linker arguments are not cacheable");
+        if crate::native_link_key::windows_link_argument_has_unmodeled_input(value) {
+            anyhow::bail!(
+                "explicit Windows linker input files (.lib/.a/.obj/.o/.res/.def/.exp/.manifest) \
+                 and file-carrying LINK options (/DEF, /DEFAULTLIB, /MANIFESTINPUT, \
+                 /MANIFESTFILE, /PDBSTRIPPED, ...) are not hashed and are not cacheable"
+            );
         }
         if let Some(path) = windows_libpath_argument(value)? {
             linker.push(PathBuf::from(path));
@@ -4168,11 +4183,6 @@ fn windows_libpath_argument(value: &str) -> Result<Option<String>> {
         anyhow::bail!("empty Windows /LIBPATH linker argument");
     }
     Ok(Some(path.to_string()))
-}
-
-fn windows_link_arg_has_unmodeled_library(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    value.contains(".lib") || value.contains("/defaultlib") || value.contains("-defaultlib")
 }
 
 fn fold_generic_linker_identity<H, Get>(
@@ -5010,14 +5020,20 @@ mod tests {
         let libpath = dir.path().join("libpath");
         std::fs::create_dir_all(&native).unwrap();
         std::fs::create_dir_all(&libpath).unwrap();
+        // `-l static=foo` resolves to `foo.lib` through the modeled search
+        // dirs and is hashed by the identity; only `-C link-arg` inputs are
+        // classified.
         let args = RustcArgs::parse(&[
             "rustc".into(),
             "--crate-type=bin".into(),
+            "-l".into(),
+            "static=foo".into(),
             "-L".into(),
             format!("native={}", native.display()),
             format!("-Clink-arg=/LIBPATH:{}", libpath.display()),
         ])
         .unwrap();
+        assert_eq!(args.link_libs, vec!["static=foo".to_string()]);
         assert_eq!(
             windows_native_link_search_dirs(&args).unwrap(),
             WindowsNativeLinkSearchDirs {
@@ -5039,6 +5055,16 @@ mod tests {
             "/DEFAULTLIB:foo",
             "-defaultlib:foo",
             "/DEFAULTLIB:foo.lib",
+            "app.res",
+            "APP.RES",
+            "extra.obj",
+            "exports.exp",
+            "/DEF:exports.def",
+            "-def:exports.def",
+            "-Wl,/def:exports.def",
+            "/MANIFESTINPUT:extra.manifest",
+            "/MANIFESTFILE:app.exe.manifest",
+            "/PDBSTRIPPED:app.public.pdb",
         ] {
             let args = RustcArgs::parse(&[
                 "rustc".into(),
@@ -5046,9 +5072,10 @@ mod tests {
                 format!("-Clink-arg={linker_arg}"),
             ])
             .unwrap();
+            let error = windows_native_link_search_dirs(&args).unwrap_err();
             assert!(
-                windows_native_link_search_dirs(&args).is_err(),
-                "unmodeled Windows library argument must fail closed: {linker_arg}"
+                error.to_string().contains("not hashed"),
+                "unmodeled Windows link input must fail closed: {linker_arg}: {error:#}"
             );
         }
     }

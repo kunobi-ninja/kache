@@ -3,7 +3,7 @@ title: Installation
 description: Install Kache from a release, package manager, crates.io, or Nix
 ---
 
-Kache requires Rust 1.95 when built from source. Release binaries have no Rust runtime dependency.
+Building from a git checkout uses the toolchain pinned in `rust-toolchain.toml`, which rustup installs on first use. `cargo install` builds with your own toolchain and needs Rust 1.95 or newer, the crate's `rust-version`. Release binaries have no Rust runtime dependency.
 
 ## Recommended methods
 

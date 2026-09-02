@@ -73,9 +73,9 @@ jobs:
           # job below — see that job for the rationale.
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      # mise installs everything in mise.toml: rust (with rustfmt +
-      # clippy via the rust tool-options block), just, helm, sccache,
-      # cargo-llvm-cov.
+      # mise installs everything in mise.toml (just, helm, sccache,
+      # cargo-llvm-cov) plus rust, which it reads from rust-toolchain.toml:
+      # channel, rustfmt and clippy.
       - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           # Pin the mise CLI. v2026.6.10 (2026-06-14) regressed binary
@@ -1060,8 +1060,9 @@ jobs:
           reshim: false
       # mise installs the toolchain via rustup under RUSTUP_HOME, but on a
       # runner with a pre-existing rustup it leaves no cargo proxy on PATH —
-      # so the stale system Rust (Homebrew 1.94) would win. Prepend the
-      # toolchain's own bin dir (the real 1.95 binaries) to PATH instead.
+      # so the stale system Rust (Homebrew) would win. Prepend the pinned
+      # toolchain's own bin dir (the rust-toolchain.toml binaries) to PATH
+      # instead.
       - name: Put the Rust toolchain first on PATH
         run: |
           bin_dir=$(echo "$RUSTUP_HOME"/toolchains/*/bin)

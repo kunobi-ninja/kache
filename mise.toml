@@ -1,14 +1,15 @@
 [settings]
-# Read rust version from rust-toolchain.toml (single source of truth
-# for both rustup and mise).
+# rust (channel, components, profile) comes from rust-toolchain.toml, the one
+# pin that rustup, mise, and the Nix flake all read. Do not add a [tools].rust
+# entry below: it would take precedence over the file. That is how CI drifted
+# to `latest` while plain rustup gave contributors the pinned channel.
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
-rust = { version = "latest", components = "rustfmt,clippy" }
 "github:casey/just" = "1.43.1"
 # Versions are pinned (not `latest`) so a tool release can't break CI with no
-# code change. Bump deliberately. (rust is intentionally left to
-# rust-toolchain.toml via idiomatic_version_file_enable_tools above.)
+# code change. Bump deliberately. (rust is pinned in rust-toolchain.toml, read
+# via idiomatic_version_file_enable_tools above.)
 helm = "4.2.0"
 # Drives the out-of-tree CMake e2e scenario (e2e-cmake-out-of-tree, #394) so it
 # runs on the Linux/macOS gate instead of skipping. The scenario itself is

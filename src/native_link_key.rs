@@ -2370,6 +2370,9 @@ mod tests {
             "static=dir\\foo",
             "static=foo:sub/renamed",
             "static=foo:sub\\renamed",
+            // An empty modifier and a repeated one are each rejected on their own.
+            "static:+verbatim,=foo",
+            "static:+whole-archive,+whole-archive=foo",
         ] {
             assert!(
                 windows_link_library_filenames(specification).is_err(),

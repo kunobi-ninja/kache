@@ -94,6 +94,8 @@ The default prefix is `artifacts`. Writers need `s3:GetObject`, `s3:PutObject`, 
 
 Remote packs use zstd; local blobs remain uncompressed. Configure the level with `cache.compression_level` or `KACHE_COMPRESSION_LEVEL`.
 
+kache never deletes remote objects. Bound the bucket with a lifecycle rule; [Bound a remote](/docs/remote-cache/bounding) lists the prefixes and ages.
+
 ## macOS LAN access
 
 macOS may request Local Network permission when an installed LaunchAgent reaches a LAN endpoint. If only the service gets `No route to host`, reinstall it with the current binary and check System Settings > Privacy & Security > Local Network.

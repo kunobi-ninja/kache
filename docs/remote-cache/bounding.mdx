@@ -1,0 +1,82 @@
+---
+title: Bound a remote
+description: Let the store expire old objects; kache never deletes remotely
+---
+
+A remote cache grows until something removes old objects. That something is the store, not kache: an S3 lifecycle rule, or a prune job run by the owner of a shared directory. kache reads and writes remote objects and never deletes them, so a policy can run at any time without pausing builds.
+
+## What the layout needs from a policy
+
+```text
+{prefix}/v3/manifests/{crate}/{key}.json      one manifest ...
+{prefix}/v3/packs/{crate}/{key}.tar.zst       ... and the pack it describes
+{prefix}/_manifests/...                       build manifests and shards
+{prefix}/v4/prefetch/catalogs/...             prefetch catalogs
+{prefix}/v4/prefetch/packs/...                content-addressed prefetch packs
+{prefix}/v4/prefetch/pack-meta/...            metadata for those packs
+```
+
+Three rules keep the store consistent under expiry:
+
+- Expire `v3/manifests/` and `v3/packs/` with the same age. A manifest and its pack are written together and neither is rewritten, so they age together. A manifest that outlives its pack is a miss; a pack that outlives its manifest is unreachable garbage.
+- Expire `v4/prefetch/catalogs/` sooner than `v4/prefetch/packs/` and `pack-meta/`. Packs are shared between catalog generations, so a live catalog must never point at an expired pack.
+- Expire by age since the object was written. kache does not rewrite an existing object, so a hot entry expires too and is uploaded again on the next miss. That is the same trade every object store's lifecycle makes; pick an age longer than the interval at which your builds change.
+
+An expired object is a miss. The daemon's remote key index can report an object present for up to `cache.remote_key_cache_refresh_secs` after it expired; the fetch then misses and the crate compiles as usual.
+
+## S3 lifecycle rules
+
+Thirty days for artifacts and fourteen for catalogs is a reasonable start. Every provider below applies the rule on its own schedule, usually once a day.
+
+**AWS S3**
+
+```json title="lifecycle.json"
+{
+  "Rules": [
+    { "ID": "kache-v3", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v3/" }, "Expiration": { "Days": 30 } },
+    { "ID": "kache-manifests", "Status": "Enabled", "Filter": { "Prefix": "artifacts/_manifests/" }, "Expiration": { "Days": 30 } },
+    { "ID": "kache-prefetch-catalogs", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v4/prefetch/catalogs/" }, "Expiration": { "Days": 14 } },
+    { "ID": "kache-prefetch-packs", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v4/prefetch/packs/" }, "Expiration": { "Days": 30 } },
+    { "ID": "kache-prefetch-pack-meta", "Status": "Enabled", "Filter": { "Prefix": "artifacts/v4/prefetch/pack-meta/" }, "Expiration": { "Days": 30 } }
+  ]
+}
+```
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket my-kache --lifecycle-configuration file://lifecycle.json
+```
+
+Replace `artifacts/` with your `cache.remote.prefix`. Add an `AbortIncompleteMultipartUpload` rule if your bucket receives multipart uploads from other tools; kache uploads each object in one request.
+
+**Cloudflare R2**
+
+R2 supports object lifecycle rules per prefix with the same expiry-by-age semantics. Create one rule per prefix above from the bucket's settings in the dashboard, or with Wrangler.
+
+**MinIO**
+
+```bash
+mc ilm rule add --prefix "artifacts/v3/" --expire-days 30 myminio/my-kache
+mc ilm rule add --prefix "artifacts/_manifests/" --expire-days 30 myminio/my-kache
+mc ilm rule add --prefix "artifacts/v4/prefetch/catalogs/" --expire-days 14 myminio/my-kache
+mc ilm rule add --prefix "artifacts/v4/prefetch/packs/" --expire-days 30 myminio/my-kache
+mc ilm rule add --prefix "artifacts/v4/prefetch/pack-meta/" --expire-days 30 myminio/my-kache
+```
+
+## Filesystem remote
+
+The owner of the shared directory runs one prune job on one machine. Age by modification time so the result is the same on `noatime` mounts, and skip the staging directory kache renames from.
+
+```bash
+#!/bin/sh
+root=/mnt/shared-kache/artifacts
+# v3: manifests and packs in one pass, same age, so pairs go together.
+find "$root/v3" "$root/_manifests" -type f -mtime +30 -delete
+# v4: catalogs before the packs they reference.
+find "$root/v4/prefetch/catalogs" -type f -mtime +14 -delete
+find "$root/v4/prefetch/packs" "$root/v4/prefetch/pack-meta" -type f -mtime +30 -delete
+find "$root" -mindepth 1 -type d -empty -not -path '*/.kache-tmp*' -delete
+```
+
+Run it from cron or a systemd timer once a day. Nothing coordinates with writers because nothing needs to: a writer that loses a race with the prune uploads again on its next miss, and a reader that loses one records a miss.
+
+`kache gc` bounds the local store only. There is no kache command that deletes remote objects.

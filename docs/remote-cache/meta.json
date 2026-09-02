@@ -1,4 +1,10 @@
 {
   "title": "Remote cache",
-  "pages": ["s3-setup", "filesystem-setup", "sync", "ci"]
+  "pages": [
+    "s3-setup",
+    "filesystem-setup",
+    "bounding",
+    "sync",
+    "ci"
+  ]
 }

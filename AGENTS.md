@@ -5,18 +5,20 @@
 ## Before `gh pr create`
 
 ```sh
-just pr
+just check
 ```
 
-That is `just check` (fmt, clippy `-D warnings`, tests) plus `just mutants-diff` against `origin/main`. Docs-only diffs skip mutants.
+That is fmt, clippy `-D warnings`, and the workspace tests. Do not open the PR until it exits 0.
+
+Mutants run in CI, not on your machine. Open the PR as a draft; the `Mutation testing (diff k/n)` shards test every changed Rust line in parallel on Linux runners and finish in well under an hour. A red shard prints the missed mutants in its log and uploads them as `missed.txt` in its `mutation-diff-report-<k>` artifact; add the test that kills each one, push, and mark the PR ready when every shard is green. A laptop running the same diff at one to three jobs takes hours and the load makes the fixture-based tests flake.
+
+`just pr` still exists for a Linux box with cores to spare: it is `just check` plus `just mutants-diff` against `origin/main`, the same scope CI runs. If you use it:
 
 ```sh
 cargo install --locked cargo-mutants --version 27.1.0
 ```
 
 Do not invoke `cargo mutants` with `RUSTC_WRAPPER=kache`. The Justfile clears it. Hand-running mutants without `just` wraps kache in itself and the unmutated baseline dies.
-
-Do not open the PR until `just pr` exits 0.
 
 ## How mutants die here
 

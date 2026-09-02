@@ -7,6 +7,7 @@ use crate::cli::format_duration_ms;
 use crate::config::Config;
 use crate::daemon::{TransferDirection, TransferEvent};
 use crate::events::{self, BuildEvent, EventResult};
+use crate::since::SinceWindow;
 
 // ── Data Model ──────────────────────────────────────────────────────────────
 
@@ -73,9 +74,30 @@ pub struct BuildReport {
 pub struct ReportMeta {
     pub kache_version: String,
     pub generated_at: String,
+    /// The window in whole hours, rounded down (0 for a sub-hour window).
+    /// Kept for consumers that predate `since_secs`.
     pub since_hours: u64,
+    /// The window in seconds (kunobi-ninja/kache#897). Authoritative.
+    #[serde(default)]
+    pub since_secs: u64,
+    /// The window as requested: `15m`, `2h`, `24h`. Empty in reports written
+    /// before this field existed; render through [`ReportMeta::window_label`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub since: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_filter: Option<String>,
+}
+
+impl ReportMeta {
+    /// The window for headings: `since` when present, else the whole-hour
+    /// value an older report carried.
+    pub fn window_label(&self) -> String {
+        if self.since.is_empty() {
+            format!("{}h", self.since_hours)
+        } else {
+            self.since.clone()
+        }
+    }
 }
 
 fn default_trace_display_time_unit() -> String {
@@ -653,23 +675,24 @@ pub struct ReportFilter {
     pub root: Option<PathBuf>,
 }
 
-pub fn generate_report(config: &Config, hours: u64, top: usize) -> Result<BuildReport> {
-    generate_report_with_filter(config, hours, top, &ReportFilter::default())
+pub fn generate_report(config: &Config, window: SinceWindow, top: usize) -> Result<BuildReport> {
+    generate_report_with_filter(config, window, top, &ReportFilter::default())
 }
 
 pub fn generate_report_with_filter(
     config: &Config,
-    hours: u64,
+    window: SinceWindow,
     top: usize,
     filter: &ReportFilter,
 ) -> Result<BuildReport> {
-    let since = Utc::now() - chrono::Duration::hours(hours as i64);
+    let now = Utc::now();
+    let since = window.cutoff(now);
     let mut build_events = events::read_events_since(&config.event_log_path(), since)?;
     let root_filter = filter.root.as_deref().map(normalize_filter_root);
     if let Some(root) = root_filter.as_deref() {
         build_events.retain(|event| event_matches_root(event, root));
     }
-    let since_ts = since.timestamp() as u64;
+    let since_ts = window.cutoff_unix_secs(now);
     let transfers = if root_filter.is_some() {
         Vec::new()
     } else {
@@ -826,7 +849,9 @@ pub fn generate_report_with_filter(
         meta: ReportMeta {
             kache_version: crate::VERSION.to_string(),
             generated_at: Utc::now().to_rfc3339(),
-            since_hours: hours,
+            since_hours: window.hours(),
+            since_secs: window.secs(),
+            since: window.label(),
             root_filter: root_filter.clone(),
         },
         summary: ReportSummary {
@@ -914,7 +939,7 @@ pub fn generate_report_with_filter(
         bypass,
         errors_detail,
         suggestions,
-        gc: load_gc_summary(&config.cache_dir, hours),
+        gc: load_gc_summary(&config.cache_dir, since),
     })
 }
 
@@ -943,15 +968,14 @@ fn event_matches_root(event: &BuildEvent, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with(std::path::MAIN_SEPARATOR))
 }
 
-/// Load GC stats from gc_stats.json if GC ran within the report window.
-fn load_gc_summary(cache_dir: &std::path::Path, hours: u64) -> Option<GcSummary> {
+/// Load GC stats from gc_stats.json if GC ran at or after `cutoff`.
+fn load_gc_summary(cache_dir: &std::path::Path, cutoff: DateTime<Utc>) -> Option<GcSummary> {
     let path = cache_dir.join("gc_stats.json");
     let content = std::fs::read_to_string(&path).ok()?;
     let persisted: GcStatsPersisted = serde_json::from_str(&content).ok()?;
 
     // Only include if GC ran within the report window
     let last_run = chrono::DateTime::parse_from_rfc3339(&persisted.last_run).ok()?;
-    let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
     if last_run < cutoff {
         return None;
     }
@@ -2197,7 +2221,7 @@ pub fn format_markdown(report: &BuildReport) -> String {
     lines.push("#### Summary".to_string());
     lines.push("| Metric | Value |".to_string());
     lines.push("|---|---|".to_string());
-    lines.push(format!("| Window | last {}h |", report.meta.since_hours));
+    lines.push(format!("| Window | last {} |", report.meta.window_label()));
     lines.push(format!("| Hit rate (count) | {:.1}% |", s.hit_rate_pct));
     if let Some(w) = s.weighted_hit_rate_pct {
         lines.push(format!("| Hit rate (compile-cost weighted) | {:.1}% |", w));
@@ -2555,8 +2579,8 @@ pub fn format_github(report: &BuildReport) -> String {
     lines.push("| | |".to_string());
     lines.push("|---|---|".to_string());
     lines.push(format!(
-        "| **Window** | last {}h |",
-        report.meta.since_hours
+        "| **Window** | last {} |",
+        report.meta.window_label()
     ));
     lines.push(format!(
         "| **Crates** | {} cached / {} compiled / {} total |",
@@ -3026,9 +3050,9 @@ pub fn format_github(report: &BuildReport) -> String {
 
     lines.push(String::new());
     lines.push(format!(
-        "*Posted by [kache-action](https://github.com/kunobi-ninja/kache-action) · kache v{} · last {}h*",
+        "*Posted by [kache-action](https://github.com/kunobi-ninja/kache-action) · kache v{} · last {}*",
         report.meta.kache_version,
-        report.meta.since_hours,
+        report.meta.window_label(),
     ));
 
     lines.join("\n")
@@ -3044,8 +3068,8 @@ pub fn format_text(report: &BuildReport) -> String {
     let total_compiled = s.dups + s.misses;
 
     lines.push(format!(
-        "kache build report (last {}h)",
-        report.meta.since_hours
+        "kache build report (last {})",
+        report.meta.window_label()
     ));
     lines.push(format!(
         "  {:.1}% hit rate — {}/{} cacheable crates cached, {} compiled",
@@ -3398,11 +3422,44 @@ mod tests {
         std::fs::write(dir.join("gc_stats.json"), persisted).unwrap();
     }
 
+    /// A run at exactly the cutoff is inside the window: the comparison is
+    /// "older than the cutoff is excluded", not "at or older". One second
+    /// either side of that instant decides it.
+    #[test]
+    fn load_gc_summary_includes_a_run_exactly_at_the_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let last_run = Utc::now() - chrono::Duration::hours(3);
+        write_gc_stats(dir.path(), last_run);
+        // The fixture writes an RFC 3339 string, so compare against the value
+        // that string parses back to rather than the original instant.
+        let persisted: GcStatsPersisted = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("gc_stats.json")).unwrap(),
+        )
+        .unwrap();
+        let written = chrono::DateTime::parse_from_rfc3339(&persisted.last_run)
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert!(
+            load_gc_summary(dir.path(), written).is_some(),
+            "a run at the cutoff is within the window"
+        );
+        assert!(
+            load_gc_summary(dir.path(), written - chrono::Duration::seconds(1)).is_some(),
+            "a run after the cutoff is within the window"
+        );
+        assert!(
+            load_gc_summary(dir.path(), written + chrono::Duration::seconds(1)).is_none(),
+            "a run before the cutoff is outside it"
+        );
+    }
+
     #[test]
     fn load_gc_summary_returns_recent_run_within_window() {
         let dir = tempfile::tempdir().unwrap();
         write_gc_stats(dir.path(), Utc::now() - chrono::Duration::hours(1));
-        let gc = load_gc_summary(dir.path(), 24).expect("recent gc run is within the 24h window");
+        let gc = load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now()))
+            .expect("recent gc run is within the 24h window");
         assert_eq!(gc.entries_evicted, 3);
         assert_eq!(gc.bytes_freed, 4096);
         assert_eq!(gc.blobs_removed, 5);
@@ -3413,7 +3470,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_gc_stats(dir.path(), Utc::now() - chrono::Duration::hours(48));
         assert!(
-            load_gc_summary(dir.path(), 24).is_none(),
+            load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now())).is_none(),
             "a run 48h ago must fall outside the 24h window"
         );
     }
@@ -3421,14 +3478,14 @@ mod tests {
     #[test]
     fn load_gc_summary_absent_when_no_stats_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_gc_summary(dir.path(), 24).is_none());
+        assert!(load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now())).is_none());
     }
 
     #[test]
     fn load_gc_summary_absent_on_malformed_stats_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("gc_stats.json"), b"not json").unwrap();
-        assert!(load_gc_summary(dir.path(), 24).is_none());
+        assert!(load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now())).is_none());
     }
 
     fn test_event(
@@ -3730,7 +3787,7 @@ mod tests {
         failed.store_error = "refusing to cache zero-byte artifact: liblint.rmeta".to_string();
         events::log_event(&config.event_log_path(), &failed).unwrap();
 
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         assert_eq!(report.summary.store_failures, 1);
         // Still a miss: the compiler ran, and demoting it would drop it out of
@@ -3762,7 +3819,7 @@ mod tests {
         let mut bogus = test_event("serde", EventResult::LocalHit, 5, 300, 1024, "abc123def456");
         bogus.store_error = "should not be counted".to_string();
         events::log_event(&config.event_log_path(), &bogus).unwrap();
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         assert_eq!(report.summary.store_failures, 1);
 
         let text = format_text(&report);
@@ -3777,7 +3834,7 @@ mod tests {
     fn test_generate_report_with_all_result_types() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         assert_eq!(report.summary.total_crates, 5); // excludes errors from cacheable count
         assert_eq!(report.summary.local_hits, 1);
@@ -4035,7 +4092,7 @@ mod tests {
     fn test_format_json_conforms_to_schema_contract() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let json = format_json(&report).unwrap();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4049,7 +4106,7 @@ mod tests {
     fn test_validator_rejects_out_of_bounds_number_maximum() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let json = format_json(&report).unwrap();
         let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4064,7 +4121,7 @@ mod tests {
     fn test_validator_rejects_out_of_bounds_integer_minimum() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let json = format_json(&report).unwrap();
         let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4079,7 +4136,7 @@ mod tests {
     fn test_validator_rejects_invalid_schema_version() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let json = format_json(&report).unwrap();
         let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4094,7 +4151,7 @@ mod tests {
     fn test_validator_rejects_missing_required_key() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let json = format_json(&report).unwrap();
         let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4108,7 +4165,7 @@ mod tests {
     fn test_json_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let json = format_json(&report).unwrap();
         let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4136,6 +4193,55 @@ mod tests {
         assert_eq!(parsed.all_events[0].end_time, report.all_events[0].end_time);
     }
 
+    /// #897: the report's window is the one requested, in counters, in
+    /// `meta`, and in every heading.
+    #[test]
+    fn report_window_narrows_events_and_labels_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let mut stale = test_event("ancient", EventResult::Miss, 5000, 4800, 1024, "old");
+        stale.ts = Utc::now() - chrono::Duration::hours(3);
+        events::log_event(&config.event_log_path(), &stale).unwrap();
+
+        let wide = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
+        let narrow = generate_report(&config, SinceWindow::parse("15m").unwrap(), 10).unwrap();
+        assert_eq!(wide.summary.misses, narrow.summary.misses + 1);
+        assert!(
+            !narrow.all_events.iter().any(|e| e.crate_name == "ancient"),
+            "a 3h-old event is outside a 15m window"
+        );
+
+        assert_eq!(narrow.meta.since, "15m");
+        assert_eq!(narrow.meta.since_secs, 900);
+        assert_eq!(narrow.meta.since_hours, 0, "whole hours, rounded down");
+        assert_eq!(wide.meta.since_hours, 24);
+        assert_eq!(wide.meta.since_secs, 86_400);
+
+        assert!(format_text(&narrow).contains("kache build report (last 15m)"));
+        assert!(format_markdown(&narrow).contains("| Window | last 15m |"));
+        assert!(format_github(&narrow).contains("| **Window** | last 15m |"));
+        assert!(format_github(&narrow).contains("· last 15m*"));
+        let json: serde_json::Value = serde_json::from_str(&format_json(&narrow).unwrap()).unwrap();
+        assert_eq!(json["meta"]["since"], "15m");
+        assert_eq!(json["meta"]["since_secs"], 900);
+    }
+
+    /// A report written before `meta.since` existed still gets a heading.
+    #[test]
+    fn window_label_falls_back_to_whole_hours() {
+        let meta: ReportMeta = serde_json::from_str(
+            r#"{"kache_version":"0.1.0","generated_at":"2026-01-01T00:00:00Z","since_hours":6}"#,
+        )
+        .unwrap();
+        assert_eq!(meta.window_label(), "6h");
+        assert_eq!(meta.since_secs, 0);
+        let current = ReportMeta {
+            since: "15m".to_string(),
+            ..meta
+        };
+        assert_eq!(current.window_label(), "15m");
+    }
+
     #[test]
     fn test_report_filters_by_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -4145,7 +4251,7 @@ mod tests {
 
         let report = generate_report_with_filter(
             &config,
-            24,
+            SinceWindow::DEFAULT,
             10,
             &ReportFilter {
                 root: Some(root.clone()),
@@ -4177,7 +4283,7 @@ mod tests {
     fn test_trace_json_format_is_minimal_chrome_trace_container() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let json = format_trace_json(&report).unwrap();
         let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -4447,7 +4553,7 @@ mod tests {
     fn report_totals_the_wrapper_phases() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_phase_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         let t = &report.timing;
         assert_eq!(t.total_startup_ms, 7);
         assert_eq!(t.avg_startup_ms, 3.5);
@@ -4489,7 +4595,7 @@ mod tests {
     fn text_markdown_and_github_reports_show_the_wrapper_phases() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_phase_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let text = format_text(&report);
         for line in [
@@ -4532,7 +4638,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
         events::clear_events(&config.event_log_path()).unwrap();
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         assert_eq!(report.summary.total_crates, 0);
         assert!(!format_text(&report).contains("Startup:"));
         assert!(!format_markdown(&report).contains("| Startup |"));
@@ -4543,7 +4649,7 @@ mod tests {
     fn trace_json_emits_each_crate_slice_followed_by_its_phases() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_phase_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         let json = format_trace_json(&report).unwrap();
         let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = raw["traceEvents"].as_array().unwrap();
@@ -4621,7 +4727,7 @@ mod tests {
     fn test_markdown_contains_sections() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let md = format_markdown(&report);
         assert!(md.contains("### kache build report"));
@@ -4688,7 +4794,7 @@ mod tests {
         let event = test_event("serde", EventResult::LocalHit, 5, 300, 1024, "abc");
         events::log_event(&config.event_log_path(), &event).unwrap();
 
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         assert!(report.network.is_none());
         assert!(
             report
@@ -4763,7 +4869,7 @@ mod tests {
         let hit = test_event("hit", EventResult::LocalHit, 5, 100, 1024, "hk");
         events::log_event(&config.event_log_path(), &hit).unwrap();
 
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         assert!(
             report
                 .suggestions
@@ -4836,7 +4942,7 @@ mod tests {
             events::log_event(&config.event_log_path(), &e).unwrap();
         }
 
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         assert!(
             report
                 .suggestions
@@ -4909,7 +5015,7 @@ mod tests {
             events::log_transfer(&config.transfer_log_path(), t).unwrap();
         }
 
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         let joined = report.suggestions.join("\n");
         assert!(
             joined.contains("downloads failed"),
@@ -5009,7 +5115,7 @@ mod tests {
         };
         events::log_transfer(&config.transfer_log_path(), &slow).unwrap();
 
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         let joined = report.suggestions.join("\n");
         assert!(
             joined.contains("semaphore wait"),
@@ -5032,7 +5138,7 @@ mod tests {
     fn test_github_format_has_collapsible_sections() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let gh = format_github(&report);
         assert!(gh.contains("### kache build cache"));
@@ -5063,7 +5169,7 @@ mod tests {
     fn test_text_output() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         let text = format_text(&report);
         assert!(text.contains("kache build report"));
@@ -5081,7 +5187,7 @@ mod tests {
         // Storage and GC sections (markdown:1415/text:2111/github:1853 + GC).
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let mut report = generate_report(&config, 24, 10).unwrap();
+        let mut report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         report.storage = StorageBreakdown {
             reflinked_bytes: 1024,
@@ -5137,7 +5243,7 @@ mod tests {
         // phase, cumulative-phase, GET-fan-out, and error-table branches.
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let mut report = generate_report(&config, 24, 10).unwrap();
+        let mut report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
 
         report.network = Some(NetworkAnalysis {
             configured_backend: "s3".to_string(),
@@ -5377,7 +5483,7 @@ mod tests {
             remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         };
 
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         assert_eq!(report.summary.total_crates, 0);
         assert_eq!(report.summary.hit_rate_pct, 0.0);
         assert!(report.network.is_none());
@@ -5714,7 +5820,7 @@ mod tests {
         }
 
         // Must aggregate without panicking across all format arms.
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         assert!(
             report.network.is_some(),
             "downloads should yield network analysis"
@@ -5760,7 +5866,7 @@ mod tests {
         // back to the "{logical} logical, {blobs} blobs" form (the else arm).
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let mut report = generate_report(&config, 24, 10).unwrap();
+        let mut report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         report.storage = StorageBreakdown {
             reflinked_bytes: 0,
             hardlinked_bytes: 0,
@@ -5787,7 +5893,7 @@ mod tests {
     fn storage_render_flags_impossible_dedup_accounting() {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
-        let mut report = generate_report(&config, 24, 10).unwrap();
+        let mut report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         report.storage.logical_bytes = 29;
         report.storage.blob_bytes = 56;
         report.storage.dedup_saved_bytes = 0;
@@ -5808,7 +5914,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = write_test_events(dir.path());
         let render = |logical_bytes, blob_bytes, accounting_consistent| {
-            let mut report = generate_report(&config, 24, 10).unwrap();
+            let mut report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
             report.storage.restored_bytes = 0;
             report.storage.logical_bytes = logical_bytes;
             report.storage.blob_bytes = blob_bytes;
@@ -5834,7 +5940,7 @@ mod tests {
             "{github}"
         );
 
-        let mut restored = generate_report(&config, 24, 10).unwrap();
+        let mut restored = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         restored.storage.restored_bytes = 1024;
         restored.storage.logical_bytes = 1;
         restored.storage.blob_bytes = 1;
@@ -5849,7 +5955,7 @@ mod tests {
         assert!(!blob_accounting_consistent(4, 5));
 
         let state = |logical_bytes, blob_bytes, accounting_consistent| {
-            let mut report = generate_report(&config, 24, 10).unwrap();
+            let mut report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
             report.storage.logical_bytes = logical_bytes;
             report.storage.blob_bytes = blob_bytes;
             report.storage.accounting_consistent = accounting_consistent;
@@ -5861,7 +5967,7 @@ mod tests {
         assert_eq!(state(1, 0, false), StorageAccountingState::Inconsistent);
         assert_eq!(state(0, 1, false), StorageAccountingState::Inconsistent);
 
-        let report = generate_report(&config, 24, 10).unwrap();
+        let report = generate_report(&config, SinceWindow::DEFAULT, 10).unwrap();
         let mut old_json = serde_json::to_value(&report.storage).unwrap();
         old_json
             .as_object_mut()

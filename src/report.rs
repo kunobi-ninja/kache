@@ -2960,30 +2960,28 @@ pub fn format_github(report: &BuildReport) -> String {
                 t.avg_key_ms, t.avg_lookup_ms, t.avg_store_ms
             ));
         }
-        if report.summary.total_crates > 0 {
-            lines.push(format!(
-                "| Startup | {} aggregate (avg {:.1}ms/crate) |",
-                format_duration_ms(t.total_startup_ms),
-                t.avg_startup_ms
-            ));
-            lines.push(format!(
-                "| Dep-info pre-pass | {} runs, {} aggregate (avg {:.1}ms/run) |",
-                t.dep_info_runs,
-                format_duration_ms(t.total_dep_info_ms),
-                t.avg_dep_info_ms
-            ));
-            lines.push(format!(
-                "| Scheduler wait | {} aggregate (flight {}, permit {}) |",
-                format_duration_ms(t.total_wait_ms),
-                format_duration_ms(t.total_flight_wait_ms),
-                format_duration_ms(t.total_permit_wait_ms)
-            ));
-            lines.push(format!(
-                "| Unattributed | {} aggregate (avg {:.1}ms/crate) |",
-                format_duration_ms(t.total_unattributed_ms),
-                t.avg_unattributed_ms
-            ));
-        }
+        lines.push(format!(
+            "| Startup | {} aggregate (avg {:.1}ms/crate) |",
+            format_duration_ms(t.total_startup_ms),
+            t.avg_startup_ms
+        ));
+        lines.push(format!(
+            "| Dep-info pre-pass | {} runs, {} aggregate (avg {:.1}ms/run) |",
+            t.dep_info_runs,
+            format_duration_ms(t.total_dep_info_ms),
+            t.avg_dep_info_ms
+        ));
+        lines.push(format!(
+            "| Scheduler wait | {} aggregate (flight {}, permit {}) |",
+            format_duration_ms(t.total_wait_ms),
+            format_duration_ms(t.total_flight_wait_ms),
+            format_duration_ms(t.total_permit_wait_ms)
+        ));
+        lines.push(format!(
+            "| Unattributed | {} aggregate (avg {:.1}ms/crate) |",
+            format_duration_ms(t.total_unattributed_ms),
+            t.avg_unattributed_ms
+        ));
         if p.total_hits > 0 {
             lines.push(String::new());
             lines.push(format!(

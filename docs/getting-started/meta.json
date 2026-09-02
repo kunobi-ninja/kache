@@ -1,4 +1,11 @@
 {
   "title": "Getting Started",
-  "pages": ["installation", "quick-start", "comparison", "c-cpp", "configuration"]
+  "pages": [
+    "installation",
+    "quick-start",
+    "comparison",
+    "c-cpp",
+    "mutation-testing",
+    "configuration"
+  ]
 }

@@ -2852,6 +2852,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "filetime",
+ "find-msvc-tools",
  "futures",
  "glob",
  "home",

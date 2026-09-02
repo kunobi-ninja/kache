@@ -77,6 +77,9 @@ unicode-normalization = "0.1"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
 
 [target.'cfg(windows)'.dependencies]
+# Use the same Visual Studio and Windows SDK discovery path as Rust build
+# tooling, including shells where VsDevCmd has not populated PATH/LIB.
+find-msvc-tools = "0.1.9"
 # `pure` drops blake3's C SIMD (`c/blake3_neon.c` / SSE intrinsics), whose
 # arm64 NEON path doesn't cross-compile under cargo-xwin's clang + MSVC
 # sysroot. Windows-only so native/Linux/macOS keep the fast C SIMD backend.

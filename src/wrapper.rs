@@ -639,6 +639,22 @@ fn admit_scheduler_miss(
     }
 }
 
+/// Where a wrapper invocation's clock starts.
+///
+/// When `main` pinned the process start, `elapsed_ms` is anchored there so the
+/// event spans everything cargo waited for, and the time already spent (argv,
+/// logging, config load) is recorded as `startup_ms`. Without a pinned start
+/// (unit tests, library callers) the clock starts now and startup stays zero.
+fn wrapper_entry() -> std::time::Instant {
+    match crate::opcounts::process_start() {
+        Some(start) => {
+            crate::opcounts::record_startup(start.elapsed());
+            start
+        }
+        None => std::time::Instant::now(),
+    }
+}
+
 /// Run kache as a C-family compiler wrapper (`CC=kache cc`,
 /// `CXX=kache c++`, etc.).
 ///
@@ -650,7 +666,7 @@ fn admit_scheduler_miss(
 /// This is the local-cache path. Remote cache is a separate follow-up;
 /// miss-path flights, permits, and per-key build locks match rustc.
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
-    let start = std::time::Instant::now();
+    let start = wrapper_entry();
     let invocation_start_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as i64)
@@ -1612,7 +1628,7 @@ fn cc_try_remote_hit(
 /// This is the hot path — called once per crate by cargo.
 /// Flow: parse args → compute cache key → check store → link on hit → compile on miss → store → link
 pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
-    let start = std::time::Instant::now();
+    let start = wrapper_entry();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
@@ -4640,7 +4656,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 16,
+        schema: 17,
         session_id,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
@@ -4649,6 +4665,13 @@ fn log_event_details(
         lookup_ms,
         restore_ms,
         store_ms,
+        // Phases measured outside the wrapper's own timers (schema 17): the
+        // process-global accumulators, read here like the op-counters below.
+        startup_ms: crate::opcounts::startup_ms(),
+        dep_info_ms: crate::opcounts::dep_info_ms(),
+        dep_info_runs: crate::opcounts::dep_info_runs(),
+        flight_wait_ms: crate::opcounts::flight_wait_ms(),
+        permit_wait_ms: crate::opcounts::permit_wait_ms(),
         store_output_blobs: store_put.output_blobs,
         store_duplicate_blobs: store_put.duplicate_blobs,
         store_new_blobs: store_put.new_blobs,
@@ -8506,7 +8529,7 @@ exit 0
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 16);
+        assert_eq!(event.schema, 17);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);
@@ -8524,6 +8547,84 @@ exit 0
         assert!(
             event.verify_compare.is_empty(),
             "verify off must not invent a verify_compare class"
+        );
+    }
+
+    /// Schema 17: the phases measured outside the wrapper's own timers reach
+    /// the event through the process-global accumulators. The counters only
+    /// grow and other tests in this binary add real milliseconds to them, so
+    /// each field is fed a magnitude ten times the last: a lower bound and a
+    /// band catch a zeroed field and a swapped one, whatever ran before.
+    #[test]
+    fn log_event_records_the_wrapper_phase_accumulators() {
+        let _ = crate::verify_compare::take_last_report();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+
+        const STARTUP_MS: u64 = 5_000;
+        const DEP_INFO_MS: u64 = 50_000;
+        const FLIGHT_MS: u64 = 500_000;
+        const PERMIT_MS: u64 = 5_000_000;
+        let before = [
+            crate::opcounts::startup_ms(),
+            crate::opcounts::dep_info_ms(),
+            crate::opcounts::flight_wait_ms(),
+            crate::opcounts::permit_wait_ms(),
+        ];
+        let runs_before = crate::opcounts::dep_info_runs();
+        crate::opcounts::record_startup(std::time::Duration::from_millis(STARTUP_MS));
+        crate::opcounts::record_dep_info_run(std::time::Duration::from_millis(DEP_INFO_MS));
+        crate::opcounts::record_flight_wait(std::time::Duration::from_millis(FLIGHT_MS));
+        crate::opcounts::record_permit_wait(std::time::Duration::from_millis(PERMIT_MS));
+
+        log_event(
+            &config,
+            "/repo",
+            "foo",
+            EventResult::Miss,
+            100,
+            20,
+            30,
+            "cache-key",
+            40,
+            50,
+            0,
+            60,
+        );
+
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        let event = &events[0];
+        assert_eq!(event.schema, 17);
+        // Whatever other tests add is real time, far under the next band.
+        for (name, value, floor, fed) in [
+            ("startup_ms", event.startup_ms, before[0], STARTUP_MS),
+            ("dep_info_ms", event.dep_info_ms, before[1], DEP_INFO_MS),
+            ("flight_wait_ms", event.flight_wait_ms, before[2], FLIGHT_MS),
+            ("permit_wait_ms", event.permit_wait_ms, before[3], PERMIT_MS),
+        ] {
+            assert!(value >= floor + fed, "{name} = {value}, fed {fed}");
+            assert!(
+                value < floor + fed * 10,
+                "{name} = {value} carries another field's magnitude"
+            );
+        }
+        assert!(event.dep_info_runs > runs_before);
+        assert_eq!(event.wait_ms(), event.flight_wait_ms + event.permit_wait_ms);
+    }
+
+    /// With a pinned process start the wrapper clock is anchored there and
+    /// the time already spent is recorded as startup.
+    #[test]
+    fn wrapper_entry_anchors_at_the_pinned_process_start() {
+        crate::opcounts::mark_process_start();
+        let pinned = crate::opcounts::process_start().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let before = crate::opcounts::startup_ms();
+        let start = wrapper_entry();
+        assert_eq!(start, pinned, "elapsed_ms must span from process start");
+        assert!(
+            crate::opcounts::startup_ms() >= before + 5,
+            "the time before wrapper entry must be recorded as startup"
         );
     }
 
@@ -8632,7 +8733,7 @@ exit 0
         let event = &events[0];
         assert_eq!(event.result, EventResult::Miss);
         assert_eq!(event.cache_key, "same-key");
-        assert_eq!(event.schema, 16);
+        assert_eq!(event.schema, 17);
         assert_eq!(
             event.lookup_rejection,
             "matching entry lacks dep-info required by this invocation"
@@ -8644,7 +8745,7 @@ exit 0
         );
     }
 
-    /// Schema 16 writes `verify_compare` from the hit-qualification stash.
+    /// `verify_compare` (schema 16) is read from the hit-qualification stash.
     /// Empty when verify did not run; the class string when it did.
     #[test]
     fn log_event_persists_verify_compare_class_on_hit() {
@@ -8667,7 +8768,7 @@ exit 0
             0,
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
-        assert_eq!(events[0].schema, 16);
+        assert_eq!(events[0].schema, 17);
         assert_eq!(events[0].result, EventResult::LocalHit);
         assert!(
             events[0].verify_compare.is_empty(),
@@ -8691,7 +8792,7 @@ exit 0
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[1].schema, 16);
+        assert_eq!(events[1].schema, 17);
         assert_eq!(
             events[1].verify_compare,
             "content: libfoo.rlib (byte mismatch)"

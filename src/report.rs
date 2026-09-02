@@ -167,6 +167,53 @@ pub struct TimingBreakdown {
     pub total_restore_ms: u64,
     #[serde(default)]
     pub total_store_ms: u64,
+    /// Process start to wrapper entry, summed over cacheable crates. Zero
+    /// for events written before schema 17.
+    #[serde(default)]
+    pub total_startup_ms: u64,
+    #[serde(default)]
+    pub avg_startup_ms: f64,
+    /// The rustc dep-info pre-pass: inside `total_key_ms`, split out because
+    /// it is a full extra compiler start per invocation. Average is per run.
+    #[serde(default)]
+    pub total_dep_info_ms: u64,
+    #[serde(default)]
+    pub dep_info_runs: u64,
+    #[serde(default)]
+    pub avg_dep_info_ms: f64,
+    /// Scheduler wait: flight join plus permit acquisition, kept apart so a
+    /// saturated pool and a shared flight stay distinguishable.
+    #[serde(default)]
+    pub total_wait_ms: u64,
+    #[serde(default)]
+    pub total_flight_wait_ms: u64,
+    #[serde(default)]
+    pub total_permit_wait_ms: u64,
+    #[serde(default)]
+    pub avg_wait_ms: f64,
+    /// Wrapper overhead no measured phase accounts for: overhead minus
+    /// startup, key, lookup, wait, restore and store, clamped at zero per
+    /// event. Overhead excludes the compile on a compiled crate.
+    #[serde(default)]
+    pub total_unattributed_ms: u64,
+    #[serde(default)]
+    pub avg_unattributed_ms: f64,
+}
+
+/// Mean of `total_ms` over `count` to one decimal; zero for an empty count.
+fn avg_ms(total_ms: u64, count: u64) -> f64 {
+    if count == 0 {
+        return 0.0;
+    }
+    (total_ms as f64 / count as f64 * 10.0).round() / 10.0
+}
+
+/// `part` as a percentage of `total` to one decimal; zero for an empty total.
+fn pct_of(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    (part as f64 / total as f64 * 1000.0).round() / 10.0
 }
 
 /// kache's storage efficiency — both halves of it.
@@ -443,7 +490,63 @@ pub struct TraceArgs {
     pub store_output_blobs: u32,
     pub store_duplicate_blobs: u32,
     pub store_new_blobs: u32,
+    /// Wrapper phases (ms), the numbers the nested phase slices are drawn
+    /// from. `dep_info_ms` is inside `key_ms`; `wait_ms` is flight plus
+    /// permit; `unattributed_ms` is the overhead no phase accounts for.
+    #[serde(default)]
+    pub startup_ms: u64,
+    #[serde(default)]
+    pub key_ms: u64,
+    #[serde(default)]
+    pub dep_info_ms: u64,
+    #[serde(default)]
+    pub dep_info_runs: u32,
+    #[serde(default)]
+    pub lookup_ms: u64,
+    #[serde(default)]
+    pub wait_ms: u64,
+    #[serde(default)]
+    pub flight_wait_ms: u64,
+    #[serde(default)]
+    pub permit_wait_ms: u64,
+    #[serde(default)]
+    pub restore_ms: u64,
+    #[serde(default)]
+    pub store_ms: u64,
+    #[serde(default)]
+    pub unattributed_ms: u64,
     pub exit_code: Option<i32>,
+}
+
+/// One wrapper phase, drawn as an `X` slice nested inside its crate's slice
+/// on the same lane. Emitted by the trace format only; the JSON report's
+/// `traceEvents` stay one slice per crate so a consumer summing `dur` does
+/// not double count.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TracePhaseEvent {
+    pub name: String,
+    pub cat: String,
+    pub ph: String,
+    /// Chrome trace timestamp in microseconds.
+    pub ts: i64,
+    /// Chrome trace duration in microseconds.
+    pub dur: u64,
+    pub pid: u32,
+    pub tid: u32,
+    pub args: TracePhaseArgs,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TracePhaseArgs {
+    pub crate_name: String,
+    pub result: String,
+    pub phase: String,
+    /// The recorded phase time. `dur` can be shorter when the slice was
+    /// clamped to its parent.
+    pub phase_ms: u64,
+    /// The slice this one nests in: the crate slice's name, or `key` for
+    /// `dep-info`.
+    pub parent: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -785,6 +888,20 @@ pub fn generate_report_with_filter(
             total_lookup_ms: stats.total_lookup_ms,
             total_restore_ms: stats.total_restore_ms,
             total_store_ms: stats.total_store_ms,
+            total_startup_ms: stats.total_startup_ms,
+            avg_startup_ms: avg_ms(stats.total_startup_ms, total_cacheable as u64),
+            total_dep_info_ms: stats.total_dep_info_ms,
+            dep_info_runs: stats.total_dep_info_runs,
+            avg_dep_info_ms: avg_ms(stats.total_dep_info_ms, stats.total_dep_info_runs),
+            total_wait_ms: stats.total_flight_wait_ms + stats.total_permit_wait_ms,
+            total_flight_wait_ms: stats.total_flight_wait_ms,
+            total_permit_wait_ms: stats.total_permit_wait_ms,
+            avg_wait_ms: avg_ms(
+                stats.total_flight_wait_ms + stats.total_permit_wait_ms,
+                total_cacheable as u64,
+            ),
+            total_unattributed_ms: stats.total_unattributed_ms,
+            avg_unattributed_ms: avg_ms(stats.total_unattributed_ms, total_cacheable as u64),
         },
         storage,
         network,
@@ -974,7 +1091,7 @@ fn trace_result_style(result: EventResult) -> (&'static str, &'static str) {
 }
 
 fn to_trace_event(event: &BuildEvent, lane: u32) -> TraceEvent {
-    let overhead_ms = event_overhead_ms(event);
+    let overhead_ms = event.overhead_ms();
     let start = event_start(event);
     let (label, cname) = trace_result_style(event.result);
     TraceEvent {
@@ -1003,13 +1120,130 @@ fn to_trace_event(event: &BuildEvent, lane: u32) -> TraceEvent {
             store_output_blobs: event.store_output_blobs,
             store_duplicate_blobs: event.store_duplicate_blobs,
             store_new_blobs: event.store_new_blobs,
+            startup_ms: event.startup_ms,
+            key_ms: event.key_ms,
+            dep_info_ms: event.dep_info_ms,
+            dep_info_runs: event.dep_info_runs,
+            lookup_ms: event.lookup_ms,
+            wait_ms: event.wait_ms(),
+            flight_wait_ms: event.flight_wait_ms,
+            permit_wait_ms: event.permit_wait_ms,
+            restore_ms: event.restore_ms,
+            store_ms: event.store_ms,
+            unattributed_ms: event.unattributed_ms(),
             exit_code: event.exit_code,
         },
     }
 }
 
+const TRACE_PHASE_CATEGORY: &str = "kache.phase";
+
+/// Lays phase slices along a parent slice's lane, clamped to the parent.
+struct PhaseLane<'a> {
+    parent: &'a TraceEvent,
+    end_us: i64,
+    cursor_us: i64,
+    slices: Vec<TracePhaseEvent>,
+}
+
+impl<'a> PhaseLane<'a> {
+    fn new(parent: &'a TraceEvent) -> Self {
+        let end_us = parent
+            .ts
+            .saturating_add(i64::try_from(parent.dur).unwrap_or(i64::MAX));
+        Self {
+            parent,
+            end_us,
+            cursor_us: parent.ts,
+            slices: Vec::new(),
+        }
+    }
+
+    /// The next phase in wrapper order: starts at the cursor and advances it.
+    fn next(&mut self, phase: &str, ms: u64) {
+        let start_us = self.cursor_us;
+        if let Some(slice) = self.slice_at(phase, ms, &self.parent.name, start_us) {
+            self.cursor_us = start_us.saturating_add(i64::try_from(slice.dur).unwrap_or(i64::MAX));
+            self.slices.push(slice);
+        }
+    }
+
+    /// A phase nested inside an earlier one: placed at that phase's start,
+    /// leaving the cursor alone.
+    fn nested(&mut self, phase: &str, ms: u64, parent_phase: &str, start_us: i64) {
+        if let Some(slice) = self.slice_at(phase, ms, parent_phase, start_us) {
+            self.slices.push(slice);
+        }
+    }
+
+    fn slice_at(
+        &self,
+        phase: &str,
+        ms: u64,
+        parent_name: &str,
+        start_us: i64,
+    ) -> Option<TracePhaseEvent> {
+        if ms == 0 || start_us >= self.end_us {
+            return None;
+        }
+        let room_us = u64::try_from(self.end_us - start_us).unwrap_or(0);
+        let dur = ms.saturating_mul(1000).min(room_us);
+        Some(TracePhaseEvent {
+            name: phase.to_string(),
+            cat: TRACE_PHASE_CATEGORY.to_string(),
+            ph: "X".to_string(),
+            ts: start_us,
+            dur,
+            pid: self.parent.pid,
+            tid: self.parent.tid,
+            args: TracePhaseArgs {
+                crate_name: self.parent.args.crate_name.clone(),
+                result: self.parent.args.result.clone(),
+                phase: phase.to_string(),
+                phase_ms: ms,
+                parent: parent_name.to_string(),
+            },
+        })
+    }
+}
+
+/// Nested phase slices for one crate slice, in wrapper order: startup, key
+/// (with the dep-info pre-pass as its child), lookup, wait, compile when this
+/// process compiled, then restore or store.
+///
+/// The wrapper records durations, not start times, so offsets accumulate
+/// from the parent's start in that order and a phase sits where it lands in
+/// the sum. What is left at the end of the parent is the unattributed
+/// remainder, visible as a gap. Every duration is a whole millisecond, so a
+/// phase under 1 ms has no slice. Children never extend past the parent: a
+/// phase set that sums past `elapsed_ms` is cut at the parent's end and the
+/// phases after it are dropped.
+fn trace_phase_events(parent: &TraceEvent) -> Vec<TracePhaseEvent> {
+    let args = &parent.args;
+    let mut lane = PhaseLane::new(parent);
+    lane.next("startup", args.startup_ms);
+    let key_start_us = lane.cursor_us;
+    lane.next("key", args.key_ms);
+    // The pre-pass runs inside key computation; where within it is not
+    // recorded, so it is drawn at the key slice's start and never past it.
+    lane.nested(
+        "dep-info",
+        args.dep_info_ms.min(args.key_ms),
+        "key",
+        key_start_us,
+    );
+    lane.next("lookup", args.lookup_ms);
+    lane.next("wait", args.wait_ms);
+    // Overhead equals elapsed on a hit (the stored compile cost was not spent
+    // here), so this is non-zero only when this process ran the compiler.
+    lane.next("compile", args.elapsed_ms.saturating_sub(args.overhead_ms));
+    lane.next("restore", args.restore_ms);
+    lane.next("store", args.store_ms);
+    lane.slices
+}
+
 fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
-    let overhead = event_overhead_ms(e);
+    let overhead = e.overhead_ms();
     let (start_time, end_time, start_unix_ms, end_unix_ms) = event_timeline(e);
     CrateDetail {
         crate_name: e.crate_name.clone(),
@@ -1031,17 +1265,6 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         preprocessor_runs: e.preprocessor_runs,
         probe_runs: e.probe_runs,
         store_error: e.store_error.clone(),
-    }
-}
-
-fn event_overhead_ms(e: &BuildEvent) -> u64 {
-    if matches!(
-        e.result,
-        EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit
-    ) {
-        e.elapsed_ms
-    } else {
-        e.elapsed_ms.saturating_sub(e.compile_time_ms)
     }
 }
 
@@ -1874,8 +2097,14 @@ pub fn format_trace_json(report: &BuildReport) -> Result<String> {
             &format!("worker {tid}"),
         ));
     }
+    // Parent first, then its phases: Perfetto nests `X` slices by containment
+    // and keeps file order for equal timestamps, so the crate slice must
+    // precede the `startup` slice that starts with it.
     for event in &report.trace_events {
         trace_events.push(serde_json::to_value(event)?);
+        for phase in trace_phase_events(event) {
+            trace_events.push(serde_json::to_value(phase)?);
+        }
     }
 
     Ok(serde_json::to_string_pretty(&TraceOutput {
@@ -1905,6 +2134,42 @@ fn human_download_phase(phase: &str) -> &str {
         "disk" => "local disk",
         other => other,
     }
+}
+
+/// Per-phase rows of the Markdown timing table, as a share of `total_ms`
+/// (tracked wrapper time). Dep-info is indented under key because it is
+/// inside it; unattributed is what the phases leave of the overhead.
+fn push_phase_rows(lines: &mut Vec<String>, t: &TimingBreakdown, total_ms: u64) {
+    use crate::cli::format_duration_ms;
+
+    let mut row = |label: String, ms: u64| {
+        lines.push(format!(
+            "| {label} | {} | {:.1}% |",
+            format_duration_ms(ms),
+            pct_of(ms, total_ms)
+        ));
+    };
+    row("Startup".to_string(), t.total_startup_ms);
+    row("Key computation".to_string(), t.total_key_ms);
+    row(
+        format!(
+            "&nbsp;&nbsp;of which dep-info pre-pass ({} runs)",
+            t.dep_info_runs
+        ),
+        t.total_dep_info_ms,
+    );
+    row("Lookup".to_string(), t.total_lookup_ms);
+    row(
+        format!(
+            "Scheduler wait (flight {}, permit {})",
+            format_duration_ms(t.total_flight_wait_ms),
+            format_duration_ms(t.total_permit_wait_ms)
+        ),
+        t.total_wait_ms,
+    );
+    row("Restore".to_string(), t.total_restore_ms);
+    row("Store".to_string(), t.total_store_ms);
+    row("Unattributed".to_string(), t.total_unattributed_ms);
 }
 
 pub fn format_markdown(report: &BuildReport) -> String {
@@ -2007,6 +2272,9 @@ pub fn format_markdown(report: &BuildReport) -> String {
         format_duration_ms(t.miss_time_ms),
         miss_pct
     ));
+    if s.total_crates > 0 {
+        push_phase_rows(&mut lines, t, total_ms);
+    }
     lines.push(String::new());
 
     // Remote-transfer table
@@ -2692,6 +2960,30 @@ pub fn format_github(report: &BuildReport) -> String {
                 t.avg_key_ms, t.avg_lookup_ms, t.avg_store_ms
             ));
         }
+        if report.summary.total_crates > 0 {
+            lines.push(format!(
+                "| Startup | {} aggregate (avg {:.1}ms/crate) |",
+                format_duration_ms(t.total_startup_ms),
+                t.avg_startup_ms
+            ));
+            lines.push(format!(
+                "| Dep-info pre-pass | {} runs, {} aggregate (avg {:.1}ms/run) |",
+                t.dep_info_runs,
+                format_duration_ms(t.total_dep_info_ms),
+                t.avg_dep_info_ms
+            ));
+            lines.push(format!(
+                "| Scheduler wait | {} aggregate (flight {}, permit {}) |",
+                format_duration_ms(t.total_wait_ms),
+                format_duration_ms(t.total_flight_wait_ms),
+                format_duration_ms(t.total_permit_wait_ms)
+            ));
+            lines.push(format!(
+                "| Unattributed | {} aggregate (avg {:.1}ms/crate) |",
+                format_duration_ms(t.total_unattributed_ms),
+                t.avg_unattributed_ms
+            ));
+        }
         if p.total_hits > 0 {
             lines.push(String::new());
             lines.push(format!(
@@ -2828,6 +3120,30 @@ pub fn format_text(report: &BuildReport) -> String {
         lines.push(format!(
             "  Miss overhead: avg {:.0}ms key + {:.0}ms lookup + {:.0}ms store",
             t.avg_key_ms, t.avg_lookup_ms, t.avg_store_ms
+        ));
+    }
+    if s.total_crates > 0 {
+        lines.push(format!(
+            "  Startup: {} aggregate (avg {:.1}ms/crate)",
+            format_duration_ms(t.total_startup_ms),
+            t.avg_startup_ms
+        ));
+        lines.push(format!(
+            "  Dep-info pre-pass: {} runs, {} aggregate (avg {:.1}ms/run)",
+            t.dep_info_runs,
+            format_duration_ms(t.total_dep_info_ms),
+            t.avg_dep_info_ms
+        ));
+        lines.push(format!(
+            "  Scheduler wait: {} aggregate (flight {}, permit {})",
+            format_duration_ms(t.total_wait_ms),
+            format_duration_ms(t.total_flight_wait_ms),
+            format_duration_ms(t.total_permit_wait_ms)
+        ));
+        lines.push(format!(
+            "  Unattributed: {} aggregate (avg {:.1}ms/crate)",
+            format_duration_ms(t.total_unattributed_ms),
+            t.avg_unattributed_ms
         ));
     }
     lines.push(String::new());
@@ -3144,6 +3460,11 @@ mod tests {
             lookup_ms: 0,
             restore_ms: 0,
             store_ms: 0,
+            startup_ms: 0,
+            dep_info_ms: 0,
+            dep_info_runs: 0,
+            flight_wait_ms: 0,
+            permit_wait_ms: 0,
             store_output_blobs: 0,
             store_duplicate_blobs: 0,
             store_new_blobs: 0,
@@ -3872,8 +4193,18 @@ mod tests {
         // Metadata events (process_name + one thread_name per lane) are prepended
         // ahead of the rich `X` slices.
         let metadata: Vec<_> = arr.iter().filter(|e| e["ph"] == "M").collect();
-        let slices: Vec<_> = arr.iter().filter(|e| e["ph"] == "X").collect();
+        // Crate slices carry `cat: kache`; their nested phases `kache.phase`.
+        let slices: Vec<_> = arr
+            .iter()
+            .filter(|e| e["ph"] == "X" && e["cat"] == "kache")
+            .collect();
         assert_eq!(slices.len(), report.trace_events.len());
+        assert!(
+            arr.iter()
+                .filter(|e| e["ph"] == "X")
+                .all(|e| e["cat"] == "kache" || e["cat"] == "kache.phase"),
+            "every X slice is a crate or one of its phases"
+        );
         assert_eq!(arr[0]["name"], "process_name");
         assert_eq!(arr[0]["args"]["name"], "kache");
         assert!(
@@ -3915,6 +4246,361 @@ mod tests {
         assert_eq!(lanes[0], 0, "first event takes lane 0");
         assert_eq!(lanes[1], 1, "an overlapping event takes a fresh lane");
         assert_eq!(lanes[2], 0, "a non-overlapping later event reuses lane 0");
+    }
+
+    /// A miss with every phase set, values chosen so no two offsets coincide.
+    fn phase_heavy_miss(lane: u32) -> TraceEvent {
+        let mut e = test_event("m", EventResult::Miss, 140, 100, 0, "k-miss");
+        e.ts = Utc::now();
+        e.startup_ms = 1;
+        e.key_ms = 10;
+        e.dep_info_ms = 4;
+        e.dep_info_runs = 1;
+        e.lookup_ms = 2;
+        e.flight_wait_ms = 3;
+        e.permit_wait_ms = 5;
+        e.store_ms = 6;
+        to_trace_event(&e, lane)
+    }
+
+    #[test]
+    fn to_trace_event_carries_the_phase_numbers_in_args() {
+        let parent = phase_heavy_miss(3);
+        let a = &parent.args;
+        assert_eq!(a.startup_ms, 1);
+        assert_eq!(a.key_ms, 10);
+        assert_eq!(a.dep_info_ms, 4);
+        assert_eq!(a.dep_info_runs, 1);
+        assert_eq!(a.lookup_ms, 2);
+        assert_eq!(a.flight_wait_ms, 3);
+        assert_eq!(a.permit_wait_ms, 5);
+        assert_eq!(a.wait_ms, 8);
+        assert_eq!(a.restore_ms, 0);
+        assert_eq!(a.store_ms, 6);
+        assert_eq!(a.overhead_ms, 40);
+        // 40 - (1 + 10 + 2 + 8 + 0 + 6)
+        assert_eq!(a.unattributed_ms, 13);
+    }
+
+    #[test]
+    fn trace_phase_events_nest_in_wrapper_order_on_the_parent_lane() {
+        let parent = phase_heavy_miss(3);
+        let phases = trace_phase_events(&parent);
+        let parent_end = parent.ts + parent.dur as i64;
+
+        let shape: Vec<(&str, i64, u64, &str)> = phases
+            .iter()
+            .map(|p| {
+                (
+                    p.name.as_str(),
+                    p.ts - parent.ts,
+                    p.dur,
+                    p.args.parent.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("startup", 0, 1_000, "miss: m"),
+                ("key", 1_000, 10_000, "miss: m"),
+                ("dep-info", 1_000, 4_000, "key"),
+                ("lookup", 11_000, 2_000, "miss: m"),
+                ("wait", 13_000, 8_000, "miss: m"),
+                ("compile", 21_000, 100_000, "miss: m"),
+                ("store", 121_000, 6_000, "miss: m"),
+            ]
+        );
+        for phase in &phases {
+            assert_eq!(phase.ph, "X");
+            assert_eq!(phase.cat, "kache.phase");
+            assert_eq!(phase.pid, parent.pid);
+            assert_eq!(phase.tid, 3, "phases share the parent's lane");
+            assert_eq!(phase.args.crate_name, "m");
+            assert_eq!(phase.args.result, "miss");
+            assert_eq!(phase.args.phase, phase.name);
+            assert!(phase.ts >= parent.ts);
+            assert!(
+                phase.ts + phase.dur as i64 <= parent_end,
+                "{} must not extend past its parent",
+                phase.name
+            );
+        }
+        let key = &phases[1];
+        let dep_info = &phases[2];
+        assert_eq!(
+            dep_info.ts, key.ts,
+            "dep-info is drawn at the key slice's start"
+        );
+        assert!(dep_info.ts + dep_info.dur as i64 <= key.ts + key.dur as i64);
+        // The gap after the last phase is the unattributed remainder.
+        let last = phases.last().unwrap();
+        assert_eq!(
+            parent_end - (last.ts + last.dur as i64),
+            parent.args.unattributed_ms as i64 * 1000
+        );
+    }
+
+    #[test]
+    fn trace_phase_events_skip_empty_phases_and_never_draw_a_hit_compile() {
+        let mut e = test_event("h", EventResult::LocalHit, 20, 250, 0, "k-hit");
+        e.ts = Utc::now();
+        e.key_ms = 10;
+        e.lookup_ms = 2;
+        e.restore_ms = 5;
+        let parent = to_trace_event(&e, 0);
+        let names: Vec<String> = trace_phase_events(&parent)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        // No startup (0 ms), no wait, no compile: the 250 ms compile cost is
+        // the stored one, not time this process spent.
+        assert_eq!(names, vec!["key", "lookup", "restore"]);
+        assert_eq!(parent.args.unattributed_ms, 3);
+    }
+
+    #[test]
+    fn trace_phase_events_clamp_to_the_parent_and_drop_what_follows() {
+        // Phases sum to 24 ms inside a 10 ms parent: key fills [0, 8), lookup
+        // is cut to [8, 10), restore has no room and is dropped.
+        let mut e = test_event("c", EventResult::LocalHit, 10, 0, 0, "k-clamp");
+        e.ts = Utc::now();
+        e.key_ms = 8;
+        e.lookup_ms = 8;
+        e.restore_ms = 8;
+        let parent = to_trace_event(&e, 1);
+        let phases = trace_phase_events(&parent);
+        let parent_end = parent.ts + parent.dur as i64;
+        assert_eq!(phases.len(), 2, "{phases:#?}");
+        assert_eq!(phases[0].name, "key");
+        assert_eq!(phases[0].dur, 8_000);
+        assert_eq!(phases[1].name, "lookup");
+        assert_eq!(phases[1].ts, parent.ts + 8_000);
+        assert_eq!(phases[1].dur, 2_000, "cut at the parent's end");
+        assert_eq!(phases[1].args.phase_ms, 8, "args keep the recorded value");
+        assert_eq!(phases[1].ts + phases[1].dur as i64, parent_end);
+        assert_eq!(parent.args.unattributed_ms, 0);
+    }
+
+    #[test]
+    fn trace_phase_events_keep_dep_info_inside_key() {
+        // Inconsistent event: dep-info time without key time. The nested
+        // slice needs a key slice to live in, so it is clamped away.
+        let mut e = test_event("d", EventResult::LocalHit, 10, 0, 0, "k-dep");
+        e.ts = Utc::now();
+        e.dep_info_ms = 5;
+        e.dep_info_runs = 1;
+        e.lookup_ms = 1;
+        let parent = to_trace_event(&e, 0);
+        let names: Vec<String> = trace_phase_events(&parent)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["lookup".to_string()]);
+
+        // With a shorter key than dep-info, the child is cut to the key.
+        e.key_ms = 3;
+        let parent = to_trace_event(&e, 0);
+        let phases = trace_phase_events(&parent);
+        assert_eq!(phases[0].name, "key");
+        assert_eq!(phases[1].name, "dep-info");
+        assert_eq!(phases[1].dur, 3_000);
+        assert_eq!(phases[1].ts, phases[0].ts);
+    }
+
+    #[test]
+    fn trace_phase_events_are_empty_for_a_zero_length_parent() {
+        let mut e = test_event("z", EventResult::Miss, 0, 0, 0, "k-zero");
+        e.ts = Utc::now();
+        e.key_ms = 3;
+        let parent = to_trace_event(&e, 0);
+        assert!(trace_phase_events(&parent).is_empty());
+    }
+
+    /// Two crates with every phase set, replacing the shared fixture so the
+    /// totals are exact: a hit (40 ms, 20 unattributed) and a miss (500 ms
+    /// with a 400 ms compile, 27 unattributed).
+    fn write_phase_events(dir: &std::path::Path) -> Config {
+        let config = write_test_events(dir);
+        events::clear_events(&config.event_log_path()).unwrap();
+        let mut hit = test_event("h", EventResult::LocalHit, 40, 250, 10, "k-h");
+        hit.startup_ms = 3;
+        hit.key_ms = 10;
+        hit.dep_info_ms = 6;
+        hit.dep_info_runs = 1;
+        hit.lookup_ms = 2;
+        hit.restore_ms = 5;
+        let mut miss = test_event("m", EventResult::Miss, 500, 400, 10, "k-m");
+        miss.startup_ms = 4;
+        miss.key_ms = 20;
+        miss.dep_info_ms = 9;
+        miss.dep_info_runs = 1;
+        miss.lookup_ms = 1;
+        miss.flight_wait_ms = 7;
+        miss.permit_wait_ms = 11;
+        miss.store_ms = 30;
+        for e in [hit, miss] {
+            events::log_event(&config.event_log_path(), &e).unwrap();
+        }
+        config
+    }
+
+    #[test]
+    fn report_totals_the_wrapper_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_phase_events(dir.path());
+        let report = generate_report(&config, 24, 10).unwrap();
+        let t = &report.timing;
+        assert_eq!(t.total_startup_ms, 7);
+        assert_eq!(t.avg_startup_ms, 3.5);
+        assert_eq!(t.total_dep_info_ms, 15);
+        assert_eq!(t.dep_info_runs, 2);
+        assert_eq!(t.avg_dep_info_ms, 7.5);
+        assert_eq!(t.total_wait_ms, 18);
+        assert_eq!(t.total_flight_wait_ms, 7);
+        assert_eq!(t.total_permit_wait_ms, 11);
+        assert_eq!(t.avg_wait_ms, 9.0);
+        assert_eq!(t.total_unattributed_ms, 47);
+        assert_eq!(t.avg_unattributed_ms, 23.5);
+        // Unchanged neighbours, as a cross-check of the fixture.
+        assert_eq!(t.total_key_ms, 30);
+        assert_eq!(t.total_lookup_ms, 3);
+        assert_eq!(t.total_restore_ms, 5);
+        assert_eq!(t.total_store_ms, 30);
+
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report).unwrap()).unwrap();
+        assert_eq!(json["timing"]["total_dep_info_ms"], 15);
+        assert_eq!(json["timing"]["dep_info_runs"], 2);
+        assert_eq!(json["timing"]["total_wait_ms"], 18);
+        assert_eq!(json["timing"]["total_startup_ms"], 7);
+        assert_eq!(json["timing"]["total_unattributed_ms"], 47);
+        let miss_slice = json["traceEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "miss: m")
+            .unwrap();
+        assert_eq!(miss_slice["args"]["dep_info_ms"], 9);
+        assert_eq!(miss_slice["args"]["wait_ms"], 18);
+        assert_eq!(miss_slice["args"]["unattributed_ms"], 27);
+        let schema: serde_json::Value = serde_json::from_str(REPORT_SCHEMA_JSON).unwrap();
+        validate_json_value(&json, &schema, &schema, "report");
+    }
+
+    #[test]
+    fn text_markdown_and_github_reports_show_the_wrapper_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_phase_events(dir.path());
+        let report = generate_report(&config, 24, 10).unwrap();
+
+        let text = format_text(&report);
+        for line in [
+            "  Startup: ~7ms aggregate (avg 3.5ms/crate)",
+            "  Dep-info pre-pass: 2 runs, ~15ms aggregate (avg 7.5ms/run)",
+            "  Scheduler wait: ~18ms aggregate (flight ~7ms, permit ~11ms)",
+            "  Unattributed: ~47ms aggregate (avg 23.5ms/crate)",
+        ] {
+            assert!(text.contains(line), "text is missing {line:?}:\n{text}");
+        }
+
+        // Percentages are of tracked wrapper time: 40 + 500 = 540 ms.
+        let md = format_markdown(&report);
+        for row in [
+            "| Startup | ~7ms | 1.3% |",
+            "| Key computation | ~30ms | 5.6% |",
+            "| &nbsp;&nbsp;of which dep-info pre-pass (2 runs) | ~15ms | 2.8% |",
+            "| Lookup | ~3ms | 0.6% |",
+            "| Scheduler wait (flight ~7ms, permit ~11ms) | ~18ms | 3.3% |",
+            "| Restore | ~5ms | 0.9% |",
+            "| Store | ~30ms | 5.6% |",
+            "| Unattributed | ~47ms | 8.7% |",
+        ] {
+            assert!(md.contains(row), "markdown is missing {row:?}:\n{md}");
+        }
+
+        let gh = format_github(&report);
+        for row in [
+            "| Startup | ~7ms aggregate (avg 3.5ms/crate) |",
+            "| Dep-info pre-pass | 2 runs, ~15ms aggregate (avg 7.5ms/run) |",
+            "| Scheduler wait | ~18ms aggregate (flight ~7ms, permit ~11ms) |",
+            "| Unattributed | ~47ms aggregate (avg 23.5ms/crate) |",
+        ] {
+            assert!(gh.contains(row), "github is missing {row:?}:\n{gh}");
+        }
+    }
+
+    #[test]
+    fn reports_without_crates_show_no_phase_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        events::clear_events(&config.event_log_path()).unwrap();
+        let report = generate_report(&config, 24, 10).unwrap();
+        assert_eq!(report.summary.total_crates, 0);
+        assert!(!format_text(&report).contains("Startup:"));
+        assert!(!format_markdown(&report).contains("| Startup |"));
+        assert!(!format_github(&report).contains("| Startup |"));
+    }
+
+    #[test]
+    fn trace_json_emits_each_crate_slice_followed_by_its_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_phase_events(dir.path());
+        let report = generate_report(&config, 24, 10).unwrap();
+        let json = format_trace_json(&report).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = raw["traceEvents"].as_array().unwrap();
+
+        let expected_phases: usize = report
+            .trace_events
+            .iter()
+            .map(|e| trace_phase_events(e).len())
+            .sum();
+        assert_eq!(
+            expected_phases,
+            5 + 7,
+            "hit: startup, key, dep-info, lookup, restore; miss: all seven"
+        );
+        let phases: Vec<_> = arr.iter().filter(|e| e["cat"] == "kache.phase").collect();
+        assert_eq!(phases.len(), expected_phases);
+
+        let miss_at = arr.iter().position(|e| e["name"] == "miss: m").unwrap();
+        let miss = &arr[miss_at];
+        let names: Vec<&str> = arr[miss_at + 1..miss_at + 8]
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "startup", "key", "dep-info", "lookup", "wait", "compile", "store"
+            ]
+        );
+        for phase in &arr[miss_at + 1..miss_at + 8] {
+            assert_eq!(phase["ph"], "X");
+            assert_eq!(phase["tid"], miss["tid"]);
+            assert_eq!(phase["pid"], miss["pid"]);
+            assert_eq!(phase["args"]["crate_name"], "m");
+            let end = phase["ts"].as_i64().unwrap() + phase["dur"].as_i64().unwrap();
+            assert!(end <= miss["ts"].as_i64().unwrap() + miss["dur"].as_i64().unwrap());
+        }
+    }
+
+    #[test]
+    fn avg_ms_rounds_to_one_decimal_and_survives_an_empty_count() {
+        assert_eq!(avg_ms(7, 2), 3.5);
+        assert_eq!(avg_ms(15, 2), 7.5);
+        assert_eq!(avg_ms(7, 3), 2.3);
+        assert_eq!(avg_ms(0, 3), 0.0);
+        assert_eq!(avg_ms(7, 0), 0.0);
+    }
+
+    #[test]
+    fn pct_of_rounds_to_one_decimal_and_survives_an_empty_total() {
+        assert_eq!(pct_of(25, 200), 12.5);
+        assert_eq!(pct_of(7, 540), 1.3);
+        assert_eq!(pct_of(540, 540), 100.0);
+        assert_eq!(pct_of(0, 540), 0.0);
+        assert_eq!(pct_of(7, 0), 0.0);
     }
 
     #[test]

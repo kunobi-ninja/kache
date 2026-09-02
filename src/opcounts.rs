@@ -14,7 +14,9 @@
 //! that across the self-hosted / GitHub-hosted runner mix.
 
 use std::cell::Cell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 static COMPILER_RUNS: AtomicU32 = AtomicU32::new(0);
 static PREPROCESSOR_RUNS: AtomicU32 = AtomicU32::new(0);
@@ -197,6 +199,96 @@ pub fn store_copied_bytes() -> u64 {
     STORE_COPIED_BYTES.load(Ordering::Relaxed)
 }
 
+// ── Wrapper phase timings ───────────────────────────────────────────────────
+//
+// `key_ms`, `lookup_ms`, `restore_ms` and `store_ms` are measured inline in
+// the wrapper and handed to the event by hand. The phases below happen in
+// code the wrapper does not call directly (the dep-info pre-pass inside key
+// computation, the scheduler's flight and permit waits) or before the wrapper
+// exists at all (process startup), so they accumulate here and are read once
+// at the single event write site, like the spawn counts above. Microseconds
+// are kept internally; the event rounds down to whole milliseconds.
+
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+static STARTUP_US: AtomicU64 = AtomicU64::new(0);
+static DEP_INFO_US: AtomicU64 = AtomicU64::new(0);
+static DEP_INFO_RUNS: AtomicU32 = AtomicU32::new(0);
+static FLIGHT_WAIT_US: AtomicU64 = AtomicU64::new(0);
+static PERMIT_WAIT_US: AtomicU64 = AtomicU64::new(0);
+
+/// Pin the process start. Called first thing in `main`, before argv handling
+/// or config load, so `startup_ms` covers everything that runs before the
+/// wrapper's first cache decision. A second call changes nothing.
+///
+/// Process-wide and permanent: in a test binary, once any test pins it,
+/// every later in-process wrapper run measures `elapsed_ms` from that pin.
+/// Tests must not assert an upper bound on `elapsed_ms` or `startup_ms`.
+pub fn mark_process_start() {
+    let _ = PROCESS_START.set(Instant::now());
+}
+
+/// The instant `main` pinned, or `None` when this process never went through
+/// `main` (unit tests, library callers). The wrapper then anchors elapsed
+/// time at its own entry and records no startup.
+pub fn process_start() -> Option<Instant> {
+    PROCESS_START.get().copied()
+}
+
+/// Record the time from process start to the wrapper's entry.
+pub fn record_startup(spent: Duration) {
+    STARTUP_US.fetch_add(micros(spent), Ordering::Relaxed);
+}
+
+/// Process start to wrapper entry so far in this process, whole milliseconds.
+pub fn startup_ms() -> u64 {
+    ms_from_micros(STARTUP_US.load(Ordering::Relaxed))
+}
+
+/// Record one `rustc --emit=dep-info` pre-pass spawn and the time spent
+/// waiting for it. Counted whether or not rustc succeeded: the spawn happened.
+pub fn record_dep_info_run(spent: Duration) {
+    DEP_INFO_RUNS.fetch_add(1, Ordering::Relaxed);
+    DEP_INFO_US.fetch_add(micros(spent), Ordering::Relaxed);
+}
+
+/// Dep-info pre-pass spawns so far in this process.
+pub fn dep_info_runs() -> u32 {
+    DEP_INFO_RUNS.load(Ordering::Relaxed)
+}
+
+/// Time spent in dep-info pre-pass spawns so far, whole milliseconds.
+pub fn dep_info_ms() -> u64 {
+    ms_from_micros(DEP_INFO_US.load(Ordering::Relaxed))
+}
+
+/// Record time blocked joining a scheduler flight another process owned.
+pub fn record_flight_wait(spent: Duration) {
+    FLIGHT_WAIT_US.fetch_add(micros(spent), Ordering::Relaxed);
+}
+
+/// Record time blocked acquiring scheduler permit slots.
+pub fn record_permit_wait(spent: Duration) {
+    PERMIT_WAIT_US.fetch_add(micros(spent), Ordering::Relaxed);
+}
+
+/// Flight-join wait so far in this process, whole milliseconds.
+pub fn flight_wait_ms() -> u64 {
+    ms_from_micros(FLIGHT_WAIT_US.load(Ordering::Relaxed))
+}
+
+/// Permit wait so far in this process, whole milliseconds.
+pub fn permit_wait_ms() -> u64 {
+    ms_from_micros(PERMIT_WAIT_US.load(Ordering::Relaxed))
+}
+
+fn micros(spent: Duration) -> u64 {
+    u64::try_from(spent.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn ms_from_micros(micros: u64) -> u64 {
+    micros / 1000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +342,58 @@ mod tests {
             skipped,
             "an unsuspended compiler run must not count as skipped"
         );
+    }
+
+    #[test]
+    fn mark_process_start_pins_one_instant() {
+        mark_process_start();
+        let pinned = process_start().expect("main's mark must be readable");
+        assert!(pinned <= Instant::now());
+        // A second mark must not move the anchor: `startup_ms` is measured
+        // from the first one.
+        mark_process_start();
+        assert_eq!(process_start(), Some(pinned));
+    }
+
+    #[test]
+    fn startup_accumulates_whole_milliseconds() {
+        let before = startup_ms();
+        record_startup(Duration::from_micros(7_400));
+        assert!(startup_ms() >= before + 7);
+    }
+
+    #[test]
+    fn dep_info_run_counts_and_times_each_spawn() {
+        let runs_before = dep_info_runs();
+        let ms_before = dep_info_ms();
+        record_dep_info_run(Duration::from_millis(12));
+        record_dep_info_run(Duration::from_millis(3));
+        assert!(dep_info_runs() >= runs_before + 2);
+        assert!(dep_info_ms() >= ms_before + 15);
+    }
+
+    #[test]
+    fn scheduler_waits_accumulate_in_their_own_counters() {
+        let flight_before = flight_wait_ms();
+        let permit_before = permit_wait_ms();
+        record_flight_wait(Duration::from_millis(5));
+        record_permit_wait(Duration::from_millis(9));
+        assert!(flight_wait_ms() >= flight_before + 5);
+        assert!(permit_wait_ms() >= permit_before + 9);
+    }
+
+    #[test]
+    fn ms_from_micros_rounds_down() {
+        assert_eq!(ms_from_micros(0), 0);
+        assert_eq!(ms_from_micros(999), 0);
+        assert_eq!(ms_from_micros(1_000), 1);
+        assert_eq!(ms_from_micros(7_500), 7);
+    }
+
+    #[test]
+    fn micros_saturates_instead_of_wrapping() {
+        assert_eq!(micros(Duration::from_micros(1_234)), 1_234);
+        assert_eq!(micros(Duration::MAX), u64::MAX);
     }
 
     #[test]

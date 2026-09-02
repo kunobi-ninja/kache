@@ -34,7 +34,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary, scratch_dir};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary, scratch_dir};
 
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
@@ -58,12 +58,10 @@ fn copy_fixture() -> TempDir {
 
 /// Runs `cargo test --test harness` through the kache wrapper.
 fn cargo_test(project: &Path, cache_dir: &Path, target_dir: &Path) -> std::process::Output {
-    std::process::Command::new("cargo")
+    hermetic_command("cargo", cache_dir, Some(&isolated_config_path(cache_dir)))
         .args(["test", "--test", "harness"])
         .current_dir(project)
         .env("RUSTC_WRAPPER", kache_binary())
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .output()
@@ -71,12 +69,14 @@ fn cargo_test(project: &Path, cache_dir: &Path, target_dir: &Path) -> std::proce
 }
 
 fn kache_report(cache_dir: &Path) -> serde_json::Value {
-    let output = std::process::Command::new(kache_binary())
-        .args(["report", "--format", "json", "--since", "1h"])
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
-        .output()
-        .expect("failed to run kache report");
+    let output = hermetic_command(
+        kache_binary(),
+        cache_dir,
+        Some(&isolated_config_path(cache_dir)),
+    )
+    .args(["report", "--format", "json", "--since", "1h"])
+    .output()
+    .expect("failed to run kache report");
 
     assert!(
         output.status.success(),

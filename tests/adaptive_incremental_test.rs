@@ -12,6 +12,12 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// Only the env plumbing is shared; this file drives the Cargo-built binary,
+// so the bootstrap helpers in `common` stay unused here.
+#[allow(dead_code)]
+mod common;
+use common::hermetic_command;
+
 fn kache_binary() -> &'static str {
     env!("CARGO_BIN_EXE_kache")
 }
@@ -38,25 +44,26 @@ fn build_variant(
     filetime::set_file_mtime(&source, FileTime::from_unix_time(source_mtime, 0)).unwrap();
 
     let event_count = fixture_events(cache_dir).len();
-    let output = Command::new("cargo")
-        .args(["build", "--offline", "--quiet", "--lib"])
-        .current_dir(project)
-        .env("RUSTC_WRAPPER", kache_binary())
-        .env("CARGO_TARGET_DIR", target_dir)
-        .env("CARGO_INCREMENTAL", "1")
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", project.join("missing-kache.toml"))
-        .env("KACHE_ADAPTIVE_INCREMENTAL", "1")
-        .env("KACHE_FALLBACK", fallback)
-        .env("FALLBACK_MARKER", project.join("fallback-used"))
-        .env("KACHE_LOG", "kache=debug")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("KACHE_CLEAN_INCREMENTAL")
-        .env_remove("KACHE_DISABLED")
-        .env_remove("KACHE_PRESERVE_INCREMENTAL")
-        .output()
-        .expect("failed to build adaptive fixture");
+    let output = hermetic_command(
+        "cargo",
+        cache_dir,
+        Some(&project.join("missing-kache.toml")),
+    )
+    .args(["build", "--offline", "--quiet", "--lib"])
+    .current_dir(project)
+    .env("RUSTC_WRAPPER", kache_binary())
+    .env("CARGO_TARGET_DIR", target_dir)
+    .env("CARGO_INCREMENTAL", "1")
+    .env("KACHE_ADAPTIVE_INCREMENTAL", "1")
+    .env("KACHE_FALLBACK", fallback)
+    .env("FALLBACK_MARKER", project.join("fallback-used"))
+    .env("KACHE_LOG", "kache=debug")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env_remove("KACHE_CLEAN_INCREMENTAL")
+    .env_remove("KACHE_DISABLED")
+    .env_remove("KACHE_PRESERVE_INCREMENTAL")
+    .output()
+    .expect("failed to build adaptive fixture");
     assert!(
         output.status.success(),
         "fixture build failed for variant {answer}\nstdout:\n{}\nstderr:\n{}",
@@ -290,24 +297,25 @@ fn user_facing_executable_without_fallback_uses_default_immediate_adaptive_lane(
         "fn main() { print!(\"adaptive executable\"); }\n",
     )
     .unwrap();
-    let output = Command::new("cargo")
-        .args(["build", "--offline", "--quiet", "--bin", "adaptive-fixture"])
-        .current_dir(project.path())
-        .env("RUSTC_WRAPPER", kache_binary())
-        .env("CARGO_TARGET_DIR", &target)
-        .env("CARGO_INCREMENTAL", "1")
-        .env("KACHE_CACHE_DIR", cache.path())
-        .env("KACHE_CONFIG", project.path().join("missing-kache.toml"))
-        .env("KACHE_CACHE_EXECUTABLES", "0")
-        .env_remove("KACHE_FALLBACK")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("KACHE_ADAPTIVE_INCREMENTAL")
-        .env_remove("KACHE_CLEAN_INCREMENTAL")
-        .env_remove("KACHE_DISABLED")
-        .env_remove("KACHE_PRESERVE_INCREMENTAL")
-        .output()
-        .expect("failed to build adaptive executable fixture");
+    let output = hermetic_command(
+        "cargo",
+        cache.path(),
+        Some(&project.path().join("missing-kache.toml")),
+    )
+    .args(["build", "--offline", "--quiet", "--bin", "adaptive-fixture"])
+    .current_dir(project.path())
+    .env("RUSTC_WRAPPER", kache_binary())
+    .env("CARGO_TARGET_DIR", &target)
+    .env("CARGO_INCREMENTAL", "1")
+    .env("KACHE_CACHE_EXECUTABLES", "0")
+    .env_remove("KACHE_FALLBACK")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env_remove("KACHE_ADAPTIVE_INCREMENTAL")
+    .env_remove("KACHE_CLEAN_INCREMENTAL")
+    .env_remove("KACHE_DISABLED")
+    .env_remove("KACHE_PRESERVE_INCREMENTAL")
+    .output()
+    .expect("failed to build adaptive executable fixture");
     assert!(
         output.status.success(),
         "adaptive executable build failed\nstdout:\n{}\nstderr:\n{}",
@@ -375,25 +383,26 @@ fn user_facing_executable_preserves_configured_fallback_contract() {
     )
     .unwrap();
 
-    let output = Command::new("cargo")
-        .args(["build", "--offline", "--quiet", "--bin", "adaptive-fixture"])
-        .current_dir(project.path())
-        .env("RUSTC_WRAPPER", kache_binary())
-        .env("CARGO_TARGET_DIR", &target)
-        .env("CARGO_INCREMENTAL", "1")
-        .env("KACHE_CACHE_DIR", cache.path())
-        .env("KACHE_CONFIG", project.path().join("missing-kache.toml"))
-        .env("KACHE_CACHE_EXECUTABLES", "0")
-        .env("KACHE_FALLBACK", &fallback)
-        .env("FALLBACK_MARKER", &fallback_marker)
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("KACHE_ADAPTIVE_INCREMENTAL")
-        .env_remove("KACHE_CLEAN_INCREMENTAL")
-        .env_remove("KACHE_DISABLED")
-        .env_remove("KACHE_PRESERVE_INCREMENTAL")
-        .output()
-        .expect("failed to build fallback executable fixture");
+    let output = hermetic_command(
+        "cargo",
+        cache.path(),
+        Some(&project.path().join("missing-kache.toml")),
+    )
+    .args(["build", "--offline", "--quiet", "--bin", "adaptive-fixture"])
+    .current_dir(project.path())
+    .env("RUSTC_WRAPPER", kache_binary())
+    .env("CARGO_TARGET_DIR", &target)
+    .env("CARGO_INCREMENTAL", "1")
+    .env("KACHE_CACHE_EXECUTABLES", "0")
+    .env("KACHE_FALLBACK", &fallback)
+    .env("FALLBACK_MARKER", &fallback_marker)
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env_remove("KACHE_ADAPTIVE_INCREMENTAL")
+    .env_remove("KACHE_CLEAN_INCREMENTAL")
+    .env_remove("KACHE_DISABLED")
+    .env_remove("KACHE_PRESERVE_INCREMENTAL")
+    .output()
+    .expect("failed to build fallback executable fixture");
     assert!(
         output.status.success(),
         "fallback executable build failed\nstdout:\n{}\nstderr:\n{}",
@@ -464,7 +473,11 @@ exit 0
     fs::set_permissions(&fake_rustc, fs::Permissions::from_mode(0o755)).unwrap();
 
     let wrapper = |argv_dump: &Path| {
-        let mut command = Command::new(kache_binary());
+        let mut command = hermetic_command(
+            kache_binary(),
+            cache.path(),
+            Some(&project.path().join("missing-kache.toml")),
+        );
         command
             .arg(&fake_rustc)
             .args(["--crate-name", "adaptive_fixture", "--crate-type", "bin"])
@@ -482,11 +495,8 @@ exit 0
             .env("CONTENDER_FILE", &contender)
             .env("CARGO_PRIMARY_PACKAGE", "1")
             .env("CARGO_INCREMENTAL", "1")
-            .env("KACHE_CACHE_DIR", cache.path())
-            .env("KACHE_CONFIG", project.path().join("missing-kache.toml"))
             .env("KACHE_CACHE_EXECUTABLES", "0")
             .env("KACHE_LOG", "kache=warn")
-            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .env_remove("KACHE_ADAPTIVE_INCREMENTAL")
             .env_remove("KACHE_CLEAN_INCREMENTAL")

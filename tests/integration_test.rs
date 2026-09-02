@@ -3,21 +3,23 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 
 fn run_kache_cc(project: &Path, cache_dir: &Path, args: &[&str]) {
     run_kache_cc_from(project, cache_dir, args);
 }
 
 fn run_kache_cc_from(cwd: &Path, cache_dir: &Path, args: &[&str]) {
-    let output = std::process::Command::new(kache_binary())
-        .args(args)
-        .current_dir(cwd)
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
-        .env("KACHE_LOG", "kache=debug")
-        .output()
-        .expect("failed to run kache cc");
+    let output = hermetic_command(
+        kache_binary(),
+        cache_dir,
+        Some(&isolated_config_path(cache_dir)),
+    )
+    .args(args)
+    .current_dir(cwd)
+    .env("KACHE_LOG", "kache=debug")
+    .output()
+    .expect("failed to run kache cc");
 
     assert!(
         output.status.success(),
@@ -28,12 +30,10 @@ fn run_kache_cc_from(cwd: &Path, cache_dir: &Path, args: &[&str]) {
 }
 
 fn run_cargo_build_with_kache(project: &Path, cache_dir: &Path, target_dir: &Path) {
-    let output = std::process::Command::new("cargo")
+    let output = hermetic_command("cargo", cache_dir, Some(&isolated_config_path(cache_dir)))
         .args(["build", "--lib"])
         .current_dir(project)
         .env("RUSTC_WRAPPER", kache_binary())
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_LOG", "kache=debug")
@@ -49,12 +49,10 @@ fn run_cargo_build_with_kache(project: &Path, cache_dir: &Path, target_dir: &Pat
 }
 
 fn run_cargo_test_with_kache(project: &Path, cache_dir: &Path, target_dir: &Path, package: &str) {
-    let output = std::process::Command::new("cargo")
+    let output = hermetic_command("cargo", cache_dir, Some(&isolated_config_path(cache_dir)))
         .args(["test", "-q", "-p", package])
         .current_dir(project)
         .env("RUSTC_WRAPPER", kache_binary())
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_LOG", "kache=debug")
@@ -70,12 +68,14 @@ fn run_cargo_test_with_kache(project: &Path, cache_dir: &Path, target_dir: &Path
 }
 
 fn kache_report(cache_dir: &Path) -> serde_json::Value {
-    let output = std::process::Command::new(kache_binary())
-        .args(["report", "--format", "json", "--since", "1h"])
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
-        .output()
-        .expect("failed to run kache report");
+    let output = hermetic_command(
+        kache_binary(),
+        cache_dir,
+        Some(&isolated_config_path(cache_dir)),
+    )
+    .args(["report", "--format", "json", "--since", "1h"])
+    .output()
+    .expect("failed to run kache report");
 
     assert!(
         output.status.success(),
@@ -87,14 +87,16 @@ fn kache_report(cache_dir: &Path) -> serde_json::Value {
 }
 
 fn kache_perfetto_report(cache_dir: &Path, root: &Path) -> serde_json::Value {
-    let output = std::process::Command::new(kache_binary())
-        .arg("report")
-        .args(["--format", "perfetto", "--since", "1h", "--root"])
-        .arg(root)
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
-        .output()
-        .expect("failed to run kache perfetto report");
+    let output = hermetic_command(
+        kache_binary(),
+        cache_dir,
+        Some(&isolated_config_path(cache_dir)),
+    )
+    .arg("report")
+    .args(["--format", "perfetto", "--since", "1h", "--root"])
+    .arg(root)
+    .output()
+    .expect("failed to run kache perfetto report");
 
     assert!(
         output.status.success(),
@@ -269,13 +271,15 @@ fn test_cli_list_empty() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
 
-    Command::new(kache_binary())
-        .arg("list")
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("No cached entries"));
+    Command::from(hermetic_command(
+        kache_binary(),
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    ))
+    .arg("list")
+    .assert()
+    .success()
+    .stdout(predicates::str::contains("No cached entries"));
 }
 
 #[test]
@@ -283,13 +287,15 @@ fn test_cli_purge_empty() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
 
-    Command::new(kache_binary())
-        .arg("purge")
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("Cleared"));
+    Command::from(hermetic_command(
+        kache_binary(),
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    ))
+    .arg("purge")
+    .assert()
+    .success()
+    .stdout(predicates::str::contains("Cleared"));
 }
 
 #[test]
@@ -301,16 +307,18 @@ fn test_disabled_passthrough() {
     let target_dir = TempDir::new().unwrap();
 
     // Build with kache disabled — should work just like normal cargo
-    let status = std::process::Command::new("cargo")
-        .args(["build"])
-        .current_dir(&test_project)
-        .env("RUSTC_WRAPPER", kache_binary())
-        .env("KACHE_DISABLED", "1")
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .env("CARGO_TARGET_DIR", target_dir.path())
-        .status()
-        .expect("failed to run cargo build with kache disabled");
+    let status = hermetic_command(
+        "cargo",
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .args(["build"])
+    .current_dir(&test_project)
+    .env("RUSTC_WRAPPER", kache_binary())
+    .env("KACHE_DISABLED", "1")
+    .env("CARGO_TARGET_DIR", target_dir.path())
+    .status()
+    .expect("failed to run cargo build with kache disabled");
 
     assert!(
         status.success(),
@@ -327,17 +335,19 @@ fn test_wrapper_hello_world() {
     let target_dir = TempDir::new().unwrap();
 
     // First build (should be all cache misses)
-    let status = std::process::Command::new("cargo")
-        .args(["build"])
-        .current_dir(&test_project)
-        .env("RUSTC_WRAPPER", kache_binary())
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .env("KACHE_EVENT_ROOT", &test_project)
-        .env("CARGO_TARGET_DIR", target_dir.path())
-        .env("KACHE_LOG", "kache=debug")
-        .status()
-        .expect("failed to run cargo build with kache");
+    let status = hermetic_command(
+        "cargo",
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .args(["build"])
+    .current_dir(&test_project)
+    .env("RUSTC_WRAPPER", kache_binary())
+    .env("KACHE_EVENT_ROOT", &test_project)
+    .env("CARGO_TARGET_DIR", target_dir.path())
+    .env("KACHE_LOG", "kache=debug")
+    .status()
+    .expect("failed to run cargo build with kache");
 
     assert!(status.success(), "first build with kache should succeed");
 
@@ -368,17 +378,19 @@ fn test_wrapper_hello_world() {
         .env("CARGO_TARGET_DIR", target_dir.path())
         .status();
 
-    let status = std::process::Command::new("cargo")
-        .args(["build"])
-        .current_dir(&test_project)
-        .env("RUSTC_WRAPPER", kache_binary())
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .env("KACHE_EVENT_ROOT", &test_project)
-        .env("CARGO_TARGET_DIR", target_dir.path())
-        .env("KACHE_LOG", "kache=debug")
-        .status()
-        .expect("failed to run second cargo build with kache");
+    let status = hermetic_command(
+        "cargo",
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .args(["build"])
+    .current_dir(&test_project)
+    .env("RUSTC_WRAPPER", kache_binary())
+    .env("KACHE_EVENT_ROOT", &test_project)
+    .env("CARGO_TARGET_DIR", target_dir.path())
+    .env("KACHE_LOG", "kache=debug")
+    .status()
+    .expect("failed to run second cargo build with kache");
 
     assert!(status.success(), "second build (cache hit) should succeed");
 
@@ -673,19 +685,21 @@ fn kache_caches_probe_keyed_flags(work: &Path) -> bool {
     std::fs::create_dir_all(&cache_dir).unwrap();
     std::fs::write(&source, "int gate(void) { return 0; }\n").unwrap();
 
-    let ok = std::process::Command::new(kache_binary())
-        .arg("cc")
-        .arg("-c")
-        .arg(&source)
-        .arg("-o")
-        .arg(work.join("gate.o"))
-        .args(["-fstack-protector-strong", "-O0", "-g0"])
-        .current_dir(work)
-        .env("KACHE_CACHE_DIR", &cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(&cache_dir))
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let ok = hermetic_command(
+        kache_binary(),
+        &cache_dir,
+        Some(&isolated_config_path(&cache_dir)),
+    )
+    .arg("cc")
+    .arg("-c")
+    .arg(&source)
+    .arg("-o")
+    .arg(work.join("gate.o"))
+    .args(["-fstack-protector-strong", "-O0", "-g0"])
+    .current_dir(work)
+    .output()
+    .map(|o| o.status.success())
+    .unwrap_or(false);
     if !ok {
         return false;
     }
@@ -1086,17 +1100,19 @@ fn test_cc_existing_readonly_output_matches_selected_compiler() {
 
     let wrapped_output = wrapped_dir.join("output.o");
     let wrapped_before = prepare(&wrapped_output);
-    let wrapped = std::process::Command::new(kache_binary())
-        .args(["cc", "-c"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&wrapped_output)
-        .args(["-O0", "-g0"])
-        .current_dir(project.path())
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .output()
-        .expect("failed to run wrapped cc");
+    let wrapped = hermetic_command(
+        kache_binary(),
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .args(["cc", "-c"])
+    .arg(&source)
+    .arg("-o")
+    .arg(&wrapped_output)
+    .args(["-O0", "-g0"])
+    .current_dir(project.path())
+    .output()
+    .expect("failed to run wrapped cc");
 
     assert_eq!(wrapped.status.code(), plain.status.code());
     assert_eq!(state(&wrapped_output, &wrapped_before), plain_state);
@@ -1106,18 +1122,20 @@ fn test_cc_existing_readonly_output_matches_selected_compiler() {
 
     let disabled_output = disabled_dir.join("output.o");
     let disabled_before = prepare(&disabled_output);
-    let disabled = std::process::Command::new(kache_binary())
-        .args(["cc", "-c"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&disabled_output)
-        .args(["-O0", "-g0"])
-        .current_dir(project.path())
-        .env("KACHE_DISABLED", "1")
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .output()
-        .expect("failed to run disabled wrapped cc");
+    let disabled = hermetic_command(
+        kache_binary(),
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .args(["cc", "-c"])
+    .arg(&source)
+    .arg("-o")
+    .arg(&disabled_output)
+    .args(["-O0", "-g0"])
+    .current_dir(project.path())
+    .env("KACHE_DISABLED", "1")
+    .output()
+    .expect("failed to run disabled wrapped cc");
     assert_eq!(disabled.status.code(), plain.status.code());
     assert_eq!(state(&disabled_output, &disabled_before), plain_state);
 }
@@ -1151,17 +1169,19 @@ fn test_cc_passthrough_preserves_non_utf8_streams_and_exit_status() {
     let output_path = project.path().join("existing.o");
     std::fs::write(&output_path, b"existing").unwrap();
 
-    let output = std::process::Command::new(kache_binary())
-        .arg(&fake_cc)
-        .args(["-c", "foo.c", "-o"])
-        .arg(&output_path)
-        .current_dir(project.path())
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .env_remove("KACHE_LOG")
-        .env_remove("KACHE_PROGRESS")
-        .output()
-        .expect("failed to run kache cc passthrough");
+    let output = hermetic_command(
+        kache_binary(),
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .arg(&fake_cc)
+    .args(["-c", "foo.c", "-o"])
+    .arg(&output_path)
+    .current_dir(project.path())
+    .env_remove("KACHE_LOG")
+    .env_remove("KACHE_PROGRESS")
+    .output()
+    .expect("failed to run kache cc passthrough");
 
     assert_eq!(output.status.code(), Some(7));
     assert_eq!(output.stdout, [0xff]);
@@ -1332,17 +1352,19 @@ fn test_cc_existing_readonly_hardlink_output_matches_selected_compiler() {
     let plain_state = state(&control_referent, &control_output, control_before);
 
     let (wrapped_referent, wrapped_output, wrapped_before) = prepare(&wrapped_dir);
-    let wrapped = std::process::Command::new(kache_binary())
-        .args(["cc", "-c"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&wrapped_output)
-        .args(["-O0", "-g0"])
-        .current_dir(project.path())
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .output()
-        .expect("failed to run wrapped cc");
+    let wrapped = hermetic_command(
+        kache_binary(),
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .args(["cc", "-c"])
+    .arg(&source)
+    .arg("-o")
+    .arg(&wrapped_output)
+    .args(["-O0", "-g0"])
+    .current_dir(project.path())
+    .output()
+    .expect("failed to run wrapped cc");
 
     assert_eq!(wrapped.status.code(), plain.status.code());
     assert_eq!(
@@ -1533,17 +1555,19 @@ fn test_cc_hit_preserves_missing_parent_failure() {
 
     let wrapped_parent = project.path().join("missing-wrapped");
     let wrapped_output = wrapped_parent.join("foo.o");
-    let wrapped = std::process::Command::new(kache_binary())
-        .args(["cc", "-c"])
-        .arg(&source)
-        .arg("-o")
-        .arg(&wrapped_output)
-        .args(["-O0", "-g0"])
-        .current_dir(project.path())
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .output()
-        .expect("failed to run wrapped cc");
+    let wrapped = hermetic_command(
+        kache_binary(),
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .args(["cc", "-c"])
+    .arg(&source)
+    .arg("-o")
+    .arg(&wrapped_output)
+    .args(["-O0", "-g0"])
+    .current_dir(project.path())
+    .output()
+    .expect("failed to run wrapped cc");
 
     assert_eq!(wrapped.status.code(), plain.status.code());
     assert!(!control_parent.exists());
@@ -1563,12 +1587,14 @@ fn test_cc_relative_depinfo_stays_writable_across_repeated_hits() {
     use std::os::unix::process::CommandExt;
 
     fn run_with_umask(project: &Path, cache_dir: &Path, args: &[&str], mask: u32) {
-        let mut command = std::process::Command::new(kache_binary());
+        let mut command = hermetic_command(
+            kache_binary(),
+            cache_dir,
+            Some(&isolated_config_path(cache_dir)),
+        );
         command
             .args(args)
             .current_dir(project)
-            .env("KACHE_CACHE_DIR", cache_dir)
-            .env("KACHE_CONFIG", isolated_config_path(cache_dir))
             .env("KACHE_LOG", "kache=debug");
         // SAFETY: pre_exec runs after fork in the child, and umask is an
         // async-signal-safe syscall that changes only that child process.
@@ -2698,12 +2724,14 @@ fn test_cc_legacy_compound_depinfo_entry_self_heals_and_why_miss_explains_it() {
     std::fs::create_dir_all(project.path().join("build")).unwrap();
     run_kache_cc(project.path(), cache_dir.path(), &args);
 
-    let why = std::process::Command::new(kache_binary())
-        .args(["why-miss", "foo.c"])
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .output()
-        .expect("failed to run why-miss");
+    let why = hermetic_command(
+        kache_binary(),
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .args(["why-miss", "foo.c"])
+    .output()
+    .expect("failed to run why-miss");
     assert!(why.status.success());
     let stdout = String::from_utf8_lossy(&why.stdout);
     assert!(
@@ -2837,12 +2865,10 @@ cache_executables = true
     std::fs::write(&config_path, config_content).unwrap();
 
     // First build (populates the cache past the size budget)
-    let output = std::process::Command::new("cargo")
+    let output = hermetic_command("cargo", cache_dir.path(), Some(&config_path))
         .args(["build"])
         .current_dir(&test_project)
         .env("RUSTC_WRAPPER", kache_binary())
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", &config_path)
         .env("CARGO_TARGET_DIR", target_dir.path())
         .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_LOG", "kache=debug")
@@ -2927,12 +2953,10 @@ cache_executables = true
     .unwrap();
 
     // Second build creates a second entry and triggers put() -> maybe_spawn_auto_gc
-    let output = std::process::Command::new("cargo")
+    let output = hermetic_command("cargo", cache_dir.path(), Some(&config_path))
         .args(["build"])
         .current_dir(test_project.path())
         .env("RUSTC_WRAPPER", kache_binary())
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", &config_path)
         .env("CARGO_TARGET_DIR", target_dir.path())
         .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_LOG", "kache=debug")
@@ -3007,26 +3031,26 @@ fn workspace_wrapper_passthrough_executes_every_time() {
     let out = cache_dir.path().join("out.rlib");
 
     let run = || {
-        std::process::Command::new(kache_binary())
-            .arg(&wrapper)
-            .arg("rustc")
-            .args([
-                "--edition",
-                "2024",
-                "--crate-type",
-                "lib",
-                "--crate-name",
-                "fakedriver",
-                "-o",
-                out.to_str().unwrap(),
-                src.to_str().unwrap(),
-            ])
-            .env("KACHE_CACHE_DIR", cache_dir.path())
-            .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-            .env_remove("RUSTC_WRAPPER")
-            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-            .output()
-            .expect("failed to run kache")
+        hermetic_command(
+            kache_binary(),
+            cache_dir.path(),
+            Some(&isolated_config_path(cache_dir.path())),
+        )
+        .arg(&wrapper)
+        .arg("rustc")
+        .args([
+            "--edition",
+            "2024",
+            "--crate-type",
+            "lib",
+            "--crate-name",
+            "fakedriver",
+            "-o",
+            out.to_str().unwrap(),
+            src.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run kache")
     };
 
     let out1 = run();

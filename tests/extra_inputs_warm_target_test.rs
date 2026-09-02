@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 
 const INPUT_PATH_ENV: &str = "KACHE_TEST_DECLARED_INPUT";
 const ACTIVATE_CONFIG_ENV: &str = "KACHE_TEST_ACTIVATE_CONFIG";
@@ -155,7 +155,7 @@ fn cargo_build_with_env(
     input_reader: &Path,
     extra_env: &[(&str, &str)],
 ) -> Output {
-    let mut command = Command::new("cargo");
+    let mut command = hermetic_command("cargo", cache_dir, Some(&isolated_config_path(cache_dir)));
     command
         .args([
             "build",
@@ -169,9 +169,7 @@ fn cargo_build_with_env(
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TERM_COLOR", "never")
-        .env("KACHE_CACHE_DIR", cache_dir)
         .env("KACHE_CACHE_EXECUTABLES", "1")
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
         .env("KACHE_LOG", "kache=debug")
         .env(INPUT_PATH_ENV, input)
         .env(
@@ -179,7 +177,6 @@ fn cargo_build_with_env(
             format!("--extern=input_reader={}", input_reader.display()),
         )
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("KACHE_DISABLED");
     for (name, value) in extra_env {
@@ -256,22 +253,21 @@ fn run_daemon_command(cache_dir: &Path, subcommand: &str) -> Output {
     let stderr_path = cache_dir.join(format!("daemon-{subcommand}.stderr"));
     let stdout = std::fs::File::create(&stdout_path).unwrap();
     let stderr = std::fs::File::create(&stderr_path).unwrap();
-    let mut child = Command::new(kache_binary())
-        .args(["daemon", subcommand])
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
-        .env("KACHE_LOCAL_HIT_DAEMON", "1")
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
-        .env("KACHE_LOG", "off")
-        .env_remove("KACHE_SOCKET_PATH")
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .stdin(std::process::Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-        .unwrap();
+    let mut child = hermetic_command(
+        kache_binary(),
+        cache_dir,
+        Some(&isolated_config_path(cache_dir)),
+    )
+    .args(["daemon", subcommand])
+    .env("KACHE_LOCAL_HIT_DAEMON", "1")
+    .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+    .env("KACHE_LOG", "off")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .stdin(std::process::Stdio::null())
+    .stdout(stdout)
+    .stderr(stderr)
+    .spawn()
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {

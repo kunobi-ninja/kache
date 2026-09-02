@@ -2,7 +2,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 mod common;
-use common::{build_kache, isolated_config_path, kache_binary};
+use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 
 /// Recursively copies a directory.
 fn copy_dir(src: &Path, dst: &Path) {
@@ -35,12 +35,10 @@ fn build_and_run(
     extra_env: &[(&str, &str)],
     extra_cargo_args: &[&str],
 ) -> String {
-    let mut cmd = std::process::Command::new("cargo");
+    let mut cmd = hermetic_command("cargo", cache_dir, Some(&isolated_config_path(cache_dir)));
     cmd.args(["build"])
         .current_dir(project)
         .env("RUSTC_WRAPPER", kache_binary())
-        .env("KACHE_CACHE_DIR", cache_dir)
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir))
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_LOG", "kache=debug");
@@ -442,27 +440,31 @@ fn stale_concurrent_builds_safe() {
 
     // Spawn two builds in parallel sharing the same cache dir
     let kache = kache_binary();
-    let mut child1 = std::process::Command::new("cargo")
-        .args(["build"])
-        .current_dir(project.path())
-        .env("RUSTC_WRAPPER", &kache)
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .env("CARGO_TARGET_DIR", target1.path())
-        .env("CARGO_INCREMENTAL", "0")
-        .spawn()
-        .expect("failed to spawn build 1");
+    let mut child1 = hermetic_command(
+        "cargo",
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .args(["build"])
+    .current_dir(project.path())
+    .env("RUSTC_WRAPPER", &kache)
+    .env("CARGO_TARGET_DIR", target1.path())
+    .env("CARGO_INCREMENTAL", "0")
+    .spawn()
+    .expect("failed to spawn build 1");
 
-    let mut child2 = std::process::Command::new("cargo")
-        .args(["build"])
-        .current_dir(project.path())
-        .env("RUSTC_WRAPPER", &kache)
-        .env("KACHE_CACHE_DIR", cache_dir.path())
-        .env("KACHE_CONFIG", isolated_config_path(cache_dir.path()))
-        .env("CARGO_TARGET_DIR", target2.path())
-        .env("CARGO_INCREMENTAL", "0")
-        .spawn()
-        .expect("failed to spawn build 2");
+    let mut child2 = hermetic_command(
+        "cargo",
+        cache_dir.path(),
+        Some(&isolated_config_path(cache_dir.path())),
+    )
+    .args(["build"])
+    .current_dir(project.path())
+    .env("RUSTC_WRAPPER", &kache)
+    .env("CARGO_TARGET_DIR", target2.path())
+    .env("CARGO_INCREMENTAL", "0")
+    .spawn()
+    .expect("failed to spawn build 2");
 
     let status1 = child1.wait().unwrap();
     let status2 = child2.wait().unwrap();

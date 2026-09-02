@@ -17,7 +17,9 @@
 //! already gitignored, and concurrent suites reuse the same build instead of
 //! each doing their own (cargo's build-dir lock serializes them).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::OnceLock;
 
 /// `<target>/kache-test-bootstrap`, derived from the running test binary at
@@ -96,6 +98,43 @@ fn bootstrap_kache() -> Result<PathBuf, String> {
 /// Keeps tests off the developer's real `~/.config/kache/config.toml`.
 pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("config.toml")
+}
+
+/// A child `cargo` or `kache` whose Kache state is pinned to `cache_dir`.
+///
+/// Tests read `events.jsonl` and reach the daemon socket under the cache dir
+/// they created, and Kache resolves both under its runtime dir. The parent
+/// environment can point that elsewhere: kache-action exports
+/// `KACHE_RUNTIME_DIR`, a build that runs the suite through the wrapper leaves
+/// `KACHE_ACTIVE`, `KACHE_SOCKET_PATH`, and `KACHE_EVENT_ROOT` behind, and a
+/// developer dogfooding Kache has `RUSTC_WRAPPER` configured. All of those
+/// are pinned or cleared here, before the caller adds its own wrapper and
+/// overrides; a later `env` call on the same key wins.
+///
+/// `config` pins `KACHE_CONFIG`. `None` unsets it so the child discovers its
+/// configuration the way a real build would.
+///
+/// Not every test binary spawns children, so the rest see it as dead.
+#[allow(dead_code)]
+pub fn hermetic_command(
+    program: impl AsRef<OsStr>,
+    cache_dir: &Path,
+    config: Option<&Path>,
+) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env("KACHE_CACHE_DIR", cache_dir)
+        .env("KACHE_RUNTIME_DIR", cache_dir)
+        .env_remove("KACHE_SOCKET_PATH")
+        .env_remove("KACHE_EVENT_ROOT")
+        .env_remove("KACHE_ACTIVE")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
+    match config {
+        Some(path) => command.env("KACHE_CONFIG", path),
+        None => command.env_remove("KACHE_CONFIG"),
+    };
+    command
 }
 
 /// A scratch directory on the *repository's* filesystem, for tests whose

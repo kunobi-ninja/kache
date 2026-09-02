@@ -88,9 +88,13 @@ jobs:
           cache: false
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       # Held at a pre-runtime-dir revision: newer kache-action exports
-      # KACHE_RUNTIME_DIR into the job env, and the test suite is not yet
-      # hermetic against it (integration tests read events.jsonl from the
-      # cache dir; daemon unit tests would share one runtime dir).
+      # KACHE_RUNTIME_DIR into the job env. The integration tests now pin
+      # KACHE_RUNTIME_DIR to their own cache dir and clear KACHE_SOCKET_PATH,
+      # KACHE_EVENT_ROOT, and KACHE_ACTIVE for every child they spawn
+      # (tests/common/mod.rs, hermetic_command), so events.jsonl and the
+      # daemon socket land where the tests look. In-process unit tests that
+      # call Config::load still see the job env, so the pin stays until they
+      # are checked.
       # Use the latest stable release to accelerate ordinary verification.
       # E2E, mutation, Kani, and platform jobs below still build this commit
       # directly. Add `[no-kache]` to a PR title to diagnose cache-related CI.

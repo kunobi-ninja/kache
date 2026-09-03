@@ -2553,6 +2553,23 @@ enum FileHashCache<'db> {
     Owned(Connection),
 }
 
+/// One input of a memoised preprocessor run: its metadata at the time the
+/// expansion was hashed, plus the hash of its contents.
+///
+/// The metadata is a fast path — identical metadata means identical bytes,
+/// with no read. The content hash is what makes the memo survive everything
+/// metadata cannot: a second worktree (new inodes and mtimes for the same
+/// bytes), a fresh CI checkout, and a header a build script regenerated
+/// byte-for-byte. Those are the cases a compile cache exists for, and they
+/// are exactly the ones metadata alone rejects.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CcPreprocessMemoInput {
+    #[serde(flatten)]
+    fingerprint: FileFingerprint,
+    /// blake3 of the file's contents when the expansion was hashed.
+    content: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FileFingerprint {
     path: String,
@@ -2680,9 +2697,19 @@ impl<'db> FileHasher<'db> {
         self.cache.is_some()
     }
 
-    /// Reuse a preprocessor-output hash only when every source/header still
-    /// has the exact metadata fingerprint captured by the successful probe.
-    /// Any database, decoding, metadata, or freshness uncertainty is a miss.
+    /// Reuse a preprocessor-output hash only when every source and header the
+    /// probe read still holds the same bytes.
+    ///
+    /// Metadata first, because identical metadata needs no read. When it
+    /// differs the file is hashed and compared, so bytes that merely moved
+    /// (another worktree, a fresh checkout) or were rewritten unchanged (a
+    /// build script regenerating a header) still hit.
+    ///
+    /// The too-new guard deliberately does not apply. It exists because
+    /// metadata cannot tell a file written a moment ago from one still being
+    /// written; a content hash can, because a file that changes afterwards
+    /// simply fails the next comparison. Any database, decoding, or metadata
+    /// uncertainty is still a miss.
     pub(crate) fn cc_preprocess_memo_lookup(&self, memo_key: &str) -> Option<String> {
         let cache = self.cache.as_ref()?;
         let record = match cache.get_cc_preprocess_memo(memo_key) {
@@ -2701,46 +2728,73 @@ impl<'db> FileHasher<'db> {
             tracing::debug!("cc preprocess memo hash is invalid");
             return None;
         }
-        let fingerprints: Vec<FileFingerprint> = match serde_json::from_str(&record.1) {
-            Ok(fingerprints) => fingerprints,
+        let inputs: Vec<CcPreprocessMemoInput> = match serde_json::from_str(&record.1) {
+            Ok(inputs) => inputs,
             Err(error) => {
                 tracing::debug!("cc preprocess memo inputs are invalid: {error}");
                 return None;
             }
         };
-        if fingerprints.is_empty() {
+        if inputs.is_empty() {
             return None;
         }
-        for expected in &fingerprints {
-            let current = match FileFingerprint::from_path(Path::new(&expected.path)) {
-                Ok(current) => current,
-                Err(error) => {
-                    tracing::debug!(
-                        "cc preprocess memo input {} is unavailable: {error}",
-                        expected.path
-                    );
-                    return None;
-                }
-            };
-            self.note_too_new(&current);
-            if current != *expected || self.too_new() {
+        for expected in &inputs {
+            if !self.memo_input_is_unchanged(expected) {
                 return None;
             }
         }
         Some(record.0)
     }
 
-    /// Capture the source/header metadata observed immediately after a full
-    /// preprocess probe. The caller revalidates this snapshot after a
-    /// successful compile or restore before committing it.
+    /// Does this input still hold the bytes the memo was recorded against?
+    ///
+    /// Identical metadata answers yes without a read. Otherwise the file is
+    /// hashed through the ordinary content cache, so a header shared by many
+    /// translation units is read once per build rather than once per unit.
+    fn memo_input_is_unchanged(&self, expected: &CcPreprocessMemoInput) -> bool {
+        let path = Path::new(&expected.fingerprint.path);
+        match FileFingerprint::from_path(path) {
+            Ok(current) => {
+                self.note_too_new(&current);
+                if current == expected.fingerprint {
+                    return true;
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "cc preprocess memo input {} is unavailable: {error}",
+                    expected.fingerprint.path
+                );
+                return false;
+            }
+        }
+        match self.hash(path) {
+            Ok(content) => content == expected.content,
+            Err(error) => {
+                tracing::debug!(
+                    "cc preprocess memo input {} could not be hashed: {error}",
+                    expected.fingerprint.path
+                );
+                false
+            }
+        }
+    }
+
+    /// Capture the source/header metadata and contents observed immediately
+    /// after a full preprocess probe. The caller revalidates this snapshot
+    /// after a successful compile or restore before committing it.
+    ///
+    /// Hashing here is what the memo is validated against later. It is not
+    /// free on a cold build, but every hash goes through the content cache,
+    /// so a header included by many translation units is read once.
     pub(crate) fn cc_preprocess_fingerprints(
         &self,
         paths: &[PathBuf],
-    ) -> Option<Vec<FileFingerprint>> {
+    ) -> Option<Vec<CcPreprocessMemoInput>> {
         if paths.is_empty() {
             return None;
         }
-        let mut fingerprints = Vec::with_capacity(paths.len());
+        let mut inputs = Vec::with_capacity(paths.len());
         for path in paths {
             let fingerprint = match FileFingerprint::from_path(path) {
                 Ok(fingerprint) => fingerprint,
@@ -2753,37 +2807,53 @@ impl<'db> FileHasher<'db> {
                 }
             };
             self.note_too_new(&fingerprint);
-            fingerprints.push(fingerprint);
+            let content = match self.hash(path) {
+                Ok(content) => content,
+                Err(error) => {
+                    tracing::debug!(
+                        "cc preprocess memo input {} could not be hashed: {error}",
+                        path.display()
+                    );
+                    return None;
+                }
+            };
+            inputs.push(CcPreprocessMemoInput {
+                fingerprint,
+                content,
+            });
         }
-        fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
-        fingerprints.dedup_by(|a, b| a.path == b.path);
-        Some(fingerprints)
+        inputs.sort_by(|a, b| a.fingerprint.path.cmp(&b.fingerprint.path));
+        inputs.dedup_by(|a, b| a.fingerprint.path == b.fingerprint.path);
+        Some(inputs)
     }
 
-    /// Commit a pending preprocessor memo after proving its inputs remained
-    /// unchanged through the successful compiler/restore boundary.
+    /// Commit a pending preprocessor memo after proving its inputs held the
+    /// same bytes through the successful compiler/restore boundary.
+    ///
+    /// An input written during this build no longer blocks the record. What
+    /// it was blocking is a torn read, and a torn read is caught where it
+    /// matters: the recorded hash is of whatever bytes were there, so the
+    /// finished file simply fails the next comparison and the expansion is
+    /// recomputed. Refusing to record instead meant a fresh checkout — every
+    /// CI runner, every new worktree — could never memoise anything at all.
     pub(crate) fn cc_preprocess_memo_record_if_unchanged(
         &self,
         memo_key: &str,
         preprocessed_hash: &str,
-        fingerprints: &[FileFingerprint],
+        inputs: &[CcPreprocessMemoInput],
     ) {
         let Some(cache) = &self.cache else {
             return;
         };
-        if fingerprints.is_empty() {
+        if inputs.is_empty() {
             return;
         }
-        for expected in fingerprints {
-            let Ok(current) = FileFingerprint::from_path(Path::new(&expected.path)) else {
-                return;
-            };
-            self.note_too_new(&current);
-            if current != *expected || self.too_new() {
+        for expected in inputs {
+            if !self.memo_input_is_unchanged(expected) {
                 return;
             }
         }
-        let inputs_json = match serde_json::to_string(fingerprints) {
+        let inputs_json = match serde_json::to_string(inputs) {
             Ok(inputs_json) => inputs_json,
             Err(error) => {
                 tracing::debug!("cc preprocess memo inputs could not be encoded: {error}");
@@ -8306,12 +8376,18 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert_eq!(hasher.cc_preprocess_memo_lookup("short-hash"), None);
         assert_eq!(hasher.cc_preprocess_memo_lookup("non-hex-hash"), None);
 
+        // An input written inside the invocation window is what a fresh
+        // checkout looks like. It used to refuse both halves of the memo,
+        // which meant CI could never memoise anything; the content hash makes
+        // the recency irrelevant.
         let mut fresh_hasher = FileHasher::persistent(&db);
-        fresh_hasher.arm_too_new_guard(1, 0);
+        fresh_hasher.arm_too_new_guard(i64::MAX, 0);
         assert_eq!(
-            fresh_hasher.cc_preprocess_memo_lookup("memo-key"),
-            None,
-            "an input too new for the invocation must force preprocessing"
+            fresh_hasher
+                .cc_preprocess_memo_lookup("memo-key")
+                .as_deref(),
+            Some(pp_hash.as_str()),
+            "unchanged bytes must hit however recently they were written"
         );
         fresh_hasher.cc_preprocess_memo_record_if_unchanged("too-new", &pp_hash, &inputs);
         assert!(
@@ -8321,8 +8397,8 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
                 .unwrap()
                 .get_cc_preprocess_memo("too-new")
                 .unwrap()
-                .is_none(),
-            "too-new inputs must not publish a memo"
+                .is_some(),
+            "a fresh checkout must still be able to publish a memo"
         );
 
         std::fs::write(&header, "#define VALUE 12345\n").unwrap();
@@ -8341,6 +8417,61 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
                 .unwrap()
                 .is_none(),
             "changed inputs must not publish a memo"
+        );
+    }
+
+    /// The case the memo exists for and used to miss: the same bytes at new
+    /// metadata. A second worktree gives every file a new inode and mtime,
+    /// and a build script that regenerates a header rewrites it identically.
+    /// Neither changes what the preprocessor would produce.
+    #[test]
+    fn cc_preprocess_memo_survives_new_metadata_for_unchanged_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let source = dir.path().join("source.c");
+        let header = dir.path().join("header.h");
+        let source_bytes = "#include \"header.h\"\nint v(void) { return VALUE; }\n";
+        let header_bytes = "#define VALUE 1\n";
+        std::fs::write(&source, source_bytes).unwrap();
+        std::fs::write(&header, header_bytes).unwrap();
+
+        let hasher = FileHasher::persistent(&db);
+        let inputs = hasher
+            .cc_preprocess_fingerprints(&[source.clone(), header.clone()])
+            .unwrap();
+        assert!(
+            inputs.iter().all(|input| input.content.len() == 64),
+            "every recorded input carries a content hash"
+        );
+        let pp_hash = "b".repeat(64);
+        hasher.cc_preprocess_memo_record_if_unchanged("memo-key", &pp_hash, &inputs);
+
+        // Rewrite both files with identical bytes. Remove first, so the
+        // replacement gets a new inode as well as a new mtime — the shape a
+        // second checkout produces.
+        for (path, bytes) in [(&source, source_bytes), (&header, header_bytes)] {
+            std::fs::remove_file(path).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let rewritten = FileFingerprint::from_path(&header).unwrap();
+        assert_ne!(
+            rewritten, inputs[0].fingerprint,
+            "the rewrite must actually change the metadata this test is about"
+        );
+
+        let reader = FileHasher::persistent(&db);
+        assert_eq!(
+            reader.cc_preprocess_memo_lookup("memo-key").as_deref(),
+            Some(pp_hash.as_str()),
+            "identical bytes at new metadata must reuse the expansion"
+        );
+
+        // One byte of difference is still a miss, whatever the metadata says.
+        std::fs::write(&header, "#define VALUE 2\n").unwrap();
+        assert_eq!(
+            FileHasher::persistent(&db).cc_preprocess_memo_lookup("memo-key"),
+            None,
+            "changed bytes must force a fresh preprocess"
         );
     }
 

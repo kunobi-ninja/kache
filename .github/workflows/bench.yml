@@ -41,7 +41,17 @@ on:
 
 concurrency:
   # One bench run per scenario+ref at a time; don't cancel a multi-hour run.
-  group: ${{ github.workflow }}-${{ github.ref }}
+  #
+  # The scenario is part of the key because that is what the sentence above
+  # says, and for a while it was not: the key was workflow+ref alone, so every
+  # scenario on a ref shared ONE slot. An 8-minute `hk` dispatch queued behind
+  # an 8-hour `firefox-pull`, which is the exact thing this block exists to
+  # prevent. Splitting the runner pool does not help - three runners are no use
+  # to a job Actions will not even assign.
+  #
+  # A scheduled run has no inputs and keys on 'all', so the nightly still
+  # serialises against another full sweep, which is what we want.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.scenario || 'all' }}
   cancel-in-progress: false
 
 permissions:

@@ -364,6 +364,21 @@ jobs:
           # `clone-ref` is a SIBLING of the work dir, so it needs its own rm.
           rm -rf tmp/perf-gate/base tmp/perf-gate/base-clone-ref
 
+      # The harness clones third-party subjects over https. Anonymous
+      # requests share this cluster's egress quota, and when it is exhausted
+      # GitHub answers 401, which git reports as "could not read Username"
+      # and the bench dies before it builds anything. Authenticating with the
+      # job's own read-only token moves those fetches onto the much larger
+      # per-token limit. Ephemeral pod, so the config dies with the job.
+      - name: Authenticate git for third-party clones
+        env:
+          GH_JOB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          header="$(printf 'x-access-token:%s' "$GH_JOB_TOKEN" | base64 -w0)"
+          git config --global --replace-all \
+            "http.https://github.com/.extraheader" "AUTHORIZATION: basic $header"
+
       - name: Benchmark the PR head
         timeout-minutes: 40
         env:

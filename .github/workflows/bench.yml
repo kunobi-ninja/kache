@@ -244,11 +244,55 @@ jobs:
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
-          # mr-boxington (mbx) is pinned to its latest release on purpose:
-          # the hk-mbx arm tracks that tool as it ships.
-          install_args: --force rust github:casey/just github:mozilla/sccache mr-boxington@latest
+          install_args: --force rust github:casey/just github:mozilla/sccache
           cache: false
           reshim: false
+
+      # The comparison tool for the `-mbx` arms, installed from its GitHub
+      # release rather than through the shared mise step: the pinned mise CLI
+      # is older than that tool's registry entry, and a tool the other arms do
+      # not use must never be able to fail their install step. Latest release
+      # on purpose — the arm tracks the tool as it ships — with the checksum
+      # verified and the version recorded in the log.
+      - name: Install mbx (comparison arms only)
+        if: endsWith(matrix.name, '-mbx')
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # curl, not `gh`: the ARC runner image ships no GitHub CLI.
+          # /releases/latest redirects to the tag, so the newest release is
+          # one HEAD request and needs no token or JSON parsing.
+          repo=https://github.com/jdx/mr-boxington
+          archive=mbx-x86_64-unknown-linux-gnu.tar.gz
+          dir="$RUNNER_TEMP/mbx"
+          mkdir -p "$dir"
+          tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$repo/releases/latest" | sed 's#.*/tag/##')"
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "::error::could not resolve the latest release tag (got '$tag')"; exit 1 ;;
+          esac
+          curl -fsSL -o "$dir/$archive" "$repo/releases/download/$tag/$archive"
+          curl -fsSL -o "$dir/SHA256SUMS" "$repo/releases/download/$tag/SHA256SUMS"
+          (cd "$dir" && grep "  $archive$" SHA256SUMS | sha256sum --check --strict -)
+          tar -xzf "$dir/$archive" -C "$dir"
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "mbx release $tag"
+          "$dir/mbx" --version
+
+      # The harness clones third-party subjects over https. Anonymous
+      # requests share this cluster's egress quota, and when it is exhausted
+      # GitHub answers 401, which git reports as "could not read Username"
+      # and the bench dies before it builds anything. Authenticating with the
+      # job's own read-only token moves those fetches onto the much larger
+      # per-token limit. Ephemeral pod, so the config dies with the job.
+      - name: Authenticate git for third-party clones
+        env:
+          GH_JOB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          header="$(printf 'x-access-token:%s' "$GH_JOB_TOKEN" | base64 -w0)"
+          git config --global --replace-all \
+            "http.https://github.com/.extraheader" "AUTHORIZATION: basic $header"
 
       # Fail fast on a full disk — disk-full mid-build is the worst failure mode
       # on the emptyDir-backed work volume.

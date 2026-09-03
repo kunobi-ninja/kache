@@ -1643,7 +1643,17 @@ fn preprocess_hash(
                 parse_preprocess_dependencies(&raw, &cwd)
             });
         match dependencies {
-            Ok(paths) => file_hasher.cc_preprocess_fingerprints(&paths),
+            Ok(paths) => {
+                // Record each input under its prefix-mapped spelling, the form
+                // the expansion above was hashed in. That is what lets another
+                // checkout read the memo: the path a second worktree resolves
+                // an input to differs, the mapped name does not.
+                let mapped: Vec<(String, PathBuf)> = paths
+                    .into_iter()
+                    .map(|path| (cc_mapped_path(&path, prefix_maps), path))
+                    .collect();
+                file_hasher.cc_preprocess_fingerprints(&mapped)
+            }
             Err(error) => {
                 tracing::debug!("cc preprocess dependency capture unavailable: {error:#}");
                 None
@@ -3894,7 +3904,7 @@ fn cc_preprocess_memo_key(
     let compiler_path = super::resolve_program_on_path(&parsed.program)?;
     let compiler_metadata = std::fs::metadata(&compiler_path).ok()?;
     let mut hasher = blake3::Hasher::new();
-    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v2");
+    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v3");
     fold_cc_memo_field(
         &mut hasher,
         b"compiler-program",
@@ -3930,21 +3940,30 @@ fn cc_preprocess_memo_key(
         b"compiler-version",
         compiler_version.as_bytes(),
     );
+    // The mapped cwd, not the raw one: two checkouts of the same tree differ
+    // here and nowhere the expansion can see, so folding the raw path gave
+    // every worktree its own memo.
     fold_cc_memo_field(
         &mut hasher,
         b"cwd",
-        cc_memo_os_bytes(cwd.as_os_str()).as_slice(),
+        cc_mapped_path(&cwd, prefix_maps).as_bytes(),
     );
     fold_cc_memo_field(
         &mut hasher,
         b"source-date-epoch",
         cc_memo_os_bytes(&epoch).as_slice(),
     );
+    // Likewise the argv: `-I` and the source path carry the checkout root.
+    // The maps are folded below, so two trees agree here only when they agree
+    // about what the mapping means.
     for arg in build_preprocess_args(parsed) {
-        fold_cc_memo_field(&mut hasher, b"arg", arg.as_bytes());
+        let mapped = apply_cc_prefix_maps_to_bytes(arg.into_bytes(), prefix_maps);
+        fold_cc_memo_field(&mut hasher, b"arg", &mapped);
     }
+    // Targets only. The sources are the per-checkout roots this whole change
+    // exists to keep out; the targets are the sentinels both trees share, and
+    // they are what decides whether two mappings mean the same thing.
     for map in prefix_maps {
-        fold_cc_memo_field(&mut hasher, b"prefix-from", map.from.as_bytes());
         fold_cc_memo_field(&mut hasher, b"prefix-to", map.to.as_bytes());
     }
 
@@ -4167,6 +4186,51 @@ fn common_is_temp_dir(common: &Path) -> bool {
 /// compiler's single-application `-ffile-prefix-map`. Single-pass matches the
 /// compiler's semantics and is identical to the old behavior for the normal case
 /// of non-overlapping absolute source prefixes.
+/// One path in the spelling the prefix maps give it, lossily for non-UTF-8.
+///
+/// The same rewrite the expansion and the resolved tokens already get, so a
+/// path recorded here reads the same from any checkout the maps cover.
+fn cc_mapped_path(path: &Path, prefix_maps: &[CcPrefixMap]) -> String {
+    // Text, not `cc_memo_os_bytes`: that encodes UTF-16 on Windows, and the
+    // map sources and targets are UTF-8, so nothing would ever match and
+    // every Windows memo missed. The maps are applied to argv strings the
+    // same way.
+    let text = path.to_string_lossy().into_owned().into_bytes();
+    String::from_utf8_lossy(&apply_cc_prefix_maps_to_bytes(text, prefix_maps)).into_owned()
+}
+
+/// Candidate real paths a mapped spelling could name in this invocation.
+///
+/// The inverse of [`cc_mapped_path`], and inexact by nature: two roots can
+/// share one sentinel, so this yields every prefix that could have produced
+/// the recorded name, most specific first. Picking wrong is not a
+/// correctness problem — the caller compares contents, so a candidate whose
+/// bytes differ is a miss and the expansion is recomputed. A mapped path
+/// with no matching sentinel yields nothing and the memo is skipped.
+fn cc_unmapped_path_candidates(mapped: &str, prefix_maps: &[CcPrefixMap]) -> Vec<PathBuf> {
+    let mut maps: Vec<&CcPrefixMap> = prefix_maps
+        .iter()
+        .filter(|map| !map.from.is_empty() && !map.to.is_empty())
+        .collect();
+    maps.sort_by_key(|map| std::cmp::Reverse(map.to.len()));
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for map in maps {
+        if let Some(rest) = mapped.strip_prefix(map.to.as_str()) {
+            let candidate = PathBuf::from(format!("{}{rest}", map.from));
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    // An absolute path outside every mapped root (a system header, the
+    // toolchain) was recorded verbatim and needs no inverse.
+    if candidates.is_empty() && Path::new(mapped).is_absolute() {
+        candidates.push(PathBuf::from(mapped));
+    }
+    candidates
+}
+
 fn apply_cc_prefix_maps_to_bytes(bytes: Vec<u8>, prefix_maps: &[CcPrefixMap]) -> Vec<u8> {
     // Most-specific (longest source) first so it wins at any position where two
     // sources overlap. (`cc_prefix_maps` already sorts this way; re-sort here so
@@ -5207,10 +5271,11 @@ impl Compiler for CcCompiler {
             .supports_cc_preprocess_memo()
             .then(|| cc_preprocess_memo_key(parsed, &prefix_maps, &resolved.version_line))
             .flatten();
-        let pp_hash = if let Some(memo_hash) = memo_key
-            .as_ref()
-            .and_then(|key| ctx.file_hasher.cc_preprocess_memo_lookup(key))
-        {
+        let pp_hash = if let Some(memo_hash) = memo_key.as_ref().and_then(|key| {
+            ctx.file_hasher.cc_preprocess_memo_lookup(key, |name| {
+                cc_unmapped_path_candidates(name, &prefix_maps)
+            })
+        }) {
             tracing::trace!(
                 target: "kache::cache_key",
                 "[key:{}] preprocessed_memo=hit",
@@ -8926,6 +8991,115 @@ mod tests {
 
     /// A variable that cannot reach the preprocessor must not give every
     /// invocation its own memo, and one that can must still be keyed.
+    /// A recorded name has to come back as the path this checkout uses, and
+    /// the memo key must not move when only the checkout root does.
+    #[test]
+    fn cc_memo_paths_map_out_and_back_across_checkouts() {
+        let maps = vec![
+            CcPrefixMap {
+                from: "/work/clone-a".to_string(),
+                to: "/kache/root".to_string(),
+            },
+            CcPrefixMap {
+                from: "/work/clone-a/build".to_string(),
+                to: "/kache/build".to_string(),
+            },
+        ];
+        assert_eq!(
+            cc_mapped_path(Path::new("/work/clone-a/src/a.h"), &maps),
+            "/kache/root/src/a.h"
+        );
+        // The longer source wins, as it does for the expansion.
+        assert_eq!(
+            cc_mapped_path(Path::new("/work/clone-a/build/gen.h"), &maps),
+            "/kache/build/gen.h"
+        );
+
+        let other = vec![
+            CcPrefixMap {
+                from: "/work/clone-b".to_string(),
+                to: "/kache/root".to_string(),
+            },
+            CcPrefixMap {
+                from: "/work/clone-b/build".to_string(),
+                to: "/kache/build".to_string(),
+            },
+        ];
+        assert_eq!(
+            cc_unmapped_path_candidates("/kache/root/src/a.h", &other),
+            vec![PathBuf::from("/work/clone-b/src/a.h")],
+            "a name recorded in one checkout resolves into the other"
+        );
+        assert_eq!(
+            cc_unmapped_path_candidates("/kache/build/gen.h", &other),
+            vec![PathBuf::from("/work/clone-b/build/gen.h")]
+        );
+
+        // Two roots behind one sentinel: both are offered, most specific
+        // first, and the caller settles it by content.
+        let shared = vec![
+            CcPrefixMap {
+                from: "/work/one".to_string(),
+                to: "/kache/root".to_string(),
+            },
+            CcPrefixMap {
+                from: "/elsewhere/two".to_string(),
+                to: "/kache/root".to_string(),
+            },
+        ];
+        assert_eq!(
+            cc_unmapped_path_candidates("/kache/root/h.h", &shared),
+            vec![
+                PathBuf::from("/work/one/h.h"),
+                PathBuf::from("/elsewhere/two/h.h")
+            ]
+        );
+
+        // An unmapped absolute path is its own answer; a relative name that
+        // matches no sentinel has none. Absoluteness is what the host says it
+        // is, so the path has to be spelled for the host.
+        let system_header = if cfg!(windows) {
+            r"C:\Program Files\sdk\stdio.h"
+        } else {
+            "/usr/include/stdio.h"
+        };
+        assert!(Path::new(system_header).is_absolute());
+        assert_eq!(
+            cc_unmapped_path_candidates(system_header, &other),
+            vec![PathBuf::from(system_header)]
+        );
+        assert!(cc_unmapped_path_candidates("relative/h.h", &other).is_empty());
+
+        // A half-empty map contributes nothing. Either side empty and the
+        // inverse is meaningless: an empty target matches every name and
+        // would graft the source onto all of them, an empty source would
+        // strip the name down to a relative path. Both must be dropped, so
+        // the filter needs both conditions.
+        let half_empty = vec![
+            CcPrefixMap {
+                from: "/work/one".to_string(),
+                to: String::new(),
+            },
+            CcPrefixMap {
+                from: String::new(),
+                to: "/kache/root".to_string(),
+            },
+        ];
+        // Neither half-empty map may contribute. The sentinel spelling is not
+        // absolute on Windows, so assert the shared property: no candidate
+        // ever comes from a map with an empty side.
+        assert!(
+            !cc_unmapped_path_candidates("/kache/root/h.h", &half_empty)
+                .iter()
+                .any(|candidate| candidate.starts_with("/work/one")),
+            "an empty target must not graft its source onto every name"
+        );
+        assert!(
+            cc_unmapped_path_candidates("relative/h.h", &half_empty).is_empty(),
+            "an empty source must not strip a name down to a relative path"
+        );
+    }
+
     #[test]
     fn cc_preprocess_memo_key_ignores_only_volatile_environment() {
         let _lock = crate::test_support::process_state_test_lock();

@@ -83,33 +83,33 @@ jobs:
           # node-backed, so the precheck also catches a too-small node).
           #
           # Smaller than Firefox but still tens of minutes cold.
-          substrate='{"name":"substrate","cmd":"bench substrate","dir":"bench-substrate","timeout":180,"job_timeout":225,"min_free_gb":60}'
+          substrate='{"name":"substrate","cmd":"bench substrate","dir":"bench-substrate","timeout":180,"job_timeout":225,"min_free_gb":60,"runner":"kunobi-runners"}'
           # SurrealDB's `surreal` server binary at default features — a large
           # pure-Rust workspace whose default features also drag in native C/C++
           # deps (rocksdb, grpcio, quickjs) that build outside kache. Comparable
           # weight to substrate; same native-prereq set (already installed below).
-          surrealdb='{"name":"surrealdb","cmd":"bench surrealdb","dir":"bench-surrealdb","timeout":180,"job_timeout":225,"min_free_gb":80}'
+          surrealdb='{"name":"surrealdb","cmd":"bench surrealdb","dir":"bench-surrealdb","timeout":180,"job_timeout":225,"min_free_gb":80,"runner":"kunobi-runners"}'
           # Lance's `lance` crate at default features — a large pure-Rust
           # workspace (Arrow, DataFusion, object-store backends, prost codegen).
           # Needs protoc + openssl headers (already installed below). Lighter
           # than surrealdb: no rocksdb/grpcio/quickjs native compile.
-          lance='{"name":"lance","cmd":"bench lance","dir":"bench-lance","timeout":180,"job_timeout":225,"min_free_gb":60}'
+          lance='{"name":"lance","cmd":"bench lance","dir":"bench-lance","timeout":180,"job_timeout":225,"min_free_gb":60,"runner":"kunobi-runners"}'
           # OpenDAL core (apache/opendal `core/` workspace) with the portable
           # service-feature set — mid-size pure-Rust, lighter than surrealdb.
           # aws-lc-sys (rustls) compiles outside kache; cmake + a C compiler
           # are already in the apt step below.
-          opendal='{"name":"opendal","cmd":"bench opendal","dir":"bench-opendal","timeout":120,"job_timeout":165,"min_free_gb":40}'
+          opendal='{"name":"opendal","cmd":"bench opendal","dir":"bench-opendal","timeout":120,"job_timeout":165,"min_free_gb":40,"runner":"kunobi-runners-small"}'
           # Full cold Firefox build is the long pole — hours. `bench firefox`
           # resolves to the exact `bench-firefox` scenario: `--profile firefox`
           # is a name SUBSTRING match that also catches `bench-firefox-windows`,
           # but discovery prefers the exact-name hit (#458), so no `os:` tag is
           # needed to pin this host-native arm. (The Windows variant runs in its
           # own job below, on the self-hosted Windows runner.)
-          firefox='{"name":"firefox","cmd":"bench firefox","dir":"bench-firefox","timeout":360,"job_timeout":405,"min_free_gb":120}'
+          firefox='{"name":"firefox","cmd":"bench firefox","dir":"bench-firefox","timeout":360,"job_timeout":405,"min_free_gb":120,"runner":"kunobi-runners"}'
           # Same Firefox shape through sccache for a side-by-side comparison.
-          firefox_sccache='{"name":"firefox-sccache","cmd":"bench-sccache firefox","dir":"bench-firefox-sccache","timeout":360,"job_timeout":405,"min_free_gb":120}'
+          firefox_sccache='{"name":"firefox-sccache","cmd":"bench-sccache firefox","dir":"bench-firefox-sccache","timeout":360,"job_timeout":405,"min_free_gb":120,"runner":"kunobi-runners"}'
           # Almost-pure C/C++ CMake build (X86-only Release) — lighter than Firefox.
-          llvm='{"name":"llvm","cmd":"bench llvm","dir":"bench-llvm","timeout":240,"job_timeout":285,"min_free_gb":100}'
+          llvm='{"name":"llvm","cmd":"bench llvm","dir":"bench-llvm","timeout":240,"job_timeout":285,"min_free_gb":100,"runner":"kunobi-runners"}'
           # Daily-pull (TEMPORAL axis, #477): one clone, build ref A then rebuild
           # ref B in the SAME worktree — two full sequential Firefox builds, so a
           # longer timeout than `firefox`. Only ONE worktree (no cross-clone
@@ -118,20 +118,20 @@ jobs:
           # scenario (substring also catches `bench-firefox-pull-windows`, but
           # discovery prefers the exact-name hit). The Windows variant runs in its
           # own job below, on the self-hosted Windows runner.
-          firefox_pull='{"name":"firefox-pull","cmd":"bench firefox-pull","dir":"bench-firefox-pull","timeout":480,"job_timeout":525,"min_free_gb":120}'
+          firefox_pull='{"name":"firefox-pull","cmd":"bench firefox-pull","dir":"bench-firefox-pull","timeout":480,"job_timeout":525,"min_free_gb":120,"runner":"kunobi-runners"}'
           # hk (jdx/hk): a mid-size Rust CLI whose build scripts compile ~750
           # C/asm objects through cc-rs (aws-lc-sys, vendored libgit2), wired
           # the way `kache init` does it so both compiler families are measured.
           # `--warm-same-tree` adds the same-path warm phase between cold and the
           # cross-clone warm. Minutes, not hours; a C compiler is all it needs.
-          hk='{"name":"hk","cmd":"bench hk --warm-same-tree","dir":"bench-hk","timeout":60,"job_timeout":90,"min_free_gb":30}'
+          hk='{"name":"hk","cmd":"bench hk --warm-same-tree","dir":"bench-hk","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners-small"}'
           # Same subject on the temporal axis: cold at the parent commit, then
           # rebuild the child in the same worktree with the store warm.
-          hk_pull='{"name":"hk-pull","cmd":"bench hk-pull","dir":"bench-hk-pull","timeout":60,"job_timeout":90,"min_free_gb":30}'
+          hk_pull='{"name":"hk-pull","cmd":"bench hk-pull","dir":"bench-hk-pull","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners-small"}'
           # The same hk shape through mbx, for a side-by-side comparison
           # (as firefox-sccache is for firefox). mbx comes from mise at its
           # latest release; the run records the version it measured.
-          hk_mbx='{"name":"hk-mbx","cmd":"bench-mbx hk","dir":"bench-hk-mbx","timeout":60,"job_timeout":90,"min_free_gb":30}'
+          hk_mbx='{"name":"hk-mbx","cmd":"bench-mbx hk","dir":"bench-hk-mbx","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners-small"}'
           case "$SCENARIO" in
             substrate)            inc="[$substrate]" ;;
             surrealdb)            inc="[$surrealdb]" ;;
@@ -167,7 +167,11 @@ jobs:
     if: needs.plan.outputs.has_linux == 'true'
     # gha-runner-scale-set: match by the scale-set's installation name (single
     # label), not a `[self-hosted, …]` set. See header comment.
-    runs-on: kunobi-runners
+    #
+    # Which pool is per arm, from the disk floor beside it in the matrix: an
+    # arm that fits the light pool's reservation runs there, several at a
+    # time, and the heavy ones keep the reserved node and its 120 GB floor.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       # Arms run concurrently (up to the kunobi-runners scale-set's maxRunners).

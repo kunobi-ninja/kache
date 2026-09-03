@@ -15,6 +15,7 @@ use crate::cli;
 use crate::config::Config;
 use crate::daemon;
 use crate::events::{self, BuildEvent, EventRecord, EventResult, EventTailer, HeartbeatEvent};
+use crate::since::SinceWindow;
 
 // ── Terminal mode guard ────────────────────────────────────────────────────
 
@@ -419,21 +420,21 @@ const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 // ── Entry point ────────────────────────────────────────────────────────────
 
 /// Run the TUI monitor dashboard.
-pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
+pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
     let _terminal_mode = TerminalModeGuard::enter()?;
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let tailer = if since_hours.is_some() {
+    let tailer = if since.is_some() {
         EventTailer::from_start(config.event_log_path())
     } else {
         EventTailer::new(config.event_log_path())
     };
 
-    let initial_events = if let Some(hours) = since_hours {
-        let since = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
-        events::read_events_since(&config.event_log_path(), since).unwrap_or_default()
+    let initial_events = if let Some(window) = since {
+        let cutoff = window.cutoff(chrono::Utc::now());
+        events::read_events_since(&config.event_log_path(), cutoff).unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -580,8 +581,14 @@ pub fn run_monitor(config: &Config, since_hours: Option<u64>) -> Result<()> {
             std::thread::spawn(move || {
                 // Auto-start stays silent here: the raw-mode alternate screen
                 // owns the terminal, so a stderr notice would corrupt it.
-                let snap =
-                    cli::fetch_stats_snapshot(&cfg, include_entries, &sort, Some(24), false, false);
+                let snap = cli::fetch_stats_snapshot(
+                    &cfg,
+                    include_entries,
+                    &sort,
+                    SinceWindow::DEFAULT,
+                    false,
+                    false,
+                );
                 if let Ok(mut s) = slot.lock() {
                     *s = Some(snap);
                 }

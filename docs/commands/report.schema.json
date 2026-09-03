@@ -42,7 +42,16 @@
         "since_hours": {
           "type": "integer",
           "minimum": 0,
-          "description": "Lookback window duration in hours."
+          "description": "Lookback window in whole hours, rounded down (0 for a sub-hour window). Kept for consumers that predate since_secs."
+        },
+        "since_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Lookback window in seconds. Authoritative; since_hours is derived from it."
+        },
+        "since": {
+          "type": "string",
+          "description": "Lookback window as requested on the command line, e.g. 15m, 2h, 24h. Absent in reports written before this field existed."
         },
         "root_filter": {
           "type": ["string", "null"],

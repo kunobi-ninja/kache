@@ -366,6 +366,33 @@ fn stats_on_empty_cache_succeeds() {
     e.cmd().args(["stats", "--since", "1h"]).assert().success();
 }
 
+/// #897: a sub-hour window is accepted and named as requested, and a value
+/// that does not parse is an error rather than a silent 24h fallback.
+#[test]
+fn stats_and_report_label_the_requested_window() {
+    let e = env();
+    e.cmd()
+        .args(["stats", "--since", "15m"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("last 15m)"));
+    e.cmd()
+        .args(["report", "--format", "text", "--since", "90m"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("kache build report (last 90m)"));
+    e.cmd()
+        .args(["stats", "--since", "soon"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invalid --since \"soon\""));
+    e.cmd()
+        .args(["report", "--since", "1.5h"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("invalid --since"));
+}
+
 /// #689 end-to-end: `stats` announces a daemon auto-start on stderr, and a
 /// later invocation pointing `KACHE_CONFIG` at a different file still renders
 /// the daemon's values — now with a warning naming both values and both

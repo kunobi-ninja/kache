@@ -806,10 +806,30 @@ pub struct StatsRequest {
     #[serde(default)]
     pub include_summaries: bool,
     pub sort_by: Option<String>,
+    /// Event window in whole hours. Older clients send only this; newer ones
+    /// send it rounded up beside `event_secs` so an older daemon still
+    /// answers with a superset of the requested window.
     pub event_hours: Option<u64>,
+    /// Event window in seconds (kunobi-ninja/kache#897). Wins over
+    /// `event_hours` when present, so `--since 15m` is a 15 minute window.
+    #[serde(default)]
+    pub event_secs: Option<u64>,
     /// Client binary mtime — lets the daemon detect when it's running stale code.
     #[serde(default)]
     pub client_epoch: u64,
+}
+
+impl StatsRequest {
+    /// The event window this request asks for: `event_secs` from a current
+    /// client, else `event_hours` from an older one, else the 24h default.
+    pub(crate) fn window(&self) -> crate::since::SinceWindow {
+        use crate::since::SinceWindow;
+        match (self.event_secs, self.event_hours) {
+            (Some(secs), _) => SinceWindow::from_secs(secs),
+            (None, Some(hours)) => SinceWindow::from_hours(hours).unwrap_or(SinceWindow::DEFAULT),
+            (None, None) => SinceWindow::DEFAULT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2776,8 +2796,7 @@ impl Daemon {
             Err(e) => return Response::err(format!("store open failed: {e}")),
         };
 
-        let hours = req.event_hours.unwrap_or(24);
-        let since = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+        let since = req.window().cutoff(chrono::Utc::now());
         let event_list =
             events::read_events_since(&self.config.event_log_path(), since).unwrap_or_default();
         let es = events::compute_stats(&event_list);
@@ -7749,9 +7768,9 @@ pub fn send_stats_request(
     config: &Config,
     include_entries: bool,
     sort_by: Option<&str>,
-    event_hours: Option<u64>,
+    window: Option<crate::since::SinceWindow>,
 ) -> Result<StatsResponse> {
-    send_stats_request_options(config, include_entries, false, sort_by, event_hours)
+    send_stats_request_options(config, include_entries, false, sort_by, window)
 }
 
 /// Read the daemon's stats without starting or waiting for a replacement.
@@ -7784,7 +7803,7 @@ pub(crate) fn send_stats_request_options(
     include_entries: bool,
     include_summaries: bool,
     sort_by: Option<&str>,
-    event_hours: Option<u64>,
+    window: Option<crate::since::SinceWindow>,
 ) -> Result<StatsResponse> {
     let client_epoch = build_epoch();
     let stats = fetch_stats(
@@ -7792,7 +7811,7 @@ pub(crate) fn send_stats_request_options(
         include_entries,
         include_summaries,
         sort_by,
-        event_hours,
+        window,
         STATS_READ_TIMEOUT,
     )?;
 
@@ -7808,7 +7827,7 @@ pub(crate) fn send_stats_request_options(
                 include_entries,
                 include_summaries,
                 sort_by,
-                event_hours,
+                window,
                 STATS_REFETCH_TIMEOUT,
             )
         {
@@ -7825,14 +7844,17 @@ fn fetch_stats(
     include_entries: bool,
     include_summaries: bool,
     sort_by: Option<&str>,
-    event_hours: Option<u64>,
+    window: Option<crate::since::SinceWindow>,
     read_timeout: Duration,
 ) -> Result<StatsResponse> {
     let req = Request::Stats(StatsRequest {
         include_entries,
         include_summaries,
         sort_by: sort_by.map(String::from),
-        event_hours,
+        // Rounded up, not down: a daemon that predates `event_secs` should
+        // answer with a superset of a sub-hour window rather than nothing.
+        event_hours: window.map(|w| w.secs().div_ceil(3600)),
+        event_secs: window.map(crate::since::SinceWindow::secs),
         client_epoch: build_epoch(),
     });
 
@@ -8407,6 +8429,7 @@ pub fn start_daemon_background() -> Result<bool> {
                     include_summaries: false,
                     sort_by: None,
                     event_hours: None,
+                    event_secs: None,
                     client_epoch: my_epoch,
                 }),
                 Duration::from_secs(2),
@@ -9890,6 +9913,7 @@ mod tests {
             include_summaries: false,
             sort_by: None,
             event_hours: None,
+            event_secs: None,
             client_epoch: 0,
         });
         let client_socket_path = socket_path.clone();
@@ -11894,6 +11918,7 @@ mod tests {
             include_summaries: true,
             sort_by: Some("size".into()),
             event_hours: Some(48),
+            event_secs: None,
             client_epoch: 0,
         });
         let json = serde_json::to_string(&req).unwrap();
@@ -12090,6 +12115,70 @@ mod tests {
         );
     }
 
+    /// #897: a current client sends the window in seconds beside the rounded
+    /// hours it sends for older daemons. The daemon must filter on the
+    /// seconds, otherwise `--since 15m` silently becomes a 1h window.
+    #[test]
+    fn handle_stats_filters_on_event_secs_over_event_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let now = chrono::Utc::now();
+        let mut recent = events::BuildEvent::new_for_test("serde", events::EventResult::LocalHit);
+        recent.ts = now - chrono::Duration::minutes(10);
+        let mut old = events::BuildEvent::new_for_test("tokio", events::EventResult::Miss);
+        old.ts = now - chrono::Duration::minutes(40);
+        events::log_event(&config.event_log_path(), &recent).unwrap();
+        events::log_event(&config.event_log_path(), &old).unwrap();
+        let daemon = Daemon::new(config);
+
+        let request = |event_hours: Option<u64>, event_secs: Option<u64>| StatsRequest {
+            include_entries: false,
+            include_summaries: false,
+            sort_by: None,
+            event_hours,
+            event_secs,
+            client_epoch: 0,
+        };
+
+        let narrow = daemon
+            .handle_stats(&request(Some(1), Some(900)))
+            .stats
+            .unwrap();
+        assert_eq!(narrow.events.local_hits, 1);
+        assert_eq!(narrow.events.misses, 0, "40 minutes ago is outside 15m");
+
+        let legacy = daemon.handle_stats(&request(Some(1), None)).stats.unwrap();
+        assert_eq!(legacy.events.local_hits, 1);
+        assert_eq!(
+            legacy.events.misses, 1,
+            "an older client's hours still apply"
+        );
+
+        let default = daemon.handle_stats(&request(None, None)).stats.unwrap();
+        assert_eq!(default.events.misses, 1, "no window at all means 24h");
+    }
+
+    #[test]
+    fn stats_request_window_prefers_secs_then_hours_then_default() {
+        use crate::since::SinceWindow;
+        let request = |event_hours: Option<u64>, event_secs: Option<u64>| StatsRequest {
+            include_entries: false,
+            include_summaries: false,
+            sort_by: None,
+            event_hours,
+            event_secs,
+            client_epoch: 0,
+        };
+        assert_eq!(request(Some(24), Some(900)).window().secs(), 900);
+        assert_eq!(request(Some(2), None).window().secs(), 7200);
+        assert_eq!(request(None, None).window(), SinceWindow::DEFAULT);
+        assert_eq!(
+            request(Some(u64::MAX), None).window(),
+            SinceWindow::DEFAULT,
+            "an overflowing hour count falls back rather than wrapping"
+        );
+    }
+
     #[test]
     fn test_handle_stats_empty_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -12111,6 +12200,7 @@ mod tests {
             include_summaries: false,
             sort_by: None,
             event_hours: Some(24),
+            event_secs: None,
             client_epoch: 0,
         });
         assert!(resp.ok);
@@ -12148,6 +12238,7 @@ mod tests {
             include_summaries: true,
             sort_by: None,
             event_hours: Some(24),
+            event_secs: None,
             client_epoch: 0,
         });
         let ids = with_summaries
@@ -12347,6 +12438,7 @@ mod tests {
             include_summaries: false,
             sort_by: Some("size".into()),
             event_hours: Some(24),
+            event_secs: None,
             client_epoch: 0,
         });
         assert!(resp.ok);
@@ -12370,6 +12462,7 @@ mod tests {
             include_summaries: false,
             sort_by: None,
             event_hours: None,
+            event_secs: None,
             client_epoch: 0,
         });
         let resp = daemon.handle_request_sync(&req);
@@ -12403,6 +12496,7 @@ mod tests {
                 include_summaries: false,
                 sort_by: Some("size".into()),
                 event_hours: Some(24),
+                event_secs: None,
                 client_epoch: 0,
             }),
         )
@@ -12882,6 +12976,7 @@ mod tests {
                 include_summaries: false,
                 sort_by: Some("size".into()),
                 event_hours: Some(24),
+                event_secs: None,
                 client_epoch: 0,
             }),
         )
@@ -12919,7 +13014,12 @@ mod tests {
         // send_stats_request is a blocking sync client; run it off the runtime.
         let cfg = config.clone();
         let stats = tokio::task::spawn_blocking(move || {
-            send_stats_request(&cfg, true, Some("size"), Some(24))
+            send_stats_request(
+                &cfg,
+                true,
+                Some("size"),
+                Some(crate::since::SinceWindow::DEFAULT),
+            )
         })
         .await
         .unwrap()
@@ -12976,6 +13076,7 @@ mod tests {
             include_summaries: false,
             sort_by: None,
             event_hours: None,
+            event_secs: None,
             client_epoch: build_epoch(),
         });
         let mut response_value = serde_json::to_value(response).unwrap();

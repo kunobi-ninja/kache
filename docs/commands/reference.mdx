@@ -179,16 +179,19 @@ kache monitor
 kache monitor --since 7d
 ```
 
+`--since` takes the same forms as `kache stats`.
+
 See [Monitor](/docs/monitor).
 
 ## `kache stats`
 
 ```bash
 kache stats
-kache stats --since 1h
+kache stats --since 15m
+kache stats --since 2h
 ```
 
-The default window is 24 hours.
+`--since` accepts `s`, `m`, `h`, and `d` units (`90s`, `15m`, `2h`, `7d`). A bare number is hours. The default is `24h`. The counters and the `last ...` label both describe the requested window; a value that does not parse is an error.
 
 ## `kache telemetry`
 
@@ -219,7 +222,7 @@ kache report --format trace --output trace.json
 | Flag | Default | Values or purpose |
 | --- | --- | --- |
 | `--format` | `text` | `json`, `trace`, `perfetto`, `chrome-trace`, `markdown`, `github`, `text` |
-| `--since` | `24h` | Event window |
+| `--since` | `24h` | Event window; same forms as `kache stats` (`15m`, `2h`, `7d`, bare hours) |
 | `--root` | all roots | Include events from one build tree |
 | `--output`, `-o` | stdout | Write to a file |
 | `--top` | `10` | Number of ranked entries |

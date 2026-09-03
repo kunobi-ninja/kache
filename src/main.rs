@@ -42,6 +42,7 @@ mod report;
 mod scheduler;
 mod service;
 mod shards;
+mod since;
 // Both callers (`clean`'s classifier and `compute_link_stats`) are `cfg(unix)`,
 // because `nlink` is the signal they combine with. Windows ReFS block-cloning
 // has no read-side query to implement this against — `FSCTL_DUPLICATE_EXTENTS`
@@ -265,14 +266,15 @@ enum Commands {
 
     /// Live TUI dashboard for monitoring builds
     Monitor {
-        /// Show events from the last N hours
+        /// Preload events from this window (e.g. 15m, 2h, 7d; a bare number
+        /// is hours)
         #[arg(long)]
         since: Option<String>,
     },
 
     /// Show cache stats summary (non-interactive)
     Stats {
-        /// Show events from the last N hours (e.g. 24h, 1h, 7d)
+        /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
         #[arg(long, default_value = "24h")]
         since: String,
     },
@@ -295,7 +297,7 @@ enum Commands {
         #[arg(long, default_value = "text")]
         format: String,
 
-        /// Time window (e.g. 24h, 7d, 1h)
+        /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
         #[arg(long, default_value = "24h")]
         since: String,
 
@@ -779,12 +781,12 @@ fn main() -> Result<()> {
             output,
             top,
         }) => {
-            let hours = parse_duration_hours(&since).unwrap_or(24);
-            cli::report(&config, &format, hours, root, output, top)
+            let window = parse_since_window(&since)?;
+            cli::report(&config, &format, window, root, output, top)
         }
         Some(Commands::Stats { since }) => {
-            let hours = parse_duration_hours(&since);
-            cli::stats(&config, &config_provenance, hours, json)
+            let window = parse_since_window(&since)?;
+            cli::stats(&config, &config_provenance, window, json)
         }
         Some(Commands::Telemetry {
             command:
@@ -804,8 +806,8 @@ fn main() -> Result<()> {
                 "monitor",
                 "`kache stats --json`",
             )?;
-            let hours = since.as_deref().and_then(parse_duration_hours);
-            tui::run_monitor(&config, hours)
+            let window = since.as_deref().map(parse_since_window).transpose()?;
+            tui::run_monitor(&config, window)
         }
         #[cfg(unix)]
         Some(Commands::InstallShims {
@@ -1127,6 +1129,17 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     std::process::exit(exit_code);
 }
 
+/// Parse a `--since` value, or fail loudly. Falling back to the default on a
+/// value that did not parse is how `--since 15m` came to report a 24h window
+/// labelled as such (kunobi-ninja/kache#897).
+fn parse_since_window(value: &str) -> Result<since::SinceWindow> {
+    since::SinceWindow::parse(value).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid --since {value:?}; expected a duration like 15m, 2h, or 7d (a bare number is hours)"
+        )
+    })
+}
+
 /// Parse a duration string like "7d", "24h", "1h" into hours.
 fn parse_duration_hours(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -1172,6 +1185,16 @@ mod tests {
             }
             result => result,
         }
+    }
+
+    #[test]
+    fn parse_since_window_accepts_minutes_and_rejects_garbage() {
+        assert_eq!(parse_since_window("15m").unwrap().secs(), 900);
+        assert_eq!(parse_since_window("2h").unwrap().secs(), 7200);
+        assert_eq!(parse_since_window("24").unwrap().secs(), 86_400);
+        let err = parse_since_window("soon").unwrap_err().to_string();
+        assert!(err.contains("invalid --since \"soon\""), "{err}");
+        assert!(err.contains("15m"), "{err}");
     }
 
     #[test]

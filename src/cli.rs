@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::daemon;
 use crate::events;
+use crate::since::SinceWindow;
 use crate::store::{STAGING_SWEEP_GRACE, Store};
 
 // ── Stats snapshot (daemon-first, fallback to direct) ──────────────────────
@@ -144,18 +145,17 @@ pub(crate) fn fetch_stats_snapshot(
     config: &Config,
     include_entries: bool,
     sort_by: &str,
-    hours: Option<u64>,
+    window: SinceWindow,
     announce_auto_start: bool,
     include_summaries: bool,
 ) -> StatsSnapshot {
-    let event_hours = hours.or(Some(24));
     // Try daemon
     if let Ok(resp) = daemon::send_stats_request_options(
         config,
         include_entries,
         include_summaries,
         Some(sort_by),
-        event_hours,
+        Some(window),
     ) {
         return StatsSnapshot {
             total_size: resp.total_size,
@@ -206,7 +206,7 @@ pub(crate) fn fetch_stats_snapshot(
             include_entries,
             include_summaries,
             Some(sort_by),
-            event_hours,
+            Some(window),
         )
     {
         return StatsSnapshot {
@@ -245,13 +245,7 @@ pub(crate) fn fetch_stats_snapshot(
     }
 
     // Fallback: direct reads (no daemon reachable).
-    snapshot_from_direct_reads(
-        config,
-        include_entries,
-        sort_by,
-        event_hours,
-        include_summaries,
-    )
+    snapshot_from_direct_reads(config, include_entries, sort_by, window, include_summaries)
 }
 
 /// Build a [`StatsSnapshot`] by reading the store and event log directly, with no
@@ -261,7 +255,7 @@ pub(crate) fn snapshot_from_direct_reads(
     config: &Config,
     include_entries: bool,
     sort_by: &str,
-    event_hours: Option<u64>,
+    window: SinceWindow,
     include_summaries: bool,
 ) -> StatsSnapshot {
     let store = Store::open(config).ok();
@@ -296,8 +290,7 @@ pub(crate) fn snapshot_from_direct_reads(
         Vec::new()
     };
 
-    let h = event_hours.unwrap_or(24);
-    let since = chrono::Utc::now() - chrono::Duration::hours(h as i64);
+    let since = window.cutoff(chrono::Utc::now());
     let event_list = events::read_events_since(&config.event_log_path(), since).unwrap_or_default();
     let es = events::compute_stats(&event_list);
 
@@ -371,7 +364,13 @@ pub fn telemetry_write(
     scenario: Option<&str>,
     phase: Option<&str>,
 ) -> Result<()> {
-    let snap = match daemon::send_stats_request_options(config, false, false, None, Some(24)) {
+    let snap = match daemon::send_stats_request_options(
+        config,
+        false,
+        false,
+        None,
+        Some(SinceWindow::DEFAULT),
+    ) {
         Ok(resp) => StatsSnapshot {
             total_size: resp.total_size,
             max_size: resp.max_size,
@@ -405,7 +404,7 @@ pub fn telemetry_write(
             in_flight: resp.in_flight,
             daemon_effective_config: resp.effective_config,
         },
-        Err(_) => snapshot_from_direct_reads(config, false, "size", Some(24), false),
+        Err(_) => snapshot_from_direct_reads(config, false, "size", SinceWindow::DEFAULT, false),
     };
     crate::otel::write_otlp(
         dir,
@@ -482,11 +481,10 @@ fn cloned_targets_line(disk: &crate::machine::DiskView) -> Option<String> {
 pub fn stats(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
-    hours: Option<u64>,
+    window: SinceWindow,
     json: bool,
 ) -> Result<()> {
-    let hours = hours.unwrap_or(24);
-    let snap = fetch_stats_snapshot(config, false, "size", Some(hours), true, true);
+    let snap = fetch_stats_snapshot(config, false, "size", window, true, true);
 
     // #689: the numbers below are daemon-first, so before rendering them say
     // when the daemon's effective config disagrees with this invocation's —
@@ -517,7 +515,12 @@ pub fn stats(
             dups: usize,
             misses: usize,
             daemon_connected: bool,
+            /// Whole hours, rounded down (0 for a sub-hour window). Kept for
+            /// consumers that predate `since_secs`.
             hours: u64,
+            since_secs: u64,
+            /// The window as requested: `15m`, `2h`, `24h`.
+            since: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             remote: Option<&'a str>,
         }
@@ -535,14 +538,16 @@ pub fn stats(
                 dups: snap.event_stats.dups,
                 misses: snap.event_stats.misses,
                 daemon_connected: snap.daemon_connected,
-                hours,
+                hours: window.hours(),
+                since_secs: window.secs(),
+                since: window.label(),
                 remote: remote.as_deref(),
             },
             crate::machine::next_for_clones(disk.cloned_into_targets_bytes),
         );
     }
 
-    for line in render_stats(&snap, config, hours) {
+    for line in render_stats(&snap, config, window) {
         println!("{line}");
     }
     if let Some(line) = cloned_targets_line(&disk) {
@@ -583,7 +588,11 @@ pub fn stats(
 /// Render the `kache stats` summary lines from a fetched snapshot. Pure (no I/O)
 /// so the dedup / weighted-hit / miss-share / daemon / remote display branches
 /// are unit-testable from crafted snapshots without a daemon or store.
-pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) -> Vec<String> {
+pub(crate) fn render_stats(
+    snap: &StatsSnapshot,
+    config: &Config,
+    window: SinceWindow,
+) -> Vec<String> {
     let mut lines = Vec::new();
 
     // Store line
@@ -647,7 +656,7 @@ pub(crate) fn render_stats(snap: &StatsSnapshot, config: &Config, hours: u64) ->
         "n/a".to_string()
     };
     lines.push(format!(
-        "Time saved: {time_saved} (estimated compile work avoided, last {hours}h)"
+        "Time saved: {time_saved} (estimated compile work avoided, last {window})"
     ));
 
     // Daemon status
@@ -973,16 +982,16 @@ fn format_epoch_ms_utc(ms: u64) -> String {
 pub fn report(
     config: &Config,
     format: &str,
-    hours: u64,
+    window: SinceWindow,
     root: Option<std::path::PathBuf>,
     output: Option<std::path::PathBuf>,
     top: usize,
 ) -> Result<()> {
     let report = if root.is_some() {
         let filter = crate::report::ReportFilter { root };
-        crate::report::generate_report_with_filter(config, hours, top, &filter)?
+        crate::report::generate_report_with_filter(config, window, top, &filter)?
     } else {
-        crate::report::generate_report(config, hours, top)?
+        crate::report::generate_report(config, window, top)?
     };
 
     let text = match format {
@@ -8347,7 +8356,7 @@ mod tests {
             total_logical_size: 4096,
             savings: 2048,
         });
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(out.contains("Store:"));
         assert!(out.contains("Dedup:      4 unique blobs"));
         assert!(out.contains("Hit rate:"));
@@ -8373,7 +8382,7 @@ mod tests {
         let mut quiet = StatsSnapshot::default();
         quiet.daemon_connected = true;
         assert!(
-            render_stats(&quiet, &remote_config, 24)
+            render_stats(&quiet, &remote_config, SinceWindow::DEFAULT)
                 .iter()
                 .all(|line| !line.starts_with("Resilience:"))
         );
@@ -8418,7 +8427,7 @@ mod tests {
         for (signal, mut snap) in signals {
             snap.daemon_connected = true;
             assert!(
-                render_stats(&snap, &remote_config, 24)
+                render_stats(&snap, &remote_config, SinceWindow::DEFAULT)
                     .iter()
                     .any(|line| line.starts_with("Resilience:")),
                 "{signal} must independently render the resilience section"
@@ -8430,7 +8439,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            render_stats(&disconnected, &remote_config, 24)
+            render_stats(&disconnected, &remote_config, SinceWindow::DEFAULT)
                 .iter()
                 .all(|line| !line.starts_with("Resilience:"))
         );
@@ -8440,9 +8449,13 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            render_stats(&connected_without_remote, &local_config, 24)
-                .iter()
-                .all(|line| !line.starts_with("Resilience:"))
+            render_stats(
+                &connected_without_remote,
+                &local_config,
+                SinceWindow::DEFAULT
+            )
+            .iter()
+            .all(|line| !line.starts_with("Resilience:"))
         );
     }
 
@@ -8457,7 +8470,7 @@ mod tests {
         // Quiet daemon: no prefetch lines at all.
         let mut quiet = StatsSnapshot::default();
         quiet.daemon_connected = true;
-        let out = render_stats(&quiet, &config, 24).join("\n");
+        let out = render_stats(&quiet, &config, SinceWindow::DEFAULT).join("\n");
         assert!(!out.contains("Prefetch:"));
         assert!(!out.contains("Planning:"));
 
@@ -8494,7 +8507,7 @@ mod tests {
         let mut eff = effective_config_like(&config);
         eff.remote_key_cache_refresh_secs = 7;
         snap.daemon_effective_config = Some(eff);
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(out.contains("Prefetch:   4 downloads"));
         assert!(out.contains("2 used (50%)"));
         assert!(out.contains("CANCELLED"));
@@ -8511,14 +8524,14 @@ mod tests {
         let mut eff = effective_config_like(&initial_only);
         eff.remote_key_cache_refresh_secs = 0;
         snap.daemon_effective_config = Some(eff);
-        let out = render_stats(&snap, &initial_only, 24).join("\n");
+        let out = render_stats(&snap, &initial_only, SinceWindow::DEFAULT).join("\n");
         assert!(out.contains(
             "Key LIST:   250000 keys in 88 ms (one initial population; periodic refresh disabled)"
         ));
 
         let mut disabled = config.clone();
         disabled.prefetch_enabled = false;
-        let out = render_stats(&quiet, &disabled, 24).join("\n");
+        let out = render_stats(&quiet, &disabled, SinceWindow::DEFAULT).join("\n");
         assert!(
             out.contains("Prefetch:   disabled (exact remote lookup and uploads remain enabled)")
         );
@@ -8526,7 +8539,7 @@ mod tests {
         assert!(!out.contains("Key LIST:"));
 
         snap.prefetch.last_list_key_count = 0;
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(out.contains("Prefetch:   4 downloads"));
         assert!(
             !out.contains("Key LIST:"),
@@ -8539,16 +8552,16 @@ mod tests {
         snap.prefetch.pack_requests_total = 0;
         snap.prefetch.v3_requests_total = 0;
         snap.prefetch.last_plan_wall_ms = 0;
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(!out.contains("Transport:"));
         assert!(!out.contains("Plan wall:"));
 
         snap.prefetch.pack_requests_total = 1;
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(out.contains("Transport:  pack 1 requests"));
         snap.prefetch.pack_requests_total = 0;
         snap.prefetch.v3_requests_total = 1;
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(out.contains("v3 1 requests"));
     }
 
@@ -8589,7 +8602,7 @@ mod tests {
         eff.prefetch_enabled = true; // …but the daemon is still planning
         snap.daemon_effective_config = Some(eff);
 
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(
             !out.contains("Prefetch:   disabled"),
             "must not claim disabled while the daemon reports enabled: {out}"
@@ -8603,7 +8616,7 @@ mod tests {
         let mut eff = effective_config_like(&config);
         eff.prefetch_enabled = false;
         snap.daemon_effective_config = Some(eff);
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(
             out.contains("Prefetch:   disabled (exact remote lookup and uploads remain enabled)")
         );
@@ -8624,7 +8637,7 @@ mod tests {
         let mut snap = StatsSnapshot::default();
         snap.daemon_connected = true; // reachable, but reported no config
 
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(out.contains(
             "Prefetch:   disabled (exact remote lookup and uploads remain enabled) \
              [client config — daemon did not report its policy]"
@@ -8759,7 +8772,7 @@ mod tests {
         eff.remote_description = None;
         eff.remote_key_cache_refresh_secs = 7;
         snap.daemon_effective_config = Some(eff);
-        let out = render_stats(&snap, &client_remote, 24).join("\n");
+        let out = render_stats(&snap, &client_remote, SinceWindow::DEFAULT).join("\n");
         assert!(out.contains("Remote:     not configured"), "{out}");
         assert!(!out.contains("Remote:     s3://"), "{out}");
 
@@ -8767,7 +8780,7 @@ mod tests {
         let mut eff = effective_config_like(&client_local);
         eff.remote_description = Some("s3://daemon-bucket/artifacts".to_string());
         snap.daemon_effective_config = Some(eff);
-        let out = render_stats(&snap, &client_local, 24).join("\n");
+        let out = render_stats(&snap, &client_local, SinceWindow::DEFAULT).join("\n");
         assert!(
             out.contains("Remote:     s3://daemon-bucket/artifacts"),
             "{out}"
@@ -8786,7 +8799,7 @@ mod tests {
         snap.daemon_connected = true;
         snap.daemon_version = "1.0.0".to_string();
         snap.daemon_build_epoch = crate::daemon::build_epoch().wrapping_add(1); // mismatch
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(out.contains("MISMATCH — auto-restart pending"));
         assert!(out.contains("local-only mode"));
     }
@@ -8796,7 +8809,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), None);
         let snap = StatsSnapshot::default(); // daemon_connected=false
-        let out = render_stats(&snap, &config, 24).join("\n");
+        let out = render_stats(&snap, &config, SinceWindow::DEFAULT).join("\n");
         assert!(out.contains("Daemon:     offline"));
         assert!(out.contains("Remote:     not configured"));
         // No blobs -> no Dedup line.
@@ -8820,10 +8833,15 @@ mod tests {
             ..Default::default()
         };
 
-        let out = render_stats(&snap, &config, 6).join("\n");
+        let window = SinceWindow::parse("15m").unwrap();
+        let out = render_stats(&snap, &config, window).join("\n");
         assert!(out.contains("Store:      500 B / 0 B (0 entries, 0%)"));
         assert!(out.contains("Dedup:      2 unique blobs, 500 B physical, 0.0% savings"));
-        assert!(out.contains("Time saved: n/a"));
+        // #897: the label names the requested window, not a hardcoded 24h.
+        assert!(
+            out.contains("Time saved: n/a (estimated compile work avoided, last 15m)"),
+            "{out}"
+        );
 
         let no_blobs = StatsSnapshot {
             blob_stats: Some(crate::store::BlobStats {
@@ -8834,7 +8852,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let out = render_stats(&no_blobs, &config, 6).join("\n");
+        let out = render_stats(&no_blobs, &config, window).join("\n");
         assert!(
             !out.contains("Dedup:"),
             "an empty blob snapshot must not render a dedup line: {out}"
@@ -8858,7 +8876,7 @@ mod tests {
         summaries.push('\n');
         std::fs::write(summary_path, summaries).unwrap();
 
-        let snap = snapshot_from_direct_reads(&config, false, "size", None, true);
+        let snap = snapshot_from_direct_reads(&config, false, "size", SinceWindow::DEFAULT, true);
         let ids = snap
             .recent_summaries
             .iter()
@@ -8899,7 +8917,7 @@ mod tests {
         )
         .unwrap();
 
-        let snap = snapshot_from_direct_reads(&config, true, "name", Some(24), false);
+        let snap = snapshot_from_direct_reads(&config, true, "name", SinceWindow::DEFAULT, false);
         assert!(!snap.daemon_connected, "direct reads report no daemon");
         assert_eq!(snap.entry_count, 1);
         assert_eq!(snap.entries.len(), 1);
@@ -8909,13 +8927,52 @@ mod tests {
         assert_eq!(snap.max_size, config.max_size);
     }
 
+    /// #897: `--since` must narrow the counters, not just the label. A 15m
+    /// window excludes the three-hour-old miss that a 24h window includes.
+    #[test]
+    fn snapshot_from_direct_reads_honors_a_sub_hour_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let now = chrono::Utc::now();
+        let mut recent = build_event(
+            "serde",
+            crate::events::EventResult::LocalHit,
+            0,
+            5,
+            4096,
+            "a",
+        );
+        recent.ts = now - chrono::Duration::minutes(10);
+        let mut old = build_event(
+            "tokio",
+            crate::events::EventResult::Miss,
+            900,
+            950,
+            8192,
+            "b",
+        );
+        old.ts = now - chrono::Duration::hours(3);
+        crate::events::log_event(&config.event_log_path(), &recent).unwrap();
+        crate::events::log_event(&config.event_log_path(), &old).unwrap();
+
+        let narrow = SinceWindow::parse("15m").unwrap();
+        let snap = snapshot_from_direct_reads(&config, false, "size", narrow, false);
+        assert_eq!(snap.event_stats.local_hits, 1);
+        assert_eq!(snap.event_stats.misses, 0, "a 3h-old miss is outside 15m");
+
+        let wide = SinceWindow::parse("24h").unwrap();
+        let snap = snapshot_from_direct_reads(&config, false, "size", wide, false);
+        assert_eq!(snap.event_stats.local_hits, 1);
+        assert_eq!(snap.event_stats.misses, 1);
+    }
+
     #[test]
     fn snapshot_from_direct_reads_without_entries_skips_listing() {
         // include_entries=false -> entries list is empty even with a populated store.
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), None);
         put_entry(&config, "k1", "serde", dir.path());
-        let snap = snapshot_from_direct_reads(&config, false, "size", None, false);
+        let snap = snapshot_from_direct_reads(&config, false, "size", SinceWindow::DEFAULT, false);
         assert!(
             snap.entries.is_empty(),
             "entries omitted when not requested"

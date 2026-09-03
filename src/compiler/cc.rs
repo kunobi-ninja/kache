@@ -1560,7 +1560,7 @@ fn parse_preprocess_dependencies(raw: &str, cwd: &Path) -> Result<Vec<PathBuf>> 
 #[derive(Debug)]
 struct PreprocessHash {
     hash: String,
-    fingerprints: Option<Vec<crate::cache_key::FileFingerprint>>,
+    fingerprints: Option<Vec<crate::cache_key::CcPreprocessMemoInput>>,
 }
 
 fn preprocess_hash(
@@ -3841,9 +3841,49 @@ fn fold_cc_memo_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
     hasher.update(value);
 }
 
-/// Local identity for a preprocessor invocation. The full environment is
-/// intentionally included: compiler-specific include variables are numerous,
-/// and an extra miss is safer than overlooking one that changes expansion.
+/// Environment variables that cannot change a preprocessor expansion and do
+/// change between two otherwise identical invocations.
+///
+/// The memo key folds the environment wholesale, because compiler-specific
+/// include variables are numerous and an extra miss is safer than overlooking
+/// one. That stays true — this is a deny list, not an allow list, so anything
+/// unrecognised is still keyed and the worst case remains a wasted preprocess.
+///
+/// Without it the memo is unreachable rather than merely conservative. A
+/// shell exports `_`, `PWD` and `OLDPWD` fresh for every command, cargo hands
+/// each build script a jobserver on file descriptors it picked this run, and
+/// kache's own runtime variables move with the cache directory. Any one of
+/// those gives every invocation its own key, so nothing is ever reused.
+/// `cwd` is folded separately and explicitly, so dropping `PWD` here loses
+/// nothing.
+const CC_MEMO_VOLATILE_ENV: &[&str] = &[
+    // Shell bookkeeping, rewritten per command.
+    "_",
+    "OLDPWD",
+    "PWD",
+    "SHLVL",
+    // Build-driver parallelism: `--jobserver-fds=3,5` names this run's fds.
+    "CARGO_MAKEFLAGS",
+    "MAKEFLAGS",
+    "MFLAGS",
+    "MAKELEVEL",
+    "NUM_JOBS",
+];
+
+/// Is this a variable the memo key deliberately ignores? kache's own
+/// `KACHE_*` settings are included: they steer the wrapper, never the
+/// preprocessor, and they differ between any two cache directories.
+fn cc_memo_env_is_volatile(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.starts_with("KACHE_") || CC_MEMO_VOLATILE_ENV.contains(&name)
+}
+
+/// Local identity for a preprocessor invocation. The environment is included
+/// apart from [`cc_memo_env_is_volatile`]: compiler-specific include
+/// variables are numerous, and an extra miss is safer than overlooking one
+/// that changes expansion.
 fn cc_preprocess_memo_key(
     parsed: &CcArgs,
     prefix_maps: &[CcPrefixMap],
@@ -3854,7 +3894,7 @@ fn cc_preprocess_memo_key(
     let compiler_path = super::resolve_program_on_path(&parsed.program)?;
     let compiler_metadata = std::fs::metadata(&compiler_path).ok()?;
     let mut hasher = blake3::Hasher::new();
-    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v1");
+    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v2");
     fold_cc_memo_field(
         &mut hasher,
         b"compiler-program",
@@ -3909,6 +3949,7 @@ fn cc_preprocess_memo_key(
     }
 
     let mut environment: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
+        .filter(|(name, _)| !cc_memo_env_is_volatile(name))
         .map(|(name, value)| (cc_memo_os_bytes(&name), cc_memo_os_bytes(&value)))
         .collect();
     environment.sort();
@@ -4437,7 +4478,7 @@ fn cc_include_name_counts(name: &OsStr) -> bool {
 struct PendingCcPreprocessMemo {
     memo_key: String,
     preprocessed_hash: String,
-    fingerprints: Vec<crate::cache_key::FileFingerprint>,
+    fingerprints: Vec<crate::cache_key::CcPreprocessMemoInput>,
 }
 
 #[derive(Default)]
@@ -8880,6 +8921,48 @@ mod tests {
         assert!(
             key.bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+
+    /// A variable that cannot reach the preprocessor must not give every
+    /// invocation its own memo, and one that can must still be keyed.
+    #[test]
+    fn cc_preprocess_memo_key_ignores_only_volatile_environment() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let compiler = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let parsed =
+            CcArgs::parse(&[compiler, "-c".to_string(), "memo-source.c".to_string()]).unwrap();
+        let key = || cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap();
+
+        let baseline = key();
+        for (name, value) in [
+            ("_", "/usr/bin/whatever"),
+            ("OLDPWD", "/somewhere/else"),
+            ("SHLVL", "9"),
+            ("CARGO_MAKEFLAGS", "-j --jobserver-fds=7,9"),
+            ("NUM_JOBS", "13"),
+            ("KACHE_CACHE_DIR", "/tmp/some-other-cache"),
+        ] {
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe { std::env::set_var(name, value) };
+            assert_eq!(
+                key(),
+                baseline,
+                "{name} cannot change an expansion and must not change the memo key"
+            );
+            unsafe { std::env::remove_var(name) };
+        }
+
+        // SAFETY: as above.
+        unsafe { std::env::set_var("CPATH", "/opt/extra/include") };
+        let with_cpath = key();
+        unsafe { std::env::remove_var("CPATH") };
+        assert_ne!(
+            with_cpath, baseline,
+            "an include-path variable changes which headers are found and must be keyed"
         );
     }
 

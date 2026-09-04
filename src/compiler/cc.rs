@@ -727,9 +727,15 @@ impl CcArgs {
             CompileMode::Link => reasons.push(RefuseReason::Unsupported(
                 "cc link mode (whole-program caching) — not yet",
             )),
-            CompileMode::Preprocess => reasons.push(RefuseReason::Unsupported(
-                "cc preprocessor mode -E — not yet",
-            )),
+            // `-E` writing to a named file is an ordinary single-output
+            // compile: the expansion is the artifact, and the key already
+            // covers everything that can change it. Writing to stdout would
+            // need the entry to carry an output no file holds, so that shape
+            // keeps its own refusal and stays countable.
+            CompileMode::Preprocess if self.output.is_none() => reasons.push(
+                RefuseReason::Unsupported("cc preprocessor mode -E to stdout — not yet"),
+            ),
+            CompileMode::Preprocess => {}
             CompileMode::Assemble => {
                 reasons.push(RefuseReason::Unsupported("cc assembly mode -S — not yet"))
             }
@@ -5392,13 +5398,18 @@ impl Compiler for CcCompiler {
             .with_context(|| format!("executing {}", parsed.program))?;
         let exit_code = output.status.code().unwrap_or(1);
 
-        // Output discovery: on a successful `-c` compile, the object
-        // file is the cacheable artifact. Skip on failure (nothing to
-        // cache) or non-Compile mode (refused upstream anyway). Objects
-        // retain their basename; dep-info gets a semantic store name because
-        // `-MF` permits arbitrary suffixes and restore already takes its real
-        // destination from the current invocation (kunobi-ninja/kache#655).
-        let artifacts = if exit_code == 0 && parsed.mode == CompileMode::Compile {
+        // Output discovery: on a successful compile the named output is the
+        // cacheable artifact. Skip on failure, and skip for the modes that
+        // are still refused upstream, where discovery would guess at a file
+        // the invocation never wrote. `-E` writing to a named file reaches
+        // here now, and its expansion is discovered the same way an object
+        // is. Objects retain their basename; dep-info gets a semantic store
+        // name because `-MF` permits arbitrary suffixes and restore already
+        // takes its real destination from the current invocation
+        // (kunobi-ninja/kache#655).
+        let discovers_outputs = matches!(parsed.mode, CompileMode::Compile)
+            || (parsed.mode == CompileMode::Preprocess && parsed.output.is_some());
+        let artifacts = if exit_code == 0 && discovers_outputs {
             discover_cc_output_artifacts(parsed)
         } else {
             ArtifactSet::empty()
@@ -9990,6 +10001,36 @@ mod tests {
             last = compiler.execute(parsed);
         }
         last
+    }
+
+    #[cfg(unix)]
+    /// `-E` to a named file is a cacheable single-output compile; `-E` to
+    /// stdout still is not, and says so in its own words so the two can be
+    /// counted apart in a report.
+    #[test]
+    fn preprocess_to_a_file_is_cacheable_and_to_stdout_is_not() {
+        let to_file = CcArgs::parse(&s(&["cc", "-E", "unit.c", "-o", "unit.i"])).unwrap();
+        assert_eq!(to_file.mode, CompileMode::Preprocess);
+        assert!(
+            to_file.refuse_reasons(&[]).is_empty(),
+            "a named output is the artifact: {:?}",
+            to_file.refuse_reasons(&[])
+        );
+        assert_eq!(
+            to_file.object_output_path(),
+            Some(PathBuf::from("unit.i")),
+            "the named output is what restore has to write"
+        );
+
+        let to_stdout = CcArgs::parse(&s(&["cc", "-E", "unit.c"])).unwrap();
+        let reasons = to_stdout.refuse_reasons(&[]);
+        assert!(
+            reasons.iter().any(|reason| matches!(
+                reason,
+                RefuseReason::Unsupported(message) if message.contains("to stdout")
+            )),
+            "stdout has no file to store: {reasons:?}"
+        );
     }
 
     #[cfg(unix)]

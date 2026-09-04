@@ -32,7 +32,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, surrealdb, lance, opendal, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, hk, hk-pull, hk-mbx]
+        options: [all, substrate, surrealdb, lance, opendal, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, hk, hk-pull, hk-mbx, opendal-mbx, lance-mbx]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -142,6 +142,14 @@ jobs:
           # (as firefox-sccache is for firefox). mbx comes from mise at its
           # latest release; the run records the version it measured.
           hk_mbx='{"name":"hk-mbx","cmd":"bench-mbx hk","dir":"bench-hk-mbx","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners-small"}'
+          # Two more subjects on the same side-by-side axis. mbx fronts Cargo,
+          # so the arms it can serve at all are exactly the cargo-driven ones:
+          # firefox (mach/gn/ninja) and llvm (cmake) are out of reach, which is
+          # why firefox's comparison arm is sccache instead. Both sit on the
+          # small pool — the heavy pool runs one job at a time and is already
+          # carrying the multi-hour arms.
+          opendal_mbx='{"name":"opendal-mbx","cmd":"bench-mbx opendal","dir":"bench-opendal-mbx","timeout":120,"job_timeout":165,"min_free_gb":40,"runner":"kunobi-runners-small"}'
+          lance_mbx='{"name":"lance-mbx","cmd":"bench-mbx lance","dir":"bench-lance-mbx","timeout":180,"job_timeout":225,"min_free_gb":60,"runner":"kunobi-runners-small"}'
           case "$SCENARIO" in
             substrate)            inc="[$substrate]" ;;
             surrealdb)            inc="[$surrealdb]" ;;
@@ -154,13 +162,15 @@ jobs:
             hk)                   inc="[$hk]" ;;
             hk-pull)              inc="[$hk_pull]" ;;
             hk-mbx)               inc="[$hk_mbx]" ;;
+            opendal-mbx)          inc="[$opendal_mbx]" ;;
+            lance-mbx)            inc="[$lance_mbx]" ;;
             # Windows-only scenarios are served by their own self-hosted jobs
             # below, so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`
             # and wastefully run the whole Linux `all` matrix alongside.
             firefox-windows)      inc="[]" ;;
             firefox-pull-windows) inc="[]" ;;
-            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull,$hk,$hk_pull,$hk_mbx]" ;;
+            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull,$hk,$hk_pull,$hk_mbx,$opendal_mbx,$lance_mbx]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
           if [ "$inc" = "[]" ]; then

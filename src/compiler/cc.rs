@@ -1652,7 +1652,9 @@ fn preprocess_hash(
                     .into_iter()
                     .map(|path| (cc_mapped_path(&path, prefix_maps), path))
                     .collect();
-                file_hasher.cc_preprocess_fingerprints(&mapped)
+                file_hasher.cc_preprocess_fingerprints(&mapped, &|path| {
+                    cc_mapped_content_hash(path, prefix_maps)
+                })
             }
             Err(error) => {
                 tracing::debug!("cc preprocess dependency capture unavailable: {error:#}");
@@ -4199,6 +4201,20 @@ fn cc_mapped_path(path: &Path, prefix_maps: &[CcPrefixMap]) -> String {
     String::from_utf8_lossy(&apply_cc_prefix_maps_to_bytes(text, prefix_maps)).into_owned()
 }
 
+/// blake3 of a file's contents with the prefix maps applied.
+///
+/// The expansion is hashed this way, so an input has to be compared this way
+/// too. A `-sys` crate's generated config header names its own build
+/// directory: the raw bytes differ between two checkouts, the mapped bytes do
+/// not, and the expansion each produces is identical. Comparing raw bytes
+/// alone therefore made the memo stricter than the key it feeds. `None` when
+/// the file cannot be read, which the caller treats as "cannot reuse".
+fn cc_mapped_content_hash(path: &Path, prefix_maps: &[CcPrefixMap]) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mapped = apply_cc_prefix_maps_to_bytes(bytes, prefix_maps);
+    Some(blake3::hash(&mapped).to_hex().to_string())
+}
+
 /// Candidate real paths a mapped spelling could name in this invocation.
 ///
 /// The inverse of [`cc_mapped_path`], and inexact by nature: two roots can
@@ -4543,6 +4559,9 @@ struct PendingCcPreprocessMemo {
     memo_key: String,
     preprocessed_hash: String,
     fingerprints: Vec<crate::cache_key::CcPreprocessMemoInput>,
+    /// The maps the expansion and the inputs were hashed under. Revalidation
+    /// at commit time has to use the same ones.
+    prefix_maps: Vec<CcPrefixMap>,
 }
 
 #[derive(Default)]
@@ -4658,6 +4677,7 @@ impl CcCompiler {
             &pending.memo_key,
             &pending.preprocessed_hash,
             &pending.fingerprints,
+            &|path| cc_mapped_content_hash(path, &pending.prefix_maps),
         );
     }
 
@@ -5272,9 +5292,11 @@ impl Compiler for CcCompiler {
             .then(|| cc_preprocess_memo_key(parsed, &prefix_maps, &resolved.version_line))
             .flatten();
         let pp_hash = if let Some(memo_hash) = memo_key.as_ref().and_then(|key| {
-            ctx.file_hasher.cc_preprocess_memo_lookup(key, |name| {
-                cc_unmapped_path_candidates(name, &prefix_maps)
-            })
+            ctx.file_hasher.cc_preprocess_memo_lookup(
+                key,
+                |name| cc_unmapped_path_candidates(name, &prefix_maps),
+                &|path| cc_mapped_content_hash(path, &prefix_maps),
+            )
         }) {
             tracing::trace!(
                 target: "kache::cache_key",
@@ -5292,6 +5314,7 @@ impl Compiler for CcCompiler {
                         memo_key,
                         preprocessed_hash: preprocessed.hash.clone(),
                         fingerprints,
+                        prefix_maps: prefix_maps.clone(),
                     });
             }
             tracing::trace!(
@@ -8991,6 +9014,54 @@ mod tests {
 
     /// A variable that cannot reach the preprocessor must not give every
     /// invocation its own memo, and one that can must still be keyed.
+    /// The mapped-content hash is what decides whether two checkouts share an
+    /// expansion, so it has to be a real digest of the mapped bytes: equal
+    /// where the maps make the contents equal, different otherwise, and
+    /// absent for a file that cannot be read.
+    #[test]
+    fn cc_mapped_content_hash_digests_the_mapped_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.h");
+        let b = dir.path().join("b.h");
+        std::fs::write(&a, "#define P \"/work/one/out\"\n").unwrap();
+        std::fs::write(&b, "#define P \"/work/two/out\"\n").unwrap();
+
+        let maps = vec![
+            CcPrefixMap {
+                from: "/work/one".to_string(),
+                to: "/kache/root".to_string(),
+            },
+            CcPrefixMap {
+                from: "/work/two".to_string(),
+                to: "/kache/root".to_string(),
+            },
+        ];
+        let hash_a = cc_mapped_content_hash(&a, &maps).unwrap();
+        let hash_b = cc_mapped_content_hash(&b, &maps).unwrap();
+        assert_eq!(hash_a.len(), 64, "a blake3 digest, not a placeholder");
+        assert_eq!(
+            hash_a, hash_b,
+            "contents the maps make equal must hash equal"
+        );
+        // The digest is of the MAPPED bytes, so it is not the raw digest.
+        assert_ne!(
+            hash_a,
+            crate::cache_key::hash_file(&a).unwrap(),
+            "mapping must actually change what is hashed"
+        );
+        // And two files the maps do not reconcile stay apart.
+        assert_ne!(
+            hash_a,
+            cc_mapped_content_hash(&b, &[]).unwrap(),
+            "without the maps the two contents differ"
+        );
+        assert_eq!(
+            cc_mapped_content_hash(&dir.path().join("absent.h"), &maps),
+            None,
+            "an unreadable input cannot be reused"
+        );
+    }
+
     /// A recorded name has to come back as the path this checkout uses, and
     /// the memo key must not move when only the checkout root does.
     #[test]

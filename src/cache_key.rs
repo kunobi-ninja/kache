@@ -878,6 +878,23 @@ pub(crate) fn stash_last_dep_info_for_test(dep_info: DepInfo) {
     let _ = LAST_KEY_DEP_INFO.try_with(|stash| *stash.borrow_mut() = Some(dep_info));
 }
 
+thread_local! {
+    /// Did the last key computed on this thread derive its input set from a
+    /// record rather than from the pre-pass?
+    ///
+    /// The wrapper needs it for the one rule that keeps stores sound: a
+    /// derived key that misses locally must be recomputed the slow way before
+    /// anything reaches the remote, the scheduler or the store.
+    static LAST_KEY_USED_PREDICTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take (consume) whether the last computed rustc key came from a prediction.
+pub(crate) fn take_last_key_used_prediction() -> bool {
+    LAST_KEY_USED_PREDICTION
+        .try_with(|stash| stash.replace(false))
+        .unwrap_or(false)
+}
+
 /// Take (consume) the input closure of the last computed rustc key.
 ///
 /// `None` for cc compiles, passthroughs, and any invocation with no source
@@ -939,6 +956,95 @@ fn rustc_prediction_identity_in_env(
     ))
 }
 
+/// How often to check a prediction against the pre-pass it replaced.
+///
+/// The rules in [`validate_prediction`] are an argument, and this is the
+/// measurement of that argument on real code. `sampled` pays one pre-pass per
+/// [`VERIFY_PREDICTION_RATE`] units to keep the argument honest; `always` is
+/// for a nightly, where the point is to count disagreements rather than to be
+/// fast. Any disagreement means the prediction is used nowhere: the pre-pass
+/// result wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifyPredictions {
+    Off,
+    Sampled,
+    Always,
+}
+
+/// One in this many predictions is checked under `sampled`.
+const VERIFY_PREDICTION_RATE: usize = 64;
+
+static VERIFY_PREDICTION_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn parse_verify_predictions(value: Option<&str>) -> VerifyPredictions {
+    match value {
+        Some(v) if v.eq_ignore_ascii_case("sampled") => VerifyPredictions::Sampled,
+        Some(v)
+            if v.eq_ignore_ascii_case("always") || v == "1" || v.eq_ignore_ascii_case("true") =>
+        {
+            VerifyPredictions::Always
+        }
+        _ => VerifyPredictions::Off,
+    }
+}
+
+fn should_verify_this_prediction(mode: VerifyPredictions) -> bool {
+    match mode {
+        VerifyPredictions::Off => false,
+        VerifyPredictions::Always => true,
+        VerifyPredictions::Sampled => VERIFY_PREDICTION_COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(VERIFY_PREDICTION_RATE),
+    }
+}
+
+/// Do the two closures agree on what rustc reads?
+///
+/// Source order is not compared: the key sorts sources before folding them,
+/// so two orderings of the same set produce the same key. Env deps are
+/// compared as a set for the same reason.
+fn closures_agree(predicted: &DepInfo, discovered: &DepInfo) -> bool {
+    let mut a = predicted.source_files.clone();
+    let mut b = discovered.source_files.clone();
+    a.sort();
+    b.sort();
+    let mut ea = predicted.env_deps.clone();
+    let mut eb = discovered.env_deps.clone();
+    ea.sort();
+    eb.sort();
+    a == b && ea == eb
+}
+
+/// The closure a prior build recorded for this unit, if every rule still
+/// holds against the tree as it is now.
+///
+/// Nothing here is trusted on its word: the record supplies candidate paths
+/// and env values, and each one is re-checked. Any doubt is a `Rejection`,
+/// and every `Rejection` means the same thing to the caller — spawn the
+/// pre-pass and discover the closure for real.
+fn predicted_key_inputs(
+    args: &RustcArgs,
+    file_hasher: &FileHasher<'_>,
+) -> std::result::Result<DepInfo, Rejection> {
+    if !file_hasher.uses_input_predictions() {
+        return Err(Rejection::Disabled);
+    }
+    if !prediction_applies(&args.externs) {
+        return Err(Rejection::NotEligible);
+    }
+    let identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
+    let record = file_hasher
+        .input_prediction(&identity)
+        .ok_or(Rejection::NoRecord)?;
+    validate_prediction(
+        &record,
+        |path| std::fs::metadata(path).ok(),
+        |path| path.exists(),
+        |var| std::env::var(var).ok(),
+    )
+}
+
 /// Discover the source closure that feeds the key.
 ///
 /// The dep-info pre-pass enumerates the real closure. If it fails we must NOT
@@ -951,7 +1057,53 @@ fn rustc_prediction_identity_in_env(
 ///
 /// `None` when the invocation names no source file: there is no closure to
 /// discover, and the key simply folds no source or env-dep group.
-fn resolve_key_inputs(args: &RustcArgs) -> Result<Option<DepInfo>> {
+fn resolve_key_inputs(
+    args: &RustcArgs,
+    file_hasher: &FileHasher<'_>,
+    crate_name: &str,
+) -> Result<Option<DepInfo>> {
+    if args.source_file.is_some() {
+        match predicted_key_inputs(args, file_hasher) {
+            Ok(dep_info) => {
+                let mode = parse_verify_predictions(
+                    std::env::var("KACHE_VERIFY_INPUT_PREDICTIONS")
+                        .ok()
+                        .as_deref(),
+                );
+                // Verification is the exceptional path: it runs the pre-pass
+                // anyway and uses ITS answer, so a disagreement is reported
+                // rather than acted on.
+                if should_verify_this_prediction(mode) {
+                    let discovered = dep_info_pre_pass(args)?;
+                    if discovered
+                        .as_ref()
+                        .is_some_and(|discovered| closures_agree(&dep_info, discovered))
+                    {
+                        tracing::trace!("[key:{}] inputs=predicted(verified)", crate_name);
+                    } else {
+                        tracing::warn!(
+                            "[key:{}] input prediction disagreed with the dep-info pass; \
+                             using the pass. Please report this with the crate and its \
+                             dependencies (kunobi-ninja/kache).",
+                            crate_name
+                        );
+                    }
+                    return Ok(discovered);
+                }
+                tracing::trace!("[key:{}] inputs=predicted", crate_name);
+                let _ = LAST_KEY_USED_PREDICTION.try_with(|stash| stash.set(true));
+                return Ok(Some(dep_info));
+            }
+            Err(reason) => {
+                tracing::trace!("[key:{}] inputs=dep-info({})", crate_name, reason.as_str())
+            }
+        }
+    }
+    dep_info_pre_pass(args)
+}
+
+/// Spawn rustc to enumerate the closure. The slow, authoritative answer.
+fn dep_info_pre_pass(args: &RustcArgs) -> Result<Option<DepInfo>> {
     args.source_file
         .as_ref()
         .map(|source| {
@@ -1011,6 +1163,7 @@ pub fn compute_cache_key(
     // bails before the pre-pass would otherwise leave the previous compile's
     // closure to be recorded against this one's identity.
     let _ = LAST_KEY_DEP_INFO.try_with(|stash| *stash.borrow_mut() = None);
+    let _ = LAST_KEY_USED_PREDICTION.try_with(|stash| stash.set(false));
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
     hasher.update(b"key_version:");
@@ -1190,7 +1343,7 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
-    let dep_info = resolve_key_inputs(args)?;
+    let dep_info = resolve_key_inputs(args, file_hasher, crate_name)?;
     // Keep the closure available to the wrapper, which records it as a
     // prediction only once the invocation it belongs to has succeeded. The
     // clone is one allocation per closure file against a whole rustc spawn.
@@ -2623,6 +2776,144 @@ impl InputPrediction {
     }
 }
 
+/// Why a recorded closure could not be used for this invocation.
+///
+/// Every variant means the same thing operationally — run the pre-pass — but
+/// they are distinguished so the trace says which rule fired, and so the
+/// tests can name the case they are pinning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rejection {
+    /// Predictions are off, or there is no table to read one from. Also the
+    /// deliberate case: the re-derivation after a predicted key misses turns
+    /// them off so it discovers the closure for real.
+    Disabled,
+    /// The invocation is not the shape a prediction is sound for.
+    NotEligible,
+    /// No record, or one this build cannot read.
+    NoRecord,
+    /// A recorded file is gone. The pre-pass will fail too and the build will
+    /// pass through to rustc's own error, which is today's behaviour.
+    Missing,
+    /// A recorded path is no longer a regular file.
+    NotRegular,
+    /// A recorded `# env-dep:` value is not what it was.
+    EnvChanged,
+    /// `mod foo;` now resolves ambiguously: both `foo.rs` and `foo/mod.rs`
+    /// exist. rustc rejects that (E0761), and replaying a recorded success
+    /// would restore an artifact for a build that should fail.
+    Sibling,
+}
+
+impl Rejection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Rejection::Disabled => "disabled",
+            Rejection::NotEligible => "not-eligible",
+            Rejection::NoRecord => "no-record",
+            Rejection::Missing => "missing",
+            Rejection::NotRegular => "not-regular",
+            Rejection::EnvChanged => "env-changed",
+            Rejection::Sibling => "sibling",
+        }
+    }
+}
+
+/// Is this invocation the shape a prediction is sound for?
+///
+/// A proc macro can scan the filesystem and emit `include_str!` per entry, so
+/// a file can enter the closure with nothing already in the closure changing.
+/// The pre-pass sees the new file; a prediction would not, and would derive
+/// the stored key: a false hit. Cargo does not make this assumption either —
+/// it recompiles when a build script's `rerun-if-changed` directory fires
+/// even if the bytes are identical.
+///
+/// The test is how cargo hands rustc a proc macro: as a dynamic library.
+/// `dylib` crate-type dependencies get swept in too, which is
+/// over-conservative and safe. This was the scoping rule of the closed
+/// kunobi-ninja/kache#334, where it left 84% of units eligible.
+pub(crate) fn prediction_applies(externs: &[crate::args::ExternDep]) -> bool {
+    !externs.iter().any(|ext| {
+        ext.path.as_deref().is_some_and(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    matches!(
+                        crate::compiler::classify_by_filename(name),
+                        crate::compiler::ArtifactKind::DynamicLibrary
+                    )
+                })
+        })
+    })
+}
+
+/// The other spelling of the same module, if this file is one half of a
+/// `mod foo;` pair.
+///
+/// `src/foo.rs` and `src/foo/mod.rs` both answer `mod foo;`, and rustc
+/// refuses to choose (E0761). A record made when only one existed must not
+/// replay success after the other appears.
+fn mod_sibling_candidate(file: &Path) -> Option<PathBuf> {
+    let stem = file.file_stem()?.to_str()?;
+    let parent = file.parent()?;
+    if file.extension().and_then(|e| e.to_str()) != Some("rs") {
+        return None;
+    }
+    match stem {
+        // `foo/mod.rs`: the other spelling is `foo.rs` beside the directory.
+        "mod" => Some(
+            parent
+                .parent()?
+                .join(parent.file_name()?)
+                .with_extension("rs"),
+        ),
+        // A crate root is named by argv, not by a `mod` item, so it has no
+        // sibling spelling to be ambiguous with.
+        "lib" | "main" => None,
+        // `foo.rs`: the other spelling is `foo/mod.rs`.
+        stem => Some(parent.join(stem).join("mod.rs")),
+    }
+}
+
+/// Turn a recorded closure back into a `DepInfo` this invocation may key off,
+/// or say why it cannot.
+///
+/// Everything is re-checked against the tree as it is now. The claim being
+/// tested is narrow: *any edit that adds a file to the closure also changes a
+/// file already in it*. Where that does not hold, one of the rules above
+/// catches it, and where none of them does, the derived key misses and the
+/// caller falls back before anything is stored.
+pub(crate) fn validate_prediction(
+    record: &InputPrediction,
+    stat: impl Fn(&Path) -> Option<std::fs::Metadata>,
+    exists: impl Fn(&Path) -> bool,
+    env_value: impl Fn(&str) -> Option<String>,
+) -> std::result::Result<DepInfo, Rejection> {
+    for file in &record.sources {
+        let Some(metadata) = stat(file) else {
+            return Err(Rejection::Missing);
+        };
+        if !metadata.is_file() {
+            return Err(Rejection::NotRegular);
+        }
+        if mod_sibling_candidate(file).is_some_and(|sibling| exists(&sibling)) {
+            return Err(Rejection::Sibling);
+        }
+    }
+    for (var, recorded) in &record.env_deps {
+        // Raw values, because the key normalises OUT_DIR-like ones to a
+        // sentinel: the raw value is the only signal that an included file
+        // moved. A value that is no longer valid UTF-8 reads as changed,
+        // which is the safe direction.
+        if env_value(var).as_deref() != Some(recorded.as_str()) {
+            return Err(Rejection::EnvChanged);
+        }
+    }
+    Ok(DepInfo {
+        source_files: record.sources.clone(),
+        env_deps: record.env_deps.clone(),
+    })
+}
+
 /// The parts of an invocation that decide which closure it will discover.
 ///
 /// Everything here shapes what rustc reads: the compiler, the argv, the
@@ -2756,6 +3047,7 @@ fn prediction_identity_in_env(
 pub struct FileHasher<'db> {
     cache: Option<FileHashCache<'db>>,
     daemon_socket: Option<PathBuf>,
+    use_input_predictions: bool,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
     recent_hashes: RefCell<HashMap<PathBuf, RecentHash>>,
     runtime_env_uses: RefCell<HashMap<(String, String), bool>>,
@@ -2885,6 +3177,7 @@ impl FileHasher<'static> {
         FileHasher {
             cache: None,
             daemon_socket: None,
+            use_input_predictions: false,
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
             runtime_env_uses: RefCell::new(HashMap::new()),
@@ -2900,6 +3193,7 @@ impl FileHasher<'static> {
             Ok(cache) => FileHasher {
                 cache: Some(cache),
                 daemon_socket: None,
+                use_input_predictions: false,
                 prefetched: RefCell::new(HashMap::new()),
                 recent_hashes: RefCell::new(HashMap::new()),
                 runtime_env_uses: RefCell::new(HashMap::new()),
@@ -2923,6 +3217,7 @@ impl<'db> FileHasher<'db> {
         FileHasher {
             cache: Some(FileHashCache::Borrowed(db)),
             daemon_socket: None,
+            use_input_predictions: false,
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
             runtime_env_uses: RefCell::new(HashMap::new()),
@@ -2935,6 +3230,23 @@ impl<'db> FileHasher<'db> {
     pub(crate) fn with_daemon(mut self, socket_path: PathBuf) -> Self {
         self.daemon_socket = Some(socket_path);
         self
+    }
+
+    /// Let key computation derive its input set from a recorded closure
+    /// instead of spawning the dep-info pre-pass.
+    ///
+    /// A property of the hasher because the hasher is what reaches the
+    /// prediction table: without an index DB there is nothing to read, and
+    /// asking is always allowed to answer "run the pre-pass".
+    pub(crate) fn with_input_predictions(mut self, enabled: bool) -> Self {
+        self.use_input_predictions = enabled;
+        self
+    }
+
+    /// May key computation derive its inputs from a record? Only when it was
+    /// asked to AND there is a table to read.
+    fn uses_input_predictions(&self) -> bool {
+        self.use_input_predictions && self.cache.is_some()
     }
 
     /// Arm the too-new-input guard (kunobi-ninja/kache#324): flag any subsequently
@@ -3041,9 +3353,6 @@ impl<'db> FileHasher<'db> {
     /// this build does not know, bytes that will not decode — is `None`, which
     /// the caller reads as "run the pre-pass".
     ///
-    /// Test-only while recording is the whole feature: the production reader
-    /// arrives with the code that derives a key from a record.
-    #[cfg(test)]
     pub(crate) fn input_prediction(&self, identity: &str) -> Option<InputPrediction> {
         let cache = self.cache.as_ref()?;
         let (schema, json) = match cache.get_input_prediction(identity) {
@@ -3748,7 +4057,6 @@ impl<'db> FileHashCache<'db> {
     /// A row written by a schema this build does not recognise reads as
     /// absent: the cost of that is one pre-pass, and the cost of guessing at
     /// an unknown encoding is a wrong key.
-    #[cfg(test)]
     fn get_input_prediction(&self, identity: &str) -> rusqlite::Result<Option<(u32, String)>> {
         self.db()
             .query_row(
@@ -6301,6 +6609,326 @@ mod tests {
             toolchain_selector_fingerprint(None, Some(&project), Some(&settings)),
             with_default,
             "a rustup default switch must move the fingerprint"
+        );
+    }
+
+    /// Both halves have to hold: a build that asked for predictions but has no
+    /// index DB (the daemon's store-free hasher) cannot read one.
+    #[test]
+    fn predictions_need_both_the_request_and_a_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        assert!(
+            FileHasher::persistent(&db)
+                .with_input_predictions(true)
+                .uses_input_predictions()
+        );
+        assert!(
+            !FileHasher::persistent(&db).uses_input_predictions(),
+            "a hasher nobody asked must not read records"
+        );
+        assert!(
+            !FileHasher::new()
+                .with_input_predictions(true)
+                .uses_input_predictions(),
+            "asking is not enough without a table to read"
+        );
+        assert!(!FileHasher::new().uses_input_predictions());
+    }
+
+    /// Each refusal reaches a human only through the key trace, so the names
+    /// have to be distinct and stable enough to grep a build log for.
+    #[test]
+    fn every_rejection_names_itself_distinctly() {
+        let all = [
+            Rejection::Disabled,
+            Rejection::NotEligible,
+            Rejection::NoRecord,
+            Rejection::Missing,
+            Rejection::NotRegular,
+            Rejection::EnvChanged,
+            Rejection::Sibling,
+        ];
+        let mut names: Vec<&str> = all.iter().map(|r| r.as_str()).collect();
+        assert!(
+            names.iter().all(|name| !name.is_empty()),
+            "a nameless refusal tells a reader nothing: {names:?}"
+        );
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(before, names.len(), "two refusals share a name: {names:?}");
+        assert_eq!(Rejection::Disabled.as_str(), "disabled");
+        assert_eq!(Rejection::Sibling.as_str(), "sibling");
+    }
+
+    /// The wrapper reads this to decide whether a key still owes a
+    /// re-derivation, and a stale `true` would make it recompute a key that
+    /// was never predicted.
+    #[test]
+    fn the_prediction_marker_is_taken_once() {
+        assert!(
+            !take_last_key_used_prediction(),
+            "nothing has been predicted on this thread"
+        );
+        LAST_KEY_USED_PREDICTION.with(|stash| stash.set(true));
+        assert!(take_last_key_used_prediction());
+        assert!(
+            !take_last_key_used_prediction(),
+            "taking must clear it, or the next key inherits this one's answer"
+        );
+    }
+
+    /// The two gates in front of a record lookup, each refusing for its own
+    /// reason so the trace can say which.
+    #[test]
+    fn a_record_is_only_consulted_for_an_eligible_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let parse = |args: &[&str]| {
+            RustcArgs::parse(&args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let plain = parse(&["rustc", "src/lib.rs", "--edition", "2021"]);
+        let with_macro = parse(&[
+            "rustc",
+            "src/lib.rs",
+            "--edition",
+            "2021",
+            "--extern",
+            "my_macro=/t/debug/deps/libmy_macro-3.so",
+        ]);
+
+        let off = FileHasher::persistent(&db);
+        assert_eq!(
+            predicted_key_inputs(&plain, &off),
+            Err(Rejection::Disabled),
+            "predictions off must not touch the table"
+        );
+
+        let on = FileHasher::persistent(&db).with_input_predictions(true);
+        assert_eq!(
+            predicted_key_inputs(&with_macro, &on),
+            Err(Rejection::NotEligible),
+            "a proc-macro dependency is refused before any lookup"
+        );
+        if get_rustc_version(Path::new("rustc")).is_ok() {
+            assert_eq!(
+                predicted_key_inputs(&plain, &on),
+                Err(Rejection::NoRecord),
+                "an eligible invocation with nothing recorded falls back"
+            );
+        }
+    }
+
+    /// A proc macro can scan a directory and emit `include_str!` per entry, so
+    /// a file can join the closure with nothing already in it changing. The
+    /// pre-pass sees it; a prediction would not. Cargo hands rustc a proc
+    /// macro as a dynamic library, and that is the test.
+    #[test]
+    fn predictions_do_not_apply_to_units_with_a_dynamic_library_dependency() {
+        let dep = |path: &str| crate::args::ExternDep {
+            name: "dep".to_string(),
+            path: Some(PathBuf::from(path)),
+        };
+        let plain = vec![
+            dep("/t/debug/deps/libserde-1.rlib"),
+            dep("/t/debug/deps/libcore-2.rmeta"),
+        ];
+        assert!(
+            prediction_applies(&plain),
+            "rlib and rmeta dependencies cannot scan the filesystem"
+        );
+        assert!(
+            prediction_applies(&[]),
+            "a unit with no dependencies is eligible"
+        );
+
+        for macro_lib in [
+            "/t/debug/deps/libmy_macro-3.so",
+            "/t/debug/deps/libmy_macro-3.dylib",
+            "/t/debug/deps/my_macro-3.dll",
+        ] {
+            let mut with_macro = plain.clone();
+            with_macro.push(dep(macro_lib));
+            assert!(
+                !prediction_applies(&with_macro),
+                "{macro_lib} may generate includes the record cannot know about"
+            );
+        }
+
+        // A dependency cargo passed without a path tells us nothing either way
+        // and must not be read as a proc macro.
+        assert!(prediction_applies(&[crate::args::ExternDep {
+            name: "std".to_string(),
+            path: None,
+        }]));
+    }
+
+    /// `src/foo.rs` and `src/foo/mod.rs` both answer `mod foo;`, and rustc
+    /// refuses to choose. Only the two spellings of a module have a sibling;
+    /// a crate root is named by argv, so it has none.
+    #[test]
+    fn mod_sibling_is_the_other_spelling_of_the_same_module() {
+        assert_eq!(
+            mod_sibling_candidate(Path::new("src/foo.rs")),
+            Some(PathBuf::from("src/foo/mod.rs"))
+        );
+        assert_eq!(
+            mod_sibling_candidate(Path::new("src/foo/mod.rs")),
+            Some(PathBuf::from("src/foo.rs"))
+        );
+        for root in ["src/lib.rs", "src/main.rs"] {
+            assert_eq!(
+                mod_sibling_candidate(Path::new(root)),
+                None,
+                "{root} is named by argv, not by a mod item"
+            );
+        }
+        assert_eq!(
+            mod_sibling_candidate(Path::new("assets/data.json")),
+            None,
+            "an included asset is not a module"
+        );
+    }
+
+    /// The verification knob is the measurement of the soundness argument on
+    /// real code, so its parsing has to be exact about what turns it on.
+    #[test]
+    fn verify_predictions_parses_its_three_modes() {
+        for on in ["always", "ALWAYS", "1", "true", "True"] {
+            assert_eq!(
+                parse_verify_predictions(Some(on)),
+                VerifyPredictions::Always,
+                "{on} must verify every prediction"
+            );
+        }
+        for sampled in ["sampled", "SAMPLED"] {
+            assert_eq!(
+                parse_verify_predictions(Some(sampled)),
+                VerifyPredictions::Sampled
+            );
+        }
+        for off in [Some("off"), Some("0"), Some("false"), Some(""), None] {
+            assert_eq!(
+                parse_verify_predictions(off),
+                VerifyPredictions::Off,
+                "{off:?} must not cost a pre-pass"
+            );
+        }
+
+        assert!(!should_verify_this_prediction(VerifyPredictions::Off));
+        assert!(should_verify_this_prediction(VerifyPredictions::Always));
+        let verified = (0..VERIFY_PREDICTION_RATE * 4)
+            .filter(|_| should_verify_this_prediction(VerifyPredictions::Sampled))
+            .count();
+        assert_eq!(
+            verified, 4,
+            "sampling must check one prediction in {VERIFY_PREDICTION_RATE}"
+        );
+    }
+
+    /// Two closures naming the same files agree however they are ordered: the
+    /// key sorts both before folding, so order cannot change a key and must
+    /// not be reported as a disagreement.
+    #[test]
+    fn closures_agree_on_content_not_order() {
+        let dep = |sources: &[&str], env: &[(&str, &str)]| DepInfo {
+            source_files: sources.iter().map(PathBuf::from).collect(),
+            env_deps: env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        };
+        let a = dep(&["src/lib.rs", "src/helper.rs"], &[("OUT_DIR", "/t")]);
+        let reordered = dep(&["src/helper.rs", "src/lib.rs"], &[("OUT_DIR", "/t")]);
+        assert!(closures_agree(&a, &reordered));
+
+        assert!(!closures_agree(
+            &a,
+            &dep(
+                &["src/lib.rs", "src/helper.rs", "src/extra.rs"],
+                &[("OUT_DIR", "/t")]
+            )
+        ));
+        assert!(!closures_agree(
+            &a,
+            &dep(&["src/lib.rs"], &[("OUT_DIR", "/t")])
+        ));
+        assert!(!closures_agree(
+            &a,
+            &dep(&["src/lib.rs", "src/helper.rs"], &[])
+        ));
+        assert!(!closures_agree(
+            &a,
+            &dep(&["src/lib.rs", "src/helper.rs"], &[("OUT_DIR", "/other")])
+        ));
+    }
+
+    /// The rules, one refusal at a time. Each is a claim that the recorded
+    /// closure no longer describes what rustc would read.
+    #[test]
+    fn a_prediction_is_validated_against_the_tree_as_it_is_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let lib = src.join("lib.rs");
+        let helper = src.join("helper.rs");
+        std::fs::write(&lib, "mod helper;\n").unwrap();
+        std::fs::write(&helper, "pub fn n() {}\n").unwrap();
+
+        let record = InputPrediction {
+            schema: PREDICTION_SCHEMA,
+            sources: vec![lib.clone(), helper.clone()],
+            env_deps: vec![("OUT_DIR".to_string(), "/t/build/out".to_string())],
+        };
+        let stat = |path: &Path| std::fs::metadata(path).ok();
+        let exists = |path: &Path| path.exists();
+        let env = |var: &str| (var == "OUT_DIR").then(|| "/t/build/out".to_string());
+
+        let accepted = validate_prediction(&record, stat, exists, env)
+            .expect("an unchanged tree must reuse the recorded closure");
+        assert_eq!(accepted.source_files, record.sources);
+        assert_eq!(accepted.env_deps, record.env_deps);
+
+        // The value the key normalises to a sentinel still has to match raw:
+        // a moved OUT_DIR is how an included generated file changes identity
+        // without any recorded file changing.
+        assert_eq!(
+            validate_prediction(&record, stat, exists, |var| (var == "OUT_DIR")
+                .then(|| "/t/build/other".to_string())),
+            Err(Rejection::EnvChanged)
+        );
+        assert_eq!(
+            validate_prediction(&record, stat, exists, |_| None),
+            Err(Rejection::EnvChanged),
+            "an unset variable is not the value that was recorded"
+        );
+
+        // A file that is gone: the pre-pass would fail too, and the build
+        // passes through to rustc's own error.
+        std::fs::remove_file(&helper).unwrap();
+        assert_eq!(
+            validate_prediction(&record, stat, exists, env),
+            Err(Rejection::Missing)
+        );
+
+        // A path that is no longer a regular file.
+        std::fs::create_dir(&helper).unwrap();
+        assert_eq!(
+            validate_prediction(&record, stat, exists, env),
+            Err(Rejection::NotRegular)
+        );
+        std::fs::remove_dir(&helper).unwrap();
+        std::fs::write(&helper, "pub fn n() {}\n").unwrap();
+
+        // Both spellings of `mod helper;` present: rustc errors (E0761), so
+        // replaying a recorded success would restore an artifact for a build
+        // that should fail.
+        std::fs::create_dir(src.join("helper")).unwrap();
+        std::fs::write(src.join("helper/mod.rs"), "pub fn n() {}\n").unwrap();
+        assert_eq!(
+            validate_prediction(&record, stat, exists, env),
+            Err(Rejection::Sibling)
         );
     }
 

@@ -2086,11 +2086,12 @@ fn run_parsed_rustc(
         }
     };
     let ComputedKey {
-        cache_key,
-        key_ms,
-        key_hash_stats,
-        key_too_new,
-        guard_inputs,
+        mut cache_key,
+        predicted,
+        mut key_ms,
+        mut key_hash_stats,
+        mut key_too_new,
+        mut guard_inputs,
     } = keyed;
     // A force-list request that could not obtain its immediate lease must not
     // retry through the post-key adaptive seed path in the same invocation.
@@ -2177,7 +2178,71 @@ fn run_parsed_rustc(
             );
         }
     };
-    let lookup_ms = lookup_start.elapsed().as_millis() as u64;
+    let mut lookup_ms = lookup_start.elapsed().as_millis() as u64;
+
+    // The rule that keeps a prediction from ever reaching the cache as an
+    // authority: a derived key that MISSES locally is re-derived from a real
+    // pre-pass, and looked up again, before anything downstream sees it.
+    //
+    // A hit needs no such thing — the entry it matched was stored under a key
+    // computed from a discovered closure, so matching it proves the prediction
+    // reproduced that closure. A miss proves nothing, and a stale record on a
+    // second machine could otherwise derive the same wrong key and hit an
+    // entry compiled from a larger input set.
+    let (lookup_result, redrive) = if needs_rederivation(predicted, lookup_result.is_some()) {
+        match recompute_key_without_prediction(
+            config,
+            compiler,
+            args,
+            workspace_root.as_deref(),
+            invocation_start_ns,
+            Some(&store),
+            extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
+        ) {
+            Ok(recomputed) => {
+                cache_key = recomputed.cache_key;
+                // Accumulate rather than replace: the first computation's
+                // measurements already include the extra-inputs resolve, and
+                // this second pass is real time this invocation spent.
+                (key_ms, key_hash_stats, key_too_new) = combine_key_measurements(
+                    key_ms,
+                    recomputed.key_ms,
+                    key_hash_stats,
+                    recomputed.key_hash_stats,
+                    key_too_new,
+                    recomputed.key_too_new,
+                );
+                guard_inputs.extend(recomputed.guard_inputs);
+                // Look up again unconditionally. The key has usually changed,
+                // and when it has not this is one index read set against the
+                // whole pre-pass just paid for.
+                let retry = std::time::Instant::now();
+                let result = store.get(&cache_key).unwrap_or_default();
+                lookup_ms = lookup_ms.saturating_add(retry.elapsed().as_millis() as u64);
+                (result, true)
+            }
+            // The pre-pass failed, which is the ordinary uncacheable case.
+            Err(e) => {
+                return passthrough_with_event(
+                    config,
+                    args,
+                    crate_name,
+                    &event_root,
+                    start,
+                    format!("uncacheable|{e:#}"),
+                );
+            }
+        }
+    } else {
+        (lookup_result, false)
+    };
+
+    // A closure that came from a record is already recorded; re-writing it on
+    // every hit would be a database write per compile for no new information.
+    // A re-derivation is the opposite case: its closure is what the record
+    // should have said, so writing it is what repairs a stale row.
+    let record_closure = should_record_closure(predicted, redrive);
+
     if let Some(meta) = lookup_result {
         // Safety: skip entries with no cached files (poisoned by earlier bugs)
         if meta.files.is_empty() {
@@ -2229,7 +2294,7 @@ fn run_parsed_rustc(
                 restore_ms,
                 0,
             );
-            record_input_prediction(config, Some(&store), args);
+            record_input_prediction(config, Some(&store), args, record_closure);
             print_progress(crate_name, EventResult::LocalHit, elapsed, size);
             // Print cached stdout/stderr
             if !meta.stdout.is_empty() {
@@ -2434,7 +2499,7 @@ fn run_parsed_rustc(
             restore_ms,
             0,
         );
-        record_input_prediction(config, Some(&store), args);
+        record_input_prediction(config, Some(&store), args, record_closure);
         // Replay the original compiler diagnostics, exactly as the other hit
         // sites do, so a coalesced compile does not swallow warnings or notes.
         replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
@@ -2790,7 +2855,7 @@ fn run_parsed_rustc(
         }
     }
 
-    record_input_prediction(config, Some(&store), args);
+    record_input_prediction(config, Some(&store), args, record_closure);
 
     // 7. Clean incremental dir, as with kache's caching, incremental compilation is redundant
     clean_incremental_dir(config, args);
@@ -3279,6 +3344,10 @@ fn missing_requested_emit(args: &RustcArgs, artifacts: &ArtifactSet) -> Option<S
 
 struct ComputedKey {
     cache_key: String,
+    /// Did this key come from a recorded closure rather than the pre-pass?
+    /// The caller owes it a re-derivation before the key may reach anything
+    /// that stores or publishes.
+    predicted: bool,
     key_ms: u64,
     key_hash_stats: FileHashStats,
     key_too_new: bool,
@@ -3299,12 +3368,12 @@ struct ComputedKey {
 /// Silent and best-effort throughout. Every reason to give up (feature off, no
 /// store, no closure to record, no identity) costs a future pre-pass and
 /// nothing else, so none of them is worth a warning on a successful build.
-fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcArgs) {
+fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcArgs, wanted: bool) {
     // Taken before any gate. The closure belongs to this invocation whether or
     // not it gets written, and leaving it in the stash would let whatever key
     // is computed next on this thread record it under a different identity.
     let dep_info = crate::cache_key::take_last_dep_info();
-    if !config.input_predictions {
+    if !config.input_predictions || !wanted {
         return;
     }
     let Some(dep_info) = dep_info else {
@@ -3385,7 +3454,8 @@ fn compute_rustc_cache_key(
     let mut file_hasher = match store {
         Some(store) => store.file_hasher_with_daemon(config.socket_path()),
         None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
-    };
+    }
+    .with_input_predictions(config.input_predictions);
     if config.modified_input_guard {
         // Flag keyed inputs touched at/after this invocation started — their
         // content at hash time may differ from what rustc reads, so we'll look
@@ -3429,11 +3499,63 @@ fn compute_rustc_cache_key(
     );
     Ok(ComputedKey {
         cache_key,
+        predicted: crate::cache_key::take_last_key_used_prediction(),
         key_ms,
         key_hash_stats,
         key_too_new,
         guard_inputs: extra_inputs_guard_inputs,
     })
+}
+
+/// Does this key still owe a re-derivation before anything may act on it?
+///
+/// Only a key that came from a record AND found nothing locally. A hit needs
+/// no check: the entry it matched was stored under a key computed from a
+/// discovered closure, so matching it proves the prediction reproduced that
+/// closure. A key that was never predicted is already the discovered one.
+fn needs_rederivation(predicted: bool, found_locally: bool) -> bool {
+    predicted && !found_locally
+}
+
+/// Should this invocation write what it discovered back to the record?
+///
+/// A closure that came from a record is already recorded, and rewriting it on
+/// every hit would be a database write per compile for no new information. A
+/// re-derivation is the opposite case: its closure is what the record should
+/// have said, so writing it is what repairs a stale row.
+fn should_record_closure(predicted: bool, rederived: bool) -> bool {
+    !predicted || rederived
+}
+
+/// Recompute the key with the dep-info pre-pass, ignoring any record.
+///
+/// Used for exactly one thing: turning a predicted key that missed into a key
+/// discovered the slow way, before the invocation is allowed to store, claim
+/// or ask a remote anything.
+fn recompute_key_without_prediction(
+    config: &Config,
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    workspace_root: Option<&Path>,
+    invocation_start_ns: i64,
+    store: Option<&Store>,
+    extra_inputs_digest: Option<&str>,
+) -> Result<ComputedKey> {
+    let mut without = config.clone();
+    without.input_predictions = false;
+    compute_rustc_cache_key(
+        &without,
+        compiler,
+        args,
+        workspace_root,
+        invocation_start_ns,
+        store,
+        extra_inputs_digest,
+        FileHashStats::default(),
+        false,
+        0,
+        Vec::new(),
+    )
 }
 
 /// Daemon fast path (kunobi-ninja/kache#565): returns `Some(exit_code)` only
@@ -5335,6 +5457,48 @@ mod tests {
         RustcCompiler::new().parse(&s(args)).unwrap()
     }
 
+    /// The two rules that keep a prediction from ever being an authority.
+    ///
+    /// Between them they decide whether a key may reach the remote, the
+    /// scheduler and the store as-is, and whether a record gets rewritten.
+    #[test]
+    fn a_predicted_key_owes_a_rederivation_only_when_it_missed() {
+        // predicted, found locally
+        assert!(
+            !needs_rederivation(true, true),
+            "a predicted key that HIT matched an entry stored under a \
+             discovered closure, which proves the prediction reproduced it"
+        );
+        assert!(
+            needs_rederivation(true, false),
+            "a predicted key that missed has proven nothing and must be \
+             recomputed before anything downstream sees it"
+        );
+        assert!(
+            !needs_rederivation(false, false),
+            "a key that was never predicted is already the discovered one"
+        );
+        assert!(!needs_rederivation(false, true));
+    }
+
+    #[test]
+    fn only_a_fresh_closure_is_worth_recording() {
+        assert!(
+            should_record_closure(false, false),
+            "a closure discovered by the pre-pass is what the record is for"
+        );
+        assert!(
+            !should_record_closure(true, false),
+            "a closure that CAME from the record is already in it; rewriting \
+             it would be a database write per compile for nothing"
+        );
+        assert!(
+            should_record_closure(true, true),
+            "a re-derivation is what repairs a stale row"
+        );
+        assert!(should_record_closure(false, true));
+    }
+
     /// Recording is opt-in and needs somewhere to record. Neither refusal may
     /// leave the discovered closure sitting in the thread-local stash, where
     /// the next key computed on this thread would find it and record another
@@ -5357,7 +5521,7 @@ mod tests {
         // Off by default, which is the state every user is in today.
         assert!(!config.input_predictions);
         stash();
-        record_input_prediction(&config, Some(&store), &args);
+        record_input_prediction(&config, Some(&store), &args, true);
         assert!(
             !recorded(&store),
             "the feature is off; nothing may be written"
@@ -5370,13 +5534,13 @@ mod tests {
         // On, but with no store to record into: the daemon's store-free path.
         config.input_predictions = true;
         stash();
-        record_input_prediction(&config, None, &args);
+        record_input_prediction(&config, None, &args, true);
         assert!(!recorded(&store));
         assert!(crate::cache_key::take_last_dep_info().is_none());
 
         // On, with a store, and a closure to record.
         stash();
-        record_input_prediction(&config, Some(&store), &args);
+        record_input_prediction(&config, Some(&store), &args, true);
         assert!(
             recorded(&store),
             "an enabled build with a store must remember what it discovered"
@@ -5387,7 +5551,7 @@ mod tests {
         // And with nothing in the stash there is nothing to record: an
         // invocation that never ran a pre-pass must not write an empty closure
         // over a good one.
-        record_input_prediction(&config, Some(&store), &args);
+        record_input_prediction(&config, Some(&store), &args, true);
         assert_eq!(
             store
                 .file_hasher()

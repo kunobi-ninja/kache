@@ -169,6 +169,63 @@ cross_pct="$(pct "$base_cross" "$head_cross")"
 regressed="$(awk -v b="$base_warm" -v h="$head_warm" -v lim="$WARM_REGRESSION_LIMIT_PCT" \
     'BEGIN { print (b + 0 > 0 && (h - b) * 100.0 / b > lim + 0) ? "yes" : "no" }')"
 
+# ── Where the warm build's time went ─────────────────────────────────────────
+# The wall-clock rows above say a build got slower. This says which part of the
+# wrapper did it, from the same phase totals the Perfetto trace draws per crate.
+#
+# Reported, never blocking. A phase can move a long way on a small absolute
+# number, and moving time BETWEEN phases is often the intended effect of a
+# change rather than a fault — the reviewer is the one who can tell which.
+# What it removes is the blind spot: a change that shifts time out of one phase
+# into another leaves the total alone and was previously invisible here.
+#
+# Phases are summed over cacheable crates, so they do not add up to the wall
+# clock: a parallel build overlaps them, and passthrough compiles are absent.
+# Zero on both sides means the phase did not run; the row is dropped rather
+# than printed as a 0.0% delta, which would read as "measured and unchanged".
+phase_ms() { jq -r ".warm_same_tree.phases.${2} // 0" "$1"; }
+
+phase_row() {
+    local label="$1" key="$2"
+    local b h
+    b="$(phase_ms "$base_json" "$key")"
+    h="$(phase_ms "$head_json" "$key")"
+    [ "$b" = "0" ] && [ "$h" = "0" ] && return 0
+    echo "| $label | ${b} ms | ${h} ms | $(pct "$b" "$h")% |"
+}
+
+phase_table() {
+    local body
+    body="$(
+        phase_row "startup" startup_ms
+        phase_row "key" key_ms
+        phase_row "&nbsp;&nbsp;dep-info pre-pass" dep_info_ms
+        phase_row "lookup" lookup_ms
+        phase_row "wait (flight + permit)" wait_ms
+        phase_row "restore" restore_ms
+        phase_row "store" store_ms
+        phase_row "unattributed" unattributed_ms
+    )"
+    # Nothing to say for an external backend or pre-schema-17 events.
+    [ -z "$body" ] && return 0
+
+    echo "<details><summary>Warm build, wrapper time by phase</summary>"
+    echo
+    echo "| phase | merge base | PR head | delta |"
+    echo "| --- | ---: | ---: | ---: |"
+    echo "$body"
+    echo
+    echo "Summed over cacheable crates, so these do not add up to the wall clock:"
+    echo "a parallel build overlaps them and passthrough compiles are absent."
+    echo "Reported only — none of these rows fails the gate."
+    local base_runs head_runs
+    base_runs="$(phase_ms "$base_json" dep_info_runs)"
+    head_runs="$(phase_ms "$head_json" dep_info_runs)"
+    echo
+    echo "dep-info pre-pass spawns: ${base_runs} (merge base) / ${head_runs} (PR head)."
+    echo "</details>"
+}
+
 # The workflow's report step parses this first line into the commit status:
 # it strips the leading `## Perf gate: ` and keeps the rest. Keep the grammar.
 if [ "$regressed" = "yes" ]; then
@@ -192,6 +249,8 @@ fi
     echo "are reported for context while their noise floor is still being established."
     echo
     echo "Milliseconds (merge base / PR head): cold ${base_cold} / ${head_cold}, warm ${base_warm} / ${head_warm}, cross-worktree ${base_cross} / ${head_cross}."
+    echo
+    phase_table
 } | tee "$md_out"
 
 if [ "$regressed" = "yes" ]; then

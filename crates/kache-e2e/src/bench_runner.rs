@@ -3711,6 +3711,59 @@ struct PhaseMetrics {
     /// Storage savings — restore method (reflink/hardlink/copy) and
     /// content dedup, from the report's `storage` section.
     storage: StorageInfo,
+    /// Where the phase's wrapper time went, summed over cacheable crates.
+    /// The wall-clock above says a build got slower; this says which part of
+    /// the wrapper did it.
+    phases: PhaseTimes,
+}
+
+/// Wrapper time by phase, in wrapper order, summed over every cacheable crate
+/// of one build phase.
+///
+/// These are the same numbers the Perfetto trace draws per crate. Carried in
+/// the result JSON so the per-PR gate can compare them between the head and
+/// its merge base: a change that moves 200 ms per crate out of `compile` and
+/// into `store` leaves the total wall-clock alone and is invisible without
+/// this breakdown.
+///
+/// Every field is zero for a build whose events predate schema 17, and for
+/// external cache backends, which have no wrapper to instrument.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PhaseTimes {
+    /// Process start to wrapper entry.
+    startup_ms: u64,
+    /// Key computation, including the dep-info pre-pass below.
+    key_ms: u64,
+    /// The rustc dep-info pre-pass: a whole extra compiler start per
+    /// invocation, inside `key_ms`.
+    dep_info_ms: u64,
+    /// How many of those the phase actually spawned.
+    dep_info_runs: u64,
+    lookup_ms: u64,
+    /// Flight join plus permit acquisition.
+    wait_ms: u64,
+    restore_ms: u64,
+    store_ms: u64,
+    /// Wrapper time no phase accounts for.
+    unattributed_ms: u64,
+}
+
+impl PhaseTimes {
+    fn from_raw(raw: &serde_json::Value) -> Self {
+        let sum = &raw["summary"];
+        let ms = |key: &str| sum[key].as_u64().unwrap_or(0);
+        Self {
+            startup_ms: ms("total_startup_ms"),
+            key_ms: ms("total_key_ms"),
+            dep_info_ms: ms("total_dep_info_ms"),
+            dep_info_runs: ms("dep_info_runs"),
+            lookup_ms: ms("total_lookup_ms"),
+            wait_ms: ms("total_wait_ms"),
+            restore_ms: ms("total_restore_ms"),
+            store_ms: ms("total_store_ms"),
+            unattributed_ms: ms("total_unattributed_ms"),
+        }
+    }
 }
 
 impl PhaseMetrics {
@@ -3751,6 +3804,7 @@ impl PhaseMetrics {
             event_log,
             leak_warnings,
             storage: StorageInfo::from_raw(raw),
+            phases: PhaseTimes::from_raw(raw),
         }
     }
 }
@@ -4092,14 +4146,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("invoked.txt");
         let kache = fake_kache_that_records(dir.path(), &marker, 0);
-        let dest = dir.path().join("cache-otlp-warm");
-        assert!(write_cache_otlp_or_warn(
+        assert!(write_otlp_until_spawned(
             &kache,
             dir.path(),
-            &dir.path().join("kache.toml"),
-            &dest,
+            &marker,
             "bench-firefox",
-            "warm",
+            "warm"
         ));
         let invoked = std::fs::read_to_string(&marker).unwrap();
         assert!(
@@ -4121,15 +4173,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("invoked.txt");
         let kache = fake_kache_that_records(dir.path(), &marker, 1);
-        assert!(!write_cache_otlp_or_warn(
+        assert!(!write_otlp_until_spawned(
             &kache,
             dir.path(),
-            &dir.path().join("kache.toml"),
-            &dir.path().join("cache-otlp-cold"),
+            &marker,
             "bench-firefox",
-            "cold",
+            "cold"
         ));
-        assert!(marker.is_file());
+        assert!(marker.is_file(), "the stand-in never ran");
     }
 
     #[test]
@@ -4143,6 +4194,88 @@ mod tests {
             "bench-firefox",
             "pull",
         ));
+    }
+
+    /// Every field here is a key in `kache report --format json`. Nothing else
+    /// couples the two, so a renamed field in the report would silently turn
+    /// this table into zeroes — which reads as "the phase did not run" rather
+    /// than "we stopped reading it".
+    #[test]
+    fn phase_times_read_the_report_summary_field_by_field() {
+        let raw = serde_json::json!({
+            "summary": {
+                "total_startup_ms": 11,
+                "total_key_ms": 22,
+                "total_dep_info_ms": 33,
+                "dep_info_runs": 44,
+                "total_lookup_ms": 55,
+                "total_wait_ms": 66,
+                "total_restore_ms": 77,
+                "total_store_ms": 88,
+                "total_unattributed_ms": 99,
+            }
+        });
+        let phases = PhaseTimes::from_raw(&raw);
+        assert_eq!(phases.startup_ms, 11);
+        assert_eq!(phases.key_ms, 22);
+        assert_eq!(phases.dep_info_ms, 33);
+        assert_eq!(phases.dep_info_runs, 44);
+        assert_eq!(phases.lookup_ms, 55);
+        assert_eq!(phases.wait_ms, 66);
+        assert_eq!(phases.restore_ms, 77);
+        assert_eq!(phases.store_ms, 88);
+        assert_eq!(phases.unattributed_ms, 99);
+
+        // A report without them — an external cache backend, or events from
+        // before the schema carried these — reads as zero, and the gate then
+        // prints no table rather than a wall of 0.0% deltas.
+        assert_eq!(
+            PhaseTimes::from_raw(&serde_json::json!({"summary": {}})),
+            PhaseTimes::default()
+        );
+        assert_eq!(
+            PhaseTimes::from_raw(&serde_json::json!({})),
+            PhaseTimes::default()
+        );
+    }
+
+    /// Call `write_cache_otlp_or_warn` until the stand-in it spawns actually
+    /// ran, and return what the call reported.
+    ///
+    /// Linux refuses to exec a file any process still holds open for writing
+    /// (ETXTBSY). This suite runs in parallel and spawns processes, so a child
+    /// can inherit the writable fd of a stand-in another test just wrote, and
+    /// the exec fails for as long as that child lives — microseconds, and
+    /// nothing to do with the behaviour under test. macOS does not enforce
+    /// this at all, which is how a test that fails on Linux and passes here
+    /// shipped: nothing runs the e2e crate's tests on Linux except the
+    /// mutation lane's baseline, and only when a change touches this crate.
+    ///
+    /// The retry is bounded, so a stand-in that genuinely never runs still
+    /// fails the assertion that follows rather than hanging.
+    fn write_otlp_until_spawned(
+        kache: &Path,
+        dir: &Path,
+        marker: &Path,
+        scenario: &str,
+        phase: &str,
+    ) -> bool {
+        let mut reported = false;
+        for _ in 0..50 {
+            reported = write_cache_otlp_or_warn(
+                kache,
+                dir,
+                &dir.join("kache.toml"),
+                &dir.join(format!("cache-otlp-{phase}")),
+                scenario,
+                phase,
+            );
+            if marker.is_file() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        reported
     }
 
     fn fake_kache_that_records(dir: &Path, marker: &Path, exit: i32) -> PathBuf {
@@ -4602,6 +4735,7 @@ mod tests {
                 blob_bytes: 0,
                 dedup_saved_bytes: 0,
             },
+            phases: PhaseTimes::default(),
         }
     }
 

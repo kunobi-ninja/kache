@@ -4391,6 +4391,99 @@ fn cc_trace_name(parsed: &CcArgs) -> String {
         .unwrap_or_else(|| "cc".to_string())
 }
 
+/// Digest the shadowing risk for the headers a preprocess actually read.
+///
+/// The walk below exists because a header appearing in an earlier include
+/// directory can shadow one that was read, without changing any recorded
+/// fingerprint. It answers that by listing everything that could exist. This
+/// answers it by looking only at what could actually shadow: a new file can
+/// only take the place of a header we read if it carries the **same relative
+/// name** and sits **earlier in the search order** than the directory that
+/// provided it.
+///
+/// So for each header read, resolve which user include directory first
+/// provides its relative name and fold that position. A file appearing ahead
+/// of it moves the position and therefore the key; a file appearing anywhere
+/// else cannot shadow anything and is correctly ignored, where the walk would
+/// have invalidated every unit naming that directory.
+///
+/// Costs one `stat` per candidate directory up to the first that provides the
+/// name, rather than a full enumeration, so there is no cap to exceed. A stat
+/// that fails for any reason other than absence fails closed, as the walk
+/// does for an unreadable directory.
+fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Result<String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let dirs = cc_user_include_dirs(parsed, &cwd);
+
+    // One entry per distinct relative name: the same header read twice, or
+    // two units reading it, resolve identically.
+    let mut names: Vec<PathBuf> = Vec::new();
+    for input in read_inputs {
+        let absolute = absolutize_path(&cwd, input);
+        // Two spellings could have reached this file, and the search order
+        // is checked for both. The path relative to the MOST SPECIFIC user
+        // directory containing it, which is what an `#include "sub/h.h"`
+        // resolves through; directories nest, so the first match is not
+        // necessarily the one that provided it. And the bare file name,
+        // which is what an angle include resolves through and the only
+        // spelling available for a header read from outside every user
+        // directory. Folding both over-detects rather than under-detects:
+        // an extra resolution can only cost a miss.
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(relative) = dirs
+            .iter()
+            .filter_map(|dir| absolute.strip_prefix(dir).ok())
+            .min_by_key(|relative| relative.components().count())
+        {
+            candidates.push(relative.to_path_buf());
+        }
+        if let Some(file_name) = absolute.file_name() {
+            candidates.push(PathBuf::from(file_name));
+        }
+        for candidate in candidates {
+            if !names.contains(&candidate) {
+                names.push(candidate);
+            }
+        }
+    }
+    names.sort();
+
+    let mut hasher = blake3::Hasher::new();
+    for name in &names {
+        hasher.update(name.as_os_str().as_encoded_bytes());
+        hasher.update(b"\x1f");
+        match cc_first_include_dir_providing(&dirs, name)? {
+            Some(index) => {
+                hasher.update(b"@");
+                hasher.update(index.to_string().as_bytes());
+            }
+            None => {
+                hasher.update(b"-");
+            }
+        }
+        hasher.update(b"\n");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Index of the first user include directory that provides `name`, stopping
+/// at the first hit. `None` when no directory does, which is itself a fact
+/// worth keying: a directory later gaining the name changes it.
+fn cc_first_include_dir_providing(dirs: &[PathBuf], name: &Path) -> Result<Option<usize>> {
+    for (index, dir) in dirs.iter().enumerate() {
+        let candidate = dir.join(name);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => return Ok(Some(index)),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => anyhow::bail!(
+                "cc include candidate {} is unreadable ({error})",
+                candidate.display()
+            ),
+        }
+    }
+    Ok(None)
+}
+
 /// Maximum file names walked across every user include dir. A partial
 /// listing could miss the shadowing header the digest exists to catch,
 /// so overflow is fail-closed passthrough rather than a truncated key.
@@ -4581,7 +4674,9 @@ pub struct CcCompiler {
     /// cc key probes and the real compiler invocation.
     base_dirs: Vec<String>,
     pending_preprocess_memo: RefCell<Option<PendingCcPreprocessMemo>>,
-    pending_include_dir_digest: RefCell<Option<String>>,
+    /// The shadowing digest folded into the key, with the read set it was
+    /// resolved from, so the publish-time recheck can reproduce it exactly.
+    pending_include_dir_digest: RefCell<Option<(String, Option<Vec<PathBuf>>)>>,
 }
 
 const C_FAMILY_DRIVERS: [(&str, ToolFamily); 7] = [
@@ -4691,10 +4786,18 @@ impl CcCompiler {
     /// the key. A new shadowing header during compile must not be published
     /// under the old key.
     pub(crate) fn include_dir_names_still_match(&self, parsed: &CcArgs) -> bool {
-        let Ok(now) = digest_cc_include_dir_names(parsed) else {
+        let pending = self.pending_include_dir_digest.borrow();
+        let Some((digest, read_inputs)) = pending.as_ref() else {
             return false;
         };
-        self.pending_include_dir_digest.borrow().as_deref() == Some(now.as_str())
+        // Recompute the way the key did. Resolving against a different set of
+        // names than the key used would compare two unrelated digests and
+        // refuse every store.
+        let now = match read_inputs {
+            Some(inputs) => digest_cc_include_shadowing(parsed, inputs),
+            None => digest_cc_include_dir_names(parsed),
+        };
+        now.is_ok_and(|now| now == *digest)
     }
 
     /// Does this argv invoke a C-family compiler?
@@ -5268,25 +5371,6 @@ impl Compiler for CcCompiler {
             );
         }
 
-        // Names in user include dirs. Preprocess fingerprints only cover
-        // files that were already read; a header that appears in an earlier
-        // `-I`/`-iquote` dir (or next to the source) can shadow one of those
-        // without changing the fingerprints. Digest names, not contents.
-        // Unreadable dirs and a walk that exceeds the cap fail closed.
-        let include_dir_digest = digest_cc_include_dir_names(parsed)?;
-        self.pending_include_dir_digest
-            .borrow_mut()
-            .replace(include_dir_digest.clone());
-        hasher.update(b"include_dir_names:");
-        hasher.update(include_dir_digest.as_bytes());
-        hasher.update(b"\n");
-        tracing::trace!(
-            target: "kache::cache_key",
-            "[key:{}] include_dir_names={}",
-            trace_name,
-            include_dir_digest
-        );
-
         // Preprocessor expansion — the load-bearing input. Captures
         // the source plus every transitively-included header plus
         // macro expansion. `-E -P` strips line markers so header
@@ -5297,22 +5381,32 @@ impl Compiler for CcCompiler {
             .supports_cc_preprocess_memo()
             .then(|| cc_preprocess_memo_key(parsed, &prefix_maps, &resolved.version_line))
             .flatten();
-        let pp_hash = if let Some(memo_hash) = memo_key.as_ref().and_then(|key| {
-            ctx.file_hasher.cc_preprocess_memo_lookup(
-                key,
-                |name| cc_unmapped_path_candidates(name, &prefix_maps),
-                &|path| cc_mapped_content_hash(path, &prefix_maps),
-            )
-        }) {
+        // The read set comes back with the expansion, from the memo when it
+        // answers and from the dependency capture otherwise. It is what makes
+        // the shadowing resolution below possible.
+        let (pp_hash, read_inputs) = if let Some((memo_hash, satisfied)) =
+            memo_key.as_ref().and_then(|key| {
+                ctx.file_hasher.cc_preprocess_memo_lookup(
+                    key,
+                    |name| cc_unmapped_path_candidates(name, &prefix_maps),
+                    &|path| cc_mapped_content_hash(path, &prefix_maps),
+                )
+            }) {
             tracing::trace!(
                 target: "kache::cache_key",
                 "[key:{}] preprocessed_memo=hit",
                 trace_name
             );
-            memo_hash
+            (memo_hash, Some(satisfied))
         } else {
             let preprocessed =
                 preprocess_hash(parsed, &prefix_maps, ctx.file_hasher, memo_key.is_some())?;
+            let read_inputs = preprocessed.fingerprints.as_ref().map(|inputs| {
+                inputs
+                    .iter()
+                    .map(|input| PathBuf::from(input.local_path()))
+                    .collect::<Vec<_>>()
+            });
             if let (Some(memo_key), Some(fingerprints)) = (memo_key, preprocessed.fingerprints) {
                 self.pending_preprocess_memo
                     .borrow_mut()
@@ -5328,7 +5422,7 @@ impl Compiler for CcCompiler {
                 "[key:{}] preprocessed_memo=miss",
                 trace_name
             );
-            preprocessed.hash
+            (preprocessed.hash, read_inputs)
         };
         hasher.update(b"preprocessed:");
         hasher.update(pp_hash.as_bytes());
@@ -5338,6 +5432,31 @@ impl Compiler for CcCompiler {
             "[key:{}] preprocessed={}",
             trace_name,
             pp_hash
+        );
+
+        // Shadowing. A header appearing in an earlier `-I`/`-iquote` dir (or
+        // next to the source) can take the place of one that was read without
+        // changing any fingerprint, so the key has to notice it. With the read
+        // set in hand this resolves only the names that could actually be
+        // shadowed; without it (a compiler whose dependency capture failed)
+        // fall back to enumerating the directories, which is what the capped
+        // walk has always done.
+        let (include_dir_digest, include_dir_mode) = match &read_inputs {
+            Some(inputs) => (digest_cc_include_shadowing(parsed, inputs)?, "resolved"),
+            None => (digest_cc_include_dir_names(parsed)?, "walked"),
+        };
+        self.pending_include_dir_digest
+            .borrow_mut()
+            .replace((include_dir_digest.clone(), read_inputs));
+        hasher.update(b"include_dir_names:");
+        hasher.update(include_dir_digest.as_bytes());
+        hasher.update(b"\n");
+        tracing::trace!(
+            target: "kache::cache_key",
+            "[key:{}] include_dir_names={} mode={}",
+            trace_name,
+            include_dir_digest,
+            include_dir_mode
         );
 
         let key = hasher.finalize().to_hex().to_string();
@@ -10749,6 +10868,140 @@ mod tests {
         (crate::cache_key::FileHasher::new(), dir.join("cache"))
     }
 
+    /// The property the whole guard exists for, on the resolution path: a
+    /// header appearing in an earlier directory shadows one that was read,
+    /// without changing any recorded content, so the key has to move.
+    #[test]
+    fn include_shadowing_notices_a_header_appearing_ahead_of_the_one_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let read = second.join("header.h");
+        fs::write(&read, "#define A 1\n").unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "#include \"header.h\"\nint x;\n").unwrap();
+
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            first.to_str().unwrap(),
+            "-I",
+            second.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let inputs = vec![source.clone(), read.clone()];
+
+        let before = digest_cc_include_shadowing(&parsed, &inputs).unwrap();
+        fs::write(first.join("header.h"), "#define A 2\n").unwrap();
+        let after = digest_cc_include_shadowing(&parsed, &inputs).unwrap();
+        assert_ne!(
+            before, after,
+            "a header ahead of the one that was read must change the key"
+        );
+
+        // And removing it again returns to the original resolution.
+        fs::remove_file(first.join("header.h")).unwrap();
+        assert_eq!(
+            digest_cc_include_shadowing(&parsed, &inputs).unwrap(),
+            before
+        );
+    }
+
+    /// The precision the walk did not have. A file that no unit could
+    /// include cannot shadow anything, so it must not move the key; the walk
+    /// invalidated every unit naming that directory.
+    #[test]
+    fn include_shadowing_ignores_a_name_that_was_never_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let include = temp.path().join("inc");
+        fs::create_dir(&include).unwrap();
+        let read = include.join("header.h");
+        fs::write(&read, "int h;\n").unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "#include \"header.h\"\nint x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let inputs = vec![source.clone(), read.clone()];
+
+        let before = digest_cc_include_shadowing(&parsed, &inputs).unwrap();
+        for name in ["unrelated.h", "other.hpp", "header.o", "notes.txt"] {
+            fs::write(include.join(name), "x").unwrap();
+        }
+        assert_eq!(
+            digest_cc_include_shadowing(&parsed, &inputs).unwrap(),
+            before,
+            "names no unit read cannot shadow and must not churn the key"
+        );
+
+        // The scale this buys: thousands of unrelated names cost nothing,
+        // where the walk refused past its cap.
+        let big = temp.path().join("big");
+        fs::create_dir(&big).unwrap();
+        for i in 0..12_000 {
+            fs::write(big.join(format!("h{i}.h")), "x").unwrap();
+        }
+        let wide = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            include.to_str().unwrap(),
+            "-I",
+            big.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert!(
+            digest_cc_include_shadowing(&wide, &inputs).is_ok(),
+            "a large include tree must resolve rather than refuse"
+        );
+        assert!(
+            digest_cc_include_dir_names(&wide).is_err(),
+            "the walk this replaces would have refused the same tree"
+        );
+    }
+
+    /// A header read from outside any user directory can still be shadowed by
+    /// one, since user directories are searched first.
+    #[test]
+    fn include_shadowing_covers_headers_read_from_outside_the_user_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("user");
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir(&user).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        let read = elsewhere.join("stdio.h");
+        fs::write(&read, "int puts(const char*);\n").unwrap();
+        let source = temp.path().join("unit.c");
+        fs::write(&source, "int x;\n").unwrap();
+        let parsed = CcArgs::parse(&s(&[
+            "cc",
+            "-c",
+            source.to_str().unwrap(),
+            "-I",
+            user.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let inputs = vec![source.clone(), read.clone()];
+
+        let before = digest_cc_include_shadowing(&parsed, &inputs).unwrap();
+        fs::write(user.join("stdio.h"), "int puts(const char*);\n").unwrap();
+        assert_ne!(
+            digest_cc_include_shadowing(&parsed, &inputs).unwrap(),
+            before,
+            "a user dir gaining the name of a system header must change the key"
+        );
+    }
+
     #[test]
     fn include_dir_digest_changes_when_an_earlier_dir_gains_a_header() {
         let temp = tempfile::tempdir().unwrap();
@@ -11068,6 +11321,43 @@ mod tests {
         fs::write(system.join("shadow.h"), "int s;\n").unwrap();
         let after = digest_cc_include_dir_names(&parsed).unwrap();
         assert_eq!(before, after, "-isystem roots must stay exempt");
+    }
+
+    /// A directory we cannot stat into is not the same as one that does not
+    /// have the header. Only ENOENT means absent; anything else leaves the
+    /// resolution unknown, and an unknown shadowing order must refuse rather
+    /// than key as if the search had reached the end.
+    #[cfg(unix)]
+    #[test]
+    fn include_dir_resolution_separates_absent_from_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(second.join("shadow.h"), "int s;\n").unwrap();
+        let dirs = vec![first.clone(), second.clone()];
+        let name = Path::new("shadow.h");
+
+        assert_eq!(
+            cc_first_include_dir_providing(&dirs, name).unwrap(),
+            Some(1),
+            "an empty first dir is genuinely absent, so the search goes on"
+        );
+        assert_eq!(
+            cc_first_include_dir_providing(&dirs, Path::new("nowhere.h")).unwrap(),
+            None,
+            "no dir providing the name is an answer in itself"
+        );
+
+        // The same search, with the first directory unreadable rather than
+        // empty, must not silently arrive at the second one.
+        fs::set_permissions(&first, fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = cc_first_include_dir_providing(&dirs, name);
+        fs::set_permissions(&first, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = blocked.expect_err("an unreadable include dir must fail closed");
+        assert!(err.to_string().contains("unreadable"), "got {err}");
     }
 
     #[cfg(unix)]

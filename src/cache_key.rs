@@ -245,7 +245,7 @@ use std::path::{Path, PathBuf};
 // passthrough. Windows GNU, cross-target, and metadata invocations remain
 // unprobed. Existing Windows linked-output keys did not contain this
 // identity, so invalidate them rather than mix schemas.
-pub(crate) const CACHE_KEY_VERSION: u32 = 30;
+pub(crate) const CACHE_KEY_VERSION: u32 = 31;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -2592,6 +2592,14 @@ pub(crate) struct CcPreprocessMemoInput {
     mapped: String,
 }
 
+impl CcPreprocessMemoInput {
+    /// Where this input was when it was recorded. Local to the recording
+    /// checkout; a reader that resolved the name elsewhere has its own path.
+    pub(crate) fn local_path(&self) -> &str {
+        &self.fingerprint.path
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FileFingerprint {
     path: String,
@@ -2768,7 +2776,7 @@ impl<'db> FileHasher<'db> {
         memo_key: &str,
         resolve: impl Fn(&str) -> Vec<PathBuf>,
         mapped_content: &impl Fn(&Path) -> Option<String>,
-    ) -> Option<String> {
+    ) -> Option<(String, Vec<PathBuf>)> {
         let cache = self.cache.as_ref()?;
         let record = match cache.get_cc_preprocess_memo(memo_key) {
             Ok(record) => record?,
@@ -2796,12 +2804,14 @@ impl<'db> FileHasher<'db> {
         if inputs.is_empty() {
             return None;
         }
+        // The paths that satisfied the memo are the inputs this invocation
+        // would have discovered by preprocessing, and the caller needs them to
+        // resolve include shadowing without a fresh dependency capture.
+        let mut satisfied = Vec::with_capacity(inputs.len());
         for expected in &inputs {
-            if !self.memo_input_is_unchanged(expected, &resolve, mapped_content) {
-                return None;
-            }
+            satisfied.push(self.memo_input_is_unchanged(expected, &resolve, mapped_content)?);
         }
-        Some(record.0)
+        Some((record.0, satisfied))
     }
 
     /// Does this input still hold the bytes the memo was recorded against?
@@ -2814,7 +2824,7 @@ impl<'db> FileHasher<'db> {
         expected: &CcPreprocessMemoInput,
         resolve: &impl Fn(&str) -> Vec<PathBuf>,
         mapped_content: &impl Fn(&Path) -> Option<String>,
-    ) -> bool {
+    ) -> Option<PathBuf> {
         // Only where THIS invocation resolves the recorded name. The path the
         // recording checkout used is not a candidate on its own merit: it may
         // still exist, unmodified, while the tree being compiled now has an
@@ -2833,18 +2843,18 @@ impl<'db> FileHasher<'db> {
             // bytes come from the content cache, and only a file differing in
             // both is read through the maps.
             if current == expected.fingerprint {
-                return true;
+                return Some(path.clone());
             }
             if self
                 .hash(path)
                 .is_ok_and(|content| content == expected.content)
             {
-                return true;
+                return Some(path.clone());
             }
             if !expected.mapped.is_empty()
                 && mapped_content(path).is_some_and(|mapped| mapped == expected.mapped)
             {
-                return true;
+                return Some(path.clone());
             }
         }
         tracing::debug!(
@@ -2852,7 +2862,7 @@ impl<'db> FileHasher<'db> {
             expected.name,
             candidates.len()
         );
-        false
+        None
     }
 
     /// Capture the source/header metadata and contents observed immediately
@@ -2932,11 +2942,14 @@ impl<'db> FileHasher<'db> {
             // Recording happens in the checkout that just ran the preprocess,
             // so each name resolves to the path it was captured from.
             let recorded_path = PathBuf::from(&expected.fingerprint.path);
-            if !self.memo_input_is_unchanged(
-                expected,
-                &|_: &str| vec![recorded_path.clone()],
-                mapped_content,
-            ) {
+            if self
+                .memo_input_is_unchanged(
+                    expected,
+                    &|_: &str| vec![recorded_path.clone()],
+                    mapped_content,
+                )
+                .is_none()
+            {
                 return;
             }
         }
@@ -8485,6 +8498,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert_eq!(
             hasher
                 .cc_preprocess_memo_lookup("memo-key", no_remap, &no_mapping)
+                .map(|(hash, _)| hash)
                 .as_deref(),
             Some(pp_hash.as_str())
         );
@@ -8515,6 +8529,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert_eq!(
             fresh_hasher
                 .cc_preprocess_memo_lookup("memo-key", no_remap, &no_mapping)
+                .map(|(hash, _)| hash)
                 .as_deref(),
             Some(pp_hash.as_str()),
             "unchanged bytes must hit however recently they were written"
@@ -8621,6 +8636,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert_eq!(
             FileHasher::persistent(&db)
                 .cc_preprocess_memo_lookup("memo-key", resolve_in_b, &map_under(&b))
+                .map(|(hash, _)| hash)
                 .as_deref(),
             Some(pp_hash.as_str()),
             "the same header under another root must reuse the expansion"
@@ -8692,6 +8708,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert_eq!(
             FileHasher::persistent(&db)
                 .cc_preprocess_memo_lookup("memo-key", resolve_in_relocated, &no_mapping)
+                .map(|(hash, _)| hash)
                 .as_deref(),
             Some(pp_hash.as_str()),
             "an identical copy in another tree must still reuse the expansion"
@@ -8747,6 +8764,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert_eq!(
             reader
                 .cc_preprocess_memo_lookup("memo-key", no_remap, &no_mapping)
+                .map(|(hash, _)| hash)
                 .as_deref(),
             Some(pp_hash.as_str()),
             "identical bytes at new metadata must reuse the expansion"

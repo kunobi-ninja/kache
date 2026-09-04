@@ -3565,6 +3565,14 @@ fn is_extra_filename_option(value: &str) -> bool {
 /// output configuration: `--emit dep-info -o <dep_file>`. Dropped on the way:
 ///
 /// - `--emit` / `--out-dir` / `-o`, superseded by the pre-pass's own pair.
+///   The joined spellings go too: `-oFILE` (which rustc accepts), a joined
+///   `--out-dir=DIR`, and single-dash `-out-dir`, which rustc parses as `-o`
+///   plus junk ("option `-o` has no space between flag name and value"). A
+///   leftover joins the pre-pass's own `-o` and rustc rejects the pair with
+///   "Option 'o' given more than once", exit 1 — a permanent passthrough for
+///   every invocation using that spelling (kunobi-ninja/kache#896). The value
+///   is inline, so unlike bare `-o` no following argument is consumed, and
+///   the match is case-sensitive: `-O` (opt-level) is kept.
 /// - `-C extra-filename`, which names output artifacts the pre-pass never
 ///   produces. rustc warns "ignoring -C extra-filename flag due to -o flag"
 ///   whenever both are present, and because that warning is emitted while the
@@ -3595,6 +3603,9 @@ fn dep_info_pass_args(source_file: &Path, rustc_args: &[String], dep_file: &Path
                 remaining.next();
             }
             _ if arg.starts_with("--emit=") || arg.starts_with("--out-dir=") => {}
+            // Joined output form: `-oFILE`. Value is inline — consume nothing
+            // further. (Exact `-o` is handled above, with its value.)
+            _ if arg.starts_with("-o") => {}
             // Joined codegen forms: `-Cextra-filename=…`, `--codegen=extra-filename=…`.
             _ if arg
                 .strip_prefix("-C")
@@ -3718,7 +3729,7 @@ pub fn run_dep_info_pass(
         );
     }
 
-    let dep_content = std::fs::read_to_string(&dep_file).context("reading dep-info output")?;
+    let dep_content = read_dep_info_file(&dep_file)?;
 
     let mut source_files = parse_dep_info(&dep_content);
     if source_files.is_empty() {
@@ -3737,6 +3748,19 @@ pub fn run_dep_info_pass(
         source_files,
         env_deps,
     })
+}
+
+/// Read a dep-info file rustc just wrote.
+///
+/// Split out of [`run_dep_info_pass`] so the encoding failure gets its own
+/// diagnosis: a non-UTF8 filename or env value in the source closure lands
+/// verbatim in this file, and `read_to_string` would refuse it with only
+/// "stream did not contain valid UTF-8" — no hint which input set stayed
+/// uncached. Fail closed with the cause named, never lossy: a lossy path
+/// would hash a filename that exists nowhere on disk.
+fn read_dep_info_file(dep_file: &Path) -> Result<String> {
+    let bytes = std::fs::read(dep_file).context("reading dep-info output")?;
+    String::from_utf8(bytes).context("dep-info output is not valid UTF-8")
 }
 
 /// Parse a Makefile-style dep-info file to extract source file paths.
@@ -9138,6 +9162,188 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert!(
             dep_args.iter().any(|a| a == "-C"),
             "a valueless -C is not an extra-filename: {dep_args:?}"
+        );
+    }
+
+    #[test]
+    fn dep_info_pass_args_drops_joined_output_flag() {
+        // rustc accepts `-o` with its value attached, and reads single-dash
+        // `-out-dir` as `-o` plus junk ("option `-o` has no space between
+        // flag name and value"). A leftover joins the pre-pass's own `-o`
+        // and rustc exits 1 with "Option 'o' given more than once" — every
+        // build using that spelling stays a passthrough
+        // (kunobi-ninja/kache#896).
+        let args: Vec<String> = [
+            "--crate-name",
+            "mylib",
+            "-o/tmp/original.rlib",
+            "--edition=2021",
+            "-O",
+            "--out-dir=/tmp/original-deps",
+            "-out-dir",
+            "/tmp/still-positional",
+            "src/lib.rs",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+
+        let dep_args = dep_info_pass_args(Path::new("src/lib.rs"), &args, Path::new("/tmp/deps.d"));
+
+        let outputs: Vec<&String> = dep_args.iter().filter(|a| a.starts_with("-o")).collect();
+        assert_eq!(
+            outputs,
+            ["-o"],
+            "only the pre-pass's own -o may survive: {dep_args:?}"
+        );
+        for dropped in [
+            "-o/tmp/original.rlib",
+            "-out-dir",
+            "--out-dir=/tmp/original-deps",
+        ] {
+            assert!(
+                !dep_args.iter().any(|a| a == dropped),
+                "{dropped} names an output the pre-pass discards: {dep_args:?}"
+            );
+        }
+        assert!(
+            dep_args.iter().any(|a| a == "/tmp/still-positional"),
+            "single-dash -out-dir takes no separate value: rustc reads the next \
+             token as a positional, and the pre-pass must fail on it exactly as \
+             the real build does: {dep_args:?}"
+        );
+        assert!(
+            dep_args.iter().any(|a| a == "-O"),
+            "capital -O is opt-level, not output: {dep_args:?}"
+        );
+        assert!(
+            dep_args.iter().any(|a| a == "--edition=2021"),
+            "the token after a joined -o is a real flag, not its value: {dep_args:?}"
+        );
+        let tail = &dep_args[dep_args.len() - 4..];
+        assert_eq!(
+            tail,
+            [
+                "--emit",
+                "dep-info",
+                "-o",
+                "/tmp/deps.d".to_string().as_str()
+            ]
+            .map(String::from),
+            "the pre-pass appends exactly one output configuration"
+        );
+    }
+
+    #[test]
+    fn dep_info_pass_args_strips_every_incremental_spelling() {
+        // All four `-C incremental` spellings rustc accepts must go through
+        // the canonical filter before the pre-pass runs: a leftover would aim
+        // the dep-info run at cargo's incremental dir
+        // (kunobi-ninja/kache#896). A bare `-C incremental` (no `=value`) is
+        // not valid rustc — it stays, so rustc rejects it exactly as it
+        // rejects the real build ("requires a string").
+        let args: Vec<String> = [
+            "--crate-name",
+            "mylib",
+            "-Cincremental=/tmp/incr-joined",
+            "-C",
+            "incremental=/tmp/incr-split",
+            "--codegen=incremental=/tmp/incr-long-joined",
+            "--codegen",
+            "incremental=/tmp/incr-long-split",
+            "src/lib.rs",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+
+        let dep_args = dep_info_pass_args(Path::new("src/lib.rs"), &args, Path::new("/tmp/deps.d"));
+
+        assert!(
+            !dep_args.iter().any(|a| a.contains("incremental")),
+            "no incremental spelling may reach the pre-pass: {dep_args:?}"
+        );
+        assert!(
+            dep_args.iter().any(|a| a == "mylib"),
+            "stripping must not swallow neighbouring flags: {dep_args:?}"
+        );
+
+        let bare: Vec<String> = ["--crate-name", "mylib", "-C", "incremental", "src/lib.rs"]
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect();
+        let dep_bare = dep_info_pass_args(Path::new("src/lib.rs"), &bare, Path::new("/tmp/deps.d"));
+
+        assert!(
+            dep_bare.iter().any(|a| a == "incremental"),
+            "a valueless incremental is rustc's to reject, not the pre-pass's to guess: {dep_bare:?}"
+        );
+    }
+
+    #[test]
+    fn dep_info_pass_prepass_succeeds_through_response_file() {
+        // The `use_response_file` path — taken whenever cargo's own argv
+        // arrived via `@file` — had no coverage. A crate under a path with
+        // spaces exercises the verbatim one-arg-per-line round-trip, which is
+        // exactly what an expanded largest-crate argv looks like
+        // (kunobi-ninja/kache#896).
+        let dir = tempfile::Builder::new()
+            .prefix("kache depinfo space ")
+            .tempdir()
+            .unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), b"mod server;\npub fn hello() {}").unwrap();
+        std::fs::write(src.join("server.rs"), b"pub fn serve() {}").unwrap();
+
+        let rustc = std::path::PathBuf::from("rustc");
+        let source = src.join("lib.rs");
+        let args = vec![
+            "--crate-name".to_string(),
+            "testcrate".to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "--edition".to_string(),
+            "2021".to_string(),
+        ];
+
+        let dep_info = run_dep_info_pass(&rustc, None, &source, &args, true)
+            .expect("the response-file pre-pass must match the direct one");
+
+        assert!(
+            dep_info.source_files.iter().any(|p| p.ends_with("lib.rs")),
+            "expected the crate root: {:?}",
+            dep_info.source_files
+        );
+        assert!(
+            dep_info
+                .source_files
+                .iter()
+                .any(|p| p.ends_with("server.rs")),
+            "an incomplete source list is what makes a crate uncacheable: {:?}",
+            dep_info.source_files
+        );
+    }
+
+    #[test]
+    fn read_dep_info_file_rejects_non_utf8() {
+        // A non-UTF8 filename or env value in the source closure lands
+        // verbatim in rustc's dep-info output. The pre-pass must refuse it
+        // with the encoding named — not a bare "stream did not contain valid
+        // UTF-8" against an unnamed input set (kunobi-ninja/kache#896).
+        let dir = tempfile::tempdir().unwrap();
+        let dep_file = dir.path().join("deps.d");
+        std::fs::write(&dep_file, b"/tmp/x.d: src/lib.rs\n").unwrap();
+        assert_eq!(
+            read_dep_info_file(&dep_file).unwrap(),
+            "/tmp/x.d: src/lib.rs\n"
+        );
+
+        std::fs::write(&dep_file, b"/tmp/x.d: src/\xfflib.rs\n").unwrap();
+        let err = format!("{:#}", read_dep_info_file(&dep_file).unwrap_err());
+        assert!(
+            err.contains("not valid UTF-8"),
+            "the refusal must name the encoding: {err}"
         );
     }
 

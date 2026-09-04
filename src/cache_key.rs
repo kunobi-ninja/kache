@@ -2519,6 +2519,11 @@ pub struct FileHasher<'db> {
     runtime_env_uses: RefCell<HashMap<(String, String), bool>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
+    /// Fingerprints of every file hashed while the too-new guard was armed.
+    /// Drained after the compile so the wrapper can prove clock-independently
+    /// that none of them changed mid-build (see
+    /// [`FileHasher::guarded_inputs_unchanged_since_hash`]).
+    guard_inputs: RefCell<Vec<FileFingerprint>>,
 }
 
 /// Optional "too-new input" guard (kunobi-ninja/kache#324). When armed, any
@@ -2625,6 +2630,7 @@ impl FileHasher<'static> {
             runtime_env_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
+            guard_inputs: RefCell::new(Vec::new()),
         }
     }
 
@@ -2639,6 +2645,7 @@ impl FileHasher<'static> {
                 runtime_env_uses: RefCell::new(HashMap::new()),
                 stats: FileHashStatsCells::default(),
                 too_new: TooNewGuard::default(),
+                guard_inputs: RefCell::new(Vec::new()),
             },
             Err(e) => {
                 tracing::debug!(
@@ -2661,6 +2668,7 @@ impl<'db> FileHasher<'db> {
             runtime_env_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
+            guard_inputs: RefCell::new(Vec::new()),
         }
     }
 
@@ -2680,6 +2688,34 @@ impl<'db> FileHasher<'db> {
     /// Whether any hashed input was "too new" since the guard was armed.
     pub fn too_new(&self) -> bool {
         self.too_new.saw_too_new.get()
+    }
+
+    /// Drain the fingerprints hashed while the guard was armed. The wrapper
+    /// carries them past the compile and hands them to
+    /// [`FileHasher::guarded_inputs_unchanged_since_hash`].
+    pub fn take_guarded_inputs(&self) -> Vec<FileFingerprint> {
+        std::mem::take(&mut *self.guard_inputs.borrow_mut())
+    }
+
+    /// Clock-independent proof that guarded inputs did not change since they
+    /// were hashed: every recorded fingerprint still matches a fresh stat and
+    /// carries a strong identity. Comparing a file's metadata against itself
+    /// never orders either side against the host clock, so this stays valid
+    /// when the filesystem lives in another clock domain (NFS skew, a fresh
+    /// checkout with future mtimes) where the wall-clock guard misfires.
+    ///
+    /// Fails closed: an empty set, a missing or changed file, or an input
+    /// without an inode (non-Unix, where replace-by-rename is invisible)
+    /// never excuses a tripped guard.
+    pub fn guarded_inputs_unchanged_since_hash(inputs: &[FileFingerprint]) -> bool {
+        if inputs.is_empty() {
+            return false;
+        }
+        inputs.iter().all(|expected| {
+            expected.inode != 0
+                && FileFingerprint::from_path(Path::new(&expected.path))
+                    .is_ok_and(|current| current == *expected)
+        })
     }
 
     fn note_too_new(&self, fingerprint: &FileFingerprint) {
@@ -2946,6 +2982,11 @@ impl<'db> FileHasher<'db> {
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
         let (hash, fingerprint) = self.hash_inner(path)?;
+        if self.too_new.invocation_start_ns > 0
+            && let Some(fingerprint) = &fingerprint
+        {
+            self.guard_inputs.borrow_mut().push(fingerprint.clone());
+        }
         self.recent_hashes.borrow_mut().insert(
             absolute_path(path),
             RecentHash {
@@ -8614,6 +8655,105 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert!(
             cacheless.too_new(),
             "a cacheless hasher must enforce the same too-new guard"
+        );
+    }
+
+    #[test]
+    fn guarded_inputs_record_only_while_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("input.rs");
+        std::fs::write(&file, b"pub fn x() {}").unwrap();
+
+        let disarmed = FileHasher::new();
+        disarmed.hash(&file).unwrap();
+        assert!(
+            disarmed.take_guarded_inputs().is_empty(),
+            "a disarmed hasher records nothing to verify"
+        );
+
+        let mut armed = FileHasher::new();
+        armed.arm_too_new_guard(1, 0);
+        armed.hash(&file).unwrap();
+        armed.hash(&file).unwrap();
+        assert_eq!(
+            armed.take_guarded_inputs().len(),
+            2,
+            "every hash while armed is recorded for post-compile verification"
+        );
+        assert!(
+            armed.take_guarded_inputs().is_empty(),
+            "taking the snapshot drains it"
+        );
+    }
+
+    #[test]
+    fn guarded_inputs_empty_set_never_excuses() {
+        assert!(
+            !FileHasher::guarded_inputs_unchanged_since_hash(&[]),
+            "a vacuous check must not waive a tripped guard"
+        );
+    }
+
+    #[test]
+    fn guarded_inputs_reject_changed_or_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("input.rs");
+        std::fs::write(&file, b"pub fn x() {}").unwrap();
+        let recorded = FileFingerprint::from_path(&file).unwrap();
+
+        std::fs::write(&file, b"pub fn x() { 1 }").unwrap();
+        assert!(
+            !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
+            "rewritten bytes must fail verification even when the wall clock cannot tell"
+        );
+
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
+            "a file that vanished mid-build must fail verification"
+        );
+    }
+
+    #[test]
+    fn guarded_inputs_reject_weak_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("input.rs");
+        std::fs::write(&file, b"pub fn x() {}").unwrap();
+        let mut recorded = FileFingerprint::from_path(&file).unwrap();
+        recorded.inode = 0;
+        assert!(
+            !FileHasher::guarded_inputs_unchanged_since_hash(std::slice::from_ref(&recorded)),
+            "without an inode a replace-by-rename is invisible, so verification must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_inputs_verify_despite_future_mtimes() {
+        // The clock-domain case: the filesystem clock runs ahead of the host
+        // (NFS skew, a fresh checkout stamped in the future), so the
+        // wall-clock guard trips on files the build never touched. Identical
+        // fingerprints before and after still prove nothing changed.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("input.rs");
+        std::fs::write(&file, b"pub fn x() {}").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2_000_000_000, 0))
+            .unwrap();
+
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let mut hasher = FileHasher::new();
+        hasher.arm_too_new_guard(now_ns, 0);
+        hasher.hash(&file).unwrap();
+        assert!(
+            hasher.too_new(),
+            "a future mtime must still trip the wall-clock guard"
+        );
+        assert!(
+            FileHasher::guarded_inputs_unchanged_since_hash(&hasher.take_guarded_inputs()),
+            "untouched bytes verify despite the skewed clock"
         );
     }
 

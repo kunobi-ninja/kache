@@ -337,7 +337,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [changes, check]
     if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       RUSTC_WRAPPER: ""
       CARGO_INCREMENTAL: "1"
@@ -370,7 +370,15 @@ jobs:
           echo "kache-service mutants: $count"
           test "$count" -gt 0
       - name: Mutate all kache-service behavior
-        timeout-minutes: 15
+        # The mutation run itself takes about ten minutes; the old 15-minute
+        # cap left too little for a slow shared runner. One that took half as
+        # long again killed the step at 15m51s AFTER all 74 mutants had been
+        # accounted for (50 caught, 24 unviable, none missed) — a red check
+        # reporting nothing but the runner's speed.
+        #
+        # Hangs are already caught closer in: `--timeout 180` bounds each
+        # mutant's test run, so this cap only has to bound the whole lane.
+        timeout-minutes: 30
         env:
           CARGO_INCREMENTAL: "1"
         run: |

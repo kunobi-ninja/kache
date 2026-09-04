@@ -2229,6 +2229,7 @@ fn run_parsed_rustc(
                 restore_ms,
                 0,
             );
+            record_input_prediction(config, Some(&store), args);
             print_progress(crate_name, EventResult::LocalHit, elapsed, size);
             // Print cached stdout/stderr
             if !meta.stdout.is_empty() {
@@ -2433,6 +2434,7 @@ fn run_parsed_rustc(
             restore_ms,
             0,
         );
+        record_input_prediction(config, Some(&store), args);
         // Replay the original compiler diagnostics, exactly as the other hit
         // sites do, so a coalesced compile does not swallow warnings or notes.
         replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
@@ -2787,6 +2789,8 @@ fn run_parsed_rustc(
             tracing::warn!("failed to send upload job to daemon: {}", e);
         }
     }
+
+    record_input_prediction(config, Some(&store), args);
 
     // 7. Clean incremental dir, as with kache's caching, incremental compilation is redundant
     clean_incremental_dir(config, args);
@@ -3282,6 +3286,41 @@ struct ComputedKey {
     /// the too-new guard was armed, carried past the compile for
     /// clock-independent verification.
     guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+}
+
+/// Remember the input closure this invocation discovered, so a later build of
+/// the same unit can derive its key without spawning the pre-pass again.
+///
+/// Called only where the invocation actually succeeded: a hit that restored,
+/// or a compile that exited zero. A failed compile is the case to leave alone
+/// — its sources are usually mid-edit, and a record written from them would
+/// only be re-validated away later at the cost of the write.
+///
+/// Silent and best-effort throughout. Every reason to give up (feature off, no
+/// store, no closure to record, no identity) costs a future pre-pass and
+/// nothing else, so none of them is worth a warning on a successful build.
+fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcArgs) {
+    // Taken before any gate. The closure belongs to this invocation whether or
+    // not it gets written, and leaving it in the stash would let whatever key
+    // is computed next on this thread record it under a different identity.
+    let dep_info = crate::cache_key::take_last_dep_info();
+    if !config.input_predictions {
+        return;
+    }
+    let Some(dep_info) = dep_info else {
+        return;
+    };
+    let Some(store) = store else {
+        return;
+    };
+    let file_hasher = store.file_hasher();
+    if !file_hasher.supports_input_predictions() {
+        return;
+    }
+    let Some(identity) = crate::cache_key::rustc_prediction_identity(args) else {
+        return;
+    };
+    file_hasher.record_input_prediction(&identity, args.crate_name.as_deref(), &dep_info);
 }
 
 fn should_skip_cache_store_for_input_race(
@@ -5296,6 +5335,70 @@ mod tests {
         RustcCompiler::new().parse(&s(args)).unwrap()
     }
 
+    /// Recording is opt-in and needs somewhere to record. Neither refusal may
+    /// leave the discovered closure sitting in the thread-local stash, where
+    /// the next key computed on this thread would find it and record another
+    /// unit's inputs under its own identity.
+    #[test]
+    fn input_predictions_record_only_when_enabled_and_backed_by_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let args = rustc_args(&["rustc", "src/lib.rs", "--crate-name", "demo"]);
+        let closure = crate::cache_key::DepInfo {
+            source_files: vec![std::path::PathBuf::from("src/lib.rs")],
+            env_deps: Vec::new(),
+        };
+        let stash = || crate::cache_key::stash_last_dep_info_for_test(closure.clone());
+        let identity = crate::cache_key::rustc_prediction_identity(&args)
+            .expect("an invocation with a crate root has an identity");
+        let recorded = |store: &Store| store.file_hasher().input_prediction(&identity).is_some();
+
+        // Off by default, which is the state every user is in today.
+        assert!(!config.input_predictions);
+        stash();
+        record_input_prediction(&config, Some(&store), &args);
+        assert!(
+            !recorded(&store),
+            "the feature is off; nothing may be written"
+        );
+        assert!(
+            crate::cache_key::take_last_dep_info().is_none(),
+            "a declined recording must still clear the stash"
+        );
+
+        // On, but with no store to record into: the daemon's store-free path.
+        config.input_predictions = true;
+        stash();
+        record_input_prediction(&config, None, &args);
+        assert!(!recorded(&store));
+        assert!(crate::cache_key::take_last_dep_info().is_none());
+
+        // On, with a store, and a closure to record.
+        stash();
+        record_input_prediction(&config, Some(&store), &args);
+        assert!(
+            recorded(&store),
+            "an enabled build with a store must remember what it discovered"
+        );
+        let record = store.file_hasher().input_prediction(&identity).unwrap();
+        assert_eq!(record.sources, closure.source_files);
+
+        // And with nothing in the stash there is nothing to record: an
+        // invocation that never ran a pre-pass must not write an empty closure
+        // over a good one.
+        record_input_prediction(&config, Some(&store), &args);
+        assert_eq!(
+            store
+                .file_hasher()
+                .input_prediction(&identity)
+                .unwrap()
+                .sources,
+            closure.source_files,
+            "a recording with no closure must leave the existing one alone"
+        );
+    }
+
     fn eligible_incremental_args(temp: &tempfile::TempDir, crate_name: &str) -> RustcArgs {
         let profile = temp.path().join("target/debug");
         let out_dir = profile.join("deps");
@@ -5704,6 +5807,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            input_predictions: false,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,

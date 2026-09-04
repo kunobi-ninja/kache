@@ -93,6 +93,7 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 | `KACHE_PRESERVE_INCREMENTAL` | `cache.preserve_incremental` | `false` | Force eligible Cargo units onto isolated incremental state |
 | `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | Force listed rustc crate names onto that incremental path |
 | `KACHE_MODIFIED_INPUT_GUARD` | `cache.modified_input_guard` | `false` | Do not store a result when a keyed input changed at or after build start |
+| `KACHE_INPUT_PREDICTIONS` | `cache.input_predictions` | `false` | Remember the source closure each crate's dep-info pass discovers |
 | `KACHE_FALLBACK` | `cache.fallback` | none | Wrapper used for ordinary Kache passthroughs |
 | none | `cache.exclude` | `[]` | Source-path globs that bypass Kache |
 | none | `cache.bypass_crates` | `[]` | Exact rustc crate names that bypass Kache |

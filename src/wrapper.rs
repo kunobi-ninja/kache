@@ -1233,6 +1233,28 @@ fn cc_cache_entry_satisfies_invocation(
     cc_cache_entry_rejection_reason(parsed, meta).is_none()
 }
 
+/// Where a cached preprocess artifact goes, if this invocation is the one
+/// that asked for it.
+///
+/// A preprocess output is not an object and has no fixed extension, so the
+/// only thing that identifies it is the name the invocation named. `None` for
+/// any other mode, and for an entry naming a different file: restoring one of
+/// those would report a hit and leave the build with the wrong bytes, or with
+/// none at all.
+fn cc_preprocess_restore_target(
+    parsed: &crate::compiler::cc::CcArgs,
+    cached_name: &str,
+) -> Option<std::path::PathBuf> {
+    if parsed.mode != crate::compiler::cc::CompileMode::Preprocess {
+        return None;
+    }
+    let target = parsed.object_output_path()?;
+    let names_match = target
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy() == cached_name);
+    names_match.then_some(target)
+}
+
 fn cc_cache_entry_rejection_reason(
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
@@ -1246,8 +1268,19 @@ fn cc_cache_entry_rejection_reason(
         .iter()
         .any(|file| classify_by_filename(&file.name) == ArtifactKind::DepInfo);
 
-    if !has_object {
+    // A preprocess names its own output and it is not an object, so require
+    // that the entry carries the file this invocation asked for rather than
+    // an object it was never going to produce.
+    let wants_object = parsed.mode != crate::compiler::cc::CompileMode::Preprocess;
+    let has_named_output = meta
+        .files
+        .iter()
+        .any(|file| cc_preprocess_restore_target(parsed, &file.name).is_some());
+
+    if wants_object && !has_object {
         Some("matching entry lacks the object artifact required by this invocation")
+    } else if !wants_object && !has_named_output {
+        Some("matching entry lacks the preprocessed output required by this invocation")
     } else if parsed.depinfo_output_path().is_some() && !has_depinfo {
         Some("matching entry lacks dep-info required by this invocation")
     } else {
@@ -1502,14 +1535,20 @@ fn restore_cc_from_cache(
                     continue;
                 }
             },
-            _ => {
-                tracing::debug!(
-                    "cc restore: cached artifact {} has unsupported kind {:?}; skipping",
-                    cached.name,
-                    kind
-                );
-                continue;
-            }
+            // Anything else is this invocation's own preprocessor output or
+            // nothing we can place. Asking once keeps the answer and the
+            // decision to use it from ever disagreeing.
+            _ => match cc_preprocess_restore_target(parsed, &cached.name) {
+                Some(target) => target,
+                None => {
+                    tracing::debug!(
+                        "cc restore: cached artifact {} has unsupported kind {:?}; skipping",
+                        cached.name,
+                        kind
+                    );
+                    continue;
+                }
+            },
         };
 
         // Recheck immediately before the path-based restore. The initial
@@ -6625,6 +6664,132 @@ mod tests {
 
     /// Degenerate cc invocations with no object path fail before blob access,
     /// giving callers a clean miss instead of materializing to an unknown path.
+    /// A preprocess hit has to land the expansion where `-o` asked for it.
+    /// Nothing else in the restore path knows how to place a `.i`, so if this
+    /// arm stops firing the caller reports a hit and leaves no output at all.
+    #[test]
+    fn restore_cc_from_cache_writes_the_preprocessed_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        create_blob(&store, hash, b"# 1 \"unit.c\"\nint expanded;\n");
+
+        let output = dir.path().join("unit.i");
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcCompiler::new()
+            .parse(&s(&["cc", "-E", "unit.c", "-o", &output_str]))
+            .unwrap();
+        let meta = entry_meta("cc-preprocess-key", vec![cached_file("unit.i", hash)], &[]);
+
+        restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"# 1 \"unit.c\"\nint expanded;\n",
+            "the cached expansion must reach the path -o named"
+        );
+
+        // An entry naming some other file is not this invocation's output, and
+        // skipping it must not invent one.
+        let other = dir.path().join("other.i");
+        let other_str = other.to_string_lossy().into_owned();
+        let mismatched = CcCompiler::new()
+            .parse(&s(&["cc", "-E", "unit.c", "-o", &other_str]))
+            .unwrap();
+        restore_cc_from_cache(&store, &mismatched, &meta).unwrap();
+        assert!(
+            !other.exists(),
+            "an entry for a different name must leave nothing behind"
+        );
+    }
+
+    /// The rule that decides where a cached preprocess artifact goes, and
+    /// whether it belongs to this invocation at all. Restore and hit
+    /// qualification both use it, so they cannot disagree.
+    #[test]
+    fn cc_preprocess_restore_target_matches_only_the_named_output() {
+        use crate::compiler::cc::CcArgs;
+        let parse = |args: &[&str]| {
+            CcArgs::parse(&args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+
+        let preprocess = parse(&["cc", "-E", "unit.c", "-o", "build/unit.i"]);
+        assert_eq!(
+            cc_preprocess_restore_target(&preprocess, "unit.i"),
+            Some(std::path::PathBuf::from("build/unit.i")),
+            "the cached name is the file this invocation asked for"
+        );
+        assert_eq!(
+            cc_preprocess_restore_target(&preprocess, "other.i"),
+            None,
+            "an entry naming a different file must not be written here"
+        );
+        assert_eq!(
+            cc_preprocess_restore_target(&preprocess, "unit.o"),
+            None,
+            "an object is not this invocation's output"
+        );
+
+        // Every other mode is somebody else's business, whatever the name.
+        for args in [
+            ["cc", "-c", "unit.c", "-o", "unit.i"].as_slice(),
+            ["cc", "unit.c", "-o", "unit.i"].as_slice(),
+        ] {
+            let other = parse(args);
+            assert_eq!(
+                cc_preprocess_restore_target(&other, "unit.i"),
+                None,
+                "{args:?} is not a preprocess and must not take this path"
+            );
+        }
+    }
+
+    /// A preprocess entry qualifies on the file the invocation asked for,
+    /// not on an object it was never going to produce. Getting this wrong
+    /// reports a hit and leaves the build without its output.
+    #[test]
+    fn cc_entry_qualification_accepts_a_preprocess_output() {
+        use crate::compiler::cc::CcArgs;
+        let args: Vec<String> = ["cc", "-E", "unit.c", "-o", "unit.i"]
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect();
+        let parsed = CcArgs::parse(&args).unwrap();
+
+        let entry = |name: &str| entry_meta_with_files(&[name]);
+
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&parsed, &entry("unit.i")),
+            None,
+            "the named expansion is what this invocation needs"
+        );
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&parsed, &entry("other.i")),
+            Some("matching entry lacks the preprocessed output required by this invocation"),
+            "an entry naming a different output cannot serve this one"
+        );
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&parsed, &entry("unit.o")),
+            Some("matching entry lacks the preprocessed output required by this invocation"),
+            "an object is not a preprocess output"
+        );
+
+        // And an ordinary compile still requires its object.
+        let compile_args: Vec<String> = ["cc", "-c", "unit.c", "-o", "unit.o"]
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect();
+        let compile = CcArgs::parse(&compile_args).unwrap();
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&compile, &entry("unit.o")),
+            None
+        );
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&compile, &entry("unit.i")),
+            Some("matching entry lacks the object artifact required by this invocation")
+        );
+    }
+
     #[test]
     fn restore_cc_from_cache_requires_object_output_for_object_blob() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,0 +1,70 @@
+# Substrate (polkadot-sdk) through mbx: the same subject, commit, Rust pin and
+# build command as bench-substrate, driven by mbx instead of kache, so the two
+# arms read side by side.
+#
+# mbx fronts Cargo and installs its own shims for build scripts, so this
+# scenario sets no compiler wiring; the harness puts its `cargo` shim on PATH
+# and points MBX_CACHE_DIR at the store. The 1.93.0 pin below is part of the
+# SUBJECT, not the cache wiring: this ref ships no rust-toolchain.toml and a
+# newer stable breaks the wasm runtime link, so it is carried over verbatim,
+# including for substrate-wasm-builder's child cargo.
+#
+# Cold and warm only — external backends have no same-tree phase and no key
+# tracing, so the correctness assertions of the kache arm become advisory
+# measure checks here. Nightly arm: substrate-mbx in bench.yml.
+name     = "bench-substrate-mbx"
+tags     = ["suite:bench", "project:substrate", "backend:mbx", "lang:rust"]
+
+requires = ["cargo", "rustc"]
+
+# polkadot-stable2603-3 has NO rust-toolchain.toml, so the build would otherwise
+# float to whatever Rust is ambient. A too-new stable (e.g. 1.96) breaks the
+# wasm runtime link (sp_io host fns come out as undefined symbols instead of
+# imports), so we pin substrate's intended Rust (1.93.0) explicitly here and via
+# RUSTUP_TOOLCHAIN in `build`. Install it + its wasm targets / rust-src. Best-
+# effort (|| true) so a non-rustup env doesn't abort; system deps are NOT
+# auto-installed — see the echo'd note.
+setup = [
+  "echo '[bench] substrate needs system deps: protoc (REQUIRED), clang, cmake, pkg-config, openssl headers. macOS: brew install protobuf cmake. Debian: apt install protobuf-compiler clang cmake pkg-config libssl-dev.'",
+  "rustup toolchain install 1.93.0 --profile minimal --no-self-update || true",
+  "rustup component add --toolchain 1.93.0 rust-src || true",
+  "rustup target add --toolchain 1.93.0 wasm32v1-none || true",
+  "rustup target add --toolchain 1.93.0 wasm32-unknown-unknown || true",
+]
+
+# Build the polkadot node. RUSTUP_TOOLCHAIN pins substrate's Rust (1.93.0) for
+# THIS build and — critically — for substrate-wasm-builder's child cargo, which
+# inherits the env (it unsets RUSTC/CARGO_ENCODED_RUSTFLAGS but NOT
+# RUSTUP_TOOLCHAIN). Set here (not just the workflow) so the pin holds wherever
+# the scenario runs; a non-empty value also overrides the workflow's empty reset.
+# macOS prelude: librocksdb-sys's bindgen build script links @rpath/libclang.dylib
+# with no embedded rpath, so point the loader (and clang-sys via LIBCLANG_PATH) at
+# the active Xcode/CLT lib — no-op off macOS or when an existing LIBCLANG_PATH is
+# set. This shell lives in config rather than Rust, which is the whole point of
+# scenarios.
+build = """
+export RUSTUP_TOOLCHAIN=1.93.0
+if [ "$(uname)" = Darwin ]; then
+  for d in "$(xcode-select -p 2>/dev/null)/Toolchains/XcodeDefault.xctoolchain/usr/lib" /Library/Developer/CommandLineTools/usr/lib; do
+    if [ -f "$d/libclang.dylib" ]; then
+      [ -n "${LIBCLANG_PATH:-}" ] || export LIBCLANG_PATH="$d"
+      export DYLD_FALLBACK_LIBRARY_PATH="$d${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+      break
+    fi
+  done
+fi
+cargo build --release -p polkadot
+"""
+
+[source]
+kind = "clone"
+repo = "https://github.com/paritytech/polkadot-sdk.git"
+# Latest stable as of 2026-05-28. NB: this ref has no rust-toolchain.toml — the
+# Rust pin is enforced by us (1.93.0, see setup/build above), not by the tree.
+ref = "polkadot-stable2603-3"
+objdir = "target"
+
+# Advisory only, as for the sccache and other -mbx arms: the number is the
+# point, and the assertions above it need kache's own instrumentation.
+[checks.measure.warm]
+min_hit_rate_pct = 50.0

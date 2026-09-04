@@ -1,0 +1,101 @@
+# SurrealDB through mbx: the same subject, commit, toolchain and build command
+# as bench-surrealdb, driven by mbx instead of kache, so the two arms read side
+# by side.
+#
+# mbx fronts Cargo and installs its own shims for build scripts, so this
+# scenario sets no compiler wiring and no KACHE_BASE_DIR; the harness puts its
+# `cargo` shim on PATH and points MBX_CACHE_DIR at the store. The native-build
+# determinism flags are carried over verbatim: they pin build PATHS and
+# timestamps, which is what makes a cross-clone comparison mean anything for
+# either tool.
+#
+# Cold and warm only — external backends have no same-tree phase and no key
+# tracing, so the correctness assertions of the kache arm become advisory
+# measure checks here. Nightly arm: surrealdb-mbx in bench.yml.
+name = "bench-surrealdb-mbx"
+tags = ["suite:bench", "project:surrealdb", "backend:mbx", "lang:rust"]
+
+requires = ["cargo", "rustc"]
+
+# SurrealDB ships a rust-toolchain.toml (channel = "1.95"), so — unlike
+# substrate — there is NOTHING to pin here: rustup auto-installs and selects
+# that toolchain on the first cargo invocation in the tree, and the bench
+# workflow clears RUSTUP_TOOLCHAIN so the file is honoured (a forced pin would
+# override it). The only out-of-band need is native system deps for the default
+# storage/scripting features; they are NOT auto-installed — the bench runner
+# already provisions them (see .github/workflows/bench.yml), and the echo below
+# documents them for a local run.
+setup = [
+  "echo '[bench] surrealdb default features need system deps: clang + libclang (rocksdb bindgen), cmake, protoc (storage-tikv/grpcio), pkg-config, openssl headers, a C/C++ compiler. macOS: brew install protobuf cmake llvm. Debian: apt install build-essential protobuf-compiler clang libclang-dev cmake pkg-config libssl-dev.'",
+]
+
+# Build the `surreal` server binary with its DEFAULT features (storage-mem,
+# storage-surrealkv, storage-rocksdb, storage-tikv, scripting, http, graphql,
+# mcp, cli, allocator, …) — i.e. what SurrealDB actually ships, the fairest
+# representative workload for the cache. macOS prelude mirrors substrate:
+# librocksdb-sys's bindgen build script links @rpath/libclang.dylib with no
+# embedded rpath, so point the loader (and clang-sys via LIBCLANG_PATH) at the
+# active Xcode/CLT lib — no-op off macOS or when LIBCLANG_PATH is already set.
+# No RUSTUP_TOOLCHAIN pin: the tree's rust-toolchain.toml drives toolchain
+# selection. This shell lives in config rather than Rust, which is the whole
+# point of scenarios.
+build = """
+if [ "$(uname)" = Darwin ]; then
+  for d in "$(xcode-select -p 2>/dev/null)/Toolchains/XcodeDefault.xctoolchain/usr/lib" /Library/Developer/CommandLineTools/usr/lib; do
+    if [ -f "$d/libclang.dylib" ]; then
+      [ -n "${LIBCLANG_PATH:-}" ] || export LIBCLANG_PATH="$d"
+      export DYLD_FALLBACK_LIBRARY_PATH="$d${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+      break
+    fi
+  done
+fi
+
+# Cross-clone cache-key portability (the headline metric this bench measures).
+# Each clone builds at a different absolute path; without help a few EXPENSIVE
+# crates re-key across clones and tank the compile-time-WEIGHTED warm hit rate
+# (~47%) even though count hit rate is ~97%. These knobs make the native build
+# byte-reproducible across clones. They change build PATHS and determinism, not
+# WHAT is built — the feature set stays exactly what SurrealDB ships, so the
+# workload remains faithful (mirrors bench-firefox's KACHE_BASE_DIR usage).
+#
+# What this recovers (validated by --trace-keys, run 28462889652):
+#   - tikv-jemalloc-sys / libjemalloc_pic.a becomes byte-identical -> warm HIT
+#     (autotools build with path-stable object names; only the timestamp/path
+#     reproducibility axes diverged, which these flags pin).
+#
+# Known residuals it does NOT fix (root-caused; tracked in #471):
+#   - rquickjs-sys / libquickjs.a (and wasm-opt-cc): the .o CONTENT is identical
+#     across clones, but the `cc` crate names each archive MEMBER with a hash
+#     derived from the absolute build path (cafca65b…-quickjs.o vs 4af22b2a…),
+#     and kache content-hashes the .a including those names. -ffile-prefix-map
+#     can't touch member names — needs an upstream cc/rquickjs path-stable-name
+#     fix, or a kache-core "hash static= members by content, ignore name" change
+#     (safe: member names don't affect linking). This cascades into the big
+#     surrealdb_core/server crates via scripting.
+#   - DEBUG_OUTPUT_DIR (wasmtime/wiggle) and OUT_DIR (cxx `scratch`): kache keeps
+#     these ABSOLUTE because they fail its include-only / no-runtime-value gate
+#     (genuine runtime value use). KACHE_PATH_ONLY_ENV_VARS=DEBUG_OUTPUT_DIR was
+#     tried and confirmed a NO-OP (the gate still kept it absolute, as it must to
+#     avoid miscaching), so it is intentionally NOT set here.
+src="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$src=. -fdebug-prefix-map=$src=. -fmacro-prefix-map=$src=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+
+cargo build --release -p surreal
+"""
+
+[source]
+kind = "clone"
+repo = "https://github.com/surrealdb/surrealdb.git"
+# Latest stable release as of 2026-06-29. This tag pins Rust via
+# rust-toolchain.toml (channel "1.95"), honoured automatically (see setup note).
+ref    = "v3.1.5"
+objdir = "target"
+
+# Advisory only, as for the sccache and other -mbx arms: the number is the
+# point, and the assertions above it need kache's own instrumentation.
+[checks.measure.warm]
+min_hit_rate_pct = 50.0

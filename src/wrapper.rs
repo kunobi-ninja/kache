@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::args::RustcArgs;
 use crate::cache_key::FileHashStats;
+use crate::cache_key::FileHasher;
 use crate::compile;
 use crate::compiler::cc::CcCompiler;
 use crate::compiler::rustc::RustcCompiler;
@@ -1666,6 +1667,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     let extra_inputs_hash_stats = extra_inputs_hasher.stats();
     let extra_inputs_too_new = extra_inputs_hasher.too_new();
+    let extra_inputs_guard_inputs = extra_inputs_hasher.take_guarded_inputs();
     let extra_inputs_key_ms = extra_inputs_key_start.elapsed().as_millis() as u64;
     // A fallback cache does not know Kache's extra-input digest. If Kache
     // declines an invocation, delegating it could restore the exact stale
@@ -1696,6 +1698,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         extra_inputs_hash_stats,
         extra_inputs_too_new,
         extra_inputs_key_ms,
+        extra_inputs_guard_inputs,
     )?;
 
     if exit == 0 {
@@ -1788,9 +1791,15 @@ fn extra_inputs_changed_during_compile(
             return true;
         }
     };
-    if before != after.as_ref() || hasher.too_new() {
+    if before != after.as_ref() {
         tracing::warn!(
             "not caching {crate_name}: extra_inputs changed while the compiler was running"
+        );
+        return true;
+    }
+    if key_inputs_changed_during_compile(hasher.too_new(), &hasher.take_guarded_inputs()) {
+        tracing::warn!(
+            "not caching {crate_name}: extra_inputs may have changed while the compiler was running"
         );
         return true;
     }
@@ -1807,6 +1816,7 @@ fn run_parsed_rustc(
     extra_inputs_hash_stats: FileHashStats,
     extra_inputs_too_new: bool,
     extra_inputs_key_ms: u64,
+    extra_inputs_guard_inputs: Vec<crate::cache_key::FileFingerprint>,
 ) -> Result<i32> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let event_root = rustc_event_root(args);
@@ -2016,6 +2026,7 @@ fn run_parsed_rustc(
         extra_inputs_hash_stats,
         extra_inputs_too_new,
         extra_inputs_key_ms,
+        extra_inputs_guard_inputs,
     ) {
         Ok(keyed) => keyed,
         Err(e) => {
@@ -2040,6 +2051,7 @@ fn run_parsed_rustc(
         key_ms,
         key_hash_stats,
         key_too_new,
+        guard_inputs,
     } = keyed;
     // A force-list request that could not obtain its immediate lease must not
     // retry through the post-key adaptive seed path in the same invocation.
@@ -2465,12 +2477,16 @@ fn run_parsed_rustc(
     // racy versus what rustc actually read — refuse to store (the compile
     // already ran and is in place; we just don't cache it). Off by default;
     // the lookup above still ran, so a sound prior entry can still be served.
+    // A tripped wall-clock flag is excused when post-compile verification
+    // proves no guarded input changed: the flag also fires across clock
+    // domains where nothing is actually racy.
     let extra_inputs_racy = args.is_primary
         && extra_inputs_changed_during_compile(config, args, extra_inputs, invocation_start_ns);
+    let key_inputs_changed = key_inputs_changed_during_compile(key_too_new, &guard_inputs);
     if should_skip_cache_store_for_input_race(
         extra_inputs_racy,
         config.modified_input_guard,
-        key_too_new,
+        key_inputs_changed,
     ) {
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
@@ -3223,6 +3239,10 @@ struct ComputedKey {
     key_ms: u64,
     key_hash_stats: FileHashStats,
     key_too_new: bool,
+    /// Fingerprints hashed for the key (plus the extra-inputs resolve) while
+    /// the too-new guard was armed, carried past the compile for
+    /// clock-independent verification.
+    guard_inputs: Vec<crate::cache_key::FileFingerprint>,
 }
 
 fn should_skip_cache_store_for_input_race(
@@ -3231,6 +3251,19 @@ fn should_skip_cache_store_for_input_race(
     key_too_new: bool,
 ) -> bool {
     extra_inputs_racy || (modified_input_guard && key_too_new)
+}
+
+/// Whether keyed inputs actually changed during the compile. A tripped
+/// wall-clock flag alone is not proof: it also fires when the filesystem
+/// clock runs ahead of the host (NFS skew, future-stamped checkouts). When
+/// every guarded input still matches its hash-time fingerprint with a strong
+/// identity, nothing changed and the store refusal is excused. Anything else
+/// — a mismatch, a missing file, a weak identity — keeps the refusal.
+fn key_inputs_changed_during_compile(
+    key_too_new: bool,
+    guard_inputs: &[crate::cache_key::FileFingerprint],
+) -> bool {
+    key_too_new && !FileHasher::guarded_inputs_unchanged_since_hash(guard_inputs)
 }
 
 fn combine_key_measurements(
@@ -3268,6 +3301,7 @@ fn compute_rustc_cache_key(
     extra_inputs_hash_stats: FileHashStats,
     extra_inputs_too_new: bool,
     extra_inputs_key_ms: u64,
+    mut extra_inputs_guard_inputs: Vec<crate::cache_key::FileFingerprint>,
 ) -> Result<ComputedKey> {
     let key_start = std::time::Instant::now();
     let mut file_hasher = match store {
@@ -3306,6 +3340,7 @@ fn compute_rustc_cache_key(
     };
     let cache_key = compiler.cache_key(args, &key_ctx)?;
     let key_hash_stats = file_hasher.stats();
+    extra_inputs_guard_inputs.extend(file_hasher.take_guarded_inputs());
     let (key_ms, key_hash_stats, key_too_new) = combine_key_measurements(
         key_start.elapsed().as_millis() as u64,
         extra_inputs_key_ms,
@@ -3319,6 +3354,7 @@ fn compute_rustc_cache_key(
         key_ms,
         key_hash_stats,
         key_too_new,
+        guard_inputs: extra_inputs_guard_inputs,
     })
 }
 
@@ -5747,6 +5783,38 @@ mod tests {
                 ),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn key_inputs_changed_excuses_skewed_clocks_but_not_real_changes() {
+        use crate::cache_key::FileFingerprint;
+
+        // No tripped flag: nothing to excuse, whatever was recorded.
+        assert!(!key_inputs_changed_during_compile(false, &[]));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("input.rs");
+        std::fs::write(&file, b"pub fn x() {}").unwrap();
+        let recorded = FileFingerprint::from_path(&file).unwrap();
+        assert!(!key_inputs_changed_during_compile(
+            false,
+            std::slice::from_ref(&recorded)
+        ));
+        // Tripped flag with nothing verifiable stays a refusal.
+        assert!(key_inputs_changed_during_compile(true, &[]));
+        #[cfg(unix)]
+        {
+            // Tripped flag, untouched inputs: a skewed clock, not a race.
+            assert!(!key_inputs_changed_during_compile(
+                true,
+                std::slice::from_ref(&recorded)
+            ));
+            // Tripped flag, rewritten inputs: a real race.
+            std::fs::write(&file, b"pub fn x() { 1 }").unwrap();
+            assert!(key_inputs_changed_during_compile(
+                true,
+                std::slice::from_ref(&recorded)
+            ));
         }
     }
 

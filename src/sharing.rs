@@ -233,6 +233,30 @@ fn probe_macos(path: &Path, size: u64) -> Sharing {
     let private_size = buf.private_size;
 
     let shared = got_flags && ext_flags & (EF_MAY_SHARE_BLOCKS | EF_SHARES_ALL_BLOCKS) != 0;
+    getattrlist_verdict(shared, got_private, private_size, size)
+}
+
+/// Turn the two numbers `getattrlist` returned into a verdict.
+///
+/// Split out from the syscall so the reasoning can be tested directly: the
+/// delayed-allocation case below cannot be produced on demand from a test.
+/// Compiled under `test` on every host so it is a rule the mutation lane can
+/// reach, rather than macOS-only code that lane can only skip.
+#[cfg(any(target_os = "macos", test))]
+fn getattrlist_verdict(shared: bool, got_private: bool, private_size: i64, size: u64) -> Sharing {
+    // A non-empty file that shares nothing but reports zero private bytes has
+    // not had its blocks allocated yet — APFS defers allocation, so a file
+    // written moments ago answers zero until it reaches disk. Believing that
+    // would tell the user deleting it frees nothing, which is the one
+    // direction that loses their bytes. Fall back to the size instead.
+    //
+    // Neither a zero-length file nor a private size the kernel declined to
+    // return needs guarding here: both already fall through to `size`, which
+    // is the same answer this returns.
+    if !shared && private_size == 0 {
+        return Sharing::unknown_for(size);
+    }
+
     let private_bytes = if got_private && private_size >= 0 {
         // PRIVATESIZE is allocated bytes; a file can report more private space
         // than its logical length (block rounding, preallocation). Clamp so a
@@ -607,6 +631,69 @@ mod tests {
             ProbeError::Failed
         );
         assert_eq!(probe_error_from_errno(None), ProbeError::Failed);
+    }
+
+    /// The delayed-allocation case, which no test can provoke on demand: APFS
+    /// reports zero allocated bytes for a file whose writes have not reached
+    /// disk. Reporting that verbatim tells `clean` the file frees nothing.
+    #[test]
+    fn a_private_file_with_no_allocated_blocks_falls_back_to_its_size() {
+        assert_eq!(
+            getattrlist_verdict(false, true, 0, 256 * 1024),
+            Sharing::unknown_for(256 * 1024),
+            "unallocated blocks must not read as unreclaimable"
+        );
+
+        // The same zero is the truth for a file that really shares everything,
+        // and for one that has no bytes to account for.
+        assert_eq!(
+            getattrlist_verdict(true, true, 0, 256 * 1024),
+            Sharing {
+                shared: true,
+                private_bytes: 0
+            },
+            "a fully shared file frees nothing, and that is not a fallback case"
+        );
+        assert_eq!(
+            getattrlist_verdict(false, true, 0, 0),
+            Sharing {
+                shared: false,
+                private_bytes: 0
+            },
+            "an empty file has nothing to allocate"
+        );
+
+        // Ordinary answers are unchanged, including the clamp.
+        assert_eq!(
+            getattrlist_verdict(false, true, 4096, 4096),
+            Sharing {
+                shared: false,
+                private_bytes: 4096
+            }
+        );
+        assert_eq!(
+            getattrlist_verdict(false, true, 2048, 4096),
+            Sharing {
+                shared: false,
+                private_bytes: 2048
+            },
+            "a partially allocated file frees only what it allocated"
+        );
+        assert_eq!(
+            getattrlist_verdict(false, true, 65536, 4096).private_bytes,
+            4096,
+            "allocated bytes past the logical length are clamped"
+        );
+        assert_eq!(
+            getattrlist_verdict(false, false, 0, 4096),
+            Sharing::unknown_for(4096),
+            "a private size the kernel did not return tells us nothing"
+        );
+        assert_eq!(
+            getattrlist_verdict(false, true, -1, 4096),
+            Sharing::unknown_for(4096),
+            "a negative private size is not an answer"
+        );
     }
 
     #[test]

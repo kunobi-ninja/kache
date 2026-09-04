@@ -1,0 +1,70 @@
+# OpenDAL core through mbx: the same subject, commit, toolchain, feature set
+# and build command as bench-opendal, driven by mbx instead of kache, so the
+# two arms read side by side.
+#
+# mbx fronts Cargo and installs its own shims for build scripts, so this
+# scenario sets no compiler wiring and no KACHE_BASE_DIR; the harness puts its
+# `cargo` shim on PATH and points MBX_CACHE_DIR at the store.
+#
+# Cold and warm only — external backends have no same-tree phase and no key
+# tracing, so the correctness assertions of the kache arm become advisory
+# measure checks here. Nightly arm: opendal-mbx in bench.yml.
+name = "bench-opendal-mbx"
+tags = ["suite:bench", "project:opendal", "backend:mbx", "lang:rust"]
+
+requires = ["cargo", "rustc"]
+
+# OpenDAL ships rust-toolchain.toml with channel = "stable" at the repo
+# root, so — like surrealdb — there is nothing to pin here: rustup
+# auto-selects that toolchain on the first cargo invocation in the tree,
+# and the bench workflow clears RUSTUP_TOOLCHAIN so the file is honoured.
+# The Cargo workspace lives under `core/` (no root Cargo.toml). The feature
+# set is OpenDAL's own portable `build_all_platforms` list: common object-
+# storage / HTTP / embedded services, excluding ones that need a
+# preinstalled native library (rocksdb, foundationdb, hdfs) or that are
+# known-broken on some hosts (sftp). System deps are NOT auto-installed —
+# the bench runner already provisions a C compiler + cmake + protoc (see
+# .github/workflows/bench.yml), and the echo below documents them for a
+# local run.
+setup = [
+  "echo '[bench] opendal selected features need system deps: a C/C++ compiler + cmake (aws-lc-sys via rustls), protoc (tikv). macOS: brew install cmake protobuf. Debian: apt install build-essential cmake protobuf-compiler pkg-config.'",
+]
+
+# Build the `opendal` facade from `core/` with the portable service set.
+# Cross-clone cache-key portability (the headline metric this bench
+# measures): each clone builds at a different absolute path, so pin
+# native-build paths/determinism the same way bench-surrealdb does. These
+# knobs change build PATHS and timestamps, not WHAT is built.
+build = """
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+
+cd core || exit
+opendal_features="services-alluxio services-azblob services-azdls services-cacache"
+opendal_features="$opendal_features services-cos services-dashmap services-dropbox services-etcd"
+opendal_features="$opendal_features services-fs services-ftp services-gcs services-gdrive services-ghac"
+opendal_features="$opendal_features services-http services-hf services-ipfs services-ipmfs services-memcached"
+opendal_features="$opendal_features services-memory services-mini-moka services-moka services-obs services-onedrive"
+opendal_features="$opendal_features services-oss services-persy services-postgresql services-redb services-redis"
+opendal_features="$opendal_features services-s3 services-seafile services-sled services-swift services-tikv"
+opendal_features="$opendal_features services-vercel-artifacts services-webdav services-webhdfs"
+cargo build --release --locked --features "$opendal_features"
+"""
+
+[source]
+kind = "clone"
+repo = "https://github.com/apache/opendal.git"
+# Latest stable release as of 2026-08-21. rust-toolchain.toml is
+# channel = "stable" (honoured automatically; see setup note). Cargo
+# workspace + lockfile live under `core/`.
+ref    = "v0.58.2"
+objdir = "core/target"
+
+# Advisory only, as for the sccache and hk-mbx arms: the number is the point,
+# and the assertions above it need kache's own instrumentation.
+[checks.measure.warm]
+min_hit_rate_pct = 50.0

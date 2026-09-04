@@ -1,0 +1,89 @@
+# Lance through mbx: the same subject, commit, toolchain and build command as
+# bench-lance, driven by mbx instead of kache, so the two arms read side by
+# side.
+#
+# mbx fronts Cargo and installs its own shims for build scripts, so this
+# scenario sets no compiler wiring and no KACHE_BASE_DIR; the harness puts its
+# `cargo` shim on PATH and points MBX_CACHE_DIR at the store. The generated
+# well-known protobuf schemas below are part of the SUBJECT, not the cache
+# wiring, so they are carried over verbatim.
+#
+# Cold and warm only — external backends have no same-tree phase and no key
+# tracing, so the correctness assertions of the kache arm become advisory
+# measure checks here. Nightly arm: lance-mbx in bench.yml.
+name = "bench-lance-mbx"
+tags = ["suite:bench", "project:lance", "backend:mbx", "lang:rust"]
+
+requires = ["cargo", "rustc", "protoc"]
+
+# Lance ships a rust-toolchain.toml (channel = "1.97.0"), so there is nothing
+# to pin here: rustup auto-installs and selects that toolchain on the first
+# cargo invocation in the tree, and the bench workflow clears RUSTUP_TOOLCHAIN
+# so the file is honoured. System protobuf (`protoc`) is required by
+# prost-build; openssl headers / pkg-config are needed by a few default-feature
+# cloud backends. They are NOT auto-installed — the bench runner already
+# provisions them (see .github/workflows/bench.yml), and the echo below
+# documents them for a local run.
+setup = [
+  "echo '[bench] lance default features need system deps: protoc (REQUIRED), pkg-config, openssl headers, a C compiler. macOS: brew install protobuf pkg-config openssl. Debian: apt install protobuf-compiler pkg-config libssl-dev build-essential.'",
+]
+
+# Build the `lance` crate with its DEFAULT features (aws, azure, gcp, oss,
+# huggingface, tencent, tos, goosefs, geo) — i.e. what Lance actually ships.
+# No RUSTUP_TOOLCHAIN pin: the tree's rust-toolchain.toml drives toolchain
+# selection. KACHE_BASE_DIR keeps checkout-absolute paths (OUT_DIR from
+# prost-build, CARGO_MANIFEST_DIR) portable across the two clones so the
+# headline cross-clone metric is measuring kache, not path baking.
+build = """
+src="$(pwd -P)"
+cargo build --release -p lance
+"""
+
+[source]
+kind = "clone"
+repo = "https://github.com/lance-format/lance.git"
+# Latest stable release as of 2026-08-27. This tag pins Rust via
+# rust-toolchain.toml (channel "1.97.0"), honoured automatically (see setup note).
+ref    = "v10.0.0"
+objdir = "target"
+
+# Lance v10 invokes protoc with only its local proto directory but imports
+# three well-known types. Supply their schemas inside the include tree Lance
+# already passes to protoc.
+[[file]]
+path = "protos/google/protobuf/empty.proto"
+mode = "write"
+content = '''
+syntax = "proto3";
+package google.protobuf;
+message Empty {}
+'''
+
+[[file]]
+path = "protos/google/protobuf/any.proto"
+mode = "write"
+content = '''
+syntax = "proto3";
+package google.protobuf;
+message Any {
+  string type_url = 1;
+  bytes value = 2;
+}
+'''
+
+[[file]]
+path = "protos/google/protobuf/timestamp.proto"
+mode = "write"
+content = '''
+syntax = "proto3";
+package google.protobuf;
+message Timestamp {
+  int64 seconds = 1;
+  int32 nanos = 2;
+}
+'''
+
+# Advisory only, as for the sccache and hk-mbx arms: the number is the point,
+# and the assertions above it need kache's own instrumentation.
+[checks.measure.warm]
+min_hit_rate_pct = 50.0

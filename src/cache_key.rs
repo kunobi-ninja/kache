@@ -857,6 +857,38 @@ pub fn take_last_key_unit_id() -> Option<String> {
         .flatten()
 }
 
+thread_local! {
+    /// The input closure the last [`compute_cache_key`] on this thread
+    /// discovered, stashed like the per-group digests above.
+    ///
+    /// The wrapper needs it to record a prediction, but only once the compile
+    /// or restore it belongs to has actually succeeded — which happens far
+    /// below the key computation, past the store, the scheduler and the
+    /// compiler. Threading a `DepInfo` through all of that would touch every
+    /// caller of `compute_cache_key`; the stash is the pattern the other
+    /// key by-products already use.
+    static LAST_KEY_DEP_INFO: std::cell::RefCell<Option<DepInfo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Put a closure in the stash as a key computation would, so the wrapper's
+/// recording gate can be tested without spawning a compiler.
+#[cfg(test)]
+pub(crate) fn stash_last_dep_info_for_test(dep_info: DepInfo) {
+    let _ = LAST_KEY_DEP_INFO.try_with(|stash| *stash.borrow_mut() = Some(dep_info));
+}
+
+/// Take (consume) the input closure of the last computed rustc key.
+///
+/// `None` for cc compiles, passthroughs, and any invocation with no source
+/// file — none of which discovered a closure to remember.
+pub(crate) fn take_last_dep_info() -> Option<DepInfo> {
+    LAST_KEY_DEP_INFO
+        .try_with(|stash| stash.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
 /// Stable identity for one dep-info source path.
 ///
 /// Cargo/worktree-local roots use the same rule rustc receives through
@@ -876,6 +908,69 @@ fn source_path_identity(file: &Path, path_normalizer: &PathNormalizer) -> Result
     opaque.update(b"kache-source-path-v1\0");
     opaque.update(&env_os_key_bytes(file.as_os_str()));
     Ok(format!("<OPAQUE_PATH>/{}", opaque.finalize().to_hex()).into_bytes())
+}
+
+/// The prediction identity of one rustc invocation, or `None` when there is
+/// nothing to predict.
+///
+/// `None` when the invocation names no source file (no closure to discover),
+/// or when the compiler's own version cannot be read — without it two
+/// toolchains would share one record, and their closures need not match.
+pub(crate) fn rustc_prediction_identity(args: &RustcArgs) -> Option<String> {
+    rustc_prediction_identity_in_env(args, std::env::vars_os().collect())
+}
+
+fn rustc_prediction_identity_in_env(
+    args: &RustcArgs,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<String> {
+    let source_file = args.source_file.as_ref()?;
+    let rustc_version = get_rustc_version(&args.rustc).ok()?;
+    Some(prediction_identity_in_env(
+        &PredictionIdentityParts {
+            rustc_version: &rustc_version,
+            inner_rustc: args.inner_rustc.as_deref(),
+            current_dir: std::env::current_dir().ok().as_deref(),
+            source_file,
+            closure_args: &closure_shaping_args(source_file, &args.all_args),
+            skip_path_remap: args.skip_path_remap(),
+        },
+        vars,
+    ))
+}
+
+/// Discover the source closure that feeds the key.
+///
+/// The dep-info pre-pass enumerates the real closure. If it fails we must NOT
+/// fabricate a crate-root-only `DepInfo` and key off it: that under-specifies
+/// the inputs, so a later build whose transitive sources (`#[path]`,
+/// `include_str!`, generated files) changed would produce the same key and
+/// restore a stale artifact (kunobi-ninja/kache#323). Propagate the error so
+/// the wrapper passes through to the real compiler and never stores under an
+/// incomplete input set.
+///
+/// `None` when the invocation names no source file: there is no closure to
+/// discover, and the key simply folds no source or env-dep group.
+fn resolve_key_inputs(args: &RustcArgs) -> Result<Option<DepInfo>> {
+    args.source_file
+        .as_ref()
+        .map(|source| {
+            run_dep_info_pass(
+                &args.rustc,
+                args.inner_rustc.as_deref(),
+                source,
+                &args.all_args,
+                args.has_expanded_argfiles(),
+            )
+            .with_context(|| {
+                format!(
+                    "dep-info pre-pass failed for {} — refusing to cache from an \
+                     incomplete input set",
+                    source.display()
+                )
+            })
+        })
+        .transpose()
 }
 
 /// Compute the blake3 cache key for a rustc invocation.
@@ -912,6 +1007,10 @@ pub fn compute_cache_key(
     // identities.
     let _ = LAST_KEY_EXTERN_UNITS.try_with(|stash| *stash.borrow_mut() = None);
     let _ = LAST_KEY_UNIT_ID.try_with(|stash| *stash.borrow_mut() = args.unit_id());
+    // And the discovered closure, for the same reason: a computation that
+    // bails before the pre-pass would otherwise leave the previous compile's
+    // closure to be recorded against this one's identity.
+    let _ = LAST_KEY_DEP_INFO.try_with(|stash| *stash.borrow_mut() = None);
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
     hasher.update(b"key_version:");
@@ -1091,33 +1190,11 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
-    // The dep-info pre-pass enumerates the real source closure that feeds the key.
-    // If it fails we must NOT fabricate a crate-root-only DepInfo and key off it:
-    // that under-specifies the inputs, so a later build whose transitive sources
-    // (`#[path]`, `include_str!`, generated files) changed would produce the same
-    // key and restore a stale artifact (kunobi-ninja/kache#323). Propagate the
-    // error so the wrapper passes through to the real compiler and never stores
-    // under an incomplete input set.
-    let dep_info = args
-        .source_file
-        .as_ref()
-        .map(|source| {
-            run_dep_info_pass(
-                &args.rustc,
-                args.inner_rustc.as_deref(),
-                source,
-                &args.all_args,
-                args.has_expanded_argfiles(),
-            )
-            .with_context(|| {
-                format!(
-                    "dep-info pre-pass failed for {} — refusing to cache from an \
-                     incomplete input set",
-                    source.display()
-                )
-            })
-        })
-        .transpose()?;
+    let dep_info = resolve_key_inputs(args)?;
+    // Keep the closure available to the wrapper, which records it as a
+    // prediction only once the invocation it belongs to has succeeded. The
+    // clone is one allocation per closure file against a whole rustc spawn.
+    let _ = LAST_KEY_DEP_INFO.try_with(|stash| *stash.borrow_mut() = dep_info.clone());
 
     let mut externs: Vec<_> = args.externs.iter().filter(|e| e.path.is_some()).collect();
     externs.sort_by_key(|e| &e.name);
@@ -2491,6 +2568,7 @@ fn compute_static_lib_hash(path: &Path) -> Result<String> {
 ///
 /// This is a struct (not a tuple) so we can add fields later without
 /// breaking call sites. Future candidates: `target_json_hash`, timing metrics.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepInfo {
     /// All source files the crate depends on (sorted, absolute paths).
     /// Includes the crate root, module files, `include!()` targets, etc.
@@ -2503,6 +2581,170 @@ pub struct DepInfo {
     /// would erase the absolute-path information the discriminator
     /// needs to read.
     pub env_deps: Vec<(String, String)>,
+}
+
+/// Version of the prediction record's own logic and encoding.
+///
+/// Folded into the identity AND stored in the row, so changing how a closure
+/// is recorded or validated orphans the old rows without touching
+/// [`CACHE_KEY_VERSION`] and therefore without invalidating a single cache
+/// entry. Precedent: `STATE_SCHEMA` / `POLICY_VERSION` in
+/// `incremental_policy.rs`.
+pub(crate) const PREDICTION_SCHEMA: u32 = 1;
+
+/// The input closure a previous build of one unit discovered, remembered so a
+/// later build of the same unit can skip re-discovering it.
+///
+/// This is a *prediction*, never an authority. It records what the dep-info
+/// pre-pass found, and every field has to be re-validated against the current
+/// tree before a key may be derived from it. Recording is all this commit
+/// does; nothing reads a record back yet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct InputPrediction {
+    /// The [`PREDICTION_SCHEMA`] that wrote the row. A reader that does not
+    /// recognise it must treat the record as absent.
+    pub(crate) schema: u32,
+    /// Exactly the spellings [`DepInfo::source_files`] carried, so a
+    /// prediction reproduces the key's `sources` group byte for byte.
+    pub(crate) sources: Vec<PathBuf>,
+    /// `# env-dep:` pairs as raw values. The key normalises some of them
+    /// (OUT_DIR-like values collapse to a sentinel), so the raw value is the
+    /// only signal that an included file moved.
+    pub(crate) env_deps: Vec<(String, String)>,
+}
+
+impl InputPrediction {
+    fn from_dep_info(dep_info: &DepInfo) -> Self {
+        Self {
+            schema: PREDICTION_SCHEMA,
+            sources: dep_info.source_files.clone(),
+            env_deps: dep_info.env_deps.clone(),
+        }
+    }
+}
+
+/// The parts of an invocation that decide which closure it will discover.
+///
+/// Everything here shapes what rustc reads: the compiler, the argv, the
+/// directory paths resolve against, and the environment the key already
+/// folds. Two invocations agreeing on all of it discover the same files, so
+/// they may share a record. Anything that disagrees gets its own row rather
+/// than a wrong answer.
+///
+/// Deliberately absent: extern *content* hashes. A changed dependency changes
+/// the derived key on its own, and re-deriving is what refreshes the record.
+/// Present but acknowledged: extern *paths*, which make a row target-dir
+/// local. A fresh worktree therefore pays one pre-pass per unit until the
+/// identity is path-normalised.
+pub(crate) struct PredictionIdentityParts<'a> {
+    pub(crate) rustc_version: &'a str,
+    pub(crate) inner_rustc: Option<&'a Path>,
+    pub(crate) current_dir: Option<&'a Path>,
+    pub(crate) source_file: &'a Path,
+    pub(crate) closure_args: &'a [String],
+    pub(crate) skip_path_remap: bool,
+}
+
+/// Environment folded into a prediction identity, by name.
+///
+/// Named rather than wholesale, because the cc preprocessor memo spent a year
+/// never hitting once for exactly this mistake: it folded the whole
+/// environment, so `_`, `PWD` and the jobserver fds made every key unique
+/// (kunobi-ninja/kache#927). Only variables that change what rustc reads
+/// belong here.
+const PREDICTION_ENV: &[&str] = &[
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC_BOOTSTRAP",
+    "OUT_DIR",
+    "CARGO_MANIFEST_DIR",
+];
+
+/// Identity of the unit whose closure a record describes.
+///
+/// Length-prefixed like the cache key's own fields, so no combination of
+/// values can be re-read as a different combination.
+///
+/// Takes the environment rather than reading it, so the folding can be tested
+/// against a fixed one. `vars_os` would otherwise be read twice in a test
+/// binary whose other tests set and unset variables concurrently.
+fn prediction_identity_in_env(
+    parts: &PredictionIdentityParts<'_>,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache-input-prediction-v1\n");
+    fold_field(
+        &mut hasher,
+        b"prediction_schema:",
+        PREDICTION_SCHEMA.to_string().as_bytes(),
+    );
+    fold_field(
+        &mut hasher,
+        b"key_version:",
+        CACHE_KEY_VERSION.to_string().as_bytes(),
+    );
+    fold_field(
+        &mut hasher,
+        b"rustc_version:",
+        parts.rustc_version.as_bytes(),
+    );
+    fold_field(
+        &mut hasher,
+        b"inner_rustc:",
+        &parts
+            .inner_rustc
+            .map(|path| env_os_key_bytes(path.as_os_str()))
+            .unwrap_or_default(),
+    );
+    // Relative paths in the argv resolve against the working directory, so two
+    // directories are two closures even with identical arguments.
+    fold_field(
+        &mut hasher,
+        b"current_dir:",
+        &parts
+            .current_dir
+            .map(|path| env_os_key_bytes(path.as_os_str()))
+            .unwrap_or_default(),
+    );
+    fold_field(
+        &mut hasher,
+        b"source_file:",
+        &env_os_key_bytes(parts.source_file.as_os_str()),
+    );
+    fold_field(
+        &mut hasher,
+        b"closure_args_len:",
+        parts.closure_args.len().to_string().as_bytes(),
+    );
+    for arg in parts.closure_args {
+        fold_field(&mut hasher, b"closure_arg:", arg.as_bytes());
+    }
+    let by_name: std::collections::BTreeMap<Vec<u8>, &std::ffi::OsString> = vars
+        .iter()
+        .map(|(name, value)| (env_text_key_bytes(name), value))
+        .collect();
+    for name in PREDICTION_ENV {
+        fold_field(&mut hasher, b"env_var:", name.as_bytes());
+        match by_name.get(name.as_bytes()) {
+            Some(value) => {
+                fold_field(&mut hasher, b"env_set:", b"1");
+                fold_field(&mut hasher, b"env_val:", &env_os_key_bytes(value));
+            }
+            // An unset variable is not an empty one: `env!` distinguishes them.
+            None => fold_field(&mut hasher, b"env_set:", b"0"),
+        }
+    }
+    for (name, value) in cargo_cfg_pairs(vars.iter().cloned()) {
+        fold_field(&mut hasher, b"cargo_cfg_name:", &env_text_key_bytes(&name));
+        fold_field(&mut hasher, b"cargo_cfg_val:", &env_os_key_bytes(&value));
+    }
+    fold_field(
+        &mut hasher,
+        b"skip_path_remap:",
+        if parts.skip_path_remap { b"1" } else { b"0" },
+    );
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Thin abstraction over file hashing.
@@ -2756,6 +2998,72 @@ impl<'db> FileHasher<'db> {
     /// Whether this hasher can persist C/C++ preprocessor memo records.
     pub(crate) fn supports_cc_preprocess_memo(&self) -> bool {
         self.cache.is_some()
+    }
+
+    /// Is there anywhere to keep a prediction record? Without the index DB
+    /// (the daemon's store-free hasher) there is not, and the caller keeps
+    /// running the pre-pass.
+    pub(crate) fn supports_input_predictions(&self) -> bool {
+        self.cache.is_some()
+    }
+
+    /// Remember the closure this build discovered for `identity`.
+    ///
+    /// Best-effort: a record is an optimisation, so a database that will not
+    /// take it costs a future pre-pass and nothing else. Never called with a
+    /// closure the pre-pass failed to produce — that is the one input set
+    /// that must not be remembered (kunobi-ninja/kache#323).
+    pub(crate) fn record_input_prediction(
+        &self,
+        identity: &str,
+        crate_name: Option<&str>,
+        dep_info: &DepInfo,
+    ) {
+        let Some(cache) = self.cache.as_ref() else {
+            return;
+        };
+        let record = InputPrediction::from_dep_info(dep_info);
+        let json = match serde_json::to_string(&record) {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::debug!("input prediction encode failed: {error}");
+                return;
+            }
+        };
+        if let Err(error) = cache.put_input_prediction(identity, record.schema, crate_name, &json) {
+            tracing::debug!("input prediction record failed: {error}");
+        }
+    }
+
+    /// The closure recorded for `identity`, if this build can still read it.
+    ///
+    /// Nothing derives a key from this yet. Any uncertainty — no row, a schema
+    /// this build does not know, bytes that will not decode — is `None`, which
+    /// the caller reads as "run the pre-pass".
+    ///
+    /// Test-only while recording is the whole feature: the production reader
+    /// arrives with the code that derives a key from a record.
+    #[cfg(test)]
+    pub(crate) fn input_prediction(&self, identity: &str) -> Option<InputPrediction> {
+        let cache = self.cache.as_ref()?;
+        let (schema, json) = match cache.get_input_prediction(identity) {
+            Ok(row) => row?,
+            Err(error) => {
+                tracing::debug!("input prediction lookup failed: {error}");
+                return None;
+            }
+        };
+        if schema != PREDICTION_SCHEMA {
+            return None;
+        }
+        match serde_json::from_str::<InputPrediction>(&json) {
+            Ok(record) if record.schema == PREDICTION_SCHEMA => Some(record),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::debug!("input prediction decode failed: {error}");
+                None
+            }
+        }
     }
 
     /// Reuse a preprocessor-output hash only when every source and header the
@@ -3435,6 +3743,38 @@ impl<'db> FileHashCache<'db> {
             .optional()
     }
 
+    /// The recorded closure for `identity`, or `None` when there is no row.
+    ///
+    /// A row written by a schema this build does not recognise reads as
+    /// absent: the cost of that is one pre-pass, and the cost of guessing at
+    /// an unknown encoding is a wrong key.
+    #[cfg(test)]
+    fn get_input_prediction(&self, identity: &str) -> rusqlite::Result<Option<(u32, String)>> {
+        self.db()
+            .query_row(
+                "SELECT schema, prediction_json FROM input_predictions WHERE identity = ?1",
+                params![identity],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+    }
+
+    fn put_input_prediction(
+        &self,
+        identity: &str,
+        schema: u32,
+        crate_name: Option<&str>,
+        prediction_json: &str,
+    ) -> rusqlite::Result<()> {
+        self.db().execute(
+            "INSERT OR REPLACE INTO input_predictions
+             (identity, schema, crate_name, prediction_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            params![identity, schema, crate_name, prediction_json],
+        )?;
+        Ok(())
+    }
+
     fn put_cc_preprocess_memo(
         &self,
         memo_key: &str,
@@ -3467,6 +3807,13 @@ pub(crate) fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result
             preprocessed_hash TEXT NOT NULL,
             inputs_json       TEXT NOT NULL,
             updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS input_predictions (
+            identity        TEXT PRIMARY KEY,
+            schema          INTEGER NOT NULL,
+            crate_name      TEXT,
+            prediction_json TEXT NOT NULL,
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS source_env_runtime_uses (
             content_hash    TEXT NOT NULL,
@@ -3638,6 +3985,22 @@ fn is_extra_filename_option(value: &str) -> bool {
 /// - `-C incremental`, via the same canonical filter the real compilation path
 ///   uses.
 fn dep_info_pass_args(source_file: &Path, rustc_args: &[String], dep_file: &Path) -> Vec<String> {
+    let mut dep_args = closure_shaping_args(source_file, rustc_args);
+    dep_args.push("--emit".to_string());
+    dep_args.push("dep-info".to_string());
+    dep_args.push("-o".to_string());
+    dep_args.push(dep_file.to_string_lossy().into_owned());
+    dep_args
+}
+
+/// The arguments that decide WHICH files rustc reads, with everything that
+/// only decides where its output goes removed.
+///
+/// Shared by the pre-pass argv and the prediction identity, so the two can
+/// never disagree about what shapes a closure. Two invocations of one crate
+/// that differ only in `-C extra-filename` read the same files, and dropping
+/// it is what lets them share a record.
+fn closure_shaping_args(source_file: &Path, rustc_args: &[String]) -> Vec<String> {
     let source_str = source_file.to_string_lossy();
     let rustc_args = crate::compile::strip_incremental_flags(rustc_args);
     let mut dep_args = vec![source_str.to_string()];
@@ -3670,11 +4033,6 @@ fn dep_info_pass_args(source_file: &Path, rustc_args: &[String], dep_file: &Path
             _ => dep_args.push((*arg).clone()),
         }
     }
-
-    dep_args.push("--emit".to_string());
-    dep_args.push("dep-info".to_string());
-    dep_args.push("-o".to_string());
-    dep_args.push(dep_file.to_string_lossy().into_owned());
 
     dep_args
 }
@@ -5944,6 +6302,316 @@ mod tests {
             with_default,
             "a rustup default switch must move the fingerprint"
         );
+    }
+
+    /// A prediction is only reusable by an invocation that would discover the
+    /// same files. Every part of the identity is one such "would discover the
+    /// same files" claim, so perturbing any of them has to produce a different
+    /// row rather than a wrong answer.
+    #[test]
+    fn prediction_identity_separates_every_part_it_folds() {
+        let base_args: Vec<String> = ["--edition", "2021", "--crate-name", "demo"]
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect();
+        let base_env = |extra: &[(&str, &str)]| -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+            let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![(
+                std::ffi::OsString::from("CARGO_CFG_TARGET_OS"),
+                std::ffi::OsString::from("linux"),
+            )];
+            env.extend(
+                extra
+                    .iter()
+                    .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v))),
+            );
+            env
+        };
+        let base_parts = PredictionIdentityParts {
+            rustc_version: "rustc 1.95.0",
+            inner_rustc: None,
+            current_dir: Some(Path::new("/w/one")),
+            source_file: Path::new("src/lib.rs"),
+            closure_args: &base_args,
+            skip_path_remap: false,
+        };
+        let base = prediction_identity_in_env(&base_parts, base_env(&[]));
+
+        assert_eq!(
+            prediction_identity_in_env(&base_parts, base_env(&[])),
+            base,
+            "the same invocation twice is the same identity"
+        );
+
+        let other_args: Vec<String> = ["--edition", "2024", "--crate-name", "demo"]
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect();
+        let perturbed: Vec<(&str, PredictionIdentityParts<'_>)> = vec![
+            (
+                "a different compiler build",
+                PredictionIdentityParts {
+                    rustc_version: "rustc 1.96.0",
+                    ..base_parts
+                },
+            ),
+            (
+                "a wrapped inner compiler",
+                PredictionIdentityParts {
+                    inner_rustc: Some(Path::new("/usr/bin/rustc")),
+                    ..base_parts
+                },
+            ),
+            (
+                "another working directory, which relative args resolve against",
+                PredictionIdentityParts {
+                    current_dir: Some(Path::new("/w/two")),
+                    ..base_parts
+                },
+            ),
+            (
+                "another crate root",
+                PredictionIdentityParts {
+                    source_file: Path::new("src/main.rs"),
+                    ..base_parts
+                },
+            ),
+            (
+                "an edition change, which changes what resolves",
+                PredictionIdentityParts {
+                    closure_args: &other_args,
+                    ..base_parts
+                },
+            ),
+            (
+                "path remapping turned off",
+                PredictionIdentityParts {
+                    skip_path_remap: true,
+                    ..base_parts
+                },
+            ),
+        ];
+        for (what, parts) in perturbed {
+            assert_ne!(
+                prediction_identity_in_env(&parts, base_env(&[])),
+                base,
+                "{what} must not reuse another invocation's record"
+            );
+        }
+
+        // The environment the key already folds, one variable at a time.
+        for var in PREDICTION_ENV {
+            assert_ne!(
+                prediction_identity_in_env(&base_parts, base_env(&[(var, "value")])),
+                base,
+                "{var} must separate identities"
+            );
+        }
+        // Set-but-empty is not unset: `env!` can tell them apart.
+        assert_ne!(
+            prediction_identity_in_env(&base_parts, base_env(&[("RUSTFLAGS", "")])),
+            base,
+            "an empty RUSTFLAGS is not an absent one"
+        );
+        // A cfg change can add or remove whole modules.
+        let mut other_cfg = base_env(&[]);
+        other_cfg[0].1 = std::ffi::OsString::from("windows");
+        assert_ne!(
+            prediction_identity_in_env(&base_parts, other_cfg),
+            base,
+            "CARGO_CFG_* changes which modules compile"
+        );
+        // Unrelated environment must NOT separate identities: folding it
+        // wholesale is what kept the cc preprocessor memo from ever hitting
+        // (kunobi-ninja/kache#927).
+        assert_eq!(
+            prediction_identity_in_env(&base_parts, base_env(&[("PWD", "/somewhere/else")])),
+            base,
+            "variables that do not change what rustc reads must not be folded"
+        );
+    }
+
+    /// An invocation with no crate root discovers no closure, so it has no
+    /// identity — and two invocations that read different files must not share
+    /// one.
+    ///
+    /// The comparisons run against one environment snapshot rather than the
+    /// live process environment: other tests in this binary set and unset
+    /// variables concurrently, which would otherwise decide the result.
+    #[test]
+    fn rustc_prediction_identity_needs_a_crate_root_and_separates_units() {
+        let parse = |args: &[&str]| {
+            RustcArgs::parse(&args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        assert_eq!(
+            rustc_prediction_identity(&parse(&["rustc", "--version"])),
+            None,
+            "a query invocation compiles nothing and predicts nothing"
+        );
+
+        if get_rustc_version(Path::new("rustc")).is_err() {
+            return; // no compiler on this host; nothing to identify against
+        }
+        let env: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![(
+            std::ffi::OsString::from("CARGO_CFG_TARGET_OS"),
+            std::ffi::OsString::from("linux"),
+        )];
+        let identity = |args: &[&str]| {
+            rustc_prediction_identity_in_env(&parse(args), env.clone())
+                .expect("a crate root gives an identity")
+        };
+
+        let lib = identity(&["rustc", "src/lib.rs", "--edition", "2021"]);
+        assert!(!lib.is_empty());
+        assert_ne!(
+            lib,
+            identity(&["rustc", "src/main.rs", "--edition", "2021"]),
+            "different crate roots read different files"
+        );
+        assert_ne!(
+            lib,
+            identity(&["rustc", "src/lib.rs", "--edition", "2024"]),
+            "a different edition resolves differently"
+        );
+
+        // Output naming is not identity: these two read the same files.
+        assert_eq!(
+            lib,
+            identity(&[
+                "rustc",
+                "src/lib.rs",
+                "--edition",
+                "2021",
+                "-C",
+                "extra-filename=-abc123",
+            ]),
+            "two units of one crate share a record"
+        );
+    }
+
+    /// The identity is the argv that shapes the closure, not the argv that
+    /// names the output. Two units of one crate differing only in where their
+    /// artifacts land read exactly the same files.
+    #[test]
+    fn prediction_identity_ignores_output_naming_flags() {
+        let closure = |extra: &[&str]| -> Vec<String> {
+            let mut args: Vec<String> = ["--edition", "2021"]
+                .iter()
+                .map(|a| (*a).to_string())
+                .collect();
+            args.extend(extra.iter().map(|a| (*a).to_string()));
+            closure_shaping_args(Path::new("src/lib.rs"), &args)
+        };
+        let plain = closure(&[]);
+        for naming in [
+            vec!["-C", "extra-filename=-abc123"],
+            vec!["--out-dir", "/target/debug/deps"],
+            vec!["--emit=metadata,link"],
+        ] {
+            assert_eq!(
+                closure(&naming),
+                plain,
+                "{naming:?} decides where output goes, not what rustc reads"
+            );
+        }
+        assert_ne!(
+            closure(&["--cfg", "feature=\"extra\""]),
+            plain,
+            "a cfg can add a module, so it stays in the identity"
+        );
+    }
+
+    /// What is written has to be exactly what comes back, or a prediction
+    /// would reproduce a different `sources` group than the pre-pass did.
+    #[test]
+    fn input_prediction_round_trips_through_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let dep_info = DepInfo {
+            source_files: vec![
+                PathBuf::from("/w/src/lib.rs"),
+                PathBuf::from("/w/src/generated.rs"),
+            ],
+            env_deps: vec![("OUT_DIR".to_string(), "/target/build/out".to_string())],
+        };
+
+        let hasher = FileHasher::persistent(&db);
+        assert!(hasher.supports_input_predictions());
+        assert_eq!(
+            hasher.input_prediction("unit"),
+            None,
+            "an identity never recorded has no prediction"
+        );
+        hasher.record_input_prediction("unit", Some("demo"), &dep_info);
+
+        let record = FileHasher::persistent(&db)
+            .input_prediction("unit")
+            .expect("the recorded closure must survive a new process");
+        assert_eq!(record.schema, PREDICTION_SCHEMA);
+        assert_eq!(record.sources, dep_info.source_files);
+        assert_eq!(record.env_deps, dep_info.env_deps);
+
+        // Re-recording replaces rather than accumulates.
+        let narrower = DepInfo {
+            source_files: vec![PathBuf::from("/w/src/lib.rs")],
+            env_deps: Vec::new(),
+        };
+        FileHasher::persistent(&db).record_input_prediction("unit", Some("demo"), &narrower);
+        let record = FileHasher::persistent(&db)
+            .input_prediction("unit")
+            .unwrap();
+        assert_eq!(record.sources, narrower.source_files);
+        assert!(record.env_deps.is_empty());
+    }
+
+    /// A row this build cannot vouch for reads as absent. The cost of that is
+    /// one pre-pass; the cost of guessing at an unknown encoding is a key
+    /// derived from someone else's rules.
+    #[test]
+    fn a_prediction_from_another_schema_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let hasher = FileHasher::persistent(&db);
+        let cache = hasher.cache.as_ref().unwrap();
+
+        cache
+            .put_input_prediction("future", PREDICTION_SCHEMA + 1, None, "{\"anything\":1}")
+            .unwrap();
+        assert_eq!(hasher.input_prediction("future"), None);
+
+        // A row whose column says the right schema but whose bytes do not
+        // decode is the same answer.
+        cache
+            .put_input_prediction("corrupt", PREDICTION_SCHEMA, None, "not json")
+            .unwrap();
+        assert_eq!(hasher.input_prediction("corrupt"), None);
+
+        // And a row whose stored schema disagrees with its own payload.
+        let stale = format!(
+            "{{\"schema\":{},\"sources\":[],\"env_deps\":[]}}",
+            PREDICTION_SCHEMA + 1
+        );
+        cache
+            .put_input_prediction("mismatched", PREDICTION_SCHEMA, None, &stale)
+            .unwrap();
+        assert_eq!(hasher.input_prediction("mismatched"), None);
+    }
+
+    /// A hasher with no database has nowhere to keep a record. The daemon's
+    /// store-free hasher is exactly this case, and it must not panic or
+    /// pretend to have recorded anything.
+    #[test]
+    fn recording_without_a_database_is_a_no_op() {
+        let hasher = FileHasher::new();
+        assert!(!hasher.supports_input_predictions());
+        hasher.record_input_prediction(
+            "unit",
+            None,
+            &DepInfo {
+                source_files: vec![PathBuf::from("/w/src/lib.rs")],
+                env_deps: Vec::new(),
+            },
+        );
+        assert_eq!(hasher.input_prediction("unit"), None);
     }
 
     #[test]

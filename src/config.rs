@@ -282,6 +282,13 @@ pub struct Config {
     /// compiler reads). Off by default. Set via `KACHE_MODIFIED_INPUT_GUARD=1`/
     /// `=true` or `[cache] modified_input_guard`; env wins over the file.
     pub modified_input_guard: bool,
+    /// Opt-in input-set predictions: when on, each rustc invocation remembers
+    /// the source closure its dep-info pre-pass discovered, so a later build of
+    /// the same unit can derive the key without spawning the pre-pass again.
+    /// Recording only for now — nothing reads a record back yet. Off by
+    /// default. Set via `KACHE_INPUT_PREDICTIONS=1`/`=true` or
+    /// `[cache] input_predictions`; env wins over the file.
+    pub input_predictions: bool,
     /// Experimental daemon-assisted local hits (kunobi-ninja/kache#565): when
     /// on, a primary rustc invocation skips opening the local SQLite store and
     /// asks the running daemon to perform the lookup, restoring from the blob
@@ -599,6 +606,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) remote_readonly: Option<bool>,
     /// Too-new-input guard. See [`Config::modified_input_guard`].
     pub(crate) modified_input_guard: Option<bool>,
+    /// Input-set predictions. See [`Config::input_predictions`].
+    pub(crate) input_predictions: Option<bool>,
     /// Daemon-assisted local hits. See [`Config::local_hit_daemon`].
     pub(crate) local_hit_daemon: Option<bool>,
     /// Windows hardlink restore opt-in. See [`Config::windows_hardlink`].
@@ -977,6 +986,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_LOCAL_ONLY",
     "KACHE_REMOTE_READONLY",
     "KACHE_MODIFIED_INPUT_GUARD",
+    "KACHE_INPUT_PREDICTIONS",
     "KACHE_LOCAL_HIT_DAEMON",
     "KACHE_WINDOWS_HARDLINK",
     "KACHE_AUTO_GC",
@@ -1453,6 +1463,7 @@ impl Config {
             remote_readonly = true;
         }
         let modified_input_guard = Self::modified_input_guard_enabled(&file_config);
+        let input_predictions = Self::input_predictions_enabled(&file_config);
         let local_hit_daemon = Self::local_hit_daemon_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
@@ -1504,6 +1515,7 @@ impl Config {
             local_only,
             remote_readonly,
             modified_input_guard,
+            input_predictions,
             local_hit_daemon,
             windows_hardlink,
             auto_gc,
@@ -1863,6 +1875,22 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.modified_input_guard)
+            .unwrap_or(false)
+    }
+
+    /// Whether input-set predictions are recorded. Env wins over the file:
+    /// `KACHE_INPUT_PREDICTIONS=1`/`=true`, else `[cache] input_predictions`,
+    /// else off.
+    fn input_predictions_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_INPUT_PREDICTIONS", ignore_env) {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.input_predictions)
             .unwrap_or(false)
     }
 
@@ -2675,6 +2703,48 @@ pub(crate) mod tests {
         TestEnvGuard { key, previous }
     }
 
+    /// Resolution order for the recording flag: the environment overrides the
+    /// file, the file is consulted when the environment is silent, and the
+    /// answer with neither is off. CI exports `KACHE_*` of its own, so the
+    /// variable is cleared explicitly rather than assumed absent.
+    #[test]
+    fn input_predictions_resolve_env_over_file_and_default_off() {
+        let file_says = |value: Option<bool>| -> Result<FileConfig> {
+            Ok(FileConfig {
+                cache: Some(CacheFileConfig {
+                    input_predictions: value,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+
+        {
+            let _env = set_env_for_test("KACHE_INPUT_PREDICTIONS", None);
+            assert!(
+                !Config::input_predictions_enabled(&file_says(None)),
+                "off unless something asks for it"
+            );
+            assert!(Config::input_predictions_enabled(&file_says(Some(true))));
+            assert!(!Config::input_predictions_enabled(&file_says(Some(false))));
+        }
+
+        for on in ["1", "true", "TRUE"] {
+            let _env = set_env_for_test("KACHE_INPUT_PREDICTIONS", Some(on.as_ref()));
+            assert!(
+                Config::input_predictions_enabled(&file_says(Some(false))),
+                "{on} in the environment must override the file"
+            );
+        }
+        for off in ["0", "false", "no", ""] {
+            let _env = set_env_for_test("KACHE_INPUT_PREDICTIONS", Some(off.as_ref()));
+            assert!(
+                !Config::input_predictions_enabled(&file_says(Some(true))),
+                "{off:?} in the environment must override the file"
+            );
+        }
+    }
+
     fn set_kache_config_for_test(path: &std::path::Path) -> TestEnvGuard {
         set_env_for_test("KACHE_CONFIG", Some(path.as_os_str()))
     }
@@ -3374,6 +3444,7 @@ remote_key_cache_refresh_secs = 900
                 local_only: None,
                 remote_readonly: None,
                 modified_input_guard: None,
+                input_predictions: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,
@@ -3839,6 +3910,7 @@ remote_key_cache_refresh_secs = 900
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            input_predictions: false,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -3894,6 +3966,7 @@ remote_key_cache_refresh_secs = 900
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            input_predictions: false,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -3945,6 +4018,7 @@ remote_key_cache_refresh_secs = 900
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            input_predictions: false,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -4015,6 +4089,7 @@ remote_key_cache_refresh_secs = 900
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            input_predictions: false,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -4670,6 +4745,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 local_only: None,
                 remote_readonly: None,
                 modified_input_guard: None,
+                input_predictions: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,

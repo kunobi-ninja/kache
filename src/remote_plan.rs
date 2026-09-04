@@ -87,6 +87,7 @@ mod tests {
             local_only: false,
             remote_readonly: false,
             modified_input_guard: false,
+            input_predictions: false,
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,

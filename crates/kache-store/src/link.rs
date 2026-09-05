@@ -25,7 +25,7 @@ pub fn set_windows_hardlink_restore(enabled: bool) {
 /// restore: without it, a hardlink would propagate the blob's read-only
 /// attribute to the build's own output (shared MFT record, #429).
 #[cfg(windows)]
-pub(crate) fn windows_hardlink_enabled() -> bool {
+pub fn windows_hardlink_enabled() -> bool {
     WINDOWS_HARDLINK_RESTORE.load(Ordering::Relaxed)
 }
 
@@ -325,9 +325,9 @@ fn warn_cross_volume_ingest_once(source: &Path, tmp: &Path) {
     match COW_WARN_MARKER.get() {
         Some(base) => {
             let marker = bucket_marker(base, "cross-volume");
-            let _warned = crate::wrapper::warn_once_per_session(
+            let _warned = crate::markers::warn_once_per_session(
                 &marker,
-                crate::wrapper::WARN_SESSION_SECS,
+                crate::markers::WARN_SESSION_SECS,
                 &message,
             );
         }
@@ -661,9 +661,9 @@ fn warn_no_cow_restore_once(
             // Separate bucket per severity: a layout advisory must never mute a
             // fault report (and vice versa).
             let marker = bucket_marker(base, cause.warn_bucket());
-            let _warned = crate::wrapper::warn_once_per_session(
+            let _warned = crate::markers::warn_once_per_session(
                 &marker,
-                crate::wrapper::WARN_SESSION_SECS,
+                crate::markers::WARN_SESSION_SECS,
                 &message,
             );
         }
@@ -767,7 +767,7 @@ fn set_executable_permissions(path: &Path) -> Result<()> {
 /// artifact into the content-addressed store (sharing blocks with the
 /// build's own output) and account for it, mirroring the restore side.
 #[cfg(target_os = "macos")]
-pub(crate) fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
+pub fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -789,7 +789,7 @@ pub(crate) fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
+pub fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
     use std::os::unix::io::AsRawFd;
 
     let src_file = fs::File::open(src)?;
@@ -824,7 +824,7 @@ pub(crate) fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
 /// leaves a wrong file. The fresh dst is created writable and does NOT inherit
 /// the store blob's read-only attribute (independent file).
 #[cfg(windows)]
-pub(crate) fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
+pub fn try_reflink(src: &Path, dst: &Path) -> Result<()> {
     let r = reflink_windows(src, dst);
     if r.is_err() {
         // Clear read-only defensively, then remove any partial dst so the
@@ -947,7 +947,7 @@ fn windows_cluster_size(path: &Path) -> Result<u64> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-pub(crate) fn try_reflink(_src: &Path, _dst: &Path) -> Result<()> {
+pub fn try_reflink(_src: &Path, _dst: &Path) -> Result<()> {
     anyhow::bail!("reflink not supported on this platform")
 }
 
@@ -982,18 +982,18 @@ fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
 /// mode as a compiler output (`0666`). The kernel therefore applies the current
 /// umask and any inherited default ACL exactly where the final file will live.
 /// No metadata operation is performed through the final pathname.
-pub(crate) struct PreparedWritableTarget {
+pub struct PreparedWritableTarget {
     staged: tempfile::NamedTempFile,
     target: PathBuf,
     bytes: u64,
 }
 
 impl PreparedWritableTarget {
-    pub(crate) fn target(&self) -> &Path {
+    pub fn target(&self) -> &Path {
         &self.target
     }
 
-    pub(crate) fn publish(self) -> Result<()> {
+    pub fn publish(self) -> Result<()> {
         let target = self.target;
         self.staged
             .persist_noclobber(&target)
@@ -1013,7 +1013,7 @@ impl PreparedWritableTarget {
     /// The caller must first establish that the target is a private, writable
     /// regular file. Special paths retain the no-clobber path above and are
     /// handled by the selected compiler instead.
-    pub(crate) fn publish_replacing(self) -> Result<()> {
+    pub fn publish_replacing(self) -> Result<()> {
         let target = self.target;
         self.staged
             .persist(&target)
@@ -1042,7 +1042,7 @@ fn new_writable_staging_file(target: &Path) -> Result<tempfile::NamedTempFile> {
 }
 
 /// Prepare cached file bytes without touching an existing target entry.
-pub(crate) fn prepare_writable_target_from_file(
+pub fn prepare_writable_target_from_file(
     src: &Path,
     target: &Path,
 ) -> Result<PreparedWritableTarget> {
@@ -1064,7 +1064,7 @@ pub(crate) fn prepare_writable_target_from_file(
 }
 
 /// Prepare transformed C/C++ bytes with the same absent-only guarantee.
-pub(crate) fn prepare_writable_target_from_bytes(
+pub fn prepare_writable_target_from_bytes(
     target: &Path,
     content: &[u8],
 ) -> Result<PreparedWritableTarget> {
@@ -1385,7 +1385,8 @@ pub fn rewrite_depinfo_content(content: &str, project_dir: &Path, mode: DepInfoM
 /// outputs and sources below Cargo's invocation directory. Re-root both with
 /// distinct sentinels so a cached `.d` never leaves Cargo watching a live donor
 /// worktree after the artifact moves (#760).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub fn rewrite_rustc_depinfo_content(
     content: &str,
     target_dir: &Path,

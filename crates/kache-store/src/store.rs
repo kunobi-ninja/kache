@@ -1,3 +1,4 @@
+use crate::ArtifactPolicy;
 use anyhow::{Context, Result};
 pub use kache_format::{CachedFile, EntryMeta};
 use rusqlite::{Connection, Error as SqlError, ErrorCode, params};
@@ -21,7 +22,7 @@ pub struct StorePutResult {
 /// transport boundary; the store still re-checks metadata, paths and lengths,
 /// but deliberately does not read every artifact a second time.
 #[derive(Debug, Clone)]
-pub(crate) struct VerifiedRestoredEntry {
+pub struct VerifiedRestoredEntry {
     pub cache_key: String,
     pub meta: EntryMeta,
 }
@@ -144,31 +145,7 @@ fn unlink_blob(blob: &Path) {
     }
 }
 
-/// May a freshly-compiled output be HARDLINKED into the blob store when the
-/// filesystem has no CoW reflink?
-///
-/// Mirrors the restore side's [`ArtifactKind::link_strategy`] reasoning:
-/// immutable kinds (`.rlib` / `.rmeta` / `.o` / …) may share an inode with the
-/// store blob because the build never mutates them in place — the same
-/// contract a warm restore already imposes, where these outputs *are*
-/// read-only hardlinks of blobs (and `prepare_output_paths` pre-cleans them
-/// before a recompile). Mutable kinds (executables, dylibs — codesigning,
-/// stripping) must stay independent so a post-build mutation can't reach the
-/// content-addressed blob.
-///
-/// Three insert-side tightenings versus restore:
-/// - `DepInfo` is excluded: the wrapper rewrites the build's `.d` in place
-///   *after* `put` (`DepInfoMode::Expand`), and restore never hardlinks `.d`
-///   either (it materializes via `write_restored`).
-/// - restore classifies with full compile context; here only the stored
-///   filename is available, so an extensionless name (a bin executable by
-///   rustc's Unix convention) or anything carrying an executable mode bit is
-///   excluded rather than defaulted to hardlink.
-/// - on Windows a hardlink would propagate the blob's read-only attribute to
-///   the build's own output (shared MFT record, #429), so insert hardlinks
-///   only under the same `[cache] windows_hardlink` opt-in as restore.
-fn hardlink_eligible(store_name: &str, executable: bool) -> bool {
-    use crate::compiler::{ArtifactKind, classify_by_filename};
+fn hardlink_eligible<P: ArtifactPolicy>(store_name: &str, executable: bool) -> bool {
     if executable {
         return false;
     }
@@ -176,18 +153,15 @@ fn hardlink_eligible(store_name: &str, executable: bool) -> bool {
     if !crate::link::windows_hardlink_enabled() {
         return false;
     }
-    match classify_by_filename(store_name) {
-        ArtifactKind::DepInfo | ArtifactKind::Other("extensionless") => false,
-        kind => kind.link_strategy() == crate::link::LinkStrategy::Hardlink,
-    }
+    P::allow_hardlink(store_name)
 }
 
-fn source_hardlink_allowed(
+fn source_hardlink_allowed<P: ArtifactPolicy>(
     allow_source_hardlinks: bool,
     store_name: &str,
     executable: bool,
 ) -> bool {
-    allow_source_hardlinks && hardlink_eligible(store_name, executable)
+    allow_source_hardlinks && hardlink_eligible::<P>(store_name, executable)
 }
 
 /// How a new blob was staged into the store before publish. Counters are
@@ -452,7 +426,7 @@ fn restore_source_writable_if_unshared(source: &Path, blob: &Path) {
     }
 }
 
-pub(crate) fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
+pub fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
     // Defensive slice: a malformed hash (e.g. from a hand-edited or malicious
     // remote `meta.json`) must not panic. Hash shape is validated at the
     // remote trust boundary (`extract_entry_pack`), so a bad hash never gets
@@ -471,7 +445,7 @@ pub(crate) fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
 /// answers "run the local path yourself" instead of mutating the store from a
 /// read-only connection.
 #[derive(Debug)]
-pub(crate) enum ProbeOutcome {
+pub enum ProbeOutcome {
     /// Committed, blob-complete entry: safe to restore from this meta.
     Hit(Box<EntryMeta>),
     /// No committed entry for this key (authoritative miss).
@@ -480,17 +454,13 @@ pub(crate) enum ProbeOutcome {
     Fallback(&'static str),
 }
 
-/// Read-only equivalent of the lookup half of [`Store::get`]: same
+/// Read-only equivalent of the lookup half of [`ArtifactStore::get`]: same
 /// committed-row check, `meta.json` parse, legacy-layout detection, and
 /// blob existence/size validation — but with every write side effect
 /// (lazy migration, evict-and-miss, hit accounting) replaced by
 /// [`ProbeOutcome::Fallback`]. Runs on a read-only connection so parallel
 /// probes never contend on the daemon's store mutex (#565).
-pub(crate) fn probe_entry_readonly(
-    db: &Connection,
-    store_dir: &Path,
-    cache_key: &str,
-) -> ProbeOutcome {
+pub fn probe_entry_readonly(db: &Connection, store_dir: &Path, cache_key: &str) -> ProbeOutcome {
     let committed = db.query_row(
         "SELECT committed FROM entries WHERE cache_key = ?1",
         params![cache_key],
@@ -546,7 +516,7 @@ pub(crate) fn probe_entry_readonly(
 /// work, no WAL/synchronous pragma churn — `query_only` hard-refuses any
 /// accidental write, and the busy timeout is half the daemon's 50 ms lookup
 /// deadline so a contended probe still answers (`Fallback`) inside budget.
-pub(crate) fn open_index_db_readonly(db_path: &Path) -> Result<Connection> {
+pub fn open_index_db_readonly(db_path: &Path) -> Result<Connection> {
     let db = Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -573,13 +543,13 @@ const TMUTIL_TIMEOUT: Duration = Duration::from_secs(30);
 /// daemon that listened but never answered (kunobi-ninja/kache#588). Instead:
 /// skip entirely when the exclusion xattr is already present (the warm case —
 /// a syscall, no subprocess), else run `tmutil` on a detached thread with a
-/// kill-after-[`TMUTIL_TIMEOUT`] so readiness never gates on backupd.
+/// 30-second timeout so readiness never gates on backupd.
 ///
 /// Returns the background thread's handle so tests can join it; production
 /// callers drop it (the thread never outlives its bounded wait by more than
 /// the child kill).
 #[cfg(target_os = "macos")]
-pub(crate) fn exclude_from_indexing(dir: &Path) -> Option<std::thread::JoinHandle<()>> {
+pub fn exclude_from_indexing(dir: &Path) -> Option<std::thread::JoinHandle<()>> {
     // Spotlight: .metadata_never_index sentinel
     let sentinel = dir.join(".metadata_never_index");
     if !sentinel.exists() {
@@ -681,14 +651,14 @@ pub struct GcStats {
 /// Registered blob bytes and blob rows an entry removal released — blobs
 /// whose last reference went away, not the entry's logical size
 /// (kunobi-ninja/kache#608). Denominated in `blobs` TABLE bytes, the same
-/// unit as [`Store::physical_size`], so eviction's running budget stays
+/// unit as [`ArtifactStore::physical_size`], so eviction's running budget stays
 /// consistent with its trigger; the file unlink itself is best-effort
 /// (Windows can defer it), so this is not a guarantee about the disk.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RemovalReclaim {
-    pub(crate) freed_bytes: u64,
-    pub(crate) blobs_unlinked: usize,
-    pub(crate) disk_bytes_reclaimed: u64,
+pub struct RemovalReclaim {
+    pub freed_bytes: u64,
+    pub blobs_unlinked: usize,
+    pub disk_bytes_reclaimed: u64,
 }
 
 /// One pass of `remove_entry_guarded_with_hooks`: either a settled outcome,
@@ -702,21 +672,21 @@ enum RemovalAttempt {
     Unreclaimable,
 }
 
-/// Outcome of [`Store::remove_entry_guarded`].
+/// Outcome of removing an entry while holding its compile lock.
 #[derive(Debug)]
-pub(crate) enum GuardedRemoval {
+pub enum GuardedRemoval {
     Reclaimed(RemovalReclaim),
     Skipped,
     Unreclaimable,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct TrackedTargetRoot {
+pub struct TrackedTargetRoot {
     pub path: PathBuf,
     pub workspace_root: PathBuf,
     pub first_seen: i64,
     pub last_seen: i64,
-    pub identity: crate::machine::PathIdentity,
+    pub identity: crate::filesystem::PathIdentity,
 }
 
 /// A shadow policy's would-evict set for one size-driven sweep
@@ -742,7 +712,7 @@ pub struct ShadowDemandSplit {
     pub shadow_kept_demanded: usize,
 }
 
-/// Statistics returned by [`Store::sweep_orphan_blobs`].
+/// Statistics returned by [`ArtifactStore::sweep_orphan_blobs`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OrphanSweepStats {
     /// Blob-shaped files inspected on disk.
@@ -776,7 +746,8 @@ struct AuthoritativeBlobIndex {
 }
 
 /// The local content-addressed store.
-pub struct Store {
+pub struct ArtifactStore<P: ArtifactPolicy> {
+    policy: std::marker::PhantomData<P>,
     config: Config,
     db: Connection,
 }
@@ -790,7 +761,7 @@ pub struct Store {
 /// (hardlink/reflink/read — milliseconds; once linked, the target file owns its
 /// own inode and is immune to a later blob unlink), so 2 minutes is generous
 /// headroom on a slow disk while staying far below any sensible cache lifetime.
-pub(crate) const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
+pub const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
 
 /// Entries backfilled with their rebuild cost per GC sweep
 /// (kunobi-ninja/kache#594).
@@ -811,7 +782,7 @@ const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 /// row is only consuming space. One row is ~100 bytes, so even a store
 /// evicting tens of thousands of entries a fortnight stays in the low
 /// megabytes.
-pub(crate) const TOMBSTONE_RETENTION_DAYS: u64 = 14;
+pub const TOMBSTONE_RETENTION_DAYS: u64 = 14;
 
 const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -861,7 +832,7 @@ impl StoreLock {
         Self::finish(file)
     }
 
-    pub(crate) fn try_acquire(path: &Path) -> Result<Option<Self>> {
+    pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
         let file = Self::open(path)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self::finish(file)?)),
@@ -908,7 +879,7 @@ pub enum BuildClaim {
 /// a memo collision before it reaches the compiler as a wrong artifact
 /// (kunobi-ninja/kache#332).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerifyRestores {
+pub enum VerifyRestores {
     /// Never re-hash (size check only). Default — verifying every hit costs an
     /// extra full read per blob.
     Off,
@@ -930,7 +901,7 @@ static VERIFY_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Parse the restore-verification mode from `KACHE_VERIFY_RESTORES`. Read per
 /// call (cheap, off the hot path) so tests can toggle it. Back-compatible: the
 /// old boolean `1`/`true` maps to `Always`, unset/`0`/`false`/`off` to `Off`.
-pub(crate) fn verify_restores_mode() -> VerifyRestores {
+pub fn verify_restores_mode() -> VerifyRestores {
     parse_verify_restores(std::env::var("KACHE_VERIFY_RESTORES").ok().as_deref())
 }
 
@@ -1007,31 +978,8 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
     }
 }
 
-/// Whether an empty file of this kind is a legitimate compiler output rather
-/// than the signature of a truncated / failed write.
-///
-/// `put` otherwise refuses zero-byte outputs, because for every linkable kind an
-/// empty artifact means the compiler died mid-write (or the disk filled) and
-/// caching it would hand that corruption to every later build (#8).
-///
-/// An `.rmeta` from a unit with no metadata to emit is the exception:
-/// `cargo check` / `cargo clippy --all-targets` compile test and bin units with
-/// `--emit=metadata`, and rustc creates the `.rmeta` cargo expects but leaves it
-/// zero bytes. Refusing it made those units permanently uncacheable, and because
-/// the guard aborts the whole `put`, it also discarded the entry's non-empty
-/// siblings (kunobi-ninja/kache#624).
-///
-/// The crate-type test is what keeps this from re-opening the hole the guard
-/// exists to close: a `lib` / `rlib` / `dylib` / `proc-macro` unit *does* have
-/// metadata, so an empty `.rmeta` there is a truncated write and stays refused.
-/// A `--test` unit passes no `--crate-type`, hence the empty-slice case.
-fn zero_byte_is_valid_output(store_name: &str, crate_types: &[String]) -> bool {
-    matches!(
-        crate::compiler::classify_by_filename(store_name),
-        crate::compiler::ArtifactKind::Metadata
-    ) && !crate_types
-        .iter()
-        .any(|ct| crate::compiler::rustc::crate_type_produces_metadata(ct))
+fn zero_byte_is_valid_output<P: ArtifactPolicy>(store_name: &str, crate_types: &[String]) -> bool {
+    P::allow_empty(store_name, crate_types)
 }
 
 /// Length-prefix a field before folding it into a hasher, so adjacent fields
@@ -1041,13 +989,10 @@ fn fold_field(h: &mut blake3::Hasher, bytes: &[u8]) {
     h.update(bytes);
 }
 
-/// Derive the deduplicated, sorted set of canonical rustc `--emit` kinds an
-/// entry covers, from its stored output filenames (kunobi-ninja/kache#325).
-/// Files that map to no emit kind (debug sidecars, etc.) are ignored.
-fn emit_kinds_for_files(files: &[CachedFile]) -> Vec<String> {
+fn emit_kinds_for_files<P: ArtifactPolicy>(files: &[CachedFile]) -> Vec<String> {
     let mut kinds: Vec<String> = files
         .iter()
-        .filter_map(|f| crate::compiler::emit_kind_for_filename(&f.name))
+        .filter_map(|f| P::emit_kind(&f.name))
         .map(str::to_string)
         .collect();
     kinds.sort();
@@ -1216,7 +1161,7 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
             ON target_roots(last_seen);",
     )?;
 
-    crate::cache_key::ensure_file_hash_cache_schema(db)?;
+    crate::file_hash::ensure_file_hash_cache_schema(db)?;
 
     Ok(())
 }
@@ -1244,18 +1189,18 @@ fn record_entry_blobs(
     Ok(())
 }
 
-pub(crate) fn open_index_db(db_path: &Path) -> Result<Connection> {
+pub fn open_index_db(db_path: &Path) -> Result<Connection> {
     open_index_db_reporting_recovery(db_path).map(|(db, _)| db)
 }
 
 /// Like [`open_index_db`], but also reports whether the index had to be
 /// recreated from scratch.
 ///
-/// [`Store::open`] needs to know: a freshly quarantined index has no rows, while
+/// [`ArtifactStore::open`] needs to know: a freshly quarantined index has no rows, while
 /// the blobs and every entry's `meta.json` are still on disk, so it can rebuild
 /// the rows instead of silently presenting a cold cache (#415). Callers that
 /// only need a connection use the wrapper above.
-pub(crate) fn open_index_db_reporting_recovery(db_path: &Path) -> Result<(Connection, bool)> {
+pub fn open_index_db_reporting_recovery(db_path: &Path) -> Result<(Connection, bool)> {
     match try_open_index_db(db_path) {
         Ok(db) => Ok((db, false)),
         // The index is a derived, rebuildable cache — the blobs plus each
@@ -1272,7 +1217,7 @@ pub(crate) fn open_index_db_reporting_recovery(db_path: &Path) -> Result<(Connec
 /// empty index so stats/report/compiles degrade gracefully instead of bricking
 /// every command.
 ///
-/// Returns `(connection, recovered)`. `recovered == true` tells [`Store::open`]
+/// Returns `(connection, recovered)`. `recovered == true` tells [`ArtifactStore::open`]
 /// the row set was lost and should be rebuilt from the entry `meta.json` files
 /// still on disk, so the user does not silently drop to a cold cache (#415).
 ///
@@ -1415,7 +1360,7 @@ fn index_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     db_path.with_file_name(name)
 }
 
-/// Outcome of [`Store::rebuild_index_from_store`].
+/// Outcome of [`ArtifactStore::rebuild_index_from_store`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RebuildStats {
     /// Entries whose rows were reconstructed from `meta.json`.
@@ -1448,8 +1393,9 @@ fn positive_or_none(value: i64) -> Option<u64> {
     (value > 0).then_some(value as u64)
 }
 
-impl Store {
-    pub fn open(config: &Config) -> Result<Self> {
+impl<P: ArtifactPolicy> ArtifactStore<P> {
+    pub fn open(config: impl Into<Config>) -> Result<Self> {
+        let config = config.into();
         fs::create_dir_all(&config.cache_dir)
             .with_context(|| format!("creating cache directory {}", config.cache_dir.display()))?;
         let store_dir = config.store_dir();
@@ -1460,7 +1406,8 @@ impl Store {
         let (db, recovered) = open_index_db_reporting_recovery(&db_path)
             .with_context(|| format!("opening index database {}", db_path.display()))?;
 
-        let store = Store {
+        let store = Self {
+            policy: std::marker::PhantomData,
             config: config.clone(),
             db,
         };
@@ -1493,28 +1440,17 @@ impl Store {
         Ok(store)
     }
 
-    pub fn file_hasher(&self) -> crate::cache_key::FileHasher<'_> {
-        crate::cache_key::FileHasher::from_connection(&self.db)
-    }
-
-    pub fn file_hasher_with_daemon(
-        &self,
-        socket_path: PathBuf,
-    ) -> crate::cache_key::FileHasher<'_> {
-        self.file_hasher().with_daemon(socket_path)
-    }
-
     /// Persistent-cache lookup for one file's content hash — DB read only, no
     /// blake3. Lets the daemon's `HashFiles` path release the store lock before
-    /// the expensive file read (#281). See [`crate::cache_key::FileHashLookup`].
-    pub fn file_hash_lookup(&self, path: &Path) -> crate::cache_key::FileHashLookup {
-        self.file_hasher().lookup_cached(path)
+    /// the expensive file read (#281). See [`crate::file_hash::FileHashLookup`].
+    pub fn file_hash_lookup(&self, path: &Path) -> crate::file_hash::FileHashLookup {
+        self.file_hash_cache().lookup_cached(path)
     }
 
     /// Record a freshly-computed file content hash (the miss arm of
     /// [`Self::file_hash_lookup`]); best-effort.
-    pub fn file_hash_record(&self, fingerprint: &crate::cache_key::FileFingerprint, hash: &str) {
-        self.file_hasher().record_cached(fingerprint, hash);
+    pub fn file_hash_record(&self, fingerprint: &crate::file_hash::FileFingerprint, hash: &str) {
+        self.file_hash_cache().record_cached(fingerprint, hash);
     }
 
     /// Associate an already-known content hash with the exact fingerprint the
@@ -1525,10 +1461,10 @@ impl Store {
     /// content's hash.
     pub fn record_verified_file_hash(
         &self,
-        fingerprint: &crate::cache_key::FileFingerprint,
+        fingerprint: &crate::file_hash::FileFingerprint,
         hash: &str,
     ) {
-        self.file_hasher().record_verified(fingerprint, hash);
+        self.file_hash_cache().record_verified(fingerprint, hash);
     }
 
     /// Associate a stable file with its already-known content hash, avoiding a
@@ -1536,11 +1472,16 @@ impl Store {
     /// every store-side operation that may change the file's fingerprint and
     /// while the compiler-owned output is stable.
     pub fn record_known_file_hash(&self, path: &Path, hash: &str) {
-        if let crate::cache_key::FileHashLookup::NeedsHash(fingerprint) =
-            self.file_hasher().lookup_cached(path)
+        if let crate::file_hash::FileHashLookup::NeedsHash(fingerprint) =
+            self.file_hash_cache().lookup_cached(path)
         {
-            self.file_hasher().record_cached(&fingerprint, hash);
+            self.file_hash_cache().record_cached(&fingerprint, hash);
         }
+    }
+
+    /// Borrow the persistent memo without exposing the index connection.
+    pub fn file_hash_cache(&self) -> crate::file_hash::FileHashCache<'_> {
+        crate::file_hash::FileHashCache::Borrowed(&self.db)
     }
 
     /// Check if a committed entry exists for this cache key.
@@ -1631,7 +1572,7 @@ impl Store {
             // checks every hit; `off` (default) relies on the size check above
             // (kunobi-ninja/kache#332).
             if verify_content {
-                match crate::cache_key::hash_file(&blob) {
+                match crate::file_hash::hash_file(&blob) {
                     Ok(actual) if actual == cached_file.hash => {}
                     Ok(actual) => {
                         tracing::warn!(
@@ -1704,7 +1645,7 @@ impl Store {
     /// production GC driver: either GC finishes first and publication
     /// revalidates that the payload survived, or the intent becomes durable
     /// before GC snapshots its protected keys.
-    pub(crate) fn acquire_gc_lock(&self) -> Result<GcLock> {
+    pub fn acquire_gc_lock(&self) -> Result<GcLock> {
         StoreLock::acquire(&self.config.store_dir().join("gc.lock"))
     }
 
@@ -1786,7 +1727,7 @@ impl Store {
     /// Store outputs without ever sharing the compiler output inode with the
     /// read-only blob. Reflinks remain eligible because they provide CoW
     /// isolation; the fallback is a byte copy rather than a hardlink.
-    pub(crate) fn put_with_compile_time_independent(
+    pub fn put_with_compile_time_independent(
         &self,
         cache_key: &str,
         crate_name: &str,
@@ -1870,7 +1811,7 @@ impl Store {
                 .map(|meta| is_executable(&meta))
                 .with_context(|| format!("stating compiler output for {store_name}"))?;
             let use_source_hardlink =
-                source_hardlink_allowed(allow_source_hardlinks, store_name, executable);
+                source_hardlink_allowed::<P>(allow_source_hardlinks, store_name, executable);
 
             let (staged, ingest) = self.stage_blob_from_source(source_path, use_source_hardlink)?;
             let staged_meta = match fs::metadata(&staged) {
@@ -1882,13 +1823,13 @@ impl Store {
                 }
             };
             let size = staged_meta.len();
-            if size == 0 && !zero_byte_is_valid_output(store_name, crate_types) {
+            if size == 0 && !zero_byte_is_valid_output::<P>(store_name, crate_types) {
                 Self::discard_staged_blob(&staged);
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
             total_size += size;
 
-            let hash = crate::cache_key::hash_file(&staged)?;
+            let hash = crate::file_hash::hash_file(&staged)?;
             if seen_output_blobs.insert(hash.clone()) {
                 put_result.output_blobs += 1;
                 if self.blob_path(&hash).is_file() {
@@ -1914,7 +1855,7 @@ impl Store {
         // Record which rustc `--emit` kinds this entry actually contains, derived
         // from the stored output files (kunobi-ninja/kache#325). Lookup rejects an
         // entry that doesn't cover what the invocation's `--emit` requested.
-        let emit_kinds = emit_kinds_for_files(&cached_files);
+        let emit_kinds = emit_kinds_for_files::<P>(&cached_files);
 
         // Capture the compiler's diagnostics so a cache hit can replay them
         // verbatim — warning gates / `-D warnings` then behave identically on a
@@ -1925,7 +1866,7 @@ impl Store {
         // Write metadata (only meta.json in the entry directory)
         let meta = EntryMeta {
             cache_key: cache_key.to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: crate_name.to_string(),
             crate_types: crate_types.to_vec(),
             files: cached_files,
@@ -2021,7 +1962,7 @@ impl Store {
             .context("writing entry metadata")?;
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
-            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, crate::cache_key::CACHE_KEY_VERSION],
+            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, kache_format::CACHE_KEY_VERSION],
         )?;
         tx.commit()?;
 
@@ -2033,10 +1974,7 @@ impl Store {
             for (file, (source, _)) in meta.files.iter().zip(&sources) {
                 // The Rust wrapper expands dep-info back to absolute paths
                 // immediately after `put`, so it is not stable here.
-                if !matches!(
-                    crate::compiler::classify_by_filename(&file.name),
-                    crate::compiler::ArtifactKind::DepInfo
-                ) {
+                if P::stable_after_store(&file.name) {
                     self.record_known_file_hash(source, &file.hash);
                 }
             }
@@ -2106,7 +2044,7 @@ impl Store {
             // same-length substituted/corrupted object would otherwise be
             // installed under its claimed hash and hardlinked into the build as
             // if content-verified. blake3 is fast; do it before any rename/INSERT.
-            let actual = crate::cache_key::hash_file(&file_path).with_context(|| {
+            let actual = crate::file_hash::hash_file(&file_path).with_context(|| {
                 format!(
                     "downloaded entry {short_key}: hashing {} for trust-boundary check",
                     cached_file.name
@@ -2244,7 +2182,7 @@ impl Store {
         before_write_lock: impl FnOnce(),
         after_write_lock: impl FnOnce(),
     ) -> Result<()> {
-        if !crate::cache_key::is_valid_cache_key(cache_key) {
+        if !kache_format::is_valid_cache_key(cache_key) {
             anyhow::bail!("refusing to discard invalid restored cache key");
         }
 
@@ -2306,25 +2244,25 @@ impl Store {
     /// [`VerifiedRestoredEntry`] after extraction verified each byte against
     /// `meta.files[].hash`. This method still performs a complete metadata and
     /// on-disk length preflight before moving blobs or opening the transaction.
-    pub(crate) fn import_verified_restored_entries(
+    pub fn import_verified_restored_entries(
         &self,
         entries: &[VerifiedRestoredEntry],
     ) -> Result<usize> {
         let mut cache_keys = std::collections::HashSet::new();
         for entry in entries {
-            if !crate::cache_key::is_valid_cache_key(&entry.cache_key)
+            if !kache_format::is_valid_cache_key(&entry.cache_key)
                 || entry.meta.cache_key != entry.cache_key
             {
                 anyhow::bail!("verified restore has an invalid cache-key binding");
             }
-            if entry.meta.key_schema != crate::cache_key::CACHE_KEY_VERSION {
+            if entry.meta.key_schema != kache_format::CACHE_KEY_VERSION {
                 anyhow::bail!(
                     "verified restore {} uses incompatible key schema {}",
                     &entry.cache_key[..16],
                     entry.meta.key_schema
                 );
             }
-            if !crate::cache_key::is_valid_crate_name(&entry.meta.crate_name) {
+            if !kache_format::is_valid_crate_name(&entry.meta.crate_name) {
                 anyhow::bail!("verified restore has an unsafe crate name");
             }
             if !cache_keys.insert(entry.cache_key.as_str()) {
@@ -2343,7 +2281,7 @@ impl Store {
             let mut artifact_names = std::collections::HashSet::new();
             for file in &entry.meta.files {
                 if !kache_format::is_safe_artifact_name(&file.name)
-                    || !crate::cache_key::is_valid_cache_key(&file.hash)
+                    || !kache_format::is_valid_cache_key(&file.hash)
                     || !artifact_names.insert(file.name.as_str())
                 {
                     anyhow::bail!(
@@ -2706,7 +2644,7 @@ impl Store {
             // Entry dirs are named by cache key. Anything else under store/ is
             // not ours to interpret, and an unvalidated name would be a path
             // component we then join (see `is_valid_cache_key`).
-            if !crate::cache_key::is_valid_cache_key(name) {
+            if !kache_format::is_valid_cache_key(name) {
                 continue;
             }
 
@@ -2857,7 +2795,7 @@ impl Store {
     /// blob. Passing that pathname to a compiler as root can truncate the blob
     /// and corrupt every cache entry that references it. This check is strictly
     /// read-only; callers fail closed instead of trying a racy path-based unlink.
-    pub(crate) fn matching_readonly_blob_inode(
+    pub fn matching_readonly_blob_inode(
         store_dir: &Path,
         output: &Path,
     ) -> Result<Option<PathBuf>> {
@@ -2868,7 +2806,7 @@ impl Store {
             return Ok(None);
         }
 
-        let hash = crate::cache_key::hash_file(output)
+        let hash = crate::file_hash::hash_file(output)
             .with_context(|| format!("hashing possible legacy output {}", output.display()))?;
         let blob = blob_path_in_store_dir(store_dir, &hash);
         if !blob.is_file() {
@@ -3060,7 +2998,7 @@ impl Store {
     ) -> Result<()> {
         let blob_path = self.blob_path(hash);
         if materialize_blob(source, &blob_path, allow_hardlink)? {
-            let actual = crate::cache_key::hash_file(&blob_path)?;
+            let actual = crate::file_hash::hash_file(&blob_path)?;
             if actual != hash {
                 anyhow::bail!(
                     "re-materialized blob for {} hashes to {} but entry records {}; \
@@ -3178,12 +3116,12 @@ impl Store {
     /// entries or remote data. Updates are debounced to keep compiler-wrapper
     /// writes off the hot path.
     pub fn remember_target_root(&self, target: &Path, workspace_root: &Path) -> Result<()> {
-        if !crate::machine::target_root_is_safe(target, workspace_root) {
+        if !crate::filesystem::target_root_is_safe(target, workspace_root) {
             return Ok(());
         }
         let target = std::path::absolute(target)?;
         let workspace_root = std::path::absolute(workspace_root)?;
-        let Some(identity) = crate::machine::directory_identity(&target) else {
+        let Some(identity) = crate::filesystem::directory_identity(&target) else {
             return Ok(());
         };
         let changed = self.db.execute(
@@ -3223,7 +3161,7 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn tracked_target_roots(&self, stale_hours: u64) -> Result<Vec<TrackedTargetRoot>> {
+    pub fn tracked_target_roots(&self, stale_hours: u64) -> Result<Vec<TrackedTargetRoot>> {
         let stale_seconds = stale_hours.saturating_mul(3600).min(i64::MAX as u64) as i64;
         let mut stmt = self.db.prepare(
             "SELECT path, workspace_root, first_seen, last_seen, device, inode
@@ -3254,13 +3192,13 @@ impl Store {
                 workspace_root: PathBuf::from(workspace_root),
                 first_seen,
                 last_seen,
-                identity: crate::machine::PathIdentity { device, inode },
+                identity: crate::filesystem::PathIdentity { device, inode },
             });
         }
         Ok(targets)
     }
 
-    pub(crate) fn forget_target_root(&self, path: &Path) -> Result<()> {
+    pub fn forget_target_root(&self, path: &Path) -> Result<()> {
         self.db.execute(
             "DELETE FROM target_roots WHERE path = ?1",
             params![path.to_string_lossy()],
@@ -3328,7 +3266,7 @@ impl Store {
     /// loops; it is now a pure function over these features
     /// (kunobi-ninja/kache#595). The size-pressure sweep already loaded every
     /// row, so this is the same I/O shape it always had.
-    pub(crate) fn eviction_candidates(&self) -> Result<Vec<crate::eviction::EntryFeatures>> {
+    pub fn eviction_candidates(&self) -> Result<Vec<crate::eviction::EntryFeatures>> {
         let mut stmt = self.db.prepare(
             "SELECT cache_key, size, hit_count, content_hash, committed,
                     (julianday('now') - julianday(last_accessed)) * 24.0,
@@ -3390,7 +3328,7 @@ impl Store {
         };
         Self::durable_upload_keys_from_names(
             entries.map(|entry| entry.map(|entry| entry.file_name())),
-            crate::config::UPLOAD_SPOOL_MAX_JOBS,
+            self.config.upload_spool_max_jobs,
         )
         .with_context(|| format!("reading {}", dir.display()))
     }
@@ -3414,7 +3352,7 @@ impl Store {
             let Some(key) = file_name.strip_suffix(".json") else {
                 continue;
             };
-            if crate::cache_key::is_valid_cache_key(key) {
+            if kache_format::is_valid_cache_key(key) {
                 keys.insert(key.to_string());
             }
         }
@@ -3805,7 +3743,7 @@ impl Store {
     /// compile is indistinguishable from "not yet backfilled" here, which is
     /// harmless — it just gets re-read on the next sweep and stays 0.
     ///
-    /// Bounded to [`COMPILE_TIME_BACKFILL_BATCH`] entries per call. Measured on
+    /// Bounded to 10,000 entries per call. Measured on
     /// a real 52k-entry store, an unbounded pass is ~6 s of `meta.json` reads —
     /// and this runs inside the daemon's GC sweep while the store mutex is
     /// held, so a first-GC-after-upgrade stall of that size is worth avoiding.
@@ -4280,7 +4218,7 @@ impl Store {
                 if externally_retained_last_reference(
                     rc,
                     held,
-                    crate::machine::blob_has_external_retainer(&self.blob_path(hash)),
+                    crate::filesystem::blob_has_external_retainer(&self.blob_path(hash)),
                 ) {
                     return Ok(RemovalAttempt::Unreclaimable);
                 }
@@ -4442,7 +4380,7 @@ impl Store {
             if readopted == 0 {
                 let blob = self.blob_path(&hash);
                 let disk =
-                    crate::machine::blob_reclaimable_bytes(&blob).unwrap_or(size.max(0) as u64);
+                    crate::filesystem::blob_reclaimable_bytes(&blob).unwrap_or(size.max(0) as u64);
                 unlink_blob(&blob);
                 reclaim.freed_bytes += size.max(0) as u64;
                 reclaim.disk_bytes_reclaimed += disk;
@@ -4456,8 +4394,9 @@ impl Store {
     /// Test-only: insert a bare committed entry row, for tests that stage a
     /// synthetic `meta.json` and need removal to own the directory (#670
     /// made directory cleanup conditional on owning the row).
-    #[cfg(test)]
-    pub(crate) fn insert_entry_row_for_test(&self, cache_key: &str) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn insert_entry_row_for_test(&self, cache_key: &str) {
         self.db
             .execute(
                 "INSERT OR REPLACE INTO entries (cache_key, crate_name, size, committed) \
@@ -4470,8 +4409,9 @@ impl Store {
     /// Test-only: backdate an entry's `last_accessed` (via a SQLite datetime
     /// modifier like `"-1 hour"`) so eviction tests can move an entry past the
     /// active-pin grace without sleeping (kunobi-ninja/kache#326).
-    #[cfg(test)]
-    pub(crate) fn set_last_accessed_for_test(&self, cache_key: &str, sql_modifier: &str) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_last_accessed_for_test(&self, cache_key: &str, sql_modifier: &str) {
         self.db
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', ?2) WHERE cache_key = ?1",
@@ -4749,6 +4689,55 @@ pub struct EntryInfo {
 
 #[cfg(test)]
 mod tests {
+    type Store = ArtifactStore<TestPolicy>;
+    struct TestPolicy;
+    impl ArtifactPolicy for TestPolicy {
+        fn allow_hardlink(name: &str) -> bool {
+            matches!(
+                std::path::Path::new(name)
+                    .extension()
+                    .and_then(|ext| ext.to_str()),
+                Some(
+                    "rlib"
+                        | "rmeta"
+                        | "o"
+                        | "obj"
+                        | "a"
+                        | "lib"
+                        | "pdb"
+                        | "dwo"
+                        | "tar"
+                        | "unknown"
+                )
+            )
+        }
+        fn allow_empty(name: &str, kinds: &[String]) -> bool {
+            name.ends_with(".rmeta")
+                && kinds
+                    .iter()
+                    .all(|kind| matches!(kind.as_str(), "bin" | "cdylib" | "staticlib"))
+        }
+        fn emit_kind(name: &str) -> Option<&'static str> {
+            match std::path::Path::new(name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("")
+            {
+                "rlib" | "so" | "dylib" | "dll" | "exe" | "a" | "lib" | "wasm" | "" => Some("link"),
+                "rmeta" => Some("metadata"),
+                "o" | "obj" => Some("obj"),
+                "d" | "pp" => Some("dep-info"),
+                "s" | "asm" => Some("asm"),
+                "ll" => Some("llvm-ir"),
+                "bc" => Some("llvm-bc"),
+                "mir" => Some("mir"),
+                _ => None,
+            }
+        }
+        fn stable_after_store(name: &str) -> bool {
+            !name.ends_with(".d") && !name.ends_with(".pp")
+        }
+    }
 
     /// `0` and negatives mean "not recorded", not a measured zero
     /// (kunobi-ninja/kache#617). Load-bearing: the `size` and
@@ -4855,31 +4844,36 @@ mod tests {
             "foo.dwo",
         ] {
             assert_eq!(
-                hardlink_eligible(name, false),
+                hardlink_eligible::<TestPolicy>(name, false),
                 gate_open,
                 "{name} should be hardlink-eligible on insert (behind the Windows gate)"
             );
         }
 
         // Mutable kinds (Copy strategy on restore): never eligible.
-        assert!(!hardlink_eligible("libfoo.dylib", false));
-        assert!(!hardlink_eligible("libfoo.so", false));
-        assert!(!hardlink_eligible("foo.exe", false));
+        assert!(!hardlink_eligible::<TestPolicy>("libfoo.dylib", false));
+        assert!(!hardlink_eligible::<TestPolicy>("libfoo.so", false));
+        assert!(!hardlink_eligible::<TestPolicy>("foo.exe", false));
 
         // Insert-only exclusions: `.d` is rewritten in place after `put`
         // (Expand), extensionless names are bin executables by rustc's Unix
         // convention, and an executable mode bit wins over the filename.
-        assert!(!hardlink_eligible("serde-abc123.d", false));
-        assert!(!hardlink_eligible("my-binary", false));
-        assert!(!hardlink_eligible("libserde-abc123.rlib", true));
+        assert!(!hardlink_eligible::<TestPolicy>("serde-abc123.d", false));
+        assert!(!hardlink_eligible::<TestPolicy>("my-binary", false));
+        assert!(!hardlink_eligible::<TestPolicy>(
+            "libserde-abc123.rlib",
+            true
+        ));
     }
 
     #[test]
     fn source_hardlink_policy_honors_independent_storage() {
-        assert!(!source_hardlink_allowed(false, "foo.o", false));
+        assert!(!source_hardlink_allowed::<TestPolicy>(
+            false, "foo.o", false
+        ));
         assert_eq!(
-            source_hardlink_allowed(true, "foo.o", false),
-            hardlink_eligible("foo.o", false)
+            source_hardlink_allowed::<TestPolicy>(true, "foo.o", false),
+            hardlink_eligible::<TestPolicy>("foo.o", false)
         );
     }
 
@@ -5078,7 +5072,7 @@ mod tests {
             )
             .unwrap();
 
-        let hash = crate::cache_key::hash_file(&source).unwrap();
+        let hash = crate::file_hash::hash_file(&source).unwrap();
         let blob = store.blob_path(&hash);
         assert_ne!(
             fs::metadata(&blob).unwrap().ino(),
@@ -5118,7 +5112,7 @@ mod tests {
             )
             .unwrap();
 
-        let hash = crate::cache_key::hash_file(&source).unwrap();
+        let hash = crate::file_hash::hash_file(&source).unwrap();
         let blob = store.blob_path(&hash);
         assert_eq!(fs::read(&blob).unwrap(), b"rlib bytes");
         assert!(
@@ -5167,7 +5161,7 @@ mod tests {
             )
             .unwrap();
 
-        let hash = crate::cache_key::hash_file(&symlink).unwrap();
+        let hash = crate::file_hash::hash_file(&symlink).unwrap();
         let blob = store.blob_path(&hash);
         let meta = fs::symlink_metadata(&blob).unwrap();
         assert!(
@@ -5376,7 +5370,7 @@ mod tests {
         fs::write(&source, b"identical-content").unwrap();
 
         let (staged_a, ingest_a) = store.stage_blob_from_source(&source, false).unwrap();
-        let hash = crate::cache_key::hash_file(&staged_a).unwrap();
+        let hash = crate::file_hash::hash_file(&staged_a).unwrap();
         assert!(
             store
                 .publish_staged_blob(&staged_a, ingest_a, &hash, 17)
@@ -5725,7 +5719,7 @@ mod tests {
 
         let source = dir.path().join("out.rlib");
         fs::write(&source, b"stable-content").unwrap();
-        let hash = crate::cache_key::hash_file(&source).unwrap();
+        let hash = crate::file_hash::hash_file(&source).unwrap();
 
         store
             .rematerialize_and_verify(&source, &hash, "out.rlib", false)
@@ -5743,7 +5737,7 @@ mod tests {
 
         let source = dir.path().join("out.rlib");
         fs::write(&source, b"original").unwrap();
-        let hash = crate::cache_key::hash_file(&source).unwrap();
+        let hash = crate::file_hash::hash_file(&source).unwrap();
 
         // Simulate a post-build mutator racing between phase 1 and recovery.
         fs::write(&source, b"mutated-after-snapshot").unwrap();
@@ -5837,52 +5831,10 @@ mod tests {
 
     fn test_config(dir: &Path) -> Config {
         Config {
-            fallback: None,
-            key_salt: None,
-            cc_extra_allowlist_flags: Vec::new(),
-            local_only: false,
-            remote_readonly: false,
-            modified_input_guard: false,
-            input_predictions: false,
-            volume_stores: Vec::new(),
-            local_hit_daemon: false,
-            windows_hardlink: false,
-            auto_gc: true,
-            gc_evict_shared: false,
-            storage_layout_advice: true,
-            heartbeat_secs: 30,
-            explain_miss: false,
-            scheduler: true,
-            path_only_env_vars: Vec::new(),
-            incremental_crates: Vec::new(),
-            key_env_vars: Vec::new(),
-            base_dirs: Vec::new(),
             cache_dir: dir.to_path_buf(),
-            runtime_dir: dir.to_path_buf(),
-            max_size: 1024 * 1024, // 1 MiB
-            remote: None,
-            remote_error: None,
-            socket_path_override: None,
-            disabled: false,
-            cache_executables: false,
-            clean_incremental: true,
-            preserve_incremental: false,
-            adaptive_incremental: true,
-            event_log_max_size: 1024 * 1024,
-            event_log_keep_lines: 100,
-            compression_level: 3,
-            s3_concurrency: 16,
-            prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
-            remote_key_cache_refresh_secs: crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
-            prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
-            prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
-            prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
-            min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
-            gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
-            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
-            s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
-            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
-            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
+            max_size: 1024 * 1024,
+            gc_evict_shared: false,
+            upload_spool_max_jobs: 65_536,
         }
     }
 
@@ -5936,12 +5888,83 @@ mod tests {
     }
 
     #[test]
+    fn file_hash_records_persist_and_reject_changed_fingerprints() {
+        use crate::file_hash::{FileFingerprint, FileHashLookup};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let artifact = dir.path().join("artifact.rlib");
+        fs::write(&artifact, vec![7; 65_536]).unwrap();
+        let fingerprint = FileFingerprint::from_path(&artifact).unwrap();
+        assert!(matches!(
+            store.file_hash_lookup(&artifact),
+            FileHashLookup::NeedsHash(_)
+        ));
+
+        store.file_hash_record(&fingerprint, "recorded");
+        assert!(
+            matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "recorded")
+        );
+        store.record_verified_file_hash(&fingerprint, "verified");
+        assert!(
+            matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "verified")
+        );
+        drop(store);
+
+        let store = Store::open(&config).unwrap();
+        assert!(
+            matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "verified")
+        );
+        fs::write(&artifact, vec![8; 65_537]).unwrap();
+        assert!(matches!(
+            store.file_hash_lookup(&artifact),
+            FileHashLookup::NeedsHash(_)
+        ));
+    }
+
+    #[test]
+    fn readonly_blob_detection_requires_a_shared_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let output = dir.path().join("output.o");
+        fs::write(&output, b"legacy compiler output").unwrap();
+        let writable = fs::metadata(&output).unwrap().permissions();
+        assert_eq!(
+            Store::matching_readonly_blob_inode(&store_dir, &output).unwrap(),
+            None
+        );
+
+        let hash = crate::file_hash::hash_file(&output).unwrap();
+        let blob = blob_path_in_store_dir(&store_dir, &hash);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::hard_link(&output, &blob).unwrap();
+        let mut readonly = writable.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&output, readonly).unwrap();
+        assert_eq!(
+            Store::matching_readonly_blob_inode(&store_dir, &output).unwrap(),
+            Some(blob)
+        );
+
+        let independent = dir.path().join("independent.o");
+        fs::copy(&output, &independent).unwrap();
+        assert!(fs::metadata(&independent).unwrap().permissions().readonly());
+        assert_eq!(
+            Store::matching_readonly_blob_inode(&store_dir, &independent).unwrap(),
+            None
+        );
+        fs::set_permissions(&output, writable.clone()).unwrap();
+        fs::set_permissions(&independent, writable).unwrap();
+    }
+
+    #[test]
     fn put_records_known_hash_only_for_stable_outputs() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&test_config(dir.path())).unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
         let artifact = dir.path().join("artifact.rlib");
         std::fs::write(&artifact, vec![b'x'; 64 * 1024]).unwrap();
-        let expected = crate::cache_key::hash_file(&artifact).unwrap();
+        let expected = crate::file_hash::hash_file(&artifact).unwrap();
 
         store
             .put(
@@ -5956,12 +5979,10 @@ mod tests {
                 "",
             )
             .unwrap();
-        let hasher = store.file_hasher();
-        assert_eq!(hasher.hash(&artifact).unwrap(), expected);
-        let stats = hasher.stats();
-        assert_eq!(stats.cache_hits, 1);
-        assert_eq!(stats.cache_misses, 0);
-        assert_eq!(stats.bytes_hashed, 0);
+        match store.file_hash_lookup(&artifact) {
+            crate::file_hash::FileHashLookup::Hit(actual) => assert_eq!(actual, expected),
+            _ => panic!("publication should seed the persistent file hash"),
+        }
 
         let dep_info = dir.path().join("artifact.d");
         std::fs::write(&dep_info, vec![b'd'; 64 * 1024]).unwrap();
@@ -5980,7 +6001,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.file_hash_lookup(&dep_info),
-            crate::cache_key::FileHashLookup::NeedsHash(_)
+            crate::file_hash::FileHashLookup::NeedsHash(_)
         ));
 
         let independent = dir.path().join("independent.o");
@@ -6001,7 +6022,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.file_hash_lookup(&independent),
-            crate::cache_key::FileHashLookup::NeedsHash(_)
+            crate::file_hash::FileHashLookup::NeedsHash(_)
         ));
     }
 
@@ -7704,7 +7725,7 @@ mod tests {
             std::path::absolute(&workspace).unwrap()
         );
         assert_eq!(
-            crate::machine::directory_identity(&target),
+            crate::filesystem::directory_identity(&target),
             Some(roots[0].identity)
         );
 
@@ -7932,7 +7953,7 @@ mod tests {
         fs::create_dir_all(&entry_dir).unwrap();
         let meta = EntryMeta {
             cache_key: cache_key.to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "empty".to_string(),
             crate_types: vec!["rlib".to_string()],
             files: vec![],
@@ -8100,7 +8121,7 @@ mod tests {
         }
         assert!(ready.exists(), "lock fixture did not become ready");
 
-        let store = Store::open(&test_config(dir.path())).unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
         assert!(
             store.try_lock("crash-release").unwrap().is_none(),
             "child must own the key before it exits"
@@ -8118,7 +8139,7 @@ mod tests {
     fn advisory_key_lock_child_fixture() {
         let root =
             PathBuf::from(std::env::var_os("KACHE_TEST_ADVISORY_LOCK_ROOT").expect("fixture root"));
-        let store = Store::open(&test_config(&root)).unwrap();
+        let store = Store::open(test_config(&root)).unwrap();
         let _lock = store
             .try_lock("crash-release")
             .unwrap()
@@ -8712,7 +8733,7 @@ mod tests {
             std::fs::remove_file(&output).unwrap();
         }
 
-        let prior_schema = crate::cache_key::CACHE_KEY_VERSION.saturating_sub(1);
+        let prior_schema = kache_format::CACHE_KEY_VERSION.saturating_sub(1);
         store
             .db
             .execute(
@@ -8733,7 +8754,7 @@ mod tests {
             .unwrap();
 
         let stats = store
-            .evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)
+            .evict_stale_key_schemas(kache_format::CACHE_KEY_VERSION)
             .unwrap();
         assert_eq!(stats.entries_evicted, 2);
         assert!(stats.bytes_freed > 0);
@@ -8745,7 +8766,7 @@ mod tests {
         assert_eq!(store.entry_count().unwrap(), 1);
 
         let second = store
-            .evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)
+            .evict_stale_key_schemas(kache_format::CACHE_KEY_VERSION)
             .unwrap();
         assert_eq!(second.entries_evicted, 0);
     }
@@ -8773,7 +8794,7 @@ mod tests {
 
         let content = std::fs::read_to_string(store.entry_dir("key").join("meta.json")).unwrap();
         let current: EntryMeta = serde_json::from_str(&content).unwrap();
-        assert_eq!(current.key_schema, crate::cache_key::CACHE_KEY_VERSION);
+        assert_eq!(current.key_schema, kache_format::CACHE_KEY_VERSION);
 
         let mut legacy: serde_json::Value = serde_json::from_str(&content).unwrap();
         legacy.as_object_mut().unwrap().remove("key_schema");
@@ -8795,8 +8816,8 @@ mod tests {
         std::fs::write(entry_dir.join("lib.rlib"), artifact_content).unwrap();
         // Real content hash — the import trust boundary re-hashes and rejects a
         // mismatch (kunobi-ninja/kache#211).
-        let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
-        let prior_schema = crate::cache_key::CACHE_KEY_VERSION.saturating_sub(1);
+        let hash = crate::file_hash::hash_file(&entry_dir.join("lib.rlib")).unwrap();
+        let prior_schema = kache_format::CACHE_KEY_VERSION.saturating_sub(1);
         let meta = EntryMeta {
             cache_key: "downloaded_key".to_string(),
             key_schema: prior_schema,
@@ -8845,7 +8866,7 @@ mod tests {
 
         let meta = EntryMeta {
             cache_key: "incomplete_key".to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "incomplete_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -8887,7 +8908,7 @@ mod tests {
         let entry_dir = config.store_dir().join(&key);
         let meta_json = serde_json::to_string_pretty(&EntryMeta {
             cache_key: key.clone(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "published".into(),
             crate_types: vec!["lib".into()],
             files: Vec::new(),
@@ -9081,10 +9102,10 @@ mod tests {
         fs::create_dir_all(&entry_dir).unwrap();
         fs::write(entry_dir.join("lib.rlib"), b"artifact data").unwrap();
 
-        let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
+        let hash = crate::file_hash::hash_file(&entry_dir.join("lib.rlib")).unwrap();
         let meta = EntryMeta {
             cache_key: "dl_key".to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "dl_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -9399,24 +9420,27 @@ mod tests {
     fn zero_byte_is_valid_output_only_for_metadata_without_a_library_unit() {
         // `--test` unit (no `--crate-type`), and the `--emit=metadata` crate
         // types rustc leaves empty.
-        assert!(zero_byte_is_valid_output("libfoo-1234.rmeta", &[]));
+        assert!(zero_byte_is_valid_output::<TestPolicy>(
+            "libfoo-1234.rmeta",
+            &[]
+        ));
         for ct in ["bin", "cdylib", "staticlib"] {
             assert!(
-                zero_byte_is_valid_output("libfoo-1234.rmeta", &[ct.into()]),
+                zero_byte_is_valid_output::<TestPolicy>("libfoo-1234.rmeta", &[ct.into()]),
                 "{ct} emits no metadata, so an empty .rmeta is legitimate"
             );
         }
         // These do emit metadata — empty means truncated.
         for ct in ["lib", "rlib", "dylib", "proc-macro", "some-future-type"] {
             assert!(
-                !zero_byte_is_valid_output("libfoo-1234.rmeta", &[ct.into()]),
+                !zero_byte_is_valid_output::<TestPolicy>("libfoo-1234.rmeta", &[ct.into()]),
                 "{ct} must keep the truncation guard"
             );
         }
         // Everything else empty means a truncated write, not a real output.
         for name in ["libfoo.rlib", "foo.d", "foo.o", "libfoo.so", "foo"] {
             assert!(
-                !zero_byte_is_valid_output(name, &[]),
+                !zero_byte_is_valid_output::<TestPolicy>(name, &[]),
                 "{name} must stay rejected when empty"
             );
         }
@@ -9434,7 +9458,7 @@ mod tests {
 
         let meta = EntryMeta {
             cache_key: "mismatch_key".to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "mismatch_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -9479,13 +9503,13 @@ mod tests {
         let mut file = CachedFile {
             name: "lib.rlib".to_string(),
             size: content.len() as u64,
-            hash: crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap(),
+            hash: crate::file_hash::hash_file(&entry_dir.join("lib.rlib")).unwrap(),
             executable: false,
         };
         mutate(&mut file);
         let meta = EntryMeta {
             cache_key: key.to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "c".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![file],
@@ -9725,7 +9749,7 @@ mod tests {
     #[ignore = "subprocess fixture for wait_for_committed_returns_false_without_an_owner"]
     fn wait_for_committed_missing_child_fixture() {
         let root = PathBuf::from(std::env::var_os("KACHE_TEST_WAIT_ROOT").expect("fixture root"));
-        let store = Store::open(&test_config(&root)).unwrap();
+        let store = Store::open(test_config(&root)).unwrap();
         assert!(!store.wait_for_committed("nope").unwrap());
     }
 
@@ -9764,7 +9788,7 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
         let waiter = std::thread::spawn(move || {
-            let store = Store::open(&test_config(&root)).unwrap();
+            let store = Store::open(test_config(&root)).unwrap();
             ready_tx.send(()).unwrap();
             store
                 .wait_for_committed_with_timeout(cache_key, Duration::from_secs(5))
@@ -11290,10 +11314,10 @@ mod tests {
         let content = b"old format artifact";
         fs::write(entry_dir.join("lib.rlib"), content).unwrap();
 
-        let hash = crate::cache_key::hash_file(&entry_dir.join("lib.rlib")).unwrap();
+        let hash = crate::file_hash::hash_file(&entry_dir.join("lib.rlib")).unwrap();
         let meta = EntryMeta {
             cache_key: "old_key".to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "old_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -11349,10 +11373,10 @@ mod tests {
         fs::create_dir_all(&entry_dir).unwrap();
         let artifact = entry_dir.join("lib.rlib");
         fs::write(&artifact, b"old format artifact").unwrap();
-        let hash = crate::cache_key::hash_file(&artifact).unwrap();
+        let hash = crate::file_hash::hash_file(&artifact).unwrap();
         let meta = EntryMeta {
             cache_key: "old_bad_key".to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "old_bad_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -11407,7 +11431,7 @@ mod tests {
         let hash = {
             let tmp = dir.path().join("tmp");
             fs::write(&tmp, content).unwrap();
-            crate::cache_key::hash_file(&tmp).unwrap()
+            crate::file_hash::hash_file(&tmp).unwrap()
         };
 
         // Create two legacy entries with identical content
@@ -11418,7 +11442,7 @@ mod tests {
 
             let meta = EntryMeta {
                 cache_key: key.to_string(),
-                key_schema: crate::cache_key::CACHE_KEY_VERSION,
+                key_schema: kache_format::CACHE_KEY_VERSION,
                 crate_name: "shared_crate".to_string(),
                 crate_types: vec!["lib".to_string()],
                 files: vec![CachedFile {
@@ -11960,12 +11984,12 @@ mod tests {
         fs::write(entry_dir.join("a.rlib"), content_a).unwrap();
         fs::write(entry_dir.join("b.dylib"), content_b).unwrap();
 
-        let hash_a = crate::cache_key::hash_file(&entry_dir.join("a.rlib")).unwrap();
-        let hash_b = crate::cache_key::hash_file(&entry_dir.join("b.dylib")).unwrap();
+        let hash_a = crate::file_hash::hash_file(&entry_dir.join("a.rlib")).unwrap();
+        let hash_b = crate::file_hash::hash_file(&entry_dir.join("b.dylib")).unwrap();
 
         let meta = EntryMeta {
             cache_key: "legacy_key".to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "legacy_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![
@@ -12053,11 +12077,11 @@ mod tests {
         fs::create_dir_all(&entry_dir).unwrap();
         let artifact = entry_dir.join("lib.rlib");
         fs::write(&artifact, b"legacy race artifact").unwrap();
-        let hash = crate::cache_key::hash_file(&artifact).unwrap();
+        let hash = crate::file_hash::hash_file(&artifact).unwrap();
         let size = fs::metadata(&artifact).unwrap().len();
         let meta = EntryMeta {
             cache_key: "legacy_race".to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "legacy_crate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -12297,7 +12321,7 @@ mod tests {
             executable: false,
         };
         // A lib `--emit=link` build: rlib + side rmeta + dep-info.
-        let kinds = emit_kinds_for_files(&[
+        let kinds = emit_kinds_for_files::<TestPolicy>(&[
             cf("libfoo.rlib"),
             cf("libfoo.rmeta"),
             cf("foo.d"),
@@ -12328,7 +12352,7 @@ mod tests {
                 executable: false,
             },
         ];
-        let kinds = emit_kinds_for_files(&files);
+        let kinds = emit_kinds_for_files::<TestPolicy>(&files);
         assert_eq!(
             kinds,
             vec!["dep-info".to_string(), "link".to_string()],
@@ -12337,7 +12361,7 @@ mod tests {
 
         let meta = EntryMeta {
             cache_key: "k".into(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "rococo_runtime".into(),
             crate_types: vec!["cdylib".into()],
             files,
@@ -12406,12 +12430,12 @@ mod tests {
 
         let artifact = entry_dir.join("lib.rlib");
         std::fs::write(&artifact, b"downloaded-artifact-data").unwrap();
-        let hash = crate::cache_key::hash_file(&artifact).unwrap();
+        let hash = crate::file_hash::hash_file(&artifact).unwrap();
         let size = std::fs::metadata(&artifact).unwrap().len();
 
         let meta = EntryMeta {
             cache_key: "dl_ch_test".to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "dlcrate".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -12466,7 +12490,7 @@ mod tests {
             std::fs::write(&artifact, contents.as_bytes()).unwrap();
             let meta = EntryMeta {
                 cache_key: key.clone(),
-                key_schema: crate::cache_key::CACHE_KEY_VERSION,
+                key_schema: kache_format::CACHE_KEY_VERSION,
                 crate_name: format!("crate{index}"),
                 crate_types: vec!["lib".to_string()],
                 files: vec![CachedFile {
@@ -12508,7 +12532,7 @@ mod tests {
             .db
             .execute(
                 "INSERT INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, 'stale', 'lib', 'dev', 0, 0, 'stale', 0, ?2, 0)",
-                params![keys[0], crate::cache_key::CACHE_KEY_VERSION],
+                params![keys[0], kache_format::CACHE_KEY_VERSION],
             )
             .unwrap();
         let imported = store.import_verified_restored_entries(&verified).unwrap();
@@ -12550,7 +12574,7 @@ mod tests {
         std::fs::write(&artifact, contents).unwrap();
         let meta = EntryMeta {
             cache_key: meta_key.to_string(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
+            key_schema: kache_format::CACHE_KEY_VERSION,
             crate_name: "fixture".to_string(),
             crate_types: vec!["lib".to_string()],
             files: vec![CachedFile {
@@ -12581,7 +12605,7 @@ mod tests {
     #[test]
     fn verified_batch_import_checks_each_cache_key_binding_independently() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&test_config(tmp.path())).unwrap();
+        let store = Store::open(test_config(tmp.path())).unwrap();
         let invalid = write_verified_fixture(&store, "invalid", "invalid", "lib.rlib", None);
         assert!(store.import_verified_restored_entries(&[invalid]).is_err());
 
@@ -12602,7 +12626,7 @@ mod tests {
             ("invalid-hash", "lib.rlib", Some("g".repeat(64))),
         ] {
             let tmp = tempfile::tempdir().unwrap();
-            let store = Store::open(&test_config(tmp.path())).unwrap();
+            let store = Store::open(test_config(tmp.path())).unwrap();
             let key = blake3::hash(label.as_bytes()).to_hex().to_string();
             let entry = write_verified_fixture(&store, &key, &key, name, hash_override);
             assert!(
@@ -12612,7 +12636,7 @@ mod tests {
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&test_config(tmp.path())).unwrap();
+        let store = Store::open(test_config(tmp.path())).unwrap();
         let key = blake3::hash(b"duplicate-artifact").to_hex().to_string();
         let mut entry = write_verified_fixture(&store, &key, &key, "lib.rlib", None);
         entry.meta.files.push(entry.meta.files[0].clone());
@@ -12627,7 +12651,7 @@ mod tests {
     #[test]
     fn verified_batch_import_never_rewrites_an_existing_content_addressed_blob() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&test_config(tmp.path())).unwrap();
+        let store = Store::open(test_config(tmp.path())).unwrap();
         let key = blake3::hash(b"existing-immutable-blob")
             .to_hex()
             .to_string();
@@ -12643,7 +12667,7 @@ mod tests {
     #[test]
     fn verified_blob_install_reports_a_vanished_source_before_rename() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&test_config(tmp.path())).unwrap();
+        let store = Store::open(test_config(tmp.path())).unwrap();
         let file = CachedFile {
             name: "lib.rlib".to_string(),
             size: 7,

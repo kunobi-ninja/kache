@@ -9,17 +9,17 @@ static ATOMIC_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 /// a file's contents can be durable while its directory entry is not. No-op on non-Unix:
 /// Windows has no directory-handle fsync and `File::open` on a directory fails.
 #[cfg(unix)]
-pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 #[cfg(not(unix))]
-pub(crate) fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+pub fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
 /// fsync a file so its bytes are durable on disk.
 /// On Windows, FlushFileBuffers requires write access.
-pub(crate) fn fsync_file(path: &Path) -> std::io::Result<()> {
+pub fn fsync_file(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     let file = fs::OpenOptions::new().write(true).open(path)?;
     #[cfg(not(windows))]
@@ -84,7 +84,7 @@ fn remove_file_robust(path: &Path) -> std::io::Result<()> {
 /// If `allow_concurrent_winner` is `true`, a concurrent writer winning the race to create
 /// the file is treated as a benign lost race and returns `Ok(false)`. If `allow_concurrent_winner`
 /// is `false`, it retries or errors out on conflicts.
-pub(crate) fn atomic_write_and_replace<F>(
+pub fn atomic_write_and_replace<F>(
     dest_path: &Path,
     allow_concurrent_winner: bool,
     write_fn: F,
@@ -99,7 +99,7 @@ where
 /// after the durable flush and before the rename. Used by store hardlink ingest
 /// to enforce the read-only guard on a shared inode only once fsync has
 /// finished (Windows `FlushFileBuffers` needs a writable handle, #196).
-pub(crate) fn atomic_write_and_replace_with<F, A>(
+pub fn atomic_write_and_replace_with<F, A>(
     dest_path: &Path,
     allow_concurrent_winner: bool,
     write_fn: F,
@@ -198,7 +198,7 @@ where
     Err(anyhow::Error::new(err).context("atomic rename failed after retries"))
 }
 
-pub(crate) fn atomic_replace(dest_path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn atomic_replace(dest_path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write_and_replace(dest_path, false, |temp_path| {
         fs::write(temp_path, bytes)?;
         Ok(())
@@ -206,11 +206,7 @@ pub(crate) fn atomic_replace(dest_path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cleanup_temp_files(
-    dir: &Path,
-    prefix: &str,
-    min_age: std::time::Duration,
-) -> Result<()> {
+pub fn cleanup_temp_files(dir: &Path, prefix: &str, min_age: std::time::Duration) -> Result<()> {
     if let Ok(entries) = fs::read_dir(dir) {
         let now = std::time::SystemTime::now();
         let expected_prefix = format!(".{prefix}.");

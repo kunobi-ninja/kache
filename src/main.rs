@@ -1,5 +1,5 @@
 mod args;
-mod atomic;
+use kache_store::atomic;
 mod build_intent;
 mod cache_fs;
 mod cache_key;
@@ -14,13 +14,12 @@ mod config_tui;
 mod daemon;
 mod daemon_local;
 mod events;
-mod eviction;
 mod extra_inputs;
 mod fallback_planner;
 mod heartbeat;
 mod identity;
 mod incremental_policy;
-mod link;
+use kache_store::link;
 mod machine;
 mod miss_chain;
 mod native_archive;
@@ -49,8 +48,9 @@ mod since;
 // is write-only — so the module compiles to its unknown-answer stub there and
 // would otherwise read as dead code in non-test builds.
 #[cfg_attr(not(unix), allow(dead_code))]
-mod sharing;
-mod store;
+use kache_store::sharing;
+mod compiler_store;
+use compiler_store as store;
 #[cfg(test)]
 mod test_support;
 mod transport;

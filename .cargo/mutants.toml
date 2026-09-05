@@ -201,6 +201,10 @@ gitignore = true
 # `identity_candidates` implementation returns `Ok(Vec::new())`. Replacing that
 # with `Ok(vec![])` is the same value. The daemon and core planner identity paths
 # remain in scope and are exercised with populated manifests.
+#
+# The Windows copy-restore warning adapter calls volume APIs and emits console
+# advice. Linux does not compile it; its portable classification helpers remain
+# in mutation scope.
 exclude_re = [
     "replace run_config_editor",
     "replace run_monitor",
@@ -251,4 +255,5 @@ exclude_re = [
     "src/cache_fs.rs:.*replace volume_total_bytes_windows",
     "src/native_link_key.rs:.*replace WindowsProbeEnvironment::augment_from_installed_msvc .* with Ok",
     "SurrealPlannerRepository>::identity_candidates .* with Ok\\(vec!\\[\\]\\)",
+    "crates/kache-store/src/link.rs:.*replace warn_no_cow_restore_once with \\(\\)",
 ]

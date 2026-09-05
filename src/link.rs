@@ -356,12 +356,10 @@ fn format_volume_pair(from: Option<String>, to: Option<String>) -> String {
 /// pin the wording without touching the filesystem.
 fn cross_volume_ingest_message(source: &Path, tmp: &Path) -> String {
     #[cfg(windows)]
-    let volumes = match (windows_volume_root(source), windows_volume_root(tmp)) {
-        (Some(from), Some(to)) => format!(" ({from} vs {to})"),
-        _ => String::new(),
-    };
+    let (from, to) = (windows_volume_root(source), windows_volume_root(tmp));
     #[cfg(not(windows))]
-    let volumes = String::new();
+    let (from, to): (Option<String>, Option<String>) = (None, None);
+    let volumes = format_volume_pair(from, to);
     format!(
         "kache: could not hardlink {source} into the store staging area ({tmp}){volumes}: \
          the link failed across mounts/volumes, so every ingest copies the full \

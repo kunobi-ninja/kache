@@ -10,6 +10,8 @@ use std::io;
 use std::path::Path;
 
 mod copy;
+#[cfg(windows)]
+pub use copy::windows_cluster_size;
 pub use copy::{copy_writable, set_writable_permissions, try_reflink};
 
 mod identity;
@@ -535,6 +537,64 @@ mod tests {
     use super::*;
 
     const BLOCK: usize = 64 * 1024;
+
+    #[test]
+    fn confidence_labels_remain_distinct_for_consumers() {
+        assert_eq!(Confidence::Exact.label(), "exact");
+        assert_eq!(Confidence::LowerBound.label(), "lower_bound");
+        assert_eq!(Confidence::Estimated.label(), "estimated");
+    }
+
+    #[test]
+    fn empty_clone_samples_gain_identity_after_an_observation() {
+        let mut sample = CloneSketch::default();
+        assert!(sample.is_empty());
+        assert!(sample.ids().is_empty());
+        sample.insert(3, 27);
+        assert!(!sample.is_empty());
+        assert_eq!(sample.ids(), &[27]);
+        assert_eq!(sample.shares_with(&CloneSketch::default()), 0);
+    }
+
+    #[test]
+    fn volume_usage_handles_empty_and_overreported_free_space() {
+        let occupied = VolumeUsage {
+            total: 80,
+            free: 20,
+        };
+        assert_eq!(occupied.used(), 60);
+        assert_eq!(occupied.used_ratio(), 0.75);
+        for usage in [
+            VolumeUsage { total: 0, free: 0 },
+            VolumeUsage { total: 0, free: 10 },
+            VolumeUsage {
+                total: 10,
+                free: 20,
+            },
+        ] {
+            assert_eq!(usage.used(), 0);
+            assert_eq!(usage.used_ratio(), 0.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn volume_query_requires_a_real_path() {
+        let dir = TempDir::new("volume-usage");
+        let usage = volume_usage(dir.path()).unwrap();
+        assert!(usage.total > 0);
+        assert!(usage.free > 0);
+        assert!(usage.free <= usage.total);
+        assert!(volume_usage(&dir.path().join("missing")).is_none());
+        assert!(volume_usage(Path::new("\0")).is_none());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unavailable_volume_usage_remains_unknown() {
+        let dir = TempDir::new("volume-usage");
+        assert!(volume_usage(dir.path()).is_none());
+    }
 
     #[test]
     fn clone_samples_are_bounded_and_scoped_to_the_device() {

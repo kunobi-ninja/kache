@@ -675,7 +675,7 @@ fn warn_no_cow_restore_once(
     let build_vol = windows_volume_root(target_path);
     // A file with no cluster-aligned range can't be block-cloned on ANY volume.
     // If the cluster size can't be read, leave it unknown rather than guessing.
-    let sub_cluster = windows_cluster_size(target_path)
+    let sub_cluster = kache_fs::windows_cluster_size(target_path)
         .ok()
         .map(|cluster| bytes > 0 && bytes < cluster);
     let cause = classify_copy_restore(

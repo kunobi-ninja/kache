@@ -175,7 +175,7 @@ fn native_reflink_windows(src: &Path, dst: &Path) -> io::Result<()> {
 /// Used to align ReFS block-clone ranges. `path` need not exist; its nearest
 /// existing parent volume is resolved.
 #[cfg(windows)]
-fn windows_cluster_size(path: &Path) -> io::Result<u64> {
+pub fn windows_cluster_size(path: &Path) -> io::Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceW, GetVolumePathNameW};
 

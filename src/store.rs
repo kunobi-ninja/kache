@@ -3023,7 +3023,14 @@ impl Store {
             return Ok(false);
         }
         fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
-        if let Err(e) = fs::rename(staged, &blob) {
+        // Wait out a delete-pending destination. A concurrent remove that drops
+        // this blob's last reference leaves the name occupied on Windows until
+        // its handle closes, and publishing into it meanwhile fails with
+        // ERROR_ACCESS_DENIED — a race between two healthy operations, reported
+        // as a failed put (kunobi-ninja/kache Test (Windows)). Retrying inside
+        // the publish keeps the staged file alive for the next attempt, which
+        // is why this is not `discard_staged_blob` then retry.
+        if let Err(e) = crate::atomic::retry_transient_windows(|| fs::rename(staged, &blob)) {
             Self::discard_staged_blob(staged);
             // Re-stat: only a publish that lost a race finds the destination
             // occupied *now* having found it free above.
@@ -4155,87 +4162,96 @@ impl Store {
         // the removal so a corrupt entry never silently leaks (#276); callers
         // (GC / purge / `doctor --repair`) log and move on, and the entry stays
         // accounted-for until a fresh `put` (INSERT OR REPLACE) overwrites it.
+        //
+        // The read waits out a transient Windows state first. A concurrent
+        // remover holding this meta.json leaves it delete-pending, and reading
+        // it meanwhile fails with ERROR_ACCESS_DENIED rather than NotFound — so
+        // without this the losing remover of a healthy race lands in the
+        // unreadable-meta arm below and reports #276 corruption. If it settles
+        // into NotFound the arm after this one judges the race properly; if it
+        // never clears, the corruption arm still refuses, unchanged.
         let meta_content: String;
-        let hashes: Vec<String> = match fs::read_to_string(&meta_path) {
-            Ok(content) => {
-                let meta: EntryMeta = serde_json::from_str(&content).with_context(|| {
-                    format!(
-                        "entry {cache_key}: meta.json unparseable — refusing removal so blob \
+        let hashes: Vec<String> =
+            match crate::atomic::retry_transient_windows(|| fs::read_to_string(&meta_path)) {
+                Ok(content) => {
+                    let meta: EntryMeta = serde_json::from_str(&content).with_context(|| {
+                        format!(
+                            "entry {cache_key}: meta.json unparseable — refusing removal so blob \
                          refcounts are not leaked (#276)"
-                    )
-                })?;
-                meta_content = content;
-                meta.files.iter().map(|f| f.hash.clone()).collect()
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // No meta.json. A same-key operation may be mid-flight: a
-                // publisher materializes meta inside its registration
-                // transaction, and a removal's cleanup pass runs in its own
-                // locked transaction (#670) — so "meta missing, row present"
-                // can be a healthy transient, not only the stranded-entry
-                // shape. Bounce off the write lock — the no-op write statement
-                // waits (busy_timeout) until any in-flight writer commits or
-                // rolls back — then judge the settled state. Both the row and
-                // the meta are checked while the lock is still held: after
-                // dropping it another writer could move the pairing again and
-                // a healthy already-absent state would misreport as #276
-                // corruption.
-                let tx = self.db.unchecked_transaction()?;
-                tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
-                let row_exists: i64 = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1)",
-                    params![cache_key],
-                    |row| row.get(0),
-                )?;
-                // fs::metadata, not Path::exists: exists() swallows every
-                // error as false, and a permission failure must refuse like
-                // the unreadable-meta arm below, not report already-absent.
-                let meta_is_back = match fs::metadata(&meta_path) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            return Err(e).with_context(|| {
-                                format!(
-                                    "entry {cache_key}: checking republished meta.json — \
+                        )
+                    })?;
+                    meta_content = content;
+                    meta.files.iter().map(|f| f.hash.clone()).collect()
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // No meta.json. A same-key operation may be mid-flight: a
+                    // publisher materializes meta inside its registration
+                    // transaction, and a removal's cleanup pass runs in its own
+                    // locked transaction (#670) — so "meta missing, row present"
+                    // can be a healthy transient, not only the stranded-entry
+                    // shape. Bounce off the write lock — the no-op write statement
+                    // waits (busy_timeout) until any in-flight writer commits or
+                    // rolls back — then judge the settled state. Both the row and
+                    // the meta are checked while the lock is still held: after
+                    // dropping it another writer could move the pairing again and
+                    // a healthy already-absent state would misreport as #276
+                    // corruption.
+                    let tx = self.db.unchecked_transaction()?;
+                    tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
+                    let row_exists: i64 = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1)",
+                        params![cache_key],
+                        |row| row.get(0),
+                    )?;
+                    // fs::metadata, not Path::exists: exists() swallows every
+                    // error as false, and a permission failure must refuse like
+                    // the unreadable-meta arm below, not report already-absent.
+                    let meta_is_back = match fs::metadata(&meta_path) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                return Err(e).with_context(|| {
+                                    format!(
+                                        "entry {cache_key}: checking republished meta.json — \
                                      refusing removal so blob refcounts are not leaked (#276)"
-                                )
-                            });
+                                    )
+                                });
+                            }
+                            false
                         }
-                        false
+                    };
+                    drop(tx);
+                    if row_exists == 0 {
+                        // The concurrent removal won (or the key never existed);
+                        // nothing left to remove.
+                        return Ok(RemovalAttempt::Done(None));
                     }
-                };
-                drop(tx);
-                if row_exists == 0 {
-                    // The concurrent removal won (or the key never existed);
-                    // nothing left to remove.
-                    return Ok(RemovalAttempt::Done(None));
-                }
-                if meta_is_back {
-                    // A republication landed while we waited: the row belongs
-                    // to a fresh generation whose meta is back. The caller
-                    // asked to remove whatever is currently published, so
-                    // retry against the new generation. Each retry requires
-                    // another full republication in the window, so this
-                    // cannot spin on its own.
-                    return Ok(RemovalAttempt::Republished);
-                }
-                // Settled: a row with no meta.json. Its blob list is unknown
-                // and deleting the row would leak the refcounts — refuse, so
-                // a corrupt entry never silently leaks (#276).
-                anyhow::bail!(
-                    "entry {cache_key}: meta.json missing but DB row present — refusing \
+                    if meta_is_back {
+                        // A republication landed while we waited: the row belongs
+                        // to a fresh generation whose meta is back. The caller
+                        // asked to remove whatever is currently published, so
+                        // retry against the new generation. Each retry requires
+                        // another full republication in the window, so this
+                        // cannot spin on its own.
+                        return Ok(RemovalAttempt::Republished);
+                    }
+                    // Settled: a row with no meta.json. Its blob list is unknown
+                    // and deleting the row would leak the refcounts — refuse, so
+                    // a corrupt entry never silently leaks (#276).
+                    anyhow::bail!(
+                        "entry {cache_key}: meta.json missing but DB row present — refusing \
                      removal so blob refcounts are not leaked (#276)"
-                );
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "entry {cache_key}: reading meta.json — refusing removal so blob \
+                    );
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "entry {cache_key}: reading meta.json — refusing removal so blob \
                          refcounts are not leaked (#276)"
-                    )
-                });
-            }
-        };
+                        )
+                    });
+                }
+            };
 
         if let Some(hook) = after_meta_read {
             hook();

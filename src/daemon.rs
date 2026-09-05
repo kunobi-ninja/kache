@@ -796,6 +796,57 @@ pub struct RemoteCheckRequest {
     /// compatibility with old clients.
     #[serde(default)]
     pub deadline_ms: Option<u64>,
+    /// Volume-shard cache dir to import into. Missing or empty keeps the
+    /// main store so older clients stay on the historical path; a value
+    /// must equal the main cache dir or a configured `[cache.volumes]`
+    /// shard. Unknown paths are rejected rather than writing off-tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_dir: Option<String>,
+}
+
+/// Cache dir a RemoteCheck should import into.
+///
+/// `None` / blank keeps the main store. A path is admitted only when it is
+/// the main cache dir or a configured volume shard.
+fn remote_check_cache_dir<'a>(
+    main_cache_dir: &'a Path,
+    volume_stores: &'a [crate::config::VolumeStore],
+    shard_dir: Option<&str>,
+) -> Result<&'a Path, &'static str> {
+    let Some(raw) = shard_dir.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(main_cache_dir);
+    };
+    let requested = Path::new(raw);
+    if requested == main_cache_dir {
+        return Ok(main_cache_dir);
+    }
+    for shard in volume_stores {
+        if requested == shard.store.as_path() {
+            return Ok(shard.store.as_path());
+        }
+    }
+    Err("remote-check shard_dir is not a configured volume store")
+}
+
+fn remote_check_entry_dir(cache_dir: &Path, key: &str) -> PathBuf {
+    cache_dir.join("store").join(key)
+}
+
+fn remote_check_blobs_dir(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("store").join("blobs")
+}
+
+/// `Some` only when the wrapper opened a volume shard rather than the main
+/// store. Older daemons ignore the field.
+pub(crate) fn remote_check_shard_dir_arg(
+    main_cache_dir: &Path,
+    store_cache_dir: &Path,
+) -> Option<String> {
+    if store_cache_dir == main_cache_dir {
+        None
+    } else {
+        Some(store_cache_dir.to_string_lossy().into_owned())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2155,6 +2206,8 @@ impl S3KeyCache {
 pub(crate) struct Daemon {
     config: Config,
     store: OnceLock<Mutex<Store>>,
+    /// Stores opened for `[cache.volumes]` shards. Main stays in `store`.
+    shard_stores: Mutex<HashMap<PathBuf, Arc<Mutex<Store>>>>,
     /// Daemon-assisted local hits (#565): read-only probe pool + pin writer.
     /// Prewarmed when enabled, with a coalesced lazy retry on failure. Only a
     /// successful initialization is cached for the daemon's lifetime.
@@ -2322,6 +2375,7 @@ impl Daemon {
         let (prefetch_cancel, _) = tokio::sync::watch::channel(false);
         Self {
             store: OnceLock::new(),
+            shard_stores: Mutex::new(HashMap::new()),
             local_hit: tokio::sync::OnceCell::new(),
             local_lookup_budget,
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
@@ -2375,6 +2429,44 @@ impl Daemon {
         f(&guard)
     }
 
+    fn shard_store_lock(&self, cache_dir: &Path) -> Result<Arc<Mutex<Store>>> {
+        {
+            let map = self
+                .shard_stores
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon shard store map poisoned"))?;
+            if let Some(existing) = map.get(cache_dir) {
+                return Ok(Arc::clone(existing));
+            }
+        }
+        let mut cfg = self.config.clone();
+        cfg.cache_dir = cache_dir.to_path_buf();
+        let store = Store::open(&cfg)?;
+        let lock = Arc::new(Mutex::new(store));
+        let mut map = self
+            .shard_stores
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon shard store map poisoned"))?;
+        Ok(Arc::clone(
+            map.entry(cache_dir.to_path_buf()).or_insert(lock),
+        ))
+    }
+
+    fn with_import_store<T>(
+        &self,
+        cache_dir: &Path,
+        f: impl FnOnce(&Store) -> Result<T>,
+    ) -> Result<T> {
+        if cache_dir == self.config.cache_dir.as_path() {
+            return self.with_store(f);
+        }
+        let lock = self.shard_store_lock(cache_dir)?;
+        let guard = lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon shard store mutex poisoned"))?;
+        f(&guard)
+    }
+
     fn with_store_timed<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> (Result<T>, u64, u64) {
         let store = match self.store_lock() {
             Ok(store) => store,
@@ -2386,6 +2478,36 @@ impl Daemon {
             Err(_) => {
                 return (
                     Err(anyhow::anyhow!("daemon store mutex poisoned")),
+                    wait_started.elapsed().as_millis() as u64,
+                    0,
+                );
+            }
+        };
+        let lock_wait_ms = wait_started.elapsed().as_millis() as u64;
+        let import_started = Instant::now();
+        let result = f(&guard);
+        let import_ms = import_started.elapsed().as_millis() as u64;
+        (result, lock_wait_ms, import_ms)
+    }
+
+    fn with_import_store_timed<T>(
+        &self,
+        cache_dir: &Path,
+        f: impl FnOnce(&Store) -> Result<T>,
+    ) -> (Result<T>, u64, u64) {
+        if cache_dir == self.config.cache_dir.as_path() {
+            return self.with_store_timed(f);
+        }
+        let lock = match self.shard_store_lock(cache_dir) {
+            Ok(lock) => lock,
+            Err(error) => return (Err(error), 0, 0),
+        };
+        let wait_started = Instant::now();
+        let guard = match lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return (
+                    Err(anyhow::anyhow!("daemon shard store mutex poisoned")),
                     wait_started.elapsed().as_millis() as u64,
                     0,
                 );
@@ -3570,7 +3692,15 @@ impl Daemon {
         if !crate::cache_key::is_valid_crate_name(&req.crate_name) {
             return Response::err("invalid crate name");
         }
-        let expected_entry_dir = self.entry_dir_for(&req.key);
+        let cache_dir = match remote_check_cache_dir(
+            &self.config.cache_dir,
+            &self.config.volume_stores,
+            req.shard_dir.as_deref(),
+        ) {
+            Ok(dir) => dir,
+            Err(msg) => return Response::err(msg),
+        };
+        let expected_entry_dir = remote_check_entry_dir(cache_dir, &req.key);
         if Path::new(&req.entry_dir) != expected_entry_dir {
             return Response::err("remote-check entry directory does not match daemon store");
         }
@@ -3610,6 +3740,14 @@ impl Daemon {
         req: &RemoteCheckRequest,
         deadline: RemoteDeadline,
     ) -> Response {
+        let cache_dir = match remote_check_cache_dir(
+            &self.config.cache_dir,
+            &self.config.volume_stores,
+            req.shard_dir.as_deref(),
+        ) {
+            Ok(dir) => dir.to_path_buf(),
+            Err(msg) => return Response::err(msg),
+        };
         let Some(remote) = &self.config.remote else {
             return Response::err("no remote configured");
         };
@@ -3824,7 +3962,7 @@ impl Daemon {
                 tokio::time::Instant::now(),
                 deadline.at().map(tokio::time::Instant::from_std),
             );
-            let entry_dir = self.entry_dir_for(&req.key);
+            let entry_dir = remote_check_entry_dir(&cache_dir, &req.key);
             let outcome = join_inflight_download(
                 &self.downloading,
                 &req.key,
@@ -3848,7 +3986,7 @@ impl Daemon {
                     // before Store publication, and an import failure may leave
                     // residue. Only a committed Store row is a cache hit.
                     let committed = self
-                        .with_store(|store| Ok(store.contains(&req.key)))
+                        .with_import_store(&cache_dir, |store| Ok(store.contains(&req.key)))
                         .unwrap_or(false);
                     if committed {
                         let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
@@ -3885,7 +4023,7 @@ impl Daemon {
         // the same re-check-under-claim defence the prefetch path uses).
         if reclaimed
             && self
-                .with_store(|store| Ok(store.contains(&req.key)))
+                .with_import_store(&cache_dir, |store| Ok(store.contains(&req.key)))
                 .unwrap_or(false)
         {
             let was_prefetched = self.prefetched_keys.read().await.contains(&req.key);
@@ -3935,8 +4073,8 @@ impl Daemon {
         // `meta.json` lands, and the next download re-extracts from scratch —
         // the same tolerance the design already has for a daemon crash
         // mid-download.
-        let entry_dir = self.entry_dir_for(&req.key);
-        let blobs_dir = self.config.store_dir().join("blobs");
+        let entry_dir = remote_check_entry_dir(&cache_dir, &req.key);
+        let blobs_dir = remote_check_blobs_dir(&cache_dir);
         let started_at_unix_ms = unix_time_ms();
         let start = Instant::now();
         self.transfer_counters
@@ -3958,8 +4096,10 @@ impl Daemon {
                         .insert(req.key.clone(), Some(cn.as_str()))
                         .await;
                 }
-                let (import_result, import_lock_wait_ms, import_ms) =
-                    self.with_store_timed(|store| store.import_restored_entry(&req.key));
+                let (import_result, import_lock_wait_ms, import_ms) = self
+                    .with_import_store_timed(&cache_dir, |store| {
+                        store.import_restored_entry(&req.key)
+                    });
                 let import_ok = match import_result {
                     Ok(()) => true,
                     Err(e) => {
@@ -7525,6 +7665,7 @@ pub fn send_remote_check(
     key: &str,
     entry_dir: &Path,
     crate_name: &str,
+    shard_dir: Option<&Path>,
 ) -> Option<RemoteCheckResult> {
     let socket_path = config.socket_path();
 
@@ -7541,6 +7682,7 @@ pub fn send_remote_check(
         entry_dir: entry_dir.to_string_lossy().into_owned(),
         crate_name: crate_name.to_string(),
         deadline_ms: Some(client_budget_ms.get()),
+        shard_dir: shard_dir.map(|dir| dir.to_string_lossy().into_owned()),
     });
 
     // This wait is on rustc's synchronous miss path. Preserve the historical
@@ -9754,6 +9896,7 @@ mod tests {
                     key,
                     crate_name: "serde".into(),
                     deadline_ms: Some(2_000),
+                    shard_dir: None,
                 }),
             )
             .await
@@ -10961,6 +11104,7 @@ mod tests {
             entry_dir: "/tmp/store/abc123".into(),
             crate_name: String::new(),
             deadline_ms: None,
+            shard_dir: None,
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -10969,6 +11113,58 @@ mod tests {
         assert!(json.contains("\"remote_check\""));
         assert!(json.contains("\"key\":\"abc123\""));
         assert!(json.contains("\"entry_dir\":\"/tmp/store/abc123\""));
+        assert!(
+            !json.contains("shard_dir"),
+            "absent shard_dir must stay off the wire so older daemons can ignore it"
+        );
+    }
+
+    #[test]
+    fn remote_check_serde_defaults_missing_shard_dir() {
+        let parsed: Request = serde_json::from_str(
+            r#"{"remote_check":{"key":"abc123","entry_dir":"/tmp/store/abc123"}}"#,
+        )
+        .unwrap();
+        match parsed {
+            Request::RemoteCheck(req) => assert_eq!(req.shard_dir, None),
+            other => panic!("expected remote_check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_check_cache_dir_resolves_main_and_configured_shards() {
+        let main = Path::new("/cache/main");
+        let shard = PathBuf::from("/cache/shard");
+        let volumes = [crate::config::VolumeStore {
+            volume: "/mnt/vol/".into(),
+            store: shard.clone(),
+        }];
+        assert_eq!(remote_check_cache_dir(main, &volumes, None).unwrap(), main);
+        assert_eq!(
+            remote_check_cache_dir(main, &volumes, Some("")).unwrap(),
+            main
+        );
+        assert_eq!(
+            remote_check_cache_dir(main, &volumes, Some("   ")).unwrap(),
+            main
+        );
+        assert_eq!(
+            remote_check_cache_dir(main, &volumes, Some("/cache/main")).unwrap(),
+            main
+        );
+        assert_eq!(
+            remote_check_cache_dir(main, &volumes, Some("/cache/shard")).unwrap(),
+            shard.as_path()
+        );
+        assert_eq!(
+            remote_check_cache_dir(main, &volumes, Some("/cache/other")).unwrap_err(),
+            "remote-check shard_dir is not a configured volume store"
+        );
+        assert_eq!(remote_check_shard_dir_arg(main, main), None);
+        assert_eq!(
+            remote_check_shard_dir_arg(main, &shard),
+            Some("/cache/shard".into())
+        );
     }
 
     #[test]
@@ -11587,6 +11783,7 @@ mod tests {
             entry_dir: "/tmp".into(),
             crate_name: String::new(),
             deadline_ms: None,
+            shard_dir: None,
         });
         let resp = daemon.handle_request_sync(&req);
         assert!(!resp.ok);
@@ -11625,6 +11822,7 @@ mod tests {
             key: test_cache_key("invalid-remote-crate"),
             crate_name: "../escape".into(),
             deadline_ms: None,
+            shard_dir: None,
         };
         let resp = daemon.handle_remote_check(&invalid_crate).await;
         assert!(!resp.ok);
@@ -11665,6 +11863,7 @@ mod tests {
             key,
             crate_name: "serde".into(),
             deadline_ms: None,
+            shard_dir: None,
         };
         let resp = daemon.handle_remote_check(&req).await;
         assert!(!resp.ok);
@@ -11814,6 +12013,7 @@ mod tests {
                 entry_dir,
                 crate_name: "serde".into(),
                 deadline_ms: None,
+                shard_dir: None,
             }),
         )
         .await;
@@ -11867,7 +12067,8 @@ mod tests {
         let config = test_config(dir.path());
 
         // No daemon running — should return None gracefully
-        let result = send_remote_check(&config, "some_key", Path::new("/tmp/test"), "unknown");
+        let result =
+            send_remote_check(&config, "some_key", Path::new("/tmp/test"), "unknown", None);
         assert!(result.is_none());
     }
 
@@ -12906,6 +13107,7 @@ mod tests {
                     entry_dir,
                     crate_name: "serde".into(),
                     deadline_ms: None,
+                    shard_dir: None,
                 }],
             }),
         )
@@ -13169,7 +13371,7 @@ mod tests {
         let missing = "d".repeat(64);
         let entry_dir = cfg.store_dir().join(&missing);
         let result = tokio::task::spawn_blocking(move || {
-            send_remote_check(&cfg, &missing, &entry_dir, "crate")
+            send_remote_check(&cfg, &missing, &entry_dir, "crate", None)
         })
         .await
         .unwrap();
@@ -13209,10 +13411,11 @@ mod tests {
         let cfg = config.clone();
         let key = "e".repeat(64);
         let entry_dir = cfg.store_dir().join(&key);
-        let result =
-            tokio::task::spawn_blocking(move || send_remote_check(&cfg, &key, &entry_dir, "crate"))
-                .await
-                .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            send_remote_check(&cfg, &key, &entry_dir, "crate", None)
+        })
+        .await
+        .unwrap();
         server.abort();
 
         assert!(
@@ -13580,6 +13783,7 @@ mod tests {
                 entry_dir,
                 crate_name: "serde".into(),
                 deadline_ms: None,
+                shard_dir: None,
             }),
         )
         .await;
@@ -13844,12 +14048,14 @@ mod tests {
                         entry_dir: entry_a,
                         crate_name: "serde".into(),
                         deadline_ms: None,
+                        shard_dir: None,
                     },
                     RemoteCheckRequest {
                         key: key_b,
                         entry_dir: entry_b,
                         crate_name: "tokio".into(),
                         deadline_ms: None,
+                        shard_dir: None,
                     },
                 ],
             })
@@ -13887,6 +14093,7 @@ mod tests {
                 entry_dir,
                 crate_name: "serde".into(),
                 deadline_ms: None,
+                shard_dir: None,
             })
             .await;
 
@@ -13949,6 +14156,7 @@ mod tests {
                 entry_dir: daemon.entry_dir_for(&key).to_string_lossy().into_owned(),
                 crate_name: "serde".into(),
                 deadline_ms: None,
+                shard_dir: None,
             })
             .await;
 
@@ -14351,6 +14559,7 @@ mod tests {
                     entry_dir: demand_entry_dir,
                     crate_name: "tokio".into(),
                     deadline_ms: None,
+                    shard_dir: None,
                 })
                 .await
         });
@@ -14641,6 +14850,7 @@ mod tests {
                 entry_dir: entry_dir.to_string_lossy().into_owned(),
                 crate_name: "serde".to_string(),
                 deadline_ms: None,
+                shard_dir: None,
             })
             .await;
 
@@ -14651,6 +14861,77 @@ mod tests {
             "entry should be imported into the local store"
         );
         assert_v3_transfer_timestamps(&latest_transfer(&daemon));
+    }
+
+    #[tokio::test]
+    async fn remote_check_with_configured_shard_dir_imports_into_the_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        let shard = dir.path().join("shard");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&shard).unwrap();
+        let mut config = test_config(&main);
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        config.volume_stores = vec![crate::config::VolumeStore {
+            volume: "/mnt/vol/".into(),
+            store: shard.clone(),
+        }];
+        let key = test_cache_key("shard-download");
+        let pack = build_entry_pack(&key, "serde");
+        let entry_dir = shard.join("store").join(&key);
+
+        let client = test_remote_backend();
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(&client, &test_pack_object_key(&key, "serde"), &pack).await;
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
+
+        let resp = daemon
+            .handle_remote_check(&RemoteCheckRequest {
+                key: key.clone(),
+                entry_dir: entry_dir.to_string_lossy().into_owned(),
+                crate_name: "serde".to_string(),
+                deadline_ms: None,
+                shard_dir: Some(shard.to_string_lossy().into_owned()),
+            })
+            .await;
+
+        assert!(resp.ok, "hit+download should succeed: {resp:?}");
+        assert_eq!(resp.found, Some(true));
+        assert!(
+            shard.join("store").join(&key).join("meta.json").exists(),
+            "entry should land in the requesting shard"
+        );
+        assert!(
+            !main.join("store").join(&key).join("meta.json").exists(),
+            "the main store must not receive a shard-targeted import"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_check_rejects_unconfigured_shard_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Daemon::new(config);
+        let key = test_cache_key("bad-shard");
+        let resp = daemon
+            .handle_remote_check(&RemoteCheckRequest {
+                key,
+                entry_dir: "/unused".into(),
+                crate_name: "serde".into(),
+                deadline_ms: None,
+                shard_dir: Some("/not/a/configured/shard".into()),
+            })
+            .await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.error.as_deref(),
+            Some("remote-check shard_dir is not a configured volume store")
+        );
     }
 
     #[tokio::test]
@@ -14681,6 +14962,7 @@ mod tests {
                 entry_dir: entry_dir.to_string_lossy().into_owned(),
                 crate_name: "serde".into(),
                 deadline_ms: None,
+                shard_dir: None,
             })
             .await;
 
@@ -14754,6 +15036,7 @@ mod tests {
             entry_dir: entry_dir.to_string_lossy().into_owned(),
             crate_name: "serde".into(),
             deadline_ms: None,
+            shard_dir: None,
         };
         let leader = {
             let daemon = daemon.clone();
@@ -14844,6 +15127,7 @@ mod tests {
             entry_dir: entry_dir.to_string_lossy().into_owned(),
             crate_name: "serde".into(),
             deadline_ms: None,
+            shard_dir: None,
         };
         let waiter = {
             let daemon = daemon.clone();
@@ -14902,6 +15186,7 @@ mod tests {
                 entry_dir: entry_dir.to_string_lossy().into_owned(),
                 crate_name: "serde".to_string(),
                 deadline_ms: None,
+                shard_dir: None,
             })
             .await;
 
@@ -15378,12 +15663,14 @@ mod tests {
                     entry_dir: "/tmp/key1".into(),
                     crate_name: String::new(),
                     deadline_ms: None,
+                    shard_dir: None,
                 },
                 RemoteCheckRequest {
                     key: "key2".into(),
                     entry_dir: "/tmp/key2".into(),
                     crate_name: String::new(),
                     deadline_ms: None,
+                    shard_dir: None,
                 },
             ],
         });
@@ -15587,6 +15874,7 @@ mod tests {
             key,
             crate_name: "crate".into(),
             deadline_ms: None,
+            shard_dir: None,
         };
         let resp = daemon.handle_remote_check(&req).await;
         assert!(resp.ok);
@@ -15627,6 +15915,7 @@ mod tests {
             key: missing,
             crate_name: "crate".into(),
             deadline_ms: None,
+            shard_dir: None,
         };
         let resp = daemon.handle_remote_check(&req).await;
         assert!(resp.ok);
@@ -15775,6 +16064,7 @@ mod tests {
             key,
             crate_name: "serde".into(),
             deadline_ms: None,
+            shard_dir: None,
         }
     }
 
@@ -16443,6 +16733,7 @@ mod tests {
                     .into_owned(),
                 crate_name: "serde".into(),
                 deadline_ms: None,
+                shard_dir: None,
             }),
         )
         .await

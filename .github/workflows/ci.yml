@@ -119,7 +119,7 @@ jobs:
       - name: Check crates.io package metadata
         # Cargo stages workspace dependencies together, including crates whose
         # first version has not reached crates.io yet.
-        run: cargo package --locked -p kache-core -p kache-format -p kache
+        run: cargo package --locked -p kache-core -p kache-format -p kache-store -p kache
         env:
           RUSTC_WRAPPER: ""
       - name: Check coverage scope and threshold (88%)
@@ -726,7 +726,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p kache --test custom_harness_test
-          cargo test -p kache --bins -- store:: link:: wrapper::tests::materialize_cached_artifact
+          cargo test -p kache-store --lib
+          cargo test -p kache --bins -- store:: wrapper::tests::materialize_cached_artifact
       - name: Report mount usage
         if: always()
         run: df -h /mnt/cow || true

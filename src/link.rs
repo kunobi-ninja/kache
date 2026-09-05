@@ -156,7 +156,6 @@ fn try_hard_link(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// 0% multi-link blobs on ext4 CI: same `st_dev` is not enough, Linux refuses
 /// `link()` across vfsmounts. EPERM happens under `protected_hardlinks=1`
 /// when the wrapper does not own the 0o444 blob. Other errnos stay debug-only.
-#[cfg(target_os = "linux")]
 pub(crate) fn warn_hardlink_fallback_once(
     store_path: &Path,
     target_path: &Path,
@@ -189,12 +188,12 @@ pub(crate) fn warn_hardlink_fallback_once(
             "hardlink-exdev",
             format!(
                 "kache: operation fell back to COPY because hardlinking failed with EXDEV \
-                 (cross-device link): the two paths are on different mounts, even if they \
-                 share one filesystem — Linux refuses link() across vfsmounts, including two \
-                 bind mounts of the same filesystem. Put the cache and build tree on the SAME \
-                 mount for zero-copy sharing. If this layout is intentional, silence this advice \
-                 with `[cache] storage_layout_advice = false`.\n         source: {}\n         \
-                 dest: {}\n         error: {}",
+                 (cross-device link): the two paths are on different mounts or volumes — \
+                 hardlinks cannot span them, not across drives, not across bind mounts \
+                 even of one filesystem. Put the cache and build tree on the SAME \
+                 mount/drive for zero-copy sharing. If this layout is intentional, \
+                 silence this advice with `[cache] storage_layout_advice = false`.\n         \
+                 source: {}\n         dest: {}\n         error: {}",
                 store_path.display(),
                 target_path.display(),
                 io_err,
@@ -204,8 +203,9 @@ pub(crate) fn warn_hardlink_fallback_once(
             "hardlink-eperm",
             format!(
                 "kache: operation fell back to COPY because hardlinking failed with EPERM \
-                 (permission denied): under fs.protected_hardlinks the caller must own the \
-                 source file. Store blobs are 0o444; if the cache was imported by another uid \
+                 (permission denied): the caller must own the source file (on Linux, \
+                 fs.protected_hardlinks refuses the link otherwise). Store blobs are \
+                 0o444; if the cache was imported by another uid \
                  (daemon vs wrapper, or a carried-over cache dir), linking copies. Ensure one \
                  uid owns the cache. If this layout is intentional, silence this advice with \
                  `[cache] storage_layout_advice = false`.\n         source: {}\n         \
@@ -435,18 +435,10 @@ fn hardlink_or_copy_with_prelink_hook(
                 crate::opcounts::record_restore_copy_other(bytes);
             }
         }
-        // The failure is no longer silent: the reason is counted above, and on
-        // Linux EXDEV/EPERM also emit the once-per-session layout advisory.
+        // The failure is no longer silent: the reason is counted above, and
+        // EXDEV/EPERM also emit the once-per-session layout advisory.
         // What gets linked is unchanged — this still falls back to a copy.
-        #[cfg(target_os = "linux")]
         warn_hardlink_fallback_once(store_path, target_path, reason, &e);
-        #[cfg(not(target_os = "linux"))]
-        tracing::debug!(
-            "hardlink failed ({}), falling back to copy: {} -> {}",
-            e,
-            store_path.display(),
-            target_path.display()
-        );
         return copy_hardlink_fallback(store_path, target_path, bytes);
     }
 
@@ -494,72 +486,6 @@ fn copy_hardlink_fallback(store_path: &Path, target_path: &Path, bytes: u64) -> 
     copy_file(store_path, target_path, false)?;
     crate::opcounts::record_copied(bytes);
     Ok(())
-}
-
-/// Tell the user their store ingests copy because the build tree and the
-/// store are on different mounts/volumes — at most once per warn-session
-/// window, and never when `[cache] storage_layout_advice = false` says the
-/// layout is intentional. Uses its own `cross-volume` bucket so it dedups
-/// independently of the copy-restore advisories. Returns whether it warned,
-/// so tests can assert the gate without touching marker files.
-pub(crate) fn warn_cross_volume_ingest_once(source: &Path, tmp: &Path) -> bool {
-    if !storage_layout_advice_enabled() {
-        return false;
-    }
-    let message = cross_volume_ingest_message(source, tmp);
-    match COW_WARN_MARKER.get() {
-        Some(base) => {
-            let marker = bucket_marker(base, "cross-volume");
-            crate::wrapper::warn_once_per_session(
-                &marker,
-                crate::wrapper::WARN_SESSION_SECS,
-                &message,
-            )
-        }
-        // No marker configured (unit tests, non-wrapper entrypoints): fall back
-        // to once-per-process rather than going silent.
-        None => {
-            use std::sync::Once;
-            static WARNED: Once = Once::new();
-            let mut warned = false;
-            WARNED.call_once(|| {
-                eprintln!("{message}");
-                warned = true;
-            });
-            warned
-        }
-    }
-}
-
-/// Format the volume pair for the cross-volume advisory. Pure and
-/// platform-neutral so the Linux mutation lane can kill its mutants even
-/// though only the Windows call site compiles the roots: both arms are
-/// reachable here on every platform.
-fn format_volume_pair(from: Option<String>, to: Option<String>) -> String {
-    match (from, to) {
-        (Some(from), Some(to)) => format!(" ({from} vs {to})"),
-        _ => String::new(),
-    }
-}
-
-/// Pure message for [`warn_cross_volume_ingest_once`], kept separate so tests
-/// pin the wording without touching the filesystem.
-fn cross_volume_ingest_message(source: &Path, tmp: &Path) -> String {
-    #[cfg(windows)]
-    let (from, to) = (windows_volume_root(source), windows_volume_root(tmp));
-    #[cfg(not(windows))]
-    let (from, to): (Option<String>, Option<String>) = (None, None);
-    let volumes = format_volume_pair(from, to);
-    format!(
-        "kache: could not hardlink {source} into the store staging area ({tmp}){volumes}: \
-         the link failed across mounts/volumes, so every ingest copies the full \
-         file instead of sharing it. Put `[cache] local_store` on the same \
-         drive as your build tree to restore zero-copy ingest. If this layout \
-         is intentional, silence this advice with \
-         `[cache] storage_layout_advice = false`.\n         affected source: {source}",
-        source = source.display(),
-        tmp = tmp.display(),
-    )
 }
 
 /// Validate a completed hardlink whose store blob could not be re-stat'ed.
@@ -2167,63 +2093,6 @@ mod tests {
             CopyRestoreCause::NoCow,
             "volume roots compare case-insensitively",
         );
-    }
-
-    /// `[cache] storage_layout_advice = false` mutes the ingest advisory;
-    /// the default warns. The return value is the observation, so no marker
-    /// files are needed and the test runs on every platform.
-    #[test]
-    fn cross_volume_advice_respects_its_kill_switch() {
-        let _lock = crate::test_support::process_state_test_lock();
-        let source = Path::new("D:/work/target/x.rlib");
-        let tmp = Path::new("C:/cache/store/staging/stage.tmp");
-        set_storage_layout_advice(false);
-        assert!(
-            !warn_cross_volume_ingest_once(source, tmp),
-            "a muted advisory must not warn"
-        );
-        set_storage_layout_advice(true);
-        // Markerless in unit tests: falls back to once-per-process eprintln.
-        // The boolean still proves the gate opened.
-        assert!(
-            warn_cross_volume_ingest_once(source, tmp),
-            "an enabled advisory must warn"
-        );
-    }
-
-    /// The cross-volume ingest message must name the fix (co-locate
-    /// `local_store` with the build) and the mute switch, so a user seeing
-    /// it once knows both what to do and how to silence it.
-    #[test]
-    fn cross_volume_ingest_message_names_fix_and_mute() {
-        let message = cross_volume_ingest_message(
-            Path::new("D:/work/target/x.rlib"),
-            Path::new("C:/cache/store/staging/stage.tmp"),
-        );
-        for needle in [
-            "D:/work/target/x.rlib",
-            "local_store",
-            "storage_layout_advice",
-            "same",
-        ] {
-            assert!(
-                message.contains(needle),
-                "advisory must mention {needle:?}: {message}"
-            );
-        }
-    }
-
-    /// Both arms of the volume-pair formatting, reachable on every platform
-    /// so the Linux mutation lane covers the Windows-only call site.
-    #[test]
-    fn format_volume_pair_formats_both_arms() {
-        assert_eq!(
-            format_volume_pair(Some("C:\\".to_string()), Some("D:\\".to_string())),
-            " (C:\\ vs D:\\)"
-        );
-        assert_eq!(format_volume_pair(None, Some("D:\\".to_string())), "");
-        assert_eq!(format_volume_pair(Some("C:\\".to_string()), None), "");
-        assert_eq!(format_volume_pair(None, None), "");
     }
 
     /// A failed probe must still warn (a copy-restore IS happening) — but as

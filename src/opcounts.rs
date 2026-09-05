@@ -264,7 +264,8 @@ pub fn record_restore_copy_permission(bytes: u64) {
 /// Record `bytes` restored by copy because of the exclusive-carrier rule
 /// (#794): the blob already had a hardlink consumer (`nlink != 1` before the
 /// link, or `nlink != 2` after), so a second share would let one consumer's
-/// mtime stamp reach another.
+/// mtime stamp reach another. Unix-only: link counts do not exist on Windows.
+#[cfg(unix)]
 pub fn record_restore_copy_exclusive(bytes: u64) {
     RESTORE_COPY_EXCLUSIVE_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
@@ -612,6 +613,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn restore_copy_exclusive_counter_increments() {
         let before = restore_copy_exclusive_bytes();
         record_restore_copy_exclusive(31);

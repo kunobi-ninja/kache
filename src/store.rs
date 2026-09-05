@@ -397,7 +397,6 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
                     }
                     Err(io_err) => {
                         let reason = StoreCopyReason::from_io_kind(io_err.kind());
-                        #[cfg(target_os = "linux")]
                         {
                             let io_reason = match reason {
                                 StoreCopyReason::CrossDevice => {
@@ -413,14 +412,6 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
                             crate::link::warn_hardlink_fallback_once(
                                 source, blob, io_reason, &io_err,
                             );
-                        }
-                        #[cfg(not(target_os = "linux"))]
-                        {
-                            // Same advisory, cross-platform wording (Windows
-                            // drives, macOS mounts); Linux is covered above.
-                            if reason == StoreCopyReason::CrossDevice {
-                                crate::link::warn_cross_volume_ingest_once(source, tmp);
-                            }
                         }
                         fs::copy(source, tmp).with_context(|| {
                             format!("copying {} to blob store", source.display())
@@ -3220,7 +3211,6 @@ impl Store {
                     Ok(()) => StoreIngest::Hardlink,
                     Err(io_err) => {
                         let reason = StoreCopyReason::from_io_kind(io_err.kind());
-                        #[cfg(target_os = "linux")]
                         {
                             let io_reason = match reason {
                                 StoreCopyReason::CrossDevice => {
@@ -3242,14 +3232,6 @@ impl Store {
                                 io_reason,
                                 &io_err,
                             );
-                        }
-                        #[cfg(not(target_os = "linux"))]
-                        {
-                            // Same advisory, cross-platform wording (Windows
-                            // drives, macOS mounts); Linux is covered above.
-                            if reason == StoreCopyReason::CrossDevice {
-                                crate::link::warn_cross_volume_ingest_once(source, tmp);
-                            }
                         }
                         fs::copy(source, tmp).with_context(|| {
                             format!("copying {} into store staging", source.display())
@@ -13676,6 +13658,21 @@ mod tests {
 
         let source = dir.path().join("libv.rlib");
         fs::write(&source, b"cross-volume-bytes").unwrap();
+
+        // Muted layout advice stays silent even on EXDEV.
+        crate::link::set_storage_layout_advice(false);
+        let _force = ForceStoreHardlink::enable();
+        let _inject = InjectStoreHardlinkError::enable(std::io::ErrorKind::CrossesDevices);
+        let (_, ingest) = store.stage_blob_from_source(&source, true).unwrap();
+        assert!(
+            matches!(ingest, StoreIngest::Copy(StoreCopyReason::CrossDevice)),
+            "muting advice must not change the copy reason, got {ingest:?}"
+        );
+        assert!(
+            !marker_written(),
+            "a muted advisory must not write a marker"
+        );
+        crate::link::set_storage_layout_advice(true);
 
         // A non-cross-device failure records its reason but advises nothing.
         let _force = ForceStoreHardlink::enable();

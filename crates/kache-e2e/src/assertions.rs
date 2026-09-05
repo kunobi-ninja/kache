@@ -282,6 +282,10 @@ pub fn apply_metric_assertions(
         let total: u32 = phase_events.iter().map(|e| e.dep_info_runs).sum();
         checks.push(AssertionCheck::max("max_dep_info_runs", max, total));
     }
+    if let Some(max) = spec.max_prediction_mismatches {
+        let total: u32 = phase_events.iter().map(|e| e.prediction_mismatches).sum();
+        checks.push(AssertionCheck::max("max_prediction_mismatches", max, total));
+    }
     checks
 }
 
@@ -445,9 +449,77 @@ mod tests {
             max_preprocessor_runs: None,
             max_probe_runs: None,
             max_dep_info_runs: None,
+            max_prediction_mismatches: None,
         };
         let checks = apply_metric_assertions(&spec, &summary(0, 0, 0, 0.0), &HashMap::new(), &[]);
         assert!(checks.is_empty());
+    }
+
+    /// The number that qualifies predictions for wider use. It only means
+    /// anything if a non-zero count actually fails the phase.
+    #[test]
+    fn prediction_mismatches_are_summed_and_bounded() {
+        let spec = |max: Option<u32>| MetricAssertions {
+            min_entries_after: None,
+            max_entries_after: None,
+            min_hits: None,
+            min_misses: None,
+            max_misses: None,
+            min_hit_rate_pct: None,
+            min_misses_per_crate: HashMap::new(),
+            max_compiler_runs: None,
+            max_preprocessor_runs: None,
+            max_probe_runs: None,
+            max_dep_info_runs: None,
+            max_prediction_mismatches: max,
+        };
+        let with_mismatches = |counts: &[u32]| -> Vec<Event> {
+            counts
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let mut e = event(&format!("c{i}"), "local_hit", 0);
+                    e.prediction_mismatches = *n;
+                    e
+                })
+                .collect()
+        };
+
+        // Not asked for, not checked.
+        assert!(
+            apply_metric_assertions(
+                &spec(None),
+                &summary(0, 0, 0, 0.0),
+                &HashMap::new(),
+                &with_mismatches(&[3])
+            )
+            .is_empty()
+        );
+
+        // Every prediction agreed: the phase is evidence, and it passes.
+        let agreed = apply_metric_assertions(
+            &spec(Some(0)),
+            &summary(0, 0, 0, 0.0),
+            &HashMap::new(),
+            &with_mismatches(&[0, 0, 0]),
+        );
+        assert_eq!(agreed.len(), 1);
+        assert!(agreed[0].passed, "{agreed:?}");
+
+        // One disagreement anywhere in the phase fails it. Summed, not per
+        // event: a hole in the argument is a hole wherever it shows up.
+        let disagreed = apply_metric_assertions(
+            &spec(Some(0)),
+            &summary(0, 0, 0, 0.0),
+            &HashMap::new(),
+            &with_mismatches(&[0, 1, 0]),
+        );
+        assert_eq!(disagreed.len(), 1);
+        assert!(
+            !disagreed[0].passed,
+            "a mismatch must fail the phase: {disagreed:?}"
+        );
+        assert_eq!(disagreed[0].actual, "1");
     }
 
     #[test]
@@ -464,6 +536,7 @@ mod tests {
             max_preprocessor_runs: None,
             max_probe_runs: None,
             max_dep_info_runs: None,
+            max_prediction_mismatches: None,
         };
         let checks = apply_metric_assertions(&spec, &summary(5, 0, 5, 100.0), &HashMap::new(), &[]);
         assert!(all_passed(&checks));
@@ -483,6 +556,7 @@ mod tests {
             max_preprocessor_runs: None,
             max_probe_runs: None,
             max_dep_info_runs: None,
+            max_prediction_mismatches: None,
         };
         let checks = apply_metric_assertions(&spec, &summary(0, 5, 5, 0.0), &HashMap::new(), &[]);
         assert!(!all_passed(&checks));
@@ -498,6 +572,7 @@ mod tests {
             preprocessor_runs: 0,
             probe_runs: 0,
             dep_info_runs: 0,
+            prediction_mismatches: 0,
             passthrough_reason: String::new(),
         }
     }

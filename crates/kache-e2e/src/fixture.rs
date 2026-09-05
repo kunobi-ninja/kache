@@ -368,6 +368,12 @@ pub struct MetricAssertions {
     /// this phase's events. `0` on a warm phase proves predictions
     /// replaced the pre-pass; positive on a cold phase counts it.
     pub max_dep_info_runs: Option<u32>,
+    /// Upper bound on sampled-verification mismatches summed across this
+    /// phase's events. Meaningful only with
+    /// `KACHE_VERIFY_INPUT_PREDICTIONS` set: `0` then means every prediction
+    /// the phase used reproduced exactly what the pre-pass discovered, which
+    /// is the evidence that qualifies predictions for wider use.
+    pub max_prediction_mismatches: Option<u32>,
 }
 
 /// No-op phase assertions. The no-op phase rebuilds without cleaning;

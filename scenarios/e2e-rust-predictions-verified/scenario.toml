@@ -1,0 +1,40 @@
+# kache-e2e fixture: the evidence that qualifies input-set predictions.
+#
+# Same subject as e2e-rust-predictions, but with
+# KACHE_VERIFY_INPUT_PREDICTIONS=always. The warm build then does BOTH: it
+# derives the key from the record and it runs the dep-info pre-pass anyway,
+# and compares the two closures. The pre-pass answer is the one that keys, so
+# a disagreement costs nothing at the time — it is counted, and the count is
+# what says whether the soundness argument holds on real code.
+#
+# max_prediction_mismatches = 0 is therefore the assertion this scenario
+# exists for. The sibling scenario asserts the opposite side of the same
+# feature (max_dep_info_runs = 0); this one deliberately does not, because
+# verification is what pays for that pre-pass.
+
+name = "e2e-rust-predictions-verified"
+tags = ["suite:e2e", "lang:rust", "case:input-predictions"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+KACHE_INPUT_PREDICTIONS = "1"
+KACHE_VERIFY_INPUT_PREDICTIONS = "always"
+
+[commands]
+build = "cargo build"
+clean = "rm -rf target"
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+max_prediction_mismatches = 0
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"

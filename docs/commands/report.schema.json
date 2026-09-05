@@ -176,6 +176,7 @@
         "avg_startup_ms": { "type": "number", "minimum": 0.0 },
         "total_dep_info_ms": { "type": "integer", "minimum": 0, "description": "Time in the rustc dep-info pre-pass. Already inside total_key_ms." },
         "dep_info_runs": { "type": "integer", "minimum": 0, "description": "Dep-info pre-pass spawns." },
+        "prediction_mismatches": { "type": "integer", "minimum": 0, "description": "Sampled verifications where a predicted input closure disagreed with the dep-info pre-pass. Zero unless KACHE_VERIFY_INPUT_PREDICTIONS asked for the comparison; the pre-pass answer always won." },
         "avg_dep_info_ms": { "type": "number", "minimum": 0.0, "description": "Mean per pre-pass run." },
         "total_wait_ms": { "type": "integer", "minimum": 0, "description": "Scheduler wait: flight join plus permit acquisition." },
         "total_flight_wait_ms": { "type": "integer", "minimum": 0 },
@@ -400,6 +401,7 @@
         "preprocessor_runs": { "type": "integer", "minimum": 0 },
         "probe_runs": { "type": "integer", "minimum": 0 },
         "dep_info_runs": { "type": "integer", "minimum": 0 },
+        "prediction_mismatches": { "type": "integer", "minimum": 0 },
         "store_error": { "type": "string" }
       }
     },

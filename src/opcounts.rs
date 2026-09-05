@@ -271,7 +271,6 @@ pub fn record_prediction_mismatch() {
 }
 
 /// Sampled-verification mismatches so far in this process.
-#[cfg(test)]
 pub fn prediction_mismatches() -> u64 {
     PREDICTION_MISMATCHES.load(Ordering::Relaxed)
 }

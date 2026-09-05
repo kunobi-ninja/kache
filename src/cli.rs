@@ -9332,6 +9332,7 @@ mod tests {
             startup_ms: 0,
             dep_info_ms: 0,
             dep_info_runs: 0,
+            prediction_mismatches: 0,
             flight_wait_ms: 0,
             permit_wait_ms: 0,
             store_output_blobs: 0,

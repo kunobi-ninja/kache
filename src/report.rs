@@ -203,6 +203,11 @@ pub struct TimingBreakdown {
     pub dep_info_runs: u64,
     #[serde(default)]
     pub avg_dep_info_ms: f64,
+    /// Sampled verifications where a predicted input closure disagreed with
+    /// the dep-info pre-pass. Zero unless `KACHE_VERIFY_INPUT_PREDICTIONS`
+    /// asked for the comparison; the pre-pass answer always won regardless.
+    #[serde(default)]
+    pub prediction_mismatches: u64,
     /// Scheduler wait: flight join plus permit acquisition, kept apart so a
     /// saturated pool and a shared flight stay distinguishable.
     #[serde(default)]
@@ -613,6 +618,11 @@ pub struct CrateDetail {
     /// on it.
     #[serde(default)]
     pub dep_info_runs: u32,
+    /// Sampled verifications this event's key computation ran where the
+    /// prediction disagreed with the pre-pass. Zero unless verification was
+    /// asked for; the e2e harness asserts on it.
+    #[serde(default)]
+    pub prediction_mismatches: u32,
     /// Why this compile's outputs were not cached, when `Store::put` failed
     /// (kunobi-ninja/kache#629). Empty on every normal outcome; when set, this
     /// row is a miss that will recur on every build until the cause is fixed.
@@ -922,6 +932,7 @@ pub fn generate_report_with_filter(
             avg_startup_ms: avg_ms(stats.total_startup_ms, total_cacheable as u64),
             total_dep_info_ms: stats.total_dep_info_ms,
             dep_info_runs: stats.total_dep_info_runs,
+            prediction_mismatches: stats.total_prediction_mismatches,
             avg_dep_info_ms: avg_ms(stats.total_dep_info_ms, stats.total_dep_info_runs),
             total_wait_ms: stats.total_flight_wait_ms + stats.total_permit_wait_ms,
             total_flight_wait_ms: stats.total_flight_wait_ms,
@@ -1294,6 +1305,7 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         preprocessor_runs: e.preprocessor_runs,
         probe_runs: e.probe_runs,
         dep_info_runs: e.dep_info_runs,
+        prediction_mismatches: e.prediction_mismatches,
         store_error: e.store_error.clone(),
     }
 }
@@ -3524,6 +3536,7 @@ mod tests {
             startup_ms: 0,
             dep_info_ms: 0,
             dep_info_runs: 0,
+            prediction_mismatches: 0,
             flight_wait_ms: 0,
             permit_wait_ms: 0,
             store_output_blobs: 0,

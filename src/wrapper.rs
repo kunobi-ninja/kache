@@ -5972,6 +5972,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,

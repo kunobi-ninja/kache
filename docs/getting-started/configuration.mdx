@@ -45,6 +45,7 @@ Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem rem
 | --- | --- | --- | --- |
 | `KACHE_CACHE_DIR` | `cache.local_store` | OS cache directory | Persistent store |
 | `KACHE_RUNTIME_DIR` | `cache.runtime_dir` | local store | Socket, locks, logs, state, and session markers |
+| none | `cache.volumes` | unset | Volume-local store shards, e.g. `[cache.volumes] "D:" = "D:/kache-store"`. Builds on a mapped volume share inodes there instead of copying across mounts. Unmapped volumes use the main store. |
 | `KACHE_SOCKET_PATH` | none | `<runtime_dir>/daemon.sock` | Absolute daemon endpoint override |
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | 5% of the cache disk, floored at 5GiB and capped at 100GiB | Registered blob bytes allowed before GC. An explicit size always wins. `none` is not allowed. |
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |

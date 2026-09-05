@@ -50,6 +50,37 @@ fn rename_backoff_ms(attempt: u32) -> u64 {
     (1u64 << attempt.min(6)).min(64)
 }
 
+/// How many times a transient Windows state is waited out before giving up.
+const TRANSIENT_ATTEMPTS: u32 = 10;
+
+/// Run a filesystem operation, waiting out a transient Windows sharing or
+/// delete-pending state.
+///
+/// On Unix an unlinked file keeps working through open handles and its name is
+/// free the moment it is removed, so a concurrent put/remove pair never
+/// collides on the name. Windows keeps the directory entry until the last
+/// handle closes and fails anything touching that name meanwhile with
+/// ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION. Those clear on their own,
+/// so they are worth waiting out rather than reporting as a fault — see
+/// [`is_transient_rename_error`], which this shares so the code list stays in
+/// one place. Off Windows that predicate is always false, so `op` runs exactly
+/// once and this adds nothing.
+pub(crate) fn retry_transient_windows<T>(
+    mut op: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(e) if is_transient_rename_error(&e) && attempt + 1 < TRANSIENT_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(rename_backoff_ms(attempt)));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Remove a file, clearing the read-only attribute first to ensure deletion
 /// succeeds even on Windows when the file was marked read-only.
 ///
@@ -262,6 +293,62 @@ mod tests {
             assert!(!is_transient_rename_error(&sharing_violation));
             assert!(!is_transient_rename_error(&other));
         }
+    }
+
+    /// A success and a non-transient failure both settle on the first call.
+    ///
+    /// Off Windows this is the whole behaviour, since no error classifies as
+    /// transient there: the retry must never turn a real fault into a delay.
+    #[test]
+    fn retry_transient_windows_does_not_retry_a_settled_outcome() {
+        let mut calls = 0;
+        let value = retry_transient_windows(|| {
+            calls += 1;
+            Ok::<_, std::io::Error>(7)
+        })
+        .unwrap();
+        assert_eq!((value, calls), (7, 1));
+
+        let mut calls = 0;
+        let err = retry_transient_windows(|| {
+            calls += 1;
+            Err::<(), _>(std::io::Error::from_raw_os_error(2))
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(2));
+        assert_eq!(calls, 1, "a non-transient error must not be retried");
+    }
+
+    /// A delete-pending destination clears on its own, so the retry has to
+    /// outlast it and then return the eventual success.
+    #[cfg(windows)]
+    #[test]
+    fn retry_transient_windows_waits_out_a_transient_failure() {
+        let mut calls = 0;
+        let value = retry_transient_windows(|| {
+            calls += 1;
+            if calls < 3 {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            Ok(calls)
+        })
+        .unwrap();
+        assert_eq!((value, calls), (3, 3));
+    }
+
+    /// A state that never clears is a real failure, and the budget is what
+    /// keeps it from hanging: the last attempt's error surfaces.
+    #[cfg(windows)]
+    #[test]
+    fn retry_transient_windows_gives_up_within_its_budget() {
+        let mut calls = 0;
+        let err = retry_transient_windows(|| {
+            calls += 1;
+            Err::<(), _>(std::io::Error::from_raw_os_error(32))
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(32));
+        assert_eq!(calls, TRANSIENT_ATTEMPTS as i32);
     }
 
     #[test]

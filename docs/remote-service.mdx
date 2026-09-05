@@ -20,7 +20,7 @@ The service in [`crates/kache-service`](https://github.com/kunobi-ninja/kache/tr
 
 Both plan versions use the same handler. When no useful candidates exist, the service returns a fallback disposition and the client uses its normal planner.
 
-Planner state is stored in embedded SurrealDB. `kache save-manifest` writes manifests to the configured remote; it does not post them directly to this service. Current deployments seed or ingest that data separately.
+Planner state is stored in an embedded SQLite database, at the path given by `--db-path` / `KACHE_PLANNER_DB_PATH`. `kache save-manifest` writes manifests to the configured remote; it does not post them directly to this service. Current deployments seed or ingest that data separately.
 
 ## Run locally
 

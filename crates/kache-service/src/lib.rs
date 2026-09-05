@@ -30,7 +30,9 @@ mod metrics;
 
 mod state;
 
-pub use state::{DEFAULT_DB_PATH, NamespaceState, PlannerStateFile, SurrealPlannerRepository};
+pub use state::{
+    DEFAULT_DB_PATH, NamespaceState, PlannerStateFile, SeedPlan, SqlitePlannerRepository,
+};
 
 type SharedPlannerDataSource = Arc<dyn PlannerDataSource + Send + Sync>;
 
@@ -268,9 +270,26 @@ fn parse_service_account_namespace(contents: &str) -> Result<String> {
 }
 
 async fn load_repository(config: &PlannerConfig) -> Result<Option<SharedPlannerDataSource>> {
-    let repository = SurrealPlannerRepository::open(&config.db_path).await?;
-    if let Some(seed_state_file) = config.seed_state_file.as_deref() {
-        repository.seed_from_state_file(seed_state_file).await?;
+    // Read and parse the seed BEFORE opening, because opening may move a
+    // pre-SQLite store aside and that is only safe if the rows really do come
+    // back. Seeding after the move meant a missing, unreadable or malformed
+    // seed failed only once the old store had already been displaced -- and a
+    // seed stored inside that directory was moved out from under its own path.
+    let seed = match config.seed_state_file.as_deref() {
+        Some(path) => Some(PlannerStateFile::read_from(path)?),
+        None => None,
+    };
+
+    // An empty seed parses fine and puts nothing back, so it is not a plan to
+    // rebuild anything.
+    let seed_plan = match &seed {
+        Some(state) if !state.is_empty() => SeedPlan::Reseeded,
+        _ => SeedPlan::None,
+    };
+
+    let repository = SqlitePlannerRepository::open(&config.db_path, seed_plan).await?;
+    if let Some(seed) = seed {
+        repository.seed_from_state(seed).await?;
     }
     Ok(Some(Arc::new(repository)))
 }
@@ -897,9 +916,10 @@ mod tests {
     #[tokio::test]
     async fn prefetch_plan_returns_execute_when_repository_has_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let repository = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
-            .await
-            .unwrap();
+        let repository =
+            SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+                .await
+                .unwrap();
         repository
             .seed_from_state(PlannerStateFile {
                 namespaces: HashMap::new(),
@@ -952,9 +972,10 @@ mod tests {
     #[tokio::test]
     async fn prefetch_plan_returns_use_fallback_when_repository_has_no_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let repository = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
-            .await
-            .unwrap();
+        let repository =
+            SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+                .await
+                .unwrap();
 
         let response = test_app(None, Some(Arc::new(repository)))
             .oneshot(
@@ -981,5 +1002,98 @@ mod tests {
         let plan: PrefetchPlan = serde_json::from_slice(&body).unwrap();
         assert_eq!(plan.disposition, PrefetchDisposition::UseFallback);
         assert!(plan.candidates.is_empty());
+    }
+
+    /// Lay out a db path holding a pre-SQLite store, plus a seed file.
+    fn legacy_store_with_seed(seed: &PlannerStateFile) -> (tempfile::TempDir, PlannerConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("planner.db");
+        std::fs::create_dir(&db_path).unwrap();
+        std::fs::write(db_path.join("LOCK"), b"legacy sentinel").unwrap();
+
+        let seed_path = dir.path().join("planner-state.json");
+        std::fs::write(&seed_path, serde_json::to_vec(seed).unwrap()).unwrap();
+
+        let mut config = test_config(db_path);
+        config.seed_state_file = Some(seed_path);
+        (dir, config)
+    }
+
+    fn seed_with_one_candidate() -> PlannerStateFile {
+        PlannerStateFile {
+            namespaces: HashMap::new(),
+            history: HashMap::from([(
+                "serde".to_string(),
+                vec![kache_core::PrefetchCandidate::new(
+                    "serde-key".to_string(),
+                    "serde".to_string(),
+                )],
+            )]),
+            key_cache: HashMap::new(),
+        }
+    }
+
+    /// A seed carrying rows licenses replacing the pre-SQLite store.
+    #[tokio::test]
+    async fn startup_replaces_a_legacy_store_when_the_seed_carries_rows() {
+        let (dir, config) = legacy_store_with_seed(&seed_with_one_candidate());
+        let db_path = config.db_path.clone();
+
+        let _router = app(config).await.expect("a seeded upgrade must start");
+
+        assert!(db_path.is_file(), "the new planner db must be a file");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().contains(".surrealkv-")),
+            "the old store must be kept alongside"
+        );
+    }
+
+    /// An empty seed parses fine and writes nothing, so it licenses nothing.
+    #[tokio::test]
+    async fn startup_refuses_a_legacy_store_when_the_seed_is_empty() {
+        let (_dir, config) = legacy_store_with_seed(&PlannerStateFile::default());
+        let db_path = config.db_path.clone();
+
+        let err = app(config)
+            .await
+            .expect_err("an empty seed must not license replacing the store");
+        assert!(err.to_string().contains("--seed-state-file"), "{err}");
+        assert!(db_path.is_dir(), "the legacy store must stay in place");
+        assert_eq!(
+            std::fs::read(db_path.join("LOCK")).unwrap(),
+            b"legacy sentinel"
+        );
+    }
+
+    /// Configuring no seed at all is the same situation.
+    #[tokio::test]
+    async fn startup_refuses_a_legacy_store_when_no_seed_is_configured() {
+        let (_dir, mut config) = legacy_store_with_seed(&seed_with_one_candidate());
+        config.seed_state_file = None;
+        let db_path = config.db_path.clone();
+
+        assert!(app(config).await.is_err());
+        assert!(db_path.is_dir(), "the legacy store must stay in place");
+    }
+
+    /// The seed is read before the store is touched, so a broken one costs
+    /// nothing. Reading it afterwards left the store displaced by a seed that
+    /// then failed.
+    #[tokio::test]
+    async fn startup_reads_the_seed_before_touching_a_legacy_store() {
+        let (dir, config) = legacy_store_with_seed(&seed_with_one_candidate());
+        std::fs::write(config.seed_state_file.as_ref().unwrap(), b"{ not json").unwrap();
+        let db_path = config.db_path.clone();
+
+        assert!(app(config).await.is_err());
+        assert!(db_path.is_dir(), "the legacy store must stay in place");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "a failed start must leave no quarantine copy behind"
+        );
     }
 }

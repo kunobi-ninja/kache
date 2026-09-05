@@ -2085,10 +2085,12 @@ fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
             (zero_copy_pct * 10.0).round() / 10.0,
         ));
     }
-    let store_copy_reasons = storage.store_copy_cross_device_bytes
-        + storage.store_copy_permission_bytes
-        + storage.store_copy_ineligible_bytes
-        + storage.store_copy_other_bytes;
+    let store_copy_reasons = copy_reason_bytes_total(
+        storage.store_copy_cross_device_bytes,
+        storage.store_copy_permission_bytes,
+        storage.store_copy_ineligible_bytes,
+        storage.store_copy_other_bytes,
+    );
     if store_copy_reasons > 0 {
         lines.push(format!(
             "| Store copy reasons | {} cross-device (EXDEV), {} permission (EPERM), {} kind-ineligible, {} other |",
@@ -2098,10 +2100,12 @@ fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
             format_bytes(storage.store_copy_other_bytes),
         ));
     }
-    let restore_copy_reasons = storage.restore_copy_cross_device_bytes
-        + storage.restore_copy_permission_bytes
-        + storage.restore_copy_exclusive_bytes
-        + storage.restore_copy_other_bytes;
+    let restore_copy_reasons = copy_reason_bytes_total(
+        storage.restore_copy_cross_device_bytes,
+        storage.restore_copy_permission_bytes,
+        storage.restore_copy_exclusive_bytes,
+        storage.restore_copy_other_bytes,
+    );
     if restore_copy_reasons > 0 {
         lines.push(format!(
             "| Restore copy reasons | {} cross-device (EXDEV), {} permission (EPERM), {} exclusive-carrier, {} other |",
@@ -2111,6 +2115,10 @@ fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
             format_bytes(storage.restore_copy_other_bytes),
         ));
     }
+}
+
+fn copy_reason_bytes_total(a: u64, b: u64, c: u64, d: u64) -> u64 {
+    a + b + c + d
 }
 
 fn push_error_table(lines: &mut Vec<String>, errors: &[ErrorDetail]) {
@@ -5944,6 +5952,63 @@ mod tests {
             report.network.is_some(),
             "downloads should yield network analysis"
         );
+    }
+
+    /// Copy-fallback reason rows render only when their guard sums are
+    /// positive, with each reason's own bytes. Any arithmetic change to the
+    /// sums hides a row or panics on underflow in debug builds.
+    #[test]
+    fn push_storage_table_renders_copy_reason_sums() {
+        let storage = StorageBreakdown {
+            reflinked_bytes: 0,
+            hardlinked_bytes: 0,
+            copied_bytes: 0,
+            restored_bytes: 0,
+            zero_copy_pct: 0.0,
+            store_blobs: 0,
+            logical_bytes: 0,
+            blob_bytes: 0,
+            dedup_saved_bytes: 0,
+            accounting_consistent: true,
+            store_reflinked_bytes: 0,
+            store_hardlinked_bytes: 0,
+            store_copied_bytes: 0,
+            store_copy_cross_device_bytes: 100,
+            store_copy_permission_bytes: 200,
+            store_copy_ineligible_bytes: 300,
+            store_copy_other_bytes: 400,
+            restore_copy_cross_device_bytes: 100,
+            restore_copy_permission_bytes: 200,
+            restore_copy_exclusive_bytes: 400,
+            restore_copy_other_bytes: 800,
+        };
+        let mut lines = Vec::new();
+        push_storage_table(&mut lines, &storage);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("Store copy reasons"),
+            "nonzero store reasons must render: {joined}"
+        );
+        assert!(
+            joined.contains("Restore copy reasons"),
+            "nonzero restore reasons must render: {joined}"
+        );
+        assert!(
+            joined.contains(&format_bytes(100))
+                && joined.contains(&format_bytes(200))
+                && joined.contains(&format_bytes(300))
+                && joined.contains(&format_bytes(400))
+                && joined.contains(&format_bytes(800)),
+            "each reason's own bytes must appear: {joined}"
+        );
+    }
+
+    #[test]
+    fn copy_reason_bytes_total_adds_all_four_terms() {
+        assert_eq!(copy_reason_bytes_total(0, 0, 0, 0), 0);
+        assert_eq!(copy_reason_bytes_total(1, 0, 0, 0), 1);
+        assert_eq!(copy_reason_bytes_total(1, 2, 4, 8), 15);
+        assert_eq!(copy_reason_bytes_total(100, 200, 300, 400), 1000);
     }
 
     #[test]

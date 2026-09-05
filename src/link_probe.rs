@@ -115,7 +115,7 @@ fn io_kind_name(e: &std::io::Error) -> String {
 /// Human detail for an EXDEV probe failure, with both mount roots.
 pub(crate) fn format_exdev_detail(source_mount: Option<&str>, dest_mount: Option<&str>) -> String {
     match (source_mount, dest_mount) {
-        (Some(src), Some(dst)) if src != dst => format!(
+        (Some(src), Some(dst)) if exdev_mounts_differ(src, dst) => format!(
             "EXDEV: build tree is on mount `{src}` but `<store>/staging` is on mount `{dst}` — \
              Linux refuses link() across mounts, including two bind mounts of one filesystem. \
              Put the cache and build tree on the SAME mount for zero-copy sharing"
@@ -129,6 +129,10 @@ pub(crate) fn format_exdev_detail(source_mount: Option<&str>, dest_mount: Option
               mount for zero-copy sharing (mount roots could not be determined)"
             .to_string(),
     }
+}
+
+fn exdev_mounts_differ(src: &str, dst: &str) -> bool {
+    src != dst
 }
 
 /// Human detail for an EPERM probe failure, with hardening + ownership.
@@ -208,13 +212,18 @@ pub(crate) fn find_mount_root(abs_path: &Path, mountinfo: &str) -> Option<String
         if path_str == mount_point.as_str() || path_str.starts_with(&format!("{mount_point}/")) {
             let longer = best
                 .as_ref()
-                .is_none_or(|current: &String| mount_point.len() > current.len());
+                .is_none_or(|current: &String| mount_point_is_longer(&mount_point, current));
             if longer {
                 best = Some(mount_point);
             }
         }
     }
     best
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn mount_point_is_longer(candidate: &str, current: &str) -> bool {
+    candidate.len() > current.len()
 }
 
 /// Mount point field (5th) of one `/proc/self/mountinfo` line, unescaping
@@ -248,8 +257,7 @@ fn read_protected_hardlinks() -> Option<String> {
     {
         std::fs::read_to_string("/proc/sys/fs/protected_hardlinks")
             .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .and_then(|s| parse_protected_hardlinks(&s))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -257,8 +265,8 @@ fn read_protected_hardlinks() -> Option<String> {
     }
 }
 
-/// Parse `/proc/sys/fs/protected_hardlinks` content for tests.
-#[cfg(test)]
+/// Parse `/proc/sys/fs/protected_hardlinks` content.
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn parse_protected_hardlinks(content: &str) -> Option<String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -340,6 +348,88 @@ mod tests {
     }
 
     #[test]
+    fn io_kind_name_names_the_errno() {
+        let cross = std::io::Error::new(std::io::ErrorKind::CrossesDevices, "x");
+        let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "x");
+        assert_eq!(io_kind_name(&cross), "CrossesDevices");
+        assert_eq!(io_kind_name(&missing), "NotFound");
+    }
+
+    /// uid/owner observations come from real syscalls: a file this process
+    /// just created is owned by this process's uid.
+    #[test]
+    #[cfg(unix)]
+    fn file_owner_matches_current_uid_for_own_files() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("owned");
+        std::fs::write(&file, b"x").unwrap();
+        let owner = file_owner(&file);
+        let expected = std::fs::metadata(&file).unwrap().uid();
+        assert_eq!(owner, Some(expected));
+        assert_eq!(owner, current_uid());
+        assert_eq!(current_uid(), Some(unsafe { libc::getuid() }));
+        assert_eq!(
+            file_owner(&dir.path().join("missing")),
+            None,
+            "a missing path has no owner"
+        );
+    }
+
+    /// `/proc/sys/fs/protected_hardlinks` holds `0`, `1`, or `2` on every
+    /// Linux kernel: assert the read parses to one of those, never a guess.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn read_protected_hardlinks_reports_the_kernel_value() {
+        let value = read_protected_hardlinks();
+        assert!(
+            matches!(value.as_deref(), Some("0") | Some("1") | Some("2")),
+            "unexpected protected_hardlinks content: {value:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn absolute_path_passes_absolute_paths_through() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(absolute_path(dir.path()), Some(dir.path().to_path_buf()));
+        let relative = Path::new("rel-link-probe");
+        let got = absolute_path(relative).expect("cwd is resolvable");
+        assert!(got.is_absolute(), "relative paths must be joined onto cwd");
+        assert!(got.ends_with("rel-link-probe"));
+        assert!(!got.as_os_str().is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn find_mount_for_path_resolves_a_real_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let root =
+            find_mount_for_path(dir.path()).expect("mountinfo always resolves a tempdir on Linux");
+        assert!(
+            !root.is_empty() && dir.path().starts_with(&root),
+            "mount root {root:?} must prefix {}",
+            dir.path().display()
+        );
+    }
+
+    #[test]
+    fn find_mount_root_prefers_the_longest_prefix() {
+        let mountinfo = "1 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                         2 1 8:1 / /foo rw - ext4 /dev/sda1 rw\n\
+                         3 1 8:2 / /foo/bar rw - ext4 /dev/sda2 rw\n";
+        assert_eq!(
+            find_mount_root(Path::new("/foo/bar/x"), mountinfo).as_deref(),
+            Some("/foo/bar"),
+            "nested mounts resolve to the longest match"
+        );
+        assert_eq!(
+            find_mount_root(Path::new("/foo/other"), mountinfo).as_deref(),
+            Some("/foo")
+        );
+    }
+
+    #[test]
     fn find_mount_root_matches_exact_mount_point() {
         let mountinfo = "23 28 0:20 / /sys/fs/cgroup ro shared:4 - cgroup2 cgroup2 rw\n\
                          30 1 8:1 / /mnt/data rw - ext4 /dev/sda1 rw\n";
@@ -397,14 +487,29 @@ mod tests {
         let got = format_exdev_detail(Some("/mnt/workspace"), Some("/mnt/cache"));
         assert!(got.contains("/mnt/workspace"));
         assert!(got.contains("/mnt/cache"));
-        assert!(got.contains("EXDEV"));
+        assert!(got.contains("build tree is on mount"));
+        assert!(!got.contains("vfsmounts"));
     }
 
     #[test]
     fn format_exdev_detail_reports_bind_mount_when_same() {
         let got = format_exdev_detail(Some("/mnt/data"), Some("/mnt/data"));
-        assert!(got.contains("bind"));
-        assert!(got.contains("EXDEV"));
+        assert!(got.contains("vfsmounts"));
+        assert!(!got.contains("build tree is on mount"));
+    }
+
+    #[test]
+    fn exdev_mounts_differ_is_string_inequality() {
+        assert!(exdev_mounts_differ("/a", "/b"));
+        assert!(!exdev_mounts_differ("/a", "/a"));
+    }
+
+    #[test]
+    #[cfg(any(test, target_os = "linux"))]
+    fn mount_point_is_longer_compares_lengths() {
+        assert!(mount_point_is_longer("/foo/bar", "/foo"));
+        assert!(!mount_point_is_longer("/foo", "/foo"));
+        assert!(!mount_point_is_longer("/a", "/bbb"));
     }
 
     #[test]

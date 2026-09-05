@@ -197,6 +197,14 @@ fn force_store_hardlink() -> bool {
     false
 }
 
+fn should_try_store_reflink(force_hardlink: bool) -> bool {
+    !force_hardlink
+}
+
+fn allow_store_hardlink(allow_hardlink: bool, is_regular_file: bool) -> bool {
+    allow_hardlink && is_regular_file
+}
+
 /// Attempt the ingest `link(2)`, honouring the test-only error seam. Returns
 /// the io error on failure so callers classify it instead of swallowing it.
 fn try_store_hard_link(source: &Path, tmp: &Path) -> std::io::Result<()> {
@@ -384,13 +392,14 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
         |tmp| {
             // `FORCE_STORE_HARDLINK` (test-only) skips the reflink attempt so a
             // same-device `.rlib` must hardlink even on CoW filesystems.
-            let reflink_ok =
-                !force_store_hardlink() && crate::link::try_reflink(source, tmp).is_ok();
+            let reflink_ok = should_try_store_reflink(force_store_hardlink())
+                && crate::link::try_reflink(source, tmp).is_ok();
             if reflink_ok {
                 ingest.set(StoreIngest::Reflink);
-            } else if allow_hardlink
-                && fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file())
-            {
+            } else if allow_store_hardlink(
+                allow_hardlink,
+                fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file()),
+            ) {
                 match try_store_hard_link(source, tmp) {
                     Ok(()) => {
                         ingest.set(StoreIngest::Hardlink);
@@ -3193,14 +3202,15 @@ impl Store {
             // emulation claimed the staging slot, and never when the
             // force-hardlink seam (test-only) pretends CoW is unavailable so a
             // same-device `.rlib` must hardlink even on APFS/btrfs.
-            let reflink_ok = !force_store_hardlink()
+            let reflink_ok = should_try_store_reflink(force_store_hardlink())
                 && (emulate_cow_reflink_ingest(source, tmp)?
                     || crate::link::try_reflink(source, tmp).is_ok());
             let ingest = if reflink_ok {
                 StoreIngest::Reflink
-            } else if allow_hardlink
-                && fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file())
-            {
+            } else if allow_store_hardlink(
+                allow_hardlink,
+                fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file()),
+            ) {
                 // Refused for symlink sources: hashing followed the link, but a
                 // hardlink would link the symlink itself — a pointer into mutable
                 // external state, never valid for a blob (same rule as
@@ -5457,6 +5467,48 @@ mod tests {
             "blob must be a regular file, not a symlink"
         );
         assert_eq!(fs::read(&blob).unwrap(), b"real artifact bytes");
+    }
+
+    #[test]
+    fn should_try_store_reflink_is_the_inverse_of_the_force_flag() {
+        assert!(should_try_store_reflink(false));
+        assert!(!should_try_store_reflink(true));
+    }
+
+    #[test]
+    fn allow_store_hardlink_requires_permission_and_a_regular_file() {
+        assert!(allow_store_hardlink(true, true));
+        assert!(!allow_store_hardlink(false, true));
+        assert!(!allow_store_hardlink(true, false));
+        assert!(!allow_store_hardlink(false, false));
+    }
+
+    #[test]
+    fn force_store_hardlink_defaults_off_and_follows_the_guard() {
+        assert!(!force_store_hardlink());
+        {
+            let _guard = ForceStoreHardlink::enable();
+            assert!(force_store_hardlink());
+        }
+        assert!(!force_store_hardlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_blob_without_hardlink_permission_does_not_share_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("libx.rlib");
+        fs::write(&source, b"ineligible-materialize").unwrap();
+        let blob = dir.path().join("blobs").join("aa").join("a".repeat(64));
+        let _force = ForceStoreHardlink::enable();
+        assert!(materialize_blob(&source, &blob, false).unwrap());
+        assert_eq!(
+            fs::metadata(&blob).unwrap().nlink(),
+            1,
+            "allow_hardlink=false must copy, not hardlink"
+        );
+        assert_eq!(fs::metadata(&source).unwrap().nlink(), 1);
     }
 
     #[test]

@@ -208,17 +208,29 @@ pub(crate) fn find_mount_root(abs_path: &Path, mountinfo: &str) -> Option<String
     }
     let mut best: Option<String> = None;
     for line in mountinfo.lines() {
-        let mount_point = parse_mountinfo_mount_point(line)?;
-        if path_str == mount_point.as_str() || path_str.starts_with(&format!("{mount_point}/")) {
-            let longer = best
-                .as_ref()
-                .is_none_or(|current: &String| mount_point_is_longer(&mount_point, current));
-            if longer {
-                best = Some(mount_point);
-            }
+        let Some(mount_point) = parse_mountinfo_mount_point(line) else {
+            continue;
+        };
+        if !path_is_under_mount(&path_str, &mount_point) {
+            continue;
+        }
+        let longer = best
+            .as_ref()
+            .is_none_or(|current: &String| mount_point_is_longer(&mount_point, current));
+        if longer {
+            best = Some(mount_point);
         }
     }
     best
+}
+
+/// Whether `path` lives on `mount_point`. `/` is a prefix of every absolute
+/// path; concatenating `"/" + "/"` would look for `//` and miss `/tmp`.
+#[cfg(any(test, target_os = "linux"))]
+fn path_is_under_mount(path: &str, mount_point: &str) -> bool {
+    path == mount_point
+        || (mount_point == "/" && path.starts_with('/'))
+        || path.starts_with(&format!("{mount_point}/"))
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -450,6 +462,34 @@ mod tests {
         let mountinfo = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
         // Relative path can never match an absolute mount point.
         assert!(find_mount_root(Path::new("relative/path"), mountinfo).is_none());
+    }
+
+    #[test]
+    fn find_mount_root_uses_slash_for_paths_with_no_nested_mount() {
+        let mountinfo = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(
+            find_mount_root(Path::new("/tmp/foo"), mountinfo).as_deref(),
+            Some("/"),
+            "the root mount must prefix every absolute path"
+        );
+    }
+
+    #[test]
+    fn find_mount_root_skips_malformed_lines() {
+        let mountinfo = "garbage\n1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(
+            find_mount_root(Path::new("/tmp/foo"), mountinfo).as_deref(),
+            Some("/")
+        );
+    }
+
+    #[test]
+    fn path_is_under_mount_treats_slash_as_prefix_of_every_absolute_path() {
+        assert!(path_is_under_mount("/tmp/foo", "/"));
+        assert!(path_is_under_mount("/", "/"));
+        assert!(path_is_under_mount("/mnt/data/x", "/mnt/data"));
+        assert!(!path_is_under_mount("/mnt/data", "/mnt/data/x"));
+        assert!(!path_is_under_mount("/mnt/other", "/mnt/data"));
     }
 
     #[test]

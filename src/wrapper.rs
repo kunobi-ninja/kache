@@ -21,6 +21,9 @@ use crate::link;
 use crate::scheduler::{self, FlightIdentity, MissGuard};
 use crate::store::{BuildClaim, EntryMeta, Store, StorePutResult};
 
+mod rustc_hit;
+use rustc_hit::RustcHitContext;
+
 /// Check whether progress lines should be printed to stderr.
 ///
 /// Controlled by `KACHE_PROGRESS` env var (off by default):
@@ -2109,24 +2112,23 @@ fn run_parsed_rustc(
         None
     };
 
+    let hit_context = RustcHitContext {
+        config,
+        compiler,
+        args,
+        crate_name,
+        event_root: &event_root,
+        start,
+        extra_inputs,
+    };
+
     // Daemon fast path (kunobi-ninja/kache#565): ask the running daemon
     // before opening SQLite. A served hit returns here; every other outcome
     // (miss, fallback, no daemon, restore failure) opens the store and runs
     // the fully local path below with the already-computed key.
     let mut store = store;
     if daemon_local {
-        if let Some(exit) = try_daemon_local_hit(
-            config,
-            compiler,
-            args,
-            &cache_key,
-            crate_name,
-            &event_root,
-            start,
-            key_ms,
-            key_hash_stats,
-            extra_inputs,
-        ) {
+        if let Some(exit) = try_daemon_local_hit(&hit_context, &cache_key, key_ms, key_hash_stats) {
             reset_adaptive_unit(adaptive_unit.as_ref());
             return Ok(exit);
         }
@@ -2224,14 +2226,15 @@ fn run_parsed_rustc(
                 let _ = hit_store.remove_entry(&cache_key);
             } else {
                 tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
-                let restore_start = std::time::Instant::now();
-                if let Err(e) = restore_from_cache(
-                    config,
-                    compiler,
-                    &BlobSource::Store(hit_store),
-                    args,
+                if let Err(e) = hit_context.restore_and_finish(
+                    BlobSource::Store(hit_store),
                     &meta,
-                    extra_inputs,
+                    EventResult::LocalHit,
+                    &cache_key,
+                    key_ms,
+                    key_hash_stats,
+                    lookup_ms,
+                    record_closure.then_some(&store),
                 ) {
                     tracing::warn!(
                         "restoring local cache hit for {} failed: {} — recompiling",
@@ -2247,28 +2250,6 @@ fn run_parsed_rustc(
                         format!("restore failed: {e}"),
                     );
                 }
-                let restore_ms = restore_start.elapsed().as_millis() as u64;
-                let elapsed = start.elapsed().as_millis() as u64;
-                let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                log_event_with_hash_stats(
-                    config,
-                    &event_root,
-                    crate_name,
-                    EventResult::LocalHit,
-                    elapsed,
-                    meta.compile_time_ms,
-                    size,
-                    &cache_key,
-                    key_ms,
-                    key_hash_stats,
-                    lookup_ms,
-                    restore_ms,
-                    0,
-                );
-                record_input_prediction(config, Some(&store), args, record_closure);
-                print_progress(crate_name, EventResult::LocalHit, elapsed, size);
-                replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
-                clean_incremental_dir(config, args);
                 reset_adaptive_unit(adaptive_unit.as_ref());
 
                 return Ok(0);
@@ -2280,78 +2261,32 @@ fn run_parsed_rustc(
         maybe_trigger_prefetch(config, args);
 
         // 2. Check remote cache via daemon (if configured)
-        if config.remote.is_some() {
-            let entry_dir = store.entry_dir(&cache_key);
-            // No `if result.found` guard: it only predicts what the read
-            // below settles. Reaching here means the local lookup already
-            // missed on this pass, so the entry is present exactly when
-            // the daemon just fetched it — which is what `found` reports.
-            // In the race where another process stored it meanwhile,
-            // serving it beats recompiling; only the label is imprecise,
-            // and `prefetched` still separates a prefetch from a fetch.
-            // A daemon that never answered is a miss; the build compiles.
-            if let Some(result) =
-                crate::daemon::send_remote_check(config, &cache_key, &entry_dir, crate_name)
-                && let Ok(Some(meta)) = store.get(&cache_key)
-            {
-                let event_result = if result.prefetched {
-                    tracing::debug!(
-                        "prefetch cache hit for {} ({})",
-                        crate_name,
-                        &cache_key[..16]
-                    );
-                    EventResult::PrefetchHit
-                } else {
-                    tracing::debug!("remote cache hit for {} ({})", crate_name, &cache_key[..16]);
-                    EventResult::RemoteHit
-                };
-                let restore_start = std::time::Instant::now();
-                if let Err(e) = restore_from_cache(
-                    config,
-                    compiler,
-                    &BlobSource::Store(&store),
-                    args,
-                    &meta,
-                    extra_inputs,
-                ) {
-                    tracing::warn!(
-                        "restoring cache hit for {} failed: {} — recompiling",
-                        crate_name,
-                        e
-                    );
-                    return passthrough_with_event(
-                        config,
-                        args,
-                        crate_name,
-                        &event_root,
-                        start,
-                        format!("restore failed: {e}"),
-                    );
-                }
-                let restore_ms = restore_start.elapsed().as_millis() as u64;
-                let elapsed = start.elapsed().as_millis() as u64;
-                let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                log_event_with_hash_stats(
-                    config,
-                    &event_root,
+        if let Some(restored) = try_rustc_remote_hit(
+            &hit_context,
+            &store,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            record_closure,
+        ) {
+            if let Err(e) = restored {
+                tracing::warn!(
+                    "restoring cache hit for {} failed: {} — recompiling",
                     crate_name,
-                    event_result,
-                    elapsed,
-                    meta.compile_time_ms,
-                    size,
-                    &cache_key,
-                    key_ms,
-                    key_hash_stats,
-                    lookup_ms,
-                    restore_ms,
-                    0,
+                    e
                 );
-                print_progress(crate_name, event_result, elapsed, size);
-                replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
-                clean_incremental_dir(config, args);
-                reset_adaptive_unit(adaptive_unit.as_ref());
-                return Ok(0);
+                return passthrough_with_event(
+                    config,
+                    args,
+                    crate_name,
+                    &event_root,
+                    start,
+                    format!("restore failed: {e}"),
+                );
             }
+            reset_adaptive_unit(adaptive_unit.as_ref());
+            return Ok(0);
         }
 
         if !owes_rederivation(predicted, rederived) {
@@ -2467,14 +2402,15 @@ fn run_parsed_rustc(
     };
 
     if let Some(meta) = committed {
-        let restore_start = std::time::Instant::now();
-        if let Err(e) = restore_from_cache(
-            config,
-            compiler,
-            &BlobSource::Store(&store),
-            args,
+        if let Err(e) = hit_context.restore_and_finish(
+            BlobSource::Store(&store),
             &meta,
-            extra_inputs,
+            EventResult::LocalHit,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            record_closure.then_some(&store),
         ) {
             tracing::warn!(
                 "restoring cache hit for {} failed: {} — recompiling",
@@ -2490,29 +2426,6 @@ fn run_parsed_rustc(
                 format!("restore failed: {e}"),
             );
         }
-        let restore_ms = restore_start.elapsed().as_millis() as u64;
-        let elapsed = start.elapsed().as_millis() as u64;
-        let size: u64 = meta.files.iter().map(|f| f.size).sum();
-        log_event_with_hash_stats(
-            config,
-            &event_root,
-            crate_name,
-            EventResult::LocalHit,
-            elapsed,
-            meta.compile_time_ms,
-            size,
-            &cache_key,
-            key_ms,
-            key_hash_stats,
-            lookup_ms,
-            restore_ms,
-            0,
-        );
-        record_input_prediction(config, Some(&store), args, record_closure);
-        // Replay the original compiler diagnostics, exactly as the other hit
-        // sites do, so a coalesced compile does not swallow warnings or notes.
-        replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
-        clean_incremental_dir(config, args);
         reset_adaptive_unit(adaptive_unit.as_ref());
         return Ok(0);
     }
@@ -3572,30 +3485,68 @@ fn recompute_key_without_prediction(
     )
 }
 
+/// Complete an entry made available by a remote check. `None` means no entry;
+/// a restore error stays distinct so the caller recompiles without reporting a hit.
+fn try_rustc_remote_hit(
+    hit: &RustcHitContext<'_>,
+    store: &Store,
+    cache_key: &str,
+    key_ms: u64,
+    key_hash_stats: FileHashStats,
+    lookup_ms: u64,
+    record_closure: bool,
+) -> Option<Result<()>> {
+    hit.config.remote.as_ref()?;
+    let entry_dir = store.entry_dir(cache_key);
+    let reply =
+        crate::daemon::send_remote_check(hit.config, cache_key, &entry_dir, hit.crate_name)?;
+    // A concurrent writer can also supply the entry. Read the store even when
+    // the reply says `found: false`; only `prefetched` affects the hit label.
+    let meta = store.get(cache_key).ok()??;
+    let result = if reply.prefetched {
+        tracing::debug!(
+            "prefetch cache hit for {} ({})",
+            hit.crate_name,
+            &cache_key[..16]
+        );
+        EventResult::PrefetchHit
+    } else {
+        tracing::debug!(
+            "remote cache hit for {} ({})",
+            hit.crate_name,
+            &cache_key[..16]
+        );
+        EventResult::RemoteHit
+    };
+    Some(hit.restore_and_finish(
+        BlobSource::Store(store),
+        &meta,
+        result,
+        cache_key,
+        key_ms,
+        key_hash_stats,
+        lookup_ms,
+        record_closure.then_some(store),
+    ))
+}
+
 /// Daemon fast path (kunobi-ninja/kache#565): returns `Some(exit_code)` only
 /// when the daemon served a hit AND the restore succeeded. Every other
 /// outcome returns `None` and the caller runs the fully local path — which
 /// owns eviction/repair for whatever the daemon or restore stumbled on.
-#[allow(clippy::too_many_arguments)]
 fn try_daemon_local_hit(
-    config: &Config,
-    compiler: &RustcCompiler,
-    args: &RustcArgs,
+    hit: &RustcHitContext<'_>,
     cache_key: &str,
-    crate_name: &str,
-    event_root: &str,
-    start: std::time::Instant,
     key_ms: u64,
     key_hash_stats: FileHashStats,
-    extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
 ) -> Option<i32> {
     let lookup_start = std::time::Instant::now();
-    let target_dir = args.target_dir();
+    let target_dir = hit.args.target_dir();
     let reply = crate::daemon::send_local_lookup(
-        config,
+        hit.config,
         cache_key,
         target_dir.as_deref(),
-        args.path_normalization_root(),
+        hit.args.path_normalization_root(),
     )?;
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     if reply.outcome != "hit" {
@@ -3606,44 +3557,25 @@ fn try_daemon_local_hit(
         return None;
     }
 
-    let restore_start = std::time::Instant::now();
-    let blobs = BlobSource::StoreDir(config.store_dir());
-    if let Err(e) = restore_from_cache(config, compiler, &blobs, args, &meta, extra_inputs) {
-        // Includes a blob evicted between the daemon's pin and our reflink —
-        // the local path below recompiles; never serve a partial hit.
-        tracing::warn!(
-            "daemon local hit restore failed for {}: {} — running local path",
-            crate_name,
-            e
-        );
-        return None;
-    }
-    let restore_ms = restore_start.elapsed().as_millis() as u64;
-    let elapsed = start.elapsed().as_millis() as u64;
-    let size: u64 = meta.files.iter().map(|f| f.size).sum();
-    log_event_with_hash_stats(
-        config,
-        event_root,
-        crate_name,
+    if let Err(e) = hit.restore_and_finish(
+        BlobSource::StoreDir(hit.config.store_dir()),
+        &meta,
         EventResult::LocalHit,
-        elapsed,
-        meta.compile_time_ms,
-        size,
         cache_key,
         key_ms,
         key_hash_stats,
         lookup_ms,
-        restore_ms,
-        0,
-    );
-    print_progress(crate_name, EventResult::LocalHit, elapsed, size);
-    if !meta.stdout.is_empty() {
-        print!("{}", meta.stdout);
+        None,
+    ) {
+        // Includes a blob evicted between the daemon's pin and our reflink —
+        // the local path below recompiles; never serve a partial hit.
+        tracing::warn!(
+            "daemon local hit restore failed for {}: {} — running local path",
+            hit.crate_name,
+            e
+        );
+        return None;
     }
-    if !meta.stderr.is_empty() {
-        eprint!("{}", meta.stderr);
-    }
-    clean_incremental_dir(config, args);
     Some(0)
 }
 
@@ -5294,6 +5226,8 @@ fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
 
 #[cfg(test)]
 mod tests {
+    mod rustc_hit;
+
     use super::*;
     use crate::cache_key::FileHasher;
     use crate::transport::{ListenerOptions, socket_name};
@@ -5391,6 +5325,7 @@ mod tests {
     /// unit's inputs under its own identity.
     #[test]
     fn input_predictions_record_only_when_enabled_and_backed_by_a_store() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path().join("cache"));
         let store = Store::open(&config).unwrap();
@@ -8362,6 +8297,14 @@ exit 0
 
     impl RemoteCheckReplyDaemon {
         fn spawn(socket_path: PathBuf, found: bool) -> Self {
+            Self::with_reply(
+                socket_path,
+                serde_json::json!({ "ok": true, "found": found }),
+            )
+        }
+
+        fn with_reply(socket_path: PathBuf, reply: serde_json::Value) -> Self {
+            let body = format!("{reply}\n");
             if let Some(parent) = socket_path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }
@@ -8402,7 +8345,6 @@ exit 0
                         continue;
                     }
                     requests_thread.fetch_add(1, Ordering::SeqCst);
-                    let body = format!("{}\n", serde_json::json!({ "ok": true, "found": found }));
                     let _ = stream.write_all(body.as_bytes());
                 }
             });

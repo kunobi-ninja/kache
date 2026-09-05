@@ -6688,6 +6688,8 @@ mod tests {
     /// variables concurrently, which would otherwise decide the result.
     #[test]
     fn rustc_prediction_identity_needs_a_crate_root_and_separates_units() {
+        // The identity also reads cwd, which other tests change under this lock.
+        let _lock = crate::test_support::process_state_test_lock();
         let parse = |args: &[&str]| {
             RustcArgs::parse(&args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
         };

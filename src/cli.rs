@@ -979,16 +979,38 @@ fn format_epoch_ms_utc(ms: u64) -> String {
 
 // ── kache report ──────────────────────────────────────────────────────────
 
+pub fn stats_last_build(
+    config: &Config,
+    root: Option<std::path::PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let filter = crate::report::ReportFilter {
+        root,
+        last_build: true,
+    };
+    let report =
+        crate::report::generate_report_with_filter(config, SinceWindow::DEFAULT, 10, &filter)?;
+    if json {
+        #[derive(serde::Serialize)]
+        struct Body {
+            report: crate::report::BuildReport,
+        }
+        crate::machine::emit("stats", Body { report }, Vec::new())
+    } else {
+        println!("{}", crate::report::format_text(&report));
+        Ok(())
+    }
+}
+
 pub fn report(
     config: &Config,
     format: &str,
     window: SinceWindow,
-    root: Option<std::path::PathBuf>,
+    filter: crate::report::ReportFilter,
     output: Option<std::path::PathBuf>,
     top: usize,
 ) -> Result<()> {
-    let report = if root.is_some() {
-        let filter = crate::report::ReportFilter { root };
+    let report = if filter.root.is_some() || filter.last_build {
         crate::report::generate_report_with_filter(config, window, top, &filter)?
     } else {
         crate::report::generate_report(config, window, top)?

@@ -189,9 +189,12 @@ See [Monitor](/docs/monitor).
 kache stats
 kache stats --since 15m
 kache stats --since 2h
+kache stats --last-build --root "$PWD"
 ```
 
 `--since` accepts `s`, `m`, `h`, and `d` units (`90s`, `15m`, `2h`, `7d`). A bare number is hours. The default is `24h`. The counters and the `last ...` label both describe the requested window; a value that does not parse is an error.
+
+`--last-build` shows the detailed report for the latest recorded activity session. Add `--root` to choose a build tree; without it, the latest event across all roots chooses the session. It cannot be combined with `--since`. With `--json`, the stats envelope contains a `report` object using the build report schema below.
 
 ## `kache telemetry`
 
@@ -215,6 +218,7 @@ The command compares recorded key material for the named rustc crate and reports
 ```bash
 kache report --format text --since 24h
 kache report --format markdown --root "$PWD"
+kache report --last-build --root "$PWD" --format markdown
 kache report --format json --output report.json
 kache report --format trace --output trace.json
 ```
@@ -223,11 +227,20 @@ kache report --format trace --output trace.json
 | --- | --- | --- |
 | `--format` | `text` | `json`, `trace`, `perfetto`, `chrome-trace`, `markdown`, `github`, `text` |
 | `--since` | `24h` | Event window; same forms as `kache stats` (`15m`, `2h`, `7d`, bare hours) |
+| `--last-build` | off | Latest recorded activity session; conflicts with `--since` |
 | `--root` | all roots | Include events from one build tree |
 | `--output`, `-o` | stdout | Write to a file |
 | `--top` | `10` | Number of ranked entries |
 
 `trace`, `perfetto`, and `chrome-trace` select the same trace representation. The JSON contract is documented by [`report.schema.json`](https://github.com/kunobi-ninja/kache/blob/main/docs/commands/report.schema.json).
+
+`--last-build` selects by the latest compiler event timestamp across the retained log, including events older than 24 hours. It includes only that root and session ID. For local or older events without session IDs, it infers a session from overlapping compiler activity and gaps shorter than five minutes, stopping at an event with a recorded ID. The report states which rule it used. `--root` limits the search to that tree and its descendants; the selected session still belongs to one exact root.
+
+A session can span concurrent or nearby Cargo commands. This flag does not identify one Cargo invocation. Cargo commands that do no compiler work produce no new events, running compiles have not been logged yet, and log rotation can remove the start of a session. An empty selection is an error.
+
+The session report includes cache hits, misses, bypass reasons, restored bytes and the observed compiler wall span. Compile work avoided is an aggregate estimate, not elapsed build time saved. Remote transfer totals and GC are omitted because those logs cannot identify the selected session. Store inventory and deduplication totals still describe the whole cache.
+
+JSON exposes the selection in `meta.session` (`root`, optional `session_id`, `inferred`, `inactivity_secs`); trace output carries it as `session`. In session reports, `since_secs` and `since_hours` describe the lookback to the first retained compiler start; `meta.session` defines the selection.
 
 Every report format totals the wrapper's phases per crate: startup (process start to wrapper entry), key computation with the rustc dep-info pre-pass split out by time and run count, lookup, scheduler wait (flight join plus permit acquisition), restore or store, and the unattributed remainder. Unattributed is wrapper overhead minus every measured phase, where overhead excludes the compile on a compiled crate and is the whole wrapper time on a hit. Events written by wrappers before schema 17 report zero startup, dep-info and wait time.
 

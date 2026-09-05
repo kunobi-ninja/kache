@@ -524,6 +524,113 @@ fn report_json_on_empty_cache_is_valid_json() {
 }
 
 #[test]
+fn last_build_commands_select_one_root_and_describe_session_scope() {
+    for recorded in [false, true] {
+        let e = env();
+        let root = e.home.canonicalize().unwrap();
+        let other = e.cache.canonicalize().unwrap();
+        let events = [
+            (3, &root, "local_hit", "selected"),
+            (1, &root, "miss", "older"),
+            (4, &other, "miss", "selected"),
+            (2, &root, "miss", "selected"),
+        ]
+        .map(|(minute, path, result, session)| {
+            serde_json::json!({
+                "ts": format!("2026-01-01T00:{:02}:00Z", minute * 10),
+                "root": path,
+                "session_id": if recorded { session } else { "" },
+                "crate_name": format!("fixture{minute}"),
+                "result": result,
+                // The selected miss runs until 00:20; the hit at 00:30
+                // starts at 00:19, so local activity remains contiguous.
+                "elapsed_ms": if minute == 3 { 660_000 } else { 0 },
+                "compile_time_ms": 100,
+                "size": 128,
+                "cache_key": "fixture-key",
+                "schema": 18,
+            })
+            .to_string()
+        });
+        std::fs::write(e.cache.join("events.jsonl"), events.join("\n") + "\n").unwrap();
+
+        for command in ["stats", "report"] {
+            e.cmd()
+                .args([command, "--last-build", "--root"])
+                .arg(&root)
+                .assert()
+                .success()
+                .stdout(predicates::str::contains("last build session"))
+                .stdout(predicates::str::contains(
+                    "May include multiple Cargo commands",
+                ))
+                .stdout(predicates::str::contains(if recorded {
+                    "recorded selected"
+                } else {
+                    "inferred from activity"
+                }));
+
+            let mut cmd = e.cmd();
+            cmd.args([command, "--last-build", "--root"]).arg(&root);
+            if command == "stats" {
+                cmd.arg("--json");
+            } else {
+                cmd.args(["--format", "json"]);
+            }
+            let output = cmd.assert().success().get_output().stdout.clone();
+            let raw: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            let report = if command == "stats" {
+                assert_eq!(raw["command"], "stats");
+                assert_eq!(raw["schema_version"], 1);
+                &raw["report"]
+            } else {
+                &raw
+            };
+            assert_eq!(report["summary"]["local_hits"], 1);
+            assert_eq!(report["summary"]["misses"], 1);
+            assert_eq!(report["timeline"]["event_count"], 2);
+            assert_eq!(report["meta"]["session"]["root"], root.to_str().unwrap());
+            assert_eq!(report["meta"]["session"]["inferred"], !recorded);
+            assert!(report["network"].is_null());
+        }
+
+        let output = e
+            .cmd()
+            .args(["report", "--last-build", "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(report["meta"]["session"]["root"], other.to_str().unwrap());
+        assert_eq!(report["timeline"]["event_count"], 1);
+    }
+}
+
+#[test]
+fn last_build_requires_recorded_events_and_conflicts_with_since() {
+    let e = env();
+    for command in ["stats", "report"] {
+        e.cmd()
+            .args([command, "--last-build"])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("No recorded compiler events"));
+        e.cmd()
+            .args([command, "--last-build", "--since", "24h"])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("cannot be used with"));
+    }
+    e.cmd()
+        .args(["stats", "--root", "."])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--last-build"));
+}
+
+#[test]
 fn report_writes_to_output_file() {
     let e = env();
     let out = e.cache.join("report.json");

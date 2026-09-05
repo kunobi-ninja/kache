@@ -278,6 +278,15 @@ enum Commands {
         /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
         #[arg(long, default_value = "24h")]
         since: String,
+
+        /// Report the latest recorded activity session. Sessions may span Cargo
+        /// commands; events without IDs use a five-minute idle gap per root.
+        #[arg(long, conflicts_with = "since")]
+        last_build: bool,
+
+        /// Select the latest session within this build tree/root
+        #[arg(long, requires = "last_build")]
+        root: Option<PathBuf>,
     },
 
     /// Write cache counters as OTLP JSON for Kartero to import later
@@ -301,6 +310,11 @@ enum Commands {
         /// Event window (e.g. 15m, 2h, 7d; a bare number is hours)
         #[arg(long, default_value = "24h")]
         since: String,
+
+        /// Report the latest recorded activity session. Sessions may span Cargo
+        /// commands; events without IDs use a five-minute idle gap per root.
+        #[arg(long, conflicts_with = "since")]
+        last_build: bool,
 
         /// Only include compiler events from this build tree/root
         #[arg(long)]
@@ -778,14 +792,29 @@ fn main() -> Result<()> {
         Some(Commands::Report {
             format,
             since,
+            last_build,
             root,
             output,
             top,
         }) => {
             let window = parse_since_window(&since)?;
-            cli::report(&config, &format, window, root, output, top)
+            cli::report(
+                &config,
+                &format,
+                window,
+                report::ReportFilter { root, last_build },
+                output,
+                top,
+            )
         }
-        Some(Commands::Stats { since }) => {
+        Some(Commands::Stats {
+            since,
+            last_build,
+            root,
+        }) => {
+            if last_build {
+                return cli::stats_last_build(&config, root, json);
+            }
             let window = parse_since_window(&since)?;
             cli::stats(&config, &config_provenance, window, json)
         }
@@ -1212,6 +1241,8 @@ mod tests {
     fn json_support_is_limited_to_machine_readable_commands() {
         assert!(command_supports_json(&Some(Commands::Stats {
             since: "24h".to_string(),
+            last_build: false,
+            root: None,
         })));
         assert!(command_supports_json(&Some(Commands::Daemon {
             command: Some(DaemonCommands::Status),

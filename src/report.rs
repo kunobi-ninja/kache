@@ -608,6 +608,11 @@ pub struct CrateDetail {
     /// Memoized on disk — one per build per flag set, 0 once warm.
     #[serde(default)]
     pub probe_runs: u32,
+    /// Times kache spawned the rustc dep-info pre-pass for this event.
+    /// `0` on a warm predicted hit. Deterministic; the e2e harness asserts
+    /// on it.
+    #[serde(default)]
+    pub dep_info_runs: u32,
     /// Why this compile's outputs were not cached, when `Store::put` failed
     /// (kunobi-ninja/kache#629). Empty on every normal outcome; when set, this
     /// row is a miss that will recur on every build until the cause is fixed.
@@ -1288,6 +1293,7 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         compiler_runs: e.compiler_runs,
         preprocessor_runs: e.preprocessor_runs,
         probe_runs: e.probe_runs,
+        dep_info_runs: e.dep_info_runs,
         store_error: e.store_error.clone(),
     }
 }

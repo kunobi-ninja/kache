@@ -261,6 +261,21 @@ pub fn dep_info_ms() -> u64 {
     ms_from_micros(DEP_INFO_US.load(Ordering::Relaxed))
 }
 
+static PREDICTION_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Record a sampled verification where the predicted closure differed from
+/// the pre-pass closure. The pre-pass result won; the record was refreshed
+/// from it downstream.
+pub fn record_prediction_mismatch() {
+    PREDICTION_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Sampled-verification mismatches so far in this process.
+#[cfg(test)]
+pub fn prediction_mismatches() -> u64 {
+    PREDICTION_MISMATCHES.load(Ordering::Relaxed)
+}
+
 /// Record time blocked joining a scheduler flight another process owned.
 pub fn record_flight_wait(spent: Duration) {
     FLIGHT_WAIT_US.fetch_add(micros(spent), Ordering::Relaxed);
@@ -317,6 +332,17 @@ mod tests {
         let before = probe_runs();
         record_probe_run();
         assert!(probe_runs() > before);
+    }
+
+    #[test]
+    fn record_prediction_mismatch_increments_monotonically() {
+        // Same process-global lock the verification tests hold: exact
+        // counting needs isolation from their increments.
+        let _lock = crate::test_support::process_state_test_lock();
+        let before = prediction_mismatches();
+        record_prediction_mismatch();
+        record_prediction_mismatch();
+        assert_eq!(prediction_mismatches(), before + 2);
     }
 
     #[test]

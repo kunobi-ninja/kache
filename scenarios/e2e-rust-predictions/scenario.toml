@@ -1,0 +1,35 @@
+# kache-e2e fixture: rustc input-set predictions.
+#
+# With KACHE_INPUT_PREDICTIONS=1 the cold build records each unit's dep-info
+# closure; the warm rebuild revalidates the record and derives the key
+# without spawning the dep-info pre-pass. max_dep_info_runs = 0 on warm
+# proves the spawn is gone while min_hits proves the hits stayed.
+#
+# No relocate assertion: the identity folds the working directory, so a
+# relocated tree costs one pre-pass per unit by design.
+
+name = "e2e-rust-predictions"
+tags = ["suite:e2e", "lang:rust", "case:input-predictions"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+RUSTC_WRAPPER = "$KACHE"
+KACHE_INPUT_PREDICTIONS = "1"
+
+[commands]
+build = "cargo build"
+clean = "rm -rf target"
+
+[assertions.cold]
+min_entries_after = 1
+
+[assertions.warm]
+min_hits = 1
+max_dep_info_runs = 0
+
+[assertions.noop]
+should_not_recompile = true
+recompile_marker = "Compiling"

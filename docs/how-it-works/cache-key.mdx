@@ -13,6 +13,7 @@ The exact set depends on the invocation. It can include:
 - linker identity for outputs that invoke linking
 - crate name, crate types, edition, cfg values, and features
 - source and included file contents discovered through dep-info
+- recorded input-set predictions that substitute for the dep-info spawn on warm builds (`cache.input_predictions`)
 - code-generation flags, rustflags, and requested emit kinds
 - the contents of `--extern` dependencies
 - compile-time environment values rustc reports

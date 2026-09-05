@@ -278,6 +278,10 @@ pub fn apply_metric_assertions(
         let total: u32 = phase_events.iter().map(|e| e.probe_runs).sum();
         checks.push(AssertionCheck::max("max_probe_runs", max, total));
     }
+    if let Some(max) = spec.max_dep_info_runs {
+        let total: u32 = phase_events.iter().map(|e| e.dep_info_runs).sum();
+        checks.push(AssertionCheck::max("max_dep_info_runs", max, total));
+    }
     checks
 }
 
@@ -440,6 +444,7 @@ mod tests {
             max_compiler_runs: None,
             max_preprocessor_runs: None,
             max_probe_runs: None,
+            max_dep_info_runs: None,
         };
         let checks = apply_metric_assertions(&spec, &summary(0, 0, 0, 0.0), &HashMap::new(), &[]);
         assert!(checks.is_empty());
@@ -458,6 +463,7 @@ mod tests {
             max_compiler_runs: None,
             max_preprocessor_runs: None,
             max_probe_runs: None,
+            max_dep_info_runs: None,
         };
         let checks = apply_metric_assertions(&spec, &summary(5, 0, 5, 100.0), &HashMap::new(), &[]);
         assert!(all_passed(&checks));
@@ -476,6 +482,7 @@ mod tests {
             max_compiler_runs: None,
             max_preprocessor_runs: None,
             max_probe_runs: None,
+            max_dep_info_runs: None,
         };
         let checks = apply_metric_assertions(&spec, &summary(0, 5, 5, 0.0), &HashMap::new(), &[]);
         assert!(!all_passed(&checks));
@@ -490,6 +497,7 @@ mod tests {
             compiler_runs,
             preprocessor_runs: 0,
             probe_runs: 0,
+            dep_info_runs: 0,
             passthrough_reason: String::new(),
         }
     }

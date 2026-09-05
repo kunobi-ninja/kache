@@ -21,6 +21,7 @@ mod heartbeat;
 mod identity;
 mod incremental_policy;
 mod link;
+mod link_probe;
 mod machine;
 mod miss_chain;
 mod native_archive;

@@ -276,6 +276,24 @@ pub struct StorageBreakdown {
     /// Bytes ingested into the store by a full physical copy (a real second
     /// copy — the fallback when neither reflink nor hardlink is available).
     pub store_copied_bytes: u64,
+    /// Copy-fallback reasons (#835), still as bytes. All `serde(default)` so
+    /// old reports without them still parse; new reports always write them.
+    #[serde(default)]
+    pub store_copy_cross_device_bytes: u64,
+    #[serde(default)]
+    pub store_copy_permission_bytes: u64,
+    #[serde(default)]
+    pub store_copy_ineligible_bytes: u64,
+    #[serde(default)]
+    pub store_copy_other_bytes: u64,
+    #[serde(default)]
+    pub restore_copy_cross_device_bytes: u64,
+    #[serde(default)]
+    pub restore_copy_permission_bytes: u64,
+    #[serde(default)]
+    pub restore_copy_exclusive_bytes: u64,
+    #[serde(default)]
+    pub restore_copy_other_bytes: u64,
     /// Unique content-addressed blobs in the local store.
     pub store_blobs: u64,
     /// Sum of every cache entry's logical size — what the store would
@@ -849,6 +867,14 @@ pub fn generate_report_with_filter(
         store_reflinked_bytes: stats.store_reflinked_bytes,
         store_hardlinked_bytes: stats.store_hardlinked_bytes,
         store_copied_bytes: stats.store_copied_bytes,
+        store_copy_cross_device_bytes: stats.store_copy_cross_device_bytes,
+        store_copy_permission_bytes: stats.store_copy_permission_bytes,
+        store_copy_ineligible_bytes: stats.store_copy_ineligible_bytes,
+        store_copy_other_bytes: stats.store_copy_other_bytes,
+        restore_copy_cross_device_bytes: stats.restore_copy_cross_device_bytes,
+        restore_copy_permission_bytes: stats.restore_copy_permission_bytes,
+        restore_copy_exclusive_bytes: stats.restore_copy_exclusive_bytes,
+        restore_copy_other_bytes: stats.restore_copy_other_bytes,
         store_blobs: blob_stats.total_blobs as u64,
         logical_bytes: blob_stats.total_logical_size,
         blob_bytes: blob_stats.total_blob_size,
@@ -1997,6 +2023,14 @@ fn has_storage_data(storage: &StorageBreakdown) -> bool {
         || storage.store_reflinked_bytes > 0
         || storage.store_hardlinked_bytes > 0
         || storage.store_copied_bytes > 0
+        || storage.store_copy_cross_device_bytes > 0
+        || storage.store_copy_permission_bytes > 0
+        || storage.store_copy_ineligible_bytes > 0
+        || storage.store_copy_other_bytes > 0
+        || storage.restore_copy_cross_device_bytes > 0
+        || storage.restore_copy_permission_bytes > 0
+        || storage.restore_copy_exclusive_bytes > 0
+        || storage.restore_copy_other_bytes > 0
 }
 
 fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
@@ -2049,6 +2083,32 @@ fn push_storage_table(lines: &mut Vec<String>, storage: &StorageBreakdown) {
             format_bytes(storage.store_hardlinked_bytes),
             format_bytes(storage.store_copied_bytes),
             (zero_copy_pct * 10.0).round() / 10.0,
+        ));
+    }
+    let store_copy_reasons = storage.store_copy_cross_device_bytes
+        + storage.store_copy_permission_bytes
+        + storage.store_copy_ineligible_bytes
+        + storage.store_copy_other_bytes;
+    if store_copy_reasons > 0 {
+        lines.push(format!(
+            "| Store copy reasons | {} cross-device (EXDEV), {} permission (EPERM), {} kind-ineligible, {} other |",
+            format_bytes(storage.store_copy_cross_device_bytes),
+            format_bytes(storage.store_copy_permission_bytes),
+            format_bytes(storage.store_copy_ineligible_bytes),
+            format_bytes(storage.store_copy_other_bytes),
+        ));
+    }
+    let restore_copy_reasons = storage.restore_copy_cross_device_bytes
+        + storage.restore_copy_permission_bytes
+        + storage.restore_copy_exclusive_bytes
+        + storage.restore_copy_other_bytes;
+    if restore_copy_reasons > 0 {
+        lines.push(format!(
+            "| Restore copy reasons | {} cross-device (EXDEV), {} permission (EPERM), {} exclusive-carrier, {} other |",
+            format_bytes(storage.restore_copy_cross_device_bytes),
+            format_bytes(storage.restore_copy_permission_bytes),
+            format_bytes(storage.restore_copy_exclusive_bytes),
+            format_bytes(storage.restore_copy_other_bytes),
         ));
     }
 }
@@ -3551,6 +3611,14 @@ mod tests {
             store_reflinked_bytes: 0,
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
+            store_copy_cross_device_bytes: 0,
+            store_copy_permission_bytes: 0,
+            store_copy_ineligible_bytes: 0,
+            store_copy_other_bytes: 0,
+            restore_copy_cross_device_bytes: 0,
+            restore_copy_permission_bytes: 0,
+            restore_copy_exclusive_bytes: 0,
+            restore_copy_other_bytes: 0,
             passthrough_reason: String::new(),
             store_error: String::new(),
             lookup_rejection: String::new(),
@@ -5234,6 +5302,14 @@ mod tests {
             store_reflinked_bytes: 0,
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
+            store_copy_cross_device_bytes: 0,
+            store_copy_permission_bytes: 0,
+            store_copy_ineligible_bytes: 0,
+            store_copy_other_bytes: 0,
+            restore_copy_cross_device_bytes: 0,
+            restore_copy_permission_bytes: 0,
+            restore_copy_exclusive_bytes: 0,
+            restore_copy_other_bytes: 0,
         };
         report.gc = Some(GcSummary {
             last_run: "2026-06-19T12:00:00+00:00".to_string(),
@@ -5785,6 +5861,14 @@ mod tests {
             store_reflinked_bytes: 0,
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
+            store_copy_cross_device_bytes: 0,
+            store_copy_permission_bytes: 0,
+            store_copy_ineligible_bytes: 0,
+            store_copy_other_bytes: 0,
+            restore_copy_cross_device_bytes: 0,
+            restore_copy_permission_bytes: 0,
+            restore_copy_exclusive_bytes: 0,
+            restore_copy_other_bytes: 0,
         };
         let mut lines = Vec::new();
         push_storage_table(&mut lines, &storage);
@@ -5882,6 +5966,14 @@ mod tests {
             store_reflinked_bytes: 2000,
             store_hardlinked_bytes: 1000,
             store_copied_bytes: 1000,
+            store_copy_cross_device_bytes: 0,
+            store_copy_permission_bytes: 0,
+            store_copy_ineligible_bytes: 0,
+            store_copy_other_bytes: 0,
+            restore_copy_cross_device_bytes: 0,
+            restore_copy_permission_bytes: 0,
+            restore_copy_exclusive_bytes: 0,
+            restore_copy_other_bytes: 0,
         };
         let mut lines = Vec::new();
         push_storage_table(&mut lines, &storage);
@@ -5916,6 +6008,14 @@ mod tests {
             store_reflinked_bytes: 0,
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
+            store_copy_cross_device_bytes: 0,
+            store_copy_permission_bytes: 0,
+            store_copy_ineligible_bytes: 0,
+            store_copy_other_bytes: 0,
+            restore_copy_cross_device_bytes: 0,
+            restore_copy_permission_bytes: 0,
+            restore_copy_exclusive_bytes: 0,
+            restore_copy_other_bytes: 0,
         };
         let gh = format_github(&report);
         assert!(
@@ -6013,6 +6113,112 @@ mod tests {
             decoded.accounting_consistent,
             "old JSON must stay consistent"
         );
+    }
+
+    fn empty_storage() -> StorageBreakdown {
+        StorageBreakdown {
+            reflinked_bytes: 0,
+            hardlinked_bytes: 0,
+            copied_bytes: 0,
+            restored_bytes: 0,
+            zero_copy_pct: 0.0,
+            store_reflinked_bytes: 0,
+            store_hardlinked_bytes: 0,
+            store_copied_bytes: 0,
+            store_copy_cross_device_bytes: 0,
+            store_copy_permission_bytes: 0,
+            store_copy_ineligible_bytes: 0,
+            store_copy_other_bytes: 0,
+            restore_copy_cross_device_bytes: 0,
+            restore_copy_permission_bytes: 0,
+            restore_copy_exclusive_bytes: 0,
+            restore_copy_other_bytes: 0,
+            store_blobs: 0,
+            logical_bytes: 0,
+            blob_bytes: 0,
+            dedup_saved_bytes: 0,
+            accounting_consistent: true,
+        }
+    }
+
+    #[test]
+    fn has_storage_data_is_true_for_each_copy_reason() {
+        // One test per `||` arm: deleting any arm must fail its case, where
+        // only that reason is non-zero.
+        let mut base = empty_storage();
+        assert!(!has_storage_data(&base));
+
+        base.store_copy_cross_device_bytes = 1;
+        assert!(has_storage_data(&base));
+        base = empty_storage();
+
+        base.store_copy_permission_bytes = 1;
+        assert!(has_storage_data(&base));
+        base = empty_storage();
+
+        base.store_copy_ineligible_bytes = 1;
+        assert!(has_storage_data(&base));
+        base = empty_storage();
+
+        base.store_copy_other_bytes = 1;
+        assert!(has_storage_data(&base));
+        base = empty_storage();
+
+        base.restore_copy_cross_device_bytes = 1;
+        assert!(has_storage_data(&base));
+        base = empty_storage();
+
+        base.restore_copy_permission_bytes = 1;
+        assert!(has_storage_data(&base));
+        base = empty_storage();
+
+        base.restore_copy_exclusive_bytes = 1;
+        assert!(has_storage_data(&base));
+        base = empty_storage();
+
+        base.restore_copy_other_bytes = 1;
+        assert!(has_storage_data(&base));
+    }
+
+    #[test]
+    fn push_storage_table_renders_store_copy_reasons() {
+        let mut storage = empty_storage();
+        storage.store_copy_cross_device_bytes = 100;
+        storage.store_copy_permission_bytes = 200;
+        storage.store_copy_ineligible_bytes = 300;
+        storage.store_copy_other_bytes = 400;
+        let mut lines = Vec::new();
+        push_storage_table(&mut lines, &storage);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Store copy reasons"), "got: {joined}");
+        assert!(joined.contains("cross-device (EXDEV)"), "got: {joined}");
+        assert!(joined.contains("permission (EPERM)"), "got: {joined}");
+        assert!(joined.contains("kind-ineligible"), "got: {joined}");
+    }
+
+    #[test]
+    fn push_storage_table_renders_restore_copy_reasons() {
+        let mut storage = empty_storage();
+        storage.restore_copy_cross_device_bytes = 100;
+        storage.restore_copy_permission_bytes = 200;
+        storage.restore_copy_exclusive_bytes = 300;
+        storage.restore_copy_other_bytes = 400;
+        let mut lines = Vec::new();
+        push_storage_table(&mut lines, &storage);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Restore copy reasons"), "got: {joined}");
+        assert!(joined.contains("cross-device (EXDEV)"), "got: {joined}");
+        assert!(joined.contains("exclusive-carrier"), "got: {joined}");
+    }
+
+    #[test]
+    fn push_storage_table_omits_copy_reasons_when_zero() {
+        let storage = empty_storage();
+        let mut lines = Vec::new();
+        push_storage_table(&mut lines, &storage);
+        let joined = lines.join("\n");
+        assert!(!joined.contains("Store copy reasons"), "got: {joined}");
+        assert!(!joined.contains("Restore copy reasons"), "got: {joined}");
     }
 
     #[test]

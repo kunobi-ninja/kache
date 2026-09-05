@@ -13,6 +13,7 @@ rust-version = "1.95"
 [workspace]
 members = [
     "crates/kache-core",
+    "crates/kache-format",
     "crates/kache-e2e",
     "crates/kache-proofs",
     "crates/kache-service",
@@ -32,6 +33,7 @@ exclude = ["tmp"]
 resolver = "3"
 
 [dependencies]
+kache-format = { version = "0.16.1", path = "crates/kache-format" }
 blake3 = "1"
 bytes = "1"
 # OpenDAL 0.58 publishes its modules as separate crates. Depending on only the

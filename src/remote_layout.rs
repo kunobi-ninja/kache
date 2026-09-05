@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+pub(crate) use kache_format::{is_blob_hash, is_safe_artifact_name};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -426,28 +427,6 @@ fn blob_path(blobs_dir: &Path, hash: &str) -> PathBuf {
     blobs_dir.join(prefix).join(hash)
 }
 
-/// A blob hash is a 64-char blake3 hex digest. Validated where untrusted
-/// `meta.json` enters (download/import) so a malformed hash can never reach
-/// path construction or the integrity gate (#211).
-pub(crate) fn is_blob_hash(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// A cached artifact's `name` must be a single, normal path component — no
-/// absolute/rooted path, no `..`, no separators. `meta.json` names are
-/// attacker-influenced for a shared/MITM'd bucket, and `Path::join` with an
-/// absolute or `..`-bearing component escapes the entry/target dir (e.g.
-/// `dir.join("/etc/x") == "/etc/x"`), giving an arbitrary read/overwrite
-/// primitive. Enforced at the import and restore trust boundaries (#211).
-pub(crate) fn is_safe_artifact_name(name: &str) -> bool {
-    use std::path::Component;
-    let mut components = Path::new(name).components();
-    matches!(
-        (components.next(), components.next()),
-        (Some(Component::Normal(_)), None)
-    )
-}
-
 /// A writer that tees everything written through it into a blake3 hasher, so a
 /// file's content hash can be computed in the same pass that writes it to disk.
 struct DeadlineReader<R> {
@@ -726,7 +705,7 @@ mod tests {
     use super::{
         DeadlineReader, DeadlineWriter, HashingWriter, RemoteLayout, V3Manifest, blob_path,
         copy_dir_all, create_entry_pack_zstd, extract_entry_pack, extract_verified_prefetch_entry,
-        is_blob_hash, is_rooted_path, is_safe_artifact_name, v3_manifest_key, v3_pack_key,
+        is_rooted_path, v3_manifest_key, v3_pack_key,
     };
     use crate::config::{
         Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
@@ -808,35 +787,6 @@ mod tests {
         };
         let flush_error = std::io::Write::flush(&mut hashing_writer).unwrap_err();
         assert_eq!(flush_error.kind(), std::io::ErrorKind::TimedOut);
-    }
-
-    /// #211: the trust-boundary hash validator accepts only a 64-char blake3
-    /// hex digest and rejects everything a hostile/corrupt meta.json might
-    /// carry (empty, short, wrong length, non-hex, traversal-shaped).
-    #[test]
-    fn is_blob_hash_accepts_only_blake3_hex() {
-        assert!(is_blob_hash(&"a".repeat(64)));
-        assert!(is_blob_hash(&"0123456789abcdef".repeat(4)));
-        assert!(!is_blob_hash(""));
-        assert!(!is_blob_hash("ab"));
-        assert!(!is_blob_hash(&"a".repeat(63)));
-        assert!(!is_blob_hash(&"a".repeat(65)));
-        assert!(!is_blob_hash(&"g".repeat(64))); // non-hex
-        assert!(!is_blob_hash("../../etc/passwd"));
-    }
-
-    /// #211: a cached artifact name must be a single normal component — reject
-    /// absolute, rooted, parent-dir, separator-bearing, and empty names.
-    #[test]
-    fn is_safe_artifact_name_requires_single_normal_component() {
-        assert!(is_safe_artifact_name("libfoo-abc123.rlib"));
-        assert!(is_safe_artifact_name("foo.d"));
-        assert!(!is_safe_artifact_name(""));
-        assert!(!is_safe_artifact_name("/etc/passwd"));
-        assert!(!is_safe_artifact_name("../escape"));
-        assert!(!is_safe_artifact_name("a/b"));
-        assert!(!is_safe_artifact_name("./a"));
-        assert!(!is_safe_artifact_name(".."));
     }
 
     /// #211: building a blob path from a malformed (short) hash must not panic

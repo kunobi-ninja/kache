@@ -117,16 +117,9 @@ jobs:
         run: env -u KACHE_VERSION ./scripts/with-test-resources.sh just ci
         timeout-minutes: 30
       - name: Check crates.io package metadata
-        run: |
-          version="$(cargo pkgid -p kache-core | sed 's/.*#//')"
-          cargo package -p kache-core --locked
-          # Poll the sparse index (index.crates.io), not `cargo search`: the
-          # search index is eventually-consistent and lagged on the 0.4.0 cut.
-          if curl -sf -A kache-ci-metadata-check "https://index.crates.io/ka/ch/kache-core" | grep -q "\"vers\":\"$version\""; then
-            cargo package -p kache --locked
-          else
-            echo "kache-core $version is not on crates.io yet; skipping kache package verification"
-          fi
+        # Cargo stages workspace dependencies together, including crates whose
+        # first version has not reached crates.io yet.
+        run: cargo package --locked -p kache-core -p kache-format -p kache
         env:
           RUSTC_WRAPPER: ""
       - name: Check coverage scope and threshold (88%)
@@ -585,6 +578,8 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Check routes and source parity
         run: bash scripts/check-docs.sh
+      - name: Test version consistency gate
+        run: python3 scripts/test-version-consistency.py
       - name: Manifests agree (and match the tag on a v* tag)
         # Pass the ref via a quoted env var (not `${{ }}` interpolated into the
         # script) — a tag name can legally contain shell metacharacters.

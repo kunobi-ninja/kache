@@ -2858,6 +2858,7 @@ dependencies = [
  "home",
  "interprocess",
  "kache-core",
+ "kache-format",
  "libc",
  "opendal-core",
  "opendal-http-transport-reqwest",
@@ -2910,6 +2911,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "kache-format"
+version = "0.16.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

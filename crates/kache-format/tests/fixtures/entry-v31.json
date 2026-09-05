@@ -1,0 +1,27 @@
+{
+  "cache_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "key_schema": 31,
+  "crate_name": "hello",
+  "crate_types": [
+    "bin"
+  ],
+  "files": [
+    {
+      "name": "hello",
+      "size": 4,
+      "hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "executable": true
+    }
+  ],
+  "stdout": "",
+  "stderr": "warning: example\n",
+  "features": [
+    "default"
+  ],
+  "target": "aarch64-apple-darwin",
+  "profile": "release",
+  "compile_time_ms": 1200,
+  "emit_kinds": [
+    "link"
+  ]
+}

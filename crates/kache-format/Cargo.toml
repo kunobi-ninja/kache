@@ -1,0 +1,14 @@
+[package]
+name = "kache-format"
+version = "0.16.1"
+edition = "2024"
+rust-version = "1.95"
+description = "Cache-entry metadata and validation for kache."
+license = "Apache-2.0"
+repository = "https://github.com/kunobi-ninja/kache"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

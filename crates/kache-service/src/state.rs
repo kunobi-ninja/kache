@@ -45,31 +45,63 @@ impl std::fmt::Debug for SqlitePlannerRepository {
     }
 }
 
+/// Whether the caller will repopulate the projections after `open`.
+///
+/// Only matters when the db path still holds a pre-SQLite planner database.
+/// Those rows can only ever have come from a seed file — nothing else in the
+/// service writes them — so whether the old store is disposable depends
+/// entirely on whether a seed is configured to put them back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedPlan {
+    /// A seed file follows, so a pre-SQLite database can be moved aside.
+    Reseeded,
+    /// Nothing follows. A pre-SQLite database is the only copy of that state.
+    None,
+}
+
 impl SqlitePlannerRepository {
-    pub async fn open(path: &Path) -> Result<Self> {
+    pub async fn open(path: &Path, seed_plan: SeedPlan) -> Result<Self> {
         let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || Self::open_blocking(&path))
+        tokio::task::spawn_blocking(move || Self::open_blocking(&path, seed_plan))
             .await
             .context("joining planner db open task")?
     }
 
-    fn open_blocking(path: &Path) -> Result<Self> {
+    fn open_blocking(path: &Path, seed_plan: SeedPlan) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating planner db directory {}", parent.display()))?;
         }
 
         // A pre-SQLite planner left a surrealkv *directory* at this path, and
-        // the path is a persistent volume that survives the upgrade. Opening a
-        // directory as a SQLite file fails on every start, which is the
-        // CrashLoopBackOff `init_schema` was hardened against. Move it aside
-        // instead: the tables are a projection the leader re-seeds.
+        // under `planner.persistence.type=pvc` that path survives the upgrade.
+        // Opening a directory as a SQLite file fails on every start, which is
+        // the CrashLoopBackOff `init_schema` was hardened against, so the old
+        // store cannot simply stay where it is.
+        //
+        // What it may be replaced with depends on the seed. With one
+        // configured, the leader refills the projections seconds later and
+        // moving the old store aside costs nothing. Without one, those rows are
+        // the only copy: a service that quietly replaced them with empty tables
+        // would come up ready and answer every request with a fallback plan,
+        // which looks exactly like a cache with nothing worth prefetching.
+        // Refuse instead, and say what to do about it.
         if path.is_dir() {
+            if seed_plan == SeedPlan::None {
+                anyhow::bail!(
+                    "planner database {} is a pre-SQLite store and no seed state file is \
+                     configured to rebuild it. Its rows are the only copy. Configure \
+                     --seed-state-file (planner.seedStateFile) to repopulate the projections, \
+                     or point --db-path (planner.dbPath) at a new path and leave this one alone.",
+                    path.display()
+                );
+            }
+
             let quarantine = quarantine_legacy_planner_db(path)?;
             tracing::warn!(
                 path = %path.display(),
                 quarantine = %quarantine.display(),
-                "moved a pre-SQLite planner database aside; it is kept, not deleted, and can be removed once the new database is seeded"
+                "moved a pre-SQLite planner database aside; the configured seed state file will repopulate the projections. The old store is kept, not deleted, and can be removed once the new database is seeded"
             );
         }
 
@@ -415,26 +447,33 @@ mod tests {
         let db_path = dir.path().join("planner.db");
 
         // `open` defines the schema once.
-        let repo = SqlitePlannerRepository::open(&db_path).await.unwrap();
+        let repo = SqlitePlannerRepository::open(&db_path, SeedPlan::None)
+            .await
+            .unwrap();
         drop(repo);
 
         // A restarting pod runs `open` again against exactly this state.
-        SqlitePlannerRepository::open(&db_path)
+        SqlitePlannerRepository::open(&db_path, SeedPlan::None)
             .await
             .expect("reopening a database that already has the schema must succeed");
     }
 
-    /// A surrealkv directory left at the db path must not wedge startup.
+    /// surrealkv stored the planner as a directory, not a file.
+    fn write_legacy_planner_dir(db_path: &Path) {
+        std::fs::create_dir(db_path).unwrap();
+        std::fs::write(db_path.join("LOCK"), b"legacy sentinel").unwrap();
+    }
+
+    /// With a seed configured, a surrealkv directory is moved aside, not deleted.
     #[tokio::test]
-    async fn open_quarantines_a_legacy_planner_directory() {
+    async fn open_quarantines_a_legacy_planner_directory_when_a_seed_follows() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("planner.db");
+        write_legacy_planner_dir(&db_path);
 
-        // surrealkv stored the planner as a directory, not a file.
-        std::fs::create_dir(&db_path).unwrap();
-        std::fs::write(db_path.join("LOCK"), b"").unwrap();
-
-        let repo = SqlitePlannerRepository::open(&db_path).await.unwrap();
+        let repo = SqlitePlannerRepository::open(&db_path, SeedPlan::Reseeded)
+            .await
+            .unwrap();
 
         assert!(db_path.is_file(), "the new planner db must be a file");
         assert!(
@@ -457,6 +496,40 @@ mod tests {
         );
     }
 
+    /// With no seed configured, that same directory is the only copy of the
+    /// projections. Replacing it with empty tables would leave the service
+    /// ready and answering every request with a fallback plan, which is
+    /// indistinguishable from a planner that simply has nothing to offer. Refuse
+    /// instead, and leave the old store untouched for every retry.
+    #[tokio::test]
+    async fn open_refuses_a_legacy_planner_directory_when_nothing_will_reseed_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("planner.db");
+        write_legacy_planner_dir(&db_path);
+
+        // A CrashLoopBackOff retries; every attempt must be equally harmless.
+        for _ in 0..3 {
+            let err = SqlitePlannerRepository::open(&db_path, SeedPlan::None)
+                .await
+                .expect_err("a legacy store with no seed to rebuild it must not be replaced");
+            assert!(
+                err.to_string().contains("--seed-state-file"),
+                "the error must say how to resolve it: {err}"
+            );
+
+            assert!(db_path.is_dir(), "the legacy store must stay in place");
+            assert_eq!(
+                std::fs::read(db_path.join("LOCK")).unwrap(),
+                b"legacy sentinel"
+            );
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                1,
+                "refusing must not leave quarantine copies behind"
+            );
+        }
+    }
+
     #[test]
     fn dep_key_joins_name_and_version() {
         assert_eq!(dep_key("serde", "1.0.0"), "serde@1.0.0");
@@ -472,7 +545,7 @@ mod tests {
     #[tokio::test]
     async fn namespace_upsert_keeps_punctuation_variant_namespaces_apart() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
             .await
             .unwrap();
 
@@ -531,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn crate_upsert_keeps_punctuation_variant_crates_apart() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
             .await
             .unwrap();
 
@@ -572,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn seeding_twice_updates_in_place() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
             .await
             .unwrap();
 
@@ -610,7 +683,7 @@ mod tests {
         // The same cache_key seen under two different deps must be returned
         // once — the planner's `seen` set guards against duplicate prefetch.
         let dir = tempfile::tempdir().unwrap();
-        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
             .await
             .unwrap();
         repo.seed_from_state(PlannerStateFile {
@@ -659,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn queries_return_empty_for_unknown_keys() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
             .await
             .unwrap();
 
@@ -686,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn seed_from_state_file_rejects_missing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
             .await
             .unwrap();
         let err = repo
@@ -695,11 +768,15 @@ mod tests {
         assert!(err.is_err());
     }
 
-    /// A seed that fails partway must leave no rows behind.
+    /// A seed file that does not parse is rejected before any SQL runs.
+    ///
+    /// This does NOT exercise the seed transaction — parsing fails in
+    /// `seed_from_state_file` before `seed_from_state` opens one.
+    /// `seed_rolls_back_when_a_write_fails_partway` covers that.
     #[tokio::test]
     async fn seed_from_state_file_rejects_malformed_json_without_writing() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
             .await
             .unwrap();
 
@@ -715,10 +792,121 @@ mod tests {
         );
     }
 
+    /// A seed that fails after an earlier write must leave no rows behind.
+    ///
+    /// Seeding a namespace writes both projections per candidate, so dropping
+    /// `crate_artifact` makes the namespace insert succeed and the very next
+    /// statement fail — a genuine mid-transaction failure. Without the enclosing
+    /// transaction the namespace row would survive and the planner would serve
+    /// half a state file.
+    #[tokio::test]
+    async fn seed_rolls_back_when_a_write_fails_partway() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+            .await
+            .unwrap();
+
+        repo.run(|conn| {
+            conn.execute_batch("DROP TABLE crate_artifact;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let err = repo
+            .seed_from_state(PlannerStateFile {
+                namespaces: HashMap::from([(
+                    "ns".to_string(),
+                    NamespaceState {
+                        deps: HashMap::from([(
+                            "serde@1.0.0".to_string(),
+                            vec![PrefetchCandidate::new(
+                                "serde-key".to_string(),
+                                "serde".to_string(),
+                            )],
+                        )]),
+                    },
+                )]),
+                history: HashMap::new(),
+                key_cache: HashMap::new(),
+            })
+            .await;
+        assert!(err.is_err(), "the seed must fail once a write fails");
+
+        let rows: i64 = repo
+            .run(|conn| {
+                Ok(
+                    conn.query_row("SELECT COUNT(*) FROM namespace_artifact", [], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "the successful write must have rolled back");
+    }
+
+    /// Reads return the most recently seen cache key first.
+    ///
+    /// The planner's caller truncates to the FIRST entries per crate, so a
+    /// reversed order would silently hand it the stalest keys.
+    #[tokio::test]
+    async fn reads_return_the_most_recently_seeded_key_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+            .await
+            .unwrap();
+
+        let seed = |cache_key: &str| PlannerStateFile {
+            namespaces: HashMap::from([(
+                "ns".to_string(),
+                NamespaceState {
+                    deps: HashMap::from([(
+                        "serde@1.0.0".to_string(),
+                        vec![PrefetchCandidate::new(
+                            cache_key.to_string(),
+                            "serde".to_string(),
+                        )],
+                    )]),
+                },
+            )]),
+            history: HashMap::new(),
+            key_cache: HashMap::new(),
+        };
+
+        // Seeded oldest-first, and named so that a cache_key tie-break alone
+        // would order them the other way round.
+        repo.seed_from_state(seed("zzz-older")).await.unwrap();
+        repo.seed_from_state(seed("aaa-newer")).await.unwrap();
+
+        let shard = repo
+            .shard_candidates("ns", &[("serde".to_string(), "1.0.0".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(
+            shard.iter().map(|c| &c.cache_key).collect::<Vec<_>>(),
+            ["aaa-newer", "zzz-older"]
+        );
+
+        assert_eq!(
+            repo.key_cache_keys_for_crate("serde").await.unwrap(),
+            ["aaa-newer", "zzz-older"]
+        );
+
+        let history = repo
+            .history_candidates(&["serde".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            history.iter().map(|c| &c.cache_key).collect::<Vec<_>>(),
+            ["aaa-newer", "zzz-older"]
+        );
+    }
+
     #[tokio::test]
     async fn repository_resolves_namespace_candidates_from_seed_state() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
             .await
             .unwrap();
         repo.seed_from_state(PlannerStateFile {
@@ -775,7 +963,9 @@ mod tests {
         )
         .unwrap();
 
-        let repo = SqlitePlannerRepository::open(&db_path).await.unwrap();
+        let repo = SqlitePlannerRepository::open(&db_path, SeedPlan::None)
+            .await
+            .unwrap();
         repo.seed_from_state_file(&seed_path).await.unwrap();
 
         let history = repo
@@ -795,7 +985,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("planner.db");
 
-        let repo = SqlitePlannerRepository::open(&db_path).await.unwrap();
+        let repo = SqlitePlannerRepository::open(&db_path, SeedPlan::None)
+            .await
+            .unwrap();
         repo.seed_from_state(PlannerStateFile {
             namespaces: HashMap::new(),
             history: HashMap::from([(
@@ -811,7 +1003,9 @@ mod tests {
         .unwrap();
         drop(repo);
 
-        let reopened = SqlitePlannerRepository::open(&db_path).await.unwrap();
+        let reopened = SqlitePlannerRepository::open(&db_path, SeedPlan::None)
+            .await
+            .unwrap();
         let history = reopened
             .history_candidates(&["serde".to_string()])
             .await

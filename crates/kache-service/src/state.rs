@@ -561,6 +561,73 @@ mod tests {
         assert_eq!(dep_key("", ""), "@");
     }
 
+    /// `is_empty` decides whether a seed licenses replacing a legacy store, so
+    /// it has to answer for each collection on its own: a seed carrying rows in
+    /// any ONE of the three is a seed that writes something.
+    #[test]
+    fn is_empty_is_true_only_when_no_collection_carries_a_row() {
+        let candidate = || PrefetchCandidate::new("k".to_string(), "c".to_string());
+
+        assert!(PlannerStateFile::default().is_empty());
+
+        // Present but empty containers still write nothing.
+        assert!(
+            PlannerStateFile {
+                namespaces: HashMap::from([(
+                    "ns".to_string(),
+                    NamespaceState {
+                        deps: HashMap::from([("d@1".to_string(), vec![])]),
+                    },
+                )]),
+                history: HashMap::from([("c".to_string(), vec![])]),
+                key_cache: HashMap::from([("c".to_string(), vec![])]),
+            }
+            .is_empty()
+        );
+
+        assert!(
+            !PlannerStateFile {
+                namespaces: HashMap::from([(
+                    "ns".to_string(),
+                    NamespaceState {
+                        deps: HashMap::from([("d@1".to_string(), vec![candidate()])]),
+                    },
+                )]),
+                ..Default::default()
+            }
+            .is_empty(),
+            "a namespace candidate is a row"
+        );
+
+        assert!(
+            !PlannerStateFile {
+                history: HashMap::from([("c".to_string(), vec![candidate()])]),
+                ..Default::default()
+            }
+            .is_empty(),
+            "a history candidate is a row"
+        );
+
+        assert!(
+            !PlannerStateFile {
+                key_cache: HashMap::from([("c".to_string(), vec!["k".to_string()])]),
+                ..Default::default()
+            }
+            .is_empty(),
+            "a key cache entry is a row"
+        );
+    }
+
+    /// The connection is not `Debug`, so this impl is hand-written.
+    #[tokio::test]
+    async fn debug_names_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+            .await
+            .unwrap();
+        assert!(format!("{repo:?}").contains("SqlitePlannerRepository"));
+    }
+
     /// Namespaces differing only by `/` vs `_` must stay separate rows.
     ///
     /// v0.16 derived a record id by replacing punctuation, so `linux/hash/debug`

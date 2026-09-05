@@ -1,4 +1,5 @@
 use crate::ArtifactPolicy;
+use crate::blob_validation::validate_blob_metadata;
 use anyhow::{Context, Result};
 pub use kache_format::{CachedFile, EntryMeta};
 use rusqlite::{Connection, Error as SqlError, ErrorCode, params};
@@ -685,9 +686,8 @@ pub fn probe_entry_readonly(db: &Connection, store_dir: &Path, cache_key: &str) 
 
     for cached_file in &meta.files {
         let blob = blob_path_in_store_dir(store_dir, &cached_file.hash);
-        match fs::metadata(&blob) {
-            Ok(file_meta) if file_meta.is_file() && file_meta.len() == cached_file.size => {}
-            _ => return ProbeOutcome::Fallback("blob missing or size mismatch"),
+        if validate_blob_metadata(&blob, cached_file.size).is_err() {
+            return ProbeOutcome::Fallback("blob missing or size mismatch");
         }
     }
 
@@ -1718,28 +1718,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // Verify all cached blobs still exist on disk and match expected size
         for cached_file in &meta.files {
             let blob = self.blob_path(&cached_file.hash);
-            if !blob.is_file() {
+            if let Err(error) = validate_blob_metadata(&blob, cached_file.size) {
                 tracing::warn!(
-                    "cache entry {} missing blob {} for file {}, evicting",
-                    cache_key.get(..16).unwrap_or(cache_key),
-                    &cached_file.hash[..16],
-                    cached_file.name
-                );
-                let _ = self.remove_entry(cache_key);
-                return Ok(None);
-            }
-
-            // Size validation: catches truncated/corrupt artifacts (e.g. LLVM
-            // "truncated or malformed object") without the cost of re-hashing.
-            if let Ok(file_meta) = fs::metadata(&blob)
-                && file_meta.len() != cached_file.size
-            {
-                tracing::warn!(
-                    "cache entry {} file {} size mismatch (expected {}, got {}), evicting",
+                    "cache entry {} file {} has invalid blob metadata ({error:#}), evicting",
                     cache_key.get(..16).unwrap_or(cache_key),
                     cached_file.name,
-                    cached_file.size,
-                    file_meta.len(),
                 );
                 let _ = self.remove_entry(cache_key);
                 return Ok(None);
@@ -6020,62 +6003,99 @@ mod tests {
     /// an authoritative `Miss`; anything needing repair probes `Fallback`.
     #[test]
     fn probe_entry_readonly_hit_miss_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-        let store = Store::open(&config).unwrap();
+        let _env_lock = crate::test_support::process_state_test_lock();
+        let _verify = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
+        for damage in ["missing", "short", "long", "directory"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = test_config(dir.path());
+            let store = Store::open(&config).unwrap();
 
-        let output_file = dir.path().join("out.rlib");
-        fs::write(&output_file, b"artifact-bytes").unwrap();
-        store
-            .put(
-                "probe_key",
-                "probe_crate",
-                &["lib".to_string()],
-                &[],
-                "x86_64-unknown-linux-gnu",
-                "dev",
-                &[(output_file, "libout.rlib".to_string())],
-                "out",
-                "err",
-            )
-            .unwrap();
+            let output_file = dir.path().join("out.rlib");
+            fs::write(&output_file, b"artifact-bytes").unwrap();
+            store
+                .put(
+                    "probe_key",
+                    "probe_crate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(output_file, "libout.rlib".to_string())],
+                    "out",
+                    "err",
+                )
+                .unwrap();
 
-        let ro = open_index_db_readonly(&config.index_db_path()).unwrap();
-        let store_dir = config.store_dir();
+            let ro = open_index_db_readonly(&config.index_db_path()).unwrap();
+            let store_dir = config.store_dir();
+            let hit_count = || {
+                store
+                    .db
+                    .query_row(
+                        "SELECT hit_count FROM entries WHERE cache_key = 'probe_key'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+            };
 
-        let meta = match probe_entry_readonly(&ro, &store_dir, "probe_key") {
-            ProbeOutcome::Hit(meta) => meta,
-            other => panic!("expected hit, got {other:?}"),
-        };
-        assert_eq!(meta.cache_key, "probe_key");
-        assert_eq!(meta.stdout, "out");
-        assert_eq!(meta.files.len(), 1);
-        let hits: i64 = store
-            .db
-            .query_row(
-                "SELECT hit_count FROM entries WHERE cache_key = 'probe_key'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            hits, 0,
-            "a probe must not record a hit — the pin writer does"
-        );
+            let meta = match probe_entry_readonly(&ro, &store_dir, "probe_key") {
+                ProbeOutcome::Hit(meta) => meta,
+                other => panic!("expected hit, got {other:?}"),
+            };
+            assert_eq!(meta.cache_key, "probe_key");
+            assert_eq!(meta.stdout, "out");
+            assert_eq!(meta.stderr, "err");
+            assert_eq!(meta.files.len(), 1);
+            assert_eq!(
+                hit_count(),
+                0,
+                "the probe must leave accounting to the pin writer"
+            );
 
-        assert!(matches!(
-            probe_entry_readonly(&ro, &store_dir, "no_such_key"),
-            ProbeOutcome::Miss
-        ));
+            let local = store.get("probe_key").unwrap().unwrap();
+            assert_eq!(local.files, meta.files);
+            assert_eq!(local.stdout, meta.stdout);
+            assert_eq!(local.stderr, meta.stderr);
+            assert_eq!(hit_count(), 1, "get must record the hit");
 
-        // A blob deleted out from under the entry needs evict-and-miss (a
-        // write) — the probe must delegate that to the wrapper's local path.
-        let blob = store.blob_path(&meta.files[0].hash);
-        fs::remove_file(&blob).unwrap();
-        assert!(matches!(
-            probe_entry_readonly(&ro, &store_dir, "probe_key"),
-            ProbeOutcome::Fallback(_)
-        ));
+            assert!(matches!(
+                probe_entry_readonly(&ro, &store_dir, "no_such_key"),
+                ProbeOutcome::Miss
+            ));
+
+            let blob = store.blob_path(&meta.files[0].hash);
+            let mut perms = fs::metadata(&blob).unwrap().permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(&blob, perms).unwrap();
+            fs::remove_file(&blob).unwrap();
+            match damage {
+                "missing" => {}
+                "short" => fs::write(&blob, b"short").unwrap(),
+                "long" => fs::write(&blob, b"longer than the original artifact").unwrap(),
+                "directory" => fs::create_dir(&blob).unwrap(),
+                _ => unreachable!(),
+            }
+
+            assert!(
+                matches!(
+                    probe_entry_readonly(&ro, &store_dir, "probe_key"),
+                    ProbeOutcome::Fallback("blob missing or size mismatch")
+                ),
+                "{damage}"
+            );
+            assert!(
+                store.contains("probe_key"),
+                "the probe must not evict: {damage}"
+            );
+            assert_eq!(
+                hit_count(),
+                1,
+                "a fallback must not count as a hit: {damage}"
+            );
+            assert!(store.get("probe_key").unwrap().is_none(), "{damage}");
+            assert!(!store.contains("probe_key"), "get must evict: {damage}");
+        }
     }
 
     /// `query_only` must make accidental writes through a probe connection a

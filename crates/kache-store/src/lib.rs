@@ -1,6 +1,7 @@
 //! Local artifact storage, independent of compiler parsing and remote transports.
 
 pub mod atomic;
+mod blob_validation;
 pub mod config;
 pub mod eviction;
 pub mod file_hash;

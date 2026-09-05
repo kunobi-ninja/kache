@@ -80,26 +80,29 @@ pub(crate) fn retry_transient_windows<T>(
 /// scores mutants, and every mutation of the bound and the counter survives
 /// against a branch nothing can enter. The counter arithmetic and the budget
 /// are platform-independent; only the code list is not.
+/// Whether this error should be slept out and tried again. Split from the
+/// loop so a `true` match-guard mutant cannot hang: the `for` bound below
+/// still stops, and tests of this helper reject `true` / `||` directly.
+fn should_retry_transient(transient: bool, attempt: u32) -> bool {
+    transient && attempt + 1 < TRANSIENT_ATTEMPTS
+}
+
 fn retry_transient<T>(
     mut op: impl FnMut() -> std::io::Result<T>,
     is_transient: impl Fn(&std::io::Error) -> bool,
 ) -> std::io::Result<T> {
-    let mut attempt = 0;
-    loop {
+    let mut last_err = None;
+    for attempt in 0..TRANSIENT_ATTEMPTS {
         match op() {
             Ok(value) => return Ok(value),
-            Err(e) if is_transient(&e) && attempt + 1 < TRANSIENT_ATTEMPTS => {
+            Err(e) if should_retry_transient(is_transient(&e), attempt) => {
                 std::thread::sleep(std::time::Duration::from_millis(rename_backoff_ms(attempt)));
-                let next = attempt + 1;
-                // A counter that does not advance turns this into an infinite
-                // loop, which no test can fail — it hangs instead. Assert the
-                // step so the failure is a panic a test can see.
-                debug_assert!(next > attempt, "the retry counter must advance");
-                attempt = next;
+                last_err = Some(e);
             }
             Err(e) => return Err(e),
         }
     }
+    Err(last_err.expect("retry_transient records an error before the budget is spent"))
 }
 
 /// Remove a file, clearing the read-only attribute first to ensure deletion
@@ -376,6 +379,15 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(32));
         assert_eq!(calls, TRANSIENT_ATTEMPTS);
+    }
+
+    #[test]
+    fn should_retry_transient_requires_a_transient_error_inside_the_budget() {
+        assert!(should_retry_transient(true, 0));
+        assert!(should_retry_transient(true, TRANSIENT_ATTEMPTS - 2));
+        assert!(!should_retry_transient(true, TRANSIENT_ATTEMPTS - 1));
+        assert!(!should_retry_transient(false, 0));
+        assert!(!should_retry_transient(false, TRANSIENT_ATTEMPTS - 2));
     }
 
     /// A classifier that rejects the error settles on the first call even when

@@ -341,6 +341,17 @@ fn warn_cross_volume_ingest_once(source: &Path, tmp: &Path) {
     }
 }
 
+/// Format the volume pair for the cross-volume advisory. Pure and
+/// platform-neutral so the Linux mutation lane can kill its mutants even
+/// though only the Windows call site compiles the roots: both arms are
+/// reachable here on every platform.
+fn format_volume_pair(from: Option<String>, to: Option<String>) -> String {
+    match (from, to) {
+        (Some(from), Some(to)) => format!(" ({from} vs {to})"),
+        _ => String::new(),
+    }
+}
+
 /// Pure message for [`warn_cross_volume_ingest_once`], kept separate so tests
 /// pin the wording without touching the filesystem.
 fn cross_volume_ingest_message(source: &Path, tmp: &Path) -> String {
@@ -2006,11 +2017,32 @@ mod tests {
         }
     }
 
+    /// Both arms of the volume-pair formatting, reachable on every platform
+    /// so the Linux mutation lane covers the Windows-only call site.
+    #[test]
+    fn format_volume_pair_formats_both_arms() {
+        assert_eq!(
+            format_volume_pair(Some("C:\\".to_string()), Some("D:\\".to_string())),
+            " (C:\\ vs D:\\)"
+        );
+        assert_eq!(format_volume_pair(None, Some("D:\\".to_string())), "");
+        assert_eq!(format_volume_pair(Some("C:\\".to_string()), None), "");
+        assert_eq!(format_volume_pair(None, None), "");
+    }
+
     /// `[cache] storage_layout_advice = false` mutes the ingest advisory;
     /// the default warns. Observed through marker files in a scratch dir so
     /// the assertion is the warning itself, not the toggle round-trip.
+    ///
+    /// Linux-only: only a real cross-mount `link(2)` produces `CrossesDevices`
+    /// (`/dev/shm` is a separate tmpfs on every supported Linux CI), and only
+    /// a real error exercises the guard. The message wording and the toggle
+    /// round-trip are covered platform-independently above.
     #[test]
-    fn cross_volume_advice_respects_its_kill_switch() {
+    #[cfg(target_os = "linux")]
+    fn cross_volume_guard_warns_only_on_crosses_devices() {
+        use std::os::unix::fs::MetadataExt;
+
         let _lock = crate::test_support::process_state_test_lock();
         let base =
             std::env::temp_dir().join(format!("kache-cross-volume-test-{}", std::process::id()));
@@ -2019,22 +2051,54 @@ mod tests {
         // First claimant wins the process-global marker; no other unit test
         // installs one, so this holds deterministically in this binary.
         set_cow_warn_marker(base.join("warn"));
-        let source = Path::new("D:/work/target/x.rlib");
-        let tmp = Path::new("C:/cache/store/staging/stage.tmp");
+        let marker_written = || std::fs::read_dir(&base).unwrap().next().is_some();
 
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("input.rlib");
+        std::fs::write(&source, b"fake rlib").unwrap();
+        let missing = || dir.path().join("definitely-missing.rlib");
+
+        // Muted: even a genuine cross-device failure stays silent.
         set_storage_layout_advice(false);
-        warn_cross_volume_ingest_once(source, tmp);
         assert!(
-            std::fs::read_dir(&base).unwrap().next().is_none(),
+            !hard_link_or_advise_cross_volume(&missing(), &dir.path().join("stage.tmp")),
+            "a failed link is still a failed link when muted"
+        );
+        assert!(
+            !marker_written(),
             "a muted advisory must not write a marker"
         );
 
+        // Enabled, wrong error kind: a missing source is NotFound, not a
+        // layout problem, so no advisory.
         set_storage_layout_advice(true);
-        warn_cross_volume_ingest_once(source, tmp);
+        assert!(!hard_link_or_advise_cross_volume(
+            &missing(),
+            &dir.path().join("stage.tmp")
+        ));
         assert!(
-            std::fs::read_dir(&base).unwrap().next().is_some(),
-            "an enabled advisory must write its marker"
+            !marker_written(),
+            "a non-cross-volume failure must not advise"
         );
+
+        // Enabled, genuine cross-device failure: advise exactly once.
+        let shm_dir = Path::new("/dev/shm").join(format!("kache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&shm_dir).unwrap();
+        let same_fs = match (std::fs::metadata(&shm_dir), std::fs::metadata(dir.path())) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev(),
+            _ => false,
+        };
+        assert!(
+            !same_fs,
+            "/dev/shm must be a separate filesystem for this test to mean anything"
+        );
+        assert!(
+            !hard_link_or_advise_cross_volume(&source, &shm_dir.join("stage.tmp")),
+            "a cross-device link must fail"
+        );
+        assert!(marker_written(), "a cross-device failure must advise");
+        set_storage_layout_advice(true);
+        let _ = std::fs::remove_dir_all(&shm_dir);
         let _ = std::fs::remove_dir_all(&base);
     }
 

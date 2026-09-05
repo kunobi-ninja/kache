@@ -4262,6 +4262,39 @@ pub fn doctor(
                 )),
             }),
         }
+
+        // 4c. Hardlink layout (#835): can the build tree hardlink into
+        // `<store>/staging`? EXDEV across two bind mounts of one filesystem
+        // is the most likely cause of 0% multi-link blobs on ext4 CI, with
+        // both ingest and restore falling silently to a copy. The probe
+        // creates a temp file in the build tree (current dir as proxy) and
+        // links it into staging, then removes both — observability only.
+        {
+            let build_dir = std::env::current_dir().unwrap_or_else(|_| cfg.cache_dir.clone());
+            let staging_dir = cfg.store_dir().join("staging");
+            let probe = crate::link_probe::probe_link_layout(&build_dir, &staging_dir);
+            let detail = crate::link_probe::format_probe_detail(&probe);
+            let full_detail = format!(
+                "{} (build: {}, staging: {})",
+                detail,
+                build_dir.display(),
+                staging_dir.display()
+            );
+            checks.push(Check {
+                label: "Link layout",
+                pass: probe.hardlink_supported,
+                detail: full_detail,
+                fix: if probe.hardlink_supported {
+                    None
+                } else {
+                    Some(
+                        "put the cache and build tree on the SAME mount for zero-copy sharing; \
+                         if this layout is intentional, expect copies (see `kache report` copy reasons)"
+                            .to_string(),
+                    )
+                },
+            });
+        }
     }
 
     // 5. Remote cache
@@ -9348,6 +9381,14 @@ mod tests {
             store_reflinked_bytes: 0,
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
+            store_copy_cross_device_bytes: 0,
+            store_copy_permission_bytes: 0,
+            store_copy_ineligible_bytes: 0,
+            store_copy_other_bytes: 0,
+            restore_copy_cross_device_bytes: 0,
+            restore_copy_permission_bytes: 0,
+            restore_copy_exclusive_bytes: 0,
+            restore_copy_other_bytes: 0,
             root: String::new(),
             passthrough_reason: String::new(),
             store_error: String::new(),

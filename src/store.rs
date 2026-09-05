@@ -115,6 +115,109 @@ fn emulate_cow_reflink_ingest(_source: &Path, _tmp: &Path) -> Result<bool> {
     Ok(false)
 }
 
+// ── Hardlink-fallback reason seams (#835) ─────────────────────────────────────
+//
+// Same pattern as [`FORCE_MODE_DROPPING_INGEST`]: thread-local so parallel
+// `cargo test` workers do not leak into each other. Production stubs are
+// `None`/`false` so the real `link(2)` runs.
+
+#[cfg(test)]
+thread_local! {
+    /// When set, the ingest `hard_link` attempt fails with this errno instead
+    /// of calling `link(2)`, so the reason counter is observable without bind
+    /// mounts.
+    static INJECT_STORE_HARDLINK_ERROR: std::cell::Cell<Option<std::io::ErrorKind>> =
+        const { std::cell::Cell::new(None) };
+    /// When set, the ingest skips the `try_reflink` attempt (pretends CoW is
+    /// unavailable) so the hardlink path is exercised even on APFS/btrfs.
+    static FORCE_STORE_HARDLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable [`INJECT_STORE_HARDLINK_ERROR`] for the guard's lifetime.
+#[cfg(test)]
+pub(crate) struct InjectStoreHardlinkError {
+    _private: (),
+}
+
+#[cfg(test)]
+impl InjectStoreHardlinkError {
+    pub(crate) fn enable(kind: std::io::ErrorKind) -> Self {
+        INJECT_STORE_HARDLINK_ERROR.with(|slot| slot.set(Some(kind)));
+        Self { _private: () }
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectStoreHardlinkError {
+    fn drop(&mut self) {
+        INJECT_STORE_HARDLINK_ERROR.with(|slot| slot.set(None));
+    }
+}
+
+/// Enable [`FORCE_STORE_HARDLINK`] for the guard's lifetime: skip reflink so a
+/// same-device `.rlib` put must hardlink, even on CoW filesystems.
+#[cfg(test)]
+pub(crate) struct ForceStoreHardlink {
+    _private: (),
+}
+
+#[cfg(test)]
+impl ForceStoreHardlink {
+    pub(crate) fn enable() -> Self {
+        FORCE_STORE_HARDLINK.with(|slot| slot.set(true));
+        Self { _private: () }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceStoreHardlink {
+    fn drop(&mut self) {
+        FORCE_STORE_HARDLINK.with(|slot| slot.set(false));
+    }
+}
+
+#[cfg(test)]
+fn injected_store_hardlink_error() -> Option<std::io::ErrorKind> {
+    INJECT_STORE_HARDLINK_ERROR.with(|slot| slot.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn injected_store_hardlink_error() -> Option<std::io::ErrorKind> {
+    None
+}
+
+fn force_store_hardlink() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_STORE_HARDLINK.with(|slot| slot.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn should_try_store_reflink(force_hardlink: bool) -> bool {
+    !force_hardlink
+}
+
+fn allow_store_hardlink(allow_hardlink: bool, is_regular_file: bool) -> bool {
+    allow_hardlink && is_regular_file
+}
+
+/// Attempt the ingest `link(2)`, honouring the test-only error seam. Returns
+/// the io error on failure so callers classify it instead of swallowing it.
+fn try_store_hard_link(source: &Path, tmp: &Path) -> std::io::Result<()> {
+    if let Some(kind) = injected_store_hardlink_error() {
+        return Err(std::io::Error::new(
+            kind,
+            "injected ingest hardlink failure",
+        ));
+    }
+    fs::hard_link(source, tmp)
+}
+
 /// Is `name` exactly a content-blob filename: 64 lowercase hex chars (a
 /// blake3 digest)? Used by the orphan sweep so it only ever unlinks files
 /// that look like a blob — never an in-progress temp (`.{hash}.{pid}.{n}.tmp`)
@@ -194,11 +297,51 @@ fn source_hardlink_allowed(
 /// recorded only when this call actually publishes (`atomic_write_and_replace`
 /// returns `true`); a concurrent winner already accounted for their ingest,
 /// and counting a discarded temp would over-claim zero-copy sharing.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum StoreIngest {
     Reflink,
     Hardlink,
-    Copy,
+    Copy(StoreCopyReason),
+}
+
+/// Why an ingest fell back to a copy (#835). `Ineligible` is a policy refusal
+/// (kind-ineligible or cc never shares inodes — `allow_hardlink` false, or a
+/// symlink source); the rest classify the `link(2)` errno. Recorded alongside
+/// `store_copied_bytes` on publish so the report can show *why* zero-copy did
+/// not happen. Observability only: the reason never changes what gets linked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreCopyReason {
+    Ineligible,
+    CrossDevice,
+    Permission,
+    Other,
+}
+
+impl StoreCopyReason {
+    fn from_io_kind(kind: std::io::ErrorKind) -> Self {
+        if kind == std::io::ErrorKind::CrossesDevices {
+            StoreCopyReason::CrossDevice
+        } else if kind == std::io::ErrorKind::PermissionDenied {
+            StoreCopyReason::Permission
+        } else {
+            StoreCopyReason::Other
+        }
+    }
+}
+
+/// Record the ingest copy-fallback reason alongside `store_copied_bytes`.
+/// Pure dispatch so each arm is independently testable (mutant discipline:
+// one test per arm, no skip annotations).
+fn record_store_copy_reason(reason: StoreCopyReason, bytes: u64) {
+    if reason == StoreCopyReason::CrossDevice {
+        crate::opcounts::record_store_copy_cross_device(bytes);
+    } else if reason == StoreCopyReason::Permission {
+        crate::opcounts::record_store_copy_permission(bytes);
+    } else if reason == StoreCopyReason::Ineligible {
+        crate::opcounts::record_store_copy_ineligible(bytes);
+    } else {
+        crate::opcounts::record_store_copy_other(bytes);
+    }
 }
 
 /// Durably materialize `source` into the content-addressed store at `blob`,
@@ -228,7 +371,7 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
     }
     fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
     let bytes = fs::metadata(source).map(|m| m.len()).unwrap_or(0);
-    let ingest = std::cell::Cell::new(StoreIngest::Copy);
+    let ingest = std::cell::Cell::new(StoreIngest::Copy(StoreCopyReason::Other));
     let ro_failed = std::cell::Cell::new(false);
 
     // CoW reflink first; then a hardlink where the artifact kind allows sharing
@@ -239,21 +382,57 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
     // Hardlink RO is applied in `after_fsync` (not in the write step): Windows
     // needs a writable handle to flush (#196). On RO failure we demote to a
     // full copy rather than publishing a writable shared inode.
+    //
+    // The hardlink error is captured, not swallowed with `.is_ok()`: EXDEV
+    // across bind mounts, EPERM, and other errnos are classified into
+    // `StoreCopyReason` so the report can show *why* zero-copy did not happen.
+    // What gets linked is unchanged — a failure still falls back to a copy.
     let published = match crate::atomic::atomic_write_and_replace_with(
         blob,
         true,
         |tmp| {
-            if crate::link::try_reflink(source, tmp).is_ok() {
+            // `FORCE_STORE_HARDLINK` (test-only) skips the reflink attempt so a
+            // same-device `.rlib` must hardlink even on CoW filesystems.
+            let reflink_ok = should_try_store_reflink(force_store_hardlink())
+                && crate::link::try_reflink(source, tmp).is_ok();
+            if reflink_ok {
                 ingest.set(StoreIngest::Reflink);
-            } else if allow_hardlink
-                && fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file())
-                && crate::link::hard_link_or_advise_cross_volume(source, tmp)
-            {
-                ingest.set(StoreIngest::Hardlink);
+            } else if allow_store_hardlink(
+                allow_hardlink,
+                fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file()),
+            ) {
+                match try_store_hard_link(source, tmp) {
+                    Ok(()) => {
+                        ingest.set(StoreIngest::Hardlink);
+                    }
+                    Err(io_err) => {
+                        let reason = StoreCopyReason::from_io_kind(io_err.kind());
+                        {
+                            let io_reason = match reason {
+                                StoreCopyReason::CrossDevice => {
+                                    crate::link::HardlinkIoReason::CrossDevice
+                                }
+                                StoreCopyReason::Permission => {
+                                    crate::link::HardlinkIoReason::Permission
+                                }
+                                StoreCopyReason::Other | StoreCopyReason::Ineligible => {
+                                    crate::link::HardlinkIoReason::Other
+                                }
+                            };
+                            crate::link::warn_hardlink_fallback_once(
+                                source, blob, io_reason, &io_err,
+                            );
+                        }
+                        fs::copy(source, tmp).with_context(|| {
+                            format!("copying {} to blob store", source.display())
+                        })?;
+                        ingest.set(StoreIngest::Copy(reason));
+                    }
+                }
             } else {
                 fs::copy(source, tmp)
                     .with_context(|| format!("copying {} to blob store", source.display()))?;
-                ingest.set(StoreIngest::Copy);
+                ingest.set(StoreIngest::Copy(StoreCopyReason::Ineligible));
             }
             Ok(())
         },
@@ -297,7 +476,10 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
         match ingest.get() {
             StoreIngest::Reflink => crate::opcounts::record_store_reflinked(bytes),
             StoreIngest::Hardlink => crate::opcounts::record_store_hardlinked(bytes),
-            StoreIngest::Copy => crate::opcounts::record_store_copied(bytes),
+            StoreIngest::Copy(reason) => {
+                crate::opcounts::record_store_copied(bytes);
+                record_store_copy_reason(reason, bytes);
+            }
         }
         set_blob_readonly(blob);
     } else if matches!(ingest.get(), StoreIngest::Hardlink) {
@@ -2946,24 +3128,60 @@ impl Store {
 
         let stage = |tmp: &Path, allow_hardlink: bool| -> Result<(StoreIngest, bool)> {
             // Short-circuit: the real reflink is only attempted when no test
-            // emulation claimed the staging slot.
-            let ingest = if emulate_cow_reflink_ingest(source, tmp)?
-                || crate::link::try_reflink(source, tmp).is_ok()
-            {
+            // emulation claimed the staging slot, and never when the
+            // force-hardlink seam (test-only) pretends CoW is unavailable so a
+            // same-device `.rlib` must hardlink even on APFS/btrfs.
+            let reflink_ok = should_try_store_reflink(force_store_hardlink())
+                && (emulate_cow_reflink_ingest(source, tmp)?
+                    || crate::link::try_reflink(source, tmp).is_ok());
+            let ingest = if reflink_ok {
                 StoreIngest::Reflink
-            } else if allow_hardlink
-                && fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file())
-                && crate::link::hard_link_or_advise_cross_volume(source, tmp)
-            {
+            } else if allow_store_hardlink(
+                allow_hardlink,
+                fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file()),
+            ) {
                 // Refused for symlink sources: hashing followed the link, but a
                 // hardlink would link the symlink itself — a pointer into mutable
                 // external state, never valid for a blob (same rule as
-                // `materialize_blob`).
-                StoreIngest::Hardlink
+                // `materialize_blob`). That refusal records as `Ineligible`
+                // below; only a real `link(2)` errno records as
+                // CrossDevice/Permission/Other.
+                match try_store_hard_link(source, tmp) {
+                    Ok(()) => StoreIngest::Hardlink,
+                    Err(io_err) => {
+                        let reason = StoreCopyReason::from_io_kind(io_err.kind());
+                        {
+                            let io_reason = match reason {
+                                StoreCopyReason::CrossDevice => {
+                                    crate::link::HardlinkIoReason::CrossDevice
+                                }
+                                StoreCopyReason::Permission => {
+                                    crate::link::HardlinkIoReason::Permission
+                                }
+                                StoreCopyReason::Other | StoreCopyReason::Ineligible => {
+                                    crate::link::HardlinkIoReason::Other
+                                }
+                            };
+                            // Staging links the build output into
+                            // `<store>/staging`: EXDEV here means the build
+                            // tree and the cache are on different mounts.
+                            crate::link::warn_hardlink_fallback_once(
+                                source,
+                                &self.staging_dir(),
+                                io_reason,
+                                &io_err,
+                            );
+                        }
+                        fs::copy(source, tmp).with_context(|| {
+                            format!("copying {} into store staging", source.display())
+                        })?;
+                        StoreIngest::Copy(reason)
+                    }
+                }
             } else {
                 fs::copy(source, tmp)
                     .with_context(|| format!("copying {} into store staging", source.display()))?;
-                StoreIngest::Copy
+                StoreIngest::Copy(StoreCopyReason::Ineligible)
             };
             crate::atomic::fsync_file(tmp).context("flushing staged blob")?;
             let mut ro_guard_failed = false;
@@ -3033,7 +3251,10 @@ impl Store {
         match ingest {
             StoreIngest::Reflink => crate::opcounts::record_store_reflinked(size_bytes),
             StoreIngest::Hardlink => crate::opcounts::record_store_hardlinked(size_bytes),
-            StoreIngest::Copy => crate::opcounts::record_store_copied(size_bytes),
+            StoreIngest::Copy(reason) => {
+                crate::opcounts::record_store_copied(size_bytes);
+                record_store_copy_reason(reason, size_bytes);
+            }
         }
         set_blob_readonly(&blob);
         Ok(true)
@@ -5178,6 +5399,48 @@ mod tests {
     }
 
     #[test]
+    fn should_try_store_reflink_is_the_inverse_of_the_force_flag() {
+        assert!(should_try_store_reflink(false));
+        assert!(!should_try_store_reflink(true));
+    }
+
+    #[test]
+    fn allow_store_hardlink_requires_permission_and_a_regular_file() {
+        assert!(allow_store_hardlink(true, true));
+        assert!(!allow_store_hardlink(false, true));
+        assert!(!allow_store_hardlink(true, false));
+        assert!(!allow_store_hardlink(false, false));
+    }
+
+    #[test]
+    fn force_store_hardlink_defaults_off_and_follows_the_guard() {
+        assert!(!force_store_hardlink());
+        {
+            let _guard = ForceStoreHardlink::enable();
+            assert!(force_store_hardlink());
+        }
+        assert!(!force_store_hardlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_blob_without_hardlink_permission_does_not_share_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("libx.rlib");
+        fs::write(&source, b"ineligible-materialize").unwrap();
+        let blob = dir.path().join("blobs").join("aa").join("a".repeat(64));
+        let _force = ForceStoreHardlink::enable();
+        assert!(materialize_blob(&source, &blob, false).unwrap());
+        assert_eq!(
+            fs::metadata(&blob).unwrap().nlink(),
+            1,
+            "allow_hardlink=false must copy, not hardlink"
+        );
+        assert_eq!(fs::metadata(&source).unwrap().nlink(), 1);
+    }
+
+    #[test]
     fn materialize_blob_errors_when_source_cannot_be_copied() {
         // Covers materialize_blob copy-fallback error branch.
         let dir = tempfile::tempdir().unwrap();
@@ -5614,7 +5877,7 @@ mod tests {
         // even where the filesystem has no reflink support (ext4, tmpfs).
         let (staged, ingest) = store.stage_blob_from_source(&source, true).unwrap();
         assert!(
-            !matches!(ingest, StoreIngest::Copy),
+            !matches!(ingest, StoreIngest::Copy(_)),
             "staging fell back to a byte copy where a reflink or hardlink \
              was available — the ingest destination must not exist yet"
         );
@@ -13175,5 +13438,290 @@ mod tests {
         assert!(store.contains("ch_lc_1"));
         assert!(store.contains("ch_lc_2"));
         assert!(store.contains("ch_lc_3"));
+    }
+
+    #[test]
+    fn store_copy_reason_cross_device_maps_from_exdev() {
+        assert_eq!(
+            StoreCopyReason::from_io_kind(std::io::ErrorKind::CrossesDevices),
+            StoreCopyReason::CrossDevice,
+        );
+    }
+
+    #[test]
+    fn store_copy_reason_permission_maps_from_eperm() {
+        assert_eq!(
+            StoreCopyReason::from_io_kind(std::io::ErrorKind::PermissionDenied),
+            StoreCopyReason::Permission,
+        );
+    }
+
+    #[test]
+    fn store_copy_reason_other_maps_from_unexpected_errno() {
+        assert_eq!(
+            StoreCopyReason::from_io_kind(std::io::ErrorKind::AlreadyExists),
+            StoreCopyReason::Other,
+        );
+    }
+
+    #[test]
+    fn record_store_copy_reason_cross_device_increments() {
+        let before = crate::opcounts::store_copy_cross_device_bytes();
+        record_store_copy_reason(StoreCopyReason::CrossDevice, 11);
+        assert!(crate::opcounts::store_copy_cross_device_bytes() >= before + 11);
+    }
+
+    #[test]
+    fn record_store_copy_reason_permission_increments() {
+        let before = crate::opcounts::store_copy_permission_bytes();
+        record_store_copy_reason(StoreCopyReason::Permission, 13);
+        assert!(crate::opcounts::store_copy_permission_bytes() >= before + 13);
+    }
+
+    #[test]
+    fn record_store_copy_reason_ineligible_increments() {
+        let before = crate::opcounts::store_copy_ineligible_bytes();
+        record_store_copy_reason(StoreCopyReason::Ineligible, 17);
+        assert!(crate::opcounts::store_copy_ineligible_bytes() >= before + 17);
+    }
+
+    #[test]
+    fn record_store_copy_reason_other_increments() {
+        let before = crate::opcounts::store_copy_other_bytes();
+        record_store_copy_reason(StoreCopyReason::Other, 19);
+        assert!(crate::opcounts::store_copy_other_bytes() >= before + 19);
+    }
+
+    /// Same-device `.rlib` put must hardlink, not copy (#835).
+    ///
+    /// Forces the hardlink path (skips reflink) so the assertion holds on CoW
+    /// filesystems (APFS) as well as ext4: after the put, `store_hardlinked`
+    /// grows and the blob has exactly two links (blob + build output).
+    #[cfg(unix)]
+    #[test]
+    fn rlib_put_hardlinks_on_same_device() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("libtest.rlib");
+        fs::write(&source, b"rlib-bytes-for-hardlink").unwrap();
+        let bytes = fs::metadata(&source).unwrap().len();
+
+        let before = crate::opcounts::store_hardlinked_bytes();
+        let _force = ForceStoreHardlink::enable();
+        store
+            .put(
+                "hardlink_835_key",
+                "hardlink_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(source.clone(), "libtest.rlib".to_string())],
+                "out",
+                "err",
+            )
+            .unwrap();
+
+        assert!(
+            crate::opcounts::store_hardlinked_bytes() >= before + bytes,
+            "same-device .rlib put must record hardlinked bytes"
+        );
+        let hash = crate::cache_key::hash_file(&source).unwrap();
+        let blob = store.blob_path(&hash);
+        assert_eq!(
+            fs::metadata(&blob).unwrap().nlink(),
+            2,
+            "hardlinked blob must share its inode with the build output"
+        );
+    }
+
+    #[test]
+    fn injected_cross_device_ingest_records_cross_device_reason() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("libx.rlib");
+        fs::write(&source, b"cross-device-bytes").unwrap();
+        let bytes = fs::metadata(&source).unwrap().len();
+
+        let before = crate::opcounts::store_copy_cross_device_bytes();
+        let _force = ForceStoreHardlink::enable();
+        let _inject = InjectStoreHardlinkError::enable(std::io::ErrorKind::CrossesDevices);
+        let (staged, ingest) = store.stage_blob_from_source(&source, true).unwrap();
+        assert!(
+            matches!(ingest, StoreIngest::Copy(StoreCopyReason::CrossDevice)),
+            "EXDEV injection must stage as Copy(CrossDevice), got {ingest:?}"
+        );
+        // Publish to record the reason alongside the copy.
+        let hash = crate::cache_key::hash_file(&staged).unwrap();
+        store
+            .publish_staged_blob(&staged, ingest, &hash, bytes)
+            .unwrap();
+        assert!(
+            crate::opcounts::store_copy_cross_device_bytes() >= before + bytes,
+            "EXDEV injection must record the cross-device reason"
+        );
+    }
+
+    #[test]
+    fn injected_permission_ingest_records_permission_reason() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("libp.rlib");
+        fs::write(&source, b"permission-bytes").unwrap();
+        let bytes = fs::metadata(&source).unwrap().len();
+
+        let before = crate::opcounts::store_copy_permission_bytes();
+        let _force = ForceStoreHardlink::enable();
+        let _inject = InjectStoreHardlinkError::enable(std::io::ErrorKind::PermissionDenied);
+        let (staged, ingest) = store.stage_blob_from_source(&source, true).unwrap();
+        assert!(
+            matches!(ingest, StoreIngest::Copy(StoreCopyReason::Permission)),
+            "EPERM injection must stage as Copy(Permission), got {ingest:?}"
+        );
+        let hash = crate::cache_key::hash_file(&staged).unwrap();
+        store
+            .publish_staged_blob(&staged, ingest, &hash, bytes)
+            .unwrap();
+        assert!(
+            crate::opcounts::store_copy_permission_bytes() >= before + bytes,
+            "EPERM injection must record the permission reason"
+        );
+    }
+
+    #[test]
+    fn injected_other_ingest_records_other_reason() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("libo.rlib");
+        fs::write(&source, b"other-bytes").unwrap();
+        let bytes = fs::metadata(&source).unwrap().len();
+
+        let before = crate::opcounts::store_copy_other_bytes();
+        let _force = ForceStoreHardlink::enable();
+        let _inject = InjectStoreHardlinkError::enable(std::io::ErrorKind::AlreadyExists);
+        let (staged, ingest) = store.stage_blob_from_source(&source, true).unwrap();
+        assert!(
+            matches!(ingest, StoreIngest::Copy(StoreCopyReason::Other)),
+            "other errno injection must stage as Copy(Other), got {ingest:?}"
+        );
+        let hash = crate::cache_key::hash_file(&staged).unwrap();
+        store
+            .publish_staged_blob(&staged, ingest, &hash, bytes)
+            .unwrap();
+        assert!(
+            crate::opcounts::store_copy_other_bytes() >= before + bytes,
+            "other errno injection must record the other reason"
+        );
+    }
+
+    /// The ingest advisory fires for a cross-device fallback and nothing
+    /// else, observed through marker files. Sole marker installer in this
+    /// binary: no other unit test calls `set_cow_warn_marker`, so the fresh
+    /// scratch dir starts empty deterministically.
+    #[test]
+    fn injected_cross_device_ingest_advises_but_other_errors_do_not() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "kache-store-cross-volume-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        crate::link::set_cow_warn_marker(base.join("warn"));
+        crate::link::set_storage_layout_advice(true);
+        let marker_written = || std::fs::read_dir(&base).unwrap().next().is_some();
+
+        let source = dir.path().join("libv.rlib");
+        fs::write(&source, b"cross-volume-bytes").unwrap();
+
+        // Muted layout advice stays silent even on EXDEV.
+        crate::link::set_storage_layout_advice(false);
+        let _force = ForceStoreHardlink::enable();
+        let _inject = InjectStoreHardlinkError::enable(std::io::ErrorKind::CrossesDevices);
+        let (_, ingest) = store.stage_blob_from_source(&source, true).unwrap();
+        assert!(
+            matches!(ingest, StoreIngest::Copy(StoreCopyReason::CrossDevice)),
+            "muting advice must not change the copy reason, got {ingest:?}"
+        );
+        assert!(
+            !marker_written(),
+            "a muted advisory must not write a marker"
+        );
+        crate::link::set_storage_layout_advice(true);
+
+        // A non-cross-device failure records its reason but advises nothing.
+        let _force = ForceStoreHardlink::enable();
+        let _inject = InjectStoreHardlinkError::enable(std::io::ErrorKind::AlreadyExists);
+        let (_, ingest) = store.stage_blob_from_source(&source, true).unwrap();
+        assert!(
+            matches!(ingest, StoreIngest::Copy(StoreCopyReason::Other)),
+            "expected Copy(Other), got {ingest:?}"
+        );
+        assert!(
+            !marker_written(),
+            "a non-cross-device ingest failure must not advise"
+        );
+
+        // EXDEV advises exactly once per session window.
+        let _inject = InjectStoreHardlinkError::enable(std::io::ErrorKind::CrossesDevices);
+        let (_, ingest) = store.stage_blob_from_source(&source, true).unwrap();
+        assert!(
+            matches!(ingest, StoreIngest::Copy(StoreCopyReason::CrossDevice)),
+            "expected Copy(CrossDevice), got {ingest:?}"
+        );
+        assert!(
+            marker_written(),
+            "a cross-device ingest fallback must advise"
+        );
+        crate::link::set_storage_layout_advice(true);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ineligible_ingest_records_ineligible_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        // Executables are never hardlink-eligible by policy (#429): the copy
+        // records as Ineligible, not as a link failure.
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"ineligible-bytes").unwrap();
+        let bytes = fs::metadata(&source).unwrap().len();
+
+        let before = crate::opcounts::store_copy_ineligible_bytes();
+        // `allow_hardlink=false` is the cc/policy path: no link attempted.
+        // Force past reflink so the policy refusal is exercised even on CoW
+        // filesystems where a reflink would otherwise win.
+        let _force = ForceStoreHardlink::enable();
+        let (staged, ingest) = store.stage_blob_from_source(&source, false).unwrap();
+        assert!(
+            matches!(ingest, StoreIngest::Copy(StoreCopyReason::Ineligible)),
+            "policy refusal must stage as Copy(Ineligible), got {ingest:?}"
+        );
+        let hash = crate::cache_key::hash_file(&staged).unwrap();
+        store
+            .publish_staged_blob(&staged, ingest, &hash, bytes)
+            .unwrap();
+        assert!(
+            crate::opcounts::store_copy_ineligible_bytes() >= before + bytes,
+            "policy refusal must record the ineligible reason"
+        );
     }
 }

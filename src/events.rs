@@ -162,6 +162,40 @@ pub struct BuildEvent {
     /// is available.
     #[serde(default)]
     pub store_copied_bytes: u64,
+    /// Bytes copied into the store after an EXDEV hardlink failure (#835):
+    /// `link(2)` refuses across mounts, including two bind mounts of one
+    /// filesystem. `serde(default)` so no event-schema bump is needed.
+    #[serde(default)]
+    pub store_copy_cross_device_bytes: u64,
+    /// Bytes copied into the store after an EPERM/EACCES hardlink failure
+    /// (#835). `serde(default)`, no schema bump.
+    #[serde(default)]
+    pub store_copy_permission_bytes: u64,
+    /// Bytes copied into the store without attempting a hardlink (#835):
+    /// kind-ineligible (executable, dylib, depinfo, extensionless) or a cc
+    /// put that never shares inodes. `serde(default)`, no schema bump.
+    #[serde(default)]
+    pub store_copy_ineligible_bytes: u64,
+    /// Bytes copied into the store after any other hardlink errno (#835).
+    /// `serde(default)`, no schema bump.
+    #[serde(default)]
+    pub store_copy_other_bytes: u64,
+    /// Bytes restored by copy after an EXDEV hardlink failure (#835).
+    /// `serde(default)`, no schema bump.
+    #[serde(default)]
+    pub restore_copy_cross_device_bytes: u64,
+    /// Bytes restored by copy after an EPERM/EACCES hardlink failure (#835).
+    /// `serde(default)`, no schema bump.
+    #[serde(default)]
+    pub restore_copy_permission_bytes: u64,
+    /// Bytes restored by copy for the exclusive-carrier rule (#794/#835):
+    /// the blob already had a consumer. `serde(default)`, no schema bump.
+    #[serde(default)]
+    pub restore_copy_exclusive_bytes: u64,
+    /// Bytes restored by copy after any other hardlink failure (#835).
+    /// `serde(default)`, no schema bump.
+    #[serde(default)]
+    pub restore_copy_other_bytes: u64,
     /// Why kache passed the invocation through instead of caching it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub passthrough_reason: String,
@@ -1204,6 +1238,17 @@ pub struct EventStats {
     pub store_hardlinked_bytes: u64,
     /// Bytes ingested into the store by a full physical copy (a real second copy).
     pub store_copied_bytes: u64,
+    /// Copy-fallback reasons (#835), still as bytes so the report can show
+    /// *why* zero-copy did not happen. All `serde(default)` on the event, so
+    /// old readers stay compatible.
+    pub store_copy_cross_device_bytes: u64,
+    pub store_copy_permission_bytes: u64,
+    pub store_copy_ineligible_bytes: u64,
+    pub store_copy_other_bytes: u64,
+    pub restore_copy_cross_device_bytes: u64,
+    pub restore_copy_permission_bytes: u64,
+    pub restore_copy_exclusive_bytes: u64,
+    pub restore_copy_other_bytes: u64,
     /// Compiles whose outputs were produced but not cached, because
     /// `Store::put` failed (kunobi-ninja/kache#629). A subset of `misses` —
     /// a failed put leaves the blob counters at zero, which resolves to `Miss`,
@@ -1251,6 +1296,14 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         store_reflinked_bytes: 0,
         store_hardlinked_bytes: 0,
         store_copied_bytes: 0,
+        store_copy_cross_device_bytes: 0,
+        store_copy_permission_bytes: 0,
+        store_copy_ineligible_bytes: 0,
+        store_copy_other_bytes: 0,
+        restore_copy_cross_device_bytes: 0,
+        restore_copy_permission_bytes: 0,
+        restore_copy_exclusive_bytes: 0,
+        restore_copy_other_bytes: 0,
         store_failures: 0,
     };
 
@@ -1323,6 +1376,14 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         stats.store_reflinked_bytes += event.store_reflinked_bytes;
         stats.store_hardlinked_bytes += event.store_hardlinked_bytes;
         stats.store_copied_bytes += event.store_copied_bytes;
+        stats.store_copy_cross_device_bytes += event.store_copy_cross_device_bytes;
+        stats.store_copy_permission_bytes += event.store_copy_permission_bytes;
+        stats.store_copy_ineligible_bytes += event.store_copy_ineligible_bytes;
+        stats.store_copy_other_bytes += event.store_copy_other_bytes;
+        stats.restore_copy_cross_device_bytes += event.restore_copy_cross_device_bytes;
+        stats.restore_copy_permission_bytes += event.restore_copy_permission_bytes;
+        stats.restore_copy_exclusive_bytes += event.restore_copy_exclusive_bytes;
+        stats.restore_copy_other_bytes += event.restore_copy_other_bytes;
     }
 
     stats
@@ -1382,6 +1443,14 @@ impl BuildEvent {
             store_reflinked_bytes: 0,
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
+            store_copy_cross_device_bytes: 0,
+            store_copy_permission_bytes: 0,
+            store_copy_ineligible_bytes: 0,
+            store_copy_other_bytes: 0,
+            restore_copy_cross_device_bytes: 0,
+            restore_copy_permission_bytes: 0,
+            restore_copy_exclusive_bytes: 0,
+            restore_copy_other_bytes: 0,
             passthrough_reason: String::new(),
             store_error: String::new(),
             lookup_rejection: String::new(),
@@ -1462,6 +1531,14 @@ mod tests {
             store_reflinked_bytes: 0,
             store_hardlinked_bytes: 0,
             store_copied_bytes: 0,
+            store_copy_cross_device_bytes: 0,
+            store_copy_permission_bytes: 0,
+            store_copy_ineligible_bytes: 0,
+            store_copy_other_bytes: 0,
+            restore_copy_cross_device_bytes: 0,
+            restore_copy_permission_bytes: 0,
+            restore_copy_exclusive_bytes: 0,
+            restore_copy_other_bytes: 0,
             passthrough_reason: String::new(),
             store_error: String::new(),
             lookup_rejection: String::new(),
@@ -1988,6 +2065,30 @@ mod tests {
         let stats = compute_stats(&[]);
         assert_eq!(stats.total, 0);
         assert_eq!(stats.local_hits, 0);
+    }
+
+    #[test]
+    fn compute_stats_aggregates_copy_reasons() {
+        // Distinct powers of two so any swapped operator or field still
+        // changes the sum.
+        let mut event = BuildEvent::new_for_test("a", EventResult::Miss);
+        event.store_copy_cross_device_bytes = 1;
+        event.store_copy_permission_bytes = 2;
+        event.store_copy_ineligible_bytes = 4;
+        event.store_copy_other_bytes = 8;
+        event.restore_copy_cross_device_bytes = 16;
+        event.restore_copy_permission_bytes = 32;
+        event.restore_copy_exclusive_bytes = 64;
+        event.restore_copy_other_bytes = 128;
+        let stats = compute_stats(&[event]);
+        assert_eq!(stats.store_copy_cross_device_bytes, 1);
+        assert_eq!(stats.store_copy_permission_bytes, 2);
+        assert_eq!(stats.store_copy_ineligible_bytes, 4);
+        assert_eq!(stats.store_copy_other_bytes, 8);
+        assert_eq!(stats.restore_copy_cross_device_bytes, 16);
+        assert_eq!(stats.restore_copy_permission_bytes, 32);
+        assert_eq!(stats.restore_copy_exclusive_bytes, 64);
+        assert_eq!(stats.restore_copy_other_bytes, 128);
     }
 
     #[test]

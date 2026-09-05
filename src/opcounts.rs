@@ -199,6 +199,123 @@ pub fn store_copied_bytes() -> u64 {
     STORE_COPIED_BYTES.load(Ordering::Relaxed)
 }
 
+// ── Hardlink-fallback reason byte counters (#835) ─────────────────────────────
+//
+// A copy fallback is not one condition: `link(2)` can fail with EXDEV across
+// two bind mounts of one filesystem, EPERM under `protected_hardlinks`, or any
+// other errno; the ingest can also refuse a hardlink by policy
+// (kind-ineligible: executable, dylib, depinfo, extensionless, or a cc put
+// that never shares inodes); the restore can refuse it for the
+// exclusive-carrier rule (#794: the blob already has a consumer). Recording
+// only `copied_bytes` leaves those indistinguishable in events, which is how
+// ext4 CI showed 0% multi-link blobs with no signal. These break the copy
+// side down by reason, still as deterministic bytes, so `kache report` can
+// show *why* zero-copy did not happen. Observability only: recording a reason
+// never changes what gets linked.
+
+static STORE_COPY_CROSS_DEVICE_BYTES: AtomicU64 = AtomicU64::new(0);
+static STORE_COPY_PERMISSION_BYTES: AtomicU64 = AtomicU64::new(0);
+static STORE_COPY_INELIGIBLE_BYTES: AtomicU64 = AtomicU64::new(0);
+static STORE_COPY_OTHER_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESTORE_COPY_CROSS_DEVICE_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESTORE_COPY_PERMISSION_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESTORE_COPY_EXCLUSIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+static RESTORE_COPY_OTHER_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Record `bytes` copied into the store because `link(2)` failed with
+/// `CrossesDevices` (EXDEV across mounts, including two bind mounts of one
+/// filesystem).
+pub fn record_store_copy_cross_device(bytes: u64) {
+    STORE_COPY_CROSS_DEVICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` copied into the store because `link(2)` failed with
+/// `PermissionDenied` (EPERM/EACCES, e.g. `protected_hardlinks`).
+pub fn record_store_copy_permission(bytes: u64) {
+    STORE_COPY_PERMISSION_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` copied into the store because a hardlink was never
+/// attempted: the artifact kind is ineligible (executable, dylib, depinfo,
+/// extensionless) or the put forbids source hardlinks (cc objects never share
+/// inodes).
+pub fn record_store_copy_ineligible(bytes: u64) {
+    STORE_COPY_INELIGIBLE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` copied into the store because `link(2)` failed with any
+/// other errno (EMLINK, EEXIST, …).
+pub fn record_store_copy_other(bytes: u64) {
+    STORE_COPY_OTHER_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` restored by copy because `link(2)` failed with
+/// `CrossesDevices`.
+pub fn record_restore_copy_cross_device(bytes: u64) {
+    RESTORE_COPY_CROSS_DEVICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` restored by copy because `link(2)` failed with
+/// `PermissionDenied`.
+pub fn record_restore_copy_permission(bytes: u64) {
+    RESTORE_COPY_PERMISSION_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` restored by copy because of the exclusive-carrier rule
+/// (#794): the blob already had a hardlink consumer (`nlink != 1` before the
+/// link, or `nlink != 2` after), so a second share would let one consumer's
+/// mtime stamp reach another. Unix-only: link counts do not exist on Windows.
+#[cfg(unix)]
+pub fn record_restore_copy_exclusive(bytes: u64) {
+    RESTORE_COPY_EXCLUSIVE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Record `bytes` restored by copy because `link(2)` failed with any other
+/// errno, or the blob's link count could not be verified.
+pub fn record_restore_copy_other(bytes: u64) {
+    RESTORE_COPY_OTHER_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Bytes copied into the store after an EXDEV hardlink failure.
+pub fn store_copy_cross_device_bytes() -> u64 {
+    STORE_COPY_CROSS_DEVICE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes copied into the store after an EPERM/EACCES hardlink failure.
+pub fn store_copy_permission_bytes() -> u64 {
+    STORE_COPY_PERMISSION_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes copied into the store without attempting a hardlink (kind-ineligible).
+pub fn store_copy_ineligible_bytes() -> u64 {
+    STORE_COPY_INELIGIBLE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes copied into the store after any other hardlink errno.
+pub fn store_copy_other_bytes() -> u64 {
+    STORE_COPY_OTHER_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes restored by copy after an EXDEV hardlink failure.
+pub fn restore_copy_cross_device_bytes() -> u64 {
+    RESTORE_COPY_CROSS_DEVICE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes restored by copy after an EPERM/EACCES hardlink failure.
+pub fn restore_copy_permission_bytes() -> u64 {
+    RESTORE_COPY_PERMISSION_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes restored by copy for the exclusive-carrier rule (#794).
+pub fn restore_copy_exclusive_bytes() -> u64 {
+    RESTORE_COPY_EXCLUSIVE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes restored by copy after any other hardlink failure.
+pub fn restore_copy_other_bytes() -> u64 {
+    RESTORE_COPY_OTHER_BYTES.load(Ordering::Relaxed)
+}
+
 // ── Wrapper phase timings ───────────────────────────────────────────────────
 //
 // `key_ms`, `lookup_ms`, `restore_ms` and `store_ms` are measured inline in
@@ -451,5 +568,62 @@ mod tests {
             store_reflinked_bytes() + store_hardlinked_bytes() + store_copied_bytes()
                 >= before + 224
         );
+    }
+
+    #[test]
+    fn store_copy_cross_device_counter_increments() {
+        let before = store_copy_cross_device_bytes();
+        record_store_copy_cross_device(11);
+        assert!(store_copy_cross_device_bytes() >= before + 11);
+    }
+
+    #[test]
+    fn store_copy_permission_counter_increments() {
+        let before = store_copy_permission_bytes();
+        record_store_copy_permission(13);
+        assert!(store_copy_permission_bytes() >= before + 13);
+    }
+
+    #[test]
+    fn store_copy_ineligible_counter_increments() {
+        let before = store_copy_ineligible_bytes();
+        record_store_copy_ineligible(17);
+        assert!(store_copy_ineligible_bytes() >= before + 17);
+    }
+
+    #[test]
+    fn store_copy_other_counter_increments() {
+        let before = store_copy_other_bytes();
+        record_store_copy_other(19);
+        assert!(store_copy_other_bytes() >= before + 19);
+    }
+
+    #[test]
+    fn restore_copy_cross_device_counter_increments() {
+        let before = restore_copy_cross_device_bytes();
+        record_restore_copy_cross_device(23);
+        assert!(restore_copy_cross_device_bytes() >= before + 23);
+    }
+
+    #[test]
+    fn restore_copy_permission_counter_increments() {
+        let before = restore_copy_permission_bytes();
+        record_restore_copy_permission(29);
+        assert!(restore_copy_permission_bytes() >= before + 29);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restore_copy_exclusive_counter_increments() {
+        let before = restore_copy_exclusive_bytes();
+        record_restore_copy_exclusive(31);
+        assert!(restore_copy_exclusive_bytes() >= before + 31);
+    }
+
+    #[test]
+    fn restore_copy_other_counter_increments() {
+        let before = restore_copy_other_bytes();
+        record_restore_copy_other(37);
+        assert!(restore_copy_other_bytes() >= before + 37);
     }
 }

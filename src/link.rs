@@ -10,8 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static WINDOWS_HARDLINK_RESTORE: AtomicBool = AtomicBool::new(false);
 
 /// Process-global: marker file used to dedup storage-layout advisories across
-/// the hundreds of wrapper processes a single build spawns (#508). Set at wrapper
-/// entry; if unset the advisory falls back to once-per-process.
+/// the hundreds of wrapper processes a single build spawns (#508, #835). Set
+/// at wrapper entry; if unset the advisory falls back to once-per-process.
+///
+/// Originally Windows-only for the no-CoW advisory; #835 reuses the same
+/// marker infrastructure for the Linux EXDEV/EPERM hardlink advisory, with
+/// separate buckets so one severity never mutes another.
 static COW_WARN_MARKER: OnceLock<PathBuf> = OnceLock::new();
 
 /// Set the Windows hardlink-restore opt-in (from `Config::windows_hardlink`).
@@ -29,8 +33,10 @@ pub(crate) fn windows_hardlink_enabled() -> bool {
     WINDOWS_HARDLINK_RESTORE.load(Ordering::Relaxed)
 }
 
-/// Set the cross-process dedup marker for storage-layout advisories. Call once per
-/// process before restoring.
+/// Set the cross-process dedup marker for storage-layout advisories. Call once
+/// per process before restoring. The marker itself is inert; each advisory
+/// derives a per-bucket path via [`bucket_marker`] so severities dedup
+/// independently.
 pub fn set_cow_warn_marker(path: std::path::PathBuf) {
     let _ = COW_WARN_MARKER.set(path);
 }
@@ -51,6 +57,183 @@ pub fn set_storage_layout_advice(enabled: bool) {
 /// Is `[cache] storage_layout_advice` active for this process?
 fn storage_layout_advice_enabled() -> bool {
     STORAGE_LAYOUT_ADVICE.load(Ordering::Relaxed)
+}
+
+// ── Hardlink-fallback reason classification (#835) ───────────────────────────
+//
+// `link(2)` failures are not one condition: EXDEV across two bind mounts of
+// one filesystem, EPERM under `protected_hardlinks`, and any other errno need
+// different responses (co-locate cache + build on one mount vs fix ownership
+// vs investigate). This pure helper keeps that decision table unit-testable
+// off Linux; callers record the matching opcount and, on Linux, emit the
+// once-per-session advisory. Observability only: classification never changes
+// what gets linked.
+
+/// Why a hardlink attempt fell back to a copy, for an `io::Error` from
+/// `link(2)`. Exclusive-carrier (#794) and kind-ineligible are policy
+/// refusals, not io errors, and are recorded by their own call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardlinkIoReason {
+    CrossDevice,
+    Permission,
+    Other,
+}
+
+/// Classify a `link(2)` io error kind into a copy reason. Pure so the decision
+/// table is unit-testable off Linux.
+pub(crate) fn classify_hardlink_io_error(kind: std::io::ErrorKind) -> HardlinkIoReason {
+    if kind == std::io::ErrorKind::CrossesDevices {
+        HardlinkIoReason::CrossDevice
+    } else if kind == std::io::ErrorKind::PermissionDenied {
+        HardlinkIoReason::Permission
+    } else {
+        HardlinkIoReason::Other
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only `hard_link` failure injection for the restore path (#835):
+    /// when set, `hardlink_or_copy` fails with this errno instead of calling
+    /// `link(2)`, so the reason counter and the Linux advisory are observable
+    /// without bind mounts. Thread-local so parallel `cargo test` workers do
+    /// not leak into each other. Production always sees `None`.
+    static INJECT_RESTORE_HARDLINK_ERROR: std::cell::Cell<Option<std::io::ErrorKind>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Enable [`INJECT_RESTORE_HARDLINK_ERROR`] for the guard's lifetime.
+#[cfg(test)]
+pub(crate) struct InjectRestoreHardlinkError {
+    _private: (),
+}
+
+#[cfg(test)]
+impl InjectRestoreHardlinkError {
+    pub(crate) fn enable(kind: std::io::ErrorKind) -> Self {
+        INJECT_RESTORE_HARDLINK_ERROR.with(|slot| slot.set(Some(kind)));
+        Self { _private: () }
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectRestoreHardlinkError {
+    fn drop(&mut self) {
+        INJECT_RESTORE_HARDLINK_ERROR.with(|slot| slot.set(None));
+    }
+}
+
+/// Injected restore `hard_link` errno, if any. Production stub is always
+/// `None` so the real `link(2)` runs.
+#[cfg(test)]
+fn injected_restore_hardlink_error() -> Option<std::io::ErrorKind> {
+    INJECT_RESTORE_HARDLINK_ERROR.with(|slot| slot.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn injected_restore_hardlink_error() -> Option<std::io::ErrorKind> {
+    None
+}
+
+/// Attempt `link(2)`, honouring the test-only error injection seam above.
+/// Returns the io error on failure so callers can classify it instead of
+/// swallowing it with `.is_ok()`.
+fn try_hard_link(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(kind) = injected_restore_hardlink_error() {
+        return Err(std::io::Error::new(kind, "injected hardlink failure"));
+    }
+    fs::hard_link(src, dst)
+}
+
+/// Emit the Linux once-per-session hardlink advisory for EXDEV/EPERM (#835),
+/// reusing the cross-process marker-dedup helper (`warn_once_per_session`)
+/// that the Windows no-CoW advisory uses. Observability only: never changes
+/// what gets linked. Respects `[cache] storage_layout_advice = false`, which
+/// mutes layout advice but never faults.
+///
+/// EXDEV across two bind mounts of one filesystem is the most likely cause of
+/// 0% multi-link blobs on ext4 CI: same `st_dev` is not enough, Linux refuses
+/// `link()` across vfsmounts. EPERM happens under `protected_hardlinks=1`
+/// when the wrapper does not own the 0o444 blob. Other errnos stay debug-only.
+pub(crate) fn warn_hardlink_fallback_once(
+    store_path: &Path,
+    target_path: &Path,
+    reason: HardlinkIoReason,
+    io_err: &std::io::Error,
+) {
+    if !matches!(
+        reason,
+        HardlinkIoReason::CrossDevice | HardlinkIoReason::Permission
+    ) {
+        tracing::debug!(
+            "hardlink failed ({}), falling back to copy: {} -> {}",
+            io_err,
+            store_path.display(),
+            target_path.display()
+        );
+        return;
+    }
+    if !storage_layout_advice_enabled() {
+        tracing::debug!(
+            "hardlink failed ({:?}; layout advice muted): {} -> {}",
+            reason,
+            store_path.display(),
+            target_path.display()
+        );
+        return;
+    }
+    let (bucket, message) = match reason {
+        HardlinkIoReason::CrossDevice => (
+            "hardlink-exdev",
+            format!(
+                "kache: operation fell back to COPY because hardlinking failed with EXDEV \
+                 (cross-device link): the two paths are on different mounts or volumes — \
+                 hardlinks cannot span them, not across drives, not across bind mounts \
+                 even of one filesystem. Put the cache and build tree on the SAME \
+                 mount/drive for zero-copy sharing. If this layout is intentional, \
+                 silence this advice with `[cache] storage_layout_advice = false`.\n         \
+                 source: {}\n         dest: {}\n         error: {}",
+                store_path.display(),
+                target_path.display(),
+                io_err,
+            ),
+        ),
+        HardlinkIoReason::Permission => (
+            "hardlink-eperm",
+            format!(
+                "kache: operation fell back to COPY because hardlinking failed with EPERM \
+                 (permission denied): the caller must own the source file (on Linux, \
+                 fs.protected_hardlinks refuses the link otherwise). Store blobs are \
+                 0o444; if the cache was imported by another uid \
+                 (daemon vs wrapper, or a carried-over cache dir), linking copies. Ensure one \
+                 uid owns the cache. If this layout is intentional, silence this advice with \
+                 `[cache] storage_layout_advice = false`.\n         source: {}\n         \
+                 dest: {}\n         error: {}",
+                store_path.display(),
+                target_path.display(),
+                io_err,
+            ),
+        ),
+        HardlinkIoReason::Other => {
+            return;
+        }
+    };
+    match COW_WARN_MARKER.get() {
+        Some(base) => {
+            let marker = bucket_marker(base, bucket);
+            let _warned = crate::wrapper::warn_once_per_session(
+                &marker,
+                crate::wrapper::WARN_SESSION_SECS,
+                &message,
+            );
+        }
+        None => {
+            use std::sync::Once;
+            static WARNED: Once = Once::new();
+            WARNED.call_once(|| eprintln!("{message}"));
+        }
+    }
 }
 
 /// Strategy for restoring a cached file to a build output path.
@@ -217,6 +400,7 @@ fn hardlink_or_copy_with_prelink_hook(
                     store_path.display(),
                     target_path.display()
                 );
+                crate::opcounts::record_restore_copy_exclusive(bytes);
                 return copy_hardlink_fallback(store_path, target_path, bytes);
             }
         }
@@ -227,6 +411,7 @@ fn hardlink_or_copy_with_prelink_hook(
                 store_path.display(),
                 target_path.display()
             );
+            crate::opcounts::record_restore_copy_other(bytes);
             return copy_hardlink_fallback(store_path, target_path, bytes);
         }
     }
@@ -236,13 +421,24 @@ fn hardlink_or_copy_with_prelink_hook(
     // sequential fast path. Production passes a no-op closure.
     prelink_hook();
 
-    if let Err(e) = fs::hard_link(store_path, target_path) {
-        tracing::debug!(
-            "hardlink failed ({}), falling back to copy: {} -> {}",
-            e,
-            store_path.display(),
-            target_path.display()
-        );
+    if let Err(e) = try_hard_link(store_path, target_path) {
+        let kind = e.kind();
+        let reason = classify_hardlink_io_error(kind);
+        match reason {
+            HardlinkIoReason::CrossDevice => {
+                crate::opcounts::record_restore_copy_cross_device(bytes);
+            }
+            HardlinkIoReason::Permission => {
+                crate::opcounts::record_restore_copy_permission(bytes);
+            }
+            HardlinkIoReason::Other => {
+                crate::opcounts::record_restore_copy_other(bytes);
+            }
+        }
+        // The failure is no longer silent: the reason is counted above, and
+        // EXDEV/EPERM also emit the once-per-session layout advisory.
+        // What gets linked is unchanged — this still falls back to a copy.
+        warn_hardlink_fallback_once(store_path, target_path, reason, &e);
         return copy_hardlink_fallback(store_path, target_path, bytes);
     }
 
@@ -268,6 +464,7 @@ fn hardlink_or_copy_with_prelink_hook(
                         target_path.display()
                     )
                 })?;
+                crate::opcounts::record_restore_copy_exclusive(bytes);
                 return copy_hardlink_fallback(store_path, target_path, bytes);
             }
             Err(source_error) => {
@@ -289,87 +486,6 @@ fn copy_hardlink_fallback(store_path: &Path, target_path: &Path, bytes: u64) -> 
     copy_file(store_path, target_path, false)?;
     crate::opcounts::record_copied(bytes);
     Ok(())
-}
-
-/// `fs::hard_link` for store ingest that reports a cross-volume layout once
-/// per session instead of swallowing it. Returns whether the link was made.
-///
-/// A `CrossesDevices` failure (EXDEV on Unix bind mounts, NotSameDevice on
-/// Windows drives) proves the build tree and the store staging area live on
-/// different mounts, so every ingest copies the full file. That is a layout
-/// problem worth telling the user once, with the fix (co-locate
-/// `[cache] local_store` with the build tree). Any other failure stays
-/// silent here — a later counter documents it — so this never nags about
-/// transient filesystem errors.
-pub fn hard_link_or_advise_cross_volume(source: &Path, tmp: &Path) -> bool {
-    match fs::hard_link(source, tmp) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
-            warn_cross_volume_ingest_once(source, tmp);
-            false
-        }
-        Err(_) => false,
-    }
-}
-
-/// Tell the user their store ingests copy because the build tree and the
-/// store are on different mounts/volumes — at most once per warn-session
-/// window, and never when `[cache] storage_layout_advice = false` says the
-/// layout is intentional. Uses its own `cross-volume` bucket so it dedups
-/// independently of the copy-restore advisories.
-fn warn_cross_volume_ingest_once(source: &Path, tmp: &Path) {
-    if !storage_layout_advice_enabled() {
-        return;
-    }
-    let message = cross_volume_ingest_message(source, tmp);
-    match COW_WARN_MARKER.get() {
-        Some(base) => {
-            let marker = bucket_marker(base, "cross-volume");
-            let _warned = crate::wrapper::warn_once_per_session(
-                &marker,
-                crate::wrapper::WARN_SESSION_SECS,
-                &message,
-            );
-        }
-        // No marker configured (unit tests, non-wrapper entrypoints): fall back
-        // to once-per-process rather than going silent.
-        None => {
-            use std::sync::Once;
-            static WARNED: Once = Once::new();
-            WARNED.call_once(|| eprintln!("{message}"));
-        }
-    }
-}
-
-/// Format the volume pair for the cross-volume advisory. Pure and
-/// platform-neutral so the Linux mutation lane can kill its mutants even
-/// though only the Windows call site compiles the roots: both arms are
-/// reachable here on every platform.
-fn format_volume_pair(from: Option<String>, to: Option<String>) -> String {
-    match (from, to) {
-        (Some(from), Some(to)) => format!(" ({from} vs {to})"),
-        _ => String::new(),
-    }
-}
-
-/// Pure message for [`warn_cross_volume_ingest_once`], kept separate so tests
-/// pin the wording without touching the filesystem.
-fn cross_volume_ingest_message(source: &Path, tmp: &Path) -> String {
-    #[cfg(windows)]
-    let (from, to) = (windows_volume_root(source), windows_volume_root(tmp));
-    #[cfg(not(windows))]
-    let (from, to): (Option<String>, Option<String>) = (None, None);
-    let volumes = format_volume_pair(from, to);
-    format!(
-        "kache: could not hardlink {source} into the store staging area ({tmp}){volumes}: \
-         the link failed across mounts/volumes, so every ingest copies the full \
-         file instead of sharing it. Put `[cache] local_store` on the same \
-         drive as your build tree to restore zero-copy ingest. If this layout \
-         is intentional, silence this advice with \
-         `[cache] storage_layout_advice = false`.\n         affected source: {source}",
-        source = source.display(),
-        tmp = tmp.display(),
-    )
 }
 
 /// Validate a completed hardlink whose store blob could not be re-stat'ed.
@@ -1977,127 +2093,6 @@ mod tests {
             CopyRestoreCause::NoCow,
             "volume roots compare case-insensitively",
         );
-    }
-
-    /// Same mount, same filesystem: the link is made and nothing warns.
-    #[test]
-    fn ingest_hardlink_succeeds_silently_on_one_mount() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("input.rlib");
-        std::fs::write(&source, b"fake rlib").unwrap();
-        let tmp = dir.path().join("stage.tmp");
-        assert!(
-            hard_link_or_advise_cross_volume(&source, &tmp),
-            "a same-directory link must succeed"
-        );
-        assert!(tmp.is_file());
-    }
-
-    /// The cross-volume ingest message must name the fix (co-locate
-    /// `local_store` with the build) and the mute switch, so a user seeing
-    /// it once knows both what to do and how to silence it.
-    #[test]
-    fn cross_volume_ingest_message_names_fix_and_mute() {
-        let message = cross_volume_ingest_message(
-            Path::new("D:/work/target/x.rlib"),
-            Path::new("C:/cache/store/staging/stage.tmp"),
-        );
-        for needle in [
-            "D:/work/target/x.rlib",
-            "local_store",
-            "storage_layout_advice",
-            "same",
-        ] {
-            assert!(
-                message.contains(needle),
-                "advisory must mention {needle:?}: {message}"
-            );
-        }
-    }
-
-    /// Both arms of the volume-pair formatting, reachable on every platform
-    /// so the Linux mutation lane covers the Windows-only call site.
-    #[test]
-    fn format_volume_pair_formats_both_arms() {
-        assert_eq!(
-            format_volume_pair(Some("C:\\".to_string()), Some("D:\\".to_string())),
-            " (C:\\ vs D:\\)"
-        );
-        assert_eq!(format_volume_pair(None, Some("D:\\".to_string())), "");
-        assert_eq!(format_volume_pair(Some("C:\\".to_string()), None), "");
-        assert_eq!(format_volume_pair(None, None), "");
-    }
-
-    /// `[cache] storage_layout_advice = false` mutes the ingest advisory;
-    /// the default warns. Observed through marker files in a scratch dir so
-    /// the assertion is the warning itself, not the toggle round-trip.
-    ///
-    /// Linux-only: only a real cross-mount `link(2)` produces `CrossesDevices`
-    /// (`/dev/shm` is a separate tmpfs on every supported Linux CI), and only
-    /// a real error exercises the guard. The message wording and the toggle
-    /// round-trip are covered platform-independently above.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn cross_volume_guard_warns_only_on_crosses_devices() {
-        use std::os::unix::fs::MetadataExt;
-
-        let _lock = crate::test_support::process_state_test_lock();
-        let base =
-            std::env::temp_dir().join(format!("kache-cross-volume-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        // First claimant wins the process-global marker; no other unit test
-        // installs one, so this holds deterministically in this binary.
-        set_cow_warn_marker(base.join("warn"));
-        let marker_written = || std::fs::read_dir(&base).unwrap().next().is_some();
-
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("input.rlib");
-        std::fs::write(&source, b"fake rlib").unwrap();
-        let missing = || dir.path().join("definitely-missing.rlib");
-
-        // Muted: even a genuine cross-device failure stays silent.
-        set_storage_layout_advice(false);
-        assert!(
-            !hard_link_or_advise_cross_volume(&missing(), &dir.path().join("stage.tmp")),
-            "a failed link is still a failed link when muted"
-        );
-        assert!(
-            !marker_written(),
-            "a muted advisory must not write a marker"
-        );
-
-        // Enabled, wrong error kind: a missing source is NotFound, not a
-        // layout problem, so no advisory.
-        set_storage_layout_advice(true);
-        assert!(!hard_link_or_advise_cross_volume(
-            &missing(),
-            &dir.path().join("stage.tmp")
-        ));
-        assert!(
-            !marker_written(),
-            "a non-cross-volume failure must not advise"
-        );
-
-        // Enabled, genuine cross-device failure: advise exactly once.
-        let shm_dir = Path::new("/dev/shm").join(format!("kache-test-{}", std::process::id()));
-        std::fs::create_dir_all(&shm_dir).unwrap();
-        let same_fs = match (std::fs::metadata(&shm_dir), std::fs::metadata(dir.path())) {
-            (Ok(a), Ok(b)) => a.dev() == b.dev(),
-            _ => false,
-        };
-        assert!(
-            !same_fs,
-            "/dev/shm must be a separate filesystem for this test to mean anything"
-        );
-        assert!(
-            !hard_link_or_advise_cross_volume(&source, &shm_dir.join("stage.tmp")),
-            "a cross-device link must fail"
-        );
-        assert!(marker_written(), "a cross-device failure must advise");
-        set_storage_layout_advice(true);
-        let _ = std::fs::remove_dir_all(&shm_dir);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A failed probe must still warn (a copy-restore IS happening) — but as
@@ -3817,5 +3812,133 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         assert_eq!(io_err.kind(), std::io::ErrorKind::PermissionDenied);
 
         fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn classify_hardlink_cross_device_maps_to_cross_device() {
+        assert_eq!(
+            classify_hardlink_io_error(std::io::ErrorKind::CrossesDevices),
+            HardlinkIoReason::CrossDevice,
+        );
+    }
+
+    #[test]
+    fn classify_hardlink_permission_denied_maps_to_permission() {
+        assert_eq!(
+            classify_hardlink_io_error(std::io::ErrorKind::PermissionDenied),
+            HardlinkIoReason::Permission,
+        );
+    }
+
+    #[test]
+    fn classify_hardlink_other_errno_maps_to_other() {
+        // EMLINK (too many links) and any other errno are not EXDEV/EPERM:
+        // they must not be misreported as a layout problem.
+        assert_eq!(
+            classify_hardlink_io_error(std::io::ErrorKind::AlreadyExists),
+            HardlinkIoReason::Other,
+        );
+    }
+
+    #[test]
+    fn injected_cross_device_restore_records_cross_device_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        fs::write(&blob, b"cached rlib").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let target = dir.path().join("tree.rlib");
+
+        let before = crate::opcounts::restore_copy_cross_device_bytes();
+        let _guard = InjectRestoreHardlinkError::enable(std::io::ErrorKind::CrossesDevices);
+        hardlink_or_copy(&blob, &target, bytes).unwrap();
+        assert!(
+            crate::opcounts::restore_copy_cross_device_bytes() >= before + bytes,
+            "EXDEV injection must record the cross-device reason"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"cached rlib");
+    }
+
+    #[test]
+    fn injected_permission_restore_records_permission_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        fs::write(&blob, b"cached rlib").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let target = dir.path().join("tree.rlib");
+
+        let before = crate::opcounts::restore_copy_permission_bytes();
+        let _guard = InjectRestoreHardlinkError::enable(std::io::ErrorKind::PermissionDenied);
+        hardlink_or_copy(&blob, &target, bytes).unwrap();
+        assert!(
+            crate::opcounts::restore_copy_permission_bytes() >= before + bytes,
+            "EPERM injection must record the permission reason"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"cached rlib");
+    }
+
+    #[test]
+    fn injected_other_restore_records_other_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        fs::write(&blob, b"cached rlib").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let target = dir.path().join("tree.rlib");
+
+        let before = crate::opcounts::restore_copy_other_bytes();
+        let _guard = InjectRestoreHardlinkError::enable(std::io::ErrorKind::AlreadyExists);
+        hardlink_or_copy(&blob, &target, bytes).unwrap();
+        assert!(
+            crate::opcounts::restore_copy_other_bytes() >= before + bytes,
+            "other errno injection must record the other reason"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"cached rlib");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exclusive_precheck_restore_records_exclusive_reason() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        fs::write(&blob, b"cached rlib").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+
+        // Occupy the single exclusive slot: blob + first consumer.
+        let first = dir.path().join("tree-a.rlib");
+        hardlink_or_copy(&blob, &first, bytes).unwrap();
+        assert_eq!(fs::metadata(&blob).unwrap().nlink(), 2);
+
+        let before = crate::opcounts::restore_copy_exclusive_bytes();
+        let second = dir.path().join("tree-b.rlib");
+        hardlink_or_copy(&blob, &second, bytes).unwrap();
+        assert!(
+            crate::opcounts::restore_copy_exclusive_bytes() >= before + bytes,
+            "second consumer must record the exclusive-carrier reason"
+        );
+        assert_ne!(
+            fs::metadata(&second).unwrap().ino(),
+            fs::metadata(&blob).unwrap().ino(),
+            "exclusive fallback must be a private copy"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_blob_restore_records_other_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-blob.rlib");
+        let target = dir.path().join("tree.rlib");
+
+        let before = crate::opcounts::restore_copy_other_bytes();
+        // Metadata cannot verify exclusivity: conservative copy with Other.
+        let result = hardlink_or_copy(&missing, &target, 0);
+        // Copy of a missing source fails, but the Other reason is recorded
+        // before the fallback runs.
+        assert!(result.is_err());
+        assert!(
+            crate::opcounts::restore_copy_other_bytes() >= before,
+            "unverifiable blob must record the other reason"
+        );
     }
 }

@@ -957,23 +957,12 @@ mod tests {
     fn family_probe_cached_result_roundtrips() {
         let temp = TempDir::new().unwrap();
         let _guard = set_test_cache_dir(temp.path());
-
-        let res1 = probe_compiler_family("cc");
-        if res1.is_none() {
-            return;
-        }
-
-        // Locate the cached file on disk.
-        let files: Vec<_> = std::fs::read_dir(temp.path().join("probes"))
-            .unwrap()
-            .map(|r| r.unwrap().path())
-            .collect();
-        assert_eq!(files.len(), 1);
-        let cached_path = &files[0];
-
-        // Read the file, modify the family, and write it back.
-        let bytes = std::fs::read(cached_path).unwrap();
-        let mut hit: ResolvedConfig = serde_json::from_slice(&bytes).unwrap();
+        let compiler =
+            create_mock_probe_script(temp.path(), "mock_family_roundtrip", "echo KACHE_PROBE_GNU");
+        let program = compiler.to_str().unwrap();
+        let res1 = probe_compiler_family(program).unwrap();
+        let key = cache::probe_key_isolated("cc-family", program).unwrap();
+        let mut hit = cache::load(temp.path(), &key).expect("probe result must be persisted");
 
         // Invert the family in the cached record.
         let original_family = hit.version_line.clone();
@@ -984,11 +973,11 @@ mod tests {
         };
         hit.version_line = inverted_family.to_string();
 
-        std::fs::write(cached_path, serde_json::to_vec(&hit).unwrap()).unwrap();
+        cache::store(temp.path(), &key, &hit);
 
         // Call the probe again. It should return the inverted family from the cache hit!
-        let res2 = probe_compiler_family("cc").unwrap();
-        assert_ne!(res1.unwrap(), res2);
+        let res2 = probe_compiler_family(program).unwrap();
+        assert_ne!(res1, res2);
         assert_eq!(res2, parse_family(inverted_family).unwrap());
     }
 

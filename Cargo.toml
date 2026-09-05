@@ -14,6 +14,7 @@ rust-version = "1.95"
 members = [
     "crates/kache-core",
     "crates/kache-format",
+    "crates/kache-store",
     "crates/kache-e2e",
     "crates/kache-proofs",
     "crates/kache-service",
@@ -34,6 +35,7 @@ resolver = "3"
 
 [dependencies]
 kache-format = { version = "0.16.1", path = "crates/kache-format" }
+kache-store = { version = "0.16.1", path = "crates/kache-store" }
 blake3 = "1"
 bytes = "1"
 # OpenDAL 0.58 publishes its modules as separate crates. Depending on only the
@@ -108,6 +110,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+kache-store = { version = "0.16.1", path = "crates/kache-store", features = ["test-support"] }
 assert_cmd = "2"
 axum = "0.8"
 predicates = "3"

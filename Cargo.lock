@@ -2859,6 +2859,7 @@ dependencies = [
  "interprocess",
  "kache-core",
  "kache-format",
+ "kache-store",
  "libc",
  "opendal-core",
  "opendal-http-transport-reqwest",
@@ -2949,6 +2950,23 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "kache-store"
+version = "0.16.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "filetime",
+ "kache-format",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

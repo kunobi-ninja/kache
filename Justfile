@@ -146,7 +146,7 @@ audit:
   set -euo pipefail
   # `--config` is a global option in cargo-deny 0.20 (it no longer parses
   # after the `check` subcommand).
-  for member in . crates/kache-core crates/kache-format crates/kache-service crates/kache-e2e crates/kache-proofs fuzz; do
+  for member in . crates/kache-core crates/kache-format crates/kache-store crates/kache-service crates/kache-e2e crates/kache-proofs fuzz; do
     echo "── cargo deny check ($member) ──"
     ( cd "{{justfile_directory()}}/$member" \
         && cargo deny --config "{{justfile_directory()}}/deny.toml" check )
@@ -386,6 +386,7 @@ coverage:
     --package kache \
     --package kache-core \
     --package kache-format \
+    --package kache-store \
     --package kache-e2e \
     --package kache-proofs \
     --package kache-service \
@@ -394,6 +395,7 @@ coverage:
     --package kache \
     --package kache-core \
     --package kache-format \
+    --package kache-store \
     --package kache-e2e \
     --package kache-proofs \
     --package kache-service \

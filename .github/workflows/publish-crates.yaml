@@ -87,7 +87,7 @@ jobs:
             "Test (macOS)" "Test (Windows)"
 
       - name: Verify publishable packages
-        run: cargo package --locked -p kache-core -p kache-format -p kache
+        run: cargo package --locked -p kache-core -p kache-format -p kache-store -p kache
 
       - name: Authenticate to crates.io
         id: auth
@@ -100,7 +100,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           version="${RELEASE_TAG#v}"
-          for crate in kache-core kache-format kache; do
+          for crate in kache-core kache-format kache-store kache; do
             status="$(curl -sS -A kache-publish-workflow -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/$crate/$version")"
             if [ "$status" = "200" ]; then
               echo "$crate $version is already published"

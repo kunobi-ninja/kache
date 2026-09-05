@@ -27,13 +27,13 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// Percentage of `max_size` a size-pressure sweep evicts *down to*.
-pub(crate) const EVICT_TARGET_PERCENT: u64 = 90;
+pub const EVICT_TARGET_PERCENT: u64 = 90;
 
 /// The low edge of GC's hysteresis band: the size a sweep evicts down to.
 ///
 /// Compute through `u128` so arbitrary byte-sized limits get an exact floor
 /// without overflowing near `u64::MAX`.
-pub(crate) fn eviction_target(max_size: u64) -> u64 {
+pub fn eviction_target(max_size: u64) -> u64 {
     ((max_size as u128 * EVICT_TARGET_PERCENT as u128) / 100) as u64
 }
 
@@ -45,7 +45,7 @@ pub(crate) fn eviction_target(max_size: u64) -> u64 {
 /// enough to dip under before the next `put` pushed it back over. Firing at the
 /// configured cap and stopping at 90% gives the sweep the 10% of headroom the
 /// comment always claimed.
-pub(crate) fn over_eviction_trigger(physical_size: u64, max_size: u64) -> bool {
+pub fn over_eviction_trigger(physical_size: u64, max_size: u64) -> bool {
     physical_size > max_size
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn over_eviction_trigger(physical_size: u64, max_size: u64) -> bool {
 /// Deliberately small: it is materialized for every entry in the store on each
 /// sweep, so new fields should earn their bytes.
 #[derive(Debug, Clone)]
-pub(crate) struct EntryFeatures {
+pub struct EntryFeatures {
     pub key: String,
     pub size: i64,
     pub hit_count: i64,
@@ -80,7 +80,7 @@ pub(crate) struct EntryFeatures {
 }
 
 /// Ranks or filters eviction candidates. Pure: no I/O, no store mutation.
-pub(crate) trait EvictionPolicy {
+pub trait EvictionPolicy {
     /// Stable identifier, for logging and shadow-mode comparison.
     fn name(&self) -> &'static str;
 
@@ -105,7 +105,7 @@ pub(crate) trait EvictionPolicy {
 /// tiny, i.e. last among equally stale candidates.
 ///
 /// Note this score has no notion of what an entry costs to *rebuild*; see #594.
-pub(crate) fn size_pressure_score(e: &EntryFeatures) -> f64 {
+pub fn size_pressure_score(e: &EntryFeatures) -> f64 {
     let idle = e.idle_hours.max(0.01);
     let bytes = e.reclaimable_bytes.unwrap_or(e.size);
     let size_mb = (bytes as f64 / 1_048_576.0).max(0.001);
@@ -113,7 +113,7 @@ pub(crate) fn size_pressure_score(e: &EntryFeatures) -> f64 {
 }
 
 /// Size-pressure eviction: rank every entry by [`size_pressure_score`].
-pub(crate) struct SizePressurePolicy;
+pub struct SizePressurePolicy;
 
 impl EvictionPolicy for SizePressurePolicy {
     fn name(&self) -> &'static str {
@@ -148,14 +148,14 @@ impl EvictionPolicy for SizePressurePolicy {
 /// sub-millisecond compile) rank as worthless and become the shadow's first
 /// victims, and the serve-from-cache cost is treated as negligible rather
 /// than subtracted from the rebuild cost.
-pub(crate) fn value_density_score(e: &EntryFeatures) -> f64 {
+pub fn value_density_score(e: &EntryFeatures) -> f64 {
     let bytes = e.reclaimable_bytes.unwrap_or(e.size);
     let size_mb = (bytes as f64 / 1_048_576.0).max(0.001);
     e.compile_time_ms as f64 / size_mb
 }
 
 /// Pure rebuild-cost-density ranking — the #594 shadow candidate.
-pub(crate) struct ValueDensityPolicy;
+pub struct ValueDensityPolicy;
 
 impl EvictionPolicy for ValueDensityPolicy {
     fn name(&self) -> &'static str {
@@ -188,7 +188,7 @@ impl EvictionPolicy for ValueDensityPolicy {
 /// consume this budget. Good enough for a per-entry agreement verdict;
 /// a faithful counterfactual sweep would need dynamically updated blob
 /// refcounts and the live eligibility rules (#594 follow-up territory).
-pub(crate) fn would_evict_for_budget(
+pub fn would_evict_for_budget(
     candidates: &[EntryFeatures],
     order: &[String],
     bytes_needed: u64,
@@ -219,7 +219,7 @@ pub(crate) fn would_evict_for_budget(
 /// old query kept it. Immaterial for a retention sweep measured in hours, and
 /// the finer comparison is the more truthful one, but it is a difference and
 /// not a pure refactor.
-pub(crate) struct OlderThanPolicy {
+pub struct OlderThanPolicy {
     pub hours: u64,
 }
 
@@ -249,7 +249,7 @@ impl EvictionPolicy for OlderThanPolicy {
 /// by another entry destroys hit history without reclaiming space. Candidates
 /// are eligible only when backfill proves a positive marginal reclaim. Unknown
 /// legacy rows fail closed until a later bounded backfill maps them.
-pub(crate) struct DuplicatePolicy;
+pub struct DuplicatePolicy;
 
 impl EvictionPolicy for DuplicatePolicy {
     fn name(&self) -> &'static str {

@@ -2786,6 +2786,17 @@ pub(crate) fn parse_size_checked(value: &str, source: &str) -> Option<u64> {
     parsed
 }
 
+impl From<&Config> for kache_store::config::Config {
+    fn from(config: &Config) -> Self {
+        Self {
+            cache_dir: config.cache_dir.clone(),
+            max_size: config.max_size,
+            gc_evict_shared: config.gc_evict_shared,
+            upload_spool_max_jobs: UPLOAD_SPOOL_MAX_JOBS,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) use tests::config_path_lock;
 

@@ -1,14 +1,20 @@
 [![CI](https://github.com/kunobi-ninja/kache/actions/workflows/ci.yml/badge.svg)](https://github.com/kunobi-ninja/kache/actions/workflows/ci.yml)
 [![Bench](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml/badge.svg)](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml)
 [![Crates.io](https://img.shields.io/crates/v/kache.svg)](https://crates.io/crates/kache)
-[![Documentation](https://img.shields.io/badge/docs-kunobi.ninja-blue)](https://kunobi.ninja/docs/kache)
-[![Product page](https://img.shields.io/badge/product-kunobi.ninja-orange)](https://kunobi.ninja/product/kache)
+[![Documentation](https://img.shields.io/badge/docs-kunobi.ninja-blue)][docs-badge]
+[![Product page](https://img.shields.io/badge/product-kunobi.ninja-orange)][product-badge]
 
 # Kache
 
 Kache is a local-first compiler cache for Rust and C/C++. It stores build outputs by content, reuses them across worktrees, and can copy them to S3-compatible or filesystem remotes.
 
-![One content-addressed store shared by four Firefox worktrees. Outputs are restored by reflink, so the second and later checkouts add no copied bytes and 27.4 GB is shared rather than duplicated.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/store-worktrees.svg)
+Built by [Kunobi][kunobi-brand].
+
+[Benchmarks][nav-benchmarks] · [Kache vs sccache][nav-comparison] · [CI setup][nav-ci]
+
+[![Diagram of four Firefox worktrees sharing cached build outputs through reflinks.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/store-worktrees.svg)][hero-image]
+
+[See how Kache shares build outputs across worktrees →][hero-details]
 
 ## Install
 
@@ -48,7 +54,9 @@ This wraps rustc only. C and C++ compilations remain uncached.
 | S3-compatible remote storage | Built in | Includes AWS S3, MinIO, and Cloudflare R2 |
 | Filesystem remote storage | Built in | Useful for shared disks and CI volumes |
 
-[![Bytes a second Firefox worktree adds to disk on APFS: about 3 GB for Kache, which reflinks the other 13.5 GB, against 16.7 GB for sccache, which writes an independent copy.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/worktree-cost.svg)](https://kunobi.ninja/blog/kache-storage-worktrees)
+[![Bytes a second Firefox worktree adds to disk on APFS: about 3 GB for Kache, which reflinks the other 13.5 GB, against 16.7 GB for sccache, which writes an independent copy.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/worktree-cost.svg)][storage-chart]
+
+In a Firefox 151 benchmark with Kache 0.7.0 on macOS/APFS, the second worktree added about 3 GB of new data. [Read the measurements and methodology →][storage-report]
 
 Need to choose between compiler caches? Read [Kache or sccache?](https://kunobi.ninja/docs/kache/getting-started/comparison).
 
@@ -57,6 +65,8 @@ Need to choose between compiler caches? Read [Kache or sccache?](https://kunobi.
 The scheduled [benchmark workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) runs real cold/warm builds of Firefox, LLVM, Substrate, SurrealDB, Lance, and OpenDAL on Linux, compares Firefox with sccache, and exercises Firefox on Windows. It also measures how much of a Firefox build survives a source update.
 
 Each run checks its own measurement validity and uploads reports, traces, and logs for 30 days. Treat timing or hit-rate numbers as evidence only when the individual job succeeds and its benchmark verdict is `ok`.
+
+[See the benchmark setup and report guide →][benchmark-guide]
 
 ## CI
 
@@ -129,6 +139,10 @@ Run `kache help <command>` for exact flags. The [command reference](https://kuno
 - [Daemon lifecycle](https://kunobi.ninja/docs/kache/daemon/lifecycle)
 - [Benchmarks](https://kunobi.ninja/docs/kache/benchmarks)
 
+## Also from Kunobi
+
+For Kubernetes and GitOps, [Kunobi Desktop][kunobi-desktop] lets you inspect clusters and manage Flux and Argo CD.
+
 ## Questions and gaps
 
 - [Open a bug report](https://github.com/kunobi-ninja/kache/issues/new?template=bug_report.md) when Kache behaves differently from the documentation.
@@ -145,3 +159,16 @@ cargo test --workspace --all-features
 See [CONTRIBUTING.md](.github/CONTRIBUTING.md) before opening a pull request.
 
 Kache is licensed under the [Apache License 2.0](LICENSE).
+
+[docs-badge]: https://kunobi.ninja/docs/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=docs_badge
+[product-badge]: https://kunobi.ninja/product/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=product_badge
+[kunobi-brand]: https://kunobi.ninja/?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=brand
+[nav-benchmarks]: https://kunobi.ninja/docs/kache/benchmarks?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_benchmarks
+[nav-comparison]: https://kunobi.ninja/docs/kache/getting-started/comparison?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_comparison
+[nav-ci]: https://kunobi.ninja/docs/kache/remote-cache/ci?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=nav_ci
+[hero-image]: https://kunobi.ninja/product/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=hero_image
+[hero-details]: https://kunobi.ninja/product/kache?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=hero_details
+[storage-chart]: https://kunobi.ninja/blog/kache-storage-worktrees?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=storage_chart
+[storage-report]: https://kunobi.ninja/blog/kache-storage-worktrees?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=storage_report
+[benchmark-guide]: https://kunobi.ninja/docs/kache/benchmarks?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=benchmark_guide
+[kunobi-desktop]: https://kunobi.ninja/product/desktop?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=desktop

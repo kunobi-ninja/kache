@@ -3813,6 +3813,9 @@ remote_key_cache_refresh_secs = 900
 
     #[test]
     fn absolutize_volume_path_keeps_absolute_and_joins_relative() {
+        #[cfg(windows)]
+        let abs = Path::new(r"C:\kache-vol-abs");
+        #[cfg(not(windows))]
         let abs = Path::new("/tmp/kache-vol-abs");
         assert_eq!(absolutize_volume_path(abs), abs);
         let rel = absolutize_volume_path(Path::new("kache-vol-rel"));

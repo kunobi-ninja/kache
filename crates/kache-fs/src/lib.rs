@@ -485,6 +485,7 @@ pub fn measure_file(path: &Path) -> io::Result<FileSizing> {
 /// need it, and a dependency's test code is not compiled for its dependents.
 #[cfg(any(test, feature = "testing"))]
 pub mod testutil {
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -524,12 +525,11 @@ pub mod testutil {
                 buf.extend_from_slice(&x.to_le_bytes());
             }
             buf.truncate(bytes);
-            std::fs::write(&p, &buf).expect("write");
+            let mut file = std::fs::File::create(&p).expect("create file");
+            file.write_all(&buf).expect("write");
             // Allocation probes need the writes on disk, including on APFS.
-            std::fs::File::open(&p)
-                .expect("open for sync")
-                .sync_all()
-                .expect("sync");
+            // Windows requires the writable handle for this flush.
+            file.sync_all().expect("sync");
             p
         }
     }

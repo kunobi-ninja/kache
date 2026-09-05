@@ -32,6 +32,9 @@ Prefer tests and deleting dead branches over skip annotations.
 - macOS-only helpers Linux never calls: `#[cfg(any(test, target_os = "macos"))]`.
 - `Drop` / file locks — a second process must acquire after the first drops.
 - New event-log fields — grep `event.schema` in the same commit and bump the tests.
+- A test that passes is not a test that kills the mutant. Apply the mutation by hand, watch the test fail, then revert. A stale-record test passed under both `==` and `!=` because a single client refreshed its own record before the branch was ever reached; it took two clients to make the branch observable.
+- Moving code without changing it still marks every moved line as changed, so the lane mutates lines your change never touched. Wrapping a 200-line block in a `loop` cost six survivors, four of them in code that predated the branch. Extract a function instead: the call site is one changed line and the body is none.
+- Tests that read the live process environment race the rest of the suite, which mutates it (`set_env_for_test`). Take a snapshot and pass it in, or the test passes alone and fails in `just check`.
 
 ## PRs
 

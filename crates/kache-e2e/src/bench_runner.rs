@@ -3739,6 +3739,9 @@ struct PhaseTimes {
     dep_info_ms: u64,
     /// How many of those the phase actually spawned.
     dep_info_runs: u64,
+    /// Sampled verifications where a prediction disagreed with the pre-pass.
+    /// Zero unless the phase asked for the comparison.
+    prediction_mismatches: u64,
     lookup_ms: u64,
     /// Flight join plus permit acquisition.
     wait_ms: u64,
@@ -3757,6 +3760,7 @@ impl PhaseTimes {
             key_ms: ms("total_key_ms"),
             dep_info_ms: ms("total_dep_info_ms"),
             dep_info_runs: ms("dep_info_runs"),
+            prediction_mismatches: ms("prediction_mismatches"),
             lookup_ms: ms("total_lookup_ms"),
             wait_ms: ms("total_wait_ms"),
             restore_ms: ms("total_restore_ms"),

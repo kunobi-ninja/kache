@@ -91,6 +91,16 @@ pub struct BuildEvent {
     /// 0 on every path that never computes a rustc key. Schema 17.
     #[serde(default)]
     pub dep_info_runs: u32,
+    /// Sampled verifications where the predicted input closure disagreed with
+    /// the one the dep-info pre-pass discovered. Schema 18.
+    ///
+    /// This is the number that qualifies input predictions for wider use. The
+    /// pre-pass answer always wins, so a mismatch costs nothing at the time —
+    /// it is evidence that the soundness argument has a hole, and it is only
+    /// counted where `KACHE_VERIFY_INPUT_PREDICTIONS` asked for the
+    /// comparison. Always zero with verification off, which is the default.
+    #[serde(default)]
+    pub prediction_mismatches: u32,
     /// Time blocked joining a machine-wide flight another process already
     /// owned for the same compile (ms). Zero on a hit served at first
     /// lookup; a hit taken on the recheck after the owner finished carries
@@ -1167,6 +1177,9 @@ pub struct EventStats {
     /// Dep-info pre-pass time (inside `total_key_ms`) and spawn count.
     pub total_dep_info_ms: u64,
     pub total_dep_info_runs: u64,
+    /// Sampled verifications that disagreed with the pre-pass. See
+    /// [`BuildEvent::prediction_mismatches`].
+    pub total_prediction_mismatches: u64,
     /// Scheduler waits, kept apart so a saturated pool and a shared flight
     /// stay distinguishable.
     pub total_flight_wait_ms: u64,
@@ -1225,6 +1238,7 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         total_startup_ms: 0,
         total_dep_info_ms: 0,
         total_dep_info_runs: 0,
+        total_prediction_mismatches: 0,
         total_flight_wait_ms: 0,
         total_permit_wait_ms: 0,
         total_unattributed_ms: 0,
@@ -1296,6 +1310,7 @@ pub fn compute_stats(events: &[BuildEvent]) -> EventStats {
         stats.total_startup_ms += event.startup_ms;
         stats.total_dep_info_ms += event.dep_info_ms;
         stats.total_dep_info_runs += u64::from(event.dep_info_runs);
+        stats.total_prediction_mismatches += u64::from(event.prediction_mismatches);
         stats.total_flight_wait_ms += event.flight_wait_ms;
         stats.total_permit_wait_ms += event.permit_wait_ms;
         stats.total_unattributed_ms += event.unattributed_ms();
@@ -1352,6 +1367,7 @@ impl BuildEvent {
             startup_ms: 0,
             dep_info_ms: 0,
             dep_info_runs: 0,
+            prediction_mismatches: 0,
             flight_wait_ms: 0,
             permit_wait_ms: 0,
             store_output_blobs: 0,
@@ -1431,6 +1447,7 @@ mod tests {
             startup_ms: 0,
             dep_info_ms: 0,
             dep_info_runs: 0,
+            prediction_mismatches: 0,
             flight_wait_ms: 0,
             permit_wait_ms: 0,
             store_output_blobs: 0,
@@ -1542,6 +1559,7 @@ mod tests {
         hit.key_ms = 10;
         hit.dep_info_ms = 6;
         hit.dep_info_runs = 1;
+        hit.prediction_mismatches = 2;
         hit.lookup_ms = 2;
         hit.restore_ms = 5;
         // 40 - (3 + 10 + 2 + 5) = 20
@@ -1552,6 +1570,7 @@ mod tests {
         miss.key_ms = 20;
         miss.dep_info_ms = 9;
         miss.dep_info_runs = 1;
+        miss.prediction_mismatches = 3;
         miss.lookup_ms = 1;
         miss.flight_wait_ms = 7;
         miss.permit_wait_ms = 11;
@@ -1562,6 +1581,7 @@ mod tests {
         passthrough.startup_ms = 100;
         passthrough.dep_info_ms = 100;
         passthrough.dep_info_runs = 100;
+        passthrough.prediction_mismatches = 100;
         passthrough.flight_wait_ms = 100;
         passthrough.permit_wait_ms = 100;
 
@@ -1569,6 +1589,10 @@ mod tests {
         assert_eq!(stats.total_startup_ms, 7);
         assert_eq!(stats.total_dep_info_ms, 15);
         assert_eq!(stats.total_dep_info_runs, 2);
+        // Deliberately different from the run counts above, so a total that
+        // sums the wrong field fails. Cacheable outcomes only: the
+        // passthrough's 100 must stay out.
+        assert_eq!(stats.total_prediction_mismatches, 5);
         assert_eq!(stats.total_flight_wait_ms, 7);
         assert_eq!(stats.total_permit_wait_ms, 11);
         assert_eq!(stats.total_unattributed_ms, 47);

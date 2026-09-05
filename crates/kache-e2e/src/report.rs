@@ -52,6 +52,8 @@ pub struct Event {
     /// an older kache without the field still deserialize.
     #[serde(default)]
     pub dep_info_runs: u32,
+    #[serde(default)]
+    pub prediction_mismatches: u32,
     /// Times kache spawned a compiler probe (`cc --version` / `cc -###`)
     /// for this event. `#[serde(default)]` so reports from an older
     /// kache without the field still deserialize.

@@ -8,6 +8,7 @@ pub const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 pub enum FileHashCache<'db> {
     Borrowed(&'db Connection),
+    #[cfg(any(test, feature = "test-support"))]
     Owned(Connection),
 }
 
@@ -37,6 +38,7 @@ pub enum FileHashLookup {
 }
 
 impl<'db> FileHashCache<'db> {
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open(index_db_path: &Path) -> Result<Self> {
         let db = Connection::open(index_db_path)
             .with_context(|| format!("opening file hash cache {}", index_db_path.display()))?;
@@ -50,6 +52,7 @@ impl<'db> FileHashCache<'db> {
     pub fn db(&self) -> &Connection {
         match self {
             Self::Borrowed(db) => db,
+            #[cfg(any(test, feature = "test-support"))]
             Self::Owned(db) => db,
         }
     }

@@ -2105,6 +2105,15 @@ impl Config {
         Self::match_volume_store(&self.volume_stores, path)
     }
 
+    /// Append `sep` unless already there. Pure and platform-neutral so the
+    /// Linux mutation lane covers the Windows trailing-separator rule too.
+    fn ensure_trailing_sep(mut text: String, sep: char) -> String {
+        if !text.ends_with(sep) {
+            text.push(sep);
+        }
+        text
+    }
+
     /// Normalize a `[cache.volumes]` key to a canonical root with a trailing
     /// separator, so `D:`, `d:/`, and `D:\` name one volume (case-insensitive
     /// on Windows, case-sensitive elsewhere). `None` for empty or, on Unix,
@@ -2116,11 +2125,10 @@ impl Config {
         }
         #[cfg(windows)]
         {
-            let mut normalized: String = root.replace('/', "\\").to_uppercase();
-            if !normalized.ends_with('\\') {
-                normalized.push('\\');
-            }
-            Some(normalized)
+            Some(Self::ensure_trailing_sep(
+                root.replace('/', "\\").to_uppercase(),
+                '\\',
+            ))
         }
         #[cfg(not(windows))]
         {
@@ -2131,7 +2139,7 @@ impl Config {
             if trimmed.is_empty() {
                 Some("/".to_string())
             } else {
-                Some(format!("{trimmed}/"))
+                Some(Self::ensure_trailing_sep(trimmed.to_string(), '/'))
             }
         }
     }
@@ -3581,6 +3589,57 @@ remote_key_cache_refresh_secs = 900
             );
             assert_eq!(Config::normalize_volume_root("relative/dir"), None);
             assert_eq!(Config::normalize_volume_root("D:"), None);
+        }
+    }
+
+    #[test]
+    fn ensure_trailing_sep_appends_only_when_missing() {
+        assert_eq!(
+            Config::ensure_trailing_sep("D:\\".to_string(), '\\'),
+            "D:\\"
+        );
+        assert_eq!(Config::ensure_trailing_sep("D:".to_string(), '\\'), "D:\\");
+        assert_eq!(
+            Config::ensure_trailing_sep("/mnt".to_string(), '/'),
+            "/mnt/"
+        );
+        assert_eq!(Config::ensure_trailing_sep(String::new(), '/'), "/");
+    }
+
+    #[test]
+    fn load_volume_stores_dedupes_duplicate_roots_deterministically() {
+        // "/mnt/" and "/mnt" normalize alike (likewise "D:"/"d:/" on
+        // Windows); the lexicographically-first store wins, stably.
+        let file_config: Result<FileConfig> = Ok(FileConfig {
+            cache: Some(CacheFileConfig {
+                volumes: Some(
+                    [
+                        ("/mnt/".to_string(), "b-store".to_string()),
+                        ("/mnt".to_string(), "a-store".to_string()),
+                        ("/other/".to_string(), "c-store".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let shards = Config::load_volume_stores(&file_config);
+        let kept: Vec<(&str, &str)> = shards
+            .iter()
+            .map(|shard| (shard.volume.as_str(), shard.store.to_str().unwrap()))
+            .collect();
+        if cfg!(windows) {
+            // Unix-style keys still normalize consistently there; the point
+            // here is dedup mechanics, not platform roots.
+            assert_eq!(kept.len(), 2);
+        } else {
+            assert_eq!(
+                kept,
+                vec![("/mnt/", "a-store"), ("/other/", "c-store"),],
+                "duplicates collapse to the first store, distinct roots survive"
+            );
         }
     }
 

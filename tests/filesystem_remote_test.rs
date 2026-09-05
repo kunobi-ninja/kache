@@ -62,6 +62,20 @@ impl Client {
         Self::with_runtime(shared_folder, cache_dir.to_path_buf(), runtime)
     }
 
+    /// A client that derives keys from recorded input closures. The config
+    /// carries the flag rather than the environment because these clients set
+    /// `ignore_env`.
+    fn with_predictions(shared_folder: &Path) -> Self {
+        let client = Self::new(shared_folder);
+        let config = std::fs::read_to_string(&client.config_path).unwrap();
+        std::fs::write(
+            &client.config_path,
+            config.replace("[cache]\n", "[cache]\ninput_predictions = true\n"),
+        )
+        .unwrap();
+        client
+    }
+
     fn with_runtime(shared_folder: &Path, cache_dir: PathBuf, runtime: TempDir) -> Self {
         let runtime_dir = runtime.path().to_path_buf();
         let config_path = if runtime_dir == cache_dir {
@@ -450,6 +464,157 @@ impl Drop for Client {
 /// caller's pipe handles. Daemon spawning now prevents that leak; file-backed
 /// capture and per-command deadlines remain defense in depth and make any
 /// future hang fail with a bounded, specific diagnostic.
+/// A predicted key must be allowed to ask the REMOTE before it is checked.
+///
+/// The soundness rule is that a prediction may never claim or store, not that
+/// it may never read. An entry on the remote was stored under a key computed
+/// from a discovered closure exactly as a local one was, so matching it proves
+/// the prediction reproduced that closure.
+///
+/// Re-deriving before the remote check instead made the feature worthless for
+/// the case it exists for: a checkout with an empty local store missed
+/// locally on every unit and paid a full dep-info pre-pass before the warm
+/// remote was ever asked. This pins that it no longer does.
+#[test]
+fn a_predicted_key_reaches_the_remote_without_a_pre_pass() {
+    build_kache();
+
+    let shared = TempDir::new().unwrap();
+    let source = TempDir::new().unwrap();
+    std::fs::write(
+        source.path().join("lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
+
+    let client = Client::with_predictions(shared.path());
+    let out = TempDir::new().unwrap();
+    client.start_daemon();
+
+    // Cold: compiles, records the closure, publishes to the folder.
+    client.compile_checkout(source.path(), out.path());
+    let cold = crate_event(&client.report(), "fsremote").clone();
+    assert!(
+        cold["result"] == "miss" || cold["result"] == "dup",
+        "the first compile must be a real compile: {cold}"
+    );
+    assert_eq!(
+        cold["dep_info_runs"], 1,
+        "a cold compile has no record to derive from: {cold}"
+    );
+    let cache_key = cold["cache_key"].as_str().unwrap().to_owned();
+    wait_for_remote_entry(shared.path(), "fsremote", &cache_key);
+
+    // Drop the local artifact and keep the recorded closure. That is the
+    // shape of a fresh checkout against a warm remote: the key can be
+    // derived, and nothing is stored locally to serve it.
+    // Delete the entry's blobs so the local store cannot serve it. The
+    // recorded closure lives in the index and survives, which is exactly the
+    // asymmetry a fresh checkout has once records are distributed: it can
+    // derive the key and has no artifact behind it.
+    let mut blobs = Vec::new();
+    collect_files(&client.cache_dir.join("store/blobs"), &mut blobs);
+    assert!(
+        !blobs.is_empty(),
+        "the cold compile should have stored blobs"
+    );
+    for blob in &blobs {
+        std::fs::remove_file(blob).unwrap();
+    }
+
+    std::fs::remove_dir_all(out.path()).unwrap();
+    std::fs::create_dir_all(out.path()).unwrap();
+    client.compile_checkout(source.path(), out.path());
+    let served = crate_event(&client.report(), "fsremote").clone();
+
+    assert_eq!(
+        served["cache_key"], cold["cache_key"],
+        "the derived key must be the one the pre-pass produced: {served}"
+    );
+    assert!(
+        served["result"] == "remote_hit" || served["result"] == "prefetch_hit",
+        "the remote must serve it: {served}"
+    );
+    assert_eq!(
+        served["dep_info_runs"], 0,
+        "a predicted key that the remote can serve must spawn no pre-pass: {served}"
+    );
+    assert_eq!(
+        served["compiler_runs"], 0,
+        "nothing may recompile: {served}"
+    );
+
+    client.stop_daemon_and_wait();
+}
+
+/// A record that no longer describes the tree derives a key nothing was ever
+/// stored under. The re-derivation that follows produces a key this build has
+/// not looked up yet, and on a shared cache another machine may already hold
+/// it — so the lookup phase runs a second pass rather than compiling.
+///
+/// Two clients, because one client cannot hold a stale record: its own
+/// re-derivation refreshes the record before the next build sees it. Only a
+/// second machine can publish the true key while the first still believes an
+/// older closure.
+#[test]
+fn a_stale_prediction_still_finds_the_true_key_on_the_remote() {
+    build_kache();
+
+    let shared = TempDir::new().unwrap();
+    let tree = TempDir::new().unwrap();
+    let src = tree.path().join("lib.rs");
+    std::fs::write(&src, "pub fn answer() -> u32 { 42 }\n").unwrap();
+
+    // Client A records the closure of the ORIGINAL source and stops there.
+    let alpha = Client::with_predictions(shared.path());
+    let out_a = TempDir::new().unwrap();
+    alpha.start_daemon();
+    alpha.compile_checkout(tree.path(), out_a.path());
+    let recorded = crate_event(&alpha.report(), "fsremote").clone();
+    assert_eq!(recorded["dep_info_runs"], 1, "{recorded}");
+    alpha.stop_daemon_and_wait();
+
+    // The tree grows a module. A's record now names lib.rs alone and is stale.
+    std::fs::write(tree.path().join("extra.rs"), "pub fn more() -> u32 { 1 }\n").unwrap();
+    std::fs::write(
+        &src,
+        "mod extra;\npub fn answer() -> u32 { 42 + extra::more() }\n",
+    )
+    .unwrap();
+
+    // Client B compiles the grown tree and publishes the TRUE key. B has its
+    // own cache, so nothing about A's record changes.
+    let beta = Client::new(shared.path());
+    let out_b = TempDir::new().unwrap();
+    beta.start_daemon();
+    beta.compile_checkout(tree.path(), out_b.path());
+    let published = crate_event(&beta.report(), "fsremote").clone();
+    assert_ne!(
+        published["cache_key"], recorded["cache_key"],
+        "a bigger closure must key differently: {published}"
+    );
+    let true_key = published["cache_key"].as_str().unwrap().to_owned();
+    wait_for_remote_entry(shared.path(), "fsremote", &true_key);
+    beta.stop_daemon_and_wait();
+
+    // A compiles the grown tree holding a record for the old one. The
+    // prediction derives a key nothing ever stored; the re-derivation
+    // produces the true key, which only the remote holds.
+    alpha.start_daemon();
+    alpha.compile_checkout(tree.path(), out_a.path());
+    let served = crate_event(&alpha.report(), "fsremote").clone();
+    assert_eq!(
+        served["cache_key"], published["cache_key"],
+        "the stale record must not decide the key: {served}"
+    );
+    assert_eq!(
+        served["compiler_runs"], 0,
+        "the remote holds the true key; a second pass must find it \
+         instead of recompiling: {served}"
+    );
+    alpha.stop_daemon_and_wait();
+}
+
 #[test]
 fn daemon_upload_reaches_an_independent_client_through_one_folder() {
     build_kache();

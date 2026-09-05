@@ -2158,38 +2158,200 @@ fn run_parsed_rustc(
 
     tracing::debug!("cache key for {}: {}", crate_name, &cache_key[..16]);
 
-    // 1. Check local store
-    let lookup_start = std::time::Instant::now();
-    let lookup_result = match store.get(&cache_key) {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::warn!(
-                "local store lookup failed for {}: {} — recompiling",
-                crate_name,
-                e
-            );
-            return passthrough_with_event(
-                config,
-                args,
-                crate_name,
-                &event_root,
-                start,
-                format!("store lookup failed: {e}"),
-            );
-        }
-    };
-    let mut lookup_ms = lookup_start.elapsed().as_millis() as u64;
-
-    // The rule that keeps a prediction from ever reaching the cache as an
-    // authority: a derived key that MISSES locally is re-derived from a real
-    // pre-pass, and looked up again, before anything downstream sees it.
+    // A prediction may READ the cache, local or remote, before it has been
+    // checked. The soundness argument does not distinguish the two: an entry
+    // anywhere was stored under a key computed from a discovered closure, so
+    // matching it proves the prediction reproduced that closure. What a
+    // prediction may not do is CLAIM or STORE, so the re-derivation moved to
+    // the point below where both lookups have missed.
     //
-    // A hit needs no such thing — the entry it matched was stored under a key
-    // computed from a discovered closure, so matching it proves the prediction
-    // reproduced that closure. A miss proves nothing, and a stale record on a
-    // second machine could otherwise derive the same wrong key and hit an
-    // entry compiled from a larger input set.
-    let (lookup_result, redrive) = if needs_rederivation(predicted, lookup_result.is_some()) {
+    // Re-deriving before the remote check, as this did originally, made the
+    // whole feature worthless for the case it was built for: a fresh clone has
+    // an empty local store, so every unit missed locally and paid the pre-pass
+    // before the warm remote was ever asked.
+    //
+    // The loop runs at most twice. A re-derivation that changes the key has
+    // produced a key nothing has looked up yet, and on a shared cache another
+    // machine may well hold it; a second pass is one lookup against a compile.
+    // Summed across both passes: a second lookup is real time this
+    // invocation spent looking.
+    let mut lookup_ms = 0_u64;
+    let mut record_closure = should_record_closure(predicted, false);
+    let mut rederived = false;
+    loop {
+        // 1. Check local store
+        let lookup_start = std::time::Instant::now();
+        let lookup_result = match store.get(&cache_key) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(
+                    "local store lookup failed for {}: {} — recompiling",
+                    crate_name,
+                    e
+                );
+                return passthrough_with_event(
+                    config,
+                    args,
+                    crate_name,
+                    &event_root,
+                    start,
+                    format!("store lookup failed: {e}"),
+                );
+            }
+        };
+        lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
+
+        // A closure that came from a record is already recorded; re-writing it on
+        // every hit would be a database write per compile for no new information.
+        // A re-derivation is the opposite case: its closure is what the record
+        // should have said, so writing it is what repairs a stale row.
+
+        if let Some(meta) = lookup_result {
+            // Safety: skip entries with no cached files (poisoned by earlier bugs)
+            if meta.files.is_empty() {
+                tracing::warn!(
+                    "cache entry for {} has no files, evicting and recompiling",
+                    crate_name
+                );
+                let _ = store.remove_entry(&cache_key);
+            } else {
+                tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
+                let restore_start = std::time::Instant::now();
+                if let Err(e) = restore_from_cache(
+                    config,
+                    compiler,
+                    &BlobSource::Store(&store),
+                    args,
+                    &meta,
+                    extra_inputs,
+                ) {
+                    tracing::warn!(
+                        "restoring local cache hit for {} failed: {} — recompiling",
+                        crate_name,
+                        e
+                    );
+                    return passthrough_with_event(
+                        config,
+                        args,
+                        crate_name,
+                        &event_root,
+                        start,
+                        format!("restore failed: {e}"),
+                    );
+                }
+                let restore_ms = restore_start.elapsed().as_millis() as u64;
+                let elapsed = start.elapsed().as_millis() as u64;
+                let size: u64 = meta.files.iter().map(|f| f.size).sum();
+                log_event_with_hash_stats(
+                    config,
+                    &event_root,
+                    crate_name,
+                    EventResult::LocalHit,
+                    elapsed,
+                    meta.compile_time_ms,
+                    size,
+                    &cache_key,
+                    key_ms,
+                    key_hash_stats,
+                    lookup_ms,
+                    restore_ms,
+                    0,
+                );
+                record_input_prediction(config, Some(&store), args, record_closure);
+                print_progress(crate_name, EventResult::LocalHit, elapsed, size);
+                replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+                clean_incremental_dir(config, args);
+                reset_adaptive_unit(adaptive_unit.as_ref());
+
+                return Ok(0);
+            }
+        }
+
+        // Build-session detection: send prefetch hint before remote work.
+        // Placed after local-hit check so warm-cache invocations skip this entirely.
+        maybe_trigger_prefetch(config, args);
+
+        // 2. Check remote cache via daemon (if configured)
+        if config.remote.is_some() {
+            let entry_dir = store.entry_dir(&cache_key);
+            // No `if result.found` guard: it only predicts what the read
+            // below settles. Reaching here means the local lookup already
+            // missed on this pass, so the entry is present exactly when
+            // the daemon just fetched it — which is what `found` reports.
+            // In the race where another process stored it meanwhile,
+            // serving it beats recompiling; only the label is imprecise,
+            // and `prefetched` still separates a prefetch from a fetch.
+            // A daemon that never answered is a miss; the build compiles.
+            if let Some(result) =
+                crate::daemon::send_remote_check(config, &cache_key, &entry_dir, crate_name)
+                && let Ok(Some(meta)) = store.get(&cache_key)
+            {
+                let event_result = if result.prefetched {
+                    tracing::debug!(
+                        "prefetch cache hit for {} ({})",
+                        crate_name,
+                        &cache_key[..16]
+                    );
+                    EventResult::PrefetchHit
+                } else {
+                    tracing::debug!("remote cache hit for {} ({})", crate_name, &cache_key[..16]);
+                    EventResult::RemoteHit
+                };
+                let restore_start = std::time::Instant::now();
+                if let Err(e) = restore_from_cache(
+                    config,
+                    compiler,
+                    &BlobSource::Store(&store),
+                    args,
+                    &meta,
+                    extra_inputs,
+                ) {
+                    tracing::warn!(
+                        "restoring cache hit for {} failed: {} — recompiling",
+                        crate_name,
+                        e
+                    );
+                    return passthrough_with_event(
+                        config,
+                        args,
+                        crate_name,
+                        &event_root,
+                        start,
+                        format!("restore failed: {e}"),
+                    );
+                }
+                let restore_ms = restore_start.elapsed().as_millis() as u64;
+                let elapsed = start.elapsed().as_millis() as u64;
+                let size: u64 = meta.files.iter().map(|f| f.size).sum();
+                log_event_with_hash_stats(
+                    config,
+                    &event_root,
+                    crate_name,
+                    event_result,
+                    elapsed,
+                    meta.compile_time_ms,
+                    size,
+                    &cache_key,
+                    key_ms,
+                    key_hash_stats,
+                    lookup_ms,
+                    restore_ms,
+                    0,
+                );
+                print_progress(crate_name, event_result, elapsed, size);
+                replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+                clean_incremental_dir(config, args);
+                reset_adaptive_unit(adaptive_unit.as_ref());
+                return Ok(0);
+            }
+        }
+
+        if !owes_rederivation(predicted, rederived) {
+            break;
+        }
+        rederived = true;
+        record_closure = should_record_closure(predicted, rederived);
+        let previous_key = cache_key.clone();
         match recompute_key_without_prediction(
             config,
             compiler,
@@ -2213,13 +2375,6 @@ fn run_parsed_rustc(
                     recomputed.key_too_new,
                 );
                 guard_inputs.extend(recomputed.guard_inputs);
-                // Look up again unconditionally. The key has usually changed,
-                // and when it has not this is one index read set against the
-                // whole pre-pass just paid for.
-                let retry = std::time::Instant::now();
-                let result = store.get(&cache_key).unwrap_or_default();
-                lookup_ms = lookup_ms.saturating_add(retry.elapsed().as_millis() as u64);
-                (result, true)
             }
             // The pre-pass failed, which is the ordinary uncacheable case.
             Err(e) => {
@@ -2233,164 +2388,10 @@ fn run_parsed_rustc(
                 );
             }
         }
-    } else {
-        (lookup_result, false)
-    };
-
-    // A closure that came from a record is already recorded; re-writing it on
-    // every hit would be a database write per compile for no new information.
-    // A re-derivation is the opposite case: its closure is what the record
-    // should have said, so writing it is what repairs a stale row.
-    let record_closure = should_record_closure(predicted, redrive);
-
-    if let Some(meta) = lookup_result {
-        // Safety: skip entries with no cached files (poisoned by earlier bugs)
-        if meta.files.is_empty() {
-            tracing::warn!(
-                "cache entry for {} has no files, evicting and recompiling",
-                crate_name
-            );
-            let _ = store.remove_entry(&cache_key);
-        } else {
-            tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
-            let restore_start = std::time::Instant::now();
-            if let Err(e) = restore_from_cache(
-                config,
-                compiler,
-                &BlobSource::Store(&store),
-                args,
-                &meta,
-                extra_inputs,
-            ) {
-                tracing::warn!(
-                    "restoring local cache hit for {} failed: {} — recompiling",
-                    crate_name,
-                    e
-                );
-                return passthrough_with_event(
-                    config,
-                    args,
-                    crate_name,
-                    &event_root,
-                    start,
-                    format!("restore failed: {e}"),
-                );
-            }
-            let restore_ms = restore_start.elapsed().as_millis() as u64;
-            let elapsed = start.elapsed().as_millis() as u64;
-            let size: u64 = meta.files.iter().map(|f| f.size).sum();
-            log_event_with_hash_stats(
-                config,
-                &event_root,
-                crate_name,
-                EventResult::LocalHit,
-                elapsed,
-                meta.compile_time_ms,
-                size,
-                &cache_key,
-                key_ms,
-                key_hash_stats,
-                lookup_ms,
-                restore_ms,
-                0,
-            );
-            record_input_prediction(config, Some(&store), args, record_closure);
-            print_progress(crate_name, EventResult::LocalHit, elapsed, size);
-            // Print cached stdout/stderr
-            if !meta.stdout.is_empty() {
-                print!("{}", meta.stdout);
-            }
-            if !meta.stderr.is_empty() {
-                eprint!("{}", meta.stderr);
-            }
-            clean_incremental_dir(config, args);
-            reset_adaptive_unit(adaptive_unit.as_ref());
-
-            return Ok(0);
-        }
-    }
-
-    // Build-session detection: send prefetch hint before remote work.
-    // Placed after local-hit check so warm-cache invocations skip this entirely.
-    maybe_trigger_prefetch(config, args);
-
-    // 2. Check remote cache via daemon (if configured)
-    if config.remote.is_some() {
-        let entry_dir = store.entry_dir(&cache_key);
-        match crate::daemon::send_remote_check(config, &cache_key, &entry_dir, crate_name) {
-            Some(result) if result.found => {
-                // Daemon downloaded it — now read from local store and restore
-                if let Ok(Some(meta)) = store.get(&cache_key) {
-                    let event_result = if result.prefetched {
-                        tracing::debug!(
-                            "prefetch cache hit for {} ({})",
-                            crate_name,
-                            &cache_key[..16]
-                        );
-                        EventResult::PrefetchHit
-                    } else {
-                        tracing::debug!(
-                            "remote cache hit for {} ({})",
-                            crate_name,
-                            &cache_key[..16]
-                        );
-                        EventResult::RemoteHit
-                    };
-                    let restore_start = std::time::Instant::now();
-                    if let Err(e) = restore_from_cache(
-                        config,
-                        compiler,
-                        &BlobSource::Store(&store),
-                        args,
-                        &meta,
-                        extra_inputs,
-                    ) {
-                        tracing::warn!(
-                            "restoring cache hit for {} failed: {} — recompiling",
-                            crate_name,
-                            e
-                        );
-                        return passthrough_with_event(
-                            config,
-                            args,
-                            crate_name,
-                            &event_root,
-                            start,
-                            format!("restore failed: {e}"),
-                        );
-                    }
-                    let restore_ms = restore_start.elapsed().as_millis() as u64;
-                    let elapsed = start.elapsed().as_millis() as u64;
-                    let size: u64 = meta.files.iter().map(|f| f.size).sum();
-                    log_event_with_hash_stats(
-                        config,
-                        &event_root,
-                        crate_name,
-                        event_result,
-                        elapsed,
-                        meta.compile_time_ms,
-                        size,
-                        &cache_key,
-                        key_ms,
-                        key_hash_stats,
-                        lookup_ms,
-                        restore_ms,
-                        0,
-                    );
-                    print_progress(crate_name, event_result, elapsed, size);
-                    if !meta.stdout.is_empty() {
-                        print!("{}", meta.stdout);
-                    }
-                    if !meta.stderr.is_empty() {
-                        eprint!("{}", meta.stderr);
-                    }
-                    clean_incremental_dir(config, args);
-                    reset_adaptive_unit(adaptive_unit.as_ref());
-                    return Ok(0);
-                }
-            }
-            Some(_) => {} // not in remote, continue to compile
-            None => {}    // daemon unreachable, continue to compile
+        if cache_key == previous_key {
+            // The prediction was right. Both lookups already answered for
+            // this key; asking again would be the same two misses.
+            break;
         }
     }
 
@@ -3507,14 +3508,19 @@ fn compute_rustc_cache_key(
     })
 }
 
-/// Does this key still owe a re-derivation before anything may act on it?
+/// Does this key still owe a re-derivation before it may CLAIM or STORE?
 ///
-/// Only a key that came from a record AND found nothing locally. A hit needs
-/// no check: the entry it matched was stored under a key computed from a
-/// discovered closure, so matching it proves the prediction reproduced that
-/// closure. A key that was never predicted is already the discovered one.
-fn needs_rederivation(predicted: bool, found_locally: bool) -> bool {
-    predicted && !found_locally
+/// Reached only once both the local and the remote lookup have missed, since
+/// a hit returns from inside the loop. So the question is no longer "did we
+/// find it" but only "is this key still a guess": a key that was never
+/// predicted is the discovered one already, and so is one already re-derived.
+///
+/// Reading the cache under a predicted key is deliberately NOT gated here. An
+/// entry anywhere was stored under a key computed from a discovered closure,
+/// so matching it proves the prediction reproduced that closure — the same
+/// argument for a remote entry as for a local one.
+fn owes_rederivation(predicted: bool, already_rederived: bool) -> bool {
+    predicted && !already_rederived
 }
 
 /// Should this invocation write what it discovered back to the record?
@@ -5457,28 +5463,26 @@ mod tests {
         RustcCompiler::new().parse(&s(args)).unwrap()
     }
 
-    /// The two rules that keep a prediction from ever being an authority.
+    /// The rule that keeps a prediction from ever being an authority.
     ///
-    /// Between them they decide whether a key may reach the remote, the
-    /// scheduler and the store as-is, and whether a record gets rewritten.
+    /// Reached only once both lookups have missed, so it is not asking "did we
+    /// find it" — a hit has already returned. It asks whether this key is
+    /// still a guess, and a guess may not claim or store.
     #[test]
-    fn a_predicted_key_owes_a_rederivation_only_when_it_missed() {
-        // predicted, found locally
+    fn a_predicted_key_owes_a_rederivation_until_it_has_had_one() {
         assert!(
-            !needs_rederivation(true, true),
-            "a predicted key that HIT matched an entry stored under a \
-             discovered closure, which proves the prediction reproduced it"
+            owes_rederivation(true, false),
+            "a key that came from a record and matched nothing is still a guess"
         );
         assert!(
-            needs_rederivation(true, false),
-            "a predicted key that missed has proven nothing and must be \
-             recomputed before anything downstream sees it"
+            !owes_rederivation(true, true),
+            "one re-derivation is enough; a second would be the same pre-pass"
         );
         assert!(
-            !needs_rederivation(false, false),
+            !owes_rederivation(false, false),
             "a key that was never predicted is already the discovered one"
         );
-        assert!(!needs_rederivation(false, true));
+        assert!(!owes_rederivation(false, true));
     }
 
     #[test]

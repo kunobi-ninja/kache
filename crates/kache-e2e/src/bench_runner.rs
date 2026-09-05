@@ -3447,7 +3447,7 @@ fn write_summary(
         "  kache saw     : {} compiles -> {} cached, {} passed through, {} errored",
         el.total, el.cached, el.passed_through, el.errored
     )?;
-    if let Some(line) = prediction_summary_line(&r.warm.phases, r.warm.total_crates) {
+    if let Some(line) = prediction_summary_line(&r.warm.phases, r.cold.phases.dep_info_runs) {
         writeln!(out, "{line}")?;
     }
     if !el.top_passthrough.is_empty() {
@@ -3755,28 +3755,39 @@ struct PhaseTimes {
 }
 
 /// The two numbers that say whether input predictions are working and whether
-/// they are honest: how many units skipped the dep-info pre-pass, and how many
-/// sampled cross-checks disagreed with it.
+/// they are honest: how many rustc units skipped the dep-info pre-pass, and
+/// how many sampled cross-checks disagreed with it.
 ///
-/// `None` when the phase spawned a pre-pass for every unit, which is what an
-/// arm that never enabled predictions looks like. Saying "0 of N skipped"
-/// there would read as a result rather than as an absent feature.
-fn prediction_summary_line(phases: &PhaseTimes, total_crates: u64) -> Option<String> {
-    let skipped = total_crates.checked_sub(phases.dep_info_runs)?;
+/// The denominator is the COLD phase's pre-pass count, not the phase's crate
+/// count. A cold build has no records, so it runs exactly one pre-pass per
+/// rustc unit — which is the only place that number is available. The crate
+/// count includes cc compiles, which never run one, so dividing by it would
+/// have claimed hk skipped "890 of 890" when 315 units ran the pre-pass and
+/// none skipped.
+///
+/// `None` when the warm phase ran a pre-pass for every unit the cold phase
+/// did, which is what an arm that never enabled predictions looks like.
+fn prediction_summary_line(warm: &PhaseTimes, cold_dep_info_runs: u64) -> Option<String> {
+    let skipped = cold_dep_info_runs.checked_sub(warm.dep_info_runs)?;
     if skipped == 0 {
         return None;
     }
     Some(format!(
-        "  predictions   : {skipped} of {total_crates} units skipped the dep-info pre-pass; \
-         {} sampled check(s) disagreed",
-        phases.prediction_mismatches
+        "  predictions   : {skipped} of {cold_dep_info_runs} rustc units skipped the \
+         dep-info pre-pass; {} sampled check(s) disagreed",
+        warm.prediction_mismatches
     ))
 }
 
 impl PhaseTimes {
     fn from_raw(raw: &serde_json::Value) -> Self {
-        let sum = &raw["summary"];
-        let ms = |key: &str| sum[key].as_u64().unwrap_or(0);
+        // `timing`, not `summary`. Every field below is published under
+        // `timing` in the report schema; reading `summary` returned zero for
+        // all of them, which the perf gate's phase table renders as "no phase
+        // data" — indistinguishable from an external backend that has none.
+        // The table shipped and never once appeared.
+        let timing = &raw["timing"];
+        let ms = |key: &str| timing[key].as_u64().unwrap_or(0);
         Self {
             startup_ms: ms("total_startup_ms"),
             key_ms: ms("total_key_ms"),
@@ -4222,79 +4233,121 @@ mod tests {
         ));
     }
 
-    /// The line only appears for a phase that actually used predictions.
-    /// "0 of N skipped" on an arm that never enabled them would read as a
-    /// result rather than as an absent feature.
+    /// The denominator is the cold phase's pre-pass count, because that is
+    /// one per rustc unit and nothing else in the result is. Using the crate
+    /// count would have reported hk as "890 of 890 skipped" when 315 units ran
+    /// the pre-pass and none skipped: cc compiles inflate the crate count and
+    /// never run one.
     #[test]
-    fn the_prediction_line_reports_only_a_phase_that_used_them() {
-        let phases = |runs: u64, mismatches: u64| PhaseTimes {
+    fn the_prediction_line_counts_rustc_units_not_all_compiles() {
+        let warm = |runs: u64, mismatches: u64| PhaseTimes {
             dep_info_runs: runs,
             prediction_mismatches: mismatches,
             ..PhaseTimes::default()
         };
 
-        let used = prediction_summary_line(&phases(77, 0), 663).expect("predictions were used");
-        assert!(used.contains("586 of 663"), "{used}");
+        let used = prediction_summary_line(&warm(28, 0), 306).expect("predictions were used");
+        assert!(used.contains("278 of 306 rustc units"), "{used}");
         assert!(used.contains("0 sampled check(s) disagreed"), "{used}");
 
-        let disagreed = prediction_summary_line(&phases(77, 4), 663).unwrap();
+        let disagreed = prediction_summary_line(&warm(28, 4), 306).unwrap();
         assert!(
             disagreed.contains("4 sampled check(s) disagreed"),
             "{disagreed}"
         );
 
         assert_eq!(
-            prediction_summary_line(&phases(663, 0), 663),
+            prediction_summary_line(&warm(315, 0), 315),
             None,
             "every unit ran the pre-pass, so predictions did nothing here"
         );
         assert_eq!(
-            prediction_summary_line(&phases(0, 0), 0),
+            prediction_summary_line(&warm(0, 0), 0),
             None,
-            "a phase with no units has nothing to report"
+            "an arm with no rustc units has nothing to report"
         );
         assert_eq!(
-            prediction_summary_line(&phases(700, 0), 663),
+            prediction_summary_line(&warm(400, 0), 306),
             None,
-            "more spawns than units is not a skip count; say nothing"
+            "more warm spawns than cold is not a skip count; say nothing"
         );
     }
 
-    /// Every field here is a key in `kache report --format json`. Nothing else
-    /// couples the two, so a renamed field in the report would silently turn
-    /// this table into zeroes — which reads as "the phase did not run" rather
-    /// than "we stopped reading it".
+    /// Every field here is a key under `timing` in `kache report --format
+    /// json`. Nothing else couples the two, and the previous version of this
+    /// test built its fixture from the code's own assumption — it fed a
+    /// `{"summary": {...}}` object and passed while production read the wrong
+    /// object and got zero for everything.
+    ///
+    /// So the oracle is the published schema, which is the actual contract.
     #[test]
-    fn phase_times_read_the_report_summary_field_by_field() {
+    fn phase_times_read_the_fields_the_schema_publishes_under_timing() {
+        let schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../docs/commands/report.schema.json"),
+            )
+            .expect("the published report schema"),
+        )
+        .expect("the schema is JSON");
+
+        let declared = |object: &str, field: &str| {
+            schema["properties"][object]["properties"]
+                .get(field)
+                .is_some()
+        };
+
+        // The names `from_raw` reads, listed once so the assertion below and
+        // production cannot disagree about the set.
+        let fields = [
+            "total_startup_ms",
+            "total_key_ms",
+            "total_dep_info_ms",
+            "dep_info_runs",
+            "prediction_mismatches",
+            "total_lookup_ms",
+            "total_wait_ms",
+            "total_restore_ms",
+            "total_store_ms",
+            "total_unattributed_ms",
+        ];
+        for field in fields {
+            assert!(
+                declared("timing", field),
+                "{field} is not published under `timing`; from_raw reads it there"
+            );
+            assert!(
+                !declared("summary", field),
+                "{field} also exists under `summary` — the two objects must not \
+                 both carry it, or reading the wrong one stays invisible"
+            );
+        }
+
+        // And the values arrive, keyed off that object.
         let raw = serde_json::json!({
-            "summary": {
-                "total_startup_ms": 11,
-                "total_key_ms": 22,
-                "total_dep_info_ms": 33,
-                "dep_info_runs": 44,
-                "total_lookup_ms": 55,
-                "total_wait_ms": 66,
-                "total_restore_ms": 77,
-                "total_store_ms": 88,
-                "total_unattributed_ms": 99,
-            }
+            "timing": {
+                "total_startup_ms": 11, "total_key_ms": 22, "total_dep_info_ms": 33,
+                "dep_info_runs": 44, "prediction_mismatches": 55, "total_lookup_ms": 66,
+                "total_wait_ms": 77, "total_restore_ms": 88, "total_store_ms": 99,
+                "total_unattributed_ms": 111,
+            },
+            "summary": { "total_key_ms": 999 },
         });
         let phases = PhaseTimes::from_raw(&raw);
         assert_eq!(phases.startup_ms, 11);
-        assert_eq!(phases.key_ms, 22);
+        assert_eq!(phases.key_ms, 22, "a value under `summary` must not win");
         assert_eq!(phases.dep_info_ms, 33);
         assert_eq!(phases.dep_info_runs, 44);
-        assert_eq!(phases.lookup_ms, 55);
-        assert_eq!(phases.wait_ms, 66);
-        assert_eq!(phases.restore_ms, 77);
-        assert_eq!(phases.store_ms, 88);
-        assert_eq!(phases.unattributed_ms, 99);
+        assert_eq!(phases.prediction_mismatches, 55);
+        assert_eq!(phases.lookup_ms, 66);
+        assert_eq!(phases.wait_ms, 77);
+        assert_eq!(phases.restore_ms, 88);
+        assert_eq!(phases.store_ms, 99);
+        assert_eq!(phases.unattributed_ms, 111);
 
-        // A report without them — an external cache backend, or events from
-        // before the schema carried these — reads as zero, and the gate then
-        // prints no table rather than a wall of 0.0% deltas.
+        // An external backend, or a report from before these fields existed.
         assert_eq!(
-            PhaseTimes::from_raw(&serde_json::json!({"summary": {}})),
+            PhaseTimes::from_raw(&serde_json::json!({"timing": {}})),
             PhaseTimes::default()
         );
         assert_eq!(

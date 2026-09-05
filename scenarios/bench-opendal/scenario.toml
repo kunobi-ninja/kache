@@ -31,6 +31,16 @@ setup = [
 # native-build paths/determinism the same way bench-surrealdb does. These
 # knobs change build PATHS and timestamps, not WHAT is built.
 build = """
+# Input-set predictions, with a sampled cross-check (kunobi-ninja/kache#945).
+# Predictions replace the rustc dep-info pre-pass with a recorded closure, so
+# the warm phases here measure what that is worth on a real graph. One unit in
+# 64 runs the pre-pass anyway and compares the two closures; the pre-pass
+# answer wins either way, so a disagreement costs nothing at the time. Its
+# count reaches the report, and zero across real subjects is what would
+# justify turning predictions on by default.
+export KACHE_INPUT_PREDICTIONS=1
+export KACHE_VERIFY_INPUT_PREDICTIONS=sampled
+
 repo="$(pwd -P)"
 prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
 export CFLAGS="${CFLAGS:-} $prefix_map"

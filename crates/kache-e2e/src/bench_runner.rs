@@ -3447,6 +3447,9 @@ fn write_summary(
         "  kache saw     : {} compiles -> {} cached, {} passed through, {} errored",
         el.total, el.cached, el.passed_through, el.errored
     )?;
+    if let Some(line) = prediction_summary_line(&r.warm.phases, r.warm.total_crates) {
+        writeln!(out, "{line}")?;
+    }
     if !el.top_passthrough.is_empty() {
         // Decision table, not an error list: `action  category  description`.
         // The header says the build ran normally so the rows don't read as
@@ -3749,6 +3752,25 @@ struct PhaseTimes {
     store_ms: u64,
     /// Wrapper time no phase accounts for.
     unattributed_ms: u64,
+}
+
+/// The two numbers that say whether input predictions are working and whether
+/// they are honest: how many units skipped the dep-info pre-pass, and how many
+/// sampled cross-checks disagreed with it.
+///
+/// `None` when the phase spawned a pre-pass for every unit, which is what an
+/// arm that never enabled predictions looks like. Saying "0 of N skipped"
+/// there would read as a result rather than as an absent feature.
+fn prediction_summary_line(phases: &PhaseTimes, total_crates: u64) -> Option<String> {
+    let skipped = total_crates.checked_sub(phases.dep_info_runs)?;
+    if skipped == 0 {
+        return None;
+    }
+    Some(format!(
+        "  predictions   : {skipped} of {total_crates} units skipped the dep-info pre-pass; \
+         {} sampled check(s) disagreed",
+        phases.prediction_mismatches
+    ))
 }
 
 impl PhaseTimes {
@@ -4198,6 +4220,44 @@ mod tests {
             "bench-firefox",
             "pull",
         ));
+    }
+
+    /// The line only appears for a phase that actually used predictions.
+    /// "0 of N skipped" on an arm that never enabled them would read as a
+    /// result rather than as an absent feature.
+    #[test]
+    fn the_prediction_line_reports_only_a_phase_that_used_them() {
+        let phases = |runs: u64, mismatches: u64| PhaseTimes {
+            dep_info_runs: runs,
+            prediction_mismatches: mismatches,
+            ..PhaseTimes::default()
+        };
+
+        let used = prediction_summary_line(&phases(77, 0), 663).expect("predictions were used");
+        assert!(used.contains("586 of 663"), "{used}");
+        assert!(used.contains("0 sampled check(s) disagreed"), "{used}");
+
+        let disagreed = prediction_summary_line(&phases(77, 4), 663).unwrap();
+        assert!(
+            disagreed.contains("4 sampled check(s) disagreed"),
+            "{disagreed}"
+        );
+
+        assert_eq!(
+            prediction_summary_line(&phases(663, 0), 663),
+            None,
+            "every unit ran the pre-pass, so predictions did nothing here"
+        );
+        assert_eq!(
+            prediction_summary_line(&phases(0, 0), 0),
+            None,
+            "a phase with no units has nothing to report"
+        );
+        assert_eq!(
+            prediction_summary_line(&phases(700, 0), 663),
+            None,
+            "more spawns than units is not a skip count; say nothing"
+        );
     }
 
     /// Every field here is a key in `kache report --format json`. Nothing else

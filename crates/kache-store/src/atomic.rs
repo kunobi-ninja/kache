@@ -31,7 +31,7 @@ pub fn fsync_file(path: &Path) -> std::io::Result<()> {
 /// ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32) surface when a
 /// concurrent put/remove leaves the destination delete-pending or open; both
 /// clear on their own. No such transient rename error exists off Windows.
-fn is_transient_rename_error(e: &std::io::Error) -> bool {
+pub(crate) fn is_transient_rename_error(e: &std::io::Error) -> bool {
     #[cfg(windows)]
     {
         matches!(e.raw_os_error(), Some(5) | Some(32))

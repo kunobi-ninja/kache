@@ -573,11 +573,15 @@ fn volume_route_path_cc(parsed: &crate::compiler::cc::CcArgs) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+fn volume_cache_dirs_match(routed: &Path, main: &Path) -> bool {
+    routed == main
+}
+
 /// Open the volume shard (or main store) plus an optional main-store fallback.
 fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Option<Store>)> {
     let routed = config.routed_for_path(route);
     let primary = Store::open(&routed)?;
-    if routed.cache_dir == config.cache_dir {
+    if volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
         return Ok((primary, None));
     }
     let fallback = match Store::open(config) {
@@ -5627,6 +5631,30 @@ mod tests {
         );
         parsed.output = Some(PathBuf::from("a.o"));
         assert_eq!(super::volume_route_path_cc(&parsed), PathBuf::from("a.o"));
+    }
+
+    #[test]
+    fn volume_cache_dirs_match_is_path_equality() {
+        assert!(super::volume_cache_dirs_match(
+            Path::new("/cache/main"),
+            Path::new("/cache/main")
+        ));
+        assert!(!super::volume_cache_dirs_match(
+            Path::new("/cache/shard"),
+            Path::new("/cache/main")
+        ));
+    }
+
+    #[test]
+    fn open_primary_and_fallback_skips_fallback_when_unmapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().to_path_buf());
+        let (_, fallback) =
+            super::open_primary_and_fallback(&cfg, Path::new("/unmapped/out.rlib")).unwrap();
+        assert!(
+            fallback.is_none(),
+            "the main store must not open itself as a fallback"
+        );
     }
 
     #[test]

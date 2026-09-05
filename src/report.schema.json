@@ -364,7 +364,8 @@
         "store_new_blobs",
         "compiler_runs",
         "preprocessor_runs",
-        "probe_runs"
+        "probe_runs",
+        "dep_info_runs"
       ],
       "properties": {
         "crate_name": { "type": "string" },
@@ -398,6 +399,7 @@
         "compiler_runs": { "type": "integer", "minimum": 0 },
         "preprocessor_runs": { "type": "integer", "minimum": 0 },
         "probe_runs": { "type": "integer", "minimum": 0 },
+        "dep_info_runs": { "type": "integer", "minimum": 0 },
         "store_error": { "type": "string" }
       }
     },

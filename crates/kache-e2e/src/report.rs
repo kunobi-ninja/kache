@@ -47,6 +47,11 @@ pub struct Event {
     /// Times kache spawned the preprocessor (`cc -E`) for this event.
     #[serde(default)]
     pub preprocessor_runs: u32,
+    /// Times kache spawned the rustc dep-info pre-pass for this event.
+    /// `0` on a warm predicted hit. `#[serde(default)]` so reports from
+    /// an older kache without the field still deserialize.
+    #[serde(default)]
+    pub dep_info_runs: u32,
     /// Times kache spawned a compiler probe (`cc --version` / `cc -###`)
     /// for this event. `#[serde(default)]` so reports from an older
     /// kache without the field still deserialize.

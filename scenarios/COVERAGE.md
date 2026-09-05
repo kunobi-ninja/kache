@@ -15,6 +15,7 @@ came from the second pass.
 | Feature / capability | Scenario(s) / process test |
 |---|---|
 | Rust lifecycle (cold/warm/noop) | `e2e-multi-dep`, `e2e-rust-debug` |
+| Rust input-set predictions (warm key without the dep-info spawn) | `e2e-rust-predictions` |
 | `cargo check` / `.rmeta`-only output | `e2e-rust-check` |
 | `cargo check --all-targets` zero-byte `.rmeta` (#624) | `e2e-rust-check-all-targets` |
 | Rust flag/key inputs (flag soup) | `e2e-rust-flag-soup` |

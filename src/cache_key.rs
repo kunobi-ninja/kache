@@ -1087,6 +1087,7 @@ fn resolve_key_inputs(
                              dependencies (kunobi-ninja/kache).",
                             crate_name
                         );
+                        crate::opcounts::record_prediction_mismatch();
                     }
                     return Ok(discovered);
                 }
@@ -2904,7 +2905,16 @@ pub(crate) fn validate_prediction(
         // sentinel: the raw value is the only signal that an included file
         // moved. A value that is no longer valid UTF-8 reads as changed,
         // which is the safe direction.
-        if env_value(var).as_deref() != Some(recorded.as_str()) {
+        //
+        // The parser conflates an unset variable with an empty one (both
+        // arrive as `""`), so validation must too: otherwise any crate
+        // reading an unset `option_env!` would reject every record and pay
+        // a pre-pass on every warm build.
+        let matches = match env_value(var) {
+            Some(value) => value == *recorded,
+            None => recorded.is_empty(),
+        };
+        if !matches {
             return Err(Rejection::EnvChanged);
         }
     }
@@ -6929,6 +6939,38 @@ mod tests {
         assert_eq!(
             validate_prediction(&record, stat, exists, env),
             Err(Rejection::Sibling)
+        );
+    }
+
+    /// The dep-info parser emits `VAR=` both when the variable is unset and
+    /// when it is empty, so validation must accept both for an empty record:
+    /// otherwise any crate reading an unset `option_env!` would reject every
+    /// record and pay a pre-pass on every warm build. A recorded value still
+    /// rejects an unset variable.
+    #[test]
+    fn an_unset_variable_matches_an_empty_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        std::fs::write(&lib, "pub fn f() {}\n").unwrap();
+        let stat = |path: &Path| std::fs::metadata(path).ok();
+        let exists = |path: &Path| path.exists();
+        let empty = InputPrediction {
+            schema: PREDICTION_SCHEMA,
+            sources: vec![lib.clone()],
+            env_deps: vec![("KACHE_PROBE_UNSET".to_string(), String::new())],
+        };
+        assert!(
+            validate_prediction(&empty, stat, exists, |_| None).is_ok(),
+            "unset matches empty, exactly as the parser would fold it"
+        );
+        let valued = InputPrediction {
+            schema: PREDICTION_SCHEMA,
+            sources: vec![lib],
+            env_deps: vec![("KACHE_PROBE_UNSET".to_string(), "1".to_string())],
+        };
+        assert_eq!(
+            validate_prediction(&valued, stat, exists, |_| None),
+            Err(Rejection::EnvChanged)
         );
     }
 

@@ -364,6 +364,10 @@ pub struct MetricAssertions {
     /// the probe is memoized across builds; `1` on a cold phase proves
     /// it runs once for the build, not once per translation unit.
     pub max_probe_runs: Option<u32>,
+    /// Upper bound on the rustc dep-info pre-pass spawns summed across
+    /// this phase's events. `0` on a warm phase proves predictions
+    /// replaced the pre-pass; positive on a cold phase counts it.
+    pub max_dep_info_runs: Option<u32>,
 }
 
 /// No-op phase assertions. The no-op phase rebuilds without cleaning;

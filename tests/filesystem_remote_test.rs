@@ -749,6 +749,67 @@ fn a_fresh_client_can_seed_itself_from_the_shared_folder() {
     assert!(out_b.path().join("libfsremote.rlib").is_file());
 }
 
+/// kunobi-ninja/kache#774: a remote object that vanished mid-run is a miss,
+/// never an error.
+///
+/// A shared folder's retention policy (or a concurrent collector) may delete
+/// a pack between the manifest read and the download. The build must
+/// recompile and succeed instead of failing: the folder owner owns eviction,
+/// and kache must tolerate its decisions without pausing writers.
+#[test]
+fn a_vanished_remote_pack_falls_back_to_recompile() {
+    build_kache();
+
+    let shared = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let src = sources.path().join("lib.rs");
+    std::fs::write(&src, "pub fn vanished() -> u32 { 13 }\n").unwrap();
+
+    // Seed the shared folder, then simulate retention: manifests stay, every
+    // pack for the crate goes.
+    let alpha = Client::new(shared.path());
+    let out_a = TempDir::new().unwrap();
+    alpha.compile(&src, out_a.path());
+    alpha.stop_daemon_and_wait();
+    alpha.sync(&["--push"]);
+    let artifacts = shared.path().join("artifacts");
+    let mut all_files = Vec::new();
+    collect_files(&artifacts, &mut all_files);
+    let packs: Vec<_> = all_files
+        .iter()
+        .filter(|path| path.components().any(|c| c.as_os_str() == "packs"))
+        .collect();
+    assert!(
+        !packs.is_empty(),
+        "expected at least one published pack to delete under {}",
+        artifacts.display()
+    );
+    for pack in &packs {
+        std::fs::remove_file(pack).unwrap();
+    }
+
+    // The manifest still advertises the entry, but its bytes are gone. The
+    // build must succeed by recompiling — recording a miss, not failing.
+    // Beta's daemon is up, as a real host's would be: without it the remote
+    // pull path is skipped entirely and the test would pass vacuously.
+    let beta = Client::new(shared.path());
+    let out_b = TempDir::new().unwrap();
+    beta.start_daemon();
+    beta.compile(&src, out_b.path());
+    let beta_results = beta.results();
+    assert!(
+        beta_results.iter().any(|r| r == "miss"),
+        "with the pack gone the compile is a miss, never an error: {beta_results:?}"
+    );
+    assert!(!beta_results.iter().any(|r| r == "error"));
+    assert!(out_b.path().join("libfsremote.rlib").is_file());
+    assert_eq!(
+        std::fs::read(out_a.path().join("libfsremote.rlib")).unwrap(),
+        std::fs::read(out_b.path().join("libfsremote.rlib")).unwrap(),
+        "the recompiled artifact must match the original build byte-for-byte"
+    );
+}
+
 /// kunobi-ninja/kache#704, the user-facing shape: a caller that captures
 /// kache's output through PIPES — a build script, a CI wrapper, an IDE
 /// integration — must not hang when the invocation auto-starts a daemon.

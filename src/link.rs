@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,10 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// at wrapper entry; read on the Windows restore path. Off everywhere else.
 static WINDOWS_HARDLINK_RESTORE: AtomicBool = AtomicBool::new(false);
 
-/// Process-global: marker file used to dedup the no-CoW advisory across the
-/// hundreds of wrapper processes a single build spawns (#508). Set at wrapper
+/// Process-global: marker file used to dedup storage-layout advisories across
+/// the hundreds of wrapper processes a single build spawns (#508). Set at wrapper
 /// entry; if unset the advisory falls back to once-per-process.
-#[cfg(windows)]
 static COW_WARN_MARKER: OnceLock<PathBuf> = OnceLock::new();
 
 /// Set the Windows hardlink-restore opt-in (from `Config::windows_hardlink`).
@@ -31,11 +29,9 @@ pub(crate) fn windows_hardlink_enabled() -> bool {
     WINDOWS_HARDLINK_RESTORE.load(Ordering::Relaxed)
 }
 
-/// Set the cross-process dedup marker for the no-CoW advisory. Call once per
-/// process before restoring. No effect off Windows.
-#[cfg_attr(not(windows), allow(unused_variables))]
+/// Set the cross-process dedup marker for storage-layout advisories. Call once per
+/// process before restoring.
 pub fn set_cow_warn_marker(path: std::path::PathBuf) {
-    #[cfg(windows)]
     let _ = COW_WARN_MARKER.set(path);
 }
 
@@ -53,7 +49,6 @@ pub fn set_storage_layout_advice(enabled: bool) {
 }
 
 /// Is `[cache] storage_layout_advice` active for this process?
-#[cfg(windows)]
 fn storage_layout_advice_enabled() -> bool {
     STORAGE_LAYOUT_ADVICE.load(Ordering::Relaxed)
 }
@@ -294,6 +289,87 @@ fn copy_hardlink_fallback(store_path: &Path, target_path: &Path, bytes: u64) -> 
     copy_file(store_path, target_path, false)?;
     crate::opcounts::record_copied(bytes);
     Ok(())
+}
+
+/// `fs::hard_link` for store ingest that reports a cross-volume layout once
+/// per session instead of swallowing it. Returns whether the link was made.
+///
+/// A `CrossesDevices` failure (EXDEV on Unix bind mounts, NotSameDevice on
+/// Windows drives) proves the build tree and the store staging area live on
+/// different mounts, so every ingest copies the full file. That is a layout
+/// problem worth telling the user once, with the fix (co-locate
+/// `[cache] local_store` with the build tree). Any other failure stays
+/// silent here — a later counter documents it — so this never nags about
+/// transient filesystem errors.
+pub fn hard_link_or_advise_cross_volume(source: &Path, tmp: &Path) -> bool {
+    match fs::hard_link(source, tmp) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            warn_cross_volume_ingest_once(source, tmp);
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// Tell the user their store ingests copy because the build tree and the
+/// store are on different mounts/volumes — at most once per warn-session
+/// window, and never when `[cache] storage_layout_advice = false` says the
+/// layout is intentional. Uses its own `cross-volume` bucket so it dedups
+/// independently of the copy-restore advisories.
+fn warn_cross_volume_ingest_once(source: &Path, tmp: &Path) {
+    if !storage_layout_advice_enabled() {
+        return;
+    }
+    let message = cross_volume_ingest_message(source, tmp);
+    match COW_WARN_MARKER.get() {
+        Some(base) => {
+            let marker = bucket_marker(base, "cross-volume");
+            let _warned = crate::wrapper::warn_once_per_session(
+                &marker,
+                crate::wrapper::WARN_SESSION_SECS,
+                &message,
+            );
+        }
+        // No marker configured (unit tests, non-wrapper entrypoints): fall back
+        // to once-per-process rather than going silent.
+        None => {
+            use std::sync::Once;
+            static WARNED: Once = Once::new();
+            WARNED.call_once(|| eprintln!("{message}"));
+        }
+    }
+}
+
+/// Format the volume pair for the cross-volume advisory. Pure and
+/// platform-neutral so the Linux mutation lane can kill its mutants even
+/// though only the Windows call site compiles the roots: both arms are
+/// reachable here on every platform.
+fn format_volume_pair(from: Option<String>, to: Option<String>) -> String {
+    match (from, to) {
+        (Some(from), Some(to)) => format!(" ({from} vs {to})"),
+        _ => String::new(),
+    }
+}
+
+/// Pure message for [`warn_cross_volume_ingest_once`], kept separate so tests
+/// pin the wording without touching the filesystem.
+fn cross_volume_ingest_message(source: &Path, tmp: &Path) -> String {
+    #[cfg(windows)]
+    let (from, to) = (windows_volume_root(source), windows_volume_root(tmp));
+    #[cfg(not(windows))]
+    let (from, to): (Option<String>, Option<String>) = (None, None);
+    let volumes = format_volume_pair(from, to);
+    format!(
+        "kache: could not hardlink {source} into the store staging area ({tmp}){volumes}: \
+         the link failed across mounts/volumes, so every ingest copies the full \
+         file instead of sharing it. Put `[cache] local_store` on the same \
+         drive as your build tree to restore zero-copy ingest. If this layout \
+         is intentional, silence this advice with \
+         `[cache] storage_layout_advice = false`.\n         affected source: {source}",
+        source = source.display(),
+        tmp = tmp.display(),
+    )
 }
 
 /// Validate a completed hardlink whose store blob could not be re-stat'ed.
@@ -1901,6 +1977,127 @@ mod tests {
             CopyRestoreCause::NoCow,
             "volume roots compare case-insensitively",
         );
+    }
+
+    /// Same mount, same filesystem: the link is made and nothing warns.
+    #[test]
+    fn ingest_hardlink_succeeds_silently_on_one_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("input.rlib");
+        std::fs::write(&source, b"fake rlib").unwrap();
+        let tmp = dir.path().join("stage.tmp");
+        assert!(
+            hard_link_or_advise_cross_volume(&source, &tmp),
+            "a same-directory link must succeed"
+        );
+        assert!(tmp.is_file());
+    }
+
+    /// The cross-volume ingest message must name the fix (co-locate
+    /// `local_store` with the build) and the mute switch, so a user seeing
+    /// it once knows both what to do and how to silence it.
+    #[test]
+    fn cross_volume_ingest_message_names_fix_and_mute() {
+        let message = cross_volume_ingest_message(
+            Path::new("D:/work/target/x.rlib"),
+            Path::new("C:/cache/store/staging/stage.tmp"),
+        );
+        for needle in [
+            "D:/work/target/x.rlib",
+            "local_store",
+            "storage_layout_advice",
+            "same",
+        ] {
+            assert!(
+                message.contains(needle),
+                "advisory must mention {needle:?}: {message}"
+            );
+        }
+    }
+
+    /// Both arms of the volume-pair formatting, reachable on every platform
+    /// so the Linux mutation lane covers the Windows-only call site.
+    #[test]
+    fn format_volume_pair_formats_both_arms() {
+        assert_eq!(
+            format_volume_pair(Some("C:\\".to_string()), Some("D:\\".to_string())),
+            " (C:\\ vs D:\\)"
+        );
+        assert_eq!(format_volume_pair(None, Some("D:\\".to_string())), "");
+        assert_eq!(format_volume_pair(Some("C:\\".to_string()), None), "");
+        assert_eq!(format_volume_pair(None, None), "");
+    }
+
+    /// `[cache] storage_layout_advice = false` mutes the ingest advisory;
+    /// the default warns. Observed through marker files in a scratch dir so
+    /// the assertion is the warning itself, not the toggle round-trip.
+    ///
+    /// Linux-only: only a real cross-mount `link(2)` produces `CrossesDevices`
+    /// (`/dev/shm` is a separate tmpfs on every supported Linux CI), and only
+    /// a real error exercises the guard. The message wording and the toggle
+    /// round-trip are covered platform-independently above.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cross_volume_guard_warns_only_on_crosses_devices() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _lock = crate::test_support::process_state_test_lock();
+        let base =
+            std::env::temp_dir().join(format!("kache-cross-volume-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // First claimant wins the process-global marker; no other unit test
+        // installs one, so this holds deterministically in this binary.
+        set_cow_warn_marker(base.join("warn"));
+        let marker_written = || std::fs::read_dir(&base).unwrap().next().is_some();
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("input.rlib");
+        std::fs::write(&source, b"fake rlib").unwrap();
+        let missing = || dir.path().join("definitely-missing.rlib");
+
+        // Muted: even a genuine cross-device failure stays silent.
+        set_storage_layout_advice(false);
+        assert!(
+            !hard_link_or_advise_cross_volume(&missing(), &dir.path().join("stage.tmp")),
+            "a failed link is still a failed link when muted"
+        );
+        assert!(
+            !marker_written(),
+            "a muted advisory must not write a marker"
+        );
+
+        // Enabled, wrong error kind: a missing source is NotFound, not a
+        // layout problem, so no advisory.
+        set_storage_layout_advice(true);
+        assert!(!hard_link_or_advise_cross_volume(
+            &missing(),
+            &dir.path().join("stage.tmp")
+        ));
+        assert!(
+            !marker_written(),
+            "a non-cross-volume failure must not advise"
+        );
+
+        // Enabled, genuine cross-device failure: advise exactly once.
+        let shm_dir = Path::new("/dev/shm").join(format!("kache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&shm_dir).unwrap();
+        let same_fs = match (std::fs::metadata(&shm_dir), std::fs::metadata(dir.path())) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev(),
+            _ => false,
+        };
+        assert!(
+            !same_fs,
+            "/dev/shm must be a separate filesystem for this test to mean anything"
+        );
+        assert!(
+            !hard_link_or_advise_cross_volume(&source, &shm_dir.join("stage.tmp")),
+            "a cross-device link must fail"
+        );
+        assert!(marker_written(), "a cross-device failure must advise");
+        set_storage_layout_advice(true);
+        let _ = std::fs::remove_dir_all(&shm_dir);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A failed probe must still warn (a copy-restore IS happening) — but as

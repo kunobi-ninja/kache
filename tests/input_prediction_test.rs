@@ -47,6 +47,20 @@ fn run_kache_rustc_predict(
     src: &Path,
     predictions: bool,
 ) -> std::process::Output {
+    run_kache_rustc_verify(cache_dir, out_dir, src, predictions, None)
+}
+
+/// The same invocation with `KACHE_VERIFY_INPUT_PREDICTIONS` set, which makes
+/// key computation run the pre-pass alongside a prediction and compare the two
+/// closures. The pre-pass answer always wins, so the only thing the mode
+/// changes is whether a disagreement gets counted.
+fn run_kache_rustc_verify(
+    cache_dir: &Path,
+    out_dir: &Path,
+    src: &Path,
+    predictions: bool,
+    verify: Option<&str>,
+) -> std::process::Output {
     let args: Vec<String> = vec![
         rustc_path(),
         "--crate-name".into(),
@@ -75,6 +89,7 @@ fn run_kache_rustc_predict(
         .env_remove("KACHE_FAMILY_PROBE_ACTIVE")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .envs(verify.map(|mode| ("KACHE_VERIFY_INPUT_PREDICTIONS", mode)))
         .output()
         .expect("failed to run kache rustc");
     assert!(
@@ -89,6 +104,7 @@ struct LastEvent {
     result: String,
     cache_key: String,
     dep_info_runs: u64,
+    prediction_mismatches: u64,
 }
 
 /// `local_hits` from the report summary.
@@ -139,6 +155,7 @@ fn last_event(cache_dir: &Path) -> LastEvent {
         result: event["result"].as_str().unwrap_or("").to_string(),
         cache_key: event["cache_key"].as_str().unwrap_or("").to_string(),
         dep_info_runs: event["dep_info_runs"].as_u64().unwrap_or(u64::MAX),
+        prediction_mismatches: event["prediction_mismatches"].as_u64().unwrap_or(u64::MAX),
     }
 }
 
@@ -210,6 +227,50 @@ fn predictions_cold_warm_off_and_stale_closure() {
 /// A shadowing sibling that rustc rejects must never restore: the
 /// prediction fails closed, the pre-pass runs, and the real compiler error
 /// passes through instead of a stale hit.
+/// The number that decides whether predictions can be trusted more widely.
+///
+/// With verification on, every prediction is checked against the pre-pass that
+/// would have replaced it. A mismatch means the soundness argument has a hole
+/// on this code, and it has to be a number a benchmark can assert on rather
+/// than a warning someone might read.
+#[test]
+fn verified_predictions_agree_with_the_pre_pass_and_count_it() {
+    build_kache();
+    let (_work, cache, out, src) = fixture();
+    let cache_dir = cache.path();
+    let out_dir = out.path();
+
+    // Cold records the closure. Verification has nothing to compare yet.
+    run_kache_rustc_verify(cache_dir, out_dir, &src, true, Some("always"));
+    let cold = last_event(cache_dir);
+    assert_eq!(cold.result, "miss");
+    assert_eq!(cold.prediction_mismatches, 0);
+
+    // Warm uses the record AND runs the pre-pass to check it. The pre-pass
+    // answer is the one that keys, so the key still matches cold's.
+    run_kache_rustc_verify(cache_dir, out_dir, &src, true, Some("always"));
+    let verified = last_event(cache_dir);
+    assert_eq!(verified.result, "local_hit");
+    assert_eq!(verified.cache_key, cold.cache_key);
+    assert_eq!(
+        verified.prediction_mismatches, 0,
+        "the prediction must reproduce exactly what the pre-pass discovered"
+    );
+    assert_eq!(
+        verified.dep_info_runs, 1,
+        "verification pays for the pre-pass it was checking against"
+    );
+
+    // And with verification off the same warm build skips the pre-pass
+    // entirely, which is the whole point of the record.
+    run_kache_rustc_predict(cache_dir, out_dir, &src, true);
+    let unverified = last_event(cache_dir);
+    assert_eq!(unverified.result, "local_hit");
+    assert_eq!(unverified.cache_key, cold.cache_key);
+    assert_eq!(unverified.dep_info_runs, 0);
+    assert_eq!(unverified.prediction_mismatches, 0);
+}
+
 #[test]
 fn predictions_sibling_shadow_fails_closed() {
     build_kache();

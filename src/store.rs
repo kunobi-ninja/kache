@@ -247,7 +247,7 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
                 ingest.set(StoreIngest::Reflink);
             } else if allow_hardlink
                 && fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file())
-                && fs::hard_link(source, tmp).is_ok()
+                && crate::link::hard_link_or_advise_cross_volume(source, tmp)
             {
                 ingest.set(StoreIngest::Hardlink);
             } else {
@@ -2953,7 +2953,7 @@ impl Store {
                 StoreIngest::Reflink
             } else if allow_hardlink
                 && fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_file())
-                && fs::hard_link(source, tmp).is_ok()
+                && crate::link::hard_link_or_advise_cross_volume(source, tmp)
             {
                 // Refused for symlink sources: hashing followed the link, but a
                 // hardlink would link the symlink itself — a pointer into mutable

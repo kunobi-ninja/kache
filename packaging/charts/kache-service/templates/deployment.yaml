@@ -8,30 +8,32 @@ metadata:
 spec:
 {{- if eq .Values.planner.persistence.type "pvc" }}
 {{- if gt (int .Values.replicaCount) 1 }}
-{{- fail "planner.persistence.type=pvc is single-writer: replicaCount must be 1. Two Pods cannot open the planner DB at once — the second fails on its LOCK file." }}
+{{- fail "planner.persistence.type=pvc is single-writer: replicaCount must be 1. The PVC is ReadWriteOnce, and the planner DB is written by whichever Pod holds it — nothing in the service arbitrates between two of them." }}
 {{- end }}
 {{- end }}
   replicas: {{ .Values.replicaCount }}
 {{- if eq .Values.planner.persistence.type "pvc" }}
   # Recreate, NOT the RollingUpdate default.
   #
-  # The planner DB takes an exclusive LOCK when opened, so exactly one Pod can
-  # hold it. RollingUpdate starts the replacement before terminating the old
-  # Pod, which deadlocks permanently: the new Pod cannot open the DB while the
-  # old one holds the LOCK, so it never becomes Ready — and the old Pod is
-  # never terminated precisely because the new one never becomes Ready. The
-  # rollout then sits there forever while the old Pod keeps serving, so the
-  # release looks healthy while the new version silently never ships.
+  # RollingUpdate starts the replacement before terminating the old Pod, so two
+  # Pods want this volume at once. The PVC is ReadWriteOnce, so on separate
+  # nodes the new Pod never mounts and the rollout stalls while the old Pod
+  # keeps serving: the release looks healthy while the new version silently
+  # never ships. On the same node both mount, and then both run the startup
+  # path that opens and seeds the planner DB.
   #
-  # Observed on int-pro: stuck 3d18h across 1061 CrashLoopBackOff restarts,
-  # each logging "planner.db/LOCK is already locked by another process".
+  # Until kache 0.16 the DB was surrealkv, which took an exclusive LOCK, so the
+  # second Pod at least crashed loudly. Observed on int-pro: stuck 3d18h across
+  # 1061 CrashLoopBackOff restarts, each logging "planner.db/LOCK is already
+  # locked by another process". SQLite in WAL mode does not refuse a second
+  # opener, so that noise is gone and this guard is now the only thing keeping
+  # a surge from quietly producing two writers.
   #
-  # Enabling `ha` does not substitute for this. Leader election would make the
-  # new Pod wait for the lease instead of crashing, but it would still never
-  # become Ready while the old Pod holds it — the same deadlock, just quieter.
+  # Enabling `ha` does not substitute for it. Leader election decides who seeds,
+  # not who mounts, so a surging rollout still hits the volume conflict.
   #
-  # Not overridable by design: any value reintroducing surge here recreates the
-  # deadlock. `ephemeral` gives each Pod its own emptyDir and keeps the
+  # Not overridable: any value reintroducing surge here brings the conflict
+  # back. `ephemeral` gives each Pod its own emptyDir and keeps the
   # RollingUpdate default.
   strategy:
     type: Recreate

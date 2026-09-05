@@ -30,7 +30,9 @@ mod metrics;
 
 mod state;
 
-pub use state::{DEFAULT_DB_PATH, NamespaceState, PlannerStateFile, SqlitePlannerRepository};
+pub use state::{
+    DEFAULT_DB_PATH, NamespaceState, PlannerStateFile, SeedPlan, SqlitePlannerRepository,
+};
 
 type SharedPlannerDataSource = Arc<dyn PlannerDataSource + Send + Sync>;
 
@@ -268,7 +270,14 @@ fn parse_service_account_namespace(contents: &str) -> Result<String> {
 }
 
 async fn load_repository(config: &PlannerConfig) -> Result<Option<SharedPlannerDataSource>> {
-    let repository = SqlitePlannerRepository::open(&config.db_path).await?;
+    // Tells `open` whether a pre-SQLite store at this path is disposable: the
+    // seed is the only thing that ever refills the projections.
+    let seed_plan = match config.seed_state_file {
+        Some(_) => SeedPlan::Reseeded,
+        None => SeedPlan::None,
+    };
+
+    let repository = SqlitePlannerRepository::open(&config.db_path, seed_plan).await?;
     if let Some(seed_state_file) = config.seed_state_file.as_deref() {
         repository.seed_from_state_file(seed_state_file).await?;
     }
@@ -897,9 +906,10 @@ mod tests {
     #[tokio::test]
     async fn prefetch_plan_returns_execute_when_repository_has_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let repository = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
-            .await
-            .unwrap();
+        let repository =
+            SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+                .await
+                .unwrap();
         repository
             .seed_from_state(PlannerStateFile {
                 namespaces: HashMap::new(),
@@ -952,9 +962,10 @@ mod tests {
     #[tokio::test]
     async fn prefetch_plan_returns_use_fallback_when_repository_has_no_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let repository = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
-            .await
-            .unwrap();
+        let repository =
+            SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+                .await
+                .unwrap();
 
         let response = test_app(None, Some(Arc::new(repository)))
             .oneshot(

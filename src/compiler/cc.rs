@@ -8140,16 +8140,12 @@ mod tests {
     #[test]
     fn wa_debug_prefix_map_changes_cache_key_issue_644() {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let fake_cc = temp.path().join("gcc");
-        fs::write(
-            &fake_cc,
-            "#!/bin/sh\ncase \"$1\" in\n  --version) printf 'fake gcc 1.0\\n' ;;\n  -###) exit 0 ;;\n  *) printf 'preprocessed unit\\n' ;;\nesac\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_cc, fs::Permissions::from_mode(0o755)).unwrap();
+        // A checked-in executable avoids ETXTBSY when another test forks
+        // while a runtime-created script is still open for writing.
+        let fake_cc =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_constant_output.sh");
         let source = temp.path().join("unit.S");
         fs::write(&source, "/* fake compiler ignores this */\n").unwrap();
         let output = temp.path().join("unit.o");

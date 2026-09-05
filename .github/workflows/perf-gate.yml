@@ -180,10 +180,11 @@ jobs:
     if: needs.authorize.outputs.eligible == 'true'
     # gha-runner-scale-set: match by the scale-set's installation name (single
     # label), not a `[self-hosted, …]` set. See the header.
-    # The light Kunobi pool: this job's own precheck asks for 40 GB, which
-    # fits that reservation, and running here keeps every pull request off
-    # the single reserved-node runner the heavy benchmarks queue on.
-    runs-on: kunobi-runners-small
+    # The general Kunobi pool: this job's own precheck asks for 40 GB, which
+    # fits its 80Gi per-runner ceiling, and running here keeps every pull
+    # request off the single reserved-node runner the heavy benchmarks queue
+    # on.
+    runs-on: kunobi-runners
     # Six builds of the subject (three phases x two commits) plus two builds of
     # kache itself. Normal runs land well inside this; the cap exists so a stall
     # is killed in an hour rather than at GitHub's 6h default.

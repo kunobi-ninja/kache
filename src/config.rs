@@ -69,6 +69,17 @@ pub struct VolumeStore {
     pub store: PathBuf,
 }
 
+/// Join a relative path onto the process cwd so `[cache.volumes]` keys, which
+/// are absolute, can match compiler `-o` paths that cargo passes relatively.
+fn absolutize_volume_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -80,10 +91,8 @@ pub struct Config {
     /// `None` keeps the default `<runtime_dir>/daemon.sock` placement.
     pub socket_path_override: Option<PathBuf>,
     /// Volume-local store shards from `[cache.volumes]` (empty when
-    /// unconfigured). Routing (which shard a build uses) arrives with the
-    /// wrapper integration; this slice only parses, normalizes, and matches.
-    /// Allowed-dead until then: using it now would route nothing.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// unconfigured). The wrapper opens the matching shard as `cache_dir`
+    /// so ingest and restore stay on that volume.
     pub volume_stores: Vec<VolumeStore>,
     pub max_size: u64,
     pub remote: Option<RemoteConfig>,
@@ -2098,11 +2107,29 @@ impl Config {
     /// `[cache.volumes]`. Longest normalized-prefix match, so `/mnt` and
     /// `/mnt/biglake` can coexist with the tighter root winning. `None`
     /// means the main store (plus the cross-volume advisory on a real
-    /// cross-mount build). Allowed-dead until the wrapper integration routes
-    /// through it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// cross-mount build). Relative `path`s are joined onto the process cwd
+    /// before matching; Unix keys only match absolute roots.
     pub fn volume_store_for(&self, path: &Path) -> Option<&Path> {
-        Self::match_volume_store(&self.volume_stores, path)
+        Self::match_volume_store(&self.volume_stores, &absolutize_volume_path(path))
+    }
+
+    /// Cache dir the wrapper should open for artifacts produced at `path`.
+    /// A mapped volume uses that shard; anything else uses the main store.
+    pub fn cache_dir_for_path(&self, path: &Path) -> &Path {
+        self.volume_store_for(path).unwrap_or(&self.cache_dir)
+    }
+
+    /// Config whose `cache_dir` is the shard for `path`. Runtime dir, socket,
+    /// and remote settings stay on the main config so daemons and markers
+    /// do not move with the shard.
+    pub fn routed_for_path(&self, path: &Path) -> Config {
+        let dir = self.cache_dir_for_path(path);
+        if dir == self.cache_dir.as_path() {
+            return self.clone();
+        }
+        let mut routed = self.clone();
+        routed.cache_dir = dir.to_path_buf();
+        routed
     }
 
     /// Append `sep` unless already there. Pure and platform-neutral so the
@@ -3760,6 +3787,11 @@ remote_key_cache_refresh_secs = 900
                 Some(Path::new("D:/kache-test-store"))
             );
             assert_eq!(config.volume_store_for(Path::new("C:/work/a.rlib")), None);
+            let routed = config.routed_for_path(Path::new("D:/work/a.rlib"));
+            assert_eq!(routed.cache_dir, PathBuf::from("D:/kache-test-store"));
+            assert_eq!(routed.runtime_dir, config.runtime_dir);
+            let unmapped = config.routed_for_path(Path::new("C:/work/a.rlib"));
+            assert_eq!(unmapped.cache_dir, config.cache_dir);
         }
         #[cfg(not(windows))]
         {
@@ -3768,7 +3800,25 @@ remote_key_cache_refresh_secs = 900
                 Some(Path::new("/mnt/biglake/kache-test-store"))
             );
             assert_eq!(config.volume_store_for(Path::new("/home/u/a.rlib")), None);
+            let routed = config.routed_for_path(Path::new("/mnt/biglake/work/a.rlib"));
+            assert_eq!(
+                routed.cache_dir,
+                PathBuf::from("/mnt/biglake/kache-test-store")
+            );
+            assert_eq!(routed.runtime_dir, config.runtime_dir);
+            let unmapped = config.routed_for_path(Path::new("/home/u/a.rlib"));
+            assert_eq!(unmapped.cache_dir, config.cache_dir);
         }
+    }
+
+    #[test]
+    fn absolutize_volume_path_keeps_absolute_and_joins_relative() {
+        let abs = Path::new("/tmp/kache-vol-abs");
+        assert_eq!(absolutize_volume_path(abs), abs);
+        let rel = absolutize_volume_path(Path::new("kache-vol-rel"));
+        assert!(rel.is_absolute(), "relative paths must join onto cwd");
+        assert!(rel.ends_with("kache-vol-rel"));
+        assert_ne!(rel, PathBuf::new());
     }
 
     #[test]

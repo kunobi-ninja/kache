@@ -548,6 +548,69 @@ fn take_recheck_hit(
     }
 }
 
+/// Directory used to pick a `[cache.volumes]` shard for a rustc invocation.
+fn volume_route_path_rustc(args: &RustcArgs) -> PathBuf {
+    if let Some(dir) = &args.out_dir {
+        return dir.clone();
+    }
+    if let Some(out) = &args.output {
+        if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+            return parent.to_path_buf();
+        }
+        return out.clone();
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Directory used to pick a `[cache.volumes]` shard for a cc invocation.
+fn volume_route_path_cc(parsed: &crate::compiler::cc::CcArgs) -> PathBuf {
+    if let Some(out) = &parsed.output {
+        if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+            return parent.to_path_buf();
+        }
+        return out.clone();
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Open the volume shard (or main store) plus an optional main-store fallback.
+fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Option<Store>)> {
+    let routed = config.routed_for_path(route);
+    let primary = Store::open(&routed)?;
+    if routed.cache_dir == config.cache_dir {
+        return Ok((primary, None));
+    }
+    let fallback = match Store::open(config) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!(
+                "main store unavailable for volume-shard fallback ({}): {e:#}",
+                config.cache_dir.display()
+            );
+            None
+        }
+    };
+    Ok((primary, fallback))
+}
+
+/// Local lookup: volume shard first, then the main store. The returned
+/// store is the one whose blobs must be restored.
+fn lookup_local_entry<'a>(
+    primary: &'a Store,
+    fallback: Option<&'a Store>,
+    cache_key: &str,
+) -> Result<Option<(&'a Store, crate::store::EntryMeta)>> {
+    if let Some(meta) = primary.get(cache_key)? {
+        return Ok(Some((primary, meta)));
+    }
+    if let Some(fallback) = fallback
+        && let Some(meta) = fallback.get(cache_key)?
+    {
+        return Ok(Some((fallback, meta)));
+    }
+    Ok(None)
+}
+
 fn admit_scheduler_miss(
     config: &Config,
     store: &Store,
@@ -674,20 +737,21 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
     }
 
-    let store = match Store::open(config) {
-        Ok(store) => store,
-        Err(e) => {
-            warn_store_unavailable_once(config, &e);
-            return cc_passthrough_with_event(
-                config,
-                &parsed,
-                &crate_name,
-                &event_root,
-                start,
-                format!("store unavailable: {e}"),
-            );
-        }
-    };
+    let (store, fallback_store) =
+        match open_primary_and_fallback(config, &volume_route_path_cc(&parsed)) {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn_store_unavailable_once(config, &e);
+                return cc_passthrough_with_event(
+                    config,
+                    &parsed,
+                    &crate_name,
+                    &event_root,
+                    start,
+                    format!("store unavailable: {e}"),
+                );
+            }
+        };
 
     // Compute the cache key (runs `cc -E -P` for the preprocessor
     // hash). On any failure — preprocessor error, missing compiler —
@@ -730,7 +794,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // ── Local cache lookup ───────────────────────────────────────
     let lookup_start = std::time::Instant::now();
-    let lookup = match store.get(&cache_key) {
+    let lookup = match lookup_local_entry(&store, fallback_store.as_ref(), &cache_key) {
         Ok(lookup) => lookup,
         Err(e) => {
             tracing::warn!(
@@ -750,22 +814,22 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     };
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     let mut lookup_rejection = String::new();
-    if let Some(meta) = lookup {
+    if let Some((hit_store, meta)) = lookup {
         if meta.files.is_empty() {
             // Poisoned entry (earlier bug) — evict and recompile.
             tracing::warn!("cc cache entry for {} has no files, evicting", crate_name);
             lookup_rejection = "matching entry has no cached artifacts".to_string();
-            let _ = store.remove_entry(&cache_key);
+            let _ = hit_store.remove_entry(&cache_key);
         } else if let Some(reason) = cc_cache_entry_rejection_reason(&parsed, &meta) {
             tracing::warn!(
                 "cc cache entry for {} lacks artifacts required by this invocation ({reason}), evicting",
                 crate_name,
             );
             lookup_rejection = reason.to_string();
-            let _ = store.remove_entry(&cache_key);
+            let _ = hit_store.remove_entry(&cache_key);
         } else {
             let restore_start = std::time::Instant::now();
-            if let Err(e) = restore_cc_from_cache(&store, &parsed, &meta) {
+            if let Err(e) = restore_cc_from_cache(hit_store, &parsed, &meta) {
                 if e.downcast_ref::<PartialCcRestore>().is_some() {
                     return Err(e);
                 }
@@ -1889,11 +1953,16 @@ fn run_parsed_rustc(
     // around live incremental state is exactly the kind of interaction an
     // experimental fast path should stay out of.
     let daemon_local = config.local_hit_daemon && args.is_primary && args.incremental.is_none();
+    let rustc_route = volume_route_path_rustc(args);
+    let mut fallback_store = None;
     let store = if daemon_local {
         None
     } else if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
-        match Store::open(config) {
-            Ok(store) => Some(store),
+        match open_primary_and_fallback(config, &rustc_route) {
+            Ok((primary, fallback)) => {
+                fallback_store = fallback;
+                Some(primary)
+            }
             Err(e) => {
                 warn_store_unavailable_once(config, &e);
                 None
@@ -2057,8 +2126,11 @@ fn run_parsed_rustc(
             reset_adaptive_unit(adaptive_unit.as_ref());
             return Ok(exit);
         }
-        match Store::open(config) {
-            Ok(s) => store = Some(s),
+        match open_primary_and_fallback(config, &rustc_route) {
+            Ok((s, fallback)) => {
+                store = Some(s);
+                fallback_store = fallback;
+            }
             Err(e) => warn_store_unavailable_once(config, &e),
         }
     }
@@ -2111,9 +2183,9 @@ fn run_parsed_rustc(
     let mut record_closure = should_record_closure(predicted, false);
     let mut rederived = false;
     loop {
-        // 1. Check local store
+        // 1. Check local store (volume shard, then main)
         let lookup_start = std::time::Instant::now();
-        let lookup_result = match store.get(&cache_key) {
+        let lookup_result = match lookup_local_entry(&store, fallback_store.as_ref(), &cache_key) {
             Ok(result) => result,
             Err(e) => {
                 tracing::warn!(
@@ -2138,21 +2210,21 @@ fn run_parsed_rustc(
         // A re-derivation is the opposite case: its closure is what the record
         // should have said, so writing it is what repairs a stale row.
 
-        if let Some(meta) = lookup_result {
+        if let Some((hit_store, meta)) = lookup_result {
             // Safety: skip entries with no cached files (poisoned by earlier bugs)
             if meta.files.is_empty() {
                 tracing::warn!(
                     "cache entry for {} has no files, evicting and recompiling",
                     crate_name
                 );
-                let _ = store.remove_entry(&cache_key);
+                let _ = hit_store.remove_entry(&cache_key);
             } else {
                 tracing::debug!("local cache hit for {} ({})", crate_name, &cache_key[..16]);
                 let restore_start = std::time::Instant::now();
                 if let Err(e) = restore_from_cache(
                     config,
                     compiler,
-                    &BlobSource::Store(&store),
+                    &BlobSource::Store(hit_store),
                     args,
                     &meta,
                     extra_inputs,
@@ -5509,6 +5581,73 @@ mod tests {
     }
 
     // ── Opportunistic size-pressure GC (kunobi-ninja/kache#497) ─────────────
+
+    #[test]
+    fn volume_route_path_rustc_prefers_out_dir_then_output_parent() {
+        let mut args = rustc_args(&["rustc", "foo.rs"]);
+        args.out_dir = Some(PathBuf::from("/mnt/biglake/target/debug"));
+        args.output = Some(PathBuf::from("/other/libfoo.rlib"));
+        assert_eq!(
+            super::volume_route_path_rustc(&args),
+            PathBuf::from("/mnt/biglake/target/debug")
+        );
+        args.out_dir = None;
+        assert_eq!(
+            super::volume_route_path_rustc(&args),
+            PathBuf::from("/other")
+        );
+        args.output = Some(PathBuf::from("libfoo.rlib"));
+        assert_eq!(
+            super::volume_route_path_rustc(&args),
+            PathBuf::from("libfoo.rlib")
+        );
+    }
+
+    #[test]
+    fn volume_route_path_cc_uses_output_parent() {
+        let mut parsed = crate::compiler::cc::CcArgs {
+            program: "cc".into(),
+            rest: Vec::new(),
+            sources: vec![PathBuf::from("a.c")],
+            output: Some(PathBuf::from("/mnt/biglake/build/a.o")),
+            mode: crate::compiler::cc::CompileMode::Compile,
+            includes: Vec::new(),
+            defines: Vec::new(),
+            optimization: None,
+            debug_level: None,
+            std: None,
+            pic: false,
+            depinfo: None,
+            language_override: None,
+            family: crate::compiler::cc::ToolFamily::Gnu,
+        };
+        assert_eq!(
+            super::volume_route_path_cc(&parsed),
+            PathBuf::from("/mnt/biglake/build")
+        );
+        parsed.output = Some(PathBuf::from("a.o"));
+        assert_eq!(super::volume_route_path_cc(&parsed), PathBuf::from("a.o"));
+    }
+
+    #[test]
+    fn lookup_local_entry_prefers_primary_then_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_cfg = test_config(dir.path().join("primary"));
+        let main_cfg = test_config(dir.path().join("main"));
+        let primary = Store::open(&primary_cfg).unwrap();
+        let fallback = Store::open(&main_cfg).unwrap();
+        put_test_entry(&fallback, dir.path(), "vol-fallback-key");
+        let miss = super::lookup_local_entry(&primary, Some(&fallback), "no-such-key").unwrap();
+        assert!(miss.is_none());
+        let hit = super::lookup_local_entry(&primary, Some(&fallback), "vol-fallback-key")
+            .unwrap()
+            .expect("fallback must serve a key the shard does not have");
+        assert_eq!(hit.1.crate_name, "test-crate");
+        put_test_entry(&primary, dir.path(), "vol-primary-key");
+        let primary_hit =
+            super::lookup_local_entry(&primary, Some(&fallback), "vol-primary-key").unwrap();
+        assert!(primary_hit.is_some());
+    }
 
     /// Store a small entry so the store has a nonzero size.
     fn put_test_entry(store: &Store, dir: &std::path::Path, key: &str) {

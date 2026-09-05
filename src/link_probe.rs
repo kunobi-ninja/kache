@@ -184,7 +184,7 @@ fn find_mount_for_path(path: &Path) -> Option<String> {
     {
         let content = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
         let abs = absolute_path(path)?;
-        Some(find_mount_root(&abs, &content)?)
+        find_mount_root(&abs, &content)
     }
     #[cfg(not(target_os = "linux"))]
     {

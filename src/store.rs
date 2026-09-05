@@ -186,15 +186,15 @@ fn injected_store_hardlink_error() -> Option<std::io::ErrorKind> {
     None
 }
 
-#[cfg(test)]
 fn force_store_hardlink() -> bool {
-    FORCE_STORE_HARDLINK.with(|slot| slot.get())
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-fn force_store_hardlink() -> bool {
-    false
+    #[cfg(test)]
+    {
+        FORCE_STORE_HARDLINK.with(|slot| slot.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 fn should_try_store_reflink(force_hardlink: bool) -> bool {

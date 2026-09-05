@@ -287,26 +287,29 @@ pub(crate) fn parse_protected_hardlinks(content: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-#[cfg(unix)]
 fn current_uid() -> Option<u32> {
-    // SAFETY: getuid is async-signal-safe and has no failure mode.
-    Some(unsafe { libc::getuid() })
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid is async-signal-safe and has no failure mode.
+        Some(unsafe { libc::getuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
-#[cfg(not(unix))]
-fn current_uid() -> Option<u32> {
-    None
-}
-
-#[cfg(unix)]
 fn file_owner(path: &Path) -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| m.uid())
-}
-
-#[cfg(not(unix))]
-fn file_owner(_path: &Path) -> Option<u32> {
-    None
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Whether FICLONE works in `dir`: create two temps and try to clone one into

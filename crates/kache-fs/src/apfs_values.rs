@@ -49,6 +49,7 @@ mod tests {
         assert_eq!(sharing(true, 0, Some(0), 0), Sharing::None);
         assert_eq!(sharing(false, 0, Some(0), 0), Sharing::None);
         assert_eq!(sharing(true, 0, Some(0), 4096), Sharing::None);
+        assert_eq!(sharing(true, MAY_SHARE, Some(0), 0), Sharing::Partial);
         assert_eq!(sharing(true, SHARES_ALL, Some(0), 4096), Sharing::Full);
     }
 

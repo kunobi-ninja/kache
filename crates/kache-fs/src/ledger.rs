@@ -114,9 +114,12 @@ mod tests {
     #[test]
     fn counts_an_inode_once_regardless_of_link_count() {
         let mut l = InodeLedger::new();
+        assert_eq!(l.distinct_inodes(), 0);
         assert!(l.admit(&f(7, 2, 100)));
         assert!(!l.admit(&f(7, 2, 100)));
         assert_eq!(l.distinct_inodes(), 1);
+        assert!(l.admit(&f(8, 2, 100)));
+        assert_eq!(l.distinct_inodes(), 2);
     }
 
     #[test]

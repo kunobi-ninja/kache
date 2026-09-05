@@ -268,6 +268,31 @@ mod tests {
     }
 
     #[test]
+    fn writable_permissions_apply_to_an_existing_readonly_file() {
+        let dir = TempDir::new("writable-mode");
+        let file = dir.write("file", 32);
+        let mut permissions = fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file, permissions).unwrap();
+        set_writable_permissions(&file, true).unwrap();
+        assert!(!fs::metadata(&file).unwrap().permissions().readonly());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            set_writable_permissions(&file, false).unwrap();
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        assert!(set_writable_permissions(&dir.path().join("missing"), false).is_err());
+    }
+
+    #[test]
     fn copied_file_can_be_changed_without_changing_source() {
         let dir = TempDir::new("copy-writable");
         let src = dir.write("source", 8192);

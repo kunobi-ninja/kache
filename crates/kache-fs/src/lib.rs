@@ -205,7 +205,7 @@ pub struct DirSizing {
     #[cfg_attr(feature = "serde", serde(default))]
     pub unknown_allocated_bytes: u64,
     pub files: u64,
-    /// Files whose deletion frees nothing on their own.
+    /// Files whose blocks were reported fully shared.
     pub fully_shared_files: u64,
     /// Multiply-linked inodes with at least one name outside this tree.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -423,15 +423,25 @@ fn volume_usage_unix(path: &Path) -> Option<VolumeUsage> {
     }
     // f_frsize is the fragment size; f_bavail is what a non-root user can use,
     // which is the number a human recognises as "free".
-    let unit = if s.f_frsize > 0 {
-        s.f_frsize as u64
+    Some(volume_bytes(
+        s.f_blocks as u64,
+        s.f_bavail as u64,
+        s.f_frsize as u64,
+        s.f_bsize as u64,
+    ))
+}
+
+#[cfg(any(unix, test))]
+fn volume_bytes(blocks: u64, available: u64, fragment_size: u64, block_size: u64) -> VolumeUsage {
+    let unit = if fragment_size > 0 {
+        fragment_size
     } else {
-        s.f_bsize as u64
+        block_size
     };
-    Some(VolumeUsage {
-        total: s.f_blocks as u64 * unit,
-        free: s.f_bavail as u64 * unit,
-    })
+    VolumeUsage {
+        total: blocks * unit,
+        free: available * unit,
+    }
 }
 
 /// Best probe for the filesystem holding `path`.
@@ -577,6 +587,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn volume_bytes_use_fragment_units_when_available() {
+        let fragments = volume_bytes(3, 1, 4096, 16384);
+        assert_eq!(fragments.total, 12288);
+        assert_eq!(fragments.free, 4096);
+        let blocks = volume_bytes(3, 1, 0, 16384);
+        assert_eq!(blocks.total, 49152);
+        assert_eq!(blocks.free, 16384);
+    }
+
     #[cfg(unix)]
     #[test]
     fn volume_query_requires_a_real_path() {
@@ -625,6 +645,15 @@ mod tests {
         let mut value = serde_json::to_value(a).unwrap();
         let round_trip: CloneSketch = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(a, round_trip);
+        let mut uncounted = value.clone();
+        uncounted["len"] = serde_json::json!(0);
+        let mut uncounted: CloneSketch = serde_json::from_value(uncounted).unwrap();
+        assert!(uncounted.is_empty());
+        uncounted.insert(1, 42);
+        assert_eq!(
+            uncounted, a,
+            "an unused slot cannot suppress an observation"
+        );
         value.as_object_mut().unwrap().remove("devices");
         let legacy: CloneSketch = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(legacy.shares_with(&a), 0);
@@ -806,6 +835,99 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(empty.shared_ratio(), None, "no divide by zero");
+    }
+
+    #[test]
+    fn directory_totals_keep_private_shared_and_unknown_measurements_distinct() {
+        struct FixtureProbe(Vec<FileSizing>);
+        impl SizeProbe for FixtureProbe {
+            fn measure_file(&self, _path: &Path) -> io::Result<FileSizing> {
+                unreachable!("fixture supplies directory measurements")
+            }
+
+            fn capabilities(&self) -> ProbeCaps {
+                ProbeCaps {
+                    unique_bytes: true,
+                    clone_refcount: false,
+                    name: "fixture",
+                }
+            }
+
+            fn read_dir(&self, _dir: &Path) -> io::Result<Vec<DirEntry>> {
+                Ok(self.0.iter().copied().map(DirEntry::File).collect())
+            }
+        }
+
+        let partial = FileSizing {
+            logical: 10,
+            allocated: 20,
+            unique: Some(12),
+            sharing: Sharing::Partial,
+            inode: InodeId { dev: 3, ino: 1 },
+            nlink: 1,
+            clone_id: Some(7),
+        };
+        let mut probe = FixtureProbe(vec![
+            partial,
+            FileSizing {
+                logical: 30,
+                allocated: 40,
+                unique: Some(0),
+                sharing: Sharing::Full,
+                inode: InodeId { dev: 3, ino: 2 },
+                clone_id: Some(8),
+                ..partial
+            },
+            FileSizing {
+                logical: 50,
+                allocated: 60,
+                unique: Some(60),
+                sharing: Sharing::None,
+                inode: InodeId { dev: 3, ino: 3 },
+                clone_id: Some(9),
+                ..partial
+            },
+        ]);
+        let known = probe
+            .measure_dir(Path::new("."), &mut InodeLedger::new())
+            .unwrap();
+        assert_eq!(known.confidence, Confidence::LowerBound);
+        assert_eq!(
+            (known.files, known.logical, known.allocated, known.unique),
+            (3, 90, 120, 72)
+        );
+        assert_eq!(known.fully_shared_files, 1);
+        assert_eq!(known.clones.ids(), &[7, 8]);
+        assert_eq!((known.unknown_files, known.unknown_allocated_bytes), (0, 0));
+
+        probe.0.push(FileSizing {
+            logical: 70,
+            allocated: 80,
+            unique: None,
+            sharing: Sharing::Unknown,
+            inode: InodeId { dev: 3, ino: 4 },
+            clone_id: Some(10),
+            ..partial
+        });
+        let unknown = probe
+            .measure_dir(Path::new("."), &mut InodeLedger::new())
+            .unwrap();
+        assert_eq!(unknown.confidence, Confidence::Estimated);
+        assert_eq!(
+            (
+                unknown.files,
+                unknown.logical,
+                unknown.allocated,
+                unknown.unique
+            ),
+            (4, 160, 200, 72)
+        );
+        assert_eq!(
+            (unknown.unknown_files, unknown.unknown_allocated_bytes),
+            (1, 80)
+        );
+        assert_eq!(unknown.fully_shared_files, 1);
+        assert_eq!(unknown.clones.ids(), &[7, 8]);
     }
 
     #[test]

@@ -217,6 +217,10 @@ mod tests {
         if let Some(s) = measured(&path) {
             assert!(s.unique > 0 && s.unique < md.len());
             assert_eq!(s.sharing(), Sharing::None);
+            let measurement = LinuxProbe { supported: true }.measure_file(&path).unwrap();
+            assert_eq!(measurement.unique, Some(s.unique));
+            assert_eq!(measurement.sharing, Sharing::None);
+            assert_eq!(measurement.logical, 64 * 1024 * 1024);
         }
     }
 

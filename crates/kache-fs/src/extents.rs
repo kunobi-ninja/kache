@@ -7,7 +7,7 @@ use std::io;
 pub(crate) const LAST: u32 = 0x1;
 pub(crate) const SHARED: u32 = 0x2000;
 // Only aligned, unencoded extents have lengths usable as allocation counts.
-const ACCOUNTABLE_FLAGS: u32 = LAST | SHARED | 0x800 | 0x1000; // UNWRITTEN, MERGED
+const ACCOUNTABLE_FLAGS: u32 = 0x3801; // LAST | SHARED | UNWRITTEN | MERGED
 pub(crate) const EXTENTS_PER_PAGE: usize = 128;
 const MAX_PAGES: usize = 64;
 

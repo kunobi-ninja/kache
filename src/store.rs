@@ -6599,6 +6599,50 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_index_validates_artifact_names_and_hashes_independently() {
+        for (name, invalid_hash, accepted) in [
+            ("foo.rlib", false, true),
+            ("../escape", false, false),
+            ("foo.rlib", true, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = test_config(dir.path());
+            let key = {
+                let store = Store::open(&config).unwrap();
+                put_entry(&store, dir.path(), 30, "foo", b"compiled artifact")
+            };
+            let meta_path = config.store_dir().join(&key).join("meta.json");
+            let mut meta: EntryMeta =
+                serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+            meta.files[0].name = name.into();
+            if invalid_hash {
+                let original = blob_path_in_store_dir(&config.store_dir(), &meta.files[0].hash);
+                meta.files[0].hash = "g".repeat(64);
+                let malformed = blob_path_in_store_dir(&config.store_dir(), &meta.files[0].hash);
+                fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+                // Keep the blob present and correctly sized: only validation
+                // of its hash spelling may reject this entry.
+                fs::copy(original, malformed).unwrap();
+            }
+            fs::write(meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            fs::remove_file(config.index_db_path()).unwrap();
+
+            let store = Store::open(&config).unwrap();
+            let stats = store.rebuild_index_from_store().unwrap();
+            assert_eq!(
+                (
+                    stats.entries_rebuilt,
+                    stats.entries_skipped,
+                    stats.blobs_registered
+                ),
+                if accepted { (1, 0, 1) } else { (0, 1, 0) },
+                "name={name:?}, invalid_hash={invalid_hash}"
+            );
+            assert_eq!(store.contains(&key), accepted);
+        }
+    }
+
+    #[test]
     fn rebuild_index_ignores_the_blobs_dir_and_foreign_names() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());

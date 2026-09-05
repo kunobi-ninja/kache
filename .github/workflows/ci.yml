@@ -613,7 +613,7 @@ jobs:
   # `deny.toml`. `just audit` runs cargo-deny once PER WORKSPACE MEMBER — a
   # root-only run graphs only the `kache` bin (+ kache-core) and silently skips
   # anything reachable solely through `kache-service` (e.g. the rsa
-  # RUSTSEC-2023-0071 advisory and surrealdb's BUSL-1.1 license). Kept as its
+  # RUSTSEC-2023-0071 advisory). Kept as its
   # own job — not folded into `check` — so a newly-published advisory surfaces
   # as a dedicated red check instead of being buried in `just ci`, and so it can
   # go red on advisory-DB updates alone without touching any code. Deliberately

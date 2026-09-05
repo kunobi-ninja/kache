@@ -250,5 +250,5 @@ exclude_re = [
     "src/cache_fs.rs:.*replace statfs_total_bytes_macos",
     "src/cache_fs.rs:.*replace volume_total_bytes_windows",
     "src/native_link_key.rs:.*replace WindowsProbeEnvironment::augment_from_installed_msvc .* with Ok",
-    "SurrealPlannerRepository>::identity_candidates .* with Ok\\(vec!\\[\\]\\)",
+    "SqlitePlannerRepository>::identity_candidates .* with Ok\\(vec!\\[\\]\\)",
 ]

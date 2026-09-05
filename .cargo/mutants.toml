@@ -205,7 +205,18 @@ gitignore = true
 # The Windows copy-restore warning adapter calls volume APIs and emits console
 # advice. Linux does not compile it; its portable classification helpers remain
 # in mutation scope.
+#
+# kache-fs keeps native APFS queries in a macOS-only module and names the other
+# platform adapters explicitly. The Ubuntu mutation lane cannot compile those
+# adapters; macOS and Windows tests exercise them. The portable APFS allocation
+# classifier, extent walker and Windows identity assembly stay in scope.
+# TempDir is fixture setup and cleanup, exposed by the testing feature for
+# consumer tests; mutating it tests the harness instead of filesystem behavior.
+exclude_globs = ["crates/kache-fs/src/apfs.rs"]
 exclude_re = [
+    "crates/kache-fs/src/copy.rs:.*(native_reflink_macos|native_reflink_windows|native_reflink_unsupported|windows_cluster_size)",
+    "crates/kache-fs/src/identity.rs:.*windows_metadata_identity",
+    "crates/kache-fs/src/lib.rs:.*testutil::",
     "replace run_config_editor",
     "replace run_monitor",
     "probe_macos",

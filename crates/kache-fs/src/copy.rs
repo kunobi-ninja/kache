@@ -2,6 +2,15 @@
 
 use std::{fs, io, path::Path};
 
+#[cfg(target_os = "linux")]
+use native_reflink_linux as native_reflink;
+#[cfg(target_os = "macos")]
+use native_reflink_macos as native_reflink;
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+use native_reflink_unsupported as native_reflink;
+#[cfg(windows)]
+use native_reflink_windows as native_reflink;
+
 /// Clone data into a new destination using the filesystem's copy-on-write API.
 /// Existing destinations are never replaced. An unsupported filesystem returns
 /// an error so the caller can choose its fallback. This never creates a hardlink.
@@ -12,7 +21,7 @@ pub fn try_reflink(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn native_reflink(src: &Path, dst: &Path) -> io::Result<()> {
+fn native_reflink_macos(src: &Path, dst: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -36,7 +45,7 @@ fn native_reflink(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn native_reflink(src: &Path, dst: &Path) -> io::Result<()> {
+fn native_reflink_linux(src: &Path, dst: &Path) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
 
     let src_file = fs::File::open(src)?;
@@ -61,7 +70,7 @@ fn native_reflink(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn native_reflink(src: &Path, dst: &Path) -> io::Result<()> {
+fn native_reflink_windows(src: &Path, dst: &Path) -> io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
@@ -193,7 +202,7 @@ fn windows_cluster_size(path: &Path) -> io::Result<u64> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn native_reflink(_src: &Path, _dst: &Path) -> io::Result<()> {
+fn native_reflink_unsupported(_src: &Path, _dst: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "reflink not supported on this platform",

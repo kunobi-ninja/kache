@@ -39,36 +39,8 @@ pub(crate) fn metadata_identity(
     }
     #[cfg(windows)]
     {
-        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            GetFileInformationByHandle,
-        };
         let _ = metadata;
-        let flags = FILE_FLAG_BACKUP_SEMANTICS
-            | if follow {
-                0
-            } else {
-                FILE_FLAG_OPEN_REPARSE_POINT
-            };
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(flags)
-            .open(path)?;
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: the handle and output buffer are valid for this call.
-        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok((
-            windows_identity(
-                info.dwVolumeSerialNumber,
-                info.nFileIndexHigh,
-                info.nFileIndexLow,
-            ),
-            u64::from(info.nNumberOfLinks),
-        ))
+        windows_metadata_identity(path, follow)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -78,6 +50,39 @@ pub(crate) fn metadata_identity(
             "file identity is unavailable",
         ))
     }
+}
+
+#[cfg(windows)]
+fn windows_metadata_identity(path: &Path, follow: bool) -> io::Result<(InodeId, u64)> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    let flags = FILE_FLAG_BACKUP_SEMANTICS
+        | if follow {
+            0
+        } else {
+            FILE_FLAG_OPEN_REPARSE_POINT
+        };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle and output buffer are valid for this call.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        windows_identity(
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ),
+        u64::from(info.nNumberOfLinks),
+    ))
 }
 
 #[cfg(any(windows, test))]

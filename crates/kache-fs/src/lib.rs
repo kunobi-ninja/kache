@@ -396,8 +396,20 @@ impl VolumeUsage {
 }
 
 /// Volume usage for the filesystem holding `path`.
-#[cfg(unix)]
 pub fn volume_usage(path: &Path) -> Option<VolumeUsage> {
+    #[cfg(unix)]
+    {
+        volume_usage_unix(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(unix)]
+fn volume_usage_unix(path: &Path) -> Option<VolumeUsage> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -418,11 +430,6 @@ pub fn volume_usage(path: &Path) -> Option<VolumeUsage> {
         total: s.f_blocks as u64 * unit,
         free: s.f_bavail as u64 * unit,
     })
-}
-
-#[cfg(not(unix))]
-pub fn volume_usage(_path: &Path) -> Option<VolumeUsage> {
-    None
 }
 
 /// Best probe for the filesystem holding `path`.

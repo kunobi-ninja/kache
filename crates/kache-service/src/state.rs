@@ -21,6 +21,25 @@ pub struct PlannerStateFile {
     pub key_cache: HashMap<String, Vec<String>>,
 }
 
+impl PlannerStateFile {
+    pub fn read_from(path: &Path) -> Result<Self> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading planner seed state from {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing planner seed state from {}", path.display()))
+    }
+
+    /// Whether seeding this would write no rows. Every field carries
+    /// `#[serde(default)]`, so `{}` parses successfully and means exactly this.
+    pub fn is_empty(&self) -> bool {
+        self.namespaces
+            .values()
+            .all(|namespace| namespace.deps.values().all(|c| c.is_empty()))
+            && self.history.values().all(|c| c.is_empty())
+            && self.key_cache.values().all(|k| k.is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NamespaceState {
     #[serde(default)]
@@ -50,12 +69,19 @@ impl std::fmt::Debug for SqlitePlannerRepository {
 /// Only matters when the db path still holds a pre-SQLite planner database.
 /// Those rows can only ever have come from a seed file — nothing else in the
 /// service writes them — so whether the old store is disposable depends
-/// entirely on whether a seed is configured to put them back.
+/// entirely on whether rows are about to be put back.
+///
+/// `Reseeded` is a claim about a seed the caller has ALREADY read, parsed and
+/// found non-empty; deriving it from "a `--seed-state-file` was configured"
+/// would promise a rebuild that a missing, malformed or `{}` seed never
+/// delivers. It still does not promise the new rows match the old ones: seeding
+/// upserts and never clears, so a seed narrower than the accumulated store
+/// leaves the difference behind in the quarantined copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeedPlan {
-    /// A seed file follows, so a pre-SQLite database can be moved aside.
+    /// Non-empty seed state in hand, so a pre-SQLite database can be moved aside.
     Reseeded,
-    /// Nothing follows. A pre-SQLite database is the only copy of that state.
+    /// Nothing to write. A pre-SQLite database is the only copy of that state.
     None,
 }
 
@@ -89,10 +115,12 @@ impl SqlitePlannerRepository {
         if path.is_dir() {
             if seed_plan == SeedPlan::None {
                 anyhow::bail!(
-                    "planner database {} is a pre-SQLite store and no seed state file is \
-                     configured to rebuild it. Its rows are the only copy. Configure \
-                     --seed-state-file (planner.seedStateFile) to repopulate the projections, \
-                     or point --db-path (planner.dbPath) at a new path and leave this one alone.",
+                    "planner database {} is a pre-SQLite store and there is no non-empty seed \
+                     state to rebuild it from, so replacing it would drop whatever it holds. \
+                     Point --seed-state-file (planner.seedStateFile) at seed state that covers \
+                     what this planner should serve, or point --db-path (planner.dbPath) at a \
+                     new path — that starts from empty projections and every plan falls back to \
+                     the client until something seeds it, but it leaves this store untouched.",
                     path.display()
                 );
             }
@@ -140,11 +168,8 @@ impl SqlitePlannerRepository {
     }
 
     pub async fn seed_from_state_file(&self, path: &Path) -> Result<()> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading planner seed state from {}", path.display()))?;
-        let state: PlannerStateFile = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing planner seed state from {}", path.display()))?;
-        self.seed_from_state(state).await
+        self.seed_from_state(PlannerStateFile::read_from(path)?)
+            .await
     }
 
     pub async fn seed_from_state(&self, state: PlannerStateFile) -> Result<()> {
@@ -792,17 +817,46 @@ mod tests {
         );
     }
 
-    /// A seed that fails after an earlier write must leave no rows behind.
+    /// A seed that fails after an earlier write must undo that write, and must
+    /// not touch rows an earlier successful seed committed.
     ///
     /// Seeding a namespace writes both projections per candidate, so dropping
     /// `crate_artifact` makes the namespace insert succeed and the very next
     /// statement fail — a genuine mid-transaction failure. Without the enclosing
-    /// transaction the namespace row would survive and the planner would serve
-    /// half a state file.
+    /// transaction the new namespace row would survive and the planner would
+    /// serve half a state file. The pre-existing row makes the difference
+    /// between rolling back and simply wiping the table visible; an
+    /// implementation that "cleaned up" by deleting everything on error would
+    /// pass against an empty fixture.
+    ///
+    /// This proves rollback of the failing seed, not that every partial-seed
+    /// shape rolls back: one transaction per candidate would also pass here.
     #[tokio::test]
     async fn seed_rolls_back_when_a_write_fails_partway() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+            .await
+            .unwrap();
+
+        let namespace_seed = |dep: &str, cache_key: &str| PlannerStateFile {
+            namespaces: HashMap::from([(
+                "ns".to_string(),
+                NamespaceState {
+                    deps: HashMap::from([(
+                        dep.to_string(),
+                        vec![PrefetchCandidate::new(
+                            cache_key.to_string(),
+                            "serde".to_string(),
+                        )],
+                    )]),
+                },
+            )]),
+            history: HashMap::new(),
+            key_cache: HashMap::new(),
+        };
+
+        // Committed state the failing seed must leave alone.
+        repo.seed_from_state(namespace_seed("committed@1.0.0", "committed-key"))
             .await
             .unwrap();
 
@@ -814,32 +868,27 @@ mod tests {
         .unwrap();
 
         let err = repo
-            .seed_from_state(PlannerStateFile {
-                namespaces: HashMap::from([(
-                    "ns".to_string(),
-                    NamespaceState {
-                        deps: HashMap::from([(
-                            "serde@1.0.0".to_string(),
-                            vec![PrefetchCandidate::new(
-                                "serde-key".to_string(),
-                                "serde".to_string(),
-                            )],
-                        )]),
-                    },
-                )]),
-                history: HashMap::new(),
-                key_cache: HashMap::new(),
-            })
+            .seed_from_state(namespace_seed("serde@1.0.0", "serde-key"))
             .await;
         assert!(err.is_err(), "the seed must fail once a write fails");
 
+        let survivors = repo
+            .shard_candidates("ns", &[("committed".to_string(), "1.0.0".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(
+            survivors.iter().map(|c| &c.cache_key).collect::<Vec<_>>(),
+            ["committed-key"],
+            "the failed seed must not disturb already committed rows"
+        );
+
         let rows: i64 = repo
             .run(|conn| {
-                Ok(
-                    conn.query_row("SELECT COUNT(*) FROM namespace_artifact", [], |row| {
-                        row.get(0)
-                    })?,
-                )
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM namespace_artifact WHERE cache_key = ?1",
+                    ["serde-key"],
+                    |row| row.get(0),
+                )?)
             })
             .await
             .unwrap();
@@ -874,33 +923,63 @@ mod tests {
             key_cache: HashMap::new(),
         };
 
-        // Seeded oldest-first, and named so that a cache_key tie-break alone
-        // would order them the other way round.
-        repo.seed_from_state(seed("zzz-older")).await.unwrap();
-        repo.seed_from_state(seed("aaa-newer")).await.unwrap();
+        let order = async |repo: &SqlitePlannerRepository| {
+            let shard: Vec<String> = repo
+                .shard_candidates("ns", &[("serde".to_string(), "1.0.0".to_string())])
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|c| c.cache_key)
+                .collect();
+            let history: Vec<String> = repo
+                .history_candidates(&["serde".to_string()])
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|c| c.cache_key)
+                .collect();
+            let keys = repo.key_cache_keys_for_crate("serde").await.unwrap();
+            (shard, history, keys)
+        };
 
-        let shard = repo
-            .shard_candidates("ns", &[("serde".to_string(), "1.0.0".to_string())])
-            .await
-            .unwrap();
-        assert_eq!(
-            shard.iter().map(|c| &c.cache_key).collect::<Vec<_>>(),
-            ["aaa-newer", "zzz-older"]
-        );
+        // Seeded oldest-first, and named so the NEWER key sorts LAST
+        // alphabetically: ordering by `cache_key` alone, or stamping every row
+        // identically and falling through to the tie-break, gives the reverse
+        // of what these assertions demand.
+        repo.seed_from_state(seed("aaa-older")).await.unwrap();
+        repo.seed_from_state(seed("zzz-newer")).await.unwrap();
 
-        assert_eq!(
-            repo.key_cache_keys_for_crate("serde").await.unwrap(),
-            ["aaa-newer", "zzz-older"]
-        );
+        let expected = ["zzz-newer".to_string(), "aaa-older".to_string()];
+        let (shard, history, keys) = order(&repo).await;
+        assert_eq!(shard, expected);
+        assert_eq!(history, expected);
+        assert_eq!(keys, expected);
 
-        let history = repo
-            .history_candidates(&["serde".to_string()])
-            .await
-            .unwrap();
-        assert_eq!(
-            history.iter().map(|c| &c.cache_key).collect::<Vec<_>>(),
-            ["aaa-newer", "zzz-older"]
-        );
+        // Re-seeding an existing tuple must refresh its recency, not just leave
+        // the row alone. Rewriting the stamps to known values first makes that
+        // observable without depending on clock resolution — and keeps the
+        // ordering they already imply, so an upsert that never refreshes
+        // `last_seen_at` leaves the assertions below reading the old order
+        // rather than falling into the `cache_key` tie-break that would happen
+        // to match.
+        repo.run(|conn| {
+            conn.execute_batch(
+                "UPDATE namespace_artifact SET last_seen_at = 1 WHERE cache_key = 'aaa-older';
+                 UPDATE namespace_artifact SET last_seen_at = 2 WHERE cache_key = 'zzz-newer';
+                 UPDATE crate_artifact SET last_seen_at = 1 WHERE cache_key = 'aaa-older';
+                 UPDATE crate_artifact SET last_seen_at = 2 WHERE cache_key = 'zzz-newer';",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        repo.seed_from_state(seed("aaa-older")).await.unwrap();
+
+        let refreshed = ["aaa-older".to_string(), "zzz-newer".to_string()];
+        let (shard, history, keys) = order(&repo).await;
+        assert_eq!(shard, refreshed, "the re-seeded key must sort first again");
+        assert_eq!(history, refreshed);
+        assert_eq!(keys, refreshed);
     }
 
     #[tokio::test]

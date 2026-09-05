@@ -270,16 +270,26 @@ fn parse_service_account_namespace(contents: &str) -> Result<String> {
 }
 
 async fn load_repository(config: &PlannerConfig) -> Result<Option<SharedPlannerDataSource>> {
-    // Tells `open` whether a pre-SQLite store at this path is disposable: the
-    // seed is the only thing that ever refills the projections.
-    let seed_plan = match config.seed_state_file {
-        Some(_) => SeedPlan::Reseeded,
-        None => SeedPlan::None,
+    // Read and parse the seed BEFORE opening, because opening may move a
+    // pre-SQLite store aside and that is only safe if the rows really do come
+    // back. Seeding after the move meant a missing, unreadable or malformed
+    // seed failed only once the old store had already been displaced -- and a
+    // seed stored inside that directory was moved out from under its own path.
+    let seed = match config.seed_state_file.as_deref() {
+        Some(path) => Some(PlannerStateFile::read_from(path)?),
+        None => None,
+    };
+
+    // An empty seed parses fine and puts nothing back, so it is not a plan to
+    // rebuild anything.
+    let seed_plan = match &seed {
+        Some(state) if !state.is_empty() => SeedPlan::Reseeded,
+        _ => SeedPlan::None,
     };
 
     let repository = SqlitePlannerRepository::open(&config.db_path, seed_plan).await?;
-    if let Some(seed_state_file) = config.seed_state_file.as_deref() {
-        repository.seed_from_state_file(seed_state_file).await?;
+    if let Some(seed) = seed {
+        repository.seed_from_state(seed).await?;
     }
     Ok(Some(Arc::new(repository)))
 }

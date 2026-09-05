@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+pub use kache_format::{CachedFile, EntryMeta};
 use rusqlite::{Connection, Error as SqlError, ErrorCode, params};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -644,78 +645,6 @@ fn run_tmutil_addexclusion_bounded(dir: &str) {
             Err(_) => return,
         }
     }
-}
-
-/// Metadata stored alongside cached artifacts.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct EntryMeta {
-    pub cache_key: String,
-    /// Cache-key recipe version that produced `cache_key`.
-    ///
-    /// Entries written before this field existed deserialize as `0` (unknown),
-    /// so an explicit stale-schema sweep can reclaim them without making old
-    /// stores unreadable during an ordinary upgrade.
-    #[serde(default)]
-    pub key_schema: u32,
-    pub crate_name: String,
-    pub crate_types: Vec<String>,
-    pub files: Vec<CachedFile>,
-    pub stdout: String,
-    pub stderr: String,
-    #[serde(default)]
-    pub features: Vec<String>,
-    #[serde(default)]
-    pub target: String,
-    #[serde(default)]
-    pub profile: String,
-    #[serde(default)]
-    pub compile_time_ms: u64,
-    /// Canonical rustc `--emit` kinds this entry actually contains, derived
-    /// from the stored output files at put time (kunobi-ninja/kache#325). Lookup
-    /// uses it to reject an entry that doesn't cover what the invocation's
-    /// `--emit` requested. `#[serde(default)]` keeps pre-gate `meta.json` (no
-    /// field) deserializable — an empty set means "unknown", so the lookup gate
-    /// skips the check rather than mass-invalidating old entries.
-    #[serde(default)]
-    pub emit_kinds: Vec<String>,
-}
-
-impl EntryMeta {
-    /// Whether this entry's recorded outputs cover every `--emit` kind the
-    /// caller requested (kunobi-ninja/kache#325). Superset-tolerant: an entry
-    /// that contains more kinds than requested still covers it (a lib
-    /// `--emit=link` legitimately also produces `.rmeta`).
-    ///
-    /// Returns `true` when `emit_kinds` is empty — pre-gate entries recorded no
-    /// coverage, so the check is skipped rather than mass-invalidating them.
-    /// Requested kinds that map to no stored file class (e.g. an exotic emit
-    /// kache doesn't model) are ignored so the gate never rejects on a kind it
-    /// can't reason about.
-    pub fn covers_requested_emit(&self, requested: &[String]) -> bool {
-        if self.emit_kinds.is_empty() {
-            return true;
-        }
-        requested
-            .iter()
-            .filter(|kind| crate::compiler::GATED_EMIT_KINDS.contains(&kind.as_str()))
-            .all(|kind| self.emit_kinds.iter().any(|have| have == kind))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CachedFile {
-    /// Filename relative to the cache entry directory
-    pub name: String,
-    /// Size in bytes
-    pub size: u64,
-    /// blake3 hash of file content
-    pub hash: String,
-    /// Whether the source file had the executable bit set at store time.
-    /// Folded into the local content-dedup hash so two entries differing only
-    /// by which file is executable can't collide (kunobi-ninja/kache#324).
-    /// `#[serde(default)]` keeps old `meta.json` (no field) deserializable.
-    #[serde(default)]
-    pub executable: bool,
 }
 
 /// Statistics returned by GC operations.
@@ -2138,7 +2067,7 @@ impl Store {
             // C: a malformed `hash` becomes a shard path component (`&hash[..2]`)
             // — reject anything that isn't a 64-char blake3 hex digest so it can
             // never panic a slice or escape the blob shard.
-            if !crate::remote_layout::is_blob_hash(&cached_file.hash) {
+            if !kache_format::is_blob_hash(&cached_file.hash) {
                 anyhow::bail!(
                     "downloaded entry {short_key}: rejecting file {} — malformed blob hash {:?}",
                     cached_file.name,
@@ -2147,7 +2076,7 @@ impl Store {
             }
             // B: a `name` that is absolute or contains `..` escapes the entry dir
             // on join — require a single normal component.
-            if !crate::remote_layout::is_safe_artifact_name(&cached_file.name) {
+            if !kache_format::is_safe_artifact_name(&cached_file.name) {
                 anyhow::bail!(
                     "downloaded entry {short_key}: rejecting unsafe artifact name {:?}",
                     cached_file.name,
@@ -2413,7 +2342,7 @@ impl Store {
 
             let mut artifact_names = std::collections::HashSet::new();
             for file in &entry.meta.files {
-                if !crate::remote_layout::is_safe_artifact_name(&file.name)
+                if !kache_format::is_safe_artifact_name(&file.name)
                     || !crate::cache_key::is_valid_cache_key(&file.hash)
                     || !artifact_names.insert(file.name.as_str())
                 {
@@ -2569,8 +2498,8 @@ impl Store {
             let meta: EntryMeta = serde_json::from_str(&content)
                 .with_context(|| format!("entry {key}: parsing authoritative meta.json"))?;
             for file in &meta.files {
-                if !crate::remote_layout::is_blob_hash(&file.hash)
-                    || !crate::remote_layout::is_safe_artifact_name(&file.name)
+                if !kache_format::is_blob_hash(&file.hash)
+                    || !kache_format::is_safe_artifact_name(&file.name)
                 {
                     anyhow::bail!("entry {key}: invalid blob metadata");
                 }
@@ -2813,8 +2742,8 @@ impl Store {
         // Validate the whole entry before writing anything, so a half-present
         // entry never lands as a row that would resolve to a missing blob.
         for file in &meta.files {
-            if !crate::remote_layout::is_blob_hash(&file.hash)
-                || !crate::remote_layout::is_safe_artifact_name(&file.name)
+            if !kache_format::is_blob_hash(&file.hash)
+                || !kache_format::is_safe_artifact_name(&file.name)
             {
                 return Ok(None);
             }
@@ -6668,6 +6597,50 @@ mod tests {
             !store.contains(&truncated),
             "an entry with a wrong-sized blob must not be registered"
         );
+    }
+
+    #[test]
+    fn rebuild_index_validates_artifact_names_and_hashes_independently() {
+        for (name, invalid_hash, accepted) in [
+            ("foo.rlib", false, true),
+            ("../escape", false, false),
+            ("foo.rlib", true, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = test_config(dir.path());
+            let key = {
+                let store = Store::open(&config).unwrap();
+                put_entry(&store, dir.path(), 30, "foo", b"compiled artifact")
+            };
+            let meta_path = config.store_dir().join(&key).join("meta.json");
+            let mut meta: EntryMeta =
+                serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+            meta.files[0].name = name.into();
+            if invalid_hash {
+                let original = blob_path_in_store_dir(&config.store_dir(), &meta.files[0].hash);
+                meta.files[0].hash = "g".repeat(64);
+                let malformed = blob_path_in_store_dir(&config.store_dir(), &meta.files[0].hash);
+                fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+                // Keep the blob present and correctly sized: only validation
+                // of its hash spelling may reject this entry.
+                fs::copy(original, malformed).unwrap();
+            }
+            fs::write(meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            fs::remove_file(config.index_db_path()).unwrap();
+
+            let store = Store::open(&config).unwrap();
+            let stats = store.rebuild_index_from_store().unwrap();
+            assert_eq!(
+                (
+                    stats.entries_rebuilt,
+                    stats.entries_skipped,
+                    stats.blobs_registered
+                ),
+                if accepted { (1, 0, 1) } else { (0, 1, 0) },
+                "name={name:?}, invalid_hash={invalid_hash}"
+            );
+            assert_eq!(store.contains(&key), accepted);
+        }
     }
 
     #[test]
@@ -12331,40 +12304,6 @@ mod tests {
             cf("foo.dSYM"), // sidecar → no emit kind, ignored
         ]);
         assert_eq!(kinds, vec!["dep-info", "link", "metadata"]);
-    }
-
-    /// kunobi-ninja/kache#325: the lookup gate is superset-tolerant, skips empty
-    /// (pre-gate) entries, and rejects genuinely-missing kinds.
-    #[test]
-    fn covers_requested_emit_semantics() {
-        let mk = |kinds: &[&str]| EntryMeta {
-            cache_key: "k".into(),
-            key_schema: crate::cache_key::CACHE_KEY_VERSION,
-            crate_name: "c".into(),
-            crate_types: vec![],
-            files: vec![],
-            stdout: String::new(),
-            stderr: String::new(),
-            features: vec![],
-            target: String::new(),
-            profile: String::new(),
-            compile_time_ms: 0,
-            emit_kinds: kinds.iter().map(|s| s.to_string()).collect(),
-        };
-        let req = |kinds: &[&str]| -> Vec<String> { kinds.iter().map(|s| s.to_string()).collect() };
-
-        // Superset: entry has link+metadata+dep-info, request just link.
-        assert!(mk(&["dep-info", "link", "metadata"]).covers_requested_emit(&req(&["link"])));
-        // Exact.
-        assert!(
-            mk(&["dep-info", "metadata"]).covers_requested_emit(&req(&["dep-info", "metadata"]))
-        );
-        // Missing the requested obj → not covered.
-        assert!(!mk(&["link"]).covers_requested_emit(&req(&["link", "obj"])));
-        // Pre-gate entry (no recorded kinds) → skip the check.
-        assert!(mk(&[]).covers_requested_emit(&req(&["link", "obj"])));
-        // A requested kind the gate can't map to a file is ignored, not rejected.
-        assert!(mk(&["link"]).covers_requested_emit(&req(&["link", "future-exotic"])));
     }
 
     /// kunobi-ninja/kache#431: a wasm32 target's link product is a `.wasm`

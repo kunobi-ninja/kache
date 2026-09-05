@@ -392,9 +392,7 @@ pub fn classify_by_filename(name: &str) -> ArtifactKind {
 /// the values [`emit_kind_for_filename`] can return (kunobi-ninja/kache#325). A
 /// requested kind outside this set is ignored by the gate so it never refuses on
 /// a kind kache can't map to a stored file.
-pub const GATED_EMIT_KINDS: [&str; 8] = [
-    "link", "metadata", "obj", "dep-info", "asm", "llvm-ir", "llvm-bc", "mir",
-];
+pub use kache_format::GATED_EMIT_KINDS;
 
 pub fn emit_kind_for_filename(name: &str) -> Option<&'static str> {
     let ext = std::path::Path::new(name)

@@ -1,6 +1,7 @@
 use crate::args::RustcArgs;
 use crate::path_normalizer::{PathNormalizer, check_for_path_leak};
 use anyhow::{Context, Result};
+pub(crate) use kache_format::{is_valid_cache_key, is_valid_crate_name};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -245,7 +246,7 @@ use std::path::{Path, PathBuf};
 // passthrough. Windows GNU, cross-target, and metadata invocations remain
 // unprobed. Existing Windows linked-output keys did not contain this
 // identity, so invalidate them rather than mix schemas.
-pub(crate) const CACHE_KEY_VERSION: u32 = 31;
+pub(crate) use kache_format::CACHE_KEY_VERSION;
 const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -624,37 +625,6 @@ pub(crate) fn fold_labeled(base: String, label: &str, value: &str) -> String {
     hasher.update(b"\x1f");
     hasher.update(base.as_bytes());
     hasher.finalize().to_hex().to_string()
-}
-
-/// Is `s` a well-formed cache key: exactly 64 lowercase hex chars, matching
-/// the `blake3::Hash::to_hex()` output that every key path produces
-/// ([`compute_cache_key`], [`fold_labeled`])?
-///
-/// Cache keys that arrive from an untrusted source — a prefetch planner
-/// response or an S3 bucket listing — get interpolated into local filesystem
-/// paths (`store_dir().join(cache_key)`) and S3 object keys. An unvalidated
-/// value like `../../../home/user/.config` is a path-traversal / prefix-escape
-/// primitive (`PathBuf::join` walks up on `..` and resets on an absolute
-/// component). Callers must **reject** such keys, never sanitize them.
-pub(crate) fn is_valid_cache_key(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
-}
-
-/// Is `s` a crate name safe to use as an S3 object-key path component?
-///
-/// Permissive enough for real crate names and cc source basenames
-/// (`[A-Za-z0-9_.-]`) but rejects anything that could escape a path or key
-/// prefix: separators, `..` traversal, NUL/control chars, the empty string,
-/// or an absurd length. Like [`is_valid_cache_key`], this guards values that
-/// cross the untrusted-remote boundary; reject, do not sanitize.
-pub(crate) fn is_valid_crate_name(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 128
-        && !s.contains("..")
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
 /// Fold `label` followed by a length-prefixed `value` into the cache-key hasher.
@@ -6231,49 +6201,6 @@ mod tests {
         assert!(is_valid_cache_key(&key));
         assert!(is_valid_cache_key(&"a".repeat(64)));
         assert!(is_valid_cache_key(&"0123456789abcdef".repeat(4)));
-    }
-
-    #[test]
-    fn is_valid_cache_key_rejects_traversal_and_malformed() {
-        assert!(!is_valid_cache_key(""));
-        assert!(!is_valid_cache_key("abc123")); // too short
-        assert!(!is_valid_cache_key(&"a".repeat(63)));
-        assert!(!is_valid_cache_key(&"a".repeat(65)));
-        assert!(!is_valid_cache_key(&"A".repeat(64))); // uppercase not produced by to_hex
-        assert!(!is_valid_cache_key(&"g".repeat(64))); // non-hex
-        // Path-traversal / prefix-escape attempts, padded to 64 chars.
-        assert!(!is_valid_cache_key(&format!(
-            "{:/<64}",
-            "../../../etc/passwd"
-        )));
-        assert!(!is_valid_cache_key(&format!("{:0<64}", "/abs/path")));
-        assert!(!is_valid_cache_key(&format!("{:0<63}\n", "x"))); // newline
-    }
-
-    #[test]
-    fn is_valid_crate_name_accepts_real_names() {
-        for name in [
-            "serde",
-            "tokio_stream",
-            "foo-bar",
-            "build_script_build",
-            "a.out",
-            "x",
-        ] {
-            assert!(is_valid_crate_name(name), "{name} should be valid");
-        }
-    }
-
-    #[test]
-    fn is_valid_crate_name_rejects_path_escapes() {
-        assert!(!is_valid_crate_name(""));
-        assert!(!is_valid_crate_name("../evil"));
-        assert!(!is_valid_crate_name("a/b"));
-        assert!(!is_valid_crate_name("a\\b"));
-        assert!(!is_valid_crate_name("a..b")); // traversal substring
-        assert!(!is_valid_crate_name("nul\0byte"));
-        assert!(!is_valid_crate_name("tab\there"));
-        assert!(!is_valid_crate_name(&"a".repeat(129))); // too long
     }
 
     #[test]

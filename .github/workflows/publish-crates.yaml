@@ -86,8 +86,8 @@ jobs:
             "E2E smoke (Linux)" "E2E smoke (macOS)" "E2E smoke (Windows)" \
             "Test (macOS)" "Test (Windows)"
 
-      - name: Package kache-core
-        run: cargo package -p kache-core --locked
+      - name: Verify publishable packages
+        run: cargo package --locked -p kache-core -p kache-format -p kache
 
       - name: Authenticate to crates.io
         id: auth
@@ -95,56 +95,36 @@ jobs:
         # Node 20 runtime; v1.0.4 is the first node24 release.
         uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
 
-      - name: Publish kache-core
+      - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           version="${RELEASE_TAG#v}"
-          status="$(curl -sS -A kache-publish-workflow -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/kache-core/$version")"
-          if [ "$status" = "200" ]; then
-            echo "kache-core $version is already published"
-            exit 0
-          fi
-          if [ "$status" != "404" ]; then
-            echo "unexpected crates.io status while checking kache-core $version: $status" >&2
-            exit 1
-          fi
-          cargo publish -p kache-core --locked
-
-      - name: Wait for kache-core in crates.io index
-        # Poll the sparse index (index.crates.io) — the source `cargo publish`
-        # resolves dependencies against, updated within seconds of a publish.
-        # The old `cargo search` check hit the crates.io *search* index, which
-        # is eventually-consistent and lagged past this loop on the 0.4.0 cut.
-        run: |
-          version="${RELEASE_TAG#v}"
-          for attempt in {1..30}; do
-            if curl -sf -A kache-publish-workflow \
-                 "https://index.crates.io/ka/ch/kache-core" | grep -q "\"vers\":\"$version\""; then
-              echo "kache-core $version visible in crates.io sparse index"
-              exit 0
+          for crate in kache-core kache-format kache; do
+            status="$(curl -sS -A kache-publish-workflow -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/$crate/$version")"
+            if [ "$status" = "200" ]; then
+              echo "$crate $version is already published"
+            elif [ "$status" = "404" ]; then
+              cargo publish -p "$crate" --locked
+            else
+              echo "unexpected crates.io status while checking $crate $version: $status" >&2
+              exit 1
             fi
-            echo "kache-core $version not visible yet; retry $attempt/30"
-            sleep 10
+
+            # Dependents resolve from the sparse index, whose update can lag
+            # the publish API. Wait before publishing the next crate.
+            visible=false
+            for attempt in {1..30}; do
+              if curl -sf -A kache-publish-workflow \
+                   "https://index.crates.io/ka/ch/$crate" | grep -q "\"vers\":\"$version\""; then
+                visible=true
+                break
+              fi
+              echo "$crate $version not visible yet; retry $attempt/30"
+              sleep 10
+            done
+            if [ "$visible" != "true" ]; then
+              echo "$crate $version did not become visible in crates.io index" >&2
+              exit 1
+            fi
           done
-          echo "kache-core $version did not become visible in crates.io index" >&2
-          exit 1
-
-      - name: Package kache
-        run: cargo package -p kache --locked
-
-      - name: Publish kache
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          version="${RELEASE_TAG#v}"
-          status="$(curl -sS -A kache-publish-workflow -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/kache/$version")"
-          if [ "$status" = "200" ]; then
-            echo "kache $version is already published"
-            exit 0
-          fi
-          if [ "$status" != "404" ]; then
-            echo "unexpected crates.io status while checking kache $version: $status" >&2
-            exit 1
-          fi
-          cargo publish -p kache --locked

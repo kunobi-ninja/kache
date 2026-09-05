@@ -13,24 +13,18 @@
 # NO suffix stripping. (Cargo serves prereleases only on an explicit `--version`
 # request, so this never affects a normal `cargo add`/`cargo install`.)
 #
-# Scope = what actually ships:
-#   - `kache`        crate (crates.io) + binary
-#   - `kache-core`   crate (crates.io)
-#   - the `kache-core` dependency pin in the root manifest (the one
-#     non-derived value that can silently diverge from the crate version)
-# `kache-service` and `kache-e2e` are publish=false (the service image version
-# comes from the tag; kache-e2e is test/benchmark only), so they are
-# intentionally NOT gated — an intentional version skew there must not be able
-# to block a release.
+# Scope: every publishable workspace crate and its local dependency pins.
+# Unpublished service, proof, and test packages may carry separate versions.
+# Chart versions still follow the binary release tag.
 #
 # Hermetic: pure manifest reads via python tomllib — no cargo, no nix, no
 # network — so the gate is fast (~hundreds of ms) and has no installer/registry
 # failure surface.
 #
 # Usage:
-#   check-version-consistency.sh                # internal mode: the 3 values agree
-#   check-version-consistency.sh v0.5.0         # tag mode: the 3 values == 0.5.0
-#   check-version-consistency.sh v0.5.0-rc.4    # tag mode: the 3 values == 0.5.0-rc.4
+#   check-version-consistency.sh                # internal mode: publishable versions agree
+#   check-version-consistency.sh v0.5.0         # tag mode: publishable versions == 0.5.0
+#   check-version-consistency.sh v0.5.0-rc.4    # tag mode: publishable versions == 0.5.0-rc.4
 #
 # Exit: 0 consistent; 1 on a mismatch / malformed tag; fail-closed.
 set -euo pipefail
@@ -63,22 +57,13 @@ def load(p):
 
 
 root_toml = load(root / "Cargo.toml")
-core_toml = load(root / "crates" / "kache-core" / "Cargo.toml")
-
 kache_version = root_toml["package"]["version"]
-core_version = core_toml["package"]["version"]
-
-# The kache-core dependency requirement in the root manifest. Accept both the
-# table form ({ version = "..", path = .. }) and a bare string ("..").
-deps = root_toml.get("dependencies", {})
-if "kache-core" not in deps:
-    print("kache-core is not a [dependencies] entry in the root Cargo.toml", file=sys.stderr)
-    sys.exit(1)
-entry = deps["kache-core"]
-dep_pin = entry if isinstance(entry, str) else entry.get("version")
-if dep_pin is None:
-    print("kache-core dependency has no `version` requirement to check", file=sys.stderr)
-    sys.exit(1)
+manifests = {root: root_toml}
+for member in root_toml["workspace"]["members"]:
+    for directory in root.glob(member):
+        manifest = load(directory / "Cargo.toml")
+        if manifest["package"].get("publish") is not False:
+            manifests[directory.resolve()] = manifest
 
 errors = []
 
@@ -94,20 +79,30 @@ if m:
         "use the dotted form (e.g. -rc.4) — the no-dot form sorts lexically on crates.io"
     )
 
-# (1) Internal consistency — always enforced. A half-applied bump (the crate
-# bumped but the dep-pin forgotten, or vice-versa) fails here on every PR. The
-# dep-pin must be the EXACT version string (which `cargo set-version` writes),
-# prerelease included — a hand-edited caret/range would fail closed here.
-if core_version != dep_pin:
-    errors.append(
-        f"kache-core crate version {core_version!r} != kache-core dependency pin "
-        f"{dep_pin!r} (root Cargo.toml [dependencies.kache-core].version)"
-    )
-if kache_version != core_version:
-    errors.append(
-        f"kache version {kache_version!r} != kache-core version {core_version!r} "
-        "(the workspace is bumped in lockstep)"
-    )
+# Every crate that ships follows the release version. A local dependency
+# must pin that version so the published manifest resolves the same crate.
+for directory, manifest in manifests.items():
+    package = manifest["package"]
+    if package["version"] != kache_version:
+        errors.append(
+            f"{package['name']} version {package['version']!r} != kache version {kache_version!r}"
+        )
+    dependency_tables = [manifest.get(kind, {}) for kind in ("dependencies", "build-dependencies")]
+    for target in manifest.get("target", {}).values():
+        dependency_tables.extend(target.get(kind, {}) for kind in ("dependencies", "build-dependencies"))
+    for dependencies in dependency_tables:
+        for name, dependency in dependencies.items():
+            if not isinstance(dependency, dict) or "path" not in dependency:
+                continue
+            target_dir = (directory / dependency["path"]).resolve()
+            target_manifest = manifests.get(target_dir)
+            if target_manifest is None:
+                errors.append(f"{package['name']} depends on unpublished local crate {name}")
+            elif dependency.get("version") != target_manifest["package"]["version"]:
+                errors.append(
+                    f"{package['name']} dependency pin for {name} {dependency.get('version')!r} "
+                    f"!= {target_manifest['package']['version']!r}"
+                )
 
 # (1b) Chart.yaml — both fields, because the chart ships from the same `v*` tag
 # (see the publish-chart job). `appVersion` names the app the chart deploys and
@@ -140,8 +135,6 @@ for field in ("version", "appVersion"):
 if tag_version:
     if kache_version != tag_version:
         errors.append(f"kache version {kache_version!r} != tag version {tag_version!r}")
-    if core_version != tag_version:
-        errors.append(f"kache-core version {core_version!r} != tag version {tag_version!r}")
 
 if errors:
     scope = f"tag {tag_version}" if tag_version else "the workspace manifests"
@@ -152,8 +145,6 @@ if errors:
     print(f"Fix: run `just bump {fix}` so the manifests agree, then re-tag if needed.", file=sys.stderr)
     sys.exit(1)
 
-if tag_version:
-    print(f"version consistency OK: tag {tag_version} == kache == kache-core == kache-core dep-pin")
-else:
-    print(f"version consistency OK: kache == kache-core == kache-core dep-pin == {kache_version}")
+scope = f"tag {tag_version}" if tag_version else "workspace"
+print(f"version consistency OK: {scope}, {len(manifests)} publishable crates at {kache_version}")
 PY

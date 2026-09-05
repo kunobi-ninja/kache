@@ -44,7 +44,7 @@ assert shutil.disk_usage(repo).free >= 40 * 1024**3, 'Need 40 GiB free'
     'base': BASE, 'head': HEAD, 'platform': platform.platform(),
     'host': host(), 'repetitions_per_side': 4,
 }, indent=2))
-shutil.copytree(repo / 'scenarios', root / 'scenarios')
+shutil.copytree(repo / 'scenarios/bench-pr-cargo', root / 'scenarios/bench-pr-cargo')
 command(['cargo', 'build', '--release', '--locked', '-p', 'kache-e2e',
          '--bin', 'kache-scenario'], results / 'build-instrument.log')
 engine = root / 'kache-scenario'

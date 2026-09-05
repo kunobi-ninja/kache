@@ -544,47 +544,9 @@ fn publish_rename_outcome(err: std::io::Error, blob_present: bool) -> Result<boo
 /// store blob (keep RO) or is an independent file we marked RO by mistake
 /// (restore writable).
 fn paths_share_inode(a: &Path, b: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match (fs::metadata(a), fs::metadata(b)) {
-            (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
-            _ => false,
-        }
-    }
-    #[cfg(windows)]
-    {
-        // `std::os::windows::fs::MetadataExt::{file_index,volume_serial_number}`
-        // are still unstable (`windows_by_handle`). Use the same stable
-        // `GetFileInformationByHandle` path as `events::get_file_identity`.
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-        };
-        fn identity(path: &Path) -> Option<(u32, u32, u32)> {
-            let file = fs::File::open(path).ok()?;
-            let handle = file.as_raw_handle();
-            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-            let ok = unsafe { GetFileInformationByHandle(handle as _, &mut info) };
-            if ok != 0 {
-                Some((
-                    info.dwVolumeSerialNumber,
-                    info.nFileIndexHigh,
-                    info.nFileIndexLow,
-                ))
-            } else {
-                None
-            }
-        }
-        match (identity(a), identity(b)) {
-            (Some(ia), Some(ib)) => ia == ib,
-            _ => false,
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (a, b);
-        false
+    match (kache_fs::file_identity(a), kache_fs::file_identity(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 

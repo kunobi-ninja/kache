@@ -1,0 +1,31 @@
+[package]
+name = "kache-fs"
+version = "0.16.1"
+edition = "2024"
+rust-version = "1.95"
+description = "Filesystem measurements, file identity, native cloning and copying."
+license = "Apache-2.0"
+repository = "https://github.com/kunobi-ninja/kache"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[features]
+default = []
+serde = ["dep:serde"]
+testing = []
+
+[lints.rust]
+warnings = "deny"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }

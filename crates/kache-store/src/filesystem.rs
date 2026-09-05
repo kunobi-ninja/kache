@@ -12,63 +12,12 @@ pub struct PathIdentity {
 
 /// Stable directory identity used to reject moved or replaced tracked targets.
 pub fn directory_identity(path: &Path) -> Option<PathIdentity> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_dir() {
-        return None;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some(PathIdentity {
-            device: meta.dev(),
-            inode: meta.ino(),
+    kache_fs::directory_identity(path)
+        .ok()
+        .map(|id| PathIdentity {
+            device: id.dev,
+            inode: id.ino,
         })
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle,
-        };
-
-        let directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-            .ok()?;
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        let ok = unsafe { GetFileInformationByHandle(directory.as_raw_handle() as _, &mut info) };
-        win32_call_succeeded(ok).then(|| {
-            windows_path_identity_from_parts(
-                info.dwVolumeSerialNumber,
-                info.nFileIndexHigh,
-                info.nFileIndexLow,
-            )
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        None
-    }
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-pub fn win32_call_succeeded(result: i32) -> bool {
-    result != 0
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-pub fn windows_path_identity_from_parts(
-    volume_serial: u32,
-    file_index_high: u32,
-    file_index_low: u32,
-) -> PathIdentity {
-    PathIdentity {
-        device: u64::from(volume_serial),
-        inode: (u64::from(file_index_high) << 32).saturating_add(u64::from(file_index_low)),
-    }
 }
 
 /// A tracked cleanup target must be a derived directory, never a source root
@@ -145,15 +94,6 @@ pub fn retainer_from_sharing(size: u64, sharing: Sharing) -> BlobRetainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn windows_directory_identity_preserves_the_full_file_index() {
-        assert!(!win32_call_succeeded(0));
-        assert!(win32_call_succeeded(1));
-        let identity = windows_path_identity_from_parts(0x1020_3040, 0x1122_3344, 0x5566_7788);
-        assert_eq!(identity.device, 0x1020_3040);
-        assert_eq!(identity.inode, 0x1122_3344_5566_7788);
-    }
 
     #[test]
     fn retainer_from_sharing_treats_fully_cloned_as_unreclaimable() {

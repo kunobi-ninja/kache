@@ -14,6 +14,7 @@ rust-version = "1.95"
 members = [
     "crates/kache-core",
     "crates/kache-format",
+    "crates/kache-fs",
     "crates/kache-store",
     "crates/kache-e2e",
     "crates/kache-proofs",

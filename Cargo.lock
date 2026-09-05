@@ -2923,6 +2923,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kache-fs"
+version = "0.16.1"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "kache-proofs"
 version = "0.16.1"
 
@@ -2960,6 +2970,7 @@ dependencies = [
  "blake3",
  "filetime",
  "kache-format",
+ "kache-fs",
  "libc",
  "rusqlite",
  "serde",

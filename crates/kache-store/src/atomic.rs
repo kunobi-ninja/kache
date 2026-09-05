@@ -66,15 +66,36 @@ const TRANSIENT_ATTEMPTS: u32 = 10;
 /// one place. Off Windows that predicate is always false, so `op` runs exactly
 /// once and this adds nothing.
 pub(crate) fn retry_transient_windows<T>(
+    op: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    retry_transient(op, is_transient_rename_error)
+}
+
+/// The retry loop itself, with the "is this worth waiting out" decision passed
+/// in.
+///
+/// Split from [`retry_transient_windows`] so the loop is reachable off Windows.
+/// With the classifier inlined, `is_transient_rename_error` is a compile-time
+/// `false` everywhere else, the retry arm is dead code on the Linux runner that
+/// scores mutants, and every mutation of the bound and the counter survives
+/// against a branch nothing can enter. The counter arithmetic and the budget
+/// are platform-independent; only the code list is not.
+fn retry_transient<T>(
     mut op: impl FnMut() -> std::io::Result<T>,
+    is_transient: impl Fn(&std::io::Error) -> bool,
 ) -> std::io::Result<T> {
     let mut attempt = 0;
     loop {
         match op() {
             Ok(value) => return Ok(value),
-            Err(e) if is_transient_rename_error(&e) && attempt + 1 < TRANSIENT_ATTEMPTS => {
+            Err(e) if is_transient(&e) && attempt + 1 < TRANSIENT_ATTEMPTS => {
                 std::thread::sleep(std::time::Duration::from_millis(rename_backoff_ms(attempt)));
-                attempt += 1;
+                let next = attempt + 1;
+                // A counter that does not advance turns this into an infinite
+                // loop, which no test can fail — it hangs instead. Assert the
+                // step so the failure is a panic a test can see.
+                debug_assert!(next > attempt, "the retry counter must advance");
+                attempt = next;
             }
             Err(e) => return Err(e),
         }
@@ -317,34 +338,79 @@ mod tests {
 
     /// A delete-pending destination clears on its own, so the retry has to
     /// outlast it and then return the eventual success.
-    #[cfg(windows)]
+    ///
+    /// Drives [`retry_transient`] with an always-transient classifier: the
+    /// wrapper's real one is a compile-time `false` off Windows, which would
+    /// leave this asserting nothing on most runners.
     #[test]
-    fn retry_transient_windows_waits_out_a_transient_failure() {
+    fn retry_transient_waits_out_a_transient_failure() {
         let mut calls = 0;
-        let value = retry_transient_windows(|| {
-            calls += 1;
-            if calls < 3 {
-                return Err(std::io::Error::from_raw_os_error(5));
-            }
-            Ok(calls)
-        })
+        let value = retry_transient(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    return Err(std::io::Error::from_raw_os_error(5));
+                }
+                Ok(calls)
+            },
+            |_| true,
+        )
         .unwrap();
         assert_eq!((value, calls), (3, 3));
     }
 
     /// A state that never clears is a real failure, and the budget is what
-    /// keeps it from hanging: the last attempt's error surfaces.
-    #[cfg(windows)]
+    /// keeps it from hanging: the last attempt's error surfaces, after exactly
+    /// the budgeted number of tries. The exact count is the assertion that
+    /// pins the bound — off by one either way and this fails.
     #[test]
-    fn retry_transient_windows_gives_up_within_its_budget() {
-        let mut calls = 0;
-        let err = retry_transient_windows(|| {
-            calls += 1;
-            Err::<(), _>(std::io::Error::from_raw_os_error(32))
-        })
+    fn retry_transient_gives_up_after_exactly_its_budget() {
+        let mut calls: u32 = 0;
+        let err = retry_transient(
+            || {
+                calls += 1;
+                Err::<(), _>(std::io::Error::from_raw_os_error(32))
+            },
+            |_| true,
+        )
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(32));
-        assert_eq!(calls, TRANSIENT_ATTEMPTS as i32);
+        assert_eq!(calls, TRANSIENT_ATTEMPTS);
+    }
+
+    /// A classifier that rejects the error settles on the first call even when
+    /// the error carries a Windows race code. This is the whole behaviour off
+    /// Windows, where nothing classifies as transient.
+    #[test]
+    fn retry_transient_respects_a_rejecting_classifier() {
+        let mut calls = 0;
+        let err = retry_transient(
+            || {
+                calls += 1;
+                Err::<(), _>(std::io::Error::from_raw_os_error(5))
+            },
+            |_| false,
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(5));
+        assert_eq!(calls, 1);
+    }
+
+    /// The wrapper wires the real classifier in, so it retries a Windows race
+    /// code there and settles at once everywhere else.
+    #[test]
+    fn retry_transient_windows_uses_the_windows_classifier() {
+        let mut calls: u32 = 0;
+        let err = retry_transient_windows(|| {
+            calls += 1;
+            Err::<(), _>(std::io::Error::from_raw_os_error(5))
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(5));
+        #[cfg(windows)]
+        assert_eq!(calls, TRANSIENT_ATTEMPTS);
+        #[cfg(not(windows))]
+        assert_eq!(calls, 1);
     }
 
     #[test]

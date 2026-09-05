@@ -30,7 +30,7 @@ mod metrics;
 
 mod state;
 
-pub use state::{DEFAULT_DB_PATH, NamespaceState, PlannerStateFile, SurrealPlannerRepository};
+pub use state::{DEFAULT_DB_PATH, NamespaceState, PlannerStateFile, SqlitePlannerRepository};
 
 type SharedPlannerDataSource = Arc<dyn PlannerDataSource + Send + Sync>;
 
@@ -268,7 +268,7 @@ fn parse_service_account_namespace(contents: &str) -> Result<String> {
 }
 
 async fn load_repository(config: &PlannerConfig) -> Result<Option<SharedPlannerDataSource>> {
-    let repository = SurrealPlannerRepository::open(&config.db_path).await?;
+    let repository = SqlitePlannerRepository::open(&config.db_path).await?;
     if let Some(seed_state_file) = config.seed_state_file.as_deref() {
         repository.seed_from_state_file(seed_state_file).await?;
     }
@@ -897,7 +897,7 @@ mod tests {
     #[tokio::test]
     async fn prefetch_plan_returns_execute_when_repository_has_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let repository = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
+        let repository = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
             .await
             .unwrap();
         repository
@@ -952,7 +952,7 @@ mod tests {
     #[tokio::test]
     async fn prefetch_plan_returns_use_fallback_when_repository_has_no_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let repository = SurrealPlannerRepository::open(&dir.path().join("planner.db"))
+        let repository = SqlitePlannerRepository::open(&dir.path().join("planner.db"))
             .await
             .unwrap();
 

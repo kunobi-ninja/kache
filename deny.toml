@@ -9,8 +9,8 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 ignore = [
   # RUSTSEC-2023-0071 — rsa 0.9.x Marvin timing sidechannel (medium 5.9).
-  # Transitive via kunobi-auth (ssh-key, openidconnect) and surrealdb
-  # (jsonwebtoken). No fixed `rsa` release exists ("Solution: No fixed
+  # Transitive via kunobi-auth (ssh-key, openidconnect). No fixed `rsa`
+  # release exists ("Solution: No fixed
   # upgrade is available!"). Re-evaluate when rsa >= 0.10 ships a
   # constant-time implementation. NOTE: only reachable through
   # `kache-service`, so cargo-deny must be run per workspace member (a
@@ -21,7 +21,7 @@ ignore = [
 [bans]
 # Multiple versions of the same crate inflate binary size and signal
 # upgrade churn. Warn (not deny) — perfect uniqueness is impractical in a
-# graph this size (aws-sdk + surrealdb + kube pull wide trees).
+# graph this size (aws-sdk + kube pull wide trees).
 multiple-versions = "warn"
 wildcards = "deny"
 # kache-service's path dep (kache-core) and first-party git deps
@@ -54,58 +54,13 @@ allow = [
     # repos' smaller graphs never reach:
     "0BSD",                # doctest-file, recvmsg (via interprocess)
     "CDLA-Permissive-2.0", # webpki-root-certs (via reqwest -> rustls-platform-verifier)
-    "BSL-1.0",             # xxhash-rust (via surrealkv) — Boost, OSI-permissive
 ]
 confidence-threshold = 0.93
-# surrealdb (and its sub-crates) ship under BUSL-1.1 — the Business Source
-# License, NOT an OSI-permissive license. It grants use and converts to
-# Apache-2.0 after a change date, but restricts offering the DB as a
-# competing hosted service. kache-service embeds surrealdb as its planner
-# store (already a dependency long before this file), so accept BUSL-1.1
-# scoped to exactly these crates rather than allowing it graph-wide.
-exceptions = [
-    { crate = "surrealdb", allow = ["BUSL-1.1"] },
-    { crate = "surrealdb-collections", allow = ["BUSL-1.1"] },
-    { crate = "surrealdb-core", allow = ["BUSL-1.1"] },
-    { crate = "surrealdb-protocol", allow = ["BUSL-1.1"] },
-    { crate = "surrealdb-strand", allow = ["BUSL-1.1"] },
-    { crate = "surrealdb-types", allow = ["BUSL-1.1"] },
-    { crate = "surrealdb-types-derive", allow = ["BUSL-1.1"] },
-]
-
-# surrealdb crates omit the `license` field in their manifest; cargo-deny
-# reads their LICENSE file but scores it 0.87 (below the 0.93 threshold),
-# so it reports them "unlicensed". Clarify the expression explicitly so
-# the exceptions above apply. All six share one LICENSE file (same hash).
-[[licenses.clarify]]
-crate = "surrealdb"
-expression = "BUSL-1.1"
-license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
-
-[[licenses.clarify]]
-crate = "surrealdb-collections"
-expression = "BUSL-1.1"
-license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
-
-[[licenses.clarify]]
-crate = "surrealdb-core"
-expression = "BUSL-1.1"
-license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
-
-[[licenses.clarify]]
-crate = "surrealdb-strand"
-expression = "BUSL-1.1"
-license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
-
-[[licenses.clarify]]
-crate = "surrealdb-types"
-expression = "BUSL-1.1"
-license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
-
-[[licenses.clarify]]
-crate = "surrealdb-types-derive"
-expression = "BUSL-1.1"
-license-files = [{ path = "LICENSE", hash = 0xbb1191d7 }]
+# No exceptions. The planner used to embed surrealdb, whose crates ship under
+# the Business Source License rather than an OSI-permissive one and needed a
+# per-crate BUSL-1.1 carve-out here. Moving the planner to SQLite took the
+# whole tree back to the permissive list above; keep it that way.
+exceptions = []
 
 [sources]
 unknown-registry = "deny"

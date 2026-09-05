@@ -19,10 +19,10 @@ kube = { version = "3", features = ["client"] }
 prometheus = "0.14"
 kunobi-auth = { git = "https://github.com/kunobi-ninja/kunobi-auth.git", tag = "v0.3.0", default-features = false, features = ["server"] }
 kunobi-ha = { git = "https://github.com/kunobi-ninja/kunobi-ha.git", branch = "main" }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2"
-surrealdb = { version = "3.0.5", features = ["kv-surrealkv"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

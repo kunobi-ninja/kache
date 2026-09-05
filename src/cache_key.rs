@@ -944,9 +944,6 @@ pub(crate) enum VerifyPredictions {
 /// One in this many predictions is checked under `sampled`.
 const VERIFY_PREDICTION_RATE: usize = 64;
 
-static VERIFY_PREDICTION_COUNTER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 fn parse_verify_predictions(value: Option<&str>) -> VerifyPredictions {
     match value {
         Some(v) if v.eq_ignore_ascii_case("sampled") => VerifyPredictions::Sampled,
@@ -959,14 +956,37 @@ fn parse_verify_predictions(value: Option<&str>) -> VerifyPredictions {
     }
 }
 
-fn should_verify_this_prediction(mode: VerifyPredictions) -> bool {
+/// Does THIS prediction get checked against the pre-pass it replaced?
+///
+/// Sampling is decided from the unit's own identity, not from a counter. A
+/// rolling counter is what the restore verifier uses, and it works there
+/// because the daemon is one long-lived process. The wrapper is not: it is a
+/// fresh process per compile, so a process-global counter starts at zero every
+/// time and `0 % rate == 0` makes every unit verify. That turned `sampled`
+/// into `always`, and a nightly measured the cost of both paths at once
+/// instead of the saving.
+///
+/// Hashing the identity also makes the sample stable: the same units are
+/// checked on every build, so a disagreement is reproducible rather than a
+/// one-off nobody can chase. Different units are covered across a graph
+/// because the identities differ, not because a counter advanced.
+fn should_verify_this_prediction(mode: VerifyPredictions, identity: &str) -> bool {
     match mode {
         VerifyPredictions::Off => false,
         VerifyPredictions::Always => true,
-        VerifyPredictions::Sampled => VERIFY_PREDICTION_COUNTER
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .is_multiple_of(VERIFY_PREDICTION_RATE),
+        VerifyPredictions::Sampled => sampled_by_identity(identity, VERIFY_PREDICTION_RATE),
     }
+}
+
+/// One identity in `rate` selects, decided by its own bytes so that no shared
+/// state and no ordering is involved.
+fn sampled_by_identity(identity: &str, rate: usize) -> bool {
+    if rate <= 1 {
+        return true;
+    }
+    let digest = blake3::hash(identity.as_bytes());
+    let bucket = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or([0; 8]));
+    bucket % (rate as u64) == 0
 }
 
 /// Do the two closures agree on what rustc reads?
@@ -996,7 +1016,7 @@ fn closures_agree(predicted: &DepInfo, discovered: &DepInfo) -> bool {
 fn predicted_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
-) -> std::result::Result<DepInfo, Rejection> {
+) -> std::result::Result<(DepInfo, String), Rejection> {
     if !file_hasher.uses_input_predictions() {
         return Err(Rejection::Disabled);
     }
@@ -1007,12 +1027,15 @@ fn predicted_key_inputs(
     let record = file_hasher
         .input_prediction(&identity)
         .ok_or(Rejection::NoRecord)?;
-    validate_prediction(
+    let dep_info = validate_prediction(
         &record,
         |path| std::fs::metadata(path).ok(),
         |path| path.exists(),
         |var| std::env::var(var).ok(),
-    )
+    )?;
+    // The identity travels with the closure: the sampled cross-check selects
+    // by it, so it must be the one this record actually came from.
+    Ok((dep_info, identity))
 }
 
 /// Discover the source closure that feeds the key.
@@ -1034,7 +1057,7 @@ fn resolve_key_inputs(
 ) -> Result<Option<DepInfo>> {
     if args.source_file.is_some() {
         match predicted_key_inputs(args, file_hasher) {
-            Ok(dep_info) => {
+            Ok((dep_info, identity)) => {
                 let mode = parse_verify_predictions(
                     std::env::var("KACHE_VERIFY_INPUT_PREDICTIONS")
                         .ok()
@@ -1043,7 +1066,7 @@ fn resolve_key_inputs(
                 // Verification is the exceptional path: it runs the pre-pass
                 // anyway and uses ITS answer, so a disagreement is reported
                 // rather than acted on.
-                if should_verify_this_prediction(mode) {
+                if should_verify_this_prediction(mode, &identity) {
                     let discovered = dep_info_pre_pass(args)?;
                     if discovered
                         .as_ref()
@@ -6753,15 +6776,50 @@ mod tests {
             );
         }
 
-        assert!(!should_verify_this_prediction(VerifyPredictions::Off));
-        assert!(should_verify_this_prediction(VerifyPredictions::Always));
-        let verified = (0..VERIFY_PREDICTION_RATE * 4)
-            .filter(|_| should_verify_this_prediction(VerifyPredictions::Sampled))
+        assert!(!should_verify_this_prediction(
+            VerifyPredictions::Off,
+            "unit"
+        ));
+        assert!(should_verify_this_prediction(
+            VerifyPredictions::Always,
+            "unit"
+        ));
+
+        // Sampling is decided by the identity, because the wrapper is a fresh
+        // process per compile. A rolling counter would start at zero every
+        // time and select every unit, which is how `sampled` silently became
+        // `always` and made a nightly measure the cost of both paths.
+        let identities: Vec<String> = (0..VERIFY_PREDICTION_RATE * 20)
+            .map(|i| format!("identity-{i}"))
+            .collect();
+        let chosen = identities
+            .iter()
+            .filter(|id| should_verify_this_prediction(VerifyPredictions::Sampled, id))
             .count();
-        assert_eq!(
-            verified, 4,
-            "sampling must check one prediction in {VERIFY_PREDICTION_RATE}"
+        assert!(
+            (5..=40).contains(&chosen),
+            "about 1 in {VERIFY_PREDICTION_RATE} of {} should be checked, got {chosen}",
+            identities.len()
         );
+        assert!(
+            identities
+                .iter()
+                .any(|id| !should_verify_this_prediction(VerifyPredictions::Sampled, id)),
+            "sampling that selects everything is not sampling"
+        );
+
+        // Stable: the same unit is checked on every build, so a disagreement
+        // is reproducible instead of a one-off nobody can chase.
+        let first = identities
+            .iter()
+            .find(|id| should_verify_this_prediction(VerifyPredictions::Sampled, id))
+            .expect("some identity must be selected");
+        for _ in 0..5 {
+            assert!(should_verify_this_prediction(
+                VerifyPredictions::Sampled,
+                first
+            ));
+        }
     }
 
     /// Two closures naming the same files agree however they are ordered: the

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use bytesize::ByteSize;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 0;
@@ -54,6 +55,20 @@ pub const DEFAULT_REMOTE_NEGATIVE_TTL_SECS: u64 = 60;
 /// unbounded or partially protected key set.
 pub(crate) const UPLOAD_SPOOL_MAX_JOBS: usize = 65_536;
 
+/// One volume-local shard of the content store: blobs and index for builds
+/// whose outputs live on `volume`, so they share inodes instead of copying
+/// across mounts on every build (kunobi-ninja/kache#191). The keyspace stays
+/// global — a shard is an address, never an identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeStore {
+    /// Normalized volume root this shard serves (`D:\` on Windows,
+    /// `/mnt/biglake/` on Unix).
+    pub volume: String,
+    /// Shard store dir on that volume (holds `blobs/`, `index.db`,
+    /// `staging/`). Sockets, events, and markers stay in the main runtime.
+    pub store: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
@@ -64,6 +79,12 @@ pub struct Config {
     /// Optional daemon IPC endpoint resolved once by [`Config::load`].
     /// `None` keeps the default `<runtime_dir>/daemon.sock` placement.
     pub socket_path_override: Option<PathBuf>,
+    /// Volume-local store shards from `[cache.volumes]` (empty when
+    /// unconfigured). Routing (which shard a build uses) arrives with the
+    /// wrapper integration; this slice only parses, normalizes, and matches.
+    /// Allowed-dead until then: using it now would route nothing.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub volume_stores: Vec<VolumeStore>,
     pub max_size: u64,
     pub remote: Option<RemoteConfig>,
     /// Why the remote is unavailable, when a remote *was* configured but could
@@ -602,6 +623,9 @@ pub(crate) struct CacheFileConfig {
     pub(crate) planner: Option<PlannerFileConfig>,
     /// Strict local-only mode. See [`Config::local_only`].
     pub(crate) local_only: Option<bool>,
+    /// Volume-local store shards. See [`Config::volume_stores`]: keys are
+    /// volume roots (`"D:"`, `"/mnt/biglake"`), values shard store dirs.
+    pub(crate) volumes: Option<HashMap<String, String>>,
     /// Read-only remote consumer mode. See [`Config::remote_readonly`].
     pub(crate) remote_readonly: Option<bool>,
     /// Too-new-input guard. See [`Config::modified_input_guard`].
@@ -1469,6 +1493,7 @@ impl Config {
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
+        let volume_stores = Self::load_volume_stores(&file_config);
         let heartbeat_secs = env_or_ignored("KACHE_HEARTBEAT_SECS", ignore_env)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -1521,6 +1546,7 @@ impl Config {
             auto_gc,
             gc_evict_shared,
             storage_layout_advice,
+            volume_stores,
             heartbeat_secs,
             explain_miss,
             scheduler,
@@ -2066,6 +2092,116 @@ impl Config {
 
     pub fn store_dir(&self) -> PathBuf {
         self.cache_dir.join("store")
+    }
+
+    /// Shard store dir serving `path`, if its volume is mapped in
+    /// `[cache.volumes]`. Longest normalized-prefix match, so `/mnt` and
+    /// `/mnt/biglake` can coexist with the tighter root winning. `None`
+    /// means the main store (plus the cross-volume advisory on a real
+    /// cross-mount build). Allowed-dead until the wrapper integration routes
+    /// through it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn volume_store_for(&self, path: &Path) -> Option<&Path> {
+        Self::match_volume_store(&self.volume_stores, path)
+    }
+
+    /// Append `sep` unless already there. Pure and platform-neutral so the
+    /// Linux mutation lane covers the Windows trailing-separator rule too.
+    fn ensure_trailing_sep(mut text: String, sep: char) -> String {
+        if !text.ends_with(sep) {
+            text.push(sep);
+        }
+        text
+    }
+
+    /// Normalize a `[cache.volumes]` key to a canonical root with a trailing
+    /// separator, so `D:`, `d:/`, and `D:\` name one volume (case-insensitive
+    /// on Windows, case-sensitive elsewhere). `None` for empty or, on Unix,
+    /// non-absolute roots: those can never match a real path.
+    fn normalize_volume_root(root: &str) -> Option<String> {
+        let root = root.trim();
+        if root.is_empty() {
+            return None;
+        }
+        #[cfg(windows)]
+        {
+            Some(Self::ensure_trailing_sep(
+                root.replace('/', "\\").to_uppercase(),
+                '\\',
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            if !root.starts_with('/') {
+                return None;
+            }
+            let trimmed = root.trim_end_matches('/');
+            if trimmed.is_empty() {
+                Some("/".to_string())
+            } else {
+                Some(Self::ensure_trailing_sep(trimmed.to_string(), '/'))
+            }
+        }
+    }
+
+    /// Longest normalized-prefix match of `path` against the shards. The
+    /// trailing separator in every normalized root keeps `/mnt/big` from
+    /// matching `/mnt/biglake`.
+    fn match_volume_store<'a>(shards: &'a [VolumeStore], path: &Path) -> Option<&'a Path> {
+        let candidate = Self::normalize_volume_root(&path.to_string_lossy())?;
+        shards
+            .iter()
+            .filter(|shard| candidate.starts_with(&shard.volume))
+            .max_by_key(|shard| shard.volume.len())
+            .map(|shard| shard.store.as_path())
+    }
+
+    /// Parse `[cache.volumes]` into normalized shards. Invalid entries are
+    /// skipped with a warning, never fatal: a typo must cost hits on one
+    /// volume, not break every build (same policy as an unusable remote).
+    fn load_volume_stores(file_config: &Result<FileConfig>) -> Vec<VolumeStore> {
+        let Some(map) = file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.volumes.as_ref())
+        else {
+            return Vec::new();
+        };
+        let mut shards: Vec<VolumeStore> = map
+            .iter()
+            .filter_map(|(volume, store)| {
+                let volume = Self::normalize_volume_root(volume)?;
+                if store.trim().is_empty() {
+                    tracing::warn!(
+                        "[cache.volumes] entry for {volume} has an empty store dir; ignoring"
+                    );
+                    return None;
+                }
+                Some(VolumeStore {
+                    volume,
+                    store: PathBuf::from(store),
+                })
+            })
+            .collect();
+        // Deterministic order (HashMap iteration is random): by volume, then
+        // store, so a duplicated volume always keeps the same shard and the
+        // warning below names a stable loser.
+        shards.sort_by(|a, b| (&a.volume, &a.store).cmp(&(&b.volume, &b.store)));
+        let mut deduped: Vec<VolumeStore> = Vec::with_capacity(shards.len());
+        for shard in shards {
+            match deduped.last() {
+                Some(last) if last.volume == shard.volume => {
+                    tracing::warn!(
+                        "[cache.volumes] volume {} is mapped twice; keeping {}",
+                        shard.volume,
+                        last.store.display()
+                    );
+                }
+                _ => deduped.push(shard),
+            }
+        }
+        deduped
     }
 
     pub(crate) fn upload_spool_dir(&self) -> PathBuf {
@@ -3432,6 +3568,199 @@ remote_key_cache_refresh_secs = 900
     }
 
     #[test]
+    fn normalize_volume_root_canonicalizes_roots() {
+        assert_eq!(Config::normalize_volume_root(""), None);
+        assert_eq!(Config::normalize_volume_root("   "), None);
+        if cfg!(windows) {
+            assert_eq!(Config::normalize_volume_root("D:").as_deref(), Some("D:\\"));
+            assert_eq!(
+                Config::normalize_volume_root("d:/").as_deref(),
+                Some("D:\\")
+            );
+            assert_eq!(
+                Config::normalize_volume_root("\\\\srv\\share").as_deref(),
+                Some("\\\\SRV\\SHARE\\")
+            );
+        } else {
+            assert_eq!(Config::normalize_volume_root("/").as_deref(), Some("/"));
+            assert_eq!(
+                Config::normalize_volume_root("/mnt/biglake/").as_deref(),
+                Some("/mnt/biglake/")
+            );
+            assert_eq!(Config::normalize_volume_root("relative/dir"), None);
+            assert_eq!(Config::normalize_volume_root("D:"), None);
+        }
+    }
+
+    #[test]
+    fn ensure_trailing_sep_appends_only_when_missing() {
+        assert_eq!(
+            Config::ensure_trailing_sep("D:\\".to_string(), '\\'),
+            "D:\\"
+        );
+        assert_eq!(Config::ensure_trailing_sep("D:".to_string(), '\\'), "D:\\");
+        assert_eq!(
+            Config::ensure_trailing_sep("/mnt".to_string(), '/'),
+            "/mnt/"
+        );
+        assert_eq!(Config::ensure_trailing_sep(String::new(), '/'), "/");
+    }
+
+    #[test]
+    fn load_volume_stores_dedupes_duplicate_roots_deterministically() {
+        // "/mnt/" and "/mnt" normalize alike (likewise "D:"/"d:/" on
+        // Windows); the lexicographically-first store wins, stably.
+        let file_config: Result<FileConfig> = Ok(FileConfig {
+            cache: Some(CacheFileConfig {
+                volumes: Some(
+                    [
+                        ("/mnt/".to_string(), "b-store".to_string()),
+                        ("/mnt".to_string(), "a-store".to_string()),
+                        ("/other/".to_string(), "c-store".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let shards = Config::load_volume_stores(&file_config);
+        let kept: Vec<(&str, &str)> = shards
+            .iter()
+            .map(|shard| (shard.volume.as_str(), shard.store.to_str().unwrap()))
+            .collect();
+        if cfg!(windows) {
+            // Unix-style keys still normalize consistently there; the point
+            // here is dedup mechanics, not platform roots.
+            assert_eq!(kept.len(), 2);
+        } else {
+            assert_eq!(
+                kept,
+                vec![("/mnt/", "a-store"), ("/other/", "c-store"),],
+                "duplicates collapse to the first store, distinct roots survive"
+            );
+        }
+    }
+
+    #[test]
+    fn match_volume_store_prefers_the_tightest_root() {
+        let shards = |loose: &str, tight: &str| {
+            vec![
+                VolumeStore {
+                    volume: Config::normalize_volume_root(loose).unwrap(),
+                    store: PathBuf::from("loose-store"),
+                },
+                VolumeStore {
+                    volume: Config::normalize_volume_root(tight).unwrap(),
+                    store: PathBuf::from("tight-store"),
+                },
+            ]
+        };
+        #[cfg(windows)]
+        {
+            let shards = shards("C:\\", "C:\\work\\");
+            assert_eq!(
+                Config::match_volume_store(&shards, Path::new("C:\\work\\a.rlib")),
+                Some(Path::new("tight-store")),
+                "overlapping roots resolve to the longest match"
+            );
+            assert_eq!(
+                Config::match_volume_store(&shards, Path::new("C:\\other\\a.rlib")),
+                Some(Path::new("loose-store"))
+            );
+            assert_eq!(
+                Config::match_volume_store(&shards, Path::new("D:\\a.rlib")),
+                None
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let shards = shards("/mnt/", "/mnt/biglake/");
+            assert_eq!(
+                Config::match_volume_store(&shards, Path::new("/mnt/biglake/work/a.rlib")),
+                Some(Path::new("tight-store")),
+                "overlapping roots resolve to the longest match"
+            );
+            assert_eq!(
+                Config::match_volume_store(&shards, Path::new("/mnt/other/a.rlib")),
+                Some(Path::new("loose-store"))
+            );
+            assert_eq!(
+                Config::match_volume_store(&shards, Path::new("/home/u/a.rlib")),
+                None
+            );
+        }
+        assert!(Config::match_volume_store(&[], Path::new("x")).is_none());
+    }
+
+    #[test]
+    fn load_volume_stores_skips_invalid_entries() {
+        let file_config: Result<FileConfig> = Ok(FileConfig {
+            cache: Some(CacheFileConfig {
+                volumes: Some(
+                    [
+                        ("D:".to_string(), "D:/kache-store".to_string()),
+                        ("".to_string(), "D:/nowhere".to_string()),
+                        ("E:".to_string(), "   ".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let shards = Config::load_volume_stores(&file_config);
+        if cfg!(windows) {
+            assert_eq!(shards.len(), 1);
+            assert_eq!(shards[0].volume, "D:\\");
+        } else {
+            // Unix keys must be absolute paths; drive letters never match.
+            assert!(shards.is_empty());
+        }
+    }
+
+    #[test]
+    fn volume_store_for_routes_by_toml_config() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        #[cfg(windows)]
+        std::fs::write(
+            &config_path,
+            "[cache]\nlocal_store = \"C:/kache-test-cache\"\n[cache.volumes]\n\"D:\" = \"D:/kache-test-store\"\n",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(
+            &config_path,
+            "[cache]\nlocal_store = \"/tmp/kache-test-cache\"\n[cache.volumes]\n\"/mnt/biglake\" = \"/mnt/biglake/kache-test-store\"\n",
+        )
+        .unwrap();
+        let config = Config::load().unwrap();
+        assert_eq!(config.volume_stores.len(), 1);
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                config.volume_store_for(Path::new("D:/work/a.rlib")),
+                Some(Path::new("D:/kache-test-store"))
+            );
+            assert_eq!(config.volume_store_for(Path::new("C:/work/a.rlib")), None);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                config.volume_store_for(Path::new("/mnt/biglake/work/a.rlib")),
+                Some(Path::new("/mnt/biglake/kache-test-store"))
+            );
+            assert_eq!(config.volume_store_for(Path::new("/home/u/a.rlib")), None);
+        }
+    }
+
+    #[test]
     fn test_file_config_roundtrip() {
         let config = FileConfig {
             cc: None,
@@ -3443,6 +3772,7 @@ remote_key_cache_refresh_secs = 900
                 bypass_crates: None,
                 local_only: None,
                 remote_readonly: None,
+                volumes: None,
                 modified_input_guard: None,
                 input_predictions: None,
                 local_hit_daemon: None,
@@ -3911,6 +4241,7 @@ remote_key_cache_refresh_secs = 900
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -3967,6 +4298,7 @@ remote_key_cache_refresh_secs = 900
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -4019,6 +4351,7 @@ remote_key_cache_refresh_secs = 900
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -4090,6 +4423,7 @@ remote_key_cache_refresh_secs = 900
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
             auto_gc: true,
@@ -4744,6 +5078,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 bypass_crates: None,
                 local_only: None,
                 remote_readonly: None,
+                volumes: None,
                 modified_input_guard: None,
                 input_predictions: None,
                 local_hit_daemon: None,

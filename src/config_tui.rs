@@ -2,6 +2,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use std::collections::HashMap;
 use std::io::stdout;
 use std::ops::Range;
 use std::time::Duration;
@@ -147,6 +148,9 @@ struct EditorState {
     /// `[cache] local_only` as loaded — strict local-only mode (#221). The
     /// editor has no form field for it, so carry it through verbatim on save.
     preserved_local_only: Option<bool>,
+    /// `[cache.volumes]` as loaded — volume-local store shards (#191). The
+    /// editor has no form field for it, so carry it through verbatim on save.
+    preserved_volumes: Option<HashMap<String, String>>,
     preserved_remote_readonly: Option<bool>,
     /// `[cache] modified_input_guard` as loaded — the editor has no form field
     /// for it, so carry it through verbatim on save (kunobi-ninja/kache#324).
@@ -780,6 +784,7 @@ fn fields_to_file_config(
     preserved_paths: Option<PathsFileConfig>,
     preserved_advanced: PreservedAdvancedConfig,
     preserved_local_only: Option<bool>,
+    preserved_volumes: Option<HashMap<String, String>>,
     preserved_remote_readonly: Option<bool>,
     preserved_modified_input_guard: Option<bool>,
     preserved_input_predictions: Option<bool>,
@@ -886,6 +891,7 @@ fn fields_to_file_config(
             // section verbatim so a save never drops it (or its token).
             planner: preserved_planner,
             local_only: preserved_local_only,
+            volumes: preserved_volumes,
             remote_readonly: preserved_remote_readonly,
             modified_input_guard: preserved_modified_input_guard,
             input_predictions: preserved_input_predictions,
@@ -985,6 +991,7 @@ fn initial_editor_state(
         preserved_paths: file_config.paths.clone(),
         preserved_advanced: PreservedAdvancedConfig::from_file_config(file_config),
         preserved_local_only: file_config.cache.as_ref().and_then(|c| c.local_only),
+        preserved_volumes: file_config.cache.as_ref().and_then(|c| c.volumes.clone()),
         preserved_remote_readonly: file_config.cache.as_ref().and_then(|c| c.remote_readonly),
         preserved_modified_input_guard: file_config
             .cache
@@ -1183,6 +1190,7 @@ fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
         state.preserved_paths.clone(),
         state.preserved_advanced.clone(),
         state.preserved_local_only,
+        state.preserved_volumes.clone(),
         state.preserved_remote_readonly,
         state.preserved_modified_input_guard,
         state.preserved_input_predictions,
@@ -2041,6 +2049,11 @@ mod tests {
                 bypass_crates: None,
                 local_only: None,
                 remote_readonly: None,
+                volumes: Some(
+                    [("D:".to_string(), "D:/kache-store".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
                 modified_input_guard: None,
                 input_predictions: None,
                 local_hit_daemon: None,
@@ -2111,6 +2124,7 @@ mod tests {
             original.paths.clone(),
             PreservedAdvancedConfig::from_file_config(&original),
             original.cache.as_ref().and_then(|c| c.local_only),
+            original.cache.as_ref().and_then(|c| c.volumes.clone()),
             original.cache.as_ref().and_then(|c| c.remote_readonly),
             original.cache.as_ref().and_then(|c| c.modified_input_guard),
             original.cache.as_ref().and_then(|c| c.input_predictions),
@@ -2243,6 +2257,7 @@ mod tests {
             state.preserved_paths.clone(),
             state.preserved_advanced.clone(),
             state.preserved_local_only,
+            state.preserved_volumes.clone(),
             state.preserved_remote_readonly,
             state.preserved_modified_input_guard,
             state.preserved_input_predictions,
@@ -2309,6 +2324,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let remote = reconstructed
             .cache
@@ -2360,6 +2376,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let remote = result
             .cache
@@ -2386,6 +2403,7 @@ mod tests {
             None,
             None,
             PreservedAdvancedConfig::default(),
+            None,
             None,
             None,
             None,
@@ -2468,6 +2486,7 @@ mod tests {
             preserved_paths: None,
             preserved_advanced: PreservedAdvancedConfig::default(),
             preserved_local_only: None,
+            preserved_volumes: None,
             preserved_remote_readonly: None,
             preserved_modified_input_guard: None,
             preserved_input_predictions: None,

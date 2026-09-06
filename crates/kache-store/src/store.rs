@@ -3229,6 +3229,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stats
     }
 
+    /// Cache dir this store was opened with (`blobs/`, `index.db`, `store/`).
+    pub fn cache_dir(&self) -> &std::path::Path {
+        &self.config.cache_dir
+    }
+
     /// Get the directory for a cache entry.
     pub fn entry_dir(&self, cache_key: &str) -> PathBuf {
         self.config.store_dir().join(cache_key)

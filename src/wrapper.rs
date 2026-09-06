@@ -1599,8 +1599,14 @@ fn cc_try_remote_hit(
         return Ok(None);
     }
     let entry_dir = store.entry_dir(cache_key);
-    let Some(result) = crate::daemon::send_remote_check(config, cache_key, &entry_dir, crate_name)
-    else {
+    let shard_dir = crate::daemon::remote_check_shard_dir_arg(&config.cache_dir, store.cache_dir());
+    let Some(result) = crate::daemon::send_remote_check(
+        config,
+        cache_key,
+        &entry_dir,
+        crate_name,
+        shard_dir.as_deref().map(Path::new),
+    ) else {
         return Ok(None);
     };
     if !result.found {
@@ -3498,8 +3504,15 @@ fn try_rustc_remote_hit(
 ) -> Option<Result<()>> {
     hit.config.remote.as_ref()?;
     let entry_dir = store.entry_dir(cache_key);
-    let reply =
-        crate::daemon::send_remote_check(hit.config, cache_key, &entry_dir, hit.crate_name)?;
+    let shard_dir =
+        crate::daemon::remote_check_shard_dir_arg(&hit.config.cache_dir, store.cache_dir());
+    let reply = crate::daemon::send_remote_check(
+        hit.config,
+        cache_key,
+        &entry_dir,
+        hit.crate_name,
+        shard_dir.as_deref().map(Path::new),
+    )?;
     // A concurrent writer can also supply the entry. Read the store even when
     // the reply says `found: false`; only `prefetched` affects the hit label.
     let meta = store.get(cache_key).ok()??;

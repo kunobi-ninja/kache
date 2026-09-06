@@ -86,12 +86,45 @@ pub struct ReportMeta {
     pub since: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_filter: Option<String>,
+    /// Present when the report selects one activity session instead of a window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ReportSession>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReportSession {
+    pub root: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
+    /// Local and older events lack session IDs; group their activity by idle gap.
+    pub inferred: bool,
+    pub inactivity_secs: u64,
+}
+
+impl ReportSession {
+    fn description(&self) -> String {
+        let identity = if self.inferred {
+            format!(
+                "inferred from activity ({}s idle gap)",
+                self.inactivity_secs
+            )
+        } else {
+            format!("recorded {}", self.session_id)
+        };
+        format!(
+            "Session: {identity}; root: {}. May include multiple Cargo commands. Only retained, completed compiler events are included. Store inventory covers the whole cache.",
+            self.root
+        )
+    }
 }
 
 impl ReportMeta {
     /// The window for headings: `since` when present, else the whole-hour
     /// value an older report carried.
     pub fn window_label(&self) -> String {
+        if self.session.is_some() {
+            return "build session".to_string();
+        }
         if self.since.is_empty() {
             format!("{}h", self.since_hours)
         } else {
@@ -706,6 +739,7 @@ pub struct ErrorDetail {
 #[derive(Debug, Clone, Default)]
 pub struct ReportFilter {
     pub root: Option<PathBuf>,
+    pub last_build: bool,
 }
 
 pub fn generate_report(config: &Config, window: SinceWindow, top: usize) -> Result<BuildReport> {
@@ -720,11 +754,28 @@ pub fn generate_report_with_filter(
 ) -> Result<BuildReport> {
     let now = Utc::now();
     let since = window.cutoff(now);
-    let mut build_events = events::read_events_since(&config.event_log_path(), since)?;
-    let root_filter = filter.root.as_deref().map(normalize_filter_root);
+    let mut build_events = if filter.last_build {
+        events::read_events(&config.event_log_path())?
+    } else {
+        events::read_events_since(&config.event_log_path(), since)?
+    };
+    let mut root_filter = filter.root.as_deref().map(normalize_filter_root);
     if let Some(root) = root_filter.as_deref() {
         build_events.retain(|event| event_matches_root(event, root));
     }
+    let session = if filter.last_build {
+        let session = select_last_build(&mut build_events)?;
+        root_filter = Some(session.root.clone());
+        Some(session)
+    } else {
+        None
+    };
+    let window = if filter.last_build {
+        let start = build_events.iter().map(event_start).min().unwrap();
+        SinceWindow::from_secs(now.signed_duration_since(start).num_seconds().max(0) as u64)
+    } else {
+        window
+    };
     let since_ts = window.cutoff_unix_secs(now);
     let transfers = if root_filter.is_some() {
         Vec::new()
@@ -894,6 +945,7 @@ pub fn generate_report_with_filter(
             since_secs: window.secs(),
             since: window.label(),
             root_filter: root_filter.clone(),
+            session,
         },
         summary: ReportSummary {
             hit_rate_pct: (hit_rate * 10.0).round() / 10.0,
@@ -981,8 +1033,52 @@ pub fn generate_report_with_filter(
         bypass,
         errors_detail,
         suggestions,
-        gc: load_gc_summary(&config.cache_dir, since),
+        gc: if filter.last_build {
+            None
+        } else {
+            load_gc_summary(&config.cache_dir, since)
+        },
     })
+}
+
+/// Select by completion timestamp, not append order: wrappers finish in parallel.
+/// Session IDs belong to a root. Events without IDs can only support an inferred
+/// activity group; they cannot identify individual Cargo invocations.
+fn select_last_build(events: &mut Vec<BuildEvent>) -> Result<ReportSession> {
+    let latest = events
+        .iter()
+        .max_by_key(|event| event.ts)
+        .ok_or_else(|| anyhow::anyhow!("No recorded compiler events for the selected root(s)."))?;
+    anyhow::ensure!(
+        !latest.root.is_empty(),
+        "The latest compiler event has no recorded root; use --root to select a known build tree."
+    );
+    let session = ReportSession {
+        root: latest.root.clone(),
+        session_id: latest.session_id.clone(),
+        inferred: latest.session_id.is_empty(),
+        inactivity_secs: crate::wrapper::BUILD_SESSION_SECS,
+    };
+    events.retain(|event| event.root == session.root);
+    if session.inferred {
+        events.sort_by_key(|event| event.ts);
+        let mut start = event_start(events.last().unwrap());
+        let mut first = events.len();
+        for (index, event) in events.iter().enumerate().rev() {
+            if !event.session_id.is_empty()
+                || start.signed_duration_since(event.ts)
+                    >= chrono::Duration::seconds(session.inactivity_secs as i64)
+            {
+                break;
+            }
+            first = index;
+            start = start.min(event_start(event));
+        }
+        events.drain(..first);
+    } else {
+        events.retain(|event| event.session_id == session.session_id);
+    }
+    Ok(session)
 }
 
 fn normalize_filter_root(root: &Path) -> String {
@@ -2190,6 +2286,8 @@ pub fn format_trace_json(report: &BuildReport) -> Result<String> {
         display_time_unit: &'a str,
         #[serde(rename = "traceEvents")]
         trace_events: Vec<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session: Option<&'a ReportSession>,
     }
 
     // Lead with chrome-trace metadata events that name the process and each
@@ -2220,6 +2318,7 @@ pub fn format_trace_json(report: &BuildReport) -> Result<String> {
     Ok(serde_json::to_string_pretty(&TraceOutput {
         display_time_unit: &report.display_time_unit,
         trace_events,
+        session: report.meta.session.as_ref(),
     })?)
 }
 
@@ -2308,6 +2407,12 @@ pub fn format_markdown(report: &BuildReport) -> String {
     lines.push("| Metric | Value |".to_string());
     lines.push("|---|---|".to_string());
     lines.push(format!("| Window | last {} |", report.meta.window_label()));
+    if let Some(session) = &report.meta.session {
+        lines.push(format!(
+            "| Scope | {} |",
+            markdown_cell(&session.description())
+        ));
+    }
     lines.push(format!("| Hit rate (count) | {:.1}% |", s.hit_rate_pct));
     if let Some(w) = s.weighted_hit_rate_pct {
         lines.push(format!("| Hit rate (compile-cost weighted) | {:.1}% |", w));
@@ -2668,6 +2773,12 @@ pub fn format_github(report: &BuildReport) -> String {
         "| **Window** | last {} |",
         report.meta.window_label()
     ));
+    if let Some(session) = &report.meta.session {
+        lines.push(format!(
+            "| **Scope** | {} |",
+            markdown_cell(&session.description())
+        ));
+    }
     lines.push(format!(
         "| **Crates** | {} cached / {} compiled / {} total |",
         total_hits, total_compiled, s.total_crates
@@ -3157,6 +3268,9 @@ pub fn format_text(report: &BuildReport) -> String {
         "kache build report (last {})",
         report.meta.window_label()
     ));
+    if let Some(session) = &report.meta.session {
+        lines.push(format!("  {}", session.description()));
+    }
     lines.push(format!(
         "  {:.1}% hit rate — {}/{} cacheable crates cached, {} compiled",
         s.hit_rate_pct, total_hits, s.total_crates, total_compiled,
@@ -4339,6 +4453,154 @@ mod tests {
         assert_eq!(current.window_label(), "15m");
     }
 
+    fn session_event(root: &str, session: &str, second: i64, elapsed_ms: u64) -> BuildEvent {
+        let mut event = test_event("fixture", EventResult::Miss, elapsed_ms, 10, 100, "key");
+        event.root = root.to_string();
+        event.session_id = session.to_string();
+        event.ts = DateTime::from_timestamp(1_700_000_000 + second, 0).unwrap();
+        event
+    }
+
+    #[test]
+    fn last_build_selects_recorded_root_and_id_by_timestamp() {
+        let mut events = vec![
+            session_event("/repo", "new", 900, 100),
+            session_event("/repo/nested", "new", 899, 100),
+            session_event("/other", "new", 898, 100),
+            session_event("/repo", "old", 897, 100),
+            session_event("/repo", "", 896, 100),
+            session_event("/repo", "new", 0, 100),
+        ];
+        let session = select_last_build(&mut events).unwrap();
+        assert_eq!(session.root, "/repo");
+        assert_eq!(session.session_id, "new");
+        assert!(!session.inferred);
+        assert_eq!(session.inactivity_secs, 300);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].ts.timestamp(), 1_700_000_900);
+        assert_eq!(events[1].ts.timestamp(), 1_700_000_000);
+        assert!(session.description().contains("recorded new; root: /repo"));
+    }
+
+    #[test]
+    fn last_build_infers_local_activity_with_idle_and_recorded_boundaries() {
+        for (old_id, old_second) in [("", 0), ("recorded", 299)] {
+            let mut events = vec![
+                session_event("/repo", "", 1_199, 0),
+                session_event("/repo", old_id, old_second, 0),
+                // A ten-minute compile overlaps the preceding activity: do not
+                // split merely because its completion is more than 5m later.
+                session_event("/repo", "", 900, 600_000),
+                session_event("/repo", "", 300, 0),
+                session_event("/other", "", 1_198, 0),
+            ];
+            let session = select_last_build(&mut events).unwrap();
+            assert!(session.inferred);
+            assert!(session.session_id.is_empty());
+            assert_eq!(session.inactivity_secs, 300);
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[0].ts.timestamp(), 1_700_000_300);
+            assert_eq!(events[2].ts.timestamp(), 1_700_001_199);
+            assert!(
+                session
+                    .description()
+                    .contains("inferred from activity (300s idle gap)")
+            );
+        }
+    }
+
+    #[test]
+    fn last_build_does_not_fall_back_to_an_older_known_root() {
+        assert!(
+            select_last_build(&mut Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("No recorded")
+        );
+        let mut events = vec![
+            session_event("/repo", "known", 0, 0),
+            session_event("", "", 1, 0),
+        ];
+        assert!(
+            select_last_build(&mut events)
+                .unwrap_err()
+                .to_string()
+                .contains("--root")
+        );
+    }
+
+    #[test]
+    fn last_build_report_uses_retained_history_and_omits_unscoped_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_test_events(dir.path());
+        let root = dir.path().join("checkout-a").canonicalize().unwrap();
+        let root_str = root.to_str().unwrap();
+        let mut hit = session_event(root_str, "selected", 10, 100);
+        hit.result = EventResult::LocalHit;
+        hit.compile_time_ms = 4_000;
+        hit.copied_bytes = 512;
+        let mut miss = session_event(root_str, "selected", 0, 200);
+        miss.crate_name = "compiled".to_string();
+        let mut bypass = session_event(root_str, "selected", 5, 50);
+        bypass.result = EventResult::Passthrough;
+        bypass.passthrough_reason = "fixture bypass".to_string();
+        let old = session_event(root_str, "old", -1, 0);
+        let other = session_event("/other", "selected", 9, 0);
+        let lines =
+            [&hit, &miss, &bypass, &old, &other].map(|event| serde_json::to_string(event).unwrap());
+        std::fs::write(config.event_log_path(), lines.join("\n") + "\n").unwrap();
+        write_gc_stats(dir.path(), Utc::now());
+
+        let report = generate_report_with_filter(
+            &config,
+            SinceWindow::DEFAULT,
+            10,
+            &ReportFilter {
+                root: None,
+                last_build: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.meta.root_filter.as_deref(), Some(root_str));
+        assert_eq!(report.meta.session.as_ref().unwrap().session_id, "selected");
+        assert!(report.meta.since_secs > 86_400);
+        assert_eq!(report.summary.local_hits, 1);
+        assert_eq!(report.summary.misses, 1);
+        assert_eq!(report.summary.passthroughs, 1);
+        assert_eq!(report.summary.time_saved_ms, 4_000);
+        assert_eq!(report.storage.restored_bytes, 512);
+        assert_eq!(report.timeline.event_count, 3);
+        assert_eq!(report.timeline.duration_ms, 10_200);
+        assert!(report.network.is_none());
+        assert!(report.gc.is_none());
+        for text in [
+            format_text(&report),
+            format_markdown(&report),
+            format_github(&report),
+        ] {
+            assert!(text.contains("last build session"));
+            assert!(text.contains("recorded selected"));
+            assert!(text.contains("May include multiple Cargo commands"));
+            assert!(text.contains("fixture bypass"));
+        }
+        let json: serde_json::Value = serde_json::from_str(&format_json(&report).unwrap()).unwrap();
+        assert_eq!(json["meta"]["session"]["inferred"], false);
+        let trace: serde_json::Value =
+            serde_json::from_str(&format_trace_json(&report).unwrap()).unwrap();
+        assert_eq!(trace["session"]["session_id"], "selected");
+
+        let absent = generate_report_with_filter(
+            &config,
+            SinceWindow::DEFAULT,
+            10,
+            &ReportFilter {
+                root: Some(dir.path().join("missing")),
+                last_build: true,
+            },
+        );
+        assert!(absent.unwrap_err().to_string().contains("No recorded"));
+    }
+
     #[test]
     fn test_report_filters_by_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -4352,6 +4614,7 @@ mod tests {
             10,
             &ReportFilter {
                 root: Some(root.clone()),
+                ..ReportFilter::default()
             },
         )
         .unwrap();

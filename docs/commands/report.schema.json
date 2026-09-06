@@ -55,7 +55,18 @@
         },
         "root_filter": {
           "type": ["string", "null"],
-          "description": "Root path filter if --root was specified."
+          "description": "Root path filter; for --last-build, the exact selected root."
+        },
+        "session": {
+          "type": ["object", "null"],
+          "description": "Selection for --last-build. May span Cargo commands and only covers retained, completed compiler events. When present, since_secs is the lookback to the earliest selected compiler start, not the selection rule.",
+          "required": ["root", "inferred", "inactivity_secs"],
+          "properties": {
+            "root": { "type": "string", "description": "Exact root of the selected session." },
+            "session_id": { "type": "string", "description": "Recorded ID; absent for inferred sessions." },
+            "inferred": { "type": "boolean", "description": "True when events without IDs were grouped by activity." },
+            "inactivity_secs": { "type": "integer", "minimum": 1, "description": "Idle gap that separates activity sessions." }
+          }
         }
       }
     },

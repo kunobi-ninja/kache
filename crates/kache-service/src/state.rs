@@ -74,9 +74,10 @@ impl std::fmt::Debug for SqlitePlannerRepository {
 /// `Reseeded` is a claim about a seed the caller has ALREADY read, parsed and
 /// found non-empty; deriving it from "a `--seed-state-file` was configured"
 /// would promise a rebuild that a missing, malformed or `{}` seed never
-/// delivers. It still does not promise the new rows match the old ones: seeding
-/// upserts and never clears, so a seed narrower than the accumulated store
-/// leaves the difference behind in the quarantined copy.
+/// delivers. Startup applies it with
+/// [`replace_with_state`](SqlitePlannerRepository::replace_with_state), so what
+/// the seed says is what the planner ends up serving — the old store is
+/// replaced by a known state rather than merged into an accumulating one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeedPlan {
     /// Non-empty seed state in hand, so a pre-SQLite database can be moved aside.
@@ -172,12 +173,43 @@ impl SqlitePlannerRepository {
             .await
     }
 
+    /// Make the projections exactly this state, dropping whatever was there.
+    ///
+    /// This is what startup uses, and it is what lets a seed be a promise about
+    /// the resulting content rather than only about the rows it writes.
+    /// [`seed_from_state`](Self::seed_from_state) upserts and never deletes, so
+    /// repeated startups accumulated the union of every seed ever configured: a
+    /// db could serve keys from a state file nobody had pointed at in months,
+    /// with no way to retract one, and nothing anywhere bounded the growth.
+    /// It also made [`SeedPlan::Reseeded`] weaker than it reads — the old rows
+    /// were "rebuilt" only if the current seed happened to be a superset.
+    ///
+    /// The delete and the insert share one transaction, so a reader never sees
+    /// the empty middle, and a seed that fails partway leaves the previous
+    /// state intact.
+    pub async fn replace_with_state(&self, state: PlannerStateFile) -> Result<()> {
+        self.write_state(state, true).await
+    }
+
+    /// Merge this state into the projections, keeping rows it does not mention.
     pub async fn seed_from_state(&self, state: PlannerStateFile) -> Result<()> {
+        self.write_state(state, false).await
+    }
+
+    async fn write_state(&self, state: PlannerStateFile, replace: bool) -> Result<()> {
         self.run(move |conn| {
             // One transaction for the whole seed: a partially applied state
             // file would serve plans from projections that never existed
             // together.
             let tx = conn.unchecked_transaction()?;
+
+            if replace {
+                tx.execute_batch(
+                    "DELETE FROM namespace_artifact;
+                     DELETE FROM crate_artifact;",
+                )
+                .context("clearing planner projections before seeding")?;
+            }
 
             for (namespace, namespace_state) in state.namespaces {
                 for (dep_key, candidates) in namespace_state.deps {
@@ -227,26 +259,99 @@ fn init_schema(db: &Connection) -> Result<()> {
 
     // The key tuple *is* the primary key, so a namespace differing only by
     // `/` vs `_` cannot collapse into one row the way a derived record id can.
+    //
+    // `compile_time_ms` and `size_bytes` are what a miss would cost to rebuild
+    // and how big the artifact is. Both are nullable, and null means unknown,
+    // which is NOT zero: an un-backfilled cost read as zero would rank a
+    // candidate as free to fetch and worthless to have (#617). A key-cache
+    // entry carries no metadata at all and leaves them null.
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS namespace_artifact (
-            namespace    TEXT NOT NULL,
-            dep_key      TEXT NOT NULL,
-            cache_key    TEXT NOT NULL,
-            crate_name   TEXT NOT NULL,
-            last_seen_at INTEGER NOT NULL,
+            namespace       TEXT NOT NULL,
+            dep_key         TEXT NOT NULL,
+            cache_key       TEXT NOT NULL,
+            crate_name      TEXT NOT NULL,
+            last_seen_at    INTEGER NOT NULL,
+            compile_time_ms INTEGER,
+            size_bytes      INTEGER,
             PRIMARY KEY (namespace, dep_key, cache_key)
         ) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS crate_artifact (
-            crate_name   TEXT NOT NULL,
-            cache_key    TEXT NOT NULL,
-            last_seen_at INTEGER NOT NULL,
+            crate_name      TEXT NOT NULL,
+            cache_key       TEXT NOT NULL,
+            last_seen_at    INTEGER NOT NULL,
+            compile_time_ms INTEGER,
+            size_bytes      INTEGER,
             PRIMARY KEY (crate_name, cache_key)
         ) WITHOUT ROWID;",
     )
     .context("initializing planner db schema")?;
 
+    // v0.16.1 shipped both tables without the metadata columns, and the planner
+    // db survives an upgrade on a persistent volume, so CREATE TABLE IF NOT
+    // EXISTS leaves those databases a column short and every later INSERT
+    // fails. Add what is missing. Like the CREATE above this runs on every
+    // start and so must be a no-op the second time; SQLite has no ADD COLUMN IF
+    // NOT EXISTS, and asking which columns exist is easier to reason about than
+    // pattern-matching an error string.
+    add_missing_metadata_columns(db)?;
+
     Ok(())
+}
+
+/// Bring a pre-metadata planner database up to the current schema.
+fn add_missing_metadata_columns(db: &Connection) -> Result<()> {
+    for table in ["namespace_artifact", "crate_artifact"] {
+        let columns: HashSet<String> = db
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<_>>()
+            })
+            .with_context(|| format!("reading {table} columns"))?;
+
+        for column in ["compile_time_ms", "size_bytes"] {
+            if columns.contains(column) {
+                continue;
+            }
+            db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER;"))
+                .with_context(|| format!("adding {table}.{column}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Rebuild a candidate from a projection row selecting, in order, `cache_key`,
+/// `crate_name`, `compile_time_ms`, `size_bytes`.
+///
+/// A null cost or size stays `None` rather than becoming zero: the planner
+/// ranks an unknown cost differently from a known-worthless one (#617).
+fn candidate_from_row(
+    row: &rusqlite::Row<'_>,
+    source: CandidateSource,
+) -> rusqlite::Result<PrefetchCandidate> {
+    let mut candidate = PrefetchCandidate::new(row.get(0)?, row.get(1)?);
+    candidate.compile_time_ms = from_sql_u64(row.get(2)?);
+    candidate.size_bytes = from_sql_u64(row.get(3)?);
+    Ok(candidate.with_source(source))
+}
+
+/// SQLite integers are signed and these two counts are not.
+///
+/// Saturating is a formality — the ceiling is a compile taking 292 million
+/// years or an artifact over 8 EiB — but it keeps an absurd value from wrapping
+/// into a negative, which would read back as unknown and quietly lose a
+/// candidate's ranking metadata.
+fn to_sql_u64(value: Option<u64>) -> Option<i64> {
+    value.map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+}
+
+/// The inverse. A negative on disk was not written by [`to_sql_u64`], so report
+/// it as unknown rather than as some huge number the planner would act on.
+fn from_sql_u64(value: Option<i64>) -> Option<u64> {
+    value.and_then(|v| u64::try_from(v).ok())
 }
 
 fn upsert_namespace_artifact(
@@ -257,17 +362,22 @@ fn upsert_namespace_artifact(
 ) -> Result<()> {
     db.execute(
         "INSERT INTO namespace_artifact
-             (namespace, dep_key, cache_key, crate_name, last_seen_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+             (namespace, dep_key, cache_key, crate_name, last_seen_at,
+              compile_time_ms, size_bytes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT (namespace, dep_key, cache_key) DO UPDATE SET
-             crate_name   = excluded.crate_name,
-             last_seen_at = excluded.last_seen_at",
+             crate_name      = excluded.crate_name,
+             last_seen_at    = excluded.last_seen_at,
+             compile_time_ms = COALESCE(excluded.compile_time_ms, compile_time_ms),
+             size_bytes      = COALESCE(excluded.size_bytes, size_bytes)",
         params![
             namespace,
             dep_key,
             candidate.cache_key,
             candidate.crate_name,
             now_nanos(),
+            to_sql_u64(candidate.compile_time_ms),
+            to_sql_u64(candidate.size_bytes),
         ],
     )
     .context("upserting namespace artifact projection")?;
@@ -280,12 +390,27 @@ fn upsert_crate_artifact(
     crate_name: &str,
     candidate: &PrefetchCandidate,
 ) -> Result<()> {
+    // COALESCE, not plain assignment: one seed reaches the same
+    // (crate_name, cache_key) through `namespaces`, which carries metadata, and
+    // through `key_cache`, which is bare cache keys. Whichever lands second
+    // would otherwise erase what the other knew, and which one that is depends
+    // on HashMap iteration order — so the metadata would come and go between
+    // restarts of the same seed.
     db.execute(
-        "INSERT INTO crate_artifact (crate_name, cache_key, last_seen_at)
-         VALUES (?1, ?2, ?3)
+        "INSERT INTO crate_artifact
+             (crate_name, cache_key, last_seen_at, compile_time_ms, size_bytes)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT (crate_name, cache_key) DO UPDATE SET
-             last_seen_at = excluded.last_seen_at",
-        params![crate_name, candidate.cache_key, now_nanos()],
+             last_seen_at    = excluded.last_seen_at,
+             compile_time_ms = COALESCE(excluded.compile_time_ms, compile_time_ms),
+             size_bytes      = COALESCE(excluded.size_bytes, size_bytes)",
+        params![
+            crate_name,
+            candidate.cache_key,
+            now_nanos(),
+            to_sql_u64(candidate.compile_time_ms),
+            to_sql_u64(candidate.size_bytes),
+        ],
     )
     .context("upserting crate artifact projection")?;
 
@@ -305,7 +430,7 @@ impl PlannerDataSource for SqlitePlannerRepository {
         self.run(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT cache_key, crate_name
+                    "SELECT cache_key, crate_name, compile_time_ms, size_bytes
                      FROM namespace_artifact
                      WHERE namespace = ?1 AND dep_key = ?2
                      ORDER BY last_seen_at DESC, cache_key ASC",
@@ -318,18 +443,14 @@ impl PlannerDataSource for SqlitePlannerRepository {
             for dep_key in &dep_keys {
                 let rows = stmt
                     .query_map(params![&namespace, dep_key], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        candidate_from_row(row, CandidateSource::Shard)
                     })
                     .context("querying namespace artifact projections")?;
 
                 for row in rows {
-                    let (cache_key, crate_name) =
-                        row.context("decoding namespace artifact projection")?;
-                    if seen.insert(cache_key.clone()) {
-                        candidates.push(
-                            PrefetchCandidate::new(cache_key, crate_name)
-                                .with_source(CandidateSource::Shard),
-                        );
+                    let candidate = row.context("decoding namespace artifact projection")?;
+                    if seen.insert(candidate.cache_key.clone()) {
+                        candidates.push(candidate);
                     }
                 }
             }
@@ -345,7 +466,7 @@ impl PlannerDataSource for SqlitePlannerRepository {
         self.run(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT cache_key, crate_name
+                    "SELECT cache_key, crate_name, compile_time_ms, size_bytes
                      FROM crate_artifact
                      WHERE crate_name = ?1
                      ORDER BY last_seen_at DESC, cache_key ASC",
@@ -358,18 +479,14 @@ impl PlannerDataSource for SqlitePlannerRepository {
             for crate_name in &crate_names {
                 let rows = stmt
                     .query_map(params![crate_name], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        candidate_from_row(row, CandidateSource::History)
                     })
                     .context("querying crate artifact history")?;
 
                 for row in rows {
-                    let (cache_key, row_crate_name) =
-                        row.context("decoding crate artifact history")?;
-                    if seen.insert(cache_key.clone()) {
-                        candidates.push(
-                            PrefetchCandidate::new(cache_key, row_crate_name)
-                                .with_source(CandidateSource::History),
-                        );
+                    let candidate = row.context("decoding crate artifact history")?;
+                    if seen.insert(candidate.cache_key.clone()) {
+                        candidates.push(candidate);
                     }
                 }
             }
@@ -768,6 +885,309 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].crate_name, "second");
+    }
+
+    fn candidate_with_metadata(
+        cache_key: &str,
+        crate_name: &str,
+        compile_time_ms: Option<u64>,
+        size_bytes: Option<u64>,
+    ) -> PrefetchCandidate {
+        let mut candidate = PrefetchCandidate::new(cache_key.to_string(), crate_name.to_string());
+        candidate.compile_time_ms = compile_time_ms;
+        candidate.size_bytes = size_bytes;
+        candidate
+    }
+
+    /// Rebuild cost and artifact size must survive a round trip.
+    ///
+    /// The planner ranks on them (#617), and the pre-SQLite schema dropped them
+    /// silently — every candidate came back with `None`, so ranking ran on the
+    /// fallback path with no way to tell that from a genuinely un-backfilled
+    /// store.
+    #[tokio::test]
+    async fn candidate_metadata_survives_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+            .await
+            .unwrap();
+
+        repo.seed_from_state(PlannerStateFile {
+            namespaces: HashMap::from([(
+                "ns".to_string(),
+                NamespaceState {
+                    deps: HashMap::from([(
+                        "serde@1.0.0".to_string(),
+                        vec![candidate_with_metadata(
+                            "serde-key",
+                            "serde",
+                            Some(4_200),
+                            Some(9_001),
+                        )],
+                    )]),
+                },
+            )]),
+            history: HashMap::new(),
+            key_cache: HashMap::new(),
+        })
+        .await
+        .unwrap();
+
+        let shard = repo
+            .shard_candidates("ns", &[("serde".to_string(), "1.0.0".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(shard.len(), 1);
+        assert_eq!(shard[0].compile_time_ms, Some(4_200));
+        assert_eq!(shard[0].size_bytes, Some(9_001));
+
+        // Seeding a namespace also writes the crate projection, so history has
+        // to carry the same numbers.
+        let history = repo
+            .history_candidates(&["serde".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].compile_time_ms, Some(4_200));
+        assert_eq!(history[0].size_bytes, Some(9_001));
+    }
+
+    /// A metadata-less write must not erase metadata another one recorded.
+    ///
+    /// One seed reaches the same (crate_name, cache_key) through `namespaces`,
+    /// which carries the numbers, and through `key_cache`, which is bare cache
+    /// keys. Both orders happen — HashMap iteration decides — so without
+    /// COALESCE the metadata would appear and disappear across restarts of the
+    /// very same seed.
+    #[tokio::test]
+    async fn a_bare_key_cache_entry_does_not_erase_recorded_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+            .await
+            .unwrap();
+
+        repo.seed_from_state(PlannerStateFile {
+            namespaces: HashMap::new(),
+            history: HashMap::from([(
+                "serde".to_string(),
+                vec![candidate_with_metadata(
+                    "serde-key",
+                    "serde",
+                    Some(4_200),
+                    Some(9_001),
+                )],
+            )]),
+            // Same crate and cache key, no metadata.
+            key_cache: HashMap::from([("serde".to_string(), vec!["serde-key".to_string()])]),
+        })
+        .await
+        .unwrap();
+
+        let history = repo
+            .history_candidates(&["serde".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].compile_time_ms, Some(4_200));
+        assert_eq!(history[0].size_bytes, Some(9_001));
+    }
+
+    /// Startup replaces the projections, so what the seed omits is retracted.
+    #[tokio::test]
+    async fn replace_with_state_drops_rows_the_new_seed_omits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+            .await
+            .unwrap();
+
+        let state = |crate_name: &str, cache_key: &str| PlannerStateFile {
+            namespaces: HashMap::from([(
+                "ns".to_string(),
+                NamespaceState {
+                    deps: HashMap::from([(
+                        format!("{crate_name}@1.0.0"),
+                        vec![PrefetchCandidate::new(
+                            cache_key.to_string(),
+                            crate_name.to_string(),
+                        )],
+                    )]),
+                },
+            )]),
+            history: HashMap::from([(
+                crate_name.to_string(),
+                vec![PrefetchCandidate::new(
+                    cache_key.to_string(),
+                    crate_name.to_string(),
+                )],
+            )]),
+            key_cache: HashMap::new(),
+        };
+
+        repo.replace_with_state(state("gone", "gone-key"))
+            .await
+            .unwrap();
+        repo.replace_with_state(state("kept", "kept-key"))
+            .await
+            .unwrap();
+
+        assert!(
+            repo.shard_candidates("ns", &[("gone".to_string(), "1.0.0".to_string())])
+                .await
+                .unwrap()
+                .is_empty(),
+            "a dep the new seed omits must not still resolve"
+        );
+        assert!(
+            repo.history_candidates(&["gone".to_string()])
+                .await
+                .unwrap()
+                .is_empty(),
+            "a crate the new seed omits must not still resolve"
+        );
+
+        let kept = repo
+            .shard_candidates("ns", &[("kept".to_string(), "1.0.0".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].cache_key, "kept-key");
+    }
+
+    /// `seed_from_state` stays the merging primitive the replace is built on.
+    #[tokio::test]
+    async fn seed_from_state_keeps_rows_it_does_not_mention() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+            .await
+            .unwrap();
+
+        let state = |crate_name: &str| PlannerStateFile {
+            namespaces: HashMap::new(),
+            history: HashMap::from([(
+                crate_name.to_string(),
+                vec![PrefetchCandidate::new(
+                    format!("{crate_name}-key"),
+                    crate_name.to_string(),
+                )],
+            )]),
+            key_cache: HashMap::new(),
+        };
+
+        repo.seed_from_state(state("first")).await.unwrap();
+        repo.seed_from_state(state("second")).await.unwrap();
+
+        assert_eq!(
+            repo.key_cache_keys_for_crate("first").await.unwrap(),
+            ["first-key"]
+        );
+        assert_eq!(
+            repo.key_cache_keys_for_crate("second").await.unwrap(),
+            ["second-key"]
+        );
+    }
+
+    /// A v0.16.1 database has neither metadata column, and the volume it sits
+    /// on survives the upgrade. `CREATE TABLE IF NOT EXISTS` skips a table that
+    /// already exists, so without the migration every later INSERT names a
+    /// column that is not there and the planner cannot start.
+    #[tokio::test]
+    async fn open_adds_the_metadata_columns_to_a_v0_16_1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("planner.db");
+
+        // The schema exactly as v0.16.1 wrote it, plus a row to show the
+        // migration preserves what is already stored.
+        let legacy = Connection::open(&db_path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE namespace_artifact (
+                    namespace    TEXT NOT NULL,
+                    dep_key      TEXT NOT NULL,
+                    cache_key    TEXT NOT NULL,
+                    crate_name   TEXT NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    PRIMARY KEY (namespace, dep_key, cache_key)
+                ) WITHOUT ROWID;
+
+                CREATE TABLE crate_artifact (
+                    crate_name   TEXT NOT NULL,
+                    cache_key    TEXT NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    PRIMARY KEY (crate_name, cache_key)
+                ) WITHOUT ROWID;
+
+                INSERT INTO namespace_artifact VALUES
+                    ('ns', 'serde@1.0.0', 'old-key', 'serde', 1);
+                INSERT INTO crate_artifact VALUES ('serde', 'old-key', 1);",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let repo = SqlitePlannerRepository::open(&db_path, SeedPlan::None)
+            .await
+            .unwrap();
+
+        // The pre-existing row reads back, with unknown metadata rather than
+        // zeroes.
+        let shard = repo
+            .shard_candidates("ns", &[("serde".to_string(), "1.0.0".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(shard.len(), 1);
+        assert_eq!(shard[0].cache_key, "old-key");
+        assert_eq!(shard[0].compile_time_ms, None);
+        assert_eq!(shard[0].size_bytes, None);
+
+        // And writing metadata into the migrated table works.
+        repo.seed_from_state(PlannerStateFile {
+            namespaces: HashMap::new(),
+            history: HashMap::from([(
+                "serde".to_string(),
+                vec![candidate_with_metadata(
+                    "new-key",
+                    "serde",
+                    Some(7),
+                    Some(8),
+                )],
+            )]),
+            key_cache: HashMap::new(),
+        })
+        .await
+        .unwrap();
+
+        let history = repo
+            .history_candidates(&["serde".to_string()])
+            .await
+            .unwrap();
+        let new = history
+            .iter()
+            .find(|c| c.cache_key == "new-key")
+            .expect("the new row must be there");
+        assert_eq!((new.compile_time_ms, new.size_bytes), (Some(7), Some(8)));
+    }
+
+    /// Opening twice must not try to add the columns a second time.
+    #[tokio::test]
+    async fn the_metadata_migration_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("planner.db");
+
+        for _ in 0..3 {
+            SqlitePlannerRepository::open(&db_path, SeedPlan::None)
+                .await
+                .expect("every restart must reopen cleanly");
+        }
+    }
+
+    #[test]
+    fn u64_columns_round_trip_and_reject_a_negative_on_disk() {
+        assert_eq!(from_sql_u64(to_sql_u64(Some(9_001))), Some(9_001));
+        assert_eq!(from_sql_u64(to_sql_u64(None)), None);
+        // Saturates rather than wrapping into a negative that reads as unknown.
+        assert_eq!(to_sql_u64(Some(u64::MAX)), Some(i64::MAX));
+        assert_eq!(from_sql_u64(Some(i64::MAX)), Some(i64::MAX as u64));
+        // Not written by `to_sql_u64`, so it means nothing trustworthy.
+        assert_eq!(from_sql_u64(Some(-1)), None);
     }
 
     #[tokio::test]

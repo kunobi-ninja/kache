@@ -289,7 +289,11 @@ async fn load_repository(config: &PlannerConfig) -> Result<Option<SharedPlannerD
 
     let repository = SqlitePlannerRepository::open(&config.db_path, seed_plan).await?;
     if let Some(seed) = seed {
-        repository.seed_from_state(seed).await?;
+        // Replace, not merge: the seed file is the planner's state, so what it
+        // omits is retracted. Merging made every restart accumulate the union of
+        // every seed ever configured, which nothing bounded and nothing could
+        // walk back.
+        repository.replace_with_state(seed).await?;
     }
     Ok(Some(Arc::new(repository)))
 }

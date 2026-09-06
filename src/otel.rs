@@ -528,9 +528,27 @@ mod tests {
         let point = &uploads["sum"]["dataPoints"][0];
         assert_eq!(point["asInt"], "10");
         assert_eq!(point["attributes"][0]["value"]["stringValue"], "completed");
-        // Without a start time a cumulative point has no window, and a restart
-        // is indistinguishable from a real drop.
-        assert!(point["startTimeUnixNano"].is_string());
+        // Without a usable start time a cumulative point has no window, and a
+        // restart is indistinguishable from a real drop. Assert it is a
+        // parseable nanosecond count rather than merely a string: an empty or
+        // non-numeric one satisfies "is a string" and describes nothing.
+        let start = point["startTimeUnixNano"]
+            .as_str()
+            .expect("cumulative points carry a start time");
+        let start: u64 = start
+            .parse()
+            .unwrap_or_else(|_| panic!("start time must be decimal nanoseconds, got {start:?}"));
+        assert!(start > 0, "start time must be a real instant");
+
+        // Every point in one process shares one window, so a reader can
+        // compare them without checking each start individually.
+        let starts: BTreeSet<&str> = uploads["sum"]["dataPoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["startTimeUnixNano"].as_str().unwrap())
+            .collect();
+        assert_eq!(starts.len(), 1, "all points must share one start time");
     }
 
     /// Numbers read at an instant must not become counters: summing two

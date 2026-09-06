@@ -17,6 +17,11 @@ pub use copy::{copy_writable, set_writable_permissions, try_reflink};
 mod identity;
 pub use identity::{directory_identity, file_identity};
 
+#[cfg(feature = "staging")]
+mod staging;
+#[cfg(feature = "staging")]
+pub use staging::StagedFile;
+
 mod ledger;
 pub use ledger::{InodeId, InodeLedger};
 

@@ -8303,8 +8303,8 @@ mod tests {
             "cache dump must not mix bench gauges"
         );
         assert!(
-            !body.contains("\"sum\""),
-            "Kartero drops non-gauge series; cache dump must be gauges"
+            body.contains("AGGREGATION_TEMPORALITY_CUMULATIVE"),
+            "daemon counters must ride as cumulative sums, not gauges"
         );
         assert_eq!(
             std::fs::read_to_string(out.join("schema_version"))

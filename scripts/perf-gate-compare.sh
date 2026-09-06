@@ -26,11 +26,10 @@ set -euo pipefail
 
 # ── The threshold ────────────────────────────────────────────────────────────
 # A head warm build slower than the merge base's by more than this fails the
-# gate. 5% sits above the run-to-run noise of a build measured back to back on
-# one runner while still catching the kind of drift that accumulated unnoticed
-# before this gate existed. It is the ONLY blocking number: the cold and
-# cross-worktree deltas are reported so a reviewer sees them, but they do not
-# fail the run until there is enough history to know their noise floor.
+# gate, unless the cold build on the same runner slowed by as much or more
+# (that pairing is the machine, not the cache). 5% is still the band: at a
+# 15s warm build it is 750 ms, and shared-runner jitter of about a second
+# shows up on the uncached build too. Cross-worktree is reported, not gated.
 readonly WARM_REGRESSION_LIMIT_PCT=5.0
 
 # ── The floor ────────────────────────────────────────────────────────────────
@@ -169,6 +168,22 @@ cross_pct="$(pct "$base_cross" "$head_cross")"
 regressed="$(awk -v b="$base_warm" -v h="$head_warm" -v lim="$WARM_REGRESSION_LIMIT_PCT" \
     'BEGIN { print (b + 0 > 0 && (h - b) * 100.0 / b > lim + 0) ? "yes" : "no" }')"
 
+# Warm is the cache measurement. Cold is the same machine with an empty
+# store. A 15s warm build has a 5% band of 750 ms; shared-runner jitter of
+# about a second is inside that band and moves the uncached build too. If
+# cold itself exceeds the same limit and slowed at least as much as warm,
+# the machine moved and this is not a cache regression. A wrapper that
+# adds the same percent to every rustc invocation is indistinguishable
+# from that on a single pair of runs; the phase table is what a reviewer
+# uses then.
+runner_drift="$(awk -v bc="$base_cold" -v hc="$head_cold" -v bw="$base_warm" -v hw="$head_warm" -v lim="$WARM_REGRESSION_LIMIT_PCT" \
+    'BEGIN {
+        if (bc + 0 <= 0 || bw + 0 <= 0) { print "no"; exit }
+        cold_pct = (hc - bc) * 100.0 / bc
+        warm_pct = (hw - bw) * 100.0 / bw
+        print (warm_pct > lim + 0 && cold_pct > lim + 0 && warm_pct <= cold_pct) ? "yes" : "no"
+    }')"
+
 # ── Where the warm build's time went ─────────────────────────────────────────
 # The wall-clock rows above say a build got slower. This says which part of the
 # wrapper did it, from the same phase totals the Perfetto trace draws per crate.
@@ -228,7 +243,9 @@ phase_table() {
 
 # The workflow's report step parses this first line into the commit status:
 # it strips the leading `## Perf gate: ` and keeps the rest. Keep the grammar.
-if [ "$regressed" = "yes" ]; then
+if [ "$regressed" = "yes" ] && [ "$runner_drift" = "yes" ]; then
+    headline="## Perf gate: pass — warm build ${warm_pct}% (limit +${WARM_REGRESSION_LIMIT_PCT}%; cold ${cold_pct}% on the same runner)"
+elif [ "$regressed" = "yes" ]; then
     headline="## Perf gate: FAIL — warm build ${warm_pct}% (limit +${WARM_REGRESSION_LIMIT_PCT}%)"
 else
     headline="## Perf gate: pass — warm build ${warm_pct}% (limit +${WARM_REGRESSION_LIMIT_PCT}%)"
@@ -245,15 +262,16 @@ fi
     echo "| **warm** (warm store, fresh objdir) | $(secs "$base_warm")s | $(secs "$head_warm")s | **${warm_pct}%** |"
     echo "| cross-worktree (warm store, other path) | $(secs "$base_cross")s | $(secs "$head_cross")s | ${cross_pct}% |"
     echo
-    echo "Positive means slower. Only the warm row is blocking; cold and cross-worktree"
-    echo "are reported for context while their noise floor is still being established."
+    echo "Positive means slower. Only the warm row is blocking, and only when the cold"
+    echo "build on the same runner did not slow by as much or more (that is the machine,"
+    echo "not the cache). Cross-worktree is reported, not gated."
     echo
     echo "Milliseconds (merge base / PR head): cold ${base_cold} / ${head_cold}, warm ${base_warm} / ${head_warm}, cross-worktree ${base_cross} / ${head_cross}."
     echo
     phase_table
 } | tee "$md_out"
 
-if [ "$regressed" = "yes" ]; then
+if [ "$regressed" = "yes" ] && [ "$runner_drift" != "yes" ]; then
     echo "::error::perf gate: warm wall-clock regressed ${warm_pct}% (merge base ${base_warm} ms, PR head ${head_warm} ms; limit +${WARM_REGRESSION_LIMIT_PCT}%)"
     exit 1
 fi

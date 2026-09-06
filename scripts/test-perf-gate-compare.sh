@@ -127,6 +127,31 @@ expect_status "a faster warm build passes" 0
 expect_headline "a speed-up is reported with its sign" \
     "## Perf gate: pass — warm build -11.0% (limit +5.0%)"
 
+# --- runner drift -------------------------------------------------------------
+#
+# Live #962: warm 14.8s → 15.8s printed +7.0% over the 5% limit, while cold
+# moved +10.3% on the same pairing. 15837 ms is the millisecond value that
+# prints as 15.8s and +7.0% against 14800.
+
+result "$work/base.json" 106500 14800 17000
+result "$work/head.json" 117500 15837 18000
+run_gate "$work/base.json" "$work/head.json"
+expect_status "warm +7% with a larger cold slowdown passes" 0
+expect_headline "the headline names the cold move so the status is not a silent pass" \
+    "## Perf gate: pass — warm build +7.0% (limit +5.0%; cold +10.3% on the same runner)"
+
+# Same relative move on both rows: still the runner.
+result "$work/base.json" 112400 14600 17000
+result "$work/head.json" 123200 16000 16200
+run_gate "$work/base.json" "$work/head.json"
+expect_status "warm +9.6% with cold also +9.6% passes" 0
+
+# Cold moved, but less than the limit, so it cannot pardon a warm fail.
+result "$work/base.json" 112400 14600 17000
+result "$work/head.json" 116000 16000 16200
+run_gate "$work/base.json" "$work/head.json"
+expect_status "warm +9.6% with cold +3.2% still fails" 1
+
 # --- the floor ------------------------------------------------------------------
 
 result "$work/base.json" 20000 4900 6000

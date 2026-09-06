@@ -960,7 +960,8 @@ mod tests {
         let compiler =
             create_mock_probe_script(temp.path(), "mock_family_roundtrip", "echo KACHE_PROBE_GNU");
         let program = compiler.to_str().unwrap();
-        let res1 = probe_compiler_family(program).unwrap();
+        // The first call executes the freshly written script; the second must read the cache.
+        let res1 = probe_family_retrying(program).unwrap();
         let key = cache::probe_key_isolated("cc-family", program).unwrap();
         let mut hit = cache::load(temp.path(), &key).expect("probe result must be persisted");
 

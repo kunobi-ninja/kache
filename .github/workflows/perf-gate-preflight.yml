@@ -1,7 +1,7 @@
 name: Perf gate (preflight)
 
 # Untrusted half of the per-PR performance gate. It does exactly one privileged
-# thing: nothing. It runs on a disposable GitHub-hosted runner with a read-only
+# thing: nothing. It uses the repository's validation runner with a read-only
 # token, records which pull request asked for a measurement, and hands that
 # number to `perf-gate.yml` through an artifact.
 #
@@ -38,8 +38,9 @@ permissions:
 
 jobs:
   preflight:
+    if: github.repository == 'kunobi-ninja/kache' || vars.ENABLE_PERF_GATE == 'true'
     name: Record the perf-gate request
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 5
     steps:
       # The PR number is the whole payload. Everything else — head SHA, base

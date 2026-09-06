@@ -1,0 +1,12 @@
+{
+  "name": "kache-workflow-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node workflow-policy.mjs ../.."
+  },
+  "devDependencies": {
+    "@actions/expressions": "0.3.61",
+    "yaml": "2.9.0"
+  }
+}

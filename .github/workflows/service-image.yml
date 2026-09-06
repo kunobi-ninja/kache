@@ -29,9 +29,9 @@ permissions:
 
 jobs:
   docker-dry-run:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.repository != 'kunobi-ninja/kache'
     name: Build Service Image (Dry Run)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -39,9 +39,9 @@ jobs:
         run: docker buildx bake -f packaging/docker-bake.hcl --set '*.cache-from=' service
 
   release:
-    if: github.event_name != 'pull_request'
+    if: github.repository == 'kunobi-ninja/kache' && github.event_name != 'pull_request'
     name: Build Service Image
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     permissions:
       contents: read
       actions: read # read CI job conclusions for the pushed commit (gate below)

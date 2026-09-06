@@ -13,10 +13,10 @@ concurrency:
 permissions:
   contents: read
 
-# SECURITY: validation jobs in this workflow use disposable GitHub-hosted
-# runners. Its only private-runner consumer is the tag-gated release job below;
-# runner-group policy must enforce that boundary independently of this
-# PR-editable workflow file.
+# Public repositories use GitHub-hosted validation runners, including forks.
+# Private repositories require CI_RUNNER_LINUX/MACOS/WINDOWS JSON selectors.
+# Runner-group access must enforce isolation independently of PR-editable YAML.
+# See .github/CI.md for repository configuration and publication boundaries.
 env:
   CARGO_TERM_COLOR: always
   KACHE_LOG: kache=debug
@@ -29,7 +29,7 @@ jobs:
   # any API error.
   changes:
     name: Detect changes
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 5
     outputs:
       code: ${{ steps.filter.outputs.code }}
@@ -55,7 +55,7 @@ jobs:
   check:
     # A single Linux job keeps its required name even when it is skipped.
     name: Check (Linux)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     # Job-level cap so a hang in checkout/mise/build is killed in minutes, not
@@ -173,7 +173,7 @@ jobs:
   # serial and cannot finish that scope inside a useful CI timeout.
   mutation-plan:
     name: Mutation plan
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: changes
     if: always()
     timeout-minutes: 10
@@ -252,7 +252,7 @@ jobs:
   # code PR/main push.
   mutation-core:
     name: Mutation testing (core)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: [changes, check]
     if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
     timeout-minutes: 20
@@ -320,7 +320,7 @@ jobs:
   # authentication, readiness, startup, and shutdown behavior cannot regress.
   mutation-service:
     name: Mutation testing (service)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: [changes, check]
     if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
     timeout-minutes: 35
@@ -391,7 +391,7 @@ jobs:
   # mutants, while round-robin avoids concentrating them in one shard.
   mutation-diff:
     name: Mutation testing (diff ${{ matrix.display }}/${{ matrix.total }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: [check, mutation-plan]
     if: github.event_name == 'pull_request' && needs.mutation-plan.outputs.count != '0'
     timeout-minutes: 55
@@ -459,7 +459,7 @@ jobs:
   # the PR. Any failed or cancelled expected worker fails this aggregate gate.
   mutation:
     name: Mutation testing
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: [changes, mutation-plan, mutation-core, mutation-service, mutation-diff]
     if: always() && github.ref_type != 'tag'
     timeout-minutes: 5
@@ -512,7 +512,7 @@ jobs:
   # drivers must pass through uncached; Kache does not model Kani's artifacts.
   kani:
     name: Kani proofs
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-24.04"' || vars.CI_RUNNER_LINUX) }}
     needs: [changes, check]
     if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
     timeout-minutes: 30
@@ -565,12 +565,23 @@ jobs:
   # matching a job name), so no job-name coupling is required.
   version-consistency:
     name: Repository consistency
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Check routes and source parity
         run: bash scripts/check-docs.sh
+      - name: Set up Node for workflow policy checks
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+      - name: Test workflow policy
+        working-directory: .github/tests
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm test
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/workflow-tests-npm-cache
       - name: Test version consistency gate
         run: python3 scripts/test-version-consistency.py
       - name: Manifests agree (and match the tag on a v* tag)
@@ -615,7 +626,7 @@ jobs:
   # than blocking a tag build of already-reviewed code.
   audit:
     name: Dependency audit
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     timeout-minutes: 15
@@ -637,7 +648,7 @@ jobs:
 
   nix-package:
     name: Nix package
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     timeout-minutes: 25
@@ -668,7 +679,7 @@ jobs:
   # the ingest half; both shipped green. This lane exists so a third round can't.
   cow-filesystem:
     name: CoW filesystem (btrfs)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     timeout-minutes: 30
@@ -757,16 +768,15 @@ jobs:
       matrix:
         include:
           - os: Linux
-            runner: ubuntu-latest
+            runner: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
             exe_suffix: ""
-          # Validation routes to disposable GitHub-hosted runners. This is not
-          # the enforcement boundary: PRs can change this workflow, so private
-          # runner-group policy must independently deny validation workflows.
+          # Public validation stays hosted. Private runner groups must grant
+          # access only to the intended repositories and workflow trust level.
           - os: macOS
-            runner: macos-latest
+            runner: ${{ fromJSON(!github.event.repository.private && '"macos-latest"' || vars.CI_RUNNER_MACOS) }}
             exe_suffix: ""
           - os: Windows
-            runner: windows-latest
+            runner: ${{ fromJSON(!github.event.repository.private && '"windows-latest"' || vars.CI_RUNNER_WINDOWS) }}
             exe_suffix: ".exe"
     steps:
       - name: Report skipped E2E work
@@ -1026,7 +1036,7 @@ jobs:
   # Blocking: macOS is a first-class supported platform.
   test-macos:
     name: Test (macOS)
-    runs-on: macos-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"macos-latest"' || vars.CI_RUNNER_MACOS) }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     # Cargo test is additionally capped at 30m; the job cap catches setup hangs.
@@ -1116,7 +1126,7 @@ jobs:
   # Blocking: Windows is a first-class supported platform.
   test-windows:
     name: Test (Windows)
-    runs-on: windows-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"windows-latest"' || vars.CI_RUNNER_WINDOWS) }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
     # A from-scratch `cargo test --workspace` compile has exceeded the previous
@@ -1217,7 +1227,7 @@ jobs:
     # *skipped* gate never resolves as success-equivalent and silently un-gates
     # the release. If you relax this `if:`, relax the gate's too (or drop the
     # gate's `if:` so it always runs).
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'kunobi-ninja/kache' && startsWith(github.ref, 'refs/tags/v')
     # Gate the release (and, transitively, the crates publish it triggers) on
     # the full validation suite — `version-consistency` rejects a tag that
     # disagrees with the manifest BEFORE any binary builds; `e2e` includes the
@@ -1342,9 +1352,9 @@ jobs:
   # Bootstrap: the branch is first created manually at the latest GA tag.
   stable-branch:
     name: Advance stable branch
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    if: github.repository == 'kunobi-ninja/kache' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     needs: [release]
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 5
     permissions:
       contents: write
@@ -1368,9 +1378,9 @@ jobs:
   # its chart (kobe) and images (kobe-operator, kobe-sync) already differ.
   publish-chart:
     name: Publish Helm chart (OCI)
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'kunobi-ninja/kache' && startsWith(github.ref, 'refs/tags/v')
     needs: [version-consistency]
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

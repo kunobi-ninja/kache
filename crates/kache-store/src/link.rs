@@ -886,7 +886,7 @@ fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
 /// umask and any inherited default ACL exactly where the final file will live.
 /// No metadata operation is performed through the final pathname.
 pub struct PreparedWritableTarget {
-    staged: tempfile::NamedTempFile,
+    staged: kache_fs::StagedFile,
     target: PathBuf,
     bytes: u64,
 }
@@ -898,15 +898,12 @@ impl PreparedWritableTarget {
 
     pub fn publish(self) -> Result<()> {
         let target = self.target;
-        self.staged
-            .persist_noclobber(&target)
-            .map_err(|error| error.error)
-            .with_context(|| {
-                format!(
-                    "publishing cc output without replacing {}",
-                    target.display()
-                )
-            })?;
+        self.staged.publish_new(&target).with_context(|| {
+            format!(
+                "publishing cc output without replacing {}",
+                target.display()
+            )
+        })?;
         crate::opcounts::record_copied(self.bytes);
         Ok(())
     }
@@ -919,28 +916,19 @@ impl PreparedWritableTarget {
     pub fn publish_replacing(self) -> Result<()> {
         let target = self.target;
         self.staged
-            .persist(&target)
-            .map_err(|error| error.error)
+            .replace(&target)
             .with_context(|| format!("publishing cc output over {}", target.display()))?;
         crate::opcounts::record_copied(self.bytes);
         Ok(())
     }
 }
 
-fn new_writable_staging_file(target: &Path) -> Result<tempfile::NamedTempFile> {
+fn new_writable_staging_file(target: &Path) -> Result<kache_fs::StagedFile> {
     let parent = target
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".kache-cc-restore-");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(fs::Permissions::from_mode(0o666));
-    }
-    builder
-        .tempfile_in(parent)
+    kache_fs::StagedFile::new_in(parent, ".kache-cc-restore-")
         .with_context(|| format!("creating cc restore staging file in {}", parent.display()))
 }
 
@@ -952,7 +940,7 @@ pub fn prepare_writable_target_from_file(
     let mut source = fs::File::open(src)
         .with_context(|| format!("opening cached cc artifact {}", src.display()))?;
     let mut staged = new_writable_staging_file(target)?;
-    let bytes = std::io::copy(&mut source, &mut staged).with_context(|| {
+    let bytes = std::io::copy(&mut source, staged.writer()).with_context(|| {
         format!(
             "copying cached cc artifact {} for {}",
             src.display(),
@@ -975,6 +963,7 @@ pub fn prepare_writable_target_from_bytes(
 
     let mut staged = new_writable_staging_file(target)?;
     staged
+        .writer()
         .write_all(content)
         .with_context(|| format!("writing staged cc output for {}", target.display()))?;
     Ok(PreparedWritableTarget {
@@ -3344,9 +3333,18 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         fs::create_dir(&parent).unwrap();
         let target = parent.join("output.o");
 
-        let staged = new_writable_staging_file(&target).unwrap();
-
-        assert_eq!(staged.path().parent(), Some(parent.as_path()));
+        let _staged = new_writable_staging_file(&target).unwrap();
+        let entries: Vec<_> = fs::read_dir(&parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .to_str()
+                .unwrap()
+                .starts_with(".kache-cc-restore-")
+        );
     }
 
     #[cfg(unix)]

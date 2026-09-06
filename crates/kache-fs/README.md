@@ -14,6 +14,13 @@ It refuses an existing destination and returns errors to the caller for fallback
 selection. `copy_writable` copies bytes with an explicit writable mode. Hardlinks
 use `std::fs::hard_link`; their content and metadata remain shared.
 
+The `staging` feature adds `StagedFile` for writable temporary files. Callers
+write through its writer, then choose create-only publication or replacement.
+Unpublished stages use `tempfile`'s cleanup on drop. Creation uses ordinary
+writable-file permissions, including the process umask on Unix. Callers retain
+destination checks and any flush requirements; publication does not flush file
+contents or the parent directory.
+
 The default feature set is empty. `serde` enables measurement serialization;
-`testing` exposes filesystem fixtures for consumers. The crate has no runtime,
-cache index or cleanup policy.
+`testing` exposes filesystem fixtures for consumers. `tempfile` is required only
+with `staging`. The crate has no runtime, cache index or cleanup policy.

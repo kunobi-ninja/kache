@@ -12,7 +12,7 @@ test-support = []
 
 [dependencies]
 kache-format = { version = "0.16.1", path = "../kache-format" }
-kache-fs = { version = "0.16.1", path = "../kache-fs" }
+kache-fs = { version = "0.16.1", path = "../kache-fs", features = ["staging"] }
 anyhow = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

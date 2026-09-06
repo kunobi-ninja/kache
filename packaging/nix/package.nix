@@ -81,6 +81,7 @@ buildRustPackage {
     for name in cc c++ gcc g++ clang clang++; do
       ln -s $out/bin/kache $out/lib/kache/$name
     done
+    ln -s lib/kache $out/shims
   '';
 
   # reqwest (rustls) loads system CA certs when building a client, even for the

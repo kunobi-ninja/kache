@@ -35,6 +35,8 @@ The APT and AUR packages also install `/usr/lib/kache` with the same symlinks:
 export PATH="/usr/lib/kache:$PATH"
 ```
 
+Nix packages include the same symlinks in `${kache}/shims`, also available at `${kache}/lib/kache`. Add that directory to `PATH` using the [Nix configuration example](/docs/getting-started/installation#nix); no `kache install-shims` step is needed.
+
 `kache install-shims` creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++`. Keep the real compilers later in `PATH`; Kache skips any entry that resolves back to itself.
 
 Versioned and target-prefixed names (`gcc-13`, `x86_64-pc-linux-gnu-gcc`) work if you create them by hand or scan `PATH`:

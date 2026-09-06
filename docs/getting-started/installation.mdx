@@ -103,6 +103,21 @@ nix profile install github:kunobi-ninja/kache/v0.14.2
 
 The flake also exports an overlay, NixOS module, and nix-darwin module. See the repository [`flake.nix`](https://github.com/kunobi-ninja/kache/blob/main/flake.nix) for their current names and options.
 
+The package includes `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks in `${kache}/shims`. With this flake's `overlays.default` applied, enable them in your NixOS configuration:
+
+```nix
+{ pkgs, ... }:
+{
+  environment.systemPackages = [ pkgs.kache ];
+  environment.sessionVariables = {
+    RUSTC_WRAPPER = "${pkgs.kache}/bin/kache";
+    PATH = [ "${pkgs.kache}/shims" ];
+  };
+}
+```
+
+Keep the real compilers later in `PATH`. The shims cover C and C++; Rust still uses `RUSTC_WRAPPER`. Nix builds the symlinks, so no `kache install-shims` step is needed. The existing `${kache}/lib/kache` path remains available.
+
 ## Supported release targets
 
 | Platform | Architectures |

@@ -15,6 +15,7 @@ The [Bench workflow](https://github.com/kunobi-ninja/kache/actions/workflows/ben
 - Firefox source-update builds on Linux and Windows
 - hk cold, warm and next-commit builds on Linux: a mid-size Rust CLI whose build scripts compile C and assembly through cc-rs, wired the way `kache init` configures a machine
 - The same hk build through mbx at its latest release, for a side-by-side comparison
+- eza cold, warm and cross-worktree builds on Linux: the smallest subject in the matrix and the only one built through a fat-LTO release profile, with its bundled libgit2 and zlib compiled through the same cc-rs wiring
 
 Jobs upload their reports, Perfetto traces, and logs even when a benchmark fails. GitHub retains those artifacts for 30 days.
 
@@ -50,6 +51,7 @@ just bench firefox
 just bench substrate
 just bench lance
 just bench opendal
+just bench eza
 just bench llvm
 just bench-retry firefox   # reuse the saved cold state
 just bench-trace firefox   # include key-diff artifacts

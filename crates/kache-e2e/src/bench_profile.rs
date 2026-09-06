@@ -1143,6 +1143,45 @@ diff --git a/hello.txt b/hello.txt
         );
     }
 
+    /// The shipped eza scenario measures both compiler families: rustc through
+    /// the engine's wrapper, and the bundled libgit2/zlib objects through the
+    /// host-only cc-rs wrappers `kache init` writes. It builds release, which
+    /// is the only fat-LTO profile in the suite, honours the tree's own
+    /// rust-toolchain.toml, and pins the clone by commit SHA.
+    #[test]
+    fn shipped_eza_profile_wires_host_cc_and_builds_release() {
+        let p = BenchProfile::load(&repo_profile("eza")).expect("eza.toml loads");
+        assert_eq!(p.name, "bench-eza");
+        assert_eq!(p.objdir, "target");
+        assert_eq!(p.repo, "https://github.com/eza-community/eza.git");
+        assert_eq!(p.git_ref.len(), 40, "pin by commit SHA, not a tag");
+        assert!(
+            p.files.is_empty(),
+            "eza owns its rust-toolchain.toml — nothing to inject"
+        );
+        let env = p.build_env(Path::new("/k"));
+        let host_cc = env
+            .iter()
+            .find(|(k, _)| k == "HOST_CC")
+            .expect("HOST_CC entry");
+        assert_eq!(host_cc.1, "/k cc");
+        assert!(env.iter().any(|(k, v)| k == "HOST_CXX" && v == "/k c++"));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CC_KNOWN_WRAPPER_CUSTOM" && v == "kache")
+        );
+        assert!(
+            !env.iter().any(|(k, _)| k == "CC" || k == "CXX"),
+            "CC/CXX stay untouched so cc-rs picks the host-only wrappers"
+        );
+        let build = p.build_command(Path::new("/k"));
+        assert!(build.contains("cargo build --release --locked"), "{build}");
+        assert!(
+            build.contains("KACHE_BASE_DIR"),
+            "cross-clone path portability must be set in the build script"
+        );
+    }
+
     #[test]
     fn source_ref_next_parses_and_marks_pull() {
         let dir = tempfile::tempdir().unwrap();

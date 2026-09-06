@@ -22,12 +22,11 @@ env:
   KACHE_LOG: kache=debug
 
 jobs:
-  # Skip the build matrix on docs-only PRs (*.md, *.mdx, docs/**); the
-  # `version-consistency` job still validates them. Heavy jobs gate on `code`.
-  # We use a job-level `if`, not trigger
-  # `paths-ignore`: the required checks must still report, and a *skipped* job
-  # counts as success while a never-created one wedges branch protection at
-  # "pending". Fails open (runs everything) on non-PR events or any API error.
+  # Skip compiler work on docs-only PRs (*.md, *.mdx, docs/**); the
+  # `version-consistency` job still validates them. Required check names must
+  # still be emitted. Matrix names need step-level conditions because a job
+  # condition runs before matrix expansion. Fails open on non-PR events or
+  # any API error.
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
@@ -54,7 +53,8 @@ jobs:
           fi
 
   check:
-    name: Check (${{ matrix.os }})
+    # This job only has a Linux arm. Keep its required name when it is skipped.
+    name: Check (Linux)
     runs-on: ${{ matrix.runner }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
@@ -740,7 +740,9 @@ jobs:
     name: E2E smoke (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    # Expand every platform name even when docs-only changes skip the work.
+    env:
+      RUN_E2E: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     # Per-arm cap. A hosted image or dependency download can still stall;
     # without a job timeout the default is 6h. Normal runs are <10m.
     timeout-minutes: 30
@@ -774,12 +776,16 @@ jobs:
             runner: windows-latest
             exe_suffix: ".exe"
     steps:
+      - name: Report skipped E2E work
+        if: env.RUN_E2E != 'true'
+        run: echo 'Documentation-only change; E2E scenarios skipped.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        if: env.RUN_E2E == 'true'
         # Checkout never legitimately runs this long, so fail fast rather than
         # waiting out the whole job timeout.
         timeout-minutes: 10
       - name: Put hosted Windows tools on PATH
-        if: runner.os == 'Windows'
+        if: env.RUN_E2E == 'true' && (runner.os == 'Windows')
         run: |
           if ! command -v nasm >/dev/null 2>&1; then
             nasm_dir="/c/Program Files/NASM"
@@ -798,7 +804,7 @@ jobs:
       #                   build deps, and aws-lc-sys was dropped in favour of ring.
       #   MSVC link.exe presence is proven by a successful `cargo build`.
       - name: Verify Windows build toolchain
-        if: runner.os == 'Windows'
+        if: env.RUN_E2E == 'true' && (runner.os == 'Windows')
         run: |
           missing=
           for t in cc c++ make nasm clang clang-cl; do
@@ -813,6 +819,7 @@ jobs:
       # uses the pinned toolchain from a clean state. Runs everywhere via
       # `shell: bash` (Git Bash on Windows).
       - name: Isolate tool state
+        if: env.RUN_E2E == 'true'
         run: |
           mkdir -p \
             "$RUNNER_TEMP/rustup" \
@@ -845,6 +852,7 @@ jobs:
       # the github backend, so the full `github:mozilla/sccache`
       # identifier is required.
       - name: Install tools via mise
+        if: env.RUN_E2E == 'true'
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         env:
           # jdx/mise-action extracts into `$TMPDIR/mise` before moving
@@ -870,7 +878,7 @@ jobs:
       # where mise-action puts cargo on PATH directly and there is no competing
       # system Rust to shadow it.
       - name: Put the Rust toolchain first on PATH
-        if: runner.os != 'Windows'
+        if: env.RUN_E2E == 'true' && (runner.os != 'Windows')
         run: |
           bin_dir=$(echo "$RUSTUP_HOME"/toolchains/*/bin)
           if [ ! -x "$bin_dir/cargo" ]; then
@@ -888,15 +896,17 @@ jobs:
       # so the host build breaks ("can't find crate for std") unless msvc is
       # installed there too.
       - name: Add Rust targets (msvc host + windows-gnu for rust-c-ffi)
-        if: runner.os == 'Windows'
+        if: env.RUN_E2E == 'true' && (runner.os == 'Windows')
         run: rustup target add x86_64-pc-windows-msvc x86_64-pc-windows-gnu
       - name: Build kache + e2e harness (release)
+        if: env.RUN_E2E == 'true'
         run: |
           rustc --version && cargo --version
           cargo build --release -p kache && cargo build --release -p kache-e2e
         env:
           RUSTC_WRAPPER: ""
       - name: Run e2e harness (gate scenarios)
+        if: env.RUN_E2E == 'true'
         # Single Rust harness drives selected e2e scenarios from scenarios/
         # through cold → warm → noop, applies per-fixture assertions
         # against `kache report --format json`, and writes a single
@@ -953,7 +963,7 @@ jobs:
         # Independent signal; `always()` so it runs even when the
         # harness run above failed, as long as the build produced the
         # binaries.
-        if: always() && hashFiles(format('target/release/kache-scenario{0}', matrix.exe_suffix)) != ''
+        if: env.RUN_E2E == 'true' && (always() && hashFiles(format('target/release/kache-scenario{0}', matrix.exe_suffix)) != '')
         run: |
           ./target/release/kache-scenario${{ matrix.exe_suffix }} \
             --kache ./target/release/kache${{ matrix.exe_suffix }} \
@@ -971,7 +981,7 @@ jobs:
         # sccache, asserting the rebuild is an sccache cache hit.
         # Independent signal; `always()` so it runs even if the
         # harness step above failed.
-        if: always() && hashFiles(format('target/release/kache{0}', matrix.exe_suffix)) != ''
+        if: env.RUN_E2E == 'true' && (always() && hashFiles(format('target/release/kache{0}', matrix.exe_suffix)) != '')
         run: |
           # Bounded retry, same rationale as the harness step above.
           n=0
@@ -986,7 +996,7 @@ jobs:
             sleep 15
           done
       - name: Show aggregated e2e results
-        if: always()
+        if: env.RUN_E2E == 'true' && (always())
         run: |
           if [ -f tmp/e2e/results.json ]; then
             echo "--- e2e results.json ---"
@@ -1007,7 +1017,7 @@ jobs:
         # Skipped on tag/release runs for the same reason as the coverage
         # artifact: the shared release workflow's `gh release upload
         # artifacts/*` would try to upload this directory as a release asset.
-        if: always() && github.ref_type != 'tag'
+        if: env.RUN_E2E == 'true' && (always() && github.ref_type != 'tag')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-results-${{ matrix.os }}

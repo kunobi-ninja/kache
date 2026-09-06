@@ -836,13 +836,17 @@ fn remote_check_blobs_dir(cache_dir: &Path) -> PathBuf {
     cache_dir.join("store").join("blobs")
 }
 
+fn remote_check_uses_main_store(cache_dir: &Path, main_cache_dir: &Path) -> bool {
+    cache_dir == main_cache_dir
+}
+
 /// `Some` only when the wrapper opened a volume shard rather than the main
 /// store. Older daemons ignore the field.
 pub(crate) fn remote_check_shard_dir_arg(
     main_cache_dir: &Path,
     store_cache_dir: &Path,
 ) -> Option<String> {
-    if store_cache_dir == main_cache_dir {
+    if remote_check_uses_main_store(store_cache_dir, main_cache_dir) {
         None
     } else {
         Some(store_cache_dir.to_string_lossy().into_owned())
@@ -2457,7 +2461,7 @@ impl Daemon {
         cache_dir: &Path,
         f: impl FnOnce(&Store) -> Result<T>,
     ) -> Result<T> {
-        if cache_dir == self.config.cache_dir.as_path() {
+        if remote_check_uses_main_store(cache_dir, &self.config.cache_dir) {
             return self.with_store(f);
         }
         let lock = self.shard_store_lock(cache_dir)?;
@@ -2495,7 +2499,7 @@ impl Daemon {
         cache_dir: &Path,
         f: impl FnOnce(&Store) -> Result<T>,
     ) -> (Result<T>, u64, u64) {
-        if cache_dir == self.config.cache_dir.as_path() {
+        if remote_check_uses_main_store(cache_dir, &self.config.cache_dir) {
             return self.with_store_timed(f);
         }
         let lock = match self.shard_store_lock(cache_dir) {
@@ -11164,6 +11168,16 @@ mod tests {
         assert_eq!(
             remote_check_shard_dir_arg(main, &shard),
             Some("/cache/shard".into())
+        );
+        assert!(remote_check_uses_main_store(main, main));
+        assert!(!remote_check_uses_main_store(&shard, main));
+        assert_eq!(
+            remote_check_blobs_dir(main),
+            main.join("store").join("blobs")
+        );
+        assert_eq!(
+            remote_check_entry_dir(main, "abc"),
+            main.join("store").join("abc")
         );
     }
 

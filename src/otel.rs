@@ -7,8 +7,14 @@
 //!
 //! Metric names live under `kache.cache.*` / `kache.prefetch.*` (scope
 //! `kache.cache`). Bench gauges stay in `kache.bench.*` and must not be mixed
-//! into this payload. Kartero drops non-gauge series, so this dump is a
-//! point-in-time gauge snapshot of daemon/store totals, not cumulative sums.
+//! into this payload.
+//!
+//! Instrument choice follows what the number is. Store totals, queue depths
+//! and flags are read at an instant and are gauges. Everything the daemon only
+//! ever adds to is a cumulative sum carrying the process start as
+//! `startTimeUnixNano`, so a restart reads as a counter reset rather than as
+//! a cliff, and `rate`/`increase` mean what they say. These were gauges while
+//! Kartero delivered gauges only; it takes sums from 0.4.0.
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -213,111 +219,111 @@ fn metrics_for(snap: &OtelSnapshot, now: &str) -> Vec<Value> {
         vec![as_int(snap.prefetch_last_plan_wall_ms, now, &[])],
     ));
 
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.cache.uploads",
         "{upload}",
         vec![
-            as_int(snap.uploads_completed, now, &result_attr("completed")),
-            as_int(snap.uploads_failed, now, &result_attr("failed")),
-            as_int(snap.uploads_skipped, now, &result_attr("skipped")),
-            as_int(snap.uploads_suppressed, now, &result_attr("suppressed")),
+            as_sum_int(snap.uploads_completed, now, &result_attr("completed")),
+            as_sum_int(snap.uploads_failed, now, &result_attr("failed")),
+            as_sum_int(snap.uploads_skipped, now, &result_attr("skipped")),
+            as_sum_int(snap.uploads_suppressed, now, &result_attr("suppressed")),
         ],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.cache.downloads",
         "{download}",
         vec![
-            as_int(snap.downloads_completed, now, &result_attr("completed")),
-            as_int(snap.downloads_failed, now, &result_attr("failed")),
-            as_int(snap.downloads_suppressed, now, &result_attr("suppressed")),
+            as_sum_int(snap.downloads_completed, now, &result_attr("completed")),
+            as_sum_int(snap.downloads_failed, now, &result_attr("failed")),
+            as_sum_int(snap.downloads_suppressed, now, &result_attr("suppressed")),
         ],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.cache.bytes",
         "By",
         vec![
-            as_int(
+            as_sum_int(
                 snap.bytes_uploaded,
                 now,
                 &[str_attr("kache.cache.direction", "upload")],
             ),
-            as_int(
+            as_sum_int(
                 snap.bytes_downloaded,
                 now,
                 &[str_attr("kache.cache.direction", "download")],
             ),
         ],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.cache.remote_checks",
         "{check}",
-        vec![as_int(snap.remote_check_roundtrips, now, &[])],
+        vec![as_sum_int(snap.remote_check_roundtrips, now, &[])],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.cache.negative_hits",
         "{hit}",
-        vec![as_int(snap.negative_hits, now, &[])],
+        vec![as_sum_int(snap.negative_hits, now, &[])],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.prefetch.downloads",
         "{download}",
-        vec![as_int(snap.prefetch_downloads, now, &[])],
+        vec![as_sum_int(snap.prefetch_downloads, now, &[])],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.prefetch.bytes",
         "By",
-        vec![as_int(snap.prefetch_bytes, now, &[])],
+        vec![as_sum_int(snap.prefetch_bytes, now, &[])],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.prefetch.keys_used",
         "{key}",
-        vec![as_int(snap.prefetch_keys_used, now, &[])],
+        vec![as_sum_int(snap.prefetch_keys_used, now, &[])],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.prefetch.keys_cancelled",
         "{key}",
-        vec![as_int(snap.prefetch_keys_cancelled, now, &[])],
+        vec![as_sum_int(snap.prefetch_keys_cancelled, now, &[])],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.prefetch.keys_over_budget",
         "{key}",
-        vec![as_int(snap.prefetch_keys_over_budget, now, &[])],
+        vec![as_sum_int(snap.prefetch_keys_over_budget, now, &[])],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.prefetch.plans",
         "{plan}",
         vec![
-            as_int(
+            as_sum_int(
                 snap.prefetch_plans_advisory,
                 now,
                 &[str_attr("kache.prefetch.kind", "advisory")],
             ),
-            as_int(
+            as_sum_int(
                 snap.prefetch_plans_fallback,
                 now,
                 &[str_attr("kache.prefetch.kind", "fallback")],
             ),
         ],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.prefetch.list.requests",
         "{request}",
-        vec![as_int(snap.prefetch_list_requests, now, &[])],
+        vec![as_sum_int(snap.prefetch_list_requests, now, &[])],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.prefetch.list.failures",
         "{request}",
-        vec![as_int(snap.prefetch_list_failures, now, &[])],
+        vec![as_sum_int(snap.prefetch_list_failures, now, &[])],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.prefetch.pack.requests",
         "{request}",
-        vec![as_int(snap.prefetch_pack_requests, now, &[])],
+        vec![as_sum_int(snap.prefetch_pack_requests, now, &[])],
     ));
-    metrics.push(gauge(
+    metrics.push(cum_sum(
         "kache.prefetch.v3.requests",
         "{request}",
-        vec![as_int(snap.prefetch_v3_requests, now, &[])],
+        vec![as_sum_int(snap.prefetch_v3_requests, now, &[])],
     ));
     metrics
 }
@@ -346,11 +352,40 @@ fn as_int(value: u64, time_unix_nano: &str, attributes: &[Value]) -> Value {
     })
 }
 
+/// Fixed for the life of the process, which is exactly what a cumulative
+/// sum's start time has to be: every point in this process shares one window.
+fn process_start_unix_nano() -> &'static str {
+    use std::sync::OnceLock;
+    static START: OnceLock<String> = OnceLock::new();
+    START.get_or_init(unix_nano_now).as_str()
+}
+
+fn as_sum_int(value: u64, time_unix_nano: &str, attributes: &[Value]) -> Value {
+    json!({
+        "asInt": value.to_string(),
+        "timeUnixNano": time_unix_nano,
+        "startTimeUnixNano": process_start_unix_nano(),
+        "attributes": attributes,
+    })
+}
+
 fn gauge(name: &str, unit: &str, data_points: Vec<Value>) -> Value {
     json!({
         "name": name,
         "unit": unit,
         "gauge": { "dataPoints": data_points }
+    })
+}
+
+fn cum_sum(name: &str, unit: &str, data_points: Vec<Value>) -> Value {
+    json!({
+        "name": name,
+        "unit": unit,
+        "sum": {
+            "aggregationTemporality": "AGGREGATION_TEMPORALITY_CUMULATIVE",
+            "isMonotonic": true,
+            "dataPoints": data_points
+        }
     })
 }
 
@@ -420,7 +455,10 @@ mod tests {
             .as_array()
             .unwrap()
         {
-            let points = m["gauge"]["dataPoints"].as_array().unwrap();
+            let points = m["gauge"]["dataPoints"]
+                .as_array()
+                .or_else(|| m["sum"]["dataPoints"].as_array())
+                .unwrap_or_else(|| panic!("metric {} carries no data points", m["name"]));
             for point in points {
                 for attr in point["attributes"].as_array().unwrap() {
                     keys.insert(attr["key"].as_str().unwrap().to_string());
@@ -459,7 +497,6 @@ mod tests {
         assert!(!dumped.contains("run_id"));
         assert!(!dumped.contains("cicd."));
         assert!(!dumped.contains("cache_key"));
-        assert!(!dumped.contains("\"sum\""));
     }
 
     #[test]
@@ -472,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn counters_are_int_gauges() {
+    fn counters_are_cumulative_sums() {
         let body = serialize_metrics(
             &sample_snap(),
             "kache",
@@ -482,12 +519,68 @@ mod tests {
             None,
         );
         let uploads = metric(&body, "kache.cache.uploads");
-        assert!(uploads.get("sum").is_none());
-        assert_eq!(uploads["gauge"]["dataPoints"][0]["asInt"], "10");
+        assert!(uploads.get("gauge").is_none());
         assert_eq!(
-            uploads["gauge"]["dataPoints"][0]["attributes"][0]["value"]["stringValue"],
-            "completed"
+            uploads["sum"]["aggregationTemporality"],
+            "AGGREGATION_TEMPORALITY_CUMULATIVE"
         );
+        assert_eq!(uploads["sum"]["isMonotonic"], true);
+        let point = &uploads["sum"]["dataPoints"][0];
+        assert_eq!(point["asInt"], "10");
+        assert_eq!(point["attributes"][0]["value"]["stringValue"], "completed");
+        // Without a usable start time a cumulative point has no window, and a
+        // restart is indistinguishable from a real drop. Assert it is a
+        // parseable nanosecond count rather than merely a string: an empty or
+        // non-numeric one satisfies "is a string" and describes nothing.
+        let start = point["startTimeUnixNano"]
+            .as_str()
+            .expect("cumulative points carry a start time");
+        let start: u64 = start
+            .parse()
+            .unwrap_or_else(|_| panic!("start time must be decimal nanoseconds, got {start:?}"));
+        assert!(start > 0, "start time must be a real instant");
+
+        // Every point in one process shares one window, so a reader can
+        // compare them without checking each start individually.
+        let starts: BTreeSet<&str> = uploads["sum"]["dataPoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["startTimeUnixNano"].as_str().unwrap())
+            .collect();
+        assert_eq!(starts.len(), 1, "all points must share one start time");
+    }
+
+    /// Numbers read at an instant must not become counters: summing two
+    /// readings of a store size produces something that means nothing.
+    #[test]
+    fn point_in_time_readings_stay_gauges() {
+        let body = serialize_metrics(
+            &sample_snap(),
+            "kache",
+            "0.16.0",
+            "1700000000000000000",
+            None,
+            None,
+        );
+        for name in [
+            "kache.cache.store.size",
+            "kache.cache.store.entries",
+            "kache.cache.store.max",
+            "kache.cache.uploads.pending",
+            "kache.cache.downloads.active",
+            "kache.cache.s3.concurrency",
+            "kache.cache.remote.degraded",
+            "kache.cache.negative_entries",
+            "kache.prefetch.cancelled",
+            "kache.prefetch.last_plan.candidates",
+            "kache.prefetch.last_plan.wall",
+        ] {
+            assert!(
+                metric(&body, name).get("sum").is_none(),
+                "{name} must stay a gauge"
+            );
+        }
     }
 
     #[test]

@@ -1,17 +1,94 @@
 ---
 title: Quick start
-description: Enable Kache, then verify the setup
+description: Enable Kache and verify reuse between two worktrees
 ---
+
+Build one committed revision in two temporary worktrees. Each gets a fresh target directory, while Kache shares compatible cached outputs between them. Your existing checkout and build outputs stay in place.
 
 ## Enable Kache
 
+[Install Kache](/docs/getting-started/installation), then run:
+
 ```bash
 kache init
+kache doctor
 ```
 
-`init` configures Cargo (`rustc-wrapper` and, when unset, `HOST_CC` / `HOST_CXX` for build-script C), offers Unix compiler-name shims for Make/CMake/PKGBUILD, installs the daemon as a login service, and starts it. It does not set `CC` or `CXX`, and it does not edit `PATH`. After the shims exist, prepend their directory yourself. See [C and C++](/docs/getting-started/c-cpp). It is safe to run again when repairing a setup.
+`init` configures Cargo's Rust wrapper and, when unset, `HOST_CC` / `HOST_CXX` for build-script C and C++. It also offers Unix compiler-name shims and a login service. It does not set `CC`, `CXX`, or `PATH`. See [C and C++](/docs/getting-started/c-cpp) for native build setup.
 
-Useful variants:
+`doctor` checks the wrapper configuration, conflicting wrappers, cache configuration, daemon access, and compiler-name shims. Resolve any setup issues it reports before continuing.
+
+## Build in two worktrees
+
+Use Bash, Zsh, or Git Bash at the root of a Rust repository with a committed `Cargo.toml` and `Cargo.lock`. The example builds `HEAD`; uncommitted changes stay in your original checkout. Complete any project-specific setup, such as initializing submodules, in each new worktree.
+
+Run these blocks in the same shell:
+
+```bash
+kache_trial="$(mktemp -d)"
+git worktree add --detach "$kache_trial/first" HEAD
+git worktree add --detach "$kache_trial/second" HEAD
+```
+
+Build once to make eligible outputs available in the cache:
+
+```bash
+(
+  set -e
+  cd "$kache_trial/first"
+  cargo build --locked --target-dir "$PWD/target"
+)
+```
+
+Then build the same revision in the second worktree:
+
+```bash
+(
+  set -e
+  cd "$kache_trial/second"
+  KACHE_PROGRESS=hits cargo build --locked --target-dir "$PWD/target"
+  kache report --root "$PWD"
+)
+```
+
+The explicit target paths keep the two builds separate even if you normally use a shared target directory. Cargo must request outputs for the second tree, giving Kache an opportunity to restore them. Running Cargo again with an already populated target can do no compiler work and produce no new Kache events.
+
+## Read the result
+
+Look for cache hits and restored bytes in the second tree's report. The first build may also have hits if the store already contains compatible results. Some compiler invocations pass through; check the report's bypass reasons before expecting every unit to hit.
+
+The report filters to the second tree's recorded events in the last 24 hours. On versions whose `kache report --help` lists `--last-build`, select just the latest recorded activity session:
+
+```bash
+kache report --last-build --root "$kache_trial/second"
+```
+
+`--last-build` was added after Kache 0.16.0. A session can include nearby or concurrent Cargo commands in one root; it is not an exact Cargo invocation ID. Only completed, retained compiler events appear. See the [command reference](/docs/commands/reference#kache-report) for the selection rules.
+
+Compiler work avoided is an aggregate estimate, not elapsed build time saved. This example demonstrates reuse; a speed comparison needs repeated measurements of the same workload. Rust hits also do not prove that C or C++ compilations were cached.
+
+If the second build misses, run `kache why-miss <crate>` from that worktree, using a Rust crate name from the report. It compares the latest recorded key material for that crate. Check the reported input changes and the [cache limits](/docs/how-it-works/limits).
+
+## Save a report
+
+```bash
+kache report --root "$kache_trial/second" --format markdown --output "$kache_trial/reuse.md"
+```
+
+Add `--last-build` when your installed version supports it and you want the latest session. Open `reuse.md` before sharing it: reports include local paths and crate names, and store inventory covers the whole cache. The command writes a local file; publication is a separate action.
+
+Kache is built by [Kunobi](https://kunobi.ninja/). When sharing a result, link this walkthrough so someone else can reproduce it.
+
+Keep the worktrees for further experiments, or remove them from your original repository when finished:
+
+```bash
+git worktree remove "$kache_trial/first"
+git worktree remove "$kache_trial/second"
+```
+
+The report stays at `$kache_trial/reuse.md`. Git may refuse to remove a worktree with local changes; review those files before removing it.
+
+## Setup options
 
 ```bash
 kache init --check       # print proposed changes only
@@ -19,63 +96,19 @@ kache init --no-service  # configure Cargo without a login service
 kache init --yes         # accept defaults without prompts
 ```
 
-To configure Cargo yourself, use either the environment or Cargo config:
+To try the worktree example without persistent setup, skip `kache init` and prefix both `cargo build` commands with `RUSTC_WRAPPER=kache`. For example:
 
 ```bash
-export RUSTC_WRAPPER=kache
+(
+  set -e
+  cd "$kache_trial/first"
+  RUSTC_WRAPPER=kache cargo build --locked --target-dir "$PWD/target"
+)
 ```
 
-```toml title="~/.cargo/config.toml"
-[build]
-rustc-wrapper = "kache"
-```
+This enables the Rust wrapper for that command. C and C++ builds need their [own wrapper configuration](/docs/getting-started/c-cpp).
 
-For Cargo build scripts that compile C or C++, add the `[env]` keys `kache init` writes, or put a shim on `PATH`.
-
-## Try Kache without changing configuration
-
-From a Rust project:
-
-```bash
-RUSTC_WRAPPER=kache cargo build
-cargo clean
-KACHE_PROGRESS=hits RUSTC_WRAPPER=kache cargo build
-kache stats
-```
-
-The first build fills the local cache. `cargo clean` makes Cargo request the same outputs again, so the second build can demonstrate restores. Do not add `cargo clean` to a normal build workflow.
-
-This trial does not edit Cargo configuration or install a service. It wraps rustc only; C and C++ compilations remain uncached.
-
-## Check the setup
-
-```bash
-kache doctor
-kache monitor
-```
-
-`doctor` checks wrapper configuration, conflicting wrappers, config parsing, daemon access, and (informational) whether a C/C++ compiler on `PATH` is a Kache shim. `monitor` shows hits, misses, passthroughs, store use, and remote transfers.
-
-For a non-interactive check:
-
-```bash
-kache stats
-kache list
-```
-
-## Worktrees
-
-Share the Kache store across worktrees, but give concurrent Cargo builds separate target directories. Cargo owns `target/` fingerprints and can mark a unit fresh without invoking any compiler wrapper.
-
-On Cargo 1.91 or newer, this command keeps intermediate fingerprints worktree-local while allowing final target output to be shared:
-
-```bash
-kache cargo -- build
-```
-
-Otherwise set a distinct `CARGO_TARGET_DIR` per live worktree.
-
-Tools that copy the workspace to a temporary directory and build there, such as cargo-mutants, need no extra setup. See [Mutation testing](/docs/getting-started/mutation-testing).
+After setup, keep using ordinary Cargo commands. Give concurrent worktrees separate target directories. Tools that build in temporary copies, such as cargo-mutants, need no extra setup; see [Mutation testing](/docs/getting-started/mutation-testing).
 
 ## Executables and incremental builds
 
@@ -90,5 +123,3 @@ KACHE_DISABLED=1 cargo build
 ```
 
 This keeps the wrapper in place but passes compiler work through.
-
-For C and C++, continue with [C/C++ caching](/docs/getting-started/c-cpp).

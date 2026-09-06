@@ -1,7 +1,7 @@
 name: Bench
 
 # Clone benchmark — builds kache from THIS ref and runs the cross-clone
-# cold/warm scenarios (Firefox, Substrate, SurrealDB, Lance, OpenDAL, LLVM)
+# cold/warm scenarios (Firefox, Substrate, SurrealDB, Lance, OpenDAL, eza, LLVM)
 # against one shared cache, then
 # uploads the reports. This is the heavy, hours-long, tens-of-GB-disk job the
 # bench engine's doc-comment says is "intentionally NOT wired into [PR] CI": it
@@ -35,7 +35,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, surrealdb, lance, opendal, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, hk, hk-pull, hk-mbx, opendal-mbx, lance-mbx, substrate-mbx, surrealdb-mbx]
+        options: [all, substrate, surrealdb, lance, opendal, eza, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, hk, hk-pull, hk-mbx, opendal-mbx, lance-mbx, substrate-mbx, surrealdb-mbx]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -145,6 +145,13 @@ jobs:
           # (as firefox-sccache is for firefox). mbx comes from mise at its
           # latest release; the run records the version it measured.
           hk_mbx='{"name":"hk-mbx","cmd":"bench-mbx hk","dir":"bench-hk-mbx","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          # eza: the smallest subject and the only one built through a fat-LTO
+          # release profile, so the final unit is one whole-program codegen
+          # instead of many small ones. Its bundled libgit2 and zlib put the
+          # majority of its cacheable units on the C side (199 of 319 in a local
+          # run). The cheapest arm in the sweep: minutes, and under a gigabyte
+          # of build output.
+          eza='{"name":"eza","cmd":"bench eza --warm-same-tree","dir":"bench-eza","timeout":60,"job_timeout":90,"min_free_gb":20,"runner":"kunobi-runners"}'
           # Two more subjects on the same side-by-side axis. mbx fronts Cargo,
           # so the arms it can serve at all are exactly the cargo-driven ones:
           # firefox (mach/gn/ninja) and llvm (cmake) are out of reach, which is
@@ -172,6 +179,7 @@ jobs:
             hk)                   inc="[$hk]" ;;
             hk-pull)              inc="[$hk_pull]" ;;
             hk-mbx)               inc="[$hk_mbx]" ;;
+            eza)                  inc="[$eza]" ;;
             opendal-mbx)          inc="[$opendal_mbx]" ;;
             lance-mbx)            inc="[$lance_mbx]" ;;
             substrate-mbx)        inc="[$substrate_mbx]" ;;
@@ -182,7 +190,7 @@ jobs:
             # and wastefully run the whole Linux `all` matrix alongside.
             firefox-windows)      inc="[]" ;;
             firefox-pull-windows) inc="[]" ;;
-            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull,$hk,$hk_pull,$hk_mbx,$opendal_mbx,$lance_mbx,$substrate_mbx,$surrealdb_mbx]" ;;
+            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull,$hk,$hk_pull,$hk_mbx,$eza,$opendal_mbx,$lance_mbx,$substrate_mbx,$surrealdb_mbx]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
           if [ "$inc" = "[]" ]; then

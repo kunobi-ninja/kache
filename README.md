@@ -28,20 +28,11 @@ kache init           # apply them
 
 Your Cargo commands do not change.
 
-## Try it without changing your setup
+## See your first cache hit
 
-Run two clean builds from a Rust project:
+After `kache init`, [build the same revision in two temporary worktrees][first-reuse]. Each gets its own target directory, so your existing build outputs stay in place. Use the report to check cache hits and investigate misses.
 
-```bash
-RUSTC_WRAPPER=kache cargo build
-cargo clean
-KACHE_PROGRESS=hits RUSTC_WRAPPER=kache cargo build
-kache stats
-```
-
-`cargo clean` is only for this demonstration. Kache normally helps when Cargo would otherwise compile an input it has seen before, such as in another worktree or after changing toolchains and changing back.
-
-This wraps rustc only. C and C++ compilations remain uncached.
+It also includes a trial without persistent Cargo configuration. That trial enables the Rust wrapper only; native builds need the [C/C++ setup](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
 
 ## What Kache caches
 
@@ -173,4 +164,5 @@ Kache is licensed under the [Apache License 2.0](LICENSE).
 [storage-chart]: https://kunobi.ninja/blog/kache-storage-worktrees?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=storage_chart
 [storage-report]: https://kunobi.ninja/blog/kache-storage-worktrees?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=storage_report
 [benchmark-guide]: https://kunobi.ninja/docs/kache/benchmarks?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=benchmark_guide
+[first-reuse]: https://kunobi.ninja/docs/kache/getting-started/quick-start?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=first_reuse
 [kunobi-desktop]: https://kunobi.ninja/product/desktop?utm_source=github&utm_medium=readme&utm_campaign=kache&utm_content=desktop

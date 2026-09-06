@@ -1,6 +1,6 @@
 [package]
 name = "kache-format"
-version = "0.16.1"
+version = "0.17.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Cache-entry metadata and validation for kache."

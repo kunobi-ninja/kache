@@ -38,6 +38,9 @@
 # is always leftover test state.
 /stage-*.tmp
 
+# Bytecode from scripts/*.py (version gate, crates.io bootstrap).
+__pycache__/
+
 # Nix
 /result
 

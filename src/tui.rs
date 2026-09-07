@@ -2900,11 +2900,15 @@ mod tests {
         let range = s.build_scroll.visible_range(24, 5);
         assert_eq!(range, 19..24);
 
-        // An event the filter hides does not count as an arrival.
+        // An event the filter hides does not count as an arrival; one the
+        // filter shows does.
         s.build_scroll.scroll_up_by(10);
         s.build_filter = "zzz".to_string();
         s.push_event(sample_build_event("c24", EventResult::Miss, 1, 1));
         assert_eq!(s.build_scroll.offset, 10);
+        s.build_filter = "c2".to_string();
+        s.push_event(sample_build_event("c25", EventResult::Miss, 1, 1));
+        assert_eq!(s.build_scroll.offset, 11, "a matching filter still counts");
     }
 
     #[test]

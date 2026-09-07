@@ -68,12 +68,13 @@ jobs:
   # a job-level `if` on `bench`: the `matrix` context is NOT available in a
   # job-level `if` (it is evaluated before the matrix is expanded, so it reads
   # empty) — a dispatch picking a single scenario would otherwise run zero arms.
-  # This tiny job runs on a GitHub-hosted runner so a skipped scenario never
-  # claims a self-hosted kunobi runner. schedule + `all` -> both; otherwise the
+  # This tiny job uses the validation runner so a skipped scenario never
+  # claims a benchmark runner. schedule + `all` -> both; otherwise the
   # one picked scenario. Per-arm timeout/min_free_gb travel with each entry.
   plan:
+    if: (github.repository == 'kunobi-ninja/kache' || vars.ENABLE_BENCHMARKS == 'true')
     name: Plan scenarios
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
       # Whether the Linux matrix has any arm. Windows-only scenarios produce an
@@ -217,7 +218,14 @@ jobs:
     # floor is a free-space precheck against the node filesystem, which is
     # several times larger, so it passes long before the ceiling is reached
     # and cannot catch that case on its own.
-    runs-on: ${{ matrix.runner }}
+    runs-on: >-
+      ${{ fromJSON(
+        matrix.runner == 'kunobi-runners-large' &&
+        (vars.BENCH_RUNNER_LINUX_LARGE ||
+         (github.repository == 'kunobi-ninja/kache' && '"kunobi-runners-large"') || 'null') ||
+        vars.BENCH_RUNNER_LINUX ||
+        (github.repository == 'kunobi-ninja/kache' && '"kunobi-runners"')
+      ) }}
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       # Arms run concurrently (up to the kunobi-runners scale-set's maxRunners).
@@ -486,10 +494,11 @@ jobs:
   bench-firefox-windows:
     name: Bench Firefox (Windows)
     if: >-
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' &&
-       (github.event.inputs.scenario == 'firefox-windows' || github.event.inputs.scenario == 'all'))
-    runs-on: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
+      (github.repository == 'kunobi-ninja/kache' || vars.ENABLE_BENCHMARKS == 'true') &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.scenario == 'firefox-windows' || github.event.inputs.scenario == 'all')))
+    runs-on: ${{ fromJSON(vars.BENCH_RUNNER_WINDOWS || (github.repository == 'kunobi-ninja/kache' && '["self-hosted","Windows","X64","kunobi-windows"]')) }}
     timeout-minutes: 420
     defaults:
       run:
@@ -730,10 +739,11 @@ jobs:
   bench-firefox-pull-windows:
     name: Bench Firefox Pull (Windows)
     if: >-
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' &&
-       (github.event.inputs.scenario == 'firefox-pull-windows' || github.event.inputs.scenario == 'all'))
-    runs-on: ${{ fromJSON('["self-hosted", "Windows", "X64", "kunobi-windows"]') }}
+      (github.repository == 'kunobi-ninja/kache' || vars.ENABLE_BENCHMARKS == 'true') &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' &&
+        (github.event.inputs.scenario == 'firefox-pull-windows' || github.event.inputs.scenario == 'all')))
+    runs-on: ${{ fromJSON(vars.BENCH_RUNNER_WINDOWS || (github.repository == 'kunobi-ninja/kache' && '["self-hosted","Windows","X64","kunobi-windows"]')) }}
     timeout-minutes: 540
     defaults:
       run:

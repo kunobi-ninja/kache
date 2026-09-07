@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   publish:
+    if: github.repository == 'kunobi-ninja/kache'
     name: Publish crates.io packages
     runs-on: ubuntu-latest
     # Every published GitHub Release publishes to crates.io, release-candidates

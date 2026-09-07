@@ -56,6 +56,7 @@ jobs:
   # workflow_dispatch the inputs do (with "latest"/"auto" resolution).
   # ---------------------------------------------------------------------------
   resolve:
+    if: github.repository == 'kunobi-ninja/kache'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

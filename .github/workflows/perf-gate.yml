@@ -89,11 +89,12 @@ jobs:
   # is the only place that decides whether a self-hosted job may start.
   authorize:
     name: Authorize
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 10
     # A failed or cancelled preflight, or a preflight that somehow fired on a
     # non-PR event, produces no measurement.
     if: >-
+      (github.repository == 'kunobi-ninja/kache' || vars.ENABLE_PERF_GATE == 'true') &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request'
     permissions:
@@ -184,7 +185,7 @@ jobs:
     # fits its 80Gi per-runner ceiling, and running here keeps every pull
     # request off the single reserved-node runner the heavy benchmarks queue
     # on.
-    runs-on: kunobi-runners
+    runs-on: ${{ fromJSON(vars.PERF_RUNNER_LINUX || (github.repository == 'kunobi-ninja/kache' && '"kunobi-runners"')) }}
     # Six builds of the subject (three phases x two commits) plus two builds of
     # kache itself. Normal runs land well inside this; the cap exists so a stall
     # is killed in an hour rather than at GitHub's 6h default.
@@ -447,7 +448,7 @@ jobs:
     name: Report
     needs: [authorize, measure]
     if: always() && needs.authorize.outputs.eligible == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 10
     permissions:
       contents: read

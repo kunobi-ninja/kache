@@ -1318,6 +1318,101 @@ fn init_noninteractive_writes_isolated_cargo_config() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn init_repairs_each_half_of_terminal_setup_and_reports_activation() {
+    let e = env();
+    let shims = e.home.join(".local/lib/kache/shims");
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("\ny\nn\n")
+        .assert()
+        .success();
+    let rc = e.home.join(".bashrc");
+    let configured = std::fs::read_to_string(&rc).unwrap();
+    std::fs::write(&rc, "# new user configuration\n").unwrap();
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("yes\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Enable C/C++ caching in new terminals?",
+        ));
+    assert!(std::fs::read_to_string(&rc).unwrap().ends_with(&configured));
+    let repaired = std::fs::read_to_string(&rc).unwrap();
+
+    std::fs::remove_file(shims.join("cc")).unwrap();
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("y\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Enable C/C++ caching in new terminals?",
+        ));
+    assert_eq!(std::fs::read_to_string(&rc).unwrap(), repaired);
+    assert_eq!(
+        std::fs::canonicalize(shims.join("cc")).unwrap(),
+        std::fs::canonicalize(KACHE_BIN).unwrap()
+    );
+    e.cmd()
+        .env(
+            "PATH",
+            std::env::join_paths([shims.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+                .unwrap(),
+        )
+        .args(["init", "--no-service"])
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Terminal C/C++ caching: active"))
+        .stdout(predicates::str::contains("Open a new terminal").not());
+
+    std::fs::remove_file(shims.join("cc")).unwrap();
+    std::fs::write(shims.join("cc"), "user-owned compiler").unwrap();
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("y\n")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("existing files"));
+    assert_eq!(
+        std::fs::read_to_string(shims.join("cc")).unwrap(),
+        "user-owned compiler"
+    );
+    assert_eq!(std::fs::read_to_string(rc).unwrap(), repaired);
+}
+
+#[cfg(unix)]
+#[test]
+fn init_leaves_unsupported_shells_and_managed_dotfiles_alone() {
+    let e = env();
+    e.cmd()
+        .env("SHELL", "/bin/unsupported")
+        .args(["init", "--no-service"])
+        .write_stdin("n\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("shell not supported"));
+    assert!(!e.home.join(".local/lib/kache/shims").exists());
+    let managed = e.home.join("managed-rc");
+    std::fs::write(&managed, "# managed config\n").unwrap();
+    std::os::unix::fs::symlink(&managed, e.home.join(".bashrc")).unwrap();
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("n\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("No shell files were changed."));
+    assert_eq!(
+        std::fs::read_to_string(managed).unwrap(),
+        "# managed config\n"
+    );
+    assert!(!e.home.join(".bash_profile").exists());
+    assert!(!e.home.join(".local/lib/kache/shims").exists());
+}
+
 #[test]
 fn init_writes_config_to_custom_cargo_home() {
     // When $CARGO_HOME is set, init must write the wrapper config under it,

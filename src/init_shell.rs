@@ -362,4 +362,83 @@ mod tests {
                 .contains("/a\\'b\\\\c")
         );
     }
+
+    #[test]
+    fn plans_empty_files_and_blocks_at_line_boundaries() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("nested/.bashrc");
+        let block = format!("{BEGIN}\nactivate\n{END}\n");
+        let edit = Edit::plan(path.clone(), "activate").unwrap();
+        assert!(edit.changed());
+        assert!(edit.apply().unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), block);
+        for (original, expected) in [
+            (String::new(), block.clone()),
+            ("# user".into(), format!("# user\n{block}")),
+            ("# user\n".into(), format!("# user\n{block}")),
+            (block.trim_end().into(), block.clone()),
+            (block.clone(), block.clone()),
+            (
+                format!("# before\n{BEGIN}\nold\n{END}\n# after"),
+                format!("# before\n# after\n{block}"),
+            ),
+        ] {
+            std::fs::write(&path, &original).unwrap();
+            let edit = Edit::plan(path.clone(), "activate").unwrap();
+            assert_eq!(edit.changed(), original != expected);
+            assert_eq!(edit.updated, expected);
+        }
+        for malformed in [
+            format!("{BEGIN}\n{END}trailing"),
+            format!("{BEGIN}\n{END}\n{END}"),
+            format!("prefix{BEGIN}\n{END}\n"),
+        ] {
+            std::fs::write(&path, malformed).unwrap();
+            assert!(Edit::plan(path.clone(), "activate").is_err());
+        }
+    }
+
+    #[test]
+    fn limits_reads_to_regular_small_utf8_files() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(read_regular(home.path()).is_err());
+        let path = home.path().join(".zshrc");
+        assert_eq!(read_regular(&path).unwrap(), None);
+        let at_limit = "x".repeat(1 << 20);
+        std::fs::write(&path, &at_limit).unwrap();
+        assert_eq!(read_regular(&path).unwrap(), Some(at_limit));
+        std::fs::write(&path, vec![b'x'; (1 << 20) + 1]).unwrap();
+        assert!(read_regular(&path).is_err());
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(read_regular(&path).is_err());
+    }
+
+    #[test]
+    fn activation_preserves_an_empty_or_already_exact_path() {
+        for initial in ["", "/shims", "/shims:/bin", "/shims-other:/bin"] {
+            let activation = Shell::Bash.activation(Path::new("/shims")).unwrap();
+            let script = format!("{activation}\nprintf '%s' \"$PATH\"");
+            let output = std::process::Command::new("/bin/bash")
+                .args(["--noprofile", "--norc", "-c", &script])
+                .env("PATH", initial)
+                .env_remove("BASH_ENV")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let expected = match initial {
+                "" | "/shims" => "/shims".to_owned(),
+                "/shims:/bin" => initial.to_owned(),
+                _ => format!("/shims:{initial}"),
+            };
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
+        assert_eq!(
+            Shell::Fish.command(Path::new("/shims")).unwrap(),
+            "set -gx PATH '/shims' $PATH"
+        );
+        assert_eq!(
+            Shell::Fish.activation(Path::new("/shims")).unwrap(),
+            "if test \"$PATH[1]\" != '/shims'\n    set -gx PATH '/shims' $PATH\nend"
+        );
+    }
 }

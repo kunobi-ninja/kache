@@ -3692,15 +3692,28 @@ mod tests {
         assert_eq!(s.live_heartbeats.len(), 1, "resumed: the beat was replayed");
         assert_eq!(s.in_flight_view()[0].crate_name, "gkrust");
 
+        // The same crate compiling in another tree is a different unit: its
+        // beat must survive this tree's completion (crate AND root match).
+        let elsewhere = HeartbeatEvent {
+            pid: 4343,
+            root: "/other".to_string(),
+            ..beat.clone()
+        };
+        events::log_heartbeat(&log, &elsewhere).unwrap();
+        s.ingest_tailed_records();
+        assert_eq!(s.live_heartbeats.len(), 2);
+
         let mut done = sample_build_event("gkrust", EventResult::Miss, 100, 1);
         done.root = "/w".to_string();
         events::log_event(&log, &done).unwrap();
         s.ingest_tailed_records();
         assert_eq!(s.events.len(), 1);
-        assert!(
-            s.live_heartbeats.is_empty(),
-            "completion ends the in-flight row"
+        assert_eq!(
+            s.live_heartbeats.len(),
+            1,
+            "completion ends this tree's in-flight row only"
         );
+        assert_eq!(s.live_heartbeats[&4343].1.root, "/other");
     }
 
     #[test]

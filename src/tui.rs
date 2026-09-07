@@ -1,13 +1,16 @@
 use anyhow::Result;
 use bytesize::ByteSize;
 use crossterm::ExecutableCommand;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use std::io::stdout;
+use std::io::{IsTerminal, stdout};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,6 +40,14 @@ std::thread_local! {
 
 impl TerminalModeGuard {
     pub(crate) fn enter() -> Result<Self> {
+        Self::enter_with_mouse(false)
+    }
+
+    /// Like [`enter`](Self::enter), optionally asking the terminal to report
+    /// mouse events too. Only the monitor wants those: capture disables the
+    /// terminal's native text selection, which the config editor and the
+    /// interactive clean have no reason to take away.
+    pub(crate) fn enter_with_mouse(mouse: bool) -> Result<Self> {
         static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
         PANIC_HOOK.call_once(|| {
             let previous = std::panic::take_hook();
@@ -50,6 +61,10 @@ impl TerminalModeGuard {
             // No guard exists yet to undo the half-entered state — and
             // the escape sequence may have been written before the error
             // surfaced, so leave the alternate screen too.
+            restore_terminal();
+            return Err(e.into());
+        }
+        if mouse && let Err(e) = stdout().execute(EnableMouseCapture) {
             restore_terminal();
             return Err(e.into());
         }
@@ -68,6 +83,10 @@ impl Drop for TerminalModeGuard {
 fn restore_terminal() {
     #[cfg(test)]
     TERMINAL_RESTORE_OBSERVED.with(|observed| observed.set(true));
+    // Harmless when capture was never enabled, and it must come before the
+    // screen switch: a terminal left reporting mouse motion sprays escape
+    // sequences into the shell that follows.
+    let _ = stdout().execute(DisableMouseCapture);
     let _ = stdout().execute(LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
@@ -125,6 +144,8 @@ struct Viewport {
     offset: usize,
     max_offset: usize,
     anchor: ScrollAnchor,
+    /// Rows the panel showed on its last draw; the unit for PgUp/PgDn.
+    page: usize,
 }
 
 impl Viewport {
@@ -133,22 +154,74 @@ impl Viewport {
             offset: 0,
             max_offset: 0,
             anchor,
+            page: 1,
         }
     }
 
     fn scroll_up(&mut self) {
+        self.scroll_up_by(1);
+    }
+
+    fn scroll_down(&mut self) {
+        self.scroll_down_by(1);
+    }
+
+    fn scroll_up_by(&mut self, rows: usize) {
         match self.anchor {
-            ScrollAnchor::Top => self.offset = self.offset.saturating_sub(1),
+            ScrollAnchor::Top => self.offset = self.offset.saturating_sub(rows),
             ScrollAnchor::Bottom => {
-                self.offset = self.offset.saturating_add(1).min(self.max_offset)
+                self.offset = self.offset.saturating_add(rows).min(self.max_offset)
             }
         }
     }
 
-    fn scroll_down(&mut self) {
+    fn scroll_down_by(&mut self, rows: usize) {
         match self.anchor {
-            ScrollAnchor::Top => self.offset = self.offset.saturating_add(1).min(self.max_offset),
-            ScrollAnchor::Bottom => self.offset = self.offset.saturating_sub(1),
+            ScrollAnchor::Top => {
+                self.offset = self.offset.saturating_add(rows).min(self.max_offset)
+            }
+            ScrollAnchor::Bottom => self.offset = self.offset.saturating_sub(rows),
+        }
+    }
+
+    fn page_up(&mut self) {
+        self.scroll_up_by(self.page.max(1));
+    }
+
+    fn page_down(&mut self) {
+        self.scroll_down_by(self.page.max(1));
+    }
+
+    /// Jump to the first row in logical order.
+    fn home(&mut self) {
+        self.offset = match self.anchor {
+            ScrollAnchor::Top => 0,
+            ScrollAnchor::Bottom => self.max_offset,
+        };
+    }
+
+    /// Jump to the last row in logical order. For a bottom-anchored panel this
+    /// is "follow the newest".
+    fn end(&mut self) {
+        self.offset = match self.anchor {
+            ScrollAnchor::Top => self.max_offset,
+            ScrollAnchor::Bottom => 0,
+        };
+    }
+
+    /// Whether the panel is showing its default edge, which for a
+    /// bottom-anchored panel means it is following new rows.
+    fn at_anchor(&self) -> bool {
+        self.offset == 0
+    }
+
+    /// `count` rows were added at the panel's live edge. A reader who has
+    /// scrolled away keeps looking at the same rows; the live edge is where
+    /// new rows land, and only a viewport sitting on it moves with them. The
+    /// offset is clamped on the next draw, so overshooting here is harmless.
+    fn rows_arrived(&mut self, count: usize) {
+        if count > 0 && self.offset > 0 {
+            self.offset = self.offset.saturating_add(count);
         }
     }
 
@@ -159,6 +232,7 @@ impl Viewport {
     /// Update this viewport from the rows and height that will actually render,
     /// clamp stale state, and return the corresponding range in logical order.
     fn visible_range(&mut self, item_count: usize, visible_rows: usize) -> std::ops::Range<usize> {
+        self.page = visible_rows.max(1);
         let visible_rows = visible_rows.min(item_count);
         self.max_offset = item_count.saturating_sub(visible_rows);
         self.offset = self.offset.min(self.max_offset);
@@ -359,12 +433,46 @@ struct AppState {
     stats_fetch_requested_entries: bool,
 
     should_quit: bool,
+    /// `p` freezes the screen: no new events are read, no snapshot or scan is
+    /// started. The tailer keeps its offset, so resuming replays everything
+    /// that happened meanwhile rather than dropping it.
+    paused: bool,
+    /// The time span the lookup sparklines cover. Five minutes by default;
+    /// the `--since` window when one was given, so a `--since 24h` session
+    /// sees its history instead of an empty strip.
+    spark_window: Duration,
     rustc_version: String,
     wrapper_status: String,
     service_installed: bool,
 }
 
 impl AppState {
+    /// The viewport of the panel the active tab scrolls.
+    fn active_viewport(&mut self) -> &mut Viewport {
+        match self.active_tab {
+            Tab::Build => &mut self.build_scroll,
+            Tab::Projects => &mut self.project_scroll,
+            Tab::Store => &mut self.store_scroll,
+            Tab::Transfer => &mut self.transfer_scroll,
+            Tab::Passthrough => &mut self.passthrough_scroll,
+        }
+    }
+
+    /// Append a tailed build event and keep every scrolled-away reader on the
+    /// rows they were looking at.
+    fn push_event(&mut self, event: BuildEvent) {
+        if self.build_filter.is_empty() || event.crate_name.contains(&self.build_filter) {
+            self.build_scroll.rows_arrived(1);
+        }
+        if matches!(event.result, EventResult::Passthrough)
+            && (self.passthrough_filter.is_empty()
+                || event.crate_name.contains(&self.passthrough_filter)
+                || event.passthrough_reason.contains(&self.passthrough_filter))
+        {
+            self.passthrough_scroll.rows_arrived(1);
+        }
+        self.events.push(event);
+    }
     /// The active tab's filter, empty for tabs that do not filter.
     fn filter(&self) -> &str {
         match self.active_tab {
@@ -421,7 +529,12 @@ const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Run the TUI monitor dashboard.
 pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
-    let _terminal_mode = TerminalModeGuard::enter()?;
+    if !stdout().is_terminal() {
+        anyhow::bail!(
+            "kache monitor needs a terminal; use `kache stats` for a plain-text summary that can be redirected"
+        );
+    }
+    let _terminal_mode = TerminalModeGuard::enter_with_mouse(true)?;
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -498,6 +611,10 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         stats_fetch_in_flight: false,
         stats_fetch_requested_entries: false,
         should_quit: false,
+        paused: false,
+        spark_window: since.map_or(SPARK_WINDOW, |window| {
+            Duration::from_secs(window.secs().max(60))
+        }),
         rustc_version: "\u{2026}".to_string(), // placeholder until background thread completes
         wrapper_status: crate::wrapper_config::wrapper_status_line(),
         service_installed,
@@ -505,7 +622,9 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
 
     loop {
         // Poll for new build events + heartbeats (kunobi-ninja/kache#131)
-        if let Ok(records) = state.tailer.poll_records() {
+        if !state.paused
+            && let Ok(records) = state.tailer.poll_records()
+        {
             for record in records {
                 match record {
                     EventRecord::Build(event) => {
@@ -519,7 +638,7 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
                         state.live_heartbeats.retain(|_, (_, hb)| {
                             hb.crate_name != event.crate_name || hb.root != event.root
                         });
-                        state.events.push(*event);
+                        state.push_event(*event);
                     }
                     EventRecord::Heartbeat(hb) => {
                         state.live_heartbeats.insert(hb.pid, (Instant::now(), hb));
@@ -568,7 +687,8 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         }
 
         // Spawn a background stats refresh when due (non-blocking)
-        if !state.stats_fetch_in_flight
+        if !state.paused
+            && !state.stats_fetch_in_flight
             && state.last_stats_fetch.elapsed() >= SNAPSHOT_REFRESH_INTERVAL
         {
             state.stats_fetch_in_flight = true;
@@ -596,7 +716,8 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         }
 
         // Refresh target/ scan periodically when on stats tab
-        if state.active_tab == Tab::Projects
+        if !state.paused
+            && state.active_tab == Tab::Projects
             && state.last_project_refresh.elapsed() >= PROJECT_REFRESH_INTERVAL
         {
             let is_scanning = state
@@ -613,11 +734,17 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
 
         terminal.draw(|frame| draw_ui(frame, &mut state))?;
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            handle_key(&mut state, key.code);
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key_event(&mut state, key);
+                }
+                Event::Mouse(mouse) => {
+                    let area = terminal.size()?.into();
+                    handle_mouse(&mut state, mouse, area);
+                }
+                _ => {}
+            }
         }
 
         if state.should_quit {
@@ -684,6 +811,36 @@ fn switch_tab(state: &mut AppState, tab: Tab) {
     }
 }
 
+/// Keys that carry a modifier are decided here; everything else is the plain
+/// code. Raw mode turns Ctrl+C into a key event instead of a signal, and
+/// dropping the modifier made it a bare `c`: on the Build tab that cleared
+/// the event list, which is the opposite of what the finger meant.
+fn handle_key_event(state: &mut AppState, key: KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        state.should_quit = true;
+        return;
+    }
+    handle_key(state, key.code);
+}
+
+/// Mouse support: clicking a tab title selects it; the wheel scrolls the
+/// active tab's panel three rows at a time. Anything else is ignored.
+fn handle_mouse(state: &mut AppState, mouse: MouseEvent, area: Rect) {
+    if terminal_too_small(area) {
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) if mouse.row == area.y => {
+            if let Some(tab) = tab_at_column(mouse.column.saturating_sub(area.x)) {
+                switch_tab(state, tab);
+            }
+        }
+        MouseEventKind::ScrollUp => state.active_viewport().scroll_up_by(3),
+        MouseEventKind::ScrollDown => state.active_viewport().scroll_down_by(3),
+        _ => {}
+    }
+}
+
 fn handle_key(state: &mut AppState, key: KeyCode) {
     // Filter input mode
     if state.filter_active {
@@ -742,21 +899,16 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         // Shift+Tab used to share an arm with Tab and cycle forward too, so
         // there was no way back except by number.
         KeyCode::BackTab => switch_tab(state, state.active_tab.previous()),
-        // Scrolling
-        KeyCode::Up => match state.active_tab {
-            Tab::Build => state.build_scroll.scroll_up(),
-            Tab::Projects => state.project_scroll.scroll_up(),
-            Tab::Store => state.store_scroll.scroll_up(),
-            Tab::Transfer => state.transfer_scroll.scroll_up(),
-            Tab::Passthrough => state.passthrough_scroll.scroll_up(),
-        },
-        KeyCode::Down => match state.active_tab {
-            Tab::Build => state.build_scroll.scroll_down(),
-            Tab::Projects => state.project_scroll.scroll_down(),
-            Tab::Store => state.store_scroll.scroll_down(),
-            Tab::Transfer => state.transfer_scroll.scroll_down(),
-            Tab::Passthrough => state.passthrough_scroll.scroll_down(),
-        },
+        // Scrolling: one row, one page, or straight to either end. `j`/`k`
+        // for hands that live on the home row.
+        KeyCode::Up | KeyCode::Char('k') => state.active_viewport().scroll_up(),
+        KeyCode::Down | KeyCode::Char('j') => state.active_viewport().scroll_down(),
+        KeyCode::PageUp => state.active_viewport().page_up(),
+        KeyCode::PageDown => state.active_viewport().page_down(),
+        KeyCode::Home => state.active_viewport().home(),
+        KeyCode::End => state.active_viewport().end(),
+        // Pause is global: it freezes every tab, not the one in front.
+        KeyCode::Char('p') => state.paused = !state.paused,
         // Build tab
         // One arm for every filterable tab: `filter_mut` already encodes which
         // those are, so `f` is inert on Projects and Transfer instead of
@@ -784,8 +936,29 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
 
 // ── Drawing ────────────────────────────────────────────────────────────────
 
+/// The smallest terminal the layout still reads on. Below this the fixed-height
+/// panels overlap and the tables lose their headers, so say so instead.
+const MIN_WIDTH: u16 = 60;
+const MIN_HEIGHT: u16 = 16;
+
+fn terminal_too_small(area: Rect) -> bool {
+    area.width < MIN_WIDTH || area.height < MIN_HEIGHT
+}
+
 fn draw_ui(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
+
+    if terminal_too_small(area) {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Terminal is {}×{}; kache monitor needs at least {MIN_WIDTH}×{MIN_HEIGHT}.\n\n`kache stats` prints the same numbers as text.\nq quits.",
+                area.width, area.height
+            ))
+            .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
 
     // Tab bar at the top
     let chunks = Layout::vertical([
@@ -816,18 +989,47 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
         }
     };
 
-    let tabs = Line::from(vec![
-        Span::styled(" [1] Build ", style_for(Tab::Build)),
-        Span::raw("  "),
-        Span::styled("[2] Projects", style_for(Tab::Projects)),
-        Span::raw("  "),
-        Span::styled("[3] Store ", style_for(Tab::Store)),
-        Span::raw("  "),
-        Span::styled("[4] Transfer ", style_for(Tab::Transfer)),
-        Span::raw("  "),
-        Span::styled("[5] Passthrough ", style_for(Tab::Passthrough)),
-    ]);
-    frame.render_widget(Paragraph::new(tabs), area);
+    let mut spans = Vec::with_capacity(Tab::ORDER.len() * 2);
+    for (tab, label, _) in tab_titles() {
+        spans.push(Span::styled(label, style_for(tab)));
+        spans.push(Span::raw("  "));
+    }
+    if state.paused {
+        spans.push(Span::styled(
+            " PAUSED (p resumes) ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Every tab's label and the column it starts at in the tab bar. One place
+/// for the geometry so the drawing and the mouse hit-test cannot disagree.
+fn tab_titles() -> [(Tab, &'static str, u16); 5] {
+    const LABELS: [(Tab, &str); 5] = [
+        (Tab::Build, " [1] Build "),
+        (Tab::Projects, "[2] Projects"),
+        (Tab::Store, "[3] Store "),
+        (Tab::Transfer, "[4] Transfer "),
+        (Tab::Passthrough, "[5] Passthrough "),
+    ];
+    let mut x = 0u16;
+    LABELS.map(|(tab, label)| {
+        let start = x;
+        x += label.len() as u16 + 2;
+        (tab, label, start)
+    })
+}
+
+/// The tab whose label covers `column` of the tab bar, if any.
+fn tab_at_column(column: u16) -> Option<Tab> {
+    tab_titles()
+        .into_iter()
+        .find(|(_, label, start)| column >= *start && column < start + label.len() as u16)
+        .map(|(tab, _, _)| tab)
 }
 
 // ── Build tab (existing monitor) ───────────────────────────────────────────
@@ -1099,8 +1301,15 @@ fn fmt_duration_ms(ms: u64) -> String {
 }
 
 fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    // A reader who scrolled back is told so, and told the way back: rows that
+    // stop moving otherwise look like a build that stopped.
+    let title = if state.build_scroll.at_anchor() {
+        " Live Build "
+    } else {
+        " Live Build · scrolled back, End follows "
+    };
     let block = Block::bordered()
-        .title(filtered_title(" Live Build ", state.filter()))
+        .title(filtered_title(title, state.filter()))
         .border_style(Style::default().fg(Color::Cyan));
 
     let filter_empty = state.filter().is_empty();
@@ -1117,15 +1326,32 @@ fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
         .build_scroll
         .visible_range(filtered_events.len(), visible_rows);
 
-    let header = Row::new(vec![
+    // Narrow terminals lose the columns a reader can live without, right to
+    // left, instead of clipping every column into an unreadable grid.
+    let show_size = area.width >= 90;
+    let show_compile = area.width >= 78;
+
+    let mut header = vec![
         Cell::from("Status"),
         Cell::from("Crate"),
         Cell::from("Action"),
-        Cell::from(Line::from("Compile").right_aligned()),
-        Cell::from(Line::from("Total").right_aligned()),
-        Cell::from(Line::from("Size").right_aligned()),
-    ])
-    .style(Style::default().fg(Color::DarkGray));
+    ];
+    let mut widths = vec![
+        Constraint::Length(11), // Status (icon + word)
+        Constraint::Min(14),    // Crate
+        Constraint::Length(19), // Action
+    ];
+    if show_compile {
+        header.push(Cell::from(Line::from("Compile").right_aligned()));
+        widths.push(Constraint::Length(9));
+    }
+    header.push(Cell::from(Line::from("Total").right_aligned()));
+    widths.push(Constraint::Length(8));
+    if show_size {
+        header.push(Cell::from(Line::from("Size").right_aligned()));
+        widths.push(Constraint::Length(11));
+    }
+    let header = Row::new(header).style(Style::default().fg(Color::DarkGray));
 
     let rows: Vec<Row> = filtered_events
         .iter()
@@ -1147,15 +1373,22 @@ fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
             } else {
                 String::new()
             };
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(format!("{icon} {status}")).style(cstyle),
                 Cell::from(event.crate_name.clone()),
                 Cell::from(action).style(cstyle),
-                Cell::from(Line::from(compile).right_aligned())
-                    .style(Style::default().fg(Color::DarkGray)),
-                Cell::from(Line::from(total).right_aligned()),
-                Cell::from(Line::from(size).right_aligned()),
-            ])
+            ];
+            if show_compile {
+                cells.push(
+                    Cell::from(Line::from(compile).right_aligned())
+                        .style(Style::default().fg(Color::DarkGray)),
+                );
+            }
+            cells.push(Cell::from(Line::from(total).right_aligned()));
+            if show_size {
+                cells.push(Cell::from(Line::from(size).right_aligned()));
+            }
+            Row::new(cells)
         })
         .collect();
 
@@ -1163,69 +1396,148 @@ fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
     // truncates inside the Crate column instead of shoving every later column
     // out of its grid (the old hand-padded `format!` rows misaligned on long
     // names and ambiguous-width glyphs).
-    let widths = [
-        Constraint::Length(11), // Status (icon + word)
-        Constraint::Min(14),    // Crate
-        Constraint::Length(19), // Action
-        Constraint::Length(9),  // Compile
-        Constraint::Length(8),  // Total
-        Constraint::Length(11), // Size
-    ];
-
     let table = Table::new(rows, widths).header(header).block(block);
     frame.render_widget(table, area);
 }
 
+/// How far back the lookup sparklines look when no `--since` was given.
+const SPARK_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Hits and misses per time bucket over the last `window`, oldest first, one
+/// bucket per column. Time-based rather than event-based so the strip is a
+/// clock: a quiet minute is a flat minute, and a burst is a burst, instead of
+/// every event being one step regardless of when it happened.
+fn lookup_series(
+    events: &[BuildEvent],
+    now: chrono::DateTime<chrono::Utc>,
+    window: Duration,
+    columns: usize,
+) -> (Vec<u64>, Vec<u64>) {
+    let mut hits = vec![0u64; columns];
+    let mut misses = vec![0u64; columns];
+    if columns == 0 {
+        return (hits, misses);
+    }
+    let window_ms = window.as_millis().max(1);
+    for event in events {
+        let age_ms = now.signed_duration_since(event.ts).num_milliseconds();
+        if age_ms < 0 {
+            continue;
+        }
+        let age_ms = age_ms as u128;
+        if age_ms >= window_ms {
+            continue;
+        }
+        let index = columns - 1 - (age_ms * columns as u128 / window_ms) as usize;
+        match event.result {
+            EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit => {
+                hits[index] += 1;
+            }
+            EventResult::Miss | EventResult::Dup => misses[index] += 1,
+            EventResult::Passthrough | EventResult::Skipped | EventResult::Error => {}
+        }
+    }
+    (hits, misses)
+}
+
+/// A compact window label: `5m`, `2h`, `7d`.
+fn fmt_window(window: Duration) -> String {
+    let secs = window.as_secs();
+    if secs >= 86_400 && secs.is_multiple_of(86_400) {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 fn draw_sparkline(frame: &mut Frame, state: &AppState, area: Rect) {
-    let block = Block::bordered().title(" Hit Rate (recent) ");
-
-    let width = area.width as usize;
-    let bucket_count = width.saturating_sub(4);
-
-    if state.events.is_empty() || bucket_count == 0 {
-        frame.render_widget(Paragraph::new("  No data yet").block(block), area);
+    let window = fmt_window(state.spark_window);
+    let block = Block::bordered().title(format!(" Lookups · last {window} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 3 || inner.width < 12 {
         return;
     }
 
-    let events_per_bucket = (state.events.len() / bucket_count).max(1);
-    let mut data: Vec<u64> = Vec::new();
+    let label_width = 8u16;
+    let columns = inner.width.saturating_sub(label_width) as usize;
+    let (hits, misses) = lookup_series(
+        &state.events,
+        chrono::Utc::now(),
+        state.spark_window,
+        columns,
+    );
+    let total_hits: u64 = hits.iter().sum();
+    let total_misses: u64 = misses.iter().sum();
+    // One scale for both strips, so a hit column and a miss column of the
+    // same height mean the same number of compiles.
+    let max = hits
+        .iter()
+        .chain(&misses)
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1);
 
-    for chunk in state.events.chunks(events_per_bucket) {
-        let hits = chunk
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e.result,
-                    EventResult::LocalHit | EventResult::PrefetchHit | EventResult::RemoteHit
-                )
-            })
-            .count();
-        let total = chunk.len();
-        let rate = if total > 0 {
-            (hits as f64 / total as f64 * 8.0) as u64
-        } else {
-            0
-        };
-        data.push(rate);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    for (row, label, data, color) in [
+        (rows[0], format!("hit {total_hits:>4}"), &hits, Color::Green),
+        (
+            rows[1],
+            format!("miss{total_misses:>4}"),
+            &misses,
+            Color::Red,
+        ),
+    ] {
+        let parts =
+            Layout::horizontal([Constraint::Length(label_width), Constraint::Min(0)]).split(row);
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(color)),
+            parts[0],
+        );
+        frame.render_widget(
+            Sparkline::default()
+                .data(data)
+                .max(max)
+                .style(Style::default().fg(color)),
+            parts[1],
+        );
     }
-
-    while data.len() < bucket_count {
-        data.push(0);
-    }
-
-    let sparkline = Sparkline::default()
-        .block(block)
-        .data(&data[..bucket_count.min(data.len())])
-        .max(8)
-        .style(Style::default().fg(Color::Green));
-
-    frame.render_widget(sparkline, area);
+    let axis = Layout::horizontal([
+        Constraint::Length(label_width),
+        Constraint::Min(0),
+        Constraint::Length(6),
+    ])
+    .split(rows[2]);
+    let idle = if total_hits + total_misses == 0 {
+        format!("  ·  no lookups in the last {window}")
+    } else {
+        String::new()
+    };
+    let muted = Style::default().fg(Color::DarkGray);
+    frame.render_widget(
+        Paragraph::new(format!("{window} ago{idle}")).style(muted),
+        axis[1],
+    );
+    frame.render_widget(
+        Paragraph::new("now →").right_aligned().style(muted),
+        axis[2],
+    );
 }
 
 fn draw_build_help(frame: &mut Frame, state: &AppState, area: Rect) {
     let help = help_line(
         state,
-        "q: quit  f: filter  ↑↓: scroll  ⇥/⇧⇥: tabs  c: clear",
+        "q: quit  p: pause  f: filter  ↑↓ PgUp PgDn End: scroll  ⇥/⇧⇥: tabs  c: clear",
     );
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
@@ -1284,11 +1596,30 @@ fn draw_store_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
         }
     }
 
-    let header = Row::new(vec![
-        "Key", "Crate", "Type", "Profile", "Size", "Hits", "Dup", "Created", "Accessed",
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD))
-    .bottom_margin(0);
+    // Dates go first when the terminal narrows, then type and profile; the
+    // key, crate, size, hits, and dup columns are what the tab is for.
+    let show_dates = area.width >= 110;
+    let show_kind = area.width >= 84;
+
+    let mut labels = vec!["Key", "Crate"];
+    let mut widths = vec![Constraint::Length(13), Constraint::Min(18)];
+    if show_kind {
+        labels.extend(["Type", "Profile"]);
+        widths.extend([Constraint::Length(10), Constraint::Length(10)]);
+    }
+    labels.extend(["Size", "Hits", "Dup"]);
+    widths.extend([
+        Constraint::Length(10),
+        Constraint::Length(6),
+        Constraint::Length(5),
+    ]);
+    if show_dates {
+        labels.extend(["Created", "Accessed"]);
+        widths.extend([Constraint::Length(12), Constraint::Length(12)]);
+    }
+    let header = Row::new(labels)
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .bottom_margin(0);
 
     let filter_empty = state.filter().is_empty();
     let filter_label = state.filter().to_string();
@@ -1336,43 +1667,36 @@ fn draw_store_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
             } else {
                 String::new()
             };
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(key_short.to_string()),
                 Cell::from(entry.crate_name.clone()),
-                Cell::from(crate_type.to_string()),
-                Cell::from(profile.to_string()),
-                Cell::from(ByteSize(entry.size).to_string()),
-                Cell::from(entry.hit_count.to_string()),
-                Cell::from(dup).style(Style::default().fg(Color::Yellow)),
-                Cell::from(
+            ];
+            if show_kind {
+                cells.push(Cell::from(crate_type.to_string()));
+                cells.push(Cell::from(profile.to_string()));
+            }
+            cells.push(Cell::from(ByteSize(entry.size).to_string()));
+            cells.push(Cell::from(entry.hit_count.to_string()));
+            cells.push(Cell::from(dup).style(Style::default().fg(Color::Yellow)));
+            if show_dates {
+                cells.push(Cell::from(
                     entry
                         .created_at
                         .get(..10)
                         .unwrap_or(&entry.created_at)
                         .to_string(),
-                ),
-                Cell::from(
+                ));
+                cells.push(Cell::from(
                     entry
                         .last_accessed
                         .get(..10)
                         .unwrap_or(&entry.last_accessed)
                         .to_string(),
-                ),
-            ])
+                ));
+            }
+            Row::new(cells)
         })
         .collect();
-
-    let widths = [
-        Constraint::Length(13), // Key
-        Constraint::Min(18),    // Crate
-        Constraint::Length(10), // Type
-        Constraint::Length(10), // Profile
-        Constraint::Length(10), // Size
-        Constraint::Length(6),  // Hits
-        Constraint::Length(5),  // Dup
-        Constraint::Length(12), // Created
-        Constraint::Length(12), // Accessed
-    ];
 
     let table = Table::new(rows, widths).header(header).block(block);
 
@@ -1380,7 +1704,10 @@ fn draw_store_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
 }
 
 fn draw_store_help(frame: &mut Frame, state: &AppState, area: Rect) {
-    let help = help_line(state, "q: quit  s: sort  f: filter  ↑↓: scroll  ⇥/⇧⇥: tabs");
+    let help = help_line(
+        state,
+        "q: quit  p: pause  s: sort  f: filter  ↑↓ PgUp PgDn: scroll  ⇥/⇧⇥: tabs",
+    );
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
@@ -1400,7 +1727,7 @@ fn draw_projects_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     draw_projects_overview(frame, state, chunks[0]);
     draw_projects_table(frame, state, chunks[1]);
     draw_projects_totals(frame, state, chunks[2]);
-    draw_projects_help(frame, chunks[3]);
+    draw_projects_help(frame, state, chunks[3]);
 }
 
 fn draw_projects_overview(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -1562,22 +1889,26 @@ fn draw_projects_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let visible_rows = (area.height as usize).saturating_sub(3); // borders + header
     let range = state.project_scroll.visible_range(item_count, visible_rows);
 
-    let header = Row::new(vec![
-        "Path", "Size", "Cached", "Incr", "Build", "Deps", "Bin", "Fprint", "Profile",
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    // The per-category breakdown is detail; path, size, and cached bytes are
+    // the answer. Narrow terminals keep the answer.
+    let show_breakdown = area.width >= 100;
+    let show_profile = area.width >= 80;
 
-    let widths = [
-        Constraint::Min(20),    // Path
-        Constraint::Length(9),  // Size
-        Constraint::Length(9),  // Cached
-        Constraint::Length(9),  // Incr
-        Constraint::Length(9),  // Build
-        Constraint::Length(9),  // Deps
-        Constraint::Length(9),  // Bin
-        Constraint::Length(9),  // Fprint
-        Constraint::Length(14), // Profile
+    let mut labels = vec!["Path", "Size", "Cached"];
+    let mut widths = vec![
+        Constraint::Min(20),
+        Constraint::Length(9),
+        Constraint::Length(9),
     ];
+    if show_breakdown {
+        labels.extend(["Incr", "Build", "Deps", "Bin", "Fprint"]);
+        widths.extend([Constraint::Length(9); 5]);
+    }
+    if show_profile {
+        labels.push("Profile");
+        widths.push(Constraint::Length(14));
+    }
+    let header = Row::new(labels).style(Style::default().add_modifier(Modifier::BOLD));
 
     let root = std::env::current_dir().unwrap_or_default();
 
@@ -1611,17 +1942,24 @@ fn draw_projects_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 };
 
                 let b = &t.breakdown;
-                Row::new(vec![
+                let mut cells = vec![
                     Cell::from(path_label),
                     Cell::from(format!("{:>8}", ByteSize(t.size))),
                     Cell::from(format!("{:>8}", ByteSize(t.cached_bytes))),
-                    Cell::from(fmt(b.incremental)),
-                    Cell::from(fmt(b.build_scripts)),
-                    Cell::from(fmt(b.deps_local)),
-                    Cell::from(fmt(b.binaries)),
-                    Cell::from(fmt(b.fingerprints)),
-                    Cell::from(profile_str),
-                ])
+                ];
+                if show_breakdown {
+                    cells.extend([
+                        Cell::from(fmt(b.incremental)),
+                        Cell::from(fmt(b.build_scripts)),
+                        Cell::from(fmt(b.deps_local)),
+                        Cell::from(fmt(b.binaries)),
+                        Cell::from(fmt(b.fingerprints)),
+                    ]);
+                }
+                if show_profile {
+                    cells.push(Cell::from(profile_str));
+                }
+                Row::new(cells)
             })
             .collect()
     };
@@ -1667,7 +2005,7 @@ fn draw_projects_totals(frame: &mut Frame, state: &AppState, area: Rect) {
         }
     };
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("  Size: ", Style::default().fg(Color::Cyan)),
         Span::styled(
             format!("{}", ByteSize(total_size)),
@@ -1680,25 +2018,35 @@ fn draw_projects_totals(frame: &mut Frame, state: &AppState, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
-        Span::styled("Incr: ", Style::default().fg(Color::DarkGray)),
-        fmt(total_incr),
-        Span::styled("Build: ", Style::default().fg(Color::DarkGray)),
-        fmt(total_build),
-        Span::styled("Deps: ", Style::default().fg(Color::DarkGray)),
-        fmt(total_deps),
-        Span::styled("Bin: ", Style::default().fg(Color::DarkGray)),
-        fmt(total_bin),
-        Span::styled("Fprint: ", Style::default().fg(Color::DarkGray)),
-        fmt(total_fprint),
-    ]);
+    ];
+    // Same threshold as the table above: the breakdown appears in both places
+    // or neither.
+    if area.width >= 100 {
+        spans.extend([
+            Span::styled("Incr: ", Style::default().fg(Color::DarkGray)),
+            fmt(total_incr),
+            Span::styled("Build: ", Style::default().fg(Color::DarkGray)),
+            fmt(total_build),
+            Span::styled("Deps: ", Style::default().fg(Color::DarkGray)),
+            fmt(total_deps),
+            Span::styled("Bin: ", Style::default().fg(Color::DarkGray)),
+            fmt(total_bin),
+            Span::styled("Fprint: ", Style::default().fg(Color::DarkGray)),
+            fmt(total_fprint),
+        ]);
+    }
+    let line = Line::from(spans);
 
     let block = Block::bordered().title(title);
     let paragraph = Paragraph::new(line).block(block);
     frame.render_widget(paragraph, area);
 }
 
-fn draw_projects_help(frame: &mut Frame, area: Rect) {
-    let help = "  q: quit  r: refresh  ↑↓: scroll  Tab: next  1-5: tabs";
+fn draw_projects_help(frame: &mut Frame, state: &AppState, area: Rect) {
+    let help = help_line(
+        state,
+        "q: quit  p: pause  r: refresh  ↑↓ PgUp PgDn: scroll  ⇥/⇧⇥: tabs",
+    );
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
@@ -1718,7 +2066,7 @@ fn draw_transfer_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     draw_transfer_pending(frame, state, chunks[0]);
     draw_transfer_activity(frame, state, chunks[1]);
     draw_recent_transfers(frame, state, chunks[2]);
-    draw_transfer_help(frame, chunks[3]);
+    draw_transfer_help(frame, state, chunks[3]);
 }
 
 fn draw_transfer_pending(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -1918,8 +2266,8 @@ fn draw_recent_transfers(frame: &mut Frame, state: &mut AppState, area: Rect) {
     frame.render_widget(table, area);
 }
 
-fn draw_transfer_help(frame: &mut Frame, area: Rect) {
-    let help = "  q: quit  ↑↓: scroll  Tab: next  1-5: tabs";
+fn draw_transfer_help(frame: &mut Frame, state: &AppState, area: Rect) {
+    let help = help_line(state, "q: quit  p: pause  ↑↓ PgUp PgDn: scroll  ⇥/⇧⇥: tabs");
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
 }
@@ -1968,8 +2316,24 @@ fn draw_passthrough_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
         return;
     }
 
-    let header = Row::new(vec!["Time", "Crate", "Route", "Exit", "Kind", "Reason"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    // The reason is what this tab exists for, so it keeps its share of the
+    // width; route and exit code are the first to go.
+    let show_route = area.width >= 96;
+    let show_exit = area.width >= 80;
+
+    let mut labels = vec!["Time", "Crate"];
+    let mut widths = vec![Constraint::Length(9), Constraint::Min(18)];
+    if show_route {
+        labels.push("Route");
+        widths.push(Constraint::Length(10));
+    }
+    if show_exit {
+        labels.push("Exit");
+        widths.push(Constraint::Length(6));
+    }
+    labels.extend(["Kind", "Reason"]);
+    widths.extend([Constraint::Length(14), Constraint::Percentage(45)]);
+    let header = Row::new(labels).style(Style::default().add_modifier(Modifier::BOLD));
 
     let visible_rows = (area.height as usize).saturating_sub(3);
     let range = state
@@ -1995,25 +2359,21 @@ fn draw_passthrough_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 None => Style::default().fg(Color::DarkGray),
             };
 
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(event.ts.format("%H:%M:%S").to_string()),
                 Cell::from(event.crate_name.clone()),
-                Cell::from(route).style(Style::default().fg(Color::Magenta)),
-                Cell::from(exit).style(exit_style),
-                Cell::from(kind.to_string()).style(Style::default().fg(Color::Cyan)),
-                Cell::from(reason.to_string()),
-            ])
+            ];
+            if show_route {
+                cells.push(Cell::from(route).style(Style::default().fg(Color::Magenta)));
+            }
+            if show_exit {
+                cells.push(Cell::from(exit).style(exit_style));
+            }
+            cells.push(Cell::from(kind.to_string()).style(Style::default().fg(Color::Cyan)));
+            cells.push(Cell::from(reason.to_string()));
+            Row::new(cells)
         })
         .collect();
-
-    let widths = [
-        Constraint::Length(9),
-        Constraint::Min(18),
-        Constraint::Length(10),
-        Constraint::Length(6),
-        Constraint::Length(14),
-        Constraint::Percentage(45),
-    ];
 
     let table = Table::new(rows, widths).header(header).block(block);
     frame.render_widget(table, area);
@@ -2038,7 +2398,10 @@ fn passthrough_reason_parts(reason: &str) -> (&str, &str) {
 }
 
 fn draw_passthrough_help(frame: &mut Frame, state: &AppState, area: Rect) {
-    let help = help_line(state, "q: quit  f: filter  ↑↓: scroll  ⇥/⇧⇥: tabs");
+    let help = help_line(
+        state,
+        "q: quit  p: pause  f: filter  ↑↓ PgUp PgDn: scroll  ⇥/⇧⇥: tabs",
+    );
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
 }
@@ -2233,6 +2596,8 @@ mod tests {
             stats_fetch_in_flight: false,
             stats_fetch_requested_entries: false,
             should_quit: false,
+            paused: false,
+            spark_window: SPARK_WINDOW,
             rustc_version: "test".to_string(),
             wrapper_status: "test".to_string(),
             service_installed: false,
@@ -2414,6 +2779,345 @@ mod tests {
         let mut s = test_state();
         handle_key(&mut s, KeyCode::Char('q'));
         assert!(s.should_quit);
+    }
+
+    /// Raw mode delivers Ctrl+C as a key event. Dropping the modifier made
+    /// it a bare `c`, which on the Build tab cleared the event list instead
+    /// of quitting.
+    #[test]
+    fn ctrl_c_quits_and_keeps_the_events() {
+        let mut s = test_state();
+        s.active_tab = Tab::Build;
+        s.events
+            .push(sample_build_event("serde", EventResult::Miss, 10, 1));
+        handle_key_event(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(s.should_quit, "Ctrl+C must quit");
+        assert_eq!(s.events.len(), 1, "and must not clear the Build tab");
+
+        // Plain `c` still clears, and the modifier-free path is unchanged.
+        let mut s = test_state();
+        s.active_tab = Tab::Build;
+        s.events
+            .push(sample_build_event("serde", EventResult::Miss, 10, 1));
+        handle_key_event(
+            &mut s,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        assert!(!s.should_quit);
+        assert!(s.events.is_empty());
+    }
+
+    #[test]
+    fn page_and_edge_keys_move_the_active_viewport() {
+        let mut s = test_state();
+        s.active_tab = Tab::Store;
+        s.store_scroll.visible_range(100, 10);
+        handle_key(&mut s, KeyCode::PageDown);
+        assert_eq!(s.store_scroll.offset, 10, "a page is what the panel showed");
+        handle_key(&mut s, KeyCode::End);
+        assert_eq!(s.store_scroll.offset, 90);
+        handle_key(&mut s, KeyCode::PageUp);
+        assert_eq!(s.store_scroll.offset, 80);
+        handle_key(&mut s, KeyCode::Home);
+        assert_eq!(s.store_scroll.offset, 0);
+        handle_key(&mut s, KeyCode::Char('j'));
+        assert_eq!(s.store_scroll.offset, 1);
+        handle_key(&mut s, KeyCode::Char('k'));
+        assert_eq!(s.store_scroll.offset, 0);
+
+        // Bottom-anchored: End is "follow the newest", Home is the oldest row.
+        s.active_tab = Tab::Build;
+        s.build_scroll.visible_range(100, 10);
+        handle_key(&mut s, KeyCode::PageUp);
+        assert_eq!(s.build_scroll.offset, 10);
+        assert!(!s.build_scroll.at_anchor());
+        handle_key(&mut s, KeyCode::Home);
+        assert_eq!(s.build_scroll.offset, 90);
+        handle_key(&mut s, KeyCode::End);
+        assert_eq!(s.build_scroll.offset, 0);
+        assert!(s.build_scroll.at_anchor());
+    }
+
+    /// A reader who scrolled back into history keeps looking at the same rows
+    /// while a build appends new ones; a reader at the live edge follows.
+    #[test]
+    fn arriving_rows_do_not_move_a_scrolled_reader() {
+        let mut s = test_state();
+        for i in 0..20 {
+            s.events.push(sample_build_event(
+                &format!("c{i}"),
+                EventResult::Miss,
+                1,
+                1,
+            ));
+        }
+        let range = s.build_scroll.visible_range(20, 5);
+        assert_eq!(range, 15..20, "following the newest");
+
+        s.build_scroll.scroll_up_by(10);
+        let range = s.build_scroll.visible_range(20, 5);
+        assert_eq!(range, 5..10);
+
+        for i in 20..23 {
+            s.push_event(sample_build_event(
+                &format!("c{i}"),
+                EventResult::Miss,
+                1,
+                1,
+            ));
+        }
+        let range = s.build_scroll.visible_range(23, 5);
+        assert_eq!(range, 5..10, "same rows after three arrivals");
+
+        // At the live edge the newest rows are the view.
+        s.build_scroll.end();
+        s.push_event(sample_build_event("c23", EventResult::Miss, 1, 1));
+        let range = s.build_scroll.visible_range(24, 5);
+        assert_eq!(range, 19..24);
+
+        // An event the filter hides does not count as an arrival.
+        s.build_scroll.scroll_up_by(10);
+        s.build_filter = "zzz".to_string();
+        s.push_event(sample_build_event("c24", EventResult::Miss, 1, 1));
+        assert_eq!(s.build_scroll.offset, 10);
+    }
+
+    #[test]
+    fn pause_toggles_and_is_announced() {
+        let mut s = test_state();
+        assert!(!s.paused);
+        handle_key(&mut s, KeyCode::Char('p'));
+        assert!(s.paused);
+        assert!(rendered_tab(&mut s, Tab::Build).contains("PAUSED"));
+        handle_key(&mut s, KeyCode::Char('p'));
+        assert!(!s.paused);
+        assert!(!rendered_tab(&mut s, Tab::Build).contains("PAUSED"));
+    }
+
+    #[test]
+    fn lookup_series_buckets_by_time_and_keeps_idle_time_flat() {
+        use chrono::Duration as ChronoDuration;
+        let now = chrono::Utc::now();
+        let window = Duration::from_secs(300);
+        let at = |secs_ago: i64, result: EventResult| {
+            let mut event = sample_build_event("x", result, 1, 1);
+            event.ts = now - ChronoDuration::seconds(secs_ago);
+            event
+        };
+        let events = vec![
+            at(10, EventResult::LocalHit),
+            at(10, EventResult::RemoteHit),
+            at(10, EventResult::Miss),
+            at(150, EventResult::Dup),
+            at(290, EventResult::PrefetchHit),
+            at(290, EventResult::Passthrough),
+            at(400, EventResult::LocalHit),
+            at(-5, EventResult::LocalHit),
+        ];
+        let (hits, misses) = lookup_series(&events, now, window, 3);
+        assert_eq!(
+            hits,
+            vec![1, 0, 2],
+            "oldest bucket first; 400s ago and the future are out"
+        );
+        assert_eq!(
+            misses,
+            vec![0, 1, 1],
+            "dup counts as a compile, passthrough as neither"
+        );
+        assert_eq!(lookup_series(&events, now, window, 0), (vec![], vec![]));
+    }
+
+    #[test]
+    fn fmt_window_picks_the_largest_exact_unit() {
+        assert_eq!(fmt_window(Duration::from_secs(300)), "5m");
+        assert_eq!(fmt_window(Duration::from_secs(7200)), "2h");
+        assert_eq!(fmt_window(Duration::from_secs(86_400 * 7)), "7d");
+        assert_eq!(fmt_window(Duration::from_secs(90)), "90s");
+    }
+
+    #[test]
+    fn tab_bar_click_targets_match_the_drawn_labels() {
+        let titles = tab_titles();
+        for (tab, label, start) in titles {
+            assert_eq!(tab_at_column(start), Some(tab), "first column of {label:?}");
+            assert_eq!(
+                tab_at_column(start + label.len() as u16 - 1),
+                Some(tab),
+                "last column of {label:?}"
+            );
+        }
+        // The two-space gutter between labels selects nothing.
+        let (_, first, start) = titles[0];
+        assert_eq!(tab_at_column(start + first.len() as u16), None);
+        assert_eq!(tab_at_column(999), None);
+
+        let mut s = test_state();
+        let area = Rect::new(0, 0, 120, 40);
+        let (_, _, store_x) = titles[2];
+        handle_mouse(
+            &mut s,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: store_x + 1,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert_eq!(s.active_tab, Tab::Store);
+
+        // The wheel scrolls the active tab, three rows a notch.
+        s.store_scroll.visible_range(100, 10);
+        handle_mouse(
+            &mut s,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 40,
+                row: 20,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert_eq!(s.store_scroll.offset, 3);
+    }
+
+    #[test]
+    fn too_small_terminal_says_so_instead_of_drawing_garbage() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut state = test_state();
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|frame| draw_ui(frame, &mut state)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // Wrapped text: check the tokens, not a phrase that may span rows.
+        assert!(rendered.contains("40×10"), "{rendered}");
+        assert!(rendered.contains("60×16"), "{rendered}");
+        assert!(rendered.contains("kache stats"), "{rendered}");
+        assert!(
+            !rendered.contains("[1] Build"),
+            "no tab bar in the guard screen"
+        );
+    }
+
+    /// Render `tab` at `width`×`height` and return the screen as lines.
+    fn rendered_lines(state: &mut AppState, tab: Tab, width: u16, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        state.active_tab = tab;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_ui(frame, state))
+            .expect("draw should succeed");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn populated_state() -> AppState {
+        let mut state = test_state();
+        state.events = vec![
+            sample_build_event("serde", EventResult::Miss, 4200, 2_000_000),
+            sample_build_event("tokio", EventResult::LocalHit, 30, 1_500_000),
+            sample_build_event("build.rs", EventResult::Passthrough, 80, 0),
+        ];
+        state.stats_snapshot.entries = vec![
+            sample_stats_entry("serde", 2_000_000, 5),
+            sample_stats_entry("tokio", 1_500_000, 2),
+        ];
+        state.stats_snapshot.entry_count = 2;
+        state.stats_snapshot.total_size = 3_500_000;
+        state.stats_loaded = true;
+        state.stats_snapshot.recent_transfers = vec![daemon::TransferEvent {
+            schema: 3,
+            crate_name: "serde".to_string(),
+            direction: daemon::TransferDirection::Upload,
+            format: "tar.zst".to_string(),
+            cache_key: "serde-key".to_string(),
+            object_key: "prefix/serde".to_string(),
+            compressed_bytes: 1000,
+            started_at_unix_ms: 0,
+            finished_at_unix_ms: 0,
+            elapsed_ms: 12,
+            network_ms: 6,
+            semaphore_wait_ms: 0,
+            head_ms: 0,
+            request_ms: 2,
+            body_ms: 4,
+            request_count: 1,
+            original_bytes: 3000,
+            decompress_ms: 0,
+            extract_ms: 0,
+            disk_io_ms: 0,
+            import_lock_wait_ms: 0,
+            import_ms: 0,
+            compression_ms: 0,
+            head_checks_ms: 0,
+            blobs_skipped: 0,
+            blobs_total: 1,
+            ok: true,
+            timestamp: 0,
+        }];
+        {
+            let mut scan = state.project_scan.lock().unwrap();
+            scan.project_targets = vec![cli::TargetEntry {
+                path: std::path::PathBuf::from("/work/myproj/target"),
+                size: 5_000_000,
+                cached_bytes: 3_000_000,
+                estimated_reclaimable_bytes: 2_000_000,
+                scan_identity: None,
+                profiles: vec!["debug".to_string()],
+                breakdown: cli::CategoryBreakdown::default(),
+                stale: false,
+            }];
+            scan.scanned = true;
+        }
+        state
+    }
+
+    /// Every tab at a laptop-sized and a wide terminal: the seeded row is on
+    /// screen, the columns a narrow terminal cannot afford are gone rather
+    /// than clipped, and nothing spills past the right edge.
+    #[test]
+    fn every_tab_fits_narrow_and_wide_terminals() {
+        for (tab, seeded, wide_only) in [
+            (Tab::Build, "serde", "Size"),
+            (Tab::Store, "serde", "Created"),
+            (Tab::Projects, "myproj", "Fprint"),
+            (Tab::Transfer, "serde", ""),
+            (Tab::Passthrough, "build.rs", "Route"),
+        ] {
+            for (width, height) in [(80u16, 24u16), (120, 40)] {
+                let mut state = populated_state();
+                let lines = rendered_lines(&mut state, tab, width, height);
+                let screen = lines.join("\n");
+                assert!(
+                    screen.contains(seeded),
+                    "{tab:?} at {width}x{height} must show {seeded:?}:\n{screen}"
+                );
+                assert!(
+                    screen.contains("q: quit"),
+                    "{tab:?} at {width}x{height} must keep its help bar:\n{screen}"
+                );
+                if !wide_only.is_empty() {
+                    assert_eq!(
+                        screen.contains(wide_only),
+                        width >= 120,
+                        "{tab:?} at {width}: column {wide_only:?} is wide-only:\n{screen}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

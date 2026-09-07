@@ -220,7 +220,7 @@ impl Viewport {
     /// new rows land, and only a viewport sitting on it moves with them. The
     /// offset is clamped on the next draw, so overshooting here is harmless.
     fn rows_arrived(&mut self, count: usize) {
-        if count > 0 && self.offset > 0 {
+        if self.offset > 0 {
             self.offset = self.offset.saturating_add(count);
         }
     }
@@ -458,6 +458,55 @@ impl AppState {
         }
     }
 
+    /// Read what the event log appended since the last tick: build events
+    /// and heartbeats (kunobi-ninja/kache#131). Paused, nothing is read; the
+    /// tailer keeps its offset, so resuming replays it all.
+    fn ingest_tailed_records(&mut self) {
+        if self.paused {
+            return;
+        }
+        let Ok(records) = self.tailer.poll_records() else {
+            return;
+        };
+        for record in records {
+            match record {
+                EventRecord::Build(event) => {
+                    // A completing BuildEvent ends that crate's in-flight
+                    // status (heartbeats carry a pid, BuildEvents don't —
+                    // match on crate+root). Known cosmetic limit: two
+                    // concurrent units of the SAME crate+root (host vs
+                    // target) both clear on the first completion; the
+                    // survivor reappears on its next beat within one
+                    // cadence.
+                    self.live_heartbeats.retain(|_, (_, hb)| {
+                        hb.crate_name != event.crate_name || hb.root != event.root
+                    });
+                    self.push_event(*event);
+                }
+                EventRecord::Heartbeat(hb) => {
+                    self.live_heartbeats.insert(hb.pid, (Instant::now(), hb));
+                }
+            }
+        }
+    }
+
+    /// Whether to start a snapshot fetch this tick: not while paused, never
+    /// two at once, and only at the refresh cadence.
+    fn stats_fetch_due(&self) -> bool {
+        !self.paused
+            && !self.stats_fetch_in_flight
+            && self.last_stats_fetch.elapsed() >= SNAPSHOT_REFRESH_INTERVAL
+    }
+
+    /// Whether to start a target-dir scan this tick: only while the Projects
+    /// tab is showing (the scan is expensive on big workspaces), not while
+    /// paused, and only at its own cadence.
+    fn project_scan_due(&self) -> bool {
+        !self.paused
+            && self.active_tab == Tab::Projects
+            && self.last_project_refresh.elapsed() >= PROJECT_REFRESH_INTERVAL
+    }
+
     /// Append a tailed build event and keep every scrolled-away reader on the
     /// rows they were looking at.
     fn push_event(&mut self, event: BuildEvent) {
@@ -621,31 +670,7 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
     };
 
     loop {
-        // Poll for new build events + heartbeats (kunobi-ninja/kache#131)
-        if !state.paused
-            && let Ok(records) = state.tailer.poll_records()
-        {
-            for record in records {
-                match record {
-                    EventRecord::Build(event) => {
-                        // A completing BuildEvent ends that crate's in-flight
-                        // status (heartbeats carry a pid, BuildEvents don't —
-                        // match on crate+root). Known cosmetic limit: two
-                        // concurrent units of the SAME crate+root (host vs
-                        // target) both clear on the first completion; the
-                        // survivor reappears on its next beat within one
-                        // cadence.
-                        state.live_heartbeats.retain(|_, (_, hb)| {
-                            hb.crate_name != event.crate_name || hb.root != event.root
-                        });
-                        state.push_event(*event);
-                    }
-                    EventRecord::Heartbeat(hb) => {
-                        state.live_heartbeats.insert(hb.pid, (Instant::now(), hb));
-                    }
-                }
-            }
-        }
+        state.ingest_tailed_records();
         // Expire heartbeats whose wrapper stopped beating (killed build).
         let stale_after = Duration::from_secs(state.config.heartbeat_secs.max(30) * 3);
         state
@@ -687,10 +712,7 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         }
 
         // Spawn a background stats refresh when due (non-blocking)
-        if !state.paused
-            && !state.stats_fetch_in_flight
-            && state.last_stats_fetch.elapsed() >= SNAPSHOT_REFRESH_INTERVAL
-        {
+        if state.stats_fetch_due() {
             state.stats_fetch_in_flight = true;
             state.last_stats_fetch = Instant::now();
             let cfg = state.config.clone();
@@ -716,10 +738,7 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         }
 
         // Refresh target/ scan periodically when on stats tab
-        if !state.paused
-            && state.active_tab == Tab::Projects
-            && state.last_project_refresh.elapsed() >= PROJECT_REFRESH_INTERVAL
-        {
+        if state.project_scan_due() {
             let is_scanning = state
                 .project_scan
                 .lock()
@@ -735,16 +754,8 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         terminal.draw(|frame| draw_ui(frame, &mut state))?;
 
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    handle_key_event(&mut state, key);
-                }
-                Event::Mouse(mouse) => {
-                    let area = terminal.size()?.into();
-                    handle_mouse(&mut state, mouse, area);
-                }
-                _ => {}
-            }
+            let area = terminal.size()?.into();
+            handle_terminal_event(&mut state, event::read()?, area);
         }
 
         if state.should_quit {
@@ -808,6 +819,17 @@ fn switch_tab(state: &mut AppState, tab: Tab) {
         Tab::Projects => state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL,
         Tab::Store => state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL,
         Tab::Build | Tab::Transfer | Tab::Passthrough => {}
+    }
+}
+
+/// One terminal event: key presses and mouse events are dispatched, key
+/// releases and repeats (some terminals report them) and resizes are not.
+/// Kept out of the loop so it can be exercised without a terminal.
+fn handle_terminal_event(state: &mut AppState, event: Event, area: Rect) {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key_event(state, key),
+        Event::Mouse(mouse) => handle_mouse(state, mouse, area),
+        _ => {}
     }
 }
 
@@ -3623,5 +3645,342 @@ mod tests {
             rendered.contains("kache projects"),
             "projects overview title should render: {rendered}"
         );
+    }
+    #[test]
+    fn tab_titles_advance_by_label_width_plus_gutter() {
+        let titles = tab_titles();
+        assert_eq!(titles[0].2, 0);
+        for pair in titles.windows(2) {
+            let (_, label, start) = pair[0];
+            assert_eq!(pair[1].2, start + label.len() as u16 + 2, "{label:?}");
+        }
+    }
+
+    /// The tailer is read only while not paused, a heartbeat shows up as an
+    /// in-flight compile, and the crate's completing event clears it.
+    #[test]
+    fn ingest_respects_pause_and_settles_heartbeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let mut s = test_state();
+        s.tailer = EventTailer::from_start(log.clone());
+
+        let beat = HeartbeatEvent {
+            schema: 1,
+            event: "heartbeat".to_string(),
+            ts: chrono::Utc::now(),
+            eta_s: Some(60),
+            crate_name: "gkrust".to_string(),
+            root: "/w".to_string(),
+            pid: 4242,
+            elapsed_s: 30,
+            typical_s: Some(90),
+        };
+        events::log_heartbeat(&log, &beat).unwrap();
+
+        s.paused = true;
+        s.ingest_tailed_records();
+        assert!(s.live_heartbeats.is_empty(), "paused: nothing is read");
+        assert!(s.in_flight_view().is_empty());
+
+        s.paused = false;
+        s.ingest_tailed_records();
+        assert_eq!(s.live_heartbeats.len(), 1, "resumed: the beat was replayed");
+        assert_eq!(s.in_flight_view()[0].crate_name, "gkrust");
+
+        let mut done = sample_build_event("gkrust", EventResult::Miss, 100, 1);
+        done.root = "/w".to_string();
+        events::log_event(&log, &done).unwrap();
+        s.ingest_tailed_records();
+        assert_eq!(s.events.len(), 1);
+        assert!(
+            s.live_heartbeats.is_empty(),
+            "completion ends the in-flight row"
+        );
+    }
+
+    #[test]
+    fn background_work_is_due_only_when_unpaused_idle_and_on_schedule() {
+        let mut s = test_state();
+        s.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL;
+        s.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL;
+        s.active_tab = Tab::Projects;
+        assert!(s.stats_fetch_due());
+        assert!(s.project_scan_due());
+
+        s.paused = true;
+        assert!(!s.stats_fetch_due(), "paused starts nothing");
+        assert!(!s.project_scan_due());
+        s.paused = false;
+
+        s.stats_fetch_in_flight = true;
+        assert!(!s.stats_fetch_due(), "one fetch at a time");
+        s.stats_fetch_in_flight = false;
+
+        s.last_stats_fetch = Instant::now();
+        assert!(!s.stats_fetch_due(), "not before the interval");
+
+        s.active_tab = Tab::Build;
+        assert!(
+            !s.project_scan_due(),
+            "scans only while Projects is showing"
+        );
+        s.active_tab = Tab::Projects;
+        s.last_project_refresh = Instant::now();
+        assert!(!s.project_scan_due());
+    }
+
+    #[test]
+    fn terminal_events_dispatch_presses_and_mouse_only() {
+        let area = Rect::new(0, 0, 120, 40);
+        let press = |kind| KeyEvent::new_with_kind(KeyCode::Char('q'), KeyModifiers::NONE, kind);
+
+        let mut s = test_state();
+        handle_terminal_event(&mut s, Event::Key(press(KeyEventKind::Release)), area);
+        assert!(!s.should_quit, "a release is not a keystroke");
+        handle_terminal_event(&mut s, Event::Key(press(KeyEventKind::Repeat)), area);
+        assert!(!s.should_quit);
+        handle_terminal_event(&mut s, Event::Resize(80, 24), area);
+        assert!(!s.should_quit);
+        handle_terminal_event(&mut s, Event::Key(press(KeyEventKind::Press)), area);
+        assert!(s.should_quit);
+
+        let mut s = test_state();
+        let (_, _, store_x) = tab_titles()[2];
+        handle_terminal_event(
+            &mut s,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: store_x,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            area,
+        );
+        assert_eq!(s.active_tab, Tab::Store, "mouse events reach the handler");
+    }
+
+    #[test]
+    fn mouse_clicks_off_the_tab_row_do_nothing_and_the_wheel_goes_both_ways() {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut s = test_state();
+        let (_, _, store_x) = tab_titles()[2];
+        handle_mouse(
+            &mut s,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: store_x,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert_eq!(
+            s.active_tab,
+            Tab::Build,
+            "a click in the body is not a tab click"
+        );
+
+        s.active_tab = Tab::Store;
+        s.store_scroll.visible_range(100, 10);
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 40,
+            row: 20,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut s, wheel(MouseEventKind::ScrollDown), area);
+        handle_mouse(&mut s, wheel(MouseEventKind::ScrollDown), area);
+        assert_eq!(s.store_scroll.offset, 6);
+        handle_mouse(&mut s, wheel(MouseEventKind::ScrollUp), area);
+        assert_eq!(s.store_scroll.offset, 3);
+
+        // A tiny terminal ignores the mouse along with everything else.
+        s.active_tab = Tab::Build;
+        handle_mouse(
+            &mut s,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: store_x,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 40, 10),
+        );
+        assert_eq!(s.active_tab, Tab::Build);
+    }
+
+    #[test]
+    fn terminal_size_guard_is_exact_on_both_axes() {
+        assert!(!terminal_too_small(Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT)));
+        assert!(terminal_too_small(Rect::new(
+            0,
+            0,
+            MIN_WIDTH - 1,
+            MIN_HEIGHT
+        )));
+        assert!(terminal_too_small(Rect::new(
+            0,
+            0,
+            MIN_WIDTH,
+            MIN_HEIGHT - 1
+        )));
+        assert!(terminal_too_small(Rect::new(
+            0,
+            0,
+            MIN_WIDTH - 1,
+            MIN_HEIGHT - 1
+        )));
+        assert!(!terminal_too_small(Rect::new(0, 0, 200, 60)));
+    }
+
+    #[test]
+    fn lookup_series_counts_an_event_from_this_instant_in_the_newest_column() {
+        let now = chrono::Utc::now();
+        let mut event = sample_build_event("x", EventResult::LocalHit, 1, 1);
+        event.ts = now;
+        let (hits, misses) = lookup_series(&[event], now, Duration::from_secs(300), 4);
+        assert_eq!(hits, vec![0, 0, 0, 1]);
+        assert_eq!(misses, vec![0; 4]);
+    }
+
+    #[test]
+    fn fmt_window_falls_back_when_the_unit_does_not_divide() {
+        assert_eq!(fmt_window(Duration::from_secs(45_000)), "750m");
+        assert_eq!(fmt_window(Duration::from_secs(129_600)), "36h");
+        assert_eq!(fmt_window(SPARK_WINDOW), "5m");
+    }
+
+    /// Render the sparkline alone into a `width`×`height` area.
+    fn rendered_sparkline(state: &AppState, width: u16, height: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_sparkline(frame, state, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn sparkline_labels_its_axis_and_says_when_nothing_happened() {
+        let mut s = test_state();
+        let screen = rendered_sparkline(&s, 80, 5);
+        assert!(screen.contains("Lookups · last 5m"), "{screen}");
+        assert!(screen.contains("5m ago"), "{screen}");
+        assert!(screen.contains("now →"), "{screen}");
+        assert!(
+            screen.contains("hit    0") && screen.contains("miss   0"),
+            "{screen}"
+        );
+        assert!(screen.contains("no lookups in the last 5m"), "{screen}");
+
+        // Only misses: the idle note goes away (hits + misses, not a product).
+        s.events = vec![sample_build_event("a", EventResult::Miss, 1, 1)];
+        let screen = rendered_sparkline(&s, 80, 5);
+        assert!(!screen.contains("no lookups"), "{screen}");
+        assert!(screen.contains("miss   1"), "{screen}");
+
+        // Equal counts: still not idle (a difference would say zero).
+        s.events
+            .push(sample_build_event("b", EventResult::LocalHit, 1, 1));
+        let screen = rendered_sparkline(&s, 80, 5);
+        assert!(!screen.contains("no lookups"), "{screen}");
+        assert!(screen.contains("hit    1"), "{screen}");
+
+        // The whole Build tab carries it too.
+        let screen = rendered_tab(&mut s, Tab::Build);
+        assert!(screen.contains("Lookups · last 5m"), "{screen}");
+    }
+
+    /// Below three inner rows or twelve inner columns there is no room for
+    /// two strips and an axis, so the panel draws its frame and nothing else.
+    #[test]
+    fn sparkline_needs_three_rows_and_twelve_columns_inside_the_frame() {
+        let s = test_state();
+        for (width, height, drawn) in [
+            (14u16, 5u16, true),
+            (13, 5, false),
+            (14, 4, false),
+            (13, 4, false),
+            (80, 5, true),
+        ] {
+            let screen = rendered_sparkline(&s, width, height);
+            assert_eq!(
+                screen.contains("hit"),
+                drawn,
+                "{width}x{height} should draw={drawn}:\n{screen}"
+            );
+        }
+    }
+
+    /// The columns that survive a narrow terminal: Compile and Exit and the
+    /// Projects profile need 78/80 columns, Type/Profile on Store need 84.
+    #[test]
+    fn mid_priority_columns_have_their_own_thresholds() {
+        let mut state = populated_state();
+        for (tab, column, min_width) in [
+            (Tab::Build, "Compile", 78u16),
+            (Tab::Store, "Profile", 84),
+            (Tab::Projects, "[debug]", 80),
+            (Tab::Passthrough, "Exit", 80),
+        ] {
+            for width in [min_width - 1, min_width, 120] {
+                let screen = rendered_lines(&mut state, tab, width, 40).join("\n");
+                assert_eq!(
+                    screen.contains(column),
+                    width >= min_width,
+                    "{tab:?} at {width}: {column:?}\n{screen}"
+                );
+            }
+        }
+        let screen = rendered_lines(&mut state, Tab::Projects, 120, 40).join("\n");
+        assert!(screen.contains("Total (1 project)"), "{screen}");
+        assert!(
+            screen.contains("Fprint:"),
+            "totals carry the breakdown when wide"
+        );
+        let screen = rendered_lines(&mut state, Tab::Projects, 80, 24).join("\n");
+        assert!(screen.contains("Total (1 project)"), "{screen}");
+        assert!(!screen.contains("Fprint:"), "and drop it when narrow");
+    }
+
+    #[test]
+    fn passthrough_arrivals_move_only_a_scrolled_passthrough_reader() {
+        let mut s = test_state();
+        s.passthrough_scroll.visible_range(50, 10);
+        s.passthrough_scroll.scroll_down_by(5);
+        assert_eq!(s.passthrough_scroll.offset, 5);
+
+        // A miss is not a passthrough row.
+        s.push_event(sample_build_event("a", EventResult::Miss, 1, 1));
+        assert_eq!(s.passthrough_scroll.offset, 5);
+
+        // A passthrough is, when no filter or a matching one is set.
+        s.push_event(sample_build_event("b", EventResult::Passthrough, 1, 1));
+        assert_eq!(s.passthrough_scroll.offset, 6);
+        s.passthrough_filter = "linker".to_string();
+        s.push_event(sample_build_event("c", EventResult::Passthrough, 1, 1));
+        assert_eq!(s.passthrough_scroll.offset, 7, "reason matches the filter");
+        s.passthrough_filter = "zzz".to_string();
+        s.push_event(sample_build_event("d", EventResult::Passthrough, 1, 1));
+        assert_eq!(s.passthrough_scroll.offset, 7, "filtered out: no arrival");
+        s.passthrough_filter = "d".to_string();
+        s.push_event(sample_build_event("d", EventResult::Passthrough, 1, 1));
+        assert_eq!(s.passthrough_scroll.offset, 8, "crate name matches");
+
+        // At the live edge nothing moves, whatever arrives.
+        s.passthrough_scroll.reset();
+        s.passthrough_filter.clear();
+        s.push_event(sample_build_event("e", EventResult::Passthrough, 1, 1));
+        assert_eq!(s.passthrough_scroll.offset, 0);
     }
 }

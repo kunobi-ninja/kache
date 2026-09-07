@@ -127,17 +127,17 @@ no `dev` branch.
 ### Cutting a release (maintainers)
 
 ```sh
-# 1. Bump the workspace version in a PR: edit Cargo.toml + crates/*/Cargo.toml
-#    version = "X.Y.Z", refresh Cargo.lock, `just check`. Merge it into main.
+# 1. Bump the workspace version in a PR, then merge it into main.
+just bump X.Y.Z
 
-# 2. Push the tag — let CI create the release. Do NOT draft the release by
-#    hand in the UI (see note below).
-git tag vX.Y.Z && git push origin vX.Y.Z
+# 2. From a tree that is origin/main, push the tag — let CI create the
+#    release. Do NOT draft the release by hand in the UI (see note below).
+just release
 #    The tag triggers CI; once check + nix + e2e + macOS tests pass, the
 #    release job builds the binaries and creates the GitHub Release. Publishing
 #    the release then triggers the crates.io workflow
-#    (.github/workflows/publish-crates.yaml), which publishes kache-core then
-#    kache in dependency order.
+#    (.github/workflows/publish-crates.yaml), which publishes every
+#    publishable workspace crate in dependency order.
 ```
 
 The version is bumped *in* the release PR, so `main` advertises a number only
@@ -154,24 +154,27 @@ tag is the intended, friction-free path.
 
 Publishing is automated by `.github/workflows/publish-crates.yaml`, triggered when
 a GitHub **Release** is published. It uses crates.io **Trusted Publishing** (OIDC,
-no stored token), publishes `kache-core` then `kache` (in dependency order), and
-is idempotent (skips versions already on crates.io).
+no stored token), publishes every publishable workspace crate in dependency
+order (discovered from the manifests — adding a crate does not require a
+workflow edit), and is idempotent (skips versions already on crates.io).
 
-**First publish of a *new* crate is manual.** Trusted Publishing tokens **cannot
-create a new crate** — crates.io requires the first publish to claim ownership with
-a personal token. When adding a crate, bootstrap it once:
+**First publish of a *new* crate is still a one-time claim.** Trusted Publishing
+tokens **cannot create a new crate** — crates.io requires the first publish to
+claim ownership with a personal token. From a clean worktree at the release tag:
 
 ```sh
-git checkout vX.Y.Z              # publish from the tag, never a moving branch
-cargo login                      # personal token from crates.io → Account → API Tokens
-cargo publish -p <new-crate> --locked
+# Token scopes: publish-new + trusted-publishing
+# (CARGO_REGISTRY_TOKEN, or `cargo login`)
+just crates-status           # what is missing
+just crates-bootstrap-plan   # plan (no writes)
+just crates-bootstrap        # first-publish + Trusted Publishing
 ```
 
-Then configure Trusted Publishing for that crate on crates.io (repo +
-`publish-crates.yaml` workflow, matching any Environment the others use) so all
-later releases publish automatically. Crates are published **individually** in
-dependency order — publishing `kache` does **not** publish `kache-core`; the
-dependency must already be on crates.io first.
+That publishes only crates that do not exist yet, attaches Trusted Publishing
+for `kunobi-ninja/kache` + `publish-crates.yaml` (no GitHub Environment, matching
+the publish job), and enables `trustpub_only`. Re-run the Publish crates
+workflow afterwards if it failed on the create. Later versions of that crate
+publish automatically.
 
 ## Project structure
 

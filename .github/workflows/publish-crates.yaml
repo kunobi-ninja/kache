@@ -86,8 +86,10 @@ jobs:
             "E2E smoke (Linux)" "E2E smoke (macOS)" "E2E smoke (Windows)" \
             "Test (macOS)" "Test (Windows)"
 
+      # Package set comes from scripts/crates-io.py (every publishable workspace
+      # member, dependency order). Adding a crate does not require a workflow edit.
       - name: Verify publishable packages
-        run: cargo package --locked -p kache-core -p kache-format -p kache-fs -p kache-store -p kache
+        run: cargo package --locked $(python3 scripts/crates-io.py cargo-p-args)
 
       - name: Authenticate to crates.io
         id: auth
@@ -98,33 +100,4 @@ jobs:
       - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          version="${RELEASE_TAG#v}"
-          for crate in kache-core kache-format kache-fs kache-store kache; do
-            status="$(curl -sS -A kache-publish-workflow -o /dev/null -w "%{http_code}" "https://crates.io/api/v1/crates/$crate/$version")"
-            if [ "$status" = "200" ]; then
-              echo "$crate $version is already published"
-            elif [ "$status" = "404" ]; then
-              cargo publish -p "$crate" --locked
-            else
-              echo "unexpected crates.io status while checking $crate $version: $status" >&2
-              exit 1
-            fi
-
-            # Dependents resolve from the sparse index, whose update can lag
-            # the publish API. Wait before publishing the next crate.
-            visible=false
-            for attempt in {1..30}; do
-              if curl -sf -A kache-publish-workflow \
-                   "https://index.crates.io/ka/ch/$crate" | grep -q "\"vers\":\"$version\""; then
-                visible=true
-                break
-              fi
-              echo "$crate $version not visible yet; retry $attempt/30"
-              sleep 10
-            done
-            if [ "$visible" != "true" ]; then
-              echo "$crate $version did not become visible in crates.io index" >&2
-              exit 1
-            fi
-          done
+        run: python3 scripts/crates-io.py publish --version "${RELEASE_TAG#v}"

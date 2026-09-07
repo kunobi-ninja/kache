@@ -424,8 +424,8 @@ coverage-open:
 monitor *ARGS:
   ./scripts/ci-monitor.sh {{ARGS}}
 
-# Bump the workspace version everywhere in one shot — all 4 member manifests,
-# the kache-core dep-pin, and Cargo.lock — via `cargo set-version` (NOT a broad
+# Bump the workspace version everywhere in one shot — every publishable
+# workspace crate, local path-dep pins, and Cargo.lock — via `cargo set-version` (NOT a broad
 # `cargo update`, so the pinned kunobi-* git deps and the hand-maintained nix
 # `outputHashes` stay valid; the flake derives `version` from Cargo.toml, so no
 # hash change is needed). The VERSION is the full version, prerelease included:
@@ -514,6 +514,36 @@ release:
   git tag -a "$tag" -m "$tag"
   git push origin "$tag"
   echo "pushed $tag — the gated release pipeline will run; watch CI."
+
+# Compare publishable workspace crates to crates.io (existence, max version,
+# Trusted Publishing). Token optional: without one, Trusted Publishing shows
+# as unknown.
+# Usage: `just crates-status`
+[group('release')]
+crates-status *ARGS:
+  python3 scripts/crates-io.py status {{ARGS}}
+
+# One-time first publish of crates that do not exist yet, then attach Trusted
+# Publishing for `publish-crates.yaml` (no GitHub Environment) and enable
+# trustpub_only. Later versions are published by CI via OIDC — this recipe
+# exists because Trusted Publishing cannot create a crate.
+#
+# Run from a clean worktree at tag v<workspace-version>. Needs
+# CARGO_REGISTRY_TOKEN or `cargo login`, with scopes `publish-new` and
+# `trusted-publishing`. `--allow-untagged` skips the tag check;
+# `--no-trustpub-only` leaves API-token publishes enabled.
+# Preview with `just crates-bootstrap-plan` (just's own `--dry-run` flag
+# prints the recipe instead of reaching the script).
+# Usage: `just crates-bootstrap`
+[group('release')]
+crates-bootstrap *ARGS:
+  python3 scripts/crates-io.py bootstrap {{ARGS}}
+
+# Print the first-publish / Trusted Publishing plan without writing.
+# Usage: `just crates-bootstrap-plan`
+[group('release')]
+crates-bootstrap-plan:
+  python3 scripts/crates-io.py bootstrap --dry-run
 
 # Remove build artifacts.
 clean:

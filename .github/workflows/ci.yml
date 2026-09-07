@@ -573,6 +573,8 @@ jobs:
         run: bash scripts/check-docs.sh
       - name: Test version consistency gate
         run: python3 scripts/test-version-consistency.py
+      - name: Test crates.io publish discovery
+        run: python3 scripts/test-crates-io.py
       - name: Manifests agree (and match the tag on a v* tag)
         # Pass the ref via a quoted env var (not `${{ }}` interpolated into the
         # script) — a tag name can legally contain shell metacharacters.

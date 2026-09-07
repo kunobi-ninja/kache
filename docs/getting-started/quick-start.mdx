@@ -93,8 +93,11 @@ The report stays at `$kache_trial/reuse.md`. Git may refuse to remove a worktree
 ```bash
 kache init --check       # print proposed changes only
 kache init --no-service  # configure Cargo without a login service
+kache init --no-shell    # leave terminal C/C++ setup unchanged
 kache init --yes         # accept defaults without prompts
 ```
+
+Init asks before editing Cargo or shell configuration and backs up existing files. If you enable C/C++ caching, open a new terminal afterward or run the activation command it prints. `--check` shows the planned changes without prompts or modifications.
 
 To try the worktree example without persistent setup, skip `kache init` and prefix both `cargo build` commands with `RUSTC_WRAPPER=kache`. For example:
 

@@ -15,14 +15,22 @@ PATH shims also cover Cargo's C bits when the crate invokes `cc` or `gcc` from `
 
 ## Make, CMake, autotools, PKGBUILD
 
-The Unix path is the same idea as ccache's masquerade method: put a directory of compiler-named symlinks first on `PATH`. `make`, CMake, autotools, and Arch PKGBUILDs that call `gcc` or `clang` by name then go through Kache. There is no `CC=` edit and no shell wrapper.
+Run `kache init` to enable C/C++ caching for terminal builds on Unix. It creates compiler links and offers to save the PATH setup for zsh, bash, or fish. It shows the files before changing them and backs up existing files.
+
+```bash
+kache init
+```
+
+Open a new terminal after setup, or run the activation command printed by init in the current terminal. Then use Make, CMake, or your existing build command. Compiler calls made through `PATH` go through Kache; explicit compiler paths are unchanged. Previously configured CMake build directories may need reconfiguration to select the compiler links.
+
+Use `kache init --no-shell` to leave terminal setup alone while configuring Cargo. For managed dotfiles or another shell, use the manual setup:
 
 ```bash
 kache install-shims
 export PATH="$HOME/.local/lib/kache/shims:$PATH"
 ```
 
-`kache init` can create that directory. It does not edit your shell rc or `PATH`. Add the `export` to the shell you build from, or for `makepkg`:
+For `makepkg`, you can set the path directly:
 
 ```bash
 # ~/.makepkg.conf
@@ -52,7 +60,7 @@ This is a native symlink to the `kache` binary. Do not wrap Kache in a shell scr
 
 Kache is a larger process than ccache. On a tree of many tiny `.c` files, measure both before replacing ccache.
 
-`kache doctor` reports whether a compiler name on `PATH` is a Kache shim. The check is informational, so a Rust-only setup does not fail doctor for skipping it.
+`kache doctor` checks the current terminal's PATH. If init saved shell setup but doctor still reports inactive shims, open a new terminal or run the activation command. Init cannot change its parent shell's environment.
 
 ## Prefix method
 

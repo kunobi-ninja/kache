@@ -19,6 +19,8 @@ mod fallback_planner;
 mod heartbeat;
 mod identity;
 mod incremental_policy;
+#[cfg(unix)]
+mod init_shell;
 use kache_store::link;
 mod link_probe;
 mod machine;
@@ -171,7 +173,7 @@ enum Commands {
         stale: Option<String>,
     },
 
-    /// Interactive setup: configure cargo wrapper, install and start the daemon
+    /// Set up caching for Cargo and C/C++ builds
     Init {
         /// Accept all default answers (non-interactive)
         #[arg(long, short = 'y')]
@@ -180,6 +182,10 @@ enum Commands {
         /// Do not install the daemon as a login service
         #[arg(long)]
         no_service: bool,
+
+        /// Skip C/C++ shell setup (Cargo native dependencies are still configured)
+        #[arg(long)]
+        no_shell: bool,
 
         /// Print what would change without modifying anything
         #[arg(long)]
@@ -704,8 +710,9 @@ fn main() -> Result<()> {
         Some(Commands::Init {
             yes,
             no_service,
+            no_shell,
             check,
-        }) => cli::init(yes, no_service, check),
+        }) => cli::init(yes, no_service, no_shell, check),
         Some(Commands::Doctor {
             fix,
             purge_sccache,

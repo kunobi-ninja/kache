@@ -39,15 +39,24 @@ The monitor attempts to start the daemon for transfer statistics. It still reads
 ## Keys
 
 ```text
-q                 quit
-Tab               next tab
+q, Ctrl+C         quit
+p                 pause and resume (the log keeps its place; nothing is lost)
+Tab, Shift+Tab    next and previous tab
 1 2 3 4 5         select a tab
-Up / Down         scroll
+Up / Down, j / k  scroll one row
+PgUp / PgDn       scroll one page
+Home / End        first and last row; End on Build follows new events again
 f                 filter the current supported tab
 s                 change Store sort
 c                 clear Build events
 r                 rescan Projects
 ```
+
+Clicking a tab title selects it and the mouse wheel scrolls the current panel.
+
+The `Lookups` strip under the Build events is a clock: one column per slice of the last five minutes (or of the `--since` window), hits above misses on a shared scale, so a quiet minute is flat and a burst is a burst.
+
+Narrow terminals drop the least important columns first instead of clipping every column. Below 60×16 the monitor says so and points at `kache stats`, which prints the same numbers as text and works in a pipe.
 
 ## Triage
 

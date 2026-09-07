@@ -222,6 +222,13 @@ exclude_re = [
     "crates/kache-fs/src/lib.rs:.*testutil::",
     "replace run_config_editor",
     "replace run_monitor",
+    # `run_monitor` keeps one check of its own: refusing to start when stdout
+    # is not a terminal. A test cannot flip that without either seizing the
+    # developer's terminal or running under a pseudo-terminal the lane does
+    # not have; the loop body it guards is exercised through the extracted
+    # `ingest_tailed_records`, `stats_fetch_due`, `project_scan_due`, and
+    # `handle_terminal_event`, which stay in scope.
+    "delete ! in run_monitor",
     "probe_macos",
     "replace sdk_identity_for",
     "xcrun",

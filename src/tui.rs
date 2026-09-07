@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::daemon;
 use crate::events::{self, BuildEvent, EventRecord, EventResult, EventTailer, HeartbeatEvent};
 use crate::since::SinceWindow;
+use crate::tui_sessions::{self, Analysis, Cause, Session, SessionState};
 
 // ── Terminal mode guard ────────────────────────────────────────────────────
 
@@ -96,19 +97,21 @@ fn restore_terminal() {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Build,
+    /// Why the selected build missed: causes, passthrough reasons, chronic
+    /// misses. Sits next to Build because Enter on a build lands here.
+    Why,
     Projects,
     Store,
     Transfer,
-    Passthrough,
 }
 
 impl Tab {
     const ORDER: [Tab; 5] = [
         Tab::Build,
+        Tab::Why,
         Tab::Projects,
         Tab::Store,
         Tab::Transfer,
-        Tab::Passthrough,
     ];
 
     fn index(self) -> usize {
@@ -283,7 +286,7 @@ fn reset_filtered_viewports(state: &mut AppState) {
     match state.active_tab {
         Tab::Build => state.build_scroll.reset(),
         Tab::Store => state.store_scroll.reset(),
-        Tab::Passthrough => state.passthrough_scroll.reset(),
+        Tab::Why => state.why_scroll.reset(),
         Tab::Projects | Tab::Transfer => {}
     }
 }
@@ -401,7 +404,7 @@ struct AppState {
     /// and help bar showing nothing about it.
     build_filter: String,
     store_filter: String,
-    passthrough_filter: String,
+    why_filter: String,
     filter_active: bool,
 
     // Store tab
@@ -418,9 +421,28 @@ struct AppState {
     last_project_refresh: Instant,
     project_scroll: Viewport,
 
+    // Build sessions (kunobi-ninja/kache#583). Regrouped when the log grew,
+    // re-sorted every tick. The selected build drives the Build event panel
+    // and the Why tab.
+    sessions: Vec<Session>,
+    /// `events.len()` the sessions were grouped from.
+    grouped_len: usize,
+    /// The session the reader picked, by key; `None` follows the top row,
+    /// which is the newest running build.
+    selected_session: Option<String>,
+    /// The build the panels showed last tick, and how many events it had,
+    /// so a change of build resets the viewports and new rows in the same
+    /// build keep a scrolled reader in place.
+    shown: Option<(String, usize)>,
+    /// The Why analysis for `(session key, event count)` it was computed
+    /// for. Recomputed only when either changes: the cascade walk is per
+    /// miss and not free.
+    why_cache: Option<(String, usize, Analysis)>,
+
     // Transfer tab
     transfer_scroll: Viewport,
-    passthrough_scroll: Viewport,
+    /// Why tab: the whole explanation is one scrollable body.
+    why_scroll: Viewport,
     prev_bytes_uploaded: u64,
     prev_bytes_downloaded: u64,
     upload_speed_bps: f64,
@@ -454,7 +476,7 @@ impl AppState {
             Tab::Projects => &mut self.project_scroll,
             Tab::Store => &mut self.store_scroll,
             Tab::Transfer => &mut self.transfer_scroll,
-            Tab::Passthrough => &mut self.passthrough_scroll,
+            Tab::Why => &mut self.why_scroll,
         }
     }
 
@@ -507,27 +529,130 @@ impl AppState {
             && self.last_project_refresh.elapsed() >= PROJECT_REFRESH_INTERVAL
     }
 
-    /// Append a tailed build event and keep every scrolled-away reader on the
-    /// rows they were looking at.
+    /// Append a tailed build event. Scroll bookkeeping happens when the
+    /// sessions are refreshed, once the event is known to belong to the
+    /// build on screen.
     fn push_event(&mut self, event: BuildEvent) {
-        if self.build_filter.is_empty() || event.crate_name.contains(&self.build_filter) {
-            self.build_scroll.rows_arrived(1);
-        }
-        if matches!(event.result, EventResult::Passthrough)
-            && (self.passthrough_filter.is_empty()
-                || event.crate_name.contains(&self.passthrough_filter)
-                || event.passthrough_reason.contains(&self.passthrough_filter))
-        {
-            self.passthrough_scroll.rows_arrived(1);
-        }
         self.events.push(event);
     }
+
+    /// Bring the sessions up to date: regroup when the log grew, decide
+    /// which are live and sort them every tick (a build goes from running to
+    /// done by sitting idle), then reconcile the panels with the build that
+    /// ends up selected.
+    fn refresh_sessions(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        let live_roots: std::collections::HashSet<String> = self
+            .in_flight_view()
+            .into_iter()
+            .map(|entry| entry.root)
+            .filter(|root| !root.is_empty())
+            .collect();
+        if self.grouped_len != self.events.len() {
+            self.sessions = tui_sessions::group(
+                &self.events,
+                Duration::from_secs(crate::wrapper::BUILD_SESSION_SECS),
+            );
+            self.grouped_len = self.events.len();
+        }
+        tui_sessions::refresh_state(&mut self.sessions, now, &live_roots);
+        self.reconcile_shown_build();
+    }
+
+    /// Keep the Build and Why panels honest about which build they show.
+    /// A different build (a pick, or the top row changing while following)
+    /// starts both panels from their default edge. The same build with new
+    /// rows keeps a scrolled-back reader on the rows they were reading;
+    /// rows from other builds never move anything.
+    fn reconcile_shown_build(&mut self) {
+        let now_shown = self
+            .selected_session()
+            .map(|session| (session.key.clone(), session.events.len()));
+        match (&self.shown, &now_shown) {
+            (Some((was, had)), Some((is, has))) if was == is => {
+                let arrived = self
+                    .selected_session()
+                    .map(|session| {
+                        session.events[*had..*has]
+                            .iter()
+                            .filter(|&&index| {
+                                let event = &self.events[index];
+                                self.build_filter.is_empty()
+                                    || event.crate_name.contains(&self.build_filter)
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                self.build_scroll.rows_arrived(arrived);
+            }
+            (Some(_), Some(_)) | (None, Some(_)) => {
+                self.build_scroll.reset();
+                self.why_scroll.reset();
+            }
+            (_, None) => {}
+        }
+        self.shown = now_shown;
+    }
+
+    /// The build the Build and Why tabs are about: the reader's pick when it
+    /// still exists, else the top row.
+    fn selected_session(&self) -> Option<&Session> {
+        self.selected_session
+            .as_deref()
+            .and_then(|key| self.sessions.iter().find(|s| s.key == key))
+            .or_else(|| self.sessions.first())
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        let key = self.selected_session()?.key.as_str();
+        self.sessions.iter().position(|s| s.key == key)
+    }
+
+    /// Move the selection one row down. The pick becomes explicit even on
+    /// the last row, so a new build arriving on top no longer changes what
+    /// the reader is looking at.
+    fn select_next_session(&mut self) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        let next = (index + 1).min(self.sessions.len().saturating_sub(1));
+        self.selected_session = Some(self.sessions[next].key.clone());
+        self.reconcile_shown_build();
+    }
+
+    /// Move the selection one row up. Above the top row is "follow the
+    /// newest build", the state the monitor starts in.
+    fn select_previous_session(&mut self) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        if index == 0 {
+            self.selected_session = None;
+        } else {
+            self.selected_session = Some(self.sessions[index - 1].key.clone());
+        }
+        self.reconcile_shown_build();
+    }
+
+    /// The Why analysis for the selected build, computed on first use and
+    /// whenever the event count moved.
+    fn why_analysis(&mut self) -> Option<&Analysis> {
+        let session = self.selected_session()?;
+        let key = session.key.clone();
+        let stale =
+            !matches!(&self.why_cache, Some((k, n, _)) if *k == key && *n == self.events.len());
+        if stale {
+            let analysis = tui_sessions::analyze_session(&self.events, session, &self.sessions);
+            self.why_cache = Some((key, self.events.len(), analysis));
+        }
+        self.why_cache.as_ref().map(|(_, _, analysis)| analysis)
+    }
+
     /// The active tab's filter, empty for tabs that do not filter.
     fn filter(&self) -> &str {
         match self.active_tab {
             Tab::Build => &self.build_filter,
             Tab::Store => &self.store_filter,
-            Tab::Passthrough => &self.passthrough_filter,
+            Tab::Why => &self.why_filter,
             Tab::Projects | Tab::Transfer => "",
         }
     }
@@ -538,7 +663,7 @@ impl AppState {
         match self.active_tab {
             Tab::Build => Some(&mut self.build_filter),
             Tab::Store => Some(&mut self.store_filter),
-            Tab::Passthrough => Some(&mut self.passthrough_filter),
+            Tab::Why => Some(&mut self.why_filter),
             Tab::Projects | Tab::Transfer => None,
         }
     }
@@ -639,7 +764,7 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         build_scroll: Viewport::new(ScrollAnchor::Bottom),
         build_filter: String::new(),
         store_filter: String::new(),
-        passthrough_filter: String::new(),
+        why_filter: String::new(),
         filter_active: false,
         sort_mode: SortMode::Size,
         store_scroll: Viewport::new(ScrollAnchor::Top),
@@ -649,8 +774,13 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         project_scan,
         last_project_refresh: Instant::now(),
         project_scroll: Viewport::new(ScrollAnchor::Top),
+        sessions: Vec::new(),
+        grouped_len: 0,
+        selected_session: None,
+        shown: None,
+        why_cache: None,
         transfer_scroll: Viewport::new(ScrollAnchor::Top),
-        passthrough_scroll: Viewport::new(ScrollAnchor::Top),
+        why_scroll: Viewport::new(ScrollAnchor::Top),
         prev_bytes_uploaded: 0,
         prev_bytes_downloaded: 0,
         upload_speed_bps: 0.0,
@@ -676,6 +806,10 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
         state
             .live_heartbeats
             .retain(|_, (seen, _)| seen.elapsed() < stale_after);
+
+        // Sessions depend on the clock (a build goes from running to done by
+        // sitting idle), so they are regrouped every tick, paused or not.
+        state.refresh_sessions(chrono::Utc::now());
 
         // Check for completed background rustc_version
         if let Ok(mut slot) = state.rustc_version_slot.lock()
@@ -818,7 +952,7 @@ fn switch_tab(state: &mut AppState, tab: Tab) {
     match tab {
         Tab::Projects => state.last_project_refresh = Instant::now() - PROJECT_REFRESH_INTERVAL,
         Tab::Store => state.last_stats_fetch = Instant::now() - SNAPSHOT_REFRESH_INTERVAL,
-        Tab::Build | Tab::Transfer | Tab::Passthrough => {}
+        Tab::Build | Tab::Transfer | Tab::Why => {}
     }
 }
 
@@ -913,14 +1047,24 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         }
         // Tab switching
         KeyCode::Char('1') => switch_tab(state, Tab::Build),
-        KeyCode::Char('2') => switch_tab(state, Tab::Projects),
-        KeyCode::Char('3') => switch_tab(state, Tab::Store),
-        KeyCode::Char('4') => switch_tab(state, Tab::Transfer),
-        KeyCode::Char('5') => switch_tab(state, Tab::Passthrough),
+        KeyCode::Char('2') => switch_tab(state, Tab::Why),
+        KeyCode::Char('3') => switch_tab(state, Tab::Projects),
+        KeyCode::Char('4') => switch_tab(state, Tab::Store),
+        KeyCode::Char('5') => switch_tab(state, Tab::Transfer),
         KeyCode::Tab => switch_tab(state, state.active_tab.next()),
         // Shift+Tab used to share an arm with Tab and cycle forward too, so
         // there was no way back except by number.
         KeyCode::BackTab => switch_tab(state, state.active_tab.previous()),
+        // On Build and Why, Up/Down pick the build; the event panel scrolls by
+        // page and by End. A flat list needed one axis, a list of builds with
+        // a panel each needs two.
+        KeyCode::Up | KeyCode::Char('k') if matches!(state.active_tab, Tab::Build | Tab::Why) => {
+            state.select_previous_session();
+        }
+        KeyCode::Down | KeyCode::Char('j') if matches!(state.active_tab, Tab::Build | Tab::Why) => {
+            state.select_next_session();
+        }
+        KeyCode::Enter if state.active_tab == Tab::Build => switch_tab(state, Tab::Why),
         // Scrolling: one row, one page, or straight to either end. `j`/`k`
         // for hands that live on the home row.
         KeyCode::Up | KeyCode::Char('k') => state.active_viewport().scroll_up(),
@@ -940,6 +1084,9 @@ fn handle_key(state: &mut AppState, key: KeyCode) {
         }
         KeyCode::Char('c') if state.active_tab == Tab::Build => {
             state.events.clear();
+            state.sessions.clear();
+            state.selected_session = None;
+            state.why_cache = None;
             state.build_scroll.reset();
         }
         // Store tab
@@ -996,7 +1143,7 @@ fn draw_ui(frame: &mut Frame, state: &mut AppState) {
         Tab::Projects => draw_projects_tab(frame, state, chunks[1]),
         Tab::Store => draw_store_tab(frame, state, chunks[1]),
         Tab::Transfer => draw_transfer_tab(frame, state, chunks[1]),
-        Tab::Passthrough => draw_passthrough_tab(frame, state, chunks[1]),
+        Tab::Why => draw_why_tab(frame, state, chunks[1]),
     }
 }
 
@@ -1033,10 +1180,10 @@ fn draw_tab_bar(frame: &mut Frame, state: &AppState, area: Rect) {
 fn tab_titles() -> [(Tab, &'static str, u16); 5] {
     const LABELS: [(Tab, &str); 5] = [
         (Tab::Build, " [1] Build "),
-        (Tab::Projects, "[2] Projects"),
-        (Tab::Store, "[3] Store "),
-        (Tab::Transfer, "[4] Transfer "),
-        (Tab::Passthrough, "[5] Passthrough "),
+        (Tab::Why, "[2] Why "),
+        (Tab::Projects, "[3] Projects"),
+        (Tab::Store, "[4] Store "),
+        (Tab::Transfer, "[5] Transfer "),
     ];
     let mut x = 0u16;
     LABELS.map(|(tab, label)| {
@@ -1067,11 +1214,23 @@ fn draw_build_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
         // can't crowd out the event stream.
         (in_flight.len().min(6) + 2) as u16
     };
+    // Builds panel: border (2) + header (1) + up to five rows. Absent until
+    // there is a build to list, so an idle monitor keeps the classic layout.
+    let has_builds = !state.sessions.is_empty();
+    let builds_rows = if has_builds {
+        (state.sessions.len().min(5) + 3) as u16
+    } else {
+        0
+    };
+    // On a short terminal the sparkline goes before the event rows do.
+    let show_spark = area.height >= 30;
+    let spark_rows = if show_spark { 5 } else { 0 };
     let chunks = Layout::vertical([
         Constraint::Length(9),              // Stats bar
         Constraint::Length(in_flight_rows), // In-flight compiles (if any)
-        Constraint::Min(8),                 // Live build events
-        Constraint::Length(5),              // Sparkline
+        Constraint::Length(builds_rows),    // Builds (if any)
+        Constraint::Min(6),                 // Selected build's events
+        Constraint::Length(spark_rows),     // Sparkline
         Constraint::Length(1),              // Help bar
     ])
     .split(area);
@@ -1080,9 +1239,153 @@ fn draw_build_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     if in_flight_rows > 0 {
         draw_in_flight(frame, &in_flight, chunks[1]);
     }
-    draw_live_build(frame, state, chunks[2]);
-    draw_sparkline(frame, state, chunks[3]);
-    draw_build_help(frame, state, chunks[4]);
+    if has_builds {
+        draw_builds(frame, state, chunks[2]);
+    }
+    draw_live_build(frame, state, chunks[3]);
+    if show_spark {
+        draw_sparkline(frame, state, chunks[4]);
+    }
+    draw_build_help(frame, state, chunks[5]);
+}
+
+/// `4m12s`-style compact milliseconds for cost strips; blank for zero.
+fn fmt_saved_ms(ms: u64) -> String {
+    if ms == 0 {
+        return "0s".to_string();
+    }
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    fmt_secs(ms / 1000)
+}
+
+/// The Builds table: one row per session, running builds first, the selected
+/// one marked. Selecting a build scopes the event panel and the Why tab.
+fn draw_builds(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let selected = state.selected_index().unwrap_or(0);
+    let count = state.sessions.len();
+    let following = state.selected_session.is_none();
+    let title = format!(
+        " Builds · {}/{}{} ",
+        selected + 1,
+        count,
+        if following {
+            " · following the top build"
+        } else {
+            ""
+        }
+    );
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let wide = area.width >= 100;
+    let mut labels = vec!["Build", "Started", "State"];
+    let mut widths = vec![
+        Constraint::Min(16),
+        Constraint::Length(8),
+        Constraint::Length(8),
+    ];
+    let numeric_from = labels.len();
+    labels.extend(["hit", "miss"]);
+    widths.extend([Constraint::Length(6), Constraint::Length(6)]);
+    if wide {
+        labels.push("pass");
+        widths.push(Constraint::Length(6));
+    }
+    labels.push("rate");
+    widths.push(Constraint::Length(5));
+    if wide {
+        labels.push("saved");
+        widths.push(Constraint::Length(8));
+    }
+    let header = Row::new(
+        labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let line = Line::from(*label);
+                Cell::from(if i >= numeric_from {
+                    line.right_aligned()
+                } else {
+                    line
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .style(Style::default().fg(Color::DarkGray));
+
+    let right = |text: String, style: Style| Cell::from(Line::styled(text, style).right_aligned());
+    let count_cell = |value: u64, color: Color| {
+        right(
+            value.to_string(),
+            Style::default().fg(if value == 0 { Color::DarkGray } else { color }),
+        )
+    };
+    let rows: Vec<Row> = state
+        .sessions
+        .iter()
+        .map(|session| {
+            let state_style = match session.state {
+                SessionState::Live => Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                SessionState::Finished => Style::default().fg(Color::DarkGray),
+            };
+            let name = if session.inferred {
+                format!("{} ~", session.workspace_name())
+            } else {
+                session.workspace_name().to_string()
+            };
+            let mut cells = vec![
+                Cell::from(name),
+                Cell::from(
+                    session
+                        .started
+                        .with_timezone(&chrono::Local)
+                        .format("%H:%M:%S")
+                        .to_string(),
+                ),
+                Cell::from(Span::styled(session.state.label(), state_style)),
+                count_cell(session.tally.hits, Color::Green),
+                count_cell(session.tally.compiled(), Color::White),
+            ];
+            if wide {
+                cells.push(count_cell(session.tally.passthroughs, Color::Magenta));
+            }
+            cells.push(right(
+                session
+                    .tally
+                    .hit_rate()
+                    .map_or_else(|| "-".to_string(), |rate| format!("{rate:.0}%")),
+                Style::default(),
+            ));
+            if wide {
+                cells.push(right(
+                    fmt_saved_ms(session.tally.saved_ms),
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            Row::new(cells)
+        })
+        .collect();
+
+    let visible = area.height.saturating_sub(3) as usize;
+    let table = Table::new(rows, widths)
+        .header(header)
+        .highlight_symbol("▸ ")
+        .row_highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::REVERSED),
+        )
+        .block(block);
+    // A stateful table keeps the selected row visible past the first page.
+    let mut table_state = TableState::default()
+        .with_selected(selected)
+        .with_offset(selected.saturating_add(1).saturating_sub(visible.max(1)));
+    frame.render_stateful_widget(table, area, &mut table_state);
 }
 
 /// Render the in-flight compiles panel: oldest first, one line each.
@@ -1325,20 +1628,54 @@ fn fmt_duration_ms(ms: u64) -> String {
 fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
     // A reader who scrolled back is told so, and told the way back: rows that
     // stop moving otherwise look like a build that stopped.
-    let title = if state.build_scroll.at_anchor() {
-        " Live Build "
+    let scrolled = if state.build_scroll.at_anchor() {
+        ""
     } else {
-        " Live Build · scrolled back, End follows "
+        " · scrolled back, End follows"
+    };
+    // The selected build's name and its cost strip: what the cache saved it,
+    // what its misses cost, and what kache itself cost. The last figure is
+    // the one nobody else reports.
+    let title = match state.selected_session() {
+        Some(session) => {
+            let t = &session.tally;
+            let overhead = t.overhead_share().map_or_else(
+                || fmt_saved_ms(t.overhead_ms),
+                |share| format!("{} ({share:.0}%)", fmt_saved_ms(t.overhead_ms)),
+            );
+            format!(
+                " {} · saved {} · in misses {} · kache {overhead}{scrolled} ",
+                session.workspace_name(),
+                fmt_saved_ms(t.saved_ms),
+                fmt_saved_ms(t.miss_ms),
+            )
+        }
+        None => format!(" Live Build{scrolled} "),
     };
     let block = Block::bordered()
-        .title(filtered_title(title, state.filter()))
+        .title(filtered_title(&title, state.filter()))
         .border_style(Style::default().fg(Color::Cyan));
+
+    if state.sessions.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "  Waiting for builds…\n\n  Run `cargo build` in any workspace; builds from every\n  workspace on this machine appear here, newest on top.",
+            )
+            .block(block),
+            area,
+        );
+        return;
+    }
 
     let filter_empty = state.filter().is_empty();
     let filter_label = state.filter().to_string();
-    let filtered_events: Vec<&BuildEvent> = state
-        .events
+    let selected_events: Vec<usize> = state
+        .selected_session()
+        .map(|session| session.events.clone())
+        .unwrap_or_default();
+    let filtered_events: Vec<&BuildEvent> = selected_events
         .iter()
+        .map(|&index| &state.events[index])
         .filter(|e| filter_empty || e.crate_name.contains(&filter_label))
         .collect();
 
@@ -1557,10 +1894,14 @@ fn draw_sparkline(frame: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn draw_build_help(frame: &mut Frame, state: &AppState, area: Rect) {
-    let help = help_line(
-        state,
-        "q: quit  p: pause  f: filter  ↑↓ PgUp PgDn End: scroll  ⇥/⇧⇥: tabs  c: clear",
-    );
+    // The full key list needs ~100 columns; narrower terminals get the
+    // short form rather than a clipped one.
+    let keys = if area.width >= 100 {
+        "q: quit  p: pause  ↑↓: build  Enter: why  f: filter  PgUp PgDn End: events  ⇥/⇧⇥: tabs  c: clear"
+    } else {
+        "q: quit  p: pause  ↑↓: build  ⏎: why  f: filter  PgDn/End: events  ⇥: tabs  c: clear"
+    };
+    let help = help_line(state, keys);
 
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
@@ -2294,135 +2635,424 @@ fn draw_transfer_help(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-// ── Passthrough tab ───────────────────────────────────────────────────────
+// ── Why tab ───────────────────────────────────────────────────────────────
 
-fn draw_passthrough_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
+/// Why the selected build missed: the misses collapsed to the few causes
+/// behind them, the passthroughs by reason, the crates that keep missing,
+/// and every passthrough in the build. One body, scrolled as a whole, so
+/// nothing is ever clipped out of reach.
+fn draw_why_tab(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let chunks = Layout::vertical([
-        Constraint::Min(5),    // Passthrough table
+        Constraint::Min(3),    // Body
         Constraint::Length(1), // Help bar
     ])
     .split(area);
 
-    draw_passthrough_table(frame, state, chunks[0]);
-    draw_passthrough_help(frame, state, chunks[1]);
+    let title = match state.selected_session() {
+        Some(session) => format!(
+            " Why · {} · {} ",
+            session.workspace_name(),
+            session.state.label()
+        ),
+        None => " Why ".to_string(),
+    };
+    let block = Block::bordered()
+        .title(filtered_title(&title, state.filter()))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(chunks[0]);
+    let lines = why_lines(state, inner.width);
+    let range = state
+        .why_scroll
+        .visible_range(lines.len(), inner.height as usize);
+    let block = if range.end < lines.len() || range.start > 0 {
+        block.title_bottom(
+            Line::from(format!(
+                " {}–{} of {} · PgUp PgDn ",
+                range.start + 1,
+                range.end,
+                lines.len()
+            ))
+            .right_aligned(),
+        )
+    } else {
+        block
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((range.start as u16, 0))
+            .block(block),
+        chunks[0],
+    );
+    draw_why_help(frame, state, chunks[1]);
 }
 
-fn draw_passthrough_table(frame: &mut Frame, state: &mut AppState, area: Rect) {
-    let filter_empty = state.filter().is_empty();
-    let filter_label = state.filter().to_string();
-    let events: Vec<&BuildEvent> = state
+/// A proportional bar of `width` cells, never empty for a non-zero share so
+/// a rare cause still shows as present.
+fn share_bar(count: usize, total: usize, width: usize) -> String {
+    if total == 0 || width == 0 {
+        return " ".repeat(width);
+    }
+    let filled = (count.saturating_mul(width) / total)
+        .max(usize::from(count > 0))
+        .min(width);
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+/// Terminal cells `text` occupies. Bytes and chars both lie for CJK and
+/// combining marks; the same measure ratatui lays out with.
+fn cells(text: &str) -> usize {
+    Line::from(text).width()
+}
+
+/// Clip `text` to `width` cells with an ellipsis, on a character boundary.
+fn clip(text: &str, width: usize) -> String {
+    if cells(text) <= width {
+        return text.to_string();
+    }
+    let mut kept = String::new();
+    for ch in text.chars() {
+        if cells(&format!("{kept}{ch}…")) > width {
+            break;
+        }
+        kept.push(ch);
+    }
+    format!("{kept}…")
+}
+
+/// Pad `text` to `width` cells, clipping first if it is longer.
+fn pad(text: &str, width: usize) -> String {
+    let text = clip(text, width);
+    let padding = width.saturating_sub(cells(&text));
+    format!("{text}{}", " ".repeat(padding))
+}
+
+/// The Why body, as lines. Pure so it can be asserted on in tests without
+/// a terminal. `width` is the inner width the lines are laid out for.
+fn why_lines(state: &mut AppState, width: u16) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(Color::DarkGray);
+    let heading = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let explain_miss = state.config.explain_miss;
+    let filter = state.filter().to_string();
+    let Some(session) = state.selected_session().cloned() else {
+        return vec![
+            Line::from("  No builds recorded yet."),
+            Line::styled(
+                "  Run `cargo build` in any workspace and its misses are explained here.",
+                muted,
+            ),
+        ];
+    };
+    // Fill the cache first, then borrow: the analysis is owned by the state.
+    state.why_analysis();
+    let Some((_, _, analysis)) = &state.why_cache else {
+        return Vec::new();
+    };
+    let t = &session.tally;
+    let width = width as usize;
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {} ", session.workspace_name()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "· {} · started {} · {} hits, {} misses, {} passthroughs",
+                session.state.label(),
+                session
+                    .started
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M:%S"),
+                t.hits,
+                t.compiled(),
+                t.passthroughs,
+            ),
+            muted,
+        ),
+    ]));
+    let overhead = t.overhead_share().map_or_else(
+        || fmt_saved_ms(t.overhead_ms),
+        |share| {
+            format!(
+                "{} ({share:.0}% of lookup time)",
+                fmt_saved_ms(t.overhead_ms)
+            )
+        },
+    );
+    let restored = match t.copy_share() {
+        Some(share) if share >= 1.0 => format!(
+            " · restored {}, {share:.0}% by copy",
+            ByteSize(t.restored_bytes())
+        ),
+        Some(_) => format!(" · restored {}", ByteSize(t.restored_bytes())),
+        None => String::new(),
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  saved "),
+        Span::styled(fmt_saved_ms(t.saved_ms), Style::default().fg(Color::Green)),
+        Span::raw(" · in misses "),
+        Span::styled(fmt_saved_ms(t.miss_ms), Style::default().fg(Color::White)),
+        Span::raw(format!(" · kache overhead {overhead}{restored}")),
+    ]));
+
+    // ── Misses by cause ──
+    lines.push(Line::default());
+    let capped = if analysis.misses_analyzed < analysis.misses_total {
+        format!(
+            " (newest {} of {} analyzed)",
+            analysis.misses_analyzed, analysis.misses_total
+        )
+    } else {
+        String::new()
+    };
+    lines.push(Line::styled(
+        format!(
+            "  Misses by cause · {} miss{}{capped}",
+            analysis.misses_total,
+            if analysis.misses_total == 1 { "" } else { "es" }
+        ),
+        heading,
+    ));
+    if analysis.misses_total == 0 {
+        lines.push(Line::styled(
+            if t.hits > 0 {
+                "  none: every lookup hit"
+            } else {
+                "  none: nothing was looked up"
+            },
+            muted,
+        ));
+    }
+    let bar_width = 12usize;
+    let count_width = analysis
+        .causes
+        .iter()
+        .chain(std::iter::empty())
+        .map(|g| g.count.to_string().len())
+        .chain(
+            analysis
+                .passthroughs
+                .iter()
+                .map(|g| g.count.to_string().len()),
+        )
+        .max()
+        .unwrap_or(1);
+    for group in &analysis.causes {
+        let color = if group.cause.is_failure() {
+            Color::Red
+        } else if matches!(group.cause, Cause::Unexplained) {
+            Color::DarkGray
+        } else {
+            Color::Yellow
+        };
+        let examples = if group.examples.is_empty() {
+            String::new()
+        } else {
+            let more = group.count.saturating_sub(group.examples.len());
+            format!(
+                "{}{}",
+                group.examples.join(", "),
+                if more > 0 {
+                    format!(" +{more}")
+                } else {
+                    String::new()
+                }
+            )
+        };
+        let prefix = format!(
+            "  {} {:>count_width$}  ",
+            share_bar(group.count, analysis.misses_analyzed, bar_width),
+            group.count
+        );
+        let cost = format!("  {}", fmt_saved_ms(group.compile_ms));
+        let room = width.saturating_sub(cells(&prefix) + cells(&cost) + 2);
+        let describe = group.cause.describe();
+        let describe_cells = cells(&describe);
+        let (describe_width, example_width) = if room > describe_cells + 12 {
+            (describe_cells, room - describe_cells - 2)
+        } else {
+            (room, 0)
+        };
+        let mut spans = vec![
+            Span::styled(prefix, Style::default().fg(color)),
+            Span::raw(clip(&describe, describe_width)),
+        ];
+        if example_width > 0 && !examples.is_empty() {
+            spans.push(Span::styled(
+                format!("  {}", clip(&examples, example_width)),
+                muted,
+            ));
+        }
+        spans.push(Span::styled(cost, muted));
+        lines.push(Line::from(spans));
+    }
+    if analysis.misses_total > 0 && !analysis.cascade_recorded {
+        lines.push(Line::styled(
+            if explain_miss {
+                "  no dependency digests on this build's misses; the next build records them (explain_miss is on)"
+            } else {
+                "  dependency cascades are not recorded: set [cache] explain_miss = true to name the crate that changed"
+            },
+            muted,
+        ));
+    }
+
+    // ── Passthroughs by reason ──
+    if !analysis.passthroughs.is_empty() {
+        lines.push(Line::default());
+        let total: usize = analysis.passthroughs.iter().map(|g| g.count).sum();
+        lines.push(Line::styled(
+            format!("  Passthroughs by reason · {total}"),
+            heading,
+        ));
+        for group in &analysis.passthroughs {
+            let label = if group.kind.is_empty() {
+                group.reason.clone()
+            } else {
+                format!("{}: {}", group.kind, group.reason)
+            };
+            let note = if group.probe {
+                "  (queries, not compiles)"
+            } else {
+                ""
+            };
+            let prefix = format!(
+                "  {} {:>count_width$}  ",
+                share_bar(group.count, total, bar_width),
+                group.count
+            );
+            let room = width.saturating_sub(cells(&prefix) + cells(note) + 1);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default().fg(if group.probe {
+                        Color::DarkGray
+                    } else {
+                        Color::Magenta
+                    }),
+                ),
+                Span::raw(clip(&label, room)),
+                Span::styled(note, muted),
+            ]));
+        }
+    }
+
+    // ── Chronic ──
+    if !analysis.chronic.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "  Chronic misses · missed in N of the M builds of this tree that looked it up",
+            heading,
+        ));
+        for chronic in &analysis.chronic {
+            lines.push(Line::from(vec![
+                Span::raw(format!(
+                    "  {} {}/{}",
+                    pad(&chronic.crate_name, 28),
+                    chronic.missed,
+                    chronic.seen
+                )),
+                Span::styled(
+                    if chronic.last_store_failed {
+                        "  its latest lookup ended in a store failure"
+                    } else {
+                        ""
+                    },
+                    Style::default().fg(Color::Red),
+                ),
+            ]));
+        }
+    }
+
+    // ── Every passthrough in the build ──
+    let passthroughs: Vec<&BuildEvent> = session
         .events
         .iter()
+        .map(|&index| &state.events[index])
         .filter(|event| matches!(event.result, EventResult::Passthrough))
         .filter(|event| {
-            filter_empty
-                || event.crate_name.contains(&filter_label)
-                || event.passthrough_reason.contains(&filter_label)
+            filter.is_empty()
+                || event.crate_name.contains(&filter)
+                || event.passthrough_reason.contains(&filter)
         })
         .collect();
-
-    let block = Block::bordered()
-        .title(filtered_title(
-            &format!(" Passthroughs ({}) ", events.len()),
-            state.filter(),
-        ))
-        .border_style(Style::default().fg(Color::Cyan));
-
-    if events.is_empty() {
-        let msg = if state.filter().is_empty() {
-            "  No passthroughs yet"
-        } else {
-            "  No passthroughs match the filter"
-        };
-        frame.render_widget(Paragraph::new(msg).block(block), area);
-        return;
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        format!(
+            "  Passthroughs in this build · {}{}",
+            passthroughs.len(),
+            if filter.is_empty() {
+                String::new()
+            } else {
+                format!(" matching {filter:?}")
+            }
+        ),
+        heading,
+    ));
+    if passthroughs.is_empty() {
+        lines.push(Line::styled(
+            if filter.is_empty() {
+                "  none"
+            } else {
+                "  none match the filter"
+            },
+            muted,
+        ));
     }
-
-    // The reason is what this tab exists for, so it keeps its share of the
-    // width; route and exit code are the first to go.
-    let show_route = area.width >= 96;
-    let show_exit = area.width >= 80;
-
-    let mut labels = vec!["Time", "Crate"];
-    let mut widths = vec![Constraint::Length(9), Constraint::Min(18)];
-    if show_route {
-        labels.push("Route");
-        widths.push(Constraint::Length(10));
-    }
-    if show_exit {
-        labels.push("Exit");
-        widths.push(Constraint::Length(6));
-    }
-    labels.extend(["Kind", "Reason"]);
-    widths.extend([Constraint::Length(14), Constraint::Percentage(45)]);
-    let header = Row::new(labels).style(Style::default().add_modifier(Modifier::BOLD));
-
-    let visible_rows = (area.height as usize).saturating_sub(3);
-    let range = state
-        .passthrough_scroll
-        .visible_range(events.len(), visible_rows);
-
-    let rows: Vec<Row> = events
-        .iter()
-        .rev()
-        .skip(range.start)
-        .take(range.len())
-        .map(|event| {
-            let exit = event
-                .exit_code
-                .map(|code| code.to_string())
-                .unwrap_or_default();
+    // Route and exit code are detail; on a narrow terminal the reason wins.
+    let wide = width >= 96;
+    // The crate and kind columns give up width before the reason does.
+    let crate_width = (width / 4).clamp(8, 22);
+    let kind_width = (width / 6).clamp(6, 14);
+    for event in passthroughs.iter().rev() {
+        let (kind, reason) = tui_sessions::passthrough_parts(&event.passthrough_reason);
+        let mut spans = vec![
+            Span::styled(
+                format!(
+                    "  {}  ",
+                    event.ts.with_timezone(&chrono::Local).format("%H:%M:%S")
+                ),
+                muted,
+            ),
+            Span::raw(pad(&event.crate_name, crate_width)),
+        ];
+        if wide {
             let route = if event.fallback { "fallback" } else { "direct" };
-            let (kind, reason) = passthrough_reason_parts(&event.passthrough_reason);
-
-            let exit_style = match event.exit_code {
-                Some(0) => Style::default().fg(Color::Green),
-                Some(_) => Style::default().fg(Color::Red),
-                None => Style::default().fg(Color::DarkGray),
+            let (exit, exit_style) = match event.exit_code {
+                Some(0) => ("0".to_string(), Style::default().fg(Color::Green)),
+                Some(code) => (code.to_string(), Style::default().fg(Color::Red)),
+                None => ("-".to_string(), muted),
             };
-
-            let mut cells = vec![
-                Cell::from(event.ts.format("%H:%M:%S").to_string()),
-                Cell::from(event.crate_name.clone()),
-            ];
-            if show_route {
-                cells.push(Cell::from(route).style(Style::default().fg(Color::Magenta)));
-            }
-            if show_exit {
-                cells.push(Cell::from(exit).style(exit_style));
-            }
-            cells.push(Cell::from(kind.to_string()).style(Style::default().fg(Color::Cyan)));
-            cells.push(Cell::from(reason.to_string()));
-            Row::new(cells)
-        })
-        .collect();
-
-    let table = Table::new(rows, widths).header(header).block(block);
-    frame.render_widget(table, area);
+            spans.push(Span::styled(
+                format!("  {route:<9}"),
+                Style::default().fg(Color::Magenta),
+            ));
+            spans.push(Span::styled(format!("{exit:>4}  "), exit_style));
+        } else {
+            spans.push(Span::raw("  "));
+        }
+        let kind = if kind.is_empty() { "-" } else { kind };
+        spans.push(Span::styled(
+            pad(kind, kind_width),
+            Style::default().fg(Color::Cyan),
+        ));
+        let used: usize = spans.iter().map(|span| cells(&span.content)).sum();
+        spans.push(Span::raw(format!(
+            "  {}",
+            clip(reason, width.saturating_sub(used + 2))
+        )));
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
-fn passthrough_reason_parts(reason: &str) -> (&str, &str) {
-    let reason = reason.trim();
-    if reason.is_empty() {
-        return ("unknown", "unknown");
-    }
-
-    if let Some((kind, detail)) = reason.split_once('|') {
-        let kind = kind.trim();
-        let detail = detail.trim();
-        return (
-            if kind.is_empty() { "unknown" } else { kind },
-            if detail.is_empty() { "unknown" } else { detail },
-        );
-    }
-
-    ("N/A", reason.strip_prefix("refused: ").unwrap_or(reason))
-}
-
-fn draw_passthrough_help(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_why_help(frame: &mut Frame, state: &AppState, area: Rect) {
     let help = help_line(
         state,
-        "q: quit  p: pause  f: filter  ↑↓ PgUp PgDn: scroll  ⇥/⇧⇥: tabs",
+        "q: quit  p: pause  ↑↓: build  f: filter  PgUp PgDn: scroll  ⇥/⇧⇥: tabs",
     );
     let paragraph = Paragraph::new(help).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(paragraph, area);
@@ -2456,7 +3086,7 @@ mod tests {
         assert!(!tab_needs_entries(Tab::Projects));
         assert!(tab_needs_entries(Tab::Store));
         assert!(!tab_needs_entries(Tab::Transfer));
-        assert!(!tab_needs_entries(Tab::Passthrough));
+        assert!(!tab_needs_entries(Tab::Why));
     }
 
     #[test]
@@ -2478,19 +3108,6 @@ mod tests {
 
         // Error is the only red outcome.
         assert_eq!(event_presentation(EventResult::Error).3, Color::Red);
-    }
-
-    #[test]
-    fn passthrough_reason_parts_split_structured_reasons() {
-        assert_eq!(
-            passthrough_reason_parts("unsupported|cc unsupported flag(s): -foo — not yet"),
-            ("unsupported", "cc unsupported flag(s): -foo — not yet")
-        );
-        assert_eq!(
-            passthrough_reason_parts("refused: cc: unsupported flag(s): -m64"),
-            ("N/A", "cc: unsupported flag(s): -m64")
-        );
-        assert_eq!(passthrough_reason_parts(""), ("unknown", "unknown"));
     }
 
     #[test]
@@ -2597,7 +3214,7 @@ mod tests {
             build_scroll: Viewport::new(ScrollAnchor::Bottom),
             build_filter: String::new(),
             store_filter: String::new(),
-            passthrough_filter: String::new(),
+            why_filter: String::new(),
             filter_active: false,
             sort_mode: SortMode::Size,
             store_scroll: Viewport::new(ScrollAnchor::Top),
@@ -2607,8 +3224,13 @@ mod tests {
             project_scan: Arc::new(Mutex::new(ProjectScanData::default())),
             last_project_refresh: Instant::now(),
             project_scroll: Viewport::new(ScrollAnchor::Top),
+            sessions: Vec::new(),
+            grouped_len: 0,
+            selected_session: None,
+            shown: None,
+            why_cache: None,
             transfer_scroll: Viewport::new(ScrollAnchor::Top),
-            passthrough_scroll: Viewport::new(ScrollAnchor::Top),
+            why_scroll: Viewport::new(ScrollAnchor::Top),
             prev_bytes_uploaded: 0,
             prev_bytes_downloaded: 0,
             upload_speed_bps: 0.0,
@@ -2738,13 +3360,13 @@ mod tests {
     fn handle_key_number_keys_switch_tabs() {
         let mut s = test_state();
         handle_key(&mut s, KeyCode::Char('2'));
-        assert_eq!(s.active_tab, Tab::Projects);
+        assert_eq!(s.active_tab, Tab::Why);
         handle_key(&mut s, KeyCode::Char('3'));
-        assert_eq!(s.active_tab, Tab::Store);
+        assert_eq!(s.active_tab, Tab::Projects);
         handle_key(&mut s, KeyCode::Char('4'));
-        assert_eq!(s.active_tab, Tab::Transfer);
+        assert_eq!(s.active_tab, Tab::Store);
         handle_key(&mut s, KeyCode::Char('5'));
-        assert_eq!(s.active_tab, Tab::Passthrough);
+        assert_eq!(s.active_tab, Tab::Transfer);
         handle_key(&mut s, KeyCode::Char('1'));
         assert_eq!(s.active_tab, Tab::Build);
     }
@@ -2784,10 +3406,10 @@ mod tests {
     fn handle_key_tab_cycles_forward_and_wraps() {
         let mut s = test_state();
         let order = [
+            Tab::Why,
             Tab::Projects,
             Tab::Store,
             Tab::Transfer,
-            Tab::Passthrough,
             Tab::Build,
         ];
         for expected in order {
@@ -2869,13 +3491,15 @@ mod tests {
     fn arriving_rows_do_not_move_a_scrolled_reader() {
         let mut s = test_state();
         for i in 0..20 {
-            s.events.push(sample_build_event(
+            s.push_event(session_event(
                 &format!("c{i}"),
                 EventResult::Miss,
-                1,
-                1,
+                "/w",
+                "s1",
+                100,
             ));
         }
+        s.refresh_sessions(chrono::Utc::now());
         let range = s.build_scroll.visible_range(20, 5);
         assert_eq!(range, 15..20, "following the newest");
 
@@ -2884,19 +3508,29 @@ mod tests {
         assert_eq!(range, 5..10);
 
         for i in 20..23 {
-            s.push_event(sample_build_event(
+            s.push_event(session_event(
                 &format!("c{i}"),
                 EventResult::Miss,
-                1,
-                1,
+                "/w",
+                "s1",
+                50,
             ));
         }
+        s.refresh_sessions(chrono::Utc::now());
         let range = s.build_scroll.visible_range(23, 5);
         assert_eq!(range, 5..10, "same rows after three arrivals");
 
+        // Rows for another, older build move nothing here.
+        s.push_event(session_event("x", EventResult::Miss, "/v", "s2", 400));
+        s.refresh_sessions(chrono::Utc::now());
+        assert_eq!(s.selected_session().unwrap().key, "id:s1");
+        let range = s.build_scroll.visible_range(23, 5);
+        assert_eq!(range, 5..10);
+
         // At the live edge the newest rows are the view.
         s.build_scroll.end();
-        s.push_event(sample_build_event("c23", EventResult::Miss, 1, 1));
+        s.push_event(session_event("c23", EventResult::Miss, "/w", "s1", 30));
+        s.refresh_sessions(chrono::Utc::now());
         let range = s.build_scroll.visible_range(24, 5);
         assert_eq!(range, 19..24);
 
@@ -2904,10 +3538,12 @@ mod tests {
         // filter shows does.
         s.build_scroll.scroll_up_by(10);
         s.build_filter = "zzz".to_string();
-        s.push_event(sample_build_event("c24", EventResult::Miss, 1, 1));
+        s.push_event(session_event("c24", EventResult::Miss, "/w", "s1", 20));
+        s.refresh_sessions(chrono::Utc::now());
         assert_eq!(s.build_scroll.offset, 10);
         s.build_filter = "c2".to_string();
-        s.push_event(sample_build_event("c25", EventResult::Miss, 1, 1));
+        s.push_event(session_event("c25", EventResult::Miss, "/w", "s1", 10));
+        s.refresh_sessions(chrono::Utc::now());
         assert_eq!(s.build_scroll.offset, 11, "a matching filter still counts");
     }
 
@@ -2983,7 +3619,7 @@ mod tests {
 
         let mut s = test_state();
         let area = Rect::new(0, 0, 120, 40);
-        let (_, _, store_x) = titles[2];
+        let (_, _, store_x) = titles[3];
         handle_mouse(
             &mut s,
             MouseEvent {
@@ -3108,7 +3744,261 @@ mod tests {
             }];
             scan.scanned = true;
         }
+        state.refresh_sessions(chrono::Utc::now());
         state
+    }
+
+    /// An event stamped with a build root and session id, as the wrapper
+    /// writes them.
+    fn session_event(
+        crate_name: &str,
+        result: EventResult,
+        root: &str,
+        session: &str,
+        secs_ago: i64,
+    ) -> BuildEvent {
+        let mut event = sample_build_event(crate_name, result, 100, 1);
+        event.root = root.to_string();
+        event.session_id = session.to_string();
+        event.ts = chrono::Utc::now() - chrono::Duration::seconds(secs_ago);
+        event.compile_time_ms = 2_000;
+        event
+    }
+
+    /// Two builds: an old finished one and a fresh one. Up/Down pick between
+    /// them, the top row is followed until a pick is made, and Enter opens
+    /// Why for the pick.
+    #[test]
+    fn arrows_pick_a_build_and_enter_opens_why() {
+        let mut s = test_state();
+        s.events = vec![
+            session_event("old_a", EventResult::Miss, "/w/old", "s-old", 900),
+            session_event("old_b", EventResult::LocalHit, "/w/old", "s-old", 899),
+            session_event("new_a", EventResult::Miss, "/w/new", "s-new", 5),
+        ];
+        s.refresh_sessions(chrono::Utc::now());
+        assert_eq!(s.sessions.len(), 2);
+        assert_eq!(s.sessions[0].key, "id:s-new", "newest on top");
+        assert!(s.selected_session.is_none(), "following by default");
+        assert_eq!(s.selected_session().unwrap().key, "id:s-new");
+
+        let screen = rendered_tab(&mut s, Tab::Build);
+        assert!(screen.contains("following the top build"), "{screen}");
+        assert!(screen.contains("new_a"), "the event panel is the top build");
+        assert!(!screen.contains("old_a"), "other builds' events stay out");
+
+        handle_key(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_session.as_deref(), Some("id:s-old"));
+        let screen = rendered_tab(&mut s, Tab::Build);
+        assert!(
+            screen.contains("old_a") && !screen.contains("new_a"),
+            "{screen}"
+        );
+        assert!(!screen.contains("following the top build"));
+
+        // Past the top row is back to following.
+        handle_key(&mut s, KeyCode::Up);
+        assert_eq!(s.selected_session.as_deref(), Some("id:s-new"));
+        handle_key(&mut s, KeyCode::Up);
+        assert!(s.selected_session.is_none());
+
+        // Enter lands on Why for the selected build.
+        handle_key(&mut s, KeyCode::Down);
+        handle_key(&mut s, KeyCode::Enter);
+        assert_eq!(s.active_tab, Tab::Why);
+        let screen = rendered_tab(&mut s, Tab::Why);
+        assert!(screen.contains("Why · old"), "{screen}");
+
+        // Clearing forgets the pick along with the events.
+        s.active_tab = Tab::Build;
+        handle_key(&mut s, KeyCode::Char('c'));
+        assert!(s.sessions.is_empty() && s.selected_session.is_none());
+    }
+
+    /// A pick survives the session list reordering under it: the key, not
+    /// the row index, is what is remembered.
+    #[test]
+    fn a_picked_build_stays_picked_when_rows_reorder() {
+        let mut s = test_state();
+        s.events = vec![
+            session_event("a", EventResult::Miss, "/w/one", "s1", 500),
+            session_event("b", EventResult::Miss, "/w/two", "s2", 400),
+        ];
+        s.refresh_sessions(chrono::Utc::now());
+        assert_eq!(s.sessions[0].key, "id:s2");
+        handle_key(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_session.as_deref(), Some("id:s1"));
+        // s1 wakes up and moves to the top.
+        s.push_event(session_event("c", EventResult::Miss, "/w/one", "s1", 1));
+        s.refresh_sessions(chrono::Utc::now());
+        assert_eq!(s.sessions[0].key, "id:s1");
+        assert_eq!(s.selected_session().unwrap().key, "id:s1");
+        assert_eq!(s.selected_index(), Some(0));
+    }
+
+    /// Forty misses downstream of one changed leaf read as one cause naming
+    /// the leaf, with the crates it took down and what they cost.
+    #[test]
+    fn why_tab_collapses_a_cascade_to_its_root() {
+        let externs = |mut e: BuildEvent, digest: &str| {
+            e.key_externs = [("leaf".to_string(), digest.to_string())]
+                .into_iter()
+                .collect();
+            e.key_externs_recorded = true;
+            e
+        };
+        let leaf = |mut e: BuildEvent, sources: &str| {
+            e.key_externs_recorded = true;
+            e.key_fields = [("sources".to_string(), sources.to_string())]
+                .into_iter()
+                .collect();
+            e
+        };
+        let mut events = vec![leaf(
+            session_event("leaf", EventResult::LocalHit, "/w", "before", 1000),
+            "1111",
+        )];
+        for i in 0..40 {
+            events.push(externs(
+                session_event(
+                    &format!("app{i}"),
+                    EventResult::LocalHit,
+                    "/w",
+                    "before",
+                    999,
+                ),
+                "aaaa",
+            ));
+        }
+        let mut leaf_miss = leaf(
+            session_event("leaf", EventResult::Miss, "/w", "now", 10),
+            "2222",
+        );
+        leaf_miss.key_diff = vec!["sources".to_string()];
+        events.push(leaf_miss);
+        for i in 0..40 {
+            events.push(externs(
+                session_event(&format!("app{i}"), EventResult::Miss, "/w", "now", 9),
+                "bbbb",
+            ));
+        }
+        let mut s = test_state();
+        s.events = events;
+        s.refresh_sessions(chrono::Utc::now());
+        assert_eq!(s.selected_session().unwrap().key, "id:now");
+
+        let lines: Vec<String> = why_lines(&mut s, 118)
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        let text = lines.join("\n");
+        assert!(text.contains("41 misses"), "{text}");
+        let downstream = lines
+            .iter()
+            .find(|l| l.contains("downstream of leaf"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(downstream.contains("40"), "{downstream}");
+        assert!(downstream.contains("app0, app1, app2 +37"), "{downstream}");
+        assert!(
+            downstream.contains("1m20s"),
+            "40 x 2s of compile: {downstream}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("own inputs changed: sources")),
+            "{text}"
+        );
+        assert!(
+            !text.contains("explain_miss"),
+            "digests were recorded, so no hint to enable them: {text}"
+        );
+        assert!(text.contains("saved "), "cost strip: {text}");
+
+        let screen = rendered_tab(&mut s, Tab::Why);
+        assert!(screen.contains("downstream of leaf"), "{screen}");
+
+        // Narrow: the examples still fit at 60 columns (bar, count, and the
+        // cost take 28), and are the first thing to go below that.
+        let narrow = why_lines(&mut s, 60)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(narrow.contains("downstream of leaf  app0"), "{narrow}");
+        // At 58 the room is exactly the description plus twelve: examples
+        // need more than that, so none; at 60 they fit but are clipped to the
+        // twelve cells left.
+        let edge = why_text(&mut s, 58).join("\n");
+        assert!(
+            edge.contains("downstream of leaf  1m20s"),
+            "no ellipsis: {edge}"
+        );
+        assert!(!edge.contains("app0"), "{edge}");
+        assert!(narrow.contains("app0, app1,…"), "{narrow}");
+        assert!(!narrow.contains("app2"), "{narrow}");
+        let narrower = why_lines(&mut s, 55)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(narrower.contains("downstream of leaf"), "{narrower}");
+        assert!(!narrower.contains("app0"), "{narrower}");
+    }
+
+    /// Misses with nothing recorded are said to be unexplained, and the
+    /// reader is told what to switch on.
+    #[test]
+    fn why_tab_says_when_it_cannot_explain_and_how_to_fix_that() {
+        let mut s = test_state();
+        s.events = vec![
+            session_event("x", EventResult::LocalHit, "/w", "before", 500),
+            session_event("x", EventResult::Miss, "/w", "now", 5),
+            session_event("y", EventResult::Miss, "/w", "now", 4),
+        ];
+        s.refresh_sessions(chrono::Utc::now());
+        let text: Vec<String> = why_lines(&mut s, 100)
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        let text = text.join("\n");
+        assert!(text.contains("unexplained"), "{text}");
+        assert!(
+            text.contains("no earlier compile in the loaded history"),
+            "{text}"
+        );
+        assert!(text.contains("explain_miss = true"), "{text}");
+
+        s.config.explain_miss = true;
+        s.why_cache = None;
+        let text: Vec<String> = why_lines(&mut s, 100)
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(
+            !text.join("\n").contains("explain_miss = true"),
+            "already on, so no hint"
+        );
+    }
+
+    #[test]
+    fn why_tab_without_builds_says_so() {
+        let mut s = test_state();
+        let screen = rendered_tab(&mut s, Tab::Why);
+        assert!(screen.contains("No builds recorded yet"), "{screen}");
+    }
+
+    #[test]
+    fn share_bar_never_hides_a_present_cause() {
+        assert_eq!(share_bar(0, 10, 4), "░░░░");
+        assert_eq!(share_bar(1, 1000, 4), "█░░░");
+        assert_eq!(share_bar(10, 10, 4), "████");
+        assert_eq!(share_bar(3, 0, 2), "  ");
+        assert_eq!(clip("abcdef", 4), "abc…");
+        assert_eq!(clip("abc", 4), "abc");
+        assert_eq!(fmt_saved_ms(0), "0s");
+        assert_eq!(fmt_saved_ms(750), "750ms");
+        assert_eq!(fmt_saved_ms(80_000), "1m20s");
     }
 
     /// Every tab at a laptop-sized and a wide terminal: the seeded row is on
@@ -3121,7 +4011,7 @@ mod tests {
             (Tab::Store, "serde", "Created"),
             (Tab::Projects, "myproj", "Fprint"),
             (Tab::Transfer, "serde", ""),
-            (Tab::Passthrough, "build.rs", "Route"),
+            (Tab::Why, "build.rs", "direct"),
         ] {
             for (width, height) in [(80u16, 24u16), (120, 40)] {
                 let mut state = populated_state();
@@ -3215,7 +4105,7 @@ mod tests {
 
         s.active_tab = Tab::Store;
         assert_eq!(s.filter(), "", "Store keeps its own filter");
-        s.active_tab = Tab::Passthrough;
+        s.active_tab = Tab::Why;
         assert_eq!(s.filter(), "", "Passthrough keeps its own filter");
 
         // Tabs that cannot filter report no filter and ignore `f`.
@@ -3240,12 +4130,12 @@ mod tests {
         s.active_tab = Tab::Build;
 
         handle_key(&mut s, KeyCode::Tab);
-        assert_eq!(s.active_tab, Tab::Projects);
+        assert_eq!(s.active_tab, Tab::Why);
         handle_key(&mut s, KeyCode::BackTab);
         assert_eq!(s.active_tab, Tab::Build);
         // And it wraps to the last tab rather than sticking.
         handle_key(&mut s, KeyCode::BackTab);
-        assert_eq!(s.active_tab, Tab::Passthrough);
+        assert_eq!(s.active_tab, Tab::Transfer);
         handle_key(&mut s, KeyCode::Tab);
         assert_eq!(s.active_tab, Tab::Build);
     }
@@ -3277,7 +4167,7 @@ mod tests {
         for (tab, expected) in [
             (Tab::Build, "c: clear"),
             (Tab::Store, "s: sort"),
-            (Tab::Passthrough, "f: filter"),
+            (Tab::Why, "f: filter"),
         ] {
             let mut state = test_state();
             let rendered = rendered_tab(&mut state, tab);
@@ -3365,10 +4255,10 @@ mod tests {
         handle_key(&mut s, KeyCode::Up);
         assert_eq!(s.store_scroll.offset, 1);
         // A different tab tracks its own offset.
-        s.active_tab = Tab::Passthrough;
-        s.passthrough_scroll.max_offset = 10;
+        s.active_tab = Tab::Transfer;
+        s.transfer_scroll.max_offset = 10;
         handle_key(&mut s, KeyCode::Down);
-        assert_eq!(s.passthrough_scroll.offset, 1);
+        assert_eq!(s.transfer_scroll.offset, 1);
         assert_eq!(s.store_scroll.offset, 1, "store offset is untouched");
     }
 
@@ -3377,7 +4267,7 @@ mod tests {
         let mut s = test_state();
         s.active_tab = Tab::Build;
         s.build_scroll.max_offset = 10;
-        handle_key(&mut s, KeyCode::Up);
+        handle_key(&mut s, KeyCode::PageUp);
         assert_eq!(s.build_scroll.offset, 1);
         handle_key(&mut s, KeyCode::Char('c'));
         assert!(s.events.is_empty());
@@ -3423,7 +4313,7 @@ mod tests {
             Tab::Projects,
             Tab::Store,
             Tab::Transfer,
-            Tab::Passthrough,
+            Tab::Why,
         ] {
             let mut state = test_state();
             state.active_tab = tab;
@@ -3571,7 +4461,7 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        for tab in [Tab::Build, Tab::Store, Tab::Passthrough, Tab::Transfer] {
+        for tab in [Tab::Build, Tab::Store, Tab::Why, Tab::Transfer] {
             let mut state = test_state();
             state.active_tab = tab;
             // Build events (varied results incl. a passthrough) drive the build +
@@ -3589,6 +4479,7 @@ mod tests {
             state.stats_snapshot.entry_count = 2;
             state.stats_snapshot.total_size = 3_500_000;
             state.stats_loaded = true;
+            state.refresh_sessions(chrono::Utc::now());
             // Transfer-tab counters/speeds.
             state.stats_snapshot.uploads_completed = 3;
             state.upload_speed_bps = 2_500_000.0;
@@ -3601,7 +4492,7 @@ mod tests {
             let buffer = terminal.backend().buffer().clone();
             let rendered: String = buffer.content().iter().map(|c| c.symbol()).collect();
             // Populated tabs surface a crate name we seeded.
-            if matches!(tab, Tab::Build | Tab::Store | Tab::Passthrough) {
+            if matches!(tab, Tab::Build | Tab::Store | Tab::Why) {
                 assert!(
                     rendered.contains("serde")
                         || rendered.contains("tokio")
@@ -3763,7 +4654,7 @@ mod tests {
         assert!(s.should_quit);
 
         let mut s = test_state();
-        let (_, _, store_x) = tab_titles()[2];
+        let (_, _, store_x) = tab_titles()[3];
         handle_terminal_event(
             &mut s,
             Event::Mouse(MouseEvent {
@@ -3948,7 +4839,6 @@ mod tests {
             (Tab::Build, "Compile", 78u16),
             (Tab::Store, "Profile", 84),
             (Tab::Projects, "[debug]", 80),
-            (Tab::Passthrough, "Exit", 80),
         ] {
             for width in [min_width - 1, min_width, 120] {
                 let screen = rendered_lines(&mut state, tab, width, 40).join("\n");
@@ -3971,33 +4861,401 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_arrivals_move_only_a_scrolled_passthrough_reader() {
+    fn changing_build_resets_both_panels_and_a_lone_build_can_be_pinned() {
         let mut s = test_state();
-        s.passthrough_scroll.visible_range(50, 10);
-        s.passthrough_scroll.scroll_down_by(5);
-        assert_eq!(s.passthrough_scroll.offset, 5);
+        s.push_event(session_event("a", EventResult::Miss, "/w/one", "s1", 500));
+        s.refresh_sessions(chrono::Utc::now());
+        assert!(s.selected_session.is_none());
+        // Down on the only row pins it rather than doing nothing.
+        handle_key(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_session.as_deref(), Some("id:s1"));
 
-        // A miss is not a passthrough row.
-        s.push_event(sample_build_event("a", EventResult::Miss, 1, 1));
-        assert_eq!(s.passthrough_scroll.offset, 5);
+        // Scroll both panels away from their edges, then let a newer build
+        // arrive: the pin holds and nothing resets.
+        s.build_scroll.visible_range(50, 10);
+        s.build_scroll.scroll_up_by(5);
+        s.why_scroll.visible_range(50, 10);
+        s.why_scroll.scroll_down_by(7);
+        s.push_event(session_event("b", EventResult::Miss, "/w/two", "s2", 1));
+        s.refresh_sessions(chrono::Utc::now());
+        assert_eq!(s.sessions[0].key, "id:s2");
+        assert_eq!(s.selected_session().unwrap().key, "id:s1");
+        assert_eq!((s.build_scroll.offset, s.why_scroll.offset), (5, 7));
 
-        // A passthrough is, when no filter or a matching one is set.
-        s.push_event(sample_build_event("b", EventResult::Passthrough, 1, 1));
-        assert_eq!(s.passthrough_scroll.offset, 6);
-        s.passthrough_filter = "linker".to_string();
-        s.push_event(sample_build_event("c", EventResult::Passthrough, 1, 1));
-        assert_eq!(s.passthrough_scroll.offset, 7, "reason matches the filter");
-        s.passthrough_filter = "zzz".to_string();
-        s.push_event(sample_build_event("d", EventResult::Passthrough, 1, 1));
-        assert_eq!(s.passthrough_scroll.offset, 7, "filtered out: no arrival");
-        s.passthrough_filter = "d".to_string();
-        s.push_event(sample_build_event("d", EventResult::Passthrough, 1, 1));
-        assert_eq!(s.passthrough_scroll.offset, 8, "crate name matches");
+        // Picking the other build starts both panels from their edge.
+        handle_key(&mut s, KeyCode::Up);
+        assert_eq!(s.selected_session().unwrap().key, "id:s2");
+        assert_eq!((s.build_scroll.offset, s.why_scroll.offset), (0, 0));
 
-        // At the live edge nothing moves, whatever arrives.
-        s.passthrough_scroll.reset();
-        s.passthrough_filter.clear();
-        s.push_event(sample_build_event("e", EventResult::Passthrough, 1, 1));
-        assert_eq!(s.passthrough_scroll.offset, 0);
+        // Following, a new top build resets them too.
+        handle_key(&mut s, KeyCode::Up);
+        assert!(s.selected_session.is_none());
+        s.build_scroll.visible_range(50, 10);
+        s.build_scroll.scroll_up_by(3);
+        s.push_event(session_event("c", EventResult::Miss, "/w/three", "s3", 0));
+        s.refresh_sessions(chrono::Utc::now());
+        assert_eq!(s.selected_session().unwrap().key, "id:s3");
+        assert_eq!(s.build_scroll.offset, 0);
+    }
+    fn why_text(s: &mut AppState, width: u16) -> Vec<String> {
+        why_lines(s, width)
+            .iter()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn build_tab_layout_thresholds() {
+        // No builds: no Builds panel at all, not an empty one.
+        let mut s = test_state();
+        let screen = rendered_tab(&mut s, Tab::Build);
+        assert!(!screen.contains("Builds ·"), "{screen}");
+
+        // The sparkline needs 30 content rows (31 with the tab bar).
+        let mut s = populated_state();
+        let tall = rendered_lines(&mut s, Tab::Build, 100, 31).join("\n");
+        assert!(tall.contains("Lookups · last"), "{tall}");
+        let short = rendered_lines(&mut s, Tab::Build, 100, 30).join("\n");
+        assert!(!short.contains("Lookups · last"), "{short}");
+        assert!(
+            short.contains("Builds ·"),
+            "the builds panel stays: {short}"
+        );
+
+        // The long help needs 100 columns.
+        let wide = rendered_lines(&mut s, Tab::Build, 100, 40).join("\n");
+        assert!(
+            wide.contains("Enter: why") && wide.contains("PgUp PgDn End"),
+            "{wide}"
+        );
+        let narrow = rendered_lines(&mut s, Tab::Build, 99, 40).join("\n");
+        assert!(
+            narrow.contains("⏎: why") && !narrow.contains("Enter: why"),
+            "{narrow}"
+        );
+    }
+
+    /// A body taller than the panel gets a position marker, and so does a
+    /// body scrolled away from the top even when its end is in view.
+    #[test]
+    fn why_tab_marks_its_scroll_position_only_when_there_is_more() {
+        let mut s = test_state();
+        s.events = vec![session_event("a", EventResult::Miss, "/w", "s1", 5)];
+        s.refresh_sessions(chrono::Utc::now());
+        let screen = rendered_tab(&mut s, Tab::Why);
+        assert!(!screen.contains('–'), "everything fits: {screen}");
+
+        for i in 0..30 {
+            let mut e = session_event(&format!("cc{i}"), EventResult::Passthrough, "/w", "s1", 4);
+            e.passthrough_reason = "unsupported|flag".to_string();
+            s.push_event(e);
+        }
+        s.refresh_sessions(chrono::Utc::now());
+        let screen = rendered_lines(&mut s, Tab::Why, 100, 20).join("\n");
+        assert!(screen.contains("1–16 of"), "{screen}");
+        assert!(screen.contains("PgUp PgDn"), "{screen}");
+
+        s.active_tab = Tab::Why;
+        handle_key(&mut s, KeyCode::End);
+        let screen = rendered_lines(&mut s, Tab::Why, 100, 20).join("\n");
+        let total = why_lines(&mut s, 98).len();
+        assert!(
+            screen.contains(&format!("{total} of {total}")),
+            "scrolled to the end: {screen}"
+        );
+    }
+
+    #[test]
+    fn why_cost_strip_mentions_copies_only_when_there_are_any() {
+        let mut s = test_state();
+        let mut hit = session_event("a", EventResult::LocalHit, "/w", "s1", 5);
+        hit.reflinked_bytes = 1000;
+        s.events = vec![hit];
+        s.refresh_sessions(chrono::Utc::now());
+        let text = why_text(&mut s, 120).join("\n");
+        assert!(text.contains("restored 1000 B"), "{text}");
+        assert!(!text.contains("by copy"), "{text}");
+        assert!(text.contains("none: every lookup hit"), "{text}");
+        assert!(!text.contains("explain_miss"), "no misses, no hint: {text}");
+
+        let mut hit = session_event("b", EventResult::LocalHit, "/w", "s1", 4);
+        hit.copied_bytes = 1000;
+        s.push_event(hit);
+        s.refresh_sessions(chrono::Utc::now());
+        let text = why_text(&mut s, 120).join("\n");
+        assert!(text.contains("50% by copy"), "{text}");
+
+        // A build with only passthroughs looked nothing up.
+        let mut s = test_state();
+        let mut pt = session_event("cc", EventResult::Passthrough, "/w", "s2", 3);
+        pt.passthrough_reason = "unsupported|flag".to_string();
+        s.events = vec![pt];
+        s.refresh_sessions(chrono::Utc::now());
+        let text = why_text(&mut s, 120).join("\n");
+        assert!(text.contains("none: nothing was looked up"), "{text}");
+    }
+
+    #[test]
+    fn why_counts_misses_in_english_and_says_when_capped() {
+        let mut s = test_state();
+        s.events = vec![session_event("a", EventResult::Miss, "/w", "s1", 5)];
+        s.refresh_sessions(chrono::Utc::now());
+        let text = why_text(&mut s, 120).join("\n");
+        assert!(text.contains("Misses by cause · 1 miss\n"), "{text}");
+        assert!(!text.contains("Misses by cause · 1 misses"), "{text}");
+        assert!(!text.contains("analyzed)"), "{text}");
+        assert!(!text.contains("none:"), "there is a miss: {text}");
+        assert!(
+            !text.contains("Passthroughs by reason"),
+            "none to group: {text}"
+        );
+        assert!(!text.contains("Chronic misses"), "none: {text}");
+
+        for i in 0..(tui_sessions::MAX_ANALYZED_MISSES + 9) {
+            s.push_event(session_event(
+                &format!("m{i}"),
+                EventResult::Miss,
+                "/w",
+                "s1",
+                4,
+            ));
+        }
+        s.refresh_sessions(chrono::Utc::now());
+        let text = why_text(&mut s, 120).join("\n");
+        assert!(
+            text.contains(&format!(
+                "{} misses (newest {} of {} analyzed)",
+                tui_sessions::MAX_ANALYZED_MISSES + 10,
+                tui_sessions::MAX_ANALYZED_MISSES,
+                tui_sessions::MAX_ANALYZED_MISSES + 10
+            )),
+            "{text}"
+        );
+    }
+
+    /// Every bar line and every passthrough row is laid out inside the
+    /// width it was asked for, including long reasons and the probe note.
+    fn fit_state() -> AppState {
+        let mut s = test_state();
+        let long = "unsupported|cc flag -march=native -mtune=native -fno-omit-frame-pointer -Wl,--as-needed";
+        for i in 0..3 {
+            let mut e = session_event(
+                &format!("a_rather_long_crate_name_{i}"),
+                EventResult::Passthrough,
+                "/w",
+                "s1",
+                5,
+            );
+            e.passthrough_reason = long.to_string();
+            s.push_event(e);
+        }
+        let mut probe = session_event("rustc", EventResult::Passthrough, "/w", "s1", 4);
+        probe.passthrough_reason =
+            "not-a-compile|--print cfg with a long tail of arguments, and then some more"
+                .to_string();
+        s.push_event(probe);
+        s.push_event(session_event("m", EventResult::Miss, "/w", "s1", 3));
+        s.refresh_sessions(chrono::Utc::now());
+        s
+    }
+
+    #[test]
+    fn why_lines_fit_the_width_they_are_given() {
+        let mut s = fit_state();
+        for width in [50u16, 60, 78, 100] {
+            for line in why_lines(&mut s, width) {
+                let text = line.to_string();
+                let laid_out = text.contains('░')
+                    || text.contains('█')
+                    || text.trim_start().starts_with(|c: char| c.is_ascii_digit());
+                if laid_out {
+                    assert!(
+                        line.width() <= width as usize,
+                        "{width}: {} cells: {text:?}",
+                        line.width()
+                    );
+                }
+            }
+        }
+        // Exact widths: the crate column is width/4 (8..22) and the kind
+        // column width/6 (6..14), so at 60 a passthrough row shows 15 cells
+        // of crate and 10 of kind, and at 88 the full 22 and 14.
+        let at_60 = why_text(&mut s, 60).join("\n");
+        assert!(
+            at_60.contains("  a_rather_long_…  unsupport…  cc flag"),
+            "{at_60}"
+        );
+        let at_88 = why_text(&mut s, 88).join("\n");
+        assert!(
+            at_88.contains("  a_rather_long_crate_n…  unsupported     cc flag"),
+            "{at_88}"
+        );
+        // The probe group line at 100: label, then the note, and the label
+        // is cut so that exactly the note and one cell of slack remain.
+        let group_line = why_lines(&mut s, 100)
+            .iter()
+            .map(|line| line.to_string())
+            .find(|line| line.contains("(queries, not compiles)"))
+            .unwrap();
+        assert_eq!(
+            Line::from(group_line.as_str()).width(),
+            99,
+            "{group_line:?}"
+        );
+        let text = why_text(&mut s, 100).join("\n");
+        assert!(text.contains("(queries, not compiles)"), "{text}");
+        assert!(text.contains("not-a-compile: --print cfg with"), "{text}");
+
+        // The filter narrows the passthrough list and says so.
+        s.why_filter = "rustc".to_string();
+        s.active_tab = Tab::Why;
+        let text = why_text(&mut s, 100).join("\n");
+        assert!(
+            text.contains("Passthroughs in this build · 1 matching \"rustc\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("  rustc") && !text.contains("a_rather_long"),
+            "{text}"
+        );
+        s.why_filter = "-march".to_string();
+        let text = why_text(&mut s, 100).join("\n");
+        assert!(text.contains("· 3 matching"), "reason matches too: {text}");
+        s.why_filter = "zzz".to_string();
+        let text = why_text(&mut s, 100).join("\n");
+        assert!(text.contains("none match the filter"), "{text}");
+    }
+    #[test]
+    fn enter_opens_why_only_from_build() {
+        let mut s = test_state();
+        s.active_tab = Tab::Store;
+        handle_key(&mut s, KeyCode::Enter);
+        assert_eq!(s.active_tab, Tab::Store);
+        s.active_tab = Tab::Build;
+        handle_key(&mut s, KeyCode::Enter);
+        assert_eq!(s.active_tab, Tab::Why);
+    }
+
+    #[test]
+    fn fmt_saved_ms_switches_units_at_one_second() {
+        assert_eq!(fmt_saved_ms(999), "999ms");
+        assert_eq!(fmt_saved_ms(1000), "1s");
+    }
+
+    /// A heartbeat for a tree keeps that tree's newest build running past
+    /// the grace period.
+    #[test]
+    fn in_flight_compile_keeps_its_build_running() {
+        let mut s = test_state();
+        s.events = vec![session_event("a", EventResult::Miss, "/w", "s1", 300)];
+        s.refresh_sessions(chrono::Utc::now());
+        assert_eq!(s.sessions[0].state, SessionState::Finished);
+        let beat = HeartbeatEvent {
+            schema: 1,
+            event: "heartbeat".to_string(),
+            ts: chrono::Utc::now(),
+            crate_name: "b".to_string(),
+            root: "/w".to_string(),
+            pid: 7,
+            elapsed_s: 5,
+            typical_s: None,
+            eta_s: None,
+        };
+        s.live_heartbeats.insert(7, (Instant::now(), beat));
+        s.refresh_sessions(chrono::Utc::now());
+        assert_eq!(s.sessions[0].state, SessionState::Live);
+        let screen = rendered_tab(&mut s, Tab::Build);
+        assert!(screen.contains("running"), "{screen}");
+    }
+
+    /// Render `tab` and return the raw buffer, for assertions on style.
+    fn rendered_buffer(state: &mut AppState, tab: Tab, width: u16, height: u16) -> Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        state.active_tab = tab;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_ui(frame, state))
+            .expect("draw should succeed");
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    /// The Builds table: a lone build gets its row, the selected row is
+    /// highlighted, zero counts are muted, headers sit left and numbers
+    /// right, and the pass and saved columns need 100 columns.
+    #[test]
+    fn builds_table_layout_and_styling() {
+        let mut s = test_state();
+        s.events = vec![
+            session_event("a", EventResult::Miss, "/w/one", "s1", 5),
+            session_event("b", EventResult::LocalHit, "/w/two", "s2", 400),
+        ];
+        s.refresh_sessions(chrono::Utc::now());
+
+        let buffer = rendered_buffer(&mut s, Tab::Build, 100, 40);
+        let rows: Vec<String> = (0..40).map(|y| row_text(&buffer, y)).collect();
+        let header_y = rows
+            .iter()
+            .position(|row| row.contains("Started") && row.contains("State"))
+            .unwrap_or_else(|| panic!("{}", rows.join("\n")));
+        let header = &rows[header_y];
+        assert!(header.starts_with("│  Build"), "labels left: {header:?}");
+        assert!(
+            header.contains("pass") && header.contains("saved"),
+            "{header:?}"
+        );
+        assert!(
+            header.trim_end_matches('│').trim_end().ends_with("saved"),
+            "numbers right: {header:?}"
+        );
+
+        let selected_y = header_y + 1;
+        assert!(rows[selected_y].contains("▸ one"), "{}", rows[selected_y]);
+        let mark = rows[selected_y].find('▸').unwrap() as u16;
+        let style = &buffer[(mark + 2, selected_y as u16)];
+        assert!(style.modifier.contains(Modifier::REVERSED), "{style:?}");
+        assert!(style.modifier.contains(Modifier::BOLD), "{style:?}");
+
+        // "two" has 0 misses: that cell is muted; its 1 hit is not.
+        let other_y = selected_y + 1;
+        assert!(rows[other_y].contains("two"), "{}", rows[other_y]);
+        // Column, not byte offset: the border glyphs are multi-byte.
+        let col_of = |row: &str, needle: &str| -> usize {
+            let chars: Vec<char> = row.chars().collect();
+            let needle: Vec<char> = needle.chars().collect();
+            chars
+                .windows(needle.len())
+                .position(|window| window == needle.as_slice())
+                .unwrap()
+        };
+        let miss_x = col_of(header, "miss") + 3;
+        let hit_x = col_of(header, "hit") + 2;
+        assert_eq!(buffer[(miss_x as u16, other_y as u16)].symbol(), "0");
+        assert_eq!(buffer[(miss_x as u16, other_y as u16)].fg, Color::DarkGray);
+        assert_eq!(buffer[(hit_x as u16, other_y as u16)].symbol(), "1");
+        assert_eq!(buffer[(hit_x as u16, other_y as u16)].fg, Color::Green);
+
+        let narrow = rendered_lines(&mut s, Tab::Build, 99, 40);
+        let header = narrow
+            .iter()
+            .find(|row| row.contains("Started") && row.contains("State"))
+            .unwrap();
+        assert!(
+            !header.contains("pass") && !header.contains("saved"),
+            "{header:?}"
+        );
+
+        // One build alone still gets its row (border, header, one row).
+        let mut s = test_state();
+        s.events = vec![session_event("a", EventResult::Miss, "/w/one", "s1", 5)];
+        s.refresh_sessions(chrono::Utc::now());
+        let screen = rendered_tab(&mut s, Tab::Build);
+        assert!(screen.contains("▸ one"), "{screen}");
     }
 }

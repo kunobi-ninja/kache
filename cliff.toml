@@ -1,0 +1,50 @@
+# git-cliff config for GitHub Release notes.
+# https://git-cliff.org/docs/configuration
+
+[changelog]
+header = ""
+body = """
+{%- for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits -%}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif -%}
+{%- if commit.breaking %}**breaking** {% endif -%}
+{{ commit.message | split(pat="\n") | first | trim | upper_first }}
+{% endfor -%}
+{% endfor -%}
+"""
+footer = ""
+trim = true
+postprocessors = [
+  { pattern = '\(#([0-9]+)\)', replace = "([#$1](https://github.com/kunobi-ninja/kache/pull/$1))" },
+]
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = false
+filter_commits = true
+tag_pattern = "v[0-9].*"
+topo_order = false
+sort_commits = "oldest"
+commit_parsers = [
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore: release", skip = true },
+  { message = "^Merge ", skip = true },
+  { message = "^test", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^chore\\(ci\\)", skip = true },
+  { message = "^chore\\(deps\\)", skip = true },
+  { message = "^bench", skip = true },
+  { message = "^feat\\(bench\\)", skip = true },
+  { message = "^fix\\(bench\\)", skip = true },
+  { message = "^feat\\(ci\\)", skip = true },
+  { message = "^fix\\(ci\\)", skip = true },
+  { message = "^docs\\(agents\\)", skip = true },
+  { message = "^feat", group = "<!-- 1 -->Features" },
+  { message = "^fix", group = "<!-- 2 -->Fixes" },
+  { message = "^perf", group = "<!-- 3 -->Performance" },
+  { message = "^doc", group = "<!-- 4 -->Docs" },
+  { message = "^refactor", group = "<!-- 5 -->Internals" },
+]

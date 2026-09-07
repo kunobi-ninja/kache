@@ -515,6 +515,14 @@ release:
   git push origin "$tag"
   echo "pushed $tag — the gated release pipeline will run; watch CI."
 
+# Group conventional commits into GitHub Release notes (git-cliff).
+# TAG defaults to the latest v* tag. Needs git-cliff on PATH
+# (`cargo binstall -y git-cliff`). Usage: `just release-notes` /
+# `just release-notes v0.17.0`
+[group('release')]
+release-notes TAG="":
+  ./scripts/release-notes.sh {{TAG}}
+
 # Remove build artifacts.
 clean:
   cargo clean

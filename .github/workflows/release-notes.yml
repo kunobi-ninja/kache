@@ -1,0 +1,38 @@
+name: Release notes
+
+# The reusable rust-release workflow creates the GitHub Release with
+# `gh release create --generate-notes` (a flat PR list). After that
+# release is published, replace the body with grouped notes from git-cliff.
+# Title and notes remain editable on immutable releases.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  notes:
+    name: Replace GitHub release notes
+    if: startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: git-cliff
+
+      - name: Write grouped notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          notes="$(mktemp)"
+          ./scripts/release-notes.sh "$TAG" > "$notes"
+          gh release edit "$TAG" --notes-file "$notes"

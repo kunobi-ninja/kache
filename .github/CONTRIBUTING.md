@@ -150,6 +150,11 @@ safety net the publish job re-checks (`scripts/require-ci-green.sh`) that CI
 passed for the tagged commit and refuses to publish otherwise — but pushing the
 tag is the intended, friction-free path.
 
+The GitHub Release is created with GitHub's auto-generated PR list. After it
+is published, `.github/workflows/release-notes.yml` replaces the body with
+grouped notes from git-cliff (`just release-notes`). Add a highlights blurb
+on the published notes if the grouped list is not enough.
+
 ### Publishing to crates.io
 
 Publishing is automated by `.github/workflows/publish-crates.yaml`, triggered when

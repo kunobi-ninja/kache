@@ -56,6 +56,7 @@ use compiler_store as store;
 mod test_support;
 mod transport;
 mod tui;
+mod tui_sessions;
 mod verify_compare;
 mod wrapper;
 mod wrapper_config;

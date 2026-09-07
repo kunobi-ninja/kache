@@ -28,13 +28,17 @@ The monitor attempts to start the daemon for transfer statistics. It still reads
 
 ## Tabs
 
-1. `Build` shows compiler events, outcome, action, timing, and size.
-2. `Projects` lists observed target directories and disk use. Press `r` to rescan.
-3. `Store` lists cache entries. Press `s` to change sort order.
-4. `Transfer` shows recent remote uploads and downloads.
-5. `Passthrough` shows the route, exit code, and reason for uncached invocations.
+1. `Build` lists the builds the event log has seen, newest on top and running ones first, and shows the selected build's compiler events with outcome, action, timing, and size. The panel title carries the build's cost strip: compile time saved, compile time spent in misses, and kache's own overhead.
+2. `Why` explains the selected build. Misses are collapsed to their causes, most frequent first: a failed store or a rejected lookup (a caching failure to fix), a dependency cascade named by the crate that actually changed, the crate's own changed inputs, no earlier compile in the loaded history, or unexplained. Passthroughs are grouped by reason, with queries such as `--print` kept apart from compiles. Crates that keep missing across builds of the same tree are listed as chronic, and every passthrough in the build is listed at the end. The whole tab is one body; PgUp and PgDn scroll it.
+3. `Projects` lists observed target directories and disk use. Press `r` to rescan.
+4. `Store` lists cache entries. Press `s` to change sort order.
+5. `Transfer` shows recent remote uploads and downloads.
 
-`dup` means the compiler ran after a key miss but produced blobs already in the store. It is not a cache hit.
+A build is every event sharing the session id the wrapper mints per `cargo build`. Events from older wrappers have no id and are grouped by build root, split at idle gaps of five minutes. Those builds carry a `~` after their name.
+
+Cascade causes need per-dependency digests on the events, which `[cache] explain_miss = true` records. Without it the Why tab says so. Every figure on the tab describes the loaded history: with `--since`, a crate whose last compile is before the cutoff reads as having no earlier compile.
+
+`dup` means the compiler ran after a key miss but produced blobs already in the store. It is not a cache hit. A passthrough is not a miss either: kache never consulted the cache for it.
 
 ## Keys
 
@@ -43,7 +47,8 @@ q, Ctrl+C         quit
 p                 pause and resume (the log keeps its place; nothing is lost)
 Tab, Shift+Tab    next and previous tab
 1 2 3 4 5         select a tab
-Up / Down, j / k  scroll one row
+Up / Down, j / k  on Build and Why: pick a build; elsewhere: scroll one row
+Enter             on Build: open Why for the picked build
 PgUp / PgDn       scroll one page
 Home / End        first and last row; End on Build follows new events again
 f                 filter the current supported tab
@@ -51,6 +56,8 @@ s                 change Store sort
 c                 clear Build events
 r                 rescan Projects
 ```
+
+Above the top build is "following the top build": the monitor starts there and returns there when you press Up past the first row. The top build is the newest running one, or the newest finished one when nothing is running.
 
 Clicking a tab title selects it and the mouse wheel scrolls the current panel.
 

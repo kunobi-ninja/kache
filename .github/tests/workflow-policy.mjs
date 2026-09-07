@@ -87,18 +87,46 @@ const privateRepos = [
   "kunobi-ninja/example",
   "contributor/example",
 ];
+// Publication-only workflows and measurement pools have separate checks below.
+// Discover every other runner, even if its expression loses CI_RUNNER_*.
+const publicationWorkflows = new Set([
+  "package-publish.yml",
+  "publish-crates.yaml",
+]);
+const measurementJobs = new Set([
+  "bench.yml:bench",
+  "bench.yml:bench-firefox-windows",
+  "bench.yml:bench-firefox-pull-windows",
+  "perf-gate.yml:measure",
+]);
 const routing = [];
 for (const [file, workflow] of Object.entries(files)) {
+  if (publicationWorkflows.has(file)) continue;
   for (const [id, job] of Object.entries(workflow.jobs)) {
-    if (job["runs-on"]?.includes("CI_RUNNER_"))
-      routing.push([`${file}:${id}`, job["runs-on"]]);
-    for (const row of job.strategy?.matrix?.include || []) {
-      if (row.runner?.includes("CI_RUNNER_"))
-        routing.push([`${file}:${id}:${row.os}`, row.runner]);
+    const name = `${file}:${id}`;
+    if (measurementJobs.has(name) || job.uses) continue;
+    assert(Object.hasOwn(job, "runs-on"), `${name} must select a runner`);
+    if (/^\$\{\{\s*matrix\.runner\s*\}\}$/.test(job["runs-on"])) {
+      const rows = job.strategy?.matrix?.include;
+      assert(rows?.length, `${name} must declare its runner matrix`);
+      for (const row of rows) {
+        assert(
+          Object.hasOwn(row, "runner"),
+          `${name}:${row.os} needs a runner`,
+        );
+        routing.push([`${name}:${row.os}`, row.runner]);
+      }
+    } else {
+      routing.push([name, job["runs-on"]]);
     }
   }
 }
-assert(routing.length >= 24);
+assert(routing.length > 0);
+function resolveRunner(source, context) {
+  return typeof source === "string" && source.trim().startsWith("${{")
+    ? evaluate(source, context)
+    : source;
+}
 for (const [name, expression] of routing) {
   const os = /:(test-macos|macOS)$/.test(name)
     ? "MACOS"
@@ -116,12 +144,12 @@ for (const [name, expression] of routing) {
         }[os];
   for (const repository of publicRepos) {
     eq(
-      evaluate(expression, context(repository, false)),
+      resolveRunner(expression, context(repository, false)),
       hosted,
       `${name} public default`,
     );
     eq(
-      evaluate(expression, context(repository, false, privateVars)),
+      resolveRunner(expression, context(repository, false, privateVars)),
       hosted,
       `${name} ignores private overrides in public`,
     );
@@ -129,26 +157,26 @@ for (const [name, expression] of routing) {
   const forkPr = context("kunobi-ninja/kache", false, privateVars);
   forkPr.github.event.pull_request.head.repo.full_name = "contributor/example";
   eq(
-    evaluate(expression, forkPr),
+    resolveRunner(expression, forkPr),
     hosted,
     `${name} external fork PR remains hosted`,
   );
   for (const repository of privateRepos) {
     eq(
-      evaluate(expression, context(repository, true, privateVars)),
+      resolveRunner(expression, context(repository, true, privateVars)),
       JSON.parse(privateVars[platform]),
       `${name} private configured`,
     );
     checks++;
     assert.throws(
-      () => evaluate(expression, context(repository, true)),
+      () => resolveRunner(expression, context(repository, true)),
       undefined,
       `${name} missing private selector`,
     );
     checks++;
     assert.throws(
       () =>
-        evaluate(
+        resolveRunner(
           expression,
           context(repository, true, {
             ...privateVars,

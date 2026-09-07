@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node workflow-policy.mjs ../.."
+    "test": "node workflow-policy.mjs ../.. && node --test workflow-policy.test.mjs"
   },
   "devDependencies": {
     "@actions/expressions": "0.3.61",

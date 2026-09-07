@@ -21,6 +21,10 @@ const V3_MANIFEST_VERSION: u32 = 3;
 /// terabytes. Paired with [`MAX_ZSTD_WINDOW_LOG`] on the decoder (#212).
 const MAX_EXTRACTED_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
 
+/// Cap the compressed body buffered by GET before extraction begins. This is
+/// a per-object ceiling; concurrent downloads can each hold up to this much.
+const MAX_COMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+
 /// Max zstd window-log accepted on decode (2^27 = 128 MiB). Bounds the
 /// decoder's allocation regardless of what the frame header claims (#212).
 const MAX_ZSTD_WINDOW_LOG: u32 = 27;
@@ -109,7 +113,10 @@ impl<'a> RemoteLayout<'a> {
         // likely-present keys go straight to GET, and a stale key-cache
         // positive degrades to a miss, not an error.
         let fetched = crate::remote_resilience::RemoteDeadline::from_instant(deadline)
-            .run("remote object GET", self.backend.get(&object_key, None))
+            .run(
+                "remote object GET",
+                self.backend.get(&object_key, Some(MAX_COMPRESSED_BYTES)),
+            )
             .await
             .context("downloading v3 pack")?
             .ok_or_else(|| {

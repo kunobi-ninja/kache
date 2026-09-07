@@ -51,6 +51,8 @@ Kache rejects a configuration that cannot provide atomic final renames.
 
 Filesystem prefixes cannot contain `:`.
 
+The [v3 download limits](/docs/remote-cache/s3-setup#object-layout-and-policy) also apply to shared folders: 8 GiB compressed and 8 GiB extracted per entry. Compiler invocations recompile when a remote entry exceeds either limit.
+
 ## Reclaim remote space
 
 kache never deletes remote objects. The owner of the directory runs a prune job; [Bound a remote](/docs/remote-cache/bounding) has the script and the ages that keep manifests and packs consistent.

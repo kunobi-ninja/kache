@@ -1227,7 +1227,10 @@ mod tests {
 
     #[tokio::test]
     async fn s3_wire_rejects_advertised_oversize_before_returning_body() {
-        let (endpoint, _requests) = mock_http_server(vec![http_response("200 OK", "hello")]).await;
+        // Send headers alone: the size check must reject without reading a
+        // body. Reading it would produce a truncation error instead.
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n";
+        let (endpoint, _requests) = mock_http_server(vec![response.to_string()]).await;
         let backend = anonymous_s3_backend(&endpoint);
 
         let error = backend
@@ -1236,6 +1239,69 @@ mod tests {
             .expect_err("content-length above cap must fail")
             .to_string();
         assert!(error.contains("too large"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn s3_wire_accepts_a_body_at_the_size_limit() {
+        let (endpoint, _requests) = mock_http_server(vec![http_response("200 OK", "hello")]).await;
+        let backend = anonymous_s3_backend(&endpoint);
+
+        let fetched = backend.get("key", Some(5)).await.unwrap().unwrap();
+        assert_eq!(fetched.body, "hello");
+    }
+
+    #[tokio::test]
+    async fn s3_wire_rejects_streamed_oversize_without_content_length() {
+        let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\
+                        Connection: close\r\n\r\n2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n";
+        let (endpoint, _requests) = mock_http_server(vec![response.to_string()]).await;
+        let backend = anonymous_s3_backend(&endpoint);
+
+        let error = backend
+            .get("key", Some(4))
+            .await
+            .expect_err("the body must be bounded even without Content-Length")
+            .to_string();
+        assert!(
+            error.contains("too large: at least 5 bytes (max 4)"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_download_rejects_oversize_before_publishing_an_entry() {
+        // Advertise one byte above 8 GiB without allocating a large body. Pin
+        // the public download path and its ceiling, not just Backend::get.
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 8589934593\r\n\
+                        Connection: close\r\n\r\n";
+        let (endpoint, requests) = mock_http_server(vec![response.to_string()]).await;
+        let backend = anonymous_s3_backend(&endpoint);
+        let remote = RemoteConfig::test_s3("bucket", "artifacts");
+        let layout = crate::remote_layout::RemoteLayout::new(&backend, &remote);
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("entry");
+        let blobs = temp.path().join("blobs");
+
+        let error = layout
+            .download_entry("key123", "foo", &destination, &blobs)
+            .await
+            .err()
+            .expect("an oversized v3 pack must be rejected before extraction");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("too large: 8589934593 bytes (max 8589934592)"),
+            "{message}"
+        );
+        assert!(
+            std::fs::read_dir(temp.path()).unwrap().next().is_none(),
+            "a rejected download must not publish files or leave extraction debris"
+        );
+        let requests = requests.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].lines().next(),
+            Some("GET /bucket/artifacts/v3/packs/foo/key123.tar.zst HTTP/1.1")
+        );
     }
 
     #[tokio::test]

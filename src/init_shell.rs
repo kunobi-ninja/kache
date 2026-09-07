@@ -126,7 +126,12 @@ impl Edit {
         let ends = existing.match_indices(END).collect::<Vec<_>>();
         match (starts.as_slice(), ends.as_slice()) {
             ([], []) => {}
-            ([(start, _)], [(end, _)]) if start < end => {
+            ([(start, _)], [(end, _)]) => {
+                ensure!(
+                    existing[*start..].contains(END),
+                    "closing kache shell marker precedes opening marker in {}",
+                    path.display()
+                );
                 let after = end + END.len();
                 ensure!(
                     (*start == 0 || existing.as_bytes()[start - 1] == b'\n')
@@ -407,6 +412,8 @@ mod tests {
         let at_limit = "x".repeat(1 << 20);
         std::fs::write(&path, &at_limit).unwrap();
         assert_eq!(read_regular(&path).unwrap(), Some(at_limit));
+        // ENOTDIR is a lookup error, not an absent file we may create.
+        assert!(read_regular(&path.join("child")).is_err());
         std::fs::write(&path, vec![b'x'; (1 << 20) + 1]).unwrap();
         assert!(read_regular(&path).is_err());
         std::fs::write(&path, [0xff]).unwrap();
@@ -415,10 +422,14 @@ mod tests {
 
     #[test]
     fn activation_preserves_an_empty_or_already_exact_path() {
+        // Nix provides Bash in its store, not at /bin/bash. Resolve it before
+        // replacing the child's PATH with the value this test exercises.
+        let _guard = crate::test_support::process_state_test_lock();
+        let bash = crate::compiler::resolve_program_on_path("bash").expect("Bash on test PATH");
         for initial in ["", "/shims", "/shims:/bin", "/shims-other:/bin"] {
             let activation = Shell::Bash.activation(Path::new("/shims")).unwrap();
             let script = format!("{activation}\nprintf '%s' \"$PATH\"");
-            let output = std::process::Command::new("/bin/bash")
+            let output = std::process::Command::new(&bash)
                 .args(["--noprofile", "--norc", "-c", &script])
                 .env("PATH", initial)
                 .env_remove("BASH_ENV")

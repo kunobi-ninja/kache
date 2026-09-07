@@ -1436,6 +1436,47 @@ fn init_writes_config_to_custom_cargo_home() {
 }
 
 #[test]
+fn init_adds_native_caching_to_an_existing_rust_setup() {
+    let e = env();
+    let cargo = e.home.join(".cargo/config.toml");
+    std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+    std::fs::write(&cargo, "[build]\nrustc-wrapper = \"kache\"\n").unwrap();
+    e.cmd()
+        .args(["init", "--no-service", "--no-shell"])
+        .write_stdin("y\nn\n")
+        .assert()
+        .success();
+    let config: toml::Value = toml::from_str(&std::fs::read_to_string(cargo).unwrap()).unwrap();
+    assert_eq!(config["build"]["rustc-wrapper"].as_str(), Some("kache"));
+    assert_eq!(config["env"]["HOST_CC"].as_str(), Some("kache cc"));
+    assert_eq!(config["env"]["HOST_CXX"].as_str(), Some("kache c++"));
+}
+
+#[cfg(unix)]
+#[test]
+fn init_ignores_empty_shell_config_directory_overrides() {
+    for (shell, config) in [
+        ("/bin/zsh", ".zshrc"),
+        ("/bin/fish", ".config/fish/config.fish"),
+    ] {
+        let e = env();
+        e.cmd()
+            .env("SHELL", shell)
+            .env("ZDOTDIR", "")
+            .env("XDG_CONFIG_HOME", "")
+            .args(["init", "--no-service"])
+            .write_stdin("y\ny\nn\n")
+            .assert()
+            .success();
+        assert!(
+            std::fs::read_to_string(e.home.join(config))
+                .unwrap()
+                .contains("# >>> kache compiler cache >>>")
+        );
+    }
+}
+
+#[test]
 fn daemon_without_subcommand_succeeds() {
     // `kache daemon` (no subcommand) is allowed and reports daemon state
     // without contacting or starting any service.

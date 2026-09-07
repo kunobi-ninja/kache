@@ -11081,10 +11081,10 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
 
     let cargo_path = cargo_config_target_path();
     let plan = plan_cargo_wrapper_edit(&cargo_path)?;
-    let existing = match std::fs::read_to_string(&cargo_path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error).context("read Cargo configuration"),
+    let existing = if plan == CargoWrapperPlan::Create {
+        String::new()
+    } else {
+        std::fs::read_to_string(&cargo_path).context("read Cargo configuration")?
     };
     let env_missing = crate::cargo_env::missing_assignments_from_path(&cargo_path)?;
     let mut cargo_ready = plan == CargoWrapperPlan::AlreadySet && env_missing.is_empty();

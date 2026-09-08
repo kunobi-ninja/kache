@@ -2,69 +2,14 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use std::collections::HashMap;
 use std::io::stdout;
 use std::ops::Range;
 use std::time::Duration;
 
 use crate::config::{
-    CacheFileConfig, CcFileConfig, Config, EnvOverrides, FileConfig, PathsFileConfig,
-    PlannerFileConfig, RemoteFileConfig, default_cache_dir, normalize_remote_prefix, parse_size,
-    resolve_config_path, shellexpand,
+    CacheFileConfig, Config, EnvOverrides, FileConfig, RemoteFileConfig, default_cache_dir,
+    normalize_remote_prefix, parse_size, resolve_config_path, shellexpand,
 };
-
-/// Advanced `[cache]` settings the editor has no form field for.
-///
-/// The two `Option<Vec<String>>` members are copied by name on purpose: their
-/// identical types make a positional swap compile while silently corrupting a
-/// user's path-only and key-environment declarations. Keep that explicit
-/// mapping alongside the differently typed prefetch and daemon fields so a save
-/// preserves every advanced value instead of silently reverting policy.
-#[derive(Debug, Clone, Default)]
-struct PreservedAdvancedConfig {
-    workspace: Option<toml::Value>,
-    runtime_dir: Option<String>,
-    path_only_env_vars: Option<Vec<String>>,
-    incremental_crates: Option<Vec<String>>,
-    key_env_vars: Option<Vec<String>>,
-    /// Bypass rules (#222): editor-invisible, so preserve them verbatim or a
-    /// save through the TUI would silently delete a user's don't-cache policy.
-    bypass_env: Option<Vec<String>>,
-    bypass_argv: Option<Vec<String>>,
-    bypass_crates: Option<Vec<String>>,
-    prefetch_enabled: Option<bool>,
-    remote_key_cache_refresh_secs: Option<u64>,
-    remote_restore_timeout_secs: Option<u64>,
-    remote_negative_ttl_secs: Option<u64>,
-    daemon_idle_timeout_secs: Option<u64>,
-    min_store_compile_ms: Option<u64>,
-    gc_max_age_hours: Option<u64>,
-    scheduler: Option<bool>,
-}
-
-impl PreservedAdvancedConfig {
-    fn from_file_config(file_config: &FileConfig) -> Self {
-        let cache = file_config.cache.as_ref();
-        Self {
-            workspace: file_config.workspace.clone(),
-            runtime_dir: cache.and_then(|c| c.runtime_dir.clone()),
-            path_only_env_vars: cache.and_then(|c| c.path_only_env_vars.clone()),
-            incremental_crates: cache.and_then(|c| c.incremental_crates.clone()),
-            key_env_vars: cache.and_then(|c| c.key_env_vars.clone()),
-            bypass_env: cache.and_then(|c| c.bypass_env.clone()),
-            bypass_argv: cache.and_then(|c| c.bypass_argv.clone()),
-            bypass_crates: cache.and_then(|c| c.bypass_crates.clone()),
-            prefetch_enabled: cache.and_then(|c| c.prefetch_enabled),
-            remote_key_cache_refresh_secs: cache.and_then(|c| c.remote_key_cache_refresh_secs),
-            remote_restore_timeout_secs: cache.and_then(|c| c.remote_restore_timeout_secs),
-            remote_negative_ttl_secs: cache.and_then(|c| c.remote_negative_ttl_secs),
-            daemon_idle_timeout_secs: cache.and_then(|c| c.daemon_idle_timeout_secs),
-            min_store_compile_ms: cache.and_then(|c| c.min_store_compile_ms),
-            gc_max_age_hours: cache.and_then(|c| c.gc_max_age_hours),
-            scheduler: cache.and_then(|c| c.scheduler),
-        }
-    }
-}
 
 // ── Field definitions ─────────────────────────────────────────────────────
 
@@ -130,64 +75,8 @@ struct EditorState {
     file_had_content: bool,
     has_saved_once: bool,
     scroll_offset: u16,
-    /// `[cache.planner]` section as loaded from disk. The editor has no
-    /// form fields for it (endpoint + bearer token), so it is carried
-    /// through verbatim on save — otherwise saving would silently drop
-    /// the planner config, including its credential.
-    preserved_planner: Option<PlannerFileConfig>,
-    /// `[cc]` section as loaded from disk. The editor has no form fields
-    /// for it (the cc flag allow-list), so it is carried through verbatim
-    /// on save — otherwise saving would silently drop the user's
-    /// `extra_allowlist_flags`.
-    preserved_cc: Option<CcFileConfig>,
-    /// `[paths]` is advanced/file-only; preserve it verbatim on TUI saves.
-    preserved_paths: Option<PathsFileConfig>,
-    /// Advanced `[cache]` settings as loaded — the editor has no form fields for
-    /// them, so carry them through verbatim on save.
-    preserved_advanced: PreservedAdvancedConfig,
-    /// `[cache] local_only` as loaded — strict local-only mode (#221). The
-    /// editor has no form field for it, so carry it through verbatim on save.
-    preserved_local_only: Option<bool>,
-    /// `[cache.volumes]` as loaded — volume-local store shards (#191). The
-    /// editor has no form field for it, so carry it through verbatim on save.
-    preserved_volumes: Option<HashMap<String, String>>,
-    preserved_remote_readonly: Option<bool>,
-    /// `[cache] modified_input_guard` as loaded — the editor has no form field
-    /// for it, so carry it through verbatim on save (kunobi-ninja/kache#324).
-    preserved_modified_input_guard: Option<bool>,
-    /// `[cache] input_predictions` as loaded — the editor has no form field
-    /// for it, so carry it through verbatim on save.
-    preserved_input_predictions: Option<bool>,
-    /// `[cache] local_hit_daemon` as loaded — the editor has no form field for
-    /// it, so carry it through verbatim on save (kunobi-ninja/kache#565).
-    preserved_local_hit_daemon: Option<bool>,
-    /// `[cache] windows_hardlink` as loaded — the editor has no form field for
-    /// it, so carry it through verbatim on save (#429).
-    preserved_windows_hardlink: Option<bool>,
-    /// `[cache] auto_gc` as loaded — the editor has no form field for it, so
-    /// carry it through verbatim on save (kunobi-ninja/kache#497).
-    preserved_auto_gc: Option<bool>,
-    /// `[cache] gc_evict_shared` is an advanced compatibility setting; keep
-    /// it unchanged when the interactive editor saves the file.
-    preserved_gc_evict_shared: Option<bool>,
-    /// `[cache] storage_layout_advice` as loaded — the editor has no form field
-    /// for it, so carry it through verbatim on save (kunobi-ninja/kache#551).
-    preserved_storage_layout_advice: Option<bool>,
-    /// `[cache] heartbeat_secs` / `[cache] explain_miss` as loaded — the
-    /// editor has no form fields for them, so carry them through verbatim on
-    /// save (kunobi-ninja/kache#131).
-    preserved_heartbeat_secs: Option<u64>,
-    preserved_explain_miss: Option<bool>,
-    /// `[cache] ignore_env` as loaded — the editor has no form field for it, so
-    /// carry it through verbatim on save (dropping it would silently disable the
-    /// env lockdown).
-    preserved_ignore_env: Option<bool>,
-    /// `[cache] prefetch_*` budgets as loaded — the editor has no form fields
-    /// for them, so carry them through verbatim on save; dropping them would
-    /// silently restore unbounded prefetch plans (kunobi-ninja/kache#616).
-    preserved_prefetch_max_keys: Option<u64>,
-    preserved_prefetch_max_bytes: Option<String>,
-    preserved_prefetch_deadline_secs: Option<u64>,
+    /// Keep the loaded config so fields absent from the form survive saving.
+    file_config: FileConfig,
 }
 
 // ── Build form fields from FileConfig ─────────────────────────────────────
@@ -777,29 +666,7 @@ fn run_all_validation(fields: &mut [FormField]) {
 
 // ── Extract FileConfig from fields ────────────────────────────────────────
 
-fn fields_to_file_config(
-    fields: &[FormField],
-    preserved_planner: Option<PlannerFileConfig>,
-    preserved_cc: Option<CcFileConfig>,
-    preserved_paths: Option<PathsFileConfig>,
-    preserved_advanced: PreservedAdvancedConfig,
-    preserved_local_only: Option<bool>,
-    preserved_volumes: Option<HashMap<String, String>>,
-    preserved_remote_readonly: Option<bool>,
-    preserved_modified_input_guard: Option<bool>,
-    preserved_input_predictions: Option<bool>,
-    preserved_local_hit_daemon: Option<bool>,
-    preserved_windows_hardlink: Option<bool>,
-    preserved_auto_gc: Option<bool>,
-    preserved_gc_evict_shared: Option<bool>,
-    preserved_storage_layout_advice: Option<bool>,
-    preserved_heartbeat_secs: Option<u64>,
-    preserved_explain_miss: Option<bool>,
-    preserved_ignore_env: Option<bool>,
-    preserved_prefetch_max_keys: Option<u64>,
-    preserved_prefetch_max_bytes: Option<String>,
-    preserved_prefetch_deadline_secs: Option<u64>,
-) -> FileConfig {
+fn fields_to_file_config(fields: &[FormField], original: &FileConfig) -> FileConfig {
     let get = |key: &str| -> Option<String> {
         fields.iter().find(|f| f.key == key).and_then(|f| {
             if f.value.is_empty() {
@@ -879,64 +746,21 @@ fn fields_to_file_config(
         None
     };
 
-    FileConfig {
-        cc: preserved_cc,
-        paths: preserved_paths,
-        workspace: preserved_advanced.workspace.clone(),
-        cache: Some(CacheFileConfig {
-            local_store: get("cache_dir"),
-            runtime_dir: preserved_advanced.runtime_dir.clone(),
-            local_max_size: get("max_size"),
-            // The editor exposes no planner fields; preserve the loaded
-            // section verbatim so a save never drops it (or its token).
-            planner: preserved_planner,
-            local_only: preserved_local_only,
-            volumes: preserved_volumes,
-            remote_readonly: preserved_remote_readonly,
-            modified_input_guard: preserved_modified_input_guard,
-            input_predictions: preserved_input_predictions,
-            local_hit_daemon: preserved_local_hit_daemon,
-            windows_hardlink: preserved_windows_hardlink,
-            auto_gc: preserved_auto_gc,
-            gc_evict_shared: preserved_gc_evict_shared,
-            storage_layout_advice: preserved_storage_layout_advice,
-            heartbeat_secs: preserved_heartbeat_secs,
-            explain_miss: preserved_explain_miss,
-            ignore_env: preserved_ignore_env,
-            prefetch_enabled: preserved_advanced.prefetch_enabled,
-            remote_key_cache_refresh_secs: preserved_advanced.remote_key_cache_refresh_secs,
-            remote_restore_timeout_secs: preserved_advanced.remote_restore_timeout_secs,
-            remote_negative_ttl_secs: preserved_advanced.remote_negative_ttl_secs,
-            prefetch_max_keys: preserved_prefetch_max_keys,
-            prefetch_max_bytes: preserved_prefetch_max_bytes,
-            prefetch_deadline_secs: preserved_prefetch_deadline_secs,
-            // The editor exposes neither put admission nor automatic age
-            // retention; preserve both verbatim on save.
-            min_store_compile_ms: preserved_advanced.min_store_compile_ms,
-            gc_max_age_hours: preserved_advanced.gc_max_age_hours,
-            scheduler: preserved_advanced.scheduler,
-            cache_executables: get_bool("cache_executables"),
-            clean_incremental: get_bool("clean_incremental"),
-            preserve_incremental: get_bool("preserve_incremental"),
-            adaptive_incremental: get_bool("adaptive_incremental"),
-            exclude: get_list("exclude"),
-            bypass_env: preserved_advanced.bypass_env.clone(),
-            bypass_argv: preserved_advanced.bypass_argv.clone(),
-            bypass_crates: preserved_advanced.bypass_crates.clone(),
-            event_log_max_size: get("event_log_max_size"),
-            event_log_keep_lines: get_usize("event_log_keep_lines"),
-            compression_level: get("compression_level").and_then(|s| s.parse::<i32>().ok()),
-            s3_concurrency: get("s3_concurrency").and_then(|s| s.parse::<u32>().ok()),
-            daemon_idle_timeout_secs: preserved_advanced.daemon_idle_timeout_secs,
-            s3_pool_idle_secs: get("s3_pool_idle_secs").and_then(|s| s.parse::<u64>().ok()),
-            fallback: get("fallback"),
-            key_salt: get("key_salt"),
-            path_only_env_vars: preserved_advanced.path_only_env_vars,
-            incremental_crates: preserved_advanced.incremental_crates,
-            key_env_vars: preserved_advanced.key_env_vars,
-            remote,
-        }),
-    }
+    let mut config = original.clone();
+    let cache = config.cache.get_or_insert_with(CacheFileConfig::default);
+    cache.local_store = get("cache_dir");
+    cache.local_max_size = get("max_size");
+    cache.cache_executables = get_bool("cache_executables");
+    cache.clean_incremental = get_bool("clean_incremental");
+    cache.preserve_incremental = get_bool("preserve_incremental");
+    cache.adaptive_incremental = get_bool("adaptive_incremental");
+    cache.exclude = get_list("exclude");
+    cache.event_log_max_size = get("event_log_max_size");
+    cache.event_log_keep_lines = get_usize("event_log_keep_lines");
+    cache.fallback = get("fallback");
+    cache.key_salt = get("key_salt");
+    cache.remote = remote;
+    config
 }
 
 // ── Public entry point ────────────────────────────────────────────────────
@@ -957,12 +781,7 @@ pub fn run_config_editor() -> Result<()> {
 
 /// Build the editor's starting state from a loaded config.
 ///
-/// Split out of [`run_config_editor`] so it can be tested: everything left in
-/// that function needs a real terminal (raw mode, alternate screen, an event
-/// loop), while this half decides which settings survive a save. The
-/// `preserved_*` fields are the load-bearing part — each one is a setting with
-/// no form field, so dropping one here silently deletes it from the user's
-/// config the next time they press `s`.
+/// Keep the disk values separate from environment overrides and form edits.
 fn initial_editor_state(
     file_config: &FileConfig,
     file_existed: bool,
@@ -986,38 +805,7 @@ fn initial_editor_state(
         file_had_content: file_existed,
         has_saved_once: false,
         scroll_offset: 0,
-        preserved_planner: file_config.cache.as_ref().and_then(|c| c.planner.clone()),
-        preserved_cc: file_config.cc.clone(),
-        preserved_paths: file_config.paths.clone(),
-        preserved_advanced: PreservedAdvancedConfig::from_file_config(file_config),
-        preserved_local_only: file_config.cache.as_ref().and_then(|c| c.local_only),
-        preserved_volumes: file_config.cache.as_ref().and_then(|c| c.volumes.clone()),
-        preserved_remote_readonly: file_config.cache.as_ref().and_then(|c| c.remote_readonly),
-        preserved_modified_input_guard: file_config
-            .cache
-            .as_ref()
-            .and_then(|c| c.modified_input_guard),
-        preserved_input_predictions: file_config.cache.as_ref().and_then(|c| c.input_predictions),
-        preserved_local_hit_daemon: file_config.cache.as_ref().and_then(|c| c.local_hit_daemon),
-        preserved_windows_hardlink: file_config.cache.as_ref().and_then(|c| c.windows_hardlink),
-        preserved_auto_gc: file_config.cache.as_ref().and_then(|c| c.auto_gc),
-        preserved_gc_evict_shared: file_config.cache.as_ref().and_then(|c| c.gc_evict_shared),
-        preserved_storage_layout_advice: file_config
-            .cache
-            .as_ref()
-            .and_then(|c| c.storage_layout_advice),
-        preserved_heartbeat_secs: file_config.cache.as_ref().and_then(|c| c.heartbeat_secs),
-        preserved_explain_miss: file_config.cache.as_ref().and_then(|c| c.explain_miss),
-        preserved_ignore_env: file_config.cache.as_ref().and_then(|c| c.ignore_env),
-        preserved_prefetch_max_keys: file_config.cache.as_ref().and_then(|c| c.prefetch_max_keys),
-        preserved_prefetch_max_bytes: file_config
-            .cache
-            .as_ref()
-            .and_then(|c| c.prefetch_max_bytes.clone()),
-        preserved_prefetch_deadline_secs: file_config
-            .cache
-            .as_ref()
-            .and_then(|c| c.prefetch_deadline_secs),
+        file_config: file_config.clone(),
     }
 }
 
@@ -1183,29 +971,7 @@ fn do_save(state: &mut EditorState) {
 /// the editor status. Split out from [`do_save`] (which targets the env-resolved
 /// config path) so the save + status logic is unit-testable against a temp path.
 fn do_save_to(state: &mut EditorState, path: &std::path::Path) {
-    let config = fields_to_file_config(
-        &state.fields,
-        state.preserved_planner.clone(),
-        state.preserved_cc.clone(),
-        state.preserved_paths.clone(),
-        state.preserved_advanced.clone(),
-        state.preserved_local_only,
-        state.preserved_volumes.clone(),
-        state.preserved_remote_readonly,
-        state.preserved_modified_input_guard,
-        state.preserved_input_predictions,
-        state.preserved_local_hit_daemon,
-        state.preserved_windows_hardlink,
-        state.preserved_auto_gc,
-        state.preserved_gc_evict_shared,
-        state.preserved_storage_layout_advice,
-        state.preserved_heartbeat_secs,
-        state.preserved_explain_miss,
-        state.preserved_ignore_env,
-        state.preserved_prefetch_max_keys,
-        state.preserved_prefetch_max_bytes.clone(),
-        state.preserved_prefetch_deadline_secs,
-    );
+    let config = fields_to_file_config(&state.fields, &state.file_config);
     match Config::save_file_config_to(&config, path) {
         Ok(()) => {
             state.dirty = false;
@@ -1526,6 +1292,7 @@ fn draw_footer(f: &mut ratatui::Frame, path_area: Rect, keys_area: Rect, state: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{PathsFileConfig, PlannerFileConfig};
 
     fn absolute_test_path() -> String {
         std::env::temp_dir()
@@ -2036,6 +1803,112 @@ mod tests {
     }
 
     #[test]
+    fn editor_save_preserves_legacy_settings_while_applying_visible_edits() {
+        let source = include_str!("../tests/fixtures/config_editor_legacy.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, source).unwrap();
+        let (loaded, existed) = Config::load_raw_file_config_from(&path);
+        assert!(existed);
+        let mut state = initial_editor_state(&loaded, existed, &empty_env());
+        for (key, value) in [
+            ("cache_dir", "~/new-store"),
+            ("max_size", "55GiB"),
+            ("cache_executables", "false"),
+            ("clean_incremental", "true"),
+            ("preserve_incremental", "false"),
+            ("adaptive_incremental", "true"),
+            ("exclude", "target/**, generated/**"),
+            ("event_log_max_size", "21MiB"),
+            ("event_log_keep_lines", "903"),
+            ("fallback", "custom-wrapper"),
+            ("key_salt", "new-salt"),
+            ("s3_bucket", "new-bucket"),
+        ] {
+            state
+                .fields
+                .iter_mut()
+                .find(|f| f.key == key)
+                .unwrap()
+                .value = value.to_string();
+        }
+        run_all_validation(&mut state.fields);
+        assert!(!has_validation_errors(&state.fields));
+        do_save_to(&mut state, &path);
+        assert_eq!(state.status.as_deref(), Some("Saved!"));
+
+        let mut expected: toml::Value = toml::from_str(source).unwrap();
+        let updates: toml::Table = toml::from_str(
+            r#"
+            local_store = "~/new-store"
+            local_max_size = "55GiB"
+            cache_executables = false
+            clean_incremental = true
+            preserve_incremental = false
+            adaptive_incremental = true
+            exclude = ["target/**", "generated/**"]
+            event_log_max_size = "21MiB"
+            event_log_keep_lines = 903
+            fallback = "custom-wrapper"
+            key_salt = "new-salt"
+        "#,
+        )
+        .unwrap();
+        let cache = expected["cache"].as_table_mut().unwrap();
+        cache.extend(updates);
+        let remote = cache["remote"].as_table_mut().unwrap();
+        remote.insert("type".into(), "s3".into());
+        remote.insert("bucket".into(), "new-bucket".into());
+        let user_agent = remote.remove("user-agent").unwrap();
+        remote.insert("user_agent".into(), user_agent);
+        let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved, expected,
+            "unedited settings must survive a real file save"
+        );
+    }
+
+    #[test]
+    fn editor_save_clears_visible_values_without_clearing_hidden_settings() {
+        let source = include_str!("../tests/fixtures/config_editor_legacy.toml");
+        let loaded: FileConfig = toml::from_str(source).unwrap();
+        let mut state = initial_editor_state(&loaded, true, &empty_env());
+        for field in &mut state.fields {
+            field.value.clear();
+        }
+        run_all_validation(&mut state.fields);
+        assert!(!has_validation_errors(&state.fields));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        do_save_to(&mut state, &path);
+        assert_eq!(state.status.as_deref(), Some("Saved!"));
+
+        let mut expected: toml::Value = toml::from_str(source).unwrap();
+        let cache = expected["cache"].as_table_mut().unwrap();
+        for key in [
+            "local_store",
+            "local_max_size",
+            "cache_executables",
+            "clean_incremental",
+            "preserve_incremental",
+            "adaptive_incremental",
+            "exclude",
+            "event_log_max_size",
+            "event_log_keep_lines",
+            "fallback",
+            "key_salt",
+            "remote",
+        ] {
+            assert!(cache.remove(key).is_some(), "fixture must set {key}");
+        }
+        let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved, expected,
+            "clearing form fields must restore their defaults"
+        );
+    }
+
+    #[test]
     fn test_fields_to_file_config_roundtrip() {
         let original = FileConfig {
             cc: None,
@@ -2116,39 +1989,7 @@ mod tests {
         };
 
         let fields = build_fields(&original, &empty_env());
-        let preserved = original.cache.as_ref().and_then(|c| c.planner.clone());
-        let reconstructed = fields_to_file_config(
-            &fields,
-            preserved,
-            original.cc.clone(),
-            original.paths.clone(),
-            PreservedAdvancedConfig::from_file_config(&original),
-            original.cache.as_ref().and_then(|c| c.local_only),
-            original.cache.as_ref().and_then(|c| c.volumes.clone()),
-            original.cache.as_ref().and_then(|c| c.remote_readonly),
-            original.cache.as_ref().and_then(|c| c.modified_input_guard),
-            original.cache.as_ref().and_then(|c| c.input_predictions),
-            original.cache.as_ref().and_then(|c| c.local_hit_daemon),
-            original.cache.as_ref().and_then(|c| c.windows_hardlink),
-            original.cache.as_ref().and_then(|c| c.auto_gc),
-            original.cache.as_ref().and_then(|c| c.gc_evict_shared),
-            original
-                .cache
-                .as_ref()
-                .and_then(|c| c.storage_layout_advice),
-            original.cache.as_ref().and_then(|c| c.heartbeat_secs),
-            original.cache.as_ref().and_then(|c| c.explain_miss),
-            original.cache.as_ref().and_then(|c| c.ignore_env),
-            original.cache.as_ref().and_then(|c| c.prefetch_max_keys),
-            original
-                .cache
-                .as_ref()
-                .and_then(|c| c.prefetch_max_bytes.clone()),
-            original
-                .cache
-                .as_ref()
-                .and_then(|c| c.prefetch_deadline_secs),
-        );
+        let reconstructed = fields_to_file_config(&fields, &original);
 
         let cache = reconstructed.cache.as_ref().unwrap();
         assert_eq!(
@@ -2239,40 +2080,41 @@ mod tests {
 
         let state = initial_editor_state(&loaded, true, &empty_env());
         assert_eq!(
-            state.preserved_advanced.key_env_vars.as_deref(),
+            state
+                .file_config
+                .cache
+                .as_ref()
+                .unwrap()
+                .key_env_vars
+                .as_deref(),
             Some(&["BOLTFFI_*".to_string()][..])
         );
         assert_eq!(
-            state.preserved_advanced.path_only_env_vars.as_deref(),
+            state
+                .file_config
+                .cache
+                .as_ref()
+                .unwrap()
+                .path_only_env_vars
+                .as_deref(),
             Some(&["BUILDCONFIG_RS".to_string()][..])
         );
-        assert_eq!(state.preserved_advanced.daemon_idle_timeout_secs, Some(600));
-        assert_eq!(state.preserved_advanced.scheduler, Some(false));
+        assert_eq!(
+            state
+                .file_config
+                .cache
+                .as_ref()
+                .unwrap()
+                .daemon_idle_timeout_secs,
+            Some(600)
+        );
+        assert_eq!(
+            state.file_config.cache.as_ref().unwrap().scheduler,
+            Some(false)
+        );
 
         // ...and back out again through the save path.
-        let saved = fields_to_file_config(
-            &state.fields,
-            state.preserved_planner.clone(),
-            state.preserved_cc.clone(),
-            state.preserved_paths.clone(),
-            state.preserved_advanced.clone(),
-            state.preserved_local_only,
-            state.preserved_volumes.clone(),
-            state.preserved_remote_readonly,
-            state.preserved_modified_input_guard,
-            state.preserved_input_predictions,
-            state.preserved_local_hit_daemon,
-            state.preserved_windows_hardlink,
-            state.preserved_auto_gc,
-            state.preserved_gc_evict_shared,
-            state.preserved_storage_layout_advice,
-            state.preserved_heartbeat_secs,
-            state.preserved_explain_miss,
-            state.preserved_ignore_env,
-            state.preserved_prefetch_max_keys,
-            state.preserved_prefetch_max_bytes.clone(),
-            state.preserved_prefetch_deadline_secs,
-        );
+        let saved = fields_to_file_config(&state.fields, &state.file_config);
         let cache = saved.cache.as_ref().expect("cache section written");
         assert_eq!(
             cache.key_env_vars.as_deref(),
@@ -2303,29 +2145,7 @@ mod tests {
         };
 
         let fields = build_fields(&original, &empty_env());
-        let reconstructed = fields_to_file_config(
-            &fields,
-            None,
-            None,
-            None,
-            PreservedAdvancedConfig::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let reconstructed = fields_to_file_config(&fields, &original);
         let remote = reconstructed
             .cache
             .as_ref()
@@ -2355,29 +2175,7 @@ mod tests {
             .unwrap();
         ua_field.value = "custom-agent/1.0".to_string();
 
-        let result = fields_to_file_config(
-            &fields,
-            None,
-            None,
-            None,
-            PreservedAdvancedConfig::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let result = fields_to_file_config(&fields, &config);
         let remote = result
             .cache
             .as_ref()
@@ -2397,29 +2195,7 @@ mod tests {
     fn test_fields_to_file_config_empty_omits_remote() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        let result = fields_to_file_config(
-            &fields,
-            None,
-            None,
-            None,
-            PreservedAdvancedConfig::default(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let result = fields_to_file_config(&fields, &config);
         assert!(result.cache.as_ref().unwrap().remote.is_none());
     }
 
@@ -2481,26 +2257,7 @@ mod tests {
             file_had_content: false,
             has_saved_once: false,
             scroll_offset: 0,
-            preserved_planner: None,
-            preserved_cc: None,
-            preserved_paths: None,
-            preserved_advanced: PreservedAdvancedConfig::default(),
-            preserved_local_only: None,
-            preserved_volumes: None,
-            preserved_remote_readonly: None,
-            preserved_modified_input_guard: None,
-            preserved_input_predictions: None,
-            preserved_local_hit_daemon: None,
-            preserved_windows_hardlink: None,
-            preserved_auto_gc: None,
-            preserved_gc_evict_shared: None,
-            preserved_storage_layout_advice: None,
-            preserved_heartbeat_secs: None,
-            preserved_explain_miss: None,
-            preserved_ignore_env: None,
-            preserved_prefetch_max_keys: None,
-            preserved_prefetch_max_bytes: None,
-            preserved_prefetch_deadline_secs: None,
+            file_config: FileConfig::default(),
         }
     }
 

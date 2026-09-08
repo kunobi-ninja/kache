@@ -4465,6 +4465,9 @@ impl Daemon {
             }
         };
 
+        // Parsing owns the catalog data. Release its download reservation
+        // before scheduling pack GETs against the same memory budget.
+        drop(catalog_object);
         let selected = catalog
             .packs
             .iter()
@@ -4508,7 +4511,7 @@ impl Daemon {
                         .packed_prefetch_get(
                             backend.as_ref(),
                             &key,
-                            crate::remote_pack::DEFAULT_MAX_PACK_BYTES,
+                            pack_ref.pack_bytes,
                             "packed-prefetch pack GET",
                         )
                         .await
@@ -4524,13 +4527,12 @@ impl Daemon {
                 };
                 (pack_ref, object)
             })
-            .buffer_unordered(prefetch_concurrency_cap(self.config.s3_concurrency))
-            .collect::<Vec<_>>()
-            .await;
-        fetched.sort_by(|(left, _), (right, _)| left.digest.cmp(&right.digest));
+            .buffer_unordered(prefetch_concurrency_cap(self.config.s3_concurrency));
 
         let mut verified = Vec::new();
-        for (pack_ref, pack_object) in fetched {
+        // Consume each body as it arrives. Retaining completed bodies while
+        // waiting for another GET can fill the budget and block that GET.
+        while let Some((pack_ref, pack_object)) = fetched.next().await {
             let Some(pack_object) = pack_object else {
                 continue;
             };
@@ -13666,6 +13668,46 @@ mod tests {
         v3_gets: AtomicU64,
     }
 
+    struct ReorderedPackBackend {
+        inner: Arc<dyn crate::remote_backend::RemoteBackend>,
+        first_key: String,
+        later_downloaded: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::remote_backend::RemoteBackend for ReorderedPackBackend {
+        async fn head(&self, key: &str) -> Result<bool> {
+            self.inner.head(key).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            max_bytes: Option<u64>,
+        ) -> Result<Option<crate::remote_backend::GetObject>> {
+            if key == self.first_key {
+                self.later_downloaded.notified().await;
+            }
+            let object = self.inner.get(key, max_bytes).await?;
+            if key != self.first_key && key.contains("/v4/prefetch/packs/") {
+                self.later_downloaded.notify_one();
+            }
+            Ok(object)
+        }
+
+        async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()> {
+            self.inner.put(key, body, content_type).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+
+        fn describe(&self, key: &str) -> String {
+            self.inner.describe(key)
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::remote_backend::RemoteBackend for BlockingV3Backend {
         async fn head(&self, key: &str) -> Result<bool> {
@@ -14366,6 +14408,106 @@ mod tests {
         assert!(prefetched.contains(&sentinel));
         assert!(prefetched.contains(&key_a));
         assert!(prefetched.contains(&key_b));
+    }
+
+    #[tokio::test]
+    async fn packed_prefetch_drains_bodies_with_room_for_only_one_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        let remote = test_remote_config();
+        config.remote = Some(remote.clone());
+        config.prefetch_max_bytes = 0;
+        config.s3_concurrency = 4;
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> = Arc::new(
+            crate::remote_backend::memory_backend_with_download_budget(1),
+        );
+        let daemon = Arc::new(Daemon::new(config));
+        let context = PackPrefetchContext::from_deps(
+            crate::identity::host_target_triple(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let mut packs = Vec::new();
+        let mut candidates = Vec::new();
+        for name in ["first", "second", "third"] {
+            let key = test_cache_key(name);
+            let (payload, meta_digest) = build_entry_pack_with_meta(&key, name);
+            let built = crate::remote_pack::build_pack(
+                "prefix",
+                vec![crate::remote_pack::PackInputEntry {
+                    cache_key: key.clone(),
+                    crate_name: name.into(),
+                    meta_digest: meta_digest.clone(),
+                    payload,
+                }],
+                1 << 20,
+            )
+            .unwrap();
+            put_test_object(&backend, &built.object_key, &built.bytes).await;
+            packs.push(crate::remote_pack::CatalogPackRef {
+                digest: built.digest,
+                pack_bytes: built.bytes.len() as u64,
+                entries: vec![crate::remote_pack::CatalogEntry {
+                    cache_key: key.clone(),
+                    crate_name: name.into(),
+                    meta_digest,
+                }],
+            });
+            candidates.push((key.clone(), name.into(), daemon.entry_dir_for(&key)));
+        }
+        let now = epoch_ms();
+        let encoded = crate::remote_pack::encode_catalog(
+            "prefix",
+            crate::remote_pack::PackCatalog {
+                version: crate::remote_pack::CATALOG_VERSION,
+                key_schema: crate::cache_key::CACHE_KEY_VERSION,
+                manifest_key: context.manifest_key.clone(),
+                namespace: context.namespace.clone(),
+                selector_hash: context.selector.clone(),
+                shard_hashes: context.shard_hashes.clone(),
+                created_at_ms: now,
+                expires_at_ms: now + 60_000,
+                packs,
+                fallback_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+        put_test_object(&backend, &encoded.object_key, &encoded.bytes).await;
+        // A later pack holds the only reservation before the first GET starts.
+        // Waiting for input order would retain that body and deadlock the first.
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(ReorderedPackBackend {
+                inner: backend,
+                first_key: crate::remote_pack::pack_object_key(
+                    "prefix",
+                    &encoded.catalog.packs[0].digest,
+                )
+                .unwrap(),
+                later_downloaded: Notify::new(),
+            });
+        let imported = tokio::time::timeout(
+            Duration::from_secs(3),
+            daemon.try_packed_prefetch(&context, &backend, &remote, &candidates, 0),
+        )
+        .await
+        .expect("catalog and pack bodies must be released while the queue is draining");
+        assert_eq!(imported.len(), 3);
+        for (key, _, _) in candidates {
+            assert!(imported.contains(&key));
+            assert!(
+                daemon
+                    .with_store(|store| Ok(store.get(&key)?.is_some()))
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .pack_requests_total
+                .load(Ordering::Relaxed),
+            5
+        );
     }
 
     #[tokio::test]

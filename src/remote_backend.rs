@@ -4,6 +4,10 @@
 //! ([`crate::remote`]) speak in opaque byte objects addressed by key. OpenDAL
 //! supplies the concrete S3 and shared-filesystem transports behind this seam.
 
+mod download_memory;
+
+use download_memory::{BudgetedBody, DOWNLOAD_MEMORY, DownloadMemory};
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,7 +67,8 @@ const LIST_MAX_KEY_BYTES: usize = 256 * 1024 * 1024;
 /// A fetched object plus the timing split callers report as transfer telemetry.
 #[derive(Debug)]
 pub struct GetObject {
-    /// `Bytes` so a restore does not copy the whole pack a second time.
+    /// Clones share the allocation and its memory reservation. Consume or drop
+    /// buffered objects before waiting for more downloads from the same budget.
     pub body: Bytes,
     /// Time to response headers, ms.
     pub request_ms: u64,
@@ -159,6 +164,7 @@ pub struct OpenDalBackend {
     /// "this backend writes real paths", which enables the extra key rules and the
     /// write-containment check.
     filesystem_root: Option<PathBuf>,
+    download_memory: Arc<DownloadMemory>,
 }
 
 impl OpenDalBackend {
@@ -167,6 +173,7 @@ impl OpenDalBackend {
             operator,
             root_description,
             filesystem_root: None,
+            download_memory: DOWNLOAD_MEMORY.clone(),
         }
     }
 
@@ -279,6 +286,13 @@ pub(crate) fn memory_backend() -> OpenDalBackend {
     OpenDalBackend::new(operator, "memory://test".to_string())
 }
 
+#[cfg(test)]
+pub(crate) fn memory_backend_with_download_budget(kib: u32) -> OpenDalBackend {
+    let mut backend = memory_backend();
+    backend.download_memory = Arc::new(DownloadMemory::new(kib));
+    backend
+}
+
 #[async_trait]
 impl RemoteBackend for OpenDalBackend {
     async fn head(&self, key: &str) -> Result<bool> {
@@ -291,12 +305,17 @@ impl RemoteBackend for OpenDalBackend {
     }
 
     async fn get(&self, key: &str, max_bytes: Option<u64>) -> Result<Option<GetObject>> {
+        self.validate_key("GET", key, false)?;
+        let memory = self.download_memory.acquire(max_bytes).await?;
         let mut body = Vec::new();
         let Some(transfer) = self.get_into(key, max_bytes, &mut body).await? else {
             return Ok(None);
         };
         Ok(Some(GetObject {
-            body: Bytes::from(body),
+            body: Bytes::from_owner(BudgetedBody {
+                body: Bytes::from(body),
+                _memory: memory,
+            }),
             request_ms: transfer.request_ms,
             body_ms: transfer.body_ms,
         }))
@@ -1081,6 +1100,70 @@ mod tests {
                 .contains("writing body of memory://test/key"),
             "{error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn separate_backends_share_memory_until_the_last_body_clone_is_dropped() {
+        let mut first = memory_backend();
+        let mut second = memory_backend();
+        assert!(Arc::ptr_eq(&first.download_memory, &second.download_memory));
+        let budget = Arc::new(DownloadMemory::new(10));
+        first.download_memory = budget.clone();
+        second.download_memory = budget;
+        first.put("key", b"hello".to_vec(), None).await.unwrap();
+        second.put("key", b"world".to_vec(), None).await.unwrap();
+        let body = first.get("key", Some(5 << 10)).await.unwrap().unwrap().body;
+        let clone = body.clone();
+        drop(body);
+        let deadline = crate::remote_resilience::RemoteDeadline::from_millis(10);
+        let error = deadline
+            .run("download memory", second.get("key", Some(5 << 10)))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::remote_resilience::RemoteDeadlineElapsed>()
+                .is_some()
+        );
+        drop(clone);
+        let object = tokio::time::timeout(Duration::from_secs(1), second.get("key", Some(5 << 10)))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.body, "world");
+    }
+
+    #[tokio::test]
+    async fn misses_and_failed_reads_release_download_memory() {
+        let backend = memory_backend_with_download_budget(1);
+        backend.put("key", b"hello".to_vec(), None).await.unwrap();
+        assert!(backend.get("absent", Some(5)).await.unwrap().is_none());
+        assert!(backend.get("key", Some(4)).await.is_err());
+        let object = tokio::time::timeout(Duration::from_secs(1), backend.get("key", Some(5)))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.body, "hello");
+    }
+
+    #[tokio::test]
+    async fn streaming_downloads_do_not_wait_for_buffered_memory() {
+        let backend = memory_backend_with_download_budget(1);
+        backend.put("key", b"hello".to_vec(), None).await.unwrap();
+        let buffered = backend.get("key", Some(5)).await.unwrap().unwrap();
+        let mut file = tokio::fs::File::from_std(tempfile::tempfile().unwrap());
+        let transfer = tokio::time::timeout(
+            Duration::from_secs(1),
+            backend.get_into("key", Some(5), &mut file),
+        )
+        .await
+        .expect("a disk download must not wait for a body-buffer reservation")
+        .unwrap()
+        .unwrap();
+        assert_eq!(transfer.bytes, 5);
+        assert_eq!(buffered.body, "hello");
     }
 
     #[tokio::test]

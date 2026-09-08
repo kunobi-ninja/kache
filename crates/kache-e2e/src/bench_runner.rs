@@ -905,6 +905,14 @@ fn otlp_phase(
         weighted_hit_rate_pct: Some(metrics.weighted_hit_rate_pct),
         leak_warnings: Some(metrics.leak_warnings),
         objdir_bytes,
+        // The two categories kache's own RefuseReason draws: a probe that was
+        // never a compilation, and a real compile it does not model yet. The
+        // second is a backlog item with a number on it; the first never will
+        // be. Summed together they say only "some things were skipped".
+        passthrough: vec![
+            ("not-a-compile", metrics.event_log.probed),
+            ("unsupported", metrics.event_log.passed_through),
+        ],
         top_misses: metrics
             .top_misses
             .iter()
@@ -942,6 +950,8 @@ fn otlp_sccache_phase(
         weighted_hit_rate_pct: None,
         leak_warnings: None,
         objdir_bytes,
+        // sccache reports no passthrough breakdown.
+        passthrough: Vec::new(),
         // sccache reports neither: it has no per-unit cost breakdown, and no
         // count of what it looked at without consulting the cache.
         top_misses: Vec::new(),
@@ -2754,6 +2764,11 @@ fn otlp_mbx_phase(
         weighted_hit_rate_pct: None,
         leak_warnings: None,
         objdir_bytes,
+        // Its report splits bypasses eleven ways, on a vocabulary of its own
+        // that does not map onto kache's two categories without inventing the
+        // mapping. The total is comparable; the split is not, so only the
+        // total is carried.
+        passthrough: vec![("declined", metrics.bypassed)],
         // No per-unit cost in its report.
         top_misses: Vec::new(),
         unconsulted: Some(metrics.unconsulted),
@@ -5942,6 +5957,30 @@ build = "sleep 0.2"
         assert!(!stale.exists(), "the objdir is wiped before the build");
         assert!(work_dir.join("build-cold.log").exists());
         assert!(work_dir.join("wrapper-cold.log").exists());
+    }
+
+    /// The two refusal categories must reach the payload as two numbers, from
+    /// the two counters that mean different things: `probed` is a query that
+    /// was never a compilation, `passed_through` a real compile kache does not
+    /// model yet. Collapsing them into one loses the only part anyone can act
+    /// on, and does so without any test on the emitter noticing -- the emitter
+    /// is handed whatever this function built.
+    #[test]
+    fn the_refusal_categories_come_from_their_own_counters() {
+        let metrics = PhaseMetrics {
+            event_log: EventLogStats {
+                probed: 272,
+                passed_through: 12,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let phase = otlp_phase("warm", &metrics, 0);
+        assert_eq!(
+            phase.passthrough,
+            vec![("not-a-compile", 272), ("unsupported", 12)],
+            "the categories must not be summed or swapped"
+        );
     }
 
     /// The same-tree warm is a phase of the same gauges, present only when it

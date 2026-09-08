@@ -57,7 +57,17 @@ pub(crate) struct Lease {
     unit: AdaptiveUnit,
     kind: LeaseKind,
     completion: Completion,
-    _lock: File,
+    _lock: UnitLock,
+}
+
+struct UnitLock(File);
+
+impl Drop for UnitLock {
+    fn drop(&mut self) {
+        // Closing our descriptor is insufficient if a concurrent fork still
+        // holds a duplicate. Release ownership before that child reaches exec.
+        let _ = self.0.unlock();
+    }
 }
 
 #[derive(Debug)]
@@ -378,7 +388,7 @@ impl AdaptiveUnit {
         stored
     }
 
-    fn lock(&self) -> Option<File> {
+    fn lock(&self) -> Option<UnitLock> {
         if !self.ensure_layout() {
             return None;
         }
@@ -397,7 +407,7 @@ impl AdaptiveUnit {
             return None;
         }
         match file.try_lock() {
-            Ok(()) => Some(file),
+            Ok(()) => Some(UnitLock(file)),
             Err(std::fs::TryLockError::WouldBlock | std::fs::TryLockError::Error(_)) => None,
         }
     }
@@ -876,6 +886,41 @@ mod tests {
             .unwrap();
         fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
         assert!(lease.finish_at(true, at + 2));
+    }
+
+    #[test]
+    fn unit_lock_release_does_not_wait_for_inherited_descriptors() {
+        let (_temp, _args, unit) = fixture();
+        let owner = unit.lock().unwrap();
+        // A concurrent fork can inherit the same open file description until
+        // exec closes it. A duplicate reproduces that lifetime without timing.
+        let inherited = owner.0.try_clone().unwrap();
+        assert!(unit.lock().is_none(), "the owner still holds the lock");
+        drop(owner);
+        let next = unit
+            .lock()
+            .expect("release must not wait for an inherited fd");
+        drop(next);
+        drop(inherited);
+    }
+
+    #[test]
+    fn finished_and_abandoned_leases_release_inherited_locks() {
+        for finish in [false, true] {
+            let (_temp, _args, unit) = fixture();
+            let lease = unit.try_immediate_at(100).unwrap();
+            let inherited = lease._lock.0.try_clone().unwrap();
+            assert!(unit.lock().is_none(), "a live lease remains exclusive");
+            if finish {
+                fs::write(unit.rustc_dir.join("dep-graph.bin"), b"compiled").unwrap();
+                assert!(lease.finish_at(true, 101));
+            } else {
+                drop(lease);
+            }
+            let next = unit.lock().expect("the lease must release its lock");
+            drop(next);
+            drop(inherited);
+        }
     }
 
     #[test]

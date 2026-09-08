@@ -36,6 +36,9 @@ fn kache(home: &Path, cache_dir: &Path) -> Command {
     cmd.env("KACHE_LOG", "off")
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
+        .env("SHELL", "/bin/bash")
+        .env_remove("ZDOTDIR")
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         // Daemons spawned during tests must self-exit quickly instead of
         // lingering indefinitely — otherwise, under `just coverage`,
         // they pile up and CPU-starve the rest of the suite.
@@ -1149,7 +1152,153 @@ fn init_check_is_a_dry_run() {
     // --check prints intended changes without modifying anything.
     let e = env();
     std::fs::create_dir_all(e.home.join(".cargo")).unwrap();
-    e.cmd().args(["init", "--check"]).assert().success();
+    let output = e
+        .cmd()
+        .args(["init", "--check", "--yes"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(!output.contains("[Y/n]"));
+    assert!(!e.home.join(".cargo/config.toml").exists());
+    assert!(!e.home.join(".bashrc").exists());
+    assert!(!e.home.join(".bash_profile").exists());
+    assert!(!e.home.join(".local/lib/kache/shims").exists());
+    assert!(!e.cache.join("daemon.sock").exists());
+}
+
+#[test]
+fn init_eof_does_not_accept_changes() {
+    let e = env();
+    e.cmd().args(["init", "--no-service"]).assert().success();
+    assert!(!e.home.join(".cargo/config.toml").exists());
+    assert!(!e.home.join(".bashrc").exists());
+    assert!(!e.home.join(".local/lib/kache/shims").exists());
+    assert!(!e.cache.join("daemon.sock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
+    let e = env();
+    let cargo = e.home.join(".cargo/config.toml");
+    std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+    let original = "[build]\nrustc-wrapper = \"sccache\"\n[env]\nHOST_CC = \"custom-cc\"\n";
+    std::fs::write(&cargo, original).unwrap();
+    std::fs::write(e.home.join(".bashrc"), "# user rc\n").unwrap();
+    std::fs::write(e.home.join(".profile"), "# user profile\n").unwrap();
+    let output = e
+        .cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("y\ny\nn\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("Replace sccache with Kache for Cargo builds?"));
+    assert!(output.contains("Open a new terminal"));
+    assert!(!output.contains("Setup complete"));
+    assert!(!output.contains("PKGBUILD"));
+    assert!(
+        !e.home.join(".bash_profile").exists(),
+        "must not shadow .profile"
+    );
+    let configured = std::fs::read_to_string(&cargo).unwrap();
+    assert!(configured.contains("rustc-wrapper = \"kache\""));
+    assert!(configured.contains("HOST_CC = \"custom-cc\""));
+    assert!(configured.contains("HOST_CXX = \"kache c++\""));
+    let backup = std::fs::read_dir(cargo.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".kache-cargo-backup-")
+        })
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+    let before = std::fs::read_to_string(e.home.join(".bashrc")).unwrap();
+    assert!(before.starts_with("# user rc\n"));
+    assert_eq!(before.matches("# >>> kache compiler cache >>>").count(), 1);
+    for name in ["cc", "c++", "gcc", "g++", "clang", "clang++"] {
+        assert_eq!(
+            std::fs::canonicalize(e.home.join(".local/lib/kache/shims").join(name)).unwrap(),
+            std::fs::canonicalize(KACHE_BIN).unwrap()
+        );
+    }
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("n\n")
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(e.home.join(".bashrc")).unwrap(),
+        before
+    );
+    assert_eq!(std::fs::read_to_string(&cargo).unwrap(), configured);
+    let shell = std::process::Command::new("/bin/bash")
+        .args([
+            "--noprofile",
+            "--rcfile",
+            e.home.join(".bashrc").to_str().unwrap(),
+            "-ic",
+            "command -v cc",
+        ])
+        .env("HOME", &e.home)
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("BASH_ENV")
+        .output()
+        .unwrap();
+    assert!(shell.status.success());
+    assert_eq!(
+        String::from_utf8(shell.stdout).unwrap().trim(),
+        e.home.join(".local/lib/kache/shims/cc").to_str().unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_zsh_uses_zdotdir_and_no_shell_skips_terminal_changes() {
+    let e = env();
+    let zdotdir = e.home.join("custom-zsh");
+    e.cmd()
+        .env("SHELL", "/bin/zsh")
+        .env("ZDOTDIR", &zdotdir)
+        .args(["init", "--no-service"])
+        .write_stdin("y\ny\nn\n")
+        .assert()
+        .success();
+    assert!(zdotdir.join(".zshrc").exists());
+    assert!(!e.home.join(".zshrc").exists());
+    if Path::new("/bin/zsh").exists() {
+        let output = std::process::Command::new("/bin/zsh")
+            .args(["-ic", "command -v cc"])
+            .env("HOME", &e.home)
+            .env("ZDOTDIR", &zdotdir)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            e.home.join(".local/lib/kache/shims/cc").to_str().unwrap()
+        );
+    }
+    let skipped = env();
+    skipped
+        .cmd()
+        .args(["init", "--no-service", "--no-shell"])
+        .write_stdin("y\nn\n")
+        .assert()
+        .success();
+    assert!(skipped.home.join(".cargo/config.toml").exists());
+    assert!(!skipped.home.join(".local/lib/kache/shims").exists());
+    assert!(!skipped.home.join(".bashrc").exists());
 }
 
 #[test]
@@ -1167,6 +1316,101 @@ fn init_noninteractive_writes_isolated_cargo_config() {
         cargo_home.join("config.toml").exists(),
         "init should have written an isolated cargo config"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_repairs_each_half_of_terminal_setup_and_reports_activation() {
+    let e = env();
+    let shims = e.home.join(".local/lib/kache/shims");
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("\ny\nn\n")
+        .assert()
+        .success();
+    let rc = e.home.join(".bashrc");
+    let configured = std::fs::read_to_string(&rc).unwrap();
+    std::fs::write(&rc, "# new user configuration\n").unwrap();
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("yes\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Enable C/C++ caching in new terminals?",
+        ));
+    assert!(std::fs::read_to_string(&rc).unwrap().ends_with(&configured));
+    let repaired = std::fs::read_to_string(&rc).unwrap();
+
+    std::fs::remove_file(shims.join("cc")).unwrap();
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("y\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Enable C/C++ caching in new terminals?",
+        ));
+    assert_eq!(std::fs::read_to_string(&rc).unwrap(), repaired);
+    assert_eq!(
+        std::fs::canonicalize(shims.join("cc")).unwrap(),
+        std::fs::canonicalize(KACHE_BIN).unwrap()
+    );
+    e.cmd()
+        .env(
+            "PATH",
+            std::env::join_paths([shims.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+                .unwrap(),
+        )
+        .args(["init", "--no-service"])
+        .write_stdin("n\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Terminal C/C++ caching: active"))
+        .stdout(predicates::str::contains("Open a new terminal").not());
+
+    std::fs::remove_file(shims.join("cc")).unwrap();
+    std::fs::write(shims.join("cc"), "user-owned compiler").unwrap();
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("y\n")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("existing files"));
+    assert_eq!(
+        std::fs::read_to_string(shims.join("cc")).unwrap(),
+        "user-owned compiler"
+    );
+    assert_eq!(std::fs::read_to_string(rc).unwrap(), repaired);
+}
+
+#[cfg(unix)]
+#[test]
+fn init_leaves_unsupported_shells_and_managed_dotfiles_alone() {
+    let e = env();
+    e.cmd()
+        .env("SHELL", "/bin/unsupported")
+        .args(["init", "--no-service"])
+        .write_stdin("n\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("shell not supported"));
+    assert!(!e.home.join(".local/lib/kache/shims").exists());
+    let managed = e.home.join("managed-rc");
+    std::fs::write(&managed, "# managed config\n").unwrap();
+    std::os::unix::fs::symlink(&managed, e.home.join(".bashrc")).unwrap();
+    e.cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("n\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("No shell files were changed."));
+    assert_eq!(
+        std::fs::read_to_string(managed).unwrap(),
+        "# managed config\n"
+    );
+    assert!(!e.home.join(".bash_profile").exists());
+    assert!(!e.home.join(".local/lib/kache/shims").exists());
 }
 
 #[test]
@@ -1189,6 +1433,60 @@ fn init_writes_config_to_custom_cargo_home() {
         !e.home.join(".cargo").join("config.toml").exists(),
         "init must not touch ~/.cargo when CARGO_HOME points elsewhere"
     );
+}
+
+#[test]
+fn init_adds_native_caching_to_an_existing_rust_setup() {
+    let e = env();
+    let cargo = e.home.join(".cargo/config.toml");
+    std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+    std::fs::write(&cargo, "[build]\nrustc-wrapper = \"kache\"\n").unwrap();
+    e.cmd()
+        .args(["init", "--no-service", "--no-shell"])
+        .write_stdin("y\nn\n")
+        .assert()
+        .success();
+    let config: toml::Value = toml::from_str(&std::fs::read_to_string(cargo).unwrap()).unwrap();
+    assert_eq!(config["build"]["rustc-wrapper"].as_str(), Some("kache"));
+    assert_eq!(
+        config["env"]["CC_KNOWN_WRAPPER_CUSTOM"].as_str(),
+        Some("kache")
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(config["env"]["HOST_CC"].as_str(), Some("kache cc"));
+        assert_eq!(config["env"]["HOST_CXX"].as_str(), Some("kache c++"));
+    }
+    #[cfg(windows)]
+    {
+        // Init leaves the choice between MSVC and clang-cl to the user.
+        assert!(config["env"].get("HOST_CC").is_none());
+        assert!(config["env"].get("HOST_CXX").is_none());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_ignores_empty_shell_config_directory_overrides() {
+    for (shell, config) in [
+        ("/bin/zsh", ".zshrc"),
+        ("/bin/fish", ".config/fish/config.fish"),
+    ] {
+        let e = env();
+        e.cmd()
+            .env("SHELL", shell)
+            .env("ZDOTDIR", "")
+            .env("XDG_CONFIG_HOME", "")
+            .args(["init", "--no-service"])
+            .write_stdin("y\ny\nn\n")
+            .assert()
+            .success();
+        assert!(
+            std::fs::read_to_string(e.home.join(config))
+                .unwrap()
+                .contains("# >>> kache compiler cache >>>")
+        );
+    }
 }
 
 #[test]

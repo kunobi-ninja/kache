@@ -7587,14 +7587,6 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_never_writes_an_init_edit() {
-        assert!(should_write_init_step(false, true));
-        assert!(!should_write_init_step(true, true));
-        assert!(!should_write_init_step(false, false));
-        assert!(!should_write_init_step(true, false));
-    }
-
-    #[test]
     fn test_cargo_wrapper_edit_create() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -7650,17 +7642,6 @@ mod tests {
         let new = apply_cargo_wrapper_edit(existing, &plan);
         assert!(new.contains("[net]"));
         assert!(new.trim_end().ends_with("rustc-wrapper = \"kache\""));
-    }
-
-    #[test]
-    fn test_backup_path_has_kache_backup_suffix() {
-        let path = std::path::Path::new("/tmp/cargo/config.toml");
-        let backup = backup_path_for(path).unwrap();
-        let name = backup.file_name().unwrap().to_string_lossy();
-        assert!(name.starts_with("config.toml.kache-backup."), "got {name}");
-        // Timestamp is a 15-char suffix: YYYYMMDD-HHMMSS
-        assert_eq!(name.len(), "config.toml.kache-backup.".len() + 15);
-        assert_eq!(backup.parent(), path.parent());
     }
 
     #[test]
@@ -10950,7 +10931,7 @@ mod tests {
 //   1b. Adds HOST_CC / HOST_CXX / CC_KNOWN_WRAPPER_CUSTOM under `[env]`
 //       when those keys are absent. Never sets CC or CXX.
 //   1c. Unix: offers compiler-name shims in ~/.local/lib/kache/shims.
-//       Does not edit PATH or shell rc.
+//       Saves shell PATH setup after confirmation; activation needs a new terminal.
 //   2. Installs the daemon as a login service (launchd/systemd)
 //   3. Starts the daemon
 //
@@ -11041,12 +11022,6 @@ pub(crate) fn apply_cargo_wrapper_edit(existing: &str, plan: &CargoWrapperPlan) 
     }
 }
 
-/// Whether an init file-edit step should write. Dry-run (`check`) never
-/// writes, even if the operator would have accepted the prompt.
-fn should_write_init_step(check: bool, accepted: bool) -> bool {
-    !check && accepted
-}
-
 fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bool> {
     use std::io::{BufRead, Write};
 
@@ -11061,23 +11036,15 @@ fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bo
 
     let stdin = std::io::stdin();
     let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
+    if stdin.lock().read_line(&mut line)? == 0 {
+        println!("skipped (no input; use --yes to accept defaults)");
+        return Ok(false);
+    }
     let trimmed = line.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
         return Ok(default_yes);
     }
     Ok(matches!(trimmed.as_str(), "y" | "yes"))
-}
-
-/// Build a timestamped sibling path for a pre-edit backup.
-///
-/// Format: `<name>.kache-backup.YYYYMMDD-HHMMSS`. Timestamped so repeated
-/// runs don't silently overwrite an earlier backup.
-fn backup_path_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    use chrono::Utc;
-    let file_name = path.file_name()?.to_string_lossy().into_owned();
-    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
-    Some(path.with_file_name(format!("{file_name}.kache-backup.{timestamp}")))
 }
 
 /// `$CARGO_HOME`, falling back to `~/.cargo` (cargo's documented default).
@@ -11106,161 +11073,82 @@ fn cargo_config_target_path() -> std::path::PathBuf {
     }
 }
 
-pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
-    println!();
-    println!("  kache init — set up cache wrapper and daemon");
-    println!();
-
+pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<()> {
+    println!("\n  Set up Kache\n");
     if check {
-        println!("  (dry-run — no files will be modified)");
-        println!();
+        println!("  Preview only. No files or services will change.\n");
     }
 
-    // ── Step 1: cargo config wrapper ─────────────────────────────
     let cargo_path = cargo_config_target_path();
     let plan = plan_cargo_wrapper_edit(&cargo_path)?;
-
-    match &plan {
-        CargoWrapperPlan::AlreadySet => {
-            println!(
-                "  \x1b[32m✓\x1b[0m rustc-wrapper already set to kache in {}",
-                crate::wrapper_config::display_path(&cargo_path)
-            );
-        }
-        other => {
-            let (summary, question) = match other {
-                CargoWrapperPlan::Create => (
-                    format!("create {} with rustc-wrapper = kache", cargo_path.display()),
-                    "Create cargo config?".to_string(),
-                ),
-                CargoWrapperPlan::Replace(old) => (
-                    format!(
-                        "replace rustc-wrapper = \"{old}\" with \"kache\" in {}",
-                        cargo_path.display()
-                    ),
-                    format!("Replace existing wrapper ({old}) with kache?"),
-                ),
-                CargoWrapperPlan::AddUnderBuild => (
-                    format!(
-                        "add rustc-wrapper = \"kache\" to existing [build] section in {}",
-                        cargo_path.display()
-                    ),
-                    "Add rustc-wrapper = kache?".to_string(),
-                ),
-                CargoWrapperPlan::AppendSection => (
-                    format!(
-                        "append [build] section with rustc-wrapper = \"kache\" to {}",
-                        cargo_path.display()
-                    ),
-                    "Append [build] section?".to_string(),
-                ),
-                CargoWrapperPlan::AlreadySet => unreachable!(),
-            };
-            println!("  \x1b[33m→\x1b[0m {summary}");
-            if should_write_init_step(check, prompt_yes_no(&question, true, yes)?) {
-                if let Some(parent) = cargo_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("creating {}", parent.display()))?;
-                }
-                // Back up existing content before overwriting, so users can restore
-                // if something goes sideways. Skipped for brand-new files (nothing
-                // to preserve).
-                if cargo_path.exists()
-                    && let Some(backup_path) = backup_path_for(&cargo_path)
-                {
-                    std::fs::copy(&cargo_path, &backup_path)
-                        .with_context(|| format!("writing backup to {}", backup_path.display()))?;
-                    println!(
-                        "    \x1b[32m✓\x1b[0m backup saved to {}",
-                        backup_path.display()
-                    );
-                }
-                let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
-                let new = apply_cargo_wrapper_edit(&existing, &plan);
-                std::fs::write(&cargo_path, new)
-                    .with_context(|| format!("writing {}", cargo_path.display()))?;
-                println!("    \x1b[32m✓\x1b[0m wrote {}", cargo_path.display());
-            }
-        }
-    }
-
-    // ── Step 1b: cargo [env] host C wrappers ─────────────────────
-    // HOST_CC/HOST_CXX wrap host compiles from the `cc` crate without replacing
-    // `cargo build --target`'s cross compiler. CC/CXX are never set here.
-    let env_missing = crate::cargo_env::missing_assignments_from_path(&cargo_path)?;
-    if env_missing.is_empty() {
-        println!(
-            "  \x1b[32m✓\x1b[0m cargo [env] host C wrappers already set in {}",
-            crate::wrapper_config::display_path(&cargo_path)
-        );
+    let existing = if plan == CargoWrapperPlan::Create {
+        String::new()
     } else {
-        let names = env_missing
-            .iter()
-            .map(|assignment| assignment.name)
-            .collect::<Vec<_>>()
-            .join(", ");
+        std::fs::read_to_string(&cargo_path).context("read Cargo configuration")?
+    };
+    let env_missing = crate::cargo_env::missing_assignments_from_path(&cargo_path)?;
+    let mut cargo_ready = plan == CargoWrapperPlan::AlreadySet && env_missing.is_empty();
+    if cargo_ready {
+        println!("  ✓ Cargo caching: configured");
+    } else {
+        println!("  Cargo caching: Rust and native dependencies");
         println!(
-            "  \x1b[33m→\x1b[0m set {names} in {} (does not set CC or CXX)",
+            "    Config: {}",
             crate::wrapper_config::display_path(&cargo_path)
         );
-        if should_write_init_step(
-            check,
-            prompt_yes_no(
-                "Set host C compiler wrappers for Cargo build scripts?",
-                true,
-                yes,
-            )?,
-        ) {
+        let question = if let CargoWrapperPlan::Replace(old) = &plan {
+            format!("Replace {old} with Kache for Cargo builds?")
+        } else {
+            "Enable caching for Cargo builds?".into()
+        };
+        if check {
+            println!("    Would configure Cargo. Existing compiler choices are preserved.");
+        } else if prompt_yes_no(&question, true, yes)? {
+            let wrapped = apply_cargo_wrapper_edit(&existing, &plan);
+            let updated = crate::cargo_env::apply_cargo_env_edit(&wrapped, &env_missing);
+            // Do not report success if a nonstandard existing wrapper could
+            // not be replaced by the formatting-preserving editor.
+            let parsed: toml::Value = toml::from_str(&updated)?;
+            anyhow::ensure!(
+                parsed
+                    .get("build")
+                    .and_then(|v| v.get("rustc-wrapper"))
+                    .and_then(toml::Value::as_str)
+                    == Some("kache"),
+                "could not update Cargo's existing wrapper; edit {} manually",
+                cargo_path.display()
+            );
             if let Some(parent) = cargo_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
+                std::fs::create_dir_all(parent)?;
             }
-            if cargo_path.exists()
-                && let Some(backup_path) = backup_path_for(&cargo_path)
-            {
-                std::fs::copy(&cargo_path, &backup_path)
-                    .with_context(|| format!("writing backup to {}", backup_path.display()))?;
+            if cargo_path.exists() {
+                use std::io::Write;
+                let mut backup = tempfile::Builder::new()
+                    .prefix(".kache-cargo-backup-")
+                    .tempfile_in(cargo_path.parent().context("Cargo config has no parent")?)?;
+                backup.write_all(existing.as_bytes())?;
+                backup.as_file().sync_all()?;
+                let (_, backup) = backup.keep()?;
                 println!(
-                    "    \x1b[32m✓\x1b[0m backup saved to {}",
-                    backup_path.display()
+                    "    Backup: {}",
+                    crate::wrapper_config::display_path(&backup)
                 );
             }
-            let existing = std::fs::read_to_string(&cargo_path).unwrap_or_default();
-            let new = crate::cargo_env::apply_cargo_env_edit(&existing, &env_missing);
-            std::fs::write(&cargo_path, new)
-                .with_context(|| format!("writing {}", cargo_path.display()))?;
-            println!("    \x1b[32m✓\x1b[0m wrote {}", cargo_path.display());
+            std::fs::write(&cargo_path, updated).context("save Cargo configuration")?;
+            cargo_ready = true;
+            println!("  ✓ Cargo caching: configured");
+        } else {
+            println!("  • Cargo caching: skipped");
         }
     }
 
-    // ── Step 1c: C/C++ compiler-name shims (Unix) ───────────────
-    // Creates ~/.local/lib/kache/shims. Does not edit shell rc or PATH.
     #[cfg(unix)]
-    {
-        let shim_dir = crate::compiler::shim::default_shim_dir();
-        if shim_dir_is_ready(&shim_dir) {
-            println!(
-                "  \x1b[32m✓\x1b[0m C/C++ shims already in {}",
-                shim_dir.display()
-            );
-            println!("    export PATH=\"{}:$PATH\"", shim_dir.display());
-        } else {
-            println!(
-                "  \x1b[33m→\x1b[0m install C/C++ compiler shims in {}",
-                shim_dir.display()
-            );
-            if should_write_init_step(
-                check,
-                prompt_yes_no(
-                    "Install C/C++ compiler shims for Make, CMake, and PKGBUILD?",
-                    true,
-                    yes,
-                )?,
-            ) {
-                install_shims(&shim_dir, false)?;
-            }
-        }
-    }
+    let shell_pending = init_compiler_setup(yes, no_shell, check)?;
+    #[cfg(not(unix))]
+    let shell_pending = {
+        let _ = no_shell;
+        false
+    };
 
     // ── Step 2: daemon service ───────────────────────────────────
     let service_path = crate::service::service_file_path();
@@ -11272,9 +11160,9 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
     let mut service_action_taken = false;
 
     if no_service {
-        println!("  \x1b[33m→\x1b[0m skipping service install (--no-service)");
+        println!("  \x1b[33m→\x1b[0m Login service: skipped (--no-service)");
     } else if let Some(mismatch) = service_mismatch {
-        println!("  \x1b[33m→\x1b[0m update daemon service to current kache binary");
+        println!("  \x1b[33m→\x1b[0m Background service: update to this Kache binary");
         println!("    installed: {}", mismatch.installed.display());
         println!("    current:   {}", mismatch.current.display());
         if !check && prompt_yes_no("Update service?", true, yes)? {
@@ -11283,12 +11171,12 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
         }
     } else if service_installed {
         println!(
-            "  \x1b[32m✓\x1b[0m daemon service already installed at {}",
+            "  \x1b[32m✓\x1b[0m Login service: configured ({})",
             service_path.as_ref().unwrap().display()
         );
     } else {
-        println!("  \x1b[33m→\x1b[0m install daemon as a login service (launchd/systemd)");
-        if !check && prompt_yes_no("Install service?", true, yes)? {
+        println!("  \x1b[33m→\x1b[0m Background service: start Kache when you log in");
+        if !check && prompt_yes_no("Start Kache automatically at login?", true, yes)? {
             crate::service::install()?;
             service_action_taken = true;
         }
@@ -11297,6 +11185,11 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
     // ── Step 3: daemon running ───────────────────────────────────
     // service::install() on macOS/Linux also starts the daemon, so skip the
     // manual start if we just installed it.
+    if check {
+        println!("  Background cache: would check and start if needed.");
+        println!("\n  Preview only. Run kache init to apply.\n");
+        return Ok(());
+    }
     let config = crate::config::Config::load().ok();
     let is_daemon_reachable = |cfg: &Option<crate::config::Config>| {
         cfg.as_ref()
@@ -11306,21 +11199,23 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
     let mut daemon_step_failed = false;
 
     if is_daemon_reachable(&config) {
-        println!("  \x1b[32m✓\x1b[0m daemon is running");
+        println!("  \x1b[32m✓\x1b[0m Background cache: running");
     } else if service_action_taken {
         // Service install typically starts the daemon. Give it a moment and re-check.
         std::thread::sleep(std::time::Duration::from_millis(500));
         if is_daemon_reachable(&config) {
-            println!("  \x1b[32m✓\x1b[0m daemon started by service");
+            println!("  \x1b[32m✓\x1b[0m Background cache: started");
         } else {
-            println!("  \x1b[33m→\x1b[0m daemon not reachable yet — it may take a few seconds");
+            println!(
+                "  \x1b[33m→\x1b[0m Background cache: still starting; check with kache doctor"
+            );
         }
     } else if service_installed {
         // Service is installed (from a previous run) but daemon isn't reachable.
         // Prefer `launchctl kickstart` / `systemctl restart` over a manual spawn
         // so the service manager clears any stale state (lockfiles, half-dead
         // processes) and owns the new process.
-        println!("  \x1b[33m→\x1b[0m restart daemon via service manager (daemon offline)");
+        println!("  \x1b[33m→\x1b[0m Background cache: stopped");
         if !check
             && prompt_yes_no("Restart daemon?", true, yes)?
             && let Some(ref cfg) = config
@@ -11334,7 +11229,7 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
             }
         }
     } else {
-        println!("  \x1b[33m→\x1b[0m start daemon in background");
+        println!("  \x1b[33m→\x1b[0m Background cache: not running");
         if !check && prompt_yes_no("Start daemon now?", true, yes)? {
             match crate::daemon::start_daemon_background()? {
                 true => println!("    \x1b[32m✓\x1b[0m daemon started"),
@@ -11347,19 +11242,104 @@ pub fn init(yes: bool, no_service: bool, check: bool) -> Result<()> {
     }
 
     println!();
-    if check {
-        println!("  Dry run complete — re-run without --check to apply.");
-        println!();
-        Ok(())
-    } else if daemon_step_failed {
-        println!("  \x1b[31m✗\x1b[0m Setup incomplete — see messages above.");
-        println!("     Run \x1b[1mkache doctor\x1b[0m for diagnostics.");
-        println!();
+    if daemon_step_failed {
+        println!("  Background cache setup failed. Run kache doctor for details.\n");
         anyhow::bail!("init did not complete: daemon not reachable");
+    }
+    if cargo_ready {
+        println!("  Ready for Cargo builds. Use cargo as usual.");
+    }
+    if shell_pending {
+        println!("  Open a new terminal to activate C/C++ caching.");
+    }
+    println!("  Run kache doctor to check this terminal.\n");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
+    use crate::init_shell::{Edit, Shell};
+    if no_shell {
+        println!("  • Terminal C/C++ caching: skipped (--no-shell)");
+        return Ok(false);
+    }
+    let shim_dir = crate::compiler::shim::default_shim_dir();
+    let home = dirs::home_dir().context("could not find your home directory")?;
+    let shell = std::env::var_os("SHELL")
+        .as_deref()
+        .and_then(|shell| Shell::detect(std::path::Path::new(shell)));
+    let Some(shell) = shell else {
+        println!("  • Terminal C/C++ caching: shell not supported for automatic setup");
+        println!(
+            "    Use kache install-shims, then add {} to your shell's PATH.",
+            shim_dir.display()
+        );
+        return Ok(false);
+    };
+    let zdotdir = std::env::var_os("ZDOTDIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let activation = shell.activation(&shim_dir)?;
+    let edits = shell
+        .paths(&home, zdotdir.as_deref(), xdg.as_deref())?
+        .into_iter()
+        .map(|path| Edit::plan(path, &activation))
+        .collect::<Result<Vec<_>>>();
+    let edits = match edits {
+        Ok(edits) => edits,
+        Err(error) => {
+            println!("  • Terminal C/C++ caching: shell config needs manual attention");
+            println!("    {error}");
+            println!("    No shell files were changed.");
+            return Ok(false);
+        }
+    };
+    let shims_ready = shim_dir_is_ready(&shim_dir);
+    let needs_edit = edits.iter().any(Edit::changed);
+    if !shims_ready || needs_edit {
+        println!("  C/C++ caching: terminal builds using cc, gcc or clang");
+        for edit in edits.iter().filter(|edit| edit.changed()) {
+            println!(
+                "    Shell config: {}",
+                crate::wrapper_config::display_path(&edit.path)
+            );
+        }
+        if check {
+            println!("    Would install compiler links and save the shell setup.");
+            return Ok(false);
+        }
+        if !prompt_yes_no("Enable C/C++ caching in new terminals?", true, yes)? {
+            println!("  • Terminal C/C++ caching: skipped");
+            return Ok(false);
+        }
+        if !shims_ready {
+            install_shims_named_with_output(&shim_dir, false, &[], false)?;
+            anyhow::ensure!(
+                shim_dir_is_ready(&shim_dir),
+                "existing files in {} prevent compiler setup; inspect them before using kache install-shims --force",
+                shim_dir.display()
+            );
+        }
+        for edit in &edits {
+            if let Some(backup) = edit.apply()? {
+                println!(
+                    "    Backup: {}",
+                    crate::wrapper_config::display_path(&backup)
+                );
+            }
+        }
+    }
+    if crate::compiler::shim::live_shim_path_status().on_path {
+        println!("  ✓ Terminal C/C++ caching: active");
+        Ok(false)
     } else {
-        println!("  Setup complete. Run \x1b[1mkache doctor\x1b[0m to verify.");
-        println!();
-        Ok(())
+        println!("  ✓ Terminal C/C++ caching: configured for new terminals");
+        println!("    For this terminal, run:");
+        println!("    {}", shell.command(&shim_dir)?);
+        Ok(true)
     }
 }
 
@@ -11388,15 +11368,20 @@ fn shim_dir_is_ready(dir: &std::path::Path) -> bool {
 /// dispatch so this stays a single, fully testable definition rather than two
 /// same-named ones the mutation lane cannot tell apart.
 #[cfg(unix)]
-pub(crate) fn install_shims(dir: &std::path::Path, force: bool) -> anyhow::Result<()> {
-    install_shims_named(dir, force, &[])
-}
-
-#[cfg(unix)]
 pub(crate) fn install_shims_named(
     dir: &std::path::Path,
     force: bool,
     extra_names: &[String],
+) -> anyhow::Result<()> {
+    install_shims_named_with_output(dir, force, extra_names, true)
+}
+
+#[cfg(unix)]
+fn install_shims_named_with_output(
+    dir: &std::path::Path,
+    force: bool,
+    extra_names: &[String],
+    verbose: bool,
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locating the kache binary")?;
     // Resolve so the shims survive kache being invoked through its own
@@ -11440,6 +11425,9 @@ pub(crate) fn install_shims_named(
         created.push(name.clone());
     }
 
+    if !verbose {
+        return Ok(());
+    }
     println!(
         "Created {} shim(s) in {} -> {}",
         created.len(),
@@ -11479,7 +11467,9 @@ pub(crate) fn install_shims_named(
 
 #[cfg(all(test, unix))]
 mod shim_install_tests {
-    use super::install_shims;
+    fn install_shims(dir: &std::path::Path, force: bool) -> anyhow::Result<()> {
+        super::install_shims_named(dir, force, &[])
+    }
     use crate::compiler::shim::SHIM_NAMES;
     use std::os::unix::fs::PermissionsExt;
 

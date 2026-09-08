@@ -1124,15 +1124,6 @@ pub struct CompileFinishedRequest {
     pub started_at_ms: u64,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BatchResponse {
-    pub ok: bool,
-    pub results: Vec<Response>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatsResponse {
     pub total_size: u64,
@@ -7769,45 +7760,6 @@ fn hash_files_results_from_response_line(resp_str: &str) -> Result<Vec<HashFileR
         );
     }
     Ok(resp.hash_results.unwrap_or_default())
-}
-
-/// Send a prefetch request to the daemon. Non-blocking — sends the hint and returns.
-/// Auto-starts daemon if needed. Uses fire-and-forget (no response wait).
-#[allow(dead_code)]
-pub fn send_prefetch(config: &Config, keys: &[(String, String)]) -> Result<()> {
-    let socket_path = config.socket_path();
-
-    let req = Request::Prefetch(PrefetchRequest {
-        keys: keys.to_vec(),
-        warm_all: false,
-    });
-
-    let try_send = |path: &Path| -> Result<()> { send_request_fire_and_forget(path, &req) };
-
-    match try_send(&socket_path) {
-        Ok(()) => return Ok(()),
-        Err(_) => match start_daemon_background() {
-            Ok(true) => {}
-            Ok(false) | Err(_) => {
-                tracing::warn!("could not reach or start daemon, skipping prefetch");
-                return Ok(());
-            }
-        },
-    }
-
-    for attempt in 1..=3u32 {
-        match try_send(&socket_path) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                if attempt < 3 {
-                    std::thread::sleep(send_retry_delay(attempt, std::process::id()));
-                } else {
-                    tracing::warn!("prefetch send failed after {attempt} retries: {e}");
-                }
-            }
-        }
-    }
-    Ok(()) // Non-blocking: don't fail
 }
 
 /// Send a build-started hint to the daemon. Non-blocking, fire-and-forget.
@@ -15762,21 +15714,6 @@ mod tests {
         assert_eq!(req.keys, vec![(valid_key, "serde".into())]);
     }
 
-    #[test]
-    fn test_batch_response_serde() {
-        let batch = BatchResponse {
-            ok: true,
-            results: vec![Response::found(true), Response::found(false)],
-            error: None,
-        };
-        let json = serde_json::to_string(&batch).unwrap();
-        let parsed: BatchResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(batch, parsed);
-        assert_eq!(parsed.results.len(), 2);
-        assert_eq!(parsed.results[0].found, Some(true));
-        assert_eq!(parsed.results[1].found, Some(false));
-    }
-
     // ── Warming barrier tests ─────────────────────────────────────
 
     #[tokio::test]
@@ -17616,34 +17553,6 @@ mod tests {
             .await
             .expect("the cc upload request must reach the live daemon")
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_send_prefetch_client_roundtrip() {
-        // CLIENT side: send_prefetch's first fire-and-forget try_send reaches a
-        // live server and returns Ok(()) immediately (daemon.rs 3369-3370),
-        // without falling through to the start-daemon/retry path.
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-        let socket_path = config.socket_path();
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-
-        let listener = bind_listener(&socket_path);
-        let daemon = Arc::new(Daemon::new(config.clone()));
-        let server = tokio::spawn(async move {
-            let stream = listener.accept().await.expect("accept");
-            let _ =
-                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new()).await;
-        });
-
-        let cfg = config.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            send_prefetch(&cfg, &[("a".repeat(64), "serde".to_string())])
-        })
-        .await
-        .unwrap();
-        server.await.unwrap();
-        assert!(result.is_ok(), "prefetch hint should send to a live daemon");
     }
 
     #[tokio::test]

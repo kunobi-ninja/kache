@@ -79,13 +79,6 @@ pub fn parse_cargo_lock(path: &Path) -> Result<Vec<(String, String)>> {
     Ok(deps)
 }
 
-/// Build a namespace string from known build config.
-/// Format: `{target}/{rustc_hash}/{profile}`
-#[allow(dead_code)]
-pub fn build_namespace(target: &str, rustc_hash: &str, profile: &str) -> String {
-    format!("{target}/{rustc_hash}/{profile}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,11 +229,5 @@ dependencies = ["serde"]
     fn test_parse_cargo_lock_nonexistent() {
         let result = parse_cargo_lock(Path::new("/nonexistent/Cargo.lock"));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_build_namespace() {
-        let ns = build_namespace("x86_64-unknown-linux-gnu", "abc123", "release");
-        assert_eq!(ns, "x86_64-unknown-linux-gnu/abc123/release");
     }
 }

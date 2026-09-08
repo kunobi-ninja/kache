@@ -140,21 +140,9 @@ pub fn is_reachable(path: &Path) -> bool {
     SyncStream::connect(name).is_ok()
 }
 
-/// True for I/O errors that mean the peer disconnected. Cross-platform —
-/// covers Unix `BrokenPipe` / `ConnectionReset` / `EPIPE` and the
-/// Windows-pipe variants of the same.
-pub fn is_peer_disconnect(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind::*;
-    matches!(
-        e.kind(),
-        BrokenPipe | ConnectionReset | ConnectionAborted | UnexpectedEof
-    ) || e.raw_os_error() == Some(32) // EPIPE; macOS sometimes reports as ErrorKind::Other
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Error, ErrorKind};
 
     #[test]
     fn socket_name_builds_for_a_plausible_path() {
@@ -187,44 +175,6 @@ mod tests {
             .create_sync()
             .expect("bind listener");
         assert!(is_reachable(&path));
-    }
-
-    #[test]
-    fn peer_disconnect_recognizes_disconnect_error_kinds() {
-        for kind in [
-            ErrorKind::BrokenPipe,
-            ErrorKind::ConnectionReset,
-            ErrorKind::ConnectionAborted,
-            ErrorKind::UnexpectedEof,
-        ] {
-            assert!(
-                is_peer_disconnect(&Error::from(kind)),
-                "{kind:?} should be treated as a peer disconnect"
-            );
-        }
-    }
-
-    #[test]
-    fn peer_disconnect_recognizes_raw_epipe() {
-        // macOS can surface EPIPE as ErrorKind::Other; the raw-os-error
-        // fallback must still classify it as a disconnect.
-        let err = Error::from_raw_os_error(32);
-        assert!(is_peer_disconnect(&err));
-    }
-
-    #[test]
-    fn peer_disconnect_ignores_unrelated_errors() {
-        for kind in [
-            ErrorKind::NotFound,
-            ErrorKind::PermissionDenied,
-            ErrorKind::InvalidInput,
-            ErrorKind::TimedOut,
-        ] {
-            assert!(
-                !is_peer_disconnect(&Error::from(kind)),
-                "{kind:?} should not be treated as a peer disconnect"
-            );
-        }
     }
 
     #[cfg(unix)]

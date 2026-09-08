@@ -1,0 +1,72 @@
+[cache]
+local_store = "~/old-store"
+runtime_dir = "~/runtime"
+local_max_size = "40GiB"
+local_only = false
+remote_readonly = true
+modified_input_guard = false
+input_predictions = true
+local_hit_daemon = true
+windows_hardlink = false
+auto_gc = false
+gc_evict_shared = true
+storage_layout_advice = false
+heartbeat_secs = 17
+explain_miss = true
+ignore_env = true
+cache_executables = true
+clean_incremental = false
+preserve_incremental = true
+adaptive_incremental = false
+exclude = ["vendor/**"]
+bypass_env = ["CARGO_MUTANTS=1"]
+bypass_argv = ["--cfg=probe"]
+bypass_crates = []
+event_log_max_size = "12MiB"
+event_log_keep_lines = 700
+compression_level = 3
+s3_concurrency = 8
+prefetch_enabled = false
+remote_key_cache_refresh_secs = 901
+prefetch_max_keys = 301
+prefetch_max_bytes = "2GiB"
+prefetch_deadline_secs = 61
+min_store_compile_ms = 701
+gc_max_age_hours = 73
+daemon_idle_timeout_secs = 601
+s3_pool_idle_secs = 31
+remote_restore_timeout_secs = 181
+remote_negative_ttl_secs = 47
+fallback = "sccache"
+key_salt = "old-salt"
+path_only_env_vars = ["BUILD_CONFIG"]
+incremental_crates = ["application"]
+key_env_vars = ["SCHEMA_*", "MODE"]
+scheduler = false
+
+[cache.volumes]
+"D:" = "D:/shared-cache"
+
+[cache.remote]
+# Older S3 configs infer the backend and accept the hyphenated user-agent key.
+bucket = "old-bucket"
+endpoint = "https://storage.example.invalid"
+region = "eu-west-1"
+prefix = "/legacy//artifacts/"
+profile = "build-profile"
+user-agent = "fixture-agent/1.0"
+
+[cache.planner]
+endpoint = "https://planner.example.invalid"
+timeout_ms = 2001
+token = "fixture-token"
+
+[cc]
+extra_allowlist_flags = ["-fexample"]
+
+[paths]
+base_dirs = ["/snap", "/var/lib/flatpak"]
+
+[[workspace.extra_inputs]]
+crates = ["macro-provider"]
+inputs = ["shared/value.txt"]

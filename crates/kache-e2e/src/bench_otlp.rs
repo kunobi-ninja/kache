@@ -78,6 +78,16 @@ pub struct OtlpPhase {
     /// be reconstructed from the metrics, and a fall in coverage looks
     /// identical to a fall in hit rate.
     pub unconsulted: Option<u64>,
+    /// Compiles the tool declined to cache and ran straight through, split by
+    /// why. `(category, count)`, already bounded by the caller.
+    ///
+    /// The two categories are not the same kind of thing and want opposite
+    /// responses. `not-a-compile` is a query or probe that was never a
+    /// compilation, and no amount of work makes it cacheable. `unsupported` is
+    /// a real compile the tool could cache and does not model yet -- an
+    /// engineering backlog, visible as a number. Summed together they say only
+    /// "some things were skipped".
+    pub passthrough: Vec<(&'static str, u64)>,
 }
 
 impl OtlpRun {
@@ -141,6 +151,7 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
     let mut objdir_points = Vec::new();
     let mut miss_cost_points = Vec::new();
     let mut unconsulted_points = Vec::new();
+    let mut passthrough_points = Vec::new();
 
     for phase in &run.phases {
         let phase_attrs = common_attrs(run, Some(phase.name));
@@ -164,6 +175,13 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
         // name is not: it comes from the dependency tree of whatever is being
         // benchmarked. `attribute_set_is_the_allowlist` holds that line.
         //
+        for (category, count) in &phase.passthrough {
+            passthrough_points.push(as_int(
+                *count,
+                &run.time_unix_nano,
+                &unit_attrs(run, phase.name, category),
+            ));
+        }
         // What a metric can carry is the shape: how much of the build the
         // costliest misses account for. A project whose top ten misses are 78
         // percent of the wall clock and one where they are 5 percent have the
@@ -242,6 +260,13 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
     metrics.push(gauge("kache.bench.objdir.size", "By", objdir_points));
     if !miss_cost_points.is_empty() {
         metrics.push(gauge("kache.bench.miss.cost", "s", miss_cost_points));
+    }
+    if !passthrough_points.is_empty() {
+        metrics.push(gauge(
+            "kache.bench.cache.passthrough",
+            "{unit}",
+            passthrough_points,
+        ));
     }
     if !unconsulted_points.is_empty() {
         metrics.push(gauge(
@@ -375,6 +400,7 @@ mod tests {
                     objdir_bytes: 8_000_000_000,
                     top_misses: Vec::new(),
                     unconsulted: Some(3),
+                    passthrough: Vec::new(),
                 },
                 OtlpPhase {
                     name: "warm",
@@ -391,6 +417,7 @@ mod tests {
                     objdir_bytes: 8_100_000_000,
                     top_misses: vec![("gecko".into(), 97), ("style".into(), 42)],
                     unconsulted: Some(11),
+                    passthrough: vec![("not-a-compile", 12), ("unsupported", 3)],
                 },
             ],
         }
@@ -559,6 +586,7 @@ mod tests {
             objdir_bytes: 1,
             top_misses: Vec::new(),
             unconsulted: None,
+            passthrough: Vec::new(),
         }];
         let body = serialize_metrics(&run);
         let duration = &metric(&body, "kache.bench.build.duration")["gauge"]["dataPoints"][0];
@@ -594,6 +622,7 @@ mod tests {
                 objdir_bytes: 9,
                 top_misses: Vec::new(),
                 unconsulted: None,
+                passthrough: Vec::new(),
             }],
         };
         let body = serialize_metrics(&run);
@@ -731,5 +760,85 @@ mod costliest_misses {
             .find(|p| attr(p, "kache.bench.phase") == Some("warm"))
             .unwrap();
         assert_eq!(warm["asDouble"], 11.0);
+    }
+}
+
+#[cfg(test)]
+mod passthrough_split {
+    use serde_json::Value;
+
+    fn points<'a>(body: &'a Value, name: &str) -> &'a Vec<Value> {
+        body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not in the payload"))["gauge"]["dataPoints"]
+            .as_array()
+            .unwrap()
+    }
+
+    fn attr<'a>(point: &'a Value, key: &str) -> Option<&'a str> {
+        point["attributes"]
+            .as_array()?
+            .iter()
+            .find(|a| a["key"] == key)?["value"]["stringValue"]
+            .as_str()
+    }
+
+    /// The split is the point. `unsupported` is a real compile the tool could
+    /// cache and does not model yet -- a backlog item with a number on it --
+    /// and `not-a-compile` is a probe that never could be. A single
+    /// "passthroughs: 15" cannot tell the two apart, and they want opposite
+    /// responses.
+    #[test]
+    fn the_two_categories_are_separate_series() {
+        let body = super::tests::payload_for_kache_run();
+        let pts = points(&body, "kache.bench.cache.passthrough");
+        let by = |result: &str| {
+            pts.iter()
+                .find(|p| {
+                    attr(p, "kache.bench.result") == Some(result)
+                        && attr(p, "kache.bench.phase") == Some("warm")
+                })
+                .unwrap_or_else(|| panic!("no {result} point"))["asInt"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(by("not-a-compile"), "12");
+        assert_eq!(by("unsupported"), "3");
+    }
+
+    /// The categories stay a bounded vocabulary. They come from kache's own
+    /// `RefuseReason::category`, which has two variants, plus the single
+    /// figure an external backend reports; anything else here would be a
+    /// series per refusal detail.
+    #[test]
+    fn the_vocabulary_stays_small() {
+        let body = super::tests::payload_for_kache_run();
+        let mut seen: Vec<&str> = points(&body, "kache.bench.cache.passthrough")
+            .iter()
+            .filter_map(|p| attr(p, "kache.bench.result"))
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert!(
+            seen.iter()
+                .all(|r| matches!(*r, "not-a-compile" | "unsupported" | "declined")),
+            "an unbounded refusal reason reached the payload: {seen:?}"
+        );
+    }
+
+    /// A phase that declined nothing opens no series.
+    #[test]
+    fn a_phase_that_declined_nothing_contributes_nothing() {
+        let body = super::tests::payload_for_kache_run();
+        assert!(
+            points(&body, "kache.bench.cache.passthrough")
+                .iter()
+                .all(|p| attr(p, "kache.bench.phase") == Some("warm")),
+            "the cold phase declared no passthrough and must not appear"
+        );
     }
 }

@@ -29,6 +29,7 @@ use reqsign_core::{
     CommandExecute, Context as SigningContext, Env, OsEnv, ProvideCredential,
     ProvideCredentialChain,
 };
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::config::{FilesystemRemoteConfig, RemoteBackendConfig, RemoteConfig, S3RemoteConfig};
 
@@ -70,6 +71,14 @@ pub struct GetObject {
     pub body_ms: u64,
 }
 
+/// Byte count and timings for a download written to a caller-owned sink.
+#[derive(Debug)]
+pub struct GetTransfer {
+    pub bytes: u64,
+    pub request_ms: u64,
+    pub body_ms: u64,
+}
+
 /// Outcome of an atomic create-only remote publication.
 #[allow(dead_code)] // consumed by the packed-prefetch publisher in the next slice
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +103,29 @@ pub trait RemoteBackend: Send + Sync {
     /// buffered when metadata is available, and always enforces the cap while
     /// streaming the body.
     async fn get(&self, key: &str, max_bytes: Option<u64>) -> Result<Option<GetObject>>;
+
+    /// Fetch into `destination`, flushing it before returning. A failure may
+    /// leave partial bytes in the sink; callers must discard them.
+    ///
+    /// Backends should override this to stream. The buffered fallback keeps
+    /// transports that implement only `get` usable by the restore path.
+    async fn get_into(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+        destination: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<Option<GetTransfer>> {
+        let Some(object) = self.get(key, max_bytes).await? else {
+            return Ok(None);
+        };
+        destination.write_all(&object.body).await?;
+        destination.flush().await?;
+        Ok(Some(GetTransfer {
+            bytes: object.body.len() as u64,
+            request_ms: object.request_ms,
+            body_ms: object.body_ms,
+        }))
+    }
 
     /// Store `body` at `key`.
     async fn put(&self, key: &str, body: Vec<u8>, content_type: Option<&str>) -> Result<()>;
@@ -259,6 +291,23 @@ impl RemoteBackend for OpenDalBackend {
     }
 
     async fn get(&self, key: &str, max_bytes: Option<u64>) -> Result<Option<GetObject>> {
+        let mut body = Vec::new();
+        let Some(transfer) = self.get_into(key, max_bytes, &mut body).await? else {
+            return Ok(None);
+        };
+        Ok(Some(GetObject {
+            body: Bytes::from(body),
+            request_ms: transfer.request_ms,
+            body_ms: transfer.body_ms,
+        }))
+    }
+
+    async fn get_into(
+        &self,
+        key: &str,
+        max_bytes: Option<u64>,
+        destination: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<Option<GetTransfer>> {
         self.validate_key("GET", key, false)?;
         let request_start = Instant::now();
         let reader = self
@@ -298,7 +347,6 @@ impl RemoteBackend for OpenDalBackend {
         }
 
         let body_start = Instant::now();
-        let mut chunks = Vec::new();
         let mut length = 0_u64;
         loop {
             let chunk = match stream.try_next().await {
@@ -320,7 +368,12 @@ impl RemoteBackend for OpenDalBackend {
                     self.describe(key)
                 );
             }
-            chunks.extend(chunk);
+            for bytes in chunk {
+                destination
+                    .write_all(&bytes)
+                    .await
+                    .with_context(|| format!("writing body of {}", self.describe(key)))?;
+            }
         }
         // A stream that ends early is not a valid object. The layout layer's
         // blake3 gate would reject a truncated pack anyway, but catching it here
@@ -328,12 +381,15 @@ impl RemoteBackend for OpenDalBackend {
         // known) instead of surfacing as a confusing hash mismatch, and it also
         // covers objects fetched outside that gate.
         verify_complete_body(advertised_length, length, &self.describe(key))?;
+        destination
+            .flush()
+            .await
+            .context("flushing downloaded body")?;
 
         let body_ms = body_start.elapsed().as_millis() as u64;
-        let body = chunks.into_iter().collect::<opendal::Buffer>().to_bytes();
 
-        Ok(Some(GetObject {
-            body,
+        Ok(Some(GetTransfer {
+            bytes: length,
             request_ms,
             body_ms,
         }))
@@ -908,7 +964,11 @@ mod tests {
         tokio::spawn(async move {
             let mut requests = Vec::new();
             for response in responses {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                        .await
+                        .expect("the operation must issue the expected HTTP request")
+                        .unwrap();
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 4096];
                 loop {
@@ -950,6 +1010,77 @@ mod tests {
             .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
         let operator = Operator::new(builder).unwrap().with_context(context);
         OpenDalBackend::new(operator, "s3://bucket".to_string())
+    }
+
+    #[tokio::test]
+    async fn get_into_delivers_bytes_before_the_remote_finishes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"GET /bucket/key HTTP/1.1\r\n"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhe")
+                .await
+                .unwrap();
+            finish_rx.await.unwrap();
+            socket.write_all(b"llo").await.unwrap();
+        });
+        let backend = anonymous_s3_backend(&endpoint);
+        let (mut destination, mut received) = tokio::io::duplex(8);
+        let download =
+            tokio::spawn(async move { backend.get_into("key", Some(5), &mut destination).await });
+        let mut prefix = [0; 2];
+        tokio::time::timeout(Duration::from_secs(5), received.read_exact(&mut prefix))
+            .await
+            .expect("the sink must receive bytes without waiting for EOF")
+            .unwrap();
+        assert_eq!(&prefix, b"he");
+        finish_tx.send(()).unwrap();
+        let mut suffix = Vec::new();
+        received.read_to_end(&mut suffix).await.unwrap();
+        assert_eq!(suffix, b"llo");
+        let transfer = download.await.unwrap().unwrap().unwrap();
+        assert_eq!(transfer.bytes, 5);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_into_flushes_a_file_and_reports_write_failures() {
+        let backend = memory_backend();
+        backend.put("key", b"hello".to_vec(), None).await.unwrap();
+        let mut file = tokio::fs::File::from_std(tempfile::tempfile().unwrap());
+        let transfer = backend
+            .get_into("key", Some(5), &mut file)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(transfer.bytes, 5);
+        let mut file = file
+            .try_into_std()
+            .expect("the download must finish pending writes");
+        std::io::Seek::rewind(&mut file).unwrap();
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut file, &mut body).unwrap();
+        assert_eq!(body, "hello");
+
+        let (mut closed_sink, reader) = tokio::io::duplex(1);
+        drop(reader);
+        let error = backend
+            .get_into("key", Some(5), &mut closed_sink)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("writing body of memory://test/key"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]
@@ -1302,6 +1433,52 @@ mod tests {
             requests[0].lines().next(),
             Some("GET /bucket/artifacts/v3/packs/foo/key123.tar.zst HTTP/1.1")
         );
+    }
+
+    #[tokio::test]
+    async fn v3_download_timeout_discards_the_partial_file() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+                .await
+                .unwrap();
+            started_tx.send(()).unwrap();
+            // Keep the response open until the caller cancels it.
+            let mut remaining = Vec::new();
+            let _ = socket.read_to_end(&mut remaining).await;
+        });
+        let backend = anonymous_s3_backend(&endpoint);
+        let remote = RemoteConfig::test_s3("bucket", "artifacts");
+        let layout = crate::remote_layout::RemoteLayout::new(&backend, &remote);
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("entry");
+        let blobs = temp.path().join("blobs");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let download =
+            layout.download_entry_until("key123", "foo", &destination, &blobs, Some(deadline));
+        let (result, started) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(download, started_rx)
+        })
+        .await
+        .expect("the restore must start its GET before the test deadline");
+        started.expect("the timeout must occur during a response body");
+        let error = result
+            .err()
+            .expect("an incomplete response must hit its deadline");
+        assert!(format!("{error:#}").contains("deadline"), "{error:#}");
+        assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

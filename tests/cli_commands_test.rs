@@ -1448,8 +1448,21 @@ fn init_adds_native_caching_to_an_existing_rust_setup() {
         .success();
     let config: toml::Value = toml::from_str(&std::fs::read_to_string(cargo).unwrap()).unwrap();
     assert_eq!(config["build"]["rustc-wrapper"].as_str(), Some("kache"));
-    assert_eq!(config["env"]["HOST_CC"].as_str(), Some("kache cc"));
-    assert_eq!(config["env"]["HOST_CXX"].as_str(), Some("kache c++"));
+    assert_eq!(
+        config["env"]["CC_KNOWN_WRAPPER_CUSTOM"].as_str(),
+        Some("kache")
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(config["env"]["HOST_CC"].as_str(), Some("kache cc"));
+        assert_eq!(config["env"]["HOST_CXX"].as_str(), Some("kache c++"));
+    }
+    #[cfg(windows)]
+    {
+        // Init leaves the choice between MSVC and clang-cl to the user.
+        assert!(config["env"].get("HOST_CC").is_none());
+        assert!(config["env"].get("HOST_CXX").is_none());
+    }
 }
 
 #[cfg(unix)]

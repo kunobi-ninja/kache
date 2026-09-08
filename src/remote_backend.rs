@@ -964,7 +964,11 @@ mod tests {
         tokio::spawn(async move {
             let mut requests = Vec::new();
             for response in responses {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                        .await
+                        .expect("the operation must issue the expected HTTP request")
+                        .unwrap();
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 4096];
                 loop {
@@ -1460,7 +1464,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         let download =
             layout.download_entry_until("key123", "foo", &destination, &blobs, Some(deadline));
-        let (result, started) = tokio::join!(download, started_rx);
+        let (result, started) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(download, started_rx)
+        })
+        .await
+        .expect("the restore must start its GET before the test deadline");
         started.expect("the timeout must occur during a response body");
         let error = result
             .err()

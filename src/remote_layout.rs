@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 pub(crate) use kache_format::{is_blob_hash, is_safe_artifact_name};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -21,8 +22,7 @@ const V3_MANIFEST_VERSION: u32 = 3;
 /// terabytes. Paired with [`MAX_ZSTD_WINDOW_LOG`] on the decoder (#212).
 const MAX_EXTRACTED_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
 
-/// Cap the compressed body buffered by GET before extraction begins. This is
-/// a per-object ceiling; concurrent downloads can each hold up to this much.
+/// Cap compressed bytes downloaded to the temporary file before extraction.
 const MAX_COMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
 
 /// Max zstd window-log accepted on decode (2^27 = 128 MiB). Bounds the
@@ -108,6 +108,17 @@ impl<'a> RemoteLayout<'a> {
 
         tracing::debug!("downloading v3 pack {}", self.backend.describe(&object_key));
 
+        deadline_io_check(deadline, "download setup")?;
+        let parent = entry_dir
+            .parent()
+            .context("v3 entry has no parent directory")?;
+        std::fs::create_dir_all(parent)?;
+        // Keep the spool on the cache disk, including when the cache is on an
+        // external volume. The anonymous file is removed when its handle closes,
+        // including cancellation and failed validation.
+        let spool = tempfile::tempfile_in(parent).context("creating v3 download file")?;
+        let mut spool = tokio::fs::File::from_std(spool);
+
         // A missing object is a clean miss, not a transfer failure. Callers
         // downcast to `EntryNotFound` to take the miss path (#485 Phase 0):
         // likely-present keys go straight to GET, and a stale key-cache
@@ -115,7 +126,8 @@ impl<'a> RemoteLayout<'a> {
         let fetched = crate::remote_resilience::RemoteDeadline::from_instant(deadline)
             .run(
                 "remote object GET",
-                self.backend.get(&object_key, Some(MAX_COMPRESSED_BYTES)),
+                self.backend
+                    .get_into(&object_key, Some(MAX_COMPRESSED_BYTES), &mut spool),
             )
             .await
             .context("downloading v3 pack")?
@@ -127,12 +139,13 @@ impl<'a> RemoteLayout<'a> {
             })?;
         let request_ms = fetched.request_ms;
         let body_ms = fetched.body_ms;
-        let compressed = fetched.body;
-        let compressed_len = compressed.len() as u64;
+        let compressed_len = fetched.bytes;
+        let mut compressed = spool.into_std().await;
+        compressed.rewind().context("rewinding v3 download file")?;
 
         let extract_start = std::time::Instant::now();
         let guarded = DeadlineReader {
-            inner: std::io::Cursor::new(&compressed),
+            inner: compressed,
             deadline,
         };
         let mut decoder =

@@ -877,6 +877,16 @@ fn otlp_phases(
     phases
 }
 
+/// How many of a phase's costliest misses reach the metrics.
+///
+/// Every one is a series per crate name per project, and crate names come from
+/// the repository being benchmarked rather than from anything here, so this is
+/// the only thing bounding that. Ten is enough to name where a build's time
+/// goes -- on the projects measured so far the top ten carry between 42 and 78
+/// percent of the warm wall clock -- without turning a dependency tree into a
+/// series count.
+const TOP_MISSES_EMITTED: usize = 10;
+
 fn otlp_phase(
     name: &'static str,
     metrics: &PhaseMetrics,
@@ -895,6 +905,22 @@ fn otlp_phase(
         weighted_hit_rate_pct: Some(metrics.weighted_hit_rate_pct),
         leak_warnings: Some(metrics.leak_warnings),
         objdir_bytes,
+        top_misses: metrics
+            .top_misses
+            .iter()
+            .take(TOP_MISSES_EMITTED)
+            .map(|m| (m.crate_name.clone(), m.compile_time_s))
+            .collect(),
+        // What kache looked at and never asked the cache about: probes,
+        // queries, and compiles it declined. The hit rate divides by what was
+        // resolved, so this sits outside it and cannot be recovered from the
+        // other metrics.
+        unconsulted: Some(
+            metrics
+                .event_log
+                .total
+                .saturating_sub(metrics.event_log.cached),
+        ),
     }
 }
 
@@ -916,6 +942,10 @@ fn otlp_sccache_phase(
         weighted_hit_rate_pct: None,
         leak_warnings: None,
         objdir_bytes,
+        // sccache reports neither: it has no per-unit cost breakdown, and no
+        // count of what it looked at without consulting the cache.
+        top_misses: Vec::new(),
+        unconsulted: None,
     }
 }
 
@@ -2724,6 +2754,9 @@ fn otlp_mbx_phase(
         weighted_hit_rate_pct: None,
         leak_warnings: None,
         objdir_bytes,
+        // No per-unit cost in its report.
+        top_misses: Vec::new(),
+        unconsulted: Some(metrics.unconsulted),
     }
 }
 

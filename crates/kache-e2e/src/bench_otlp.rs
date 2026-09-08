@@ -57,6 +57,27 @@ pub struct OtlpPhase {
     pub weighted_hit_rate_pct: Option<f64>,
     pub leak_warnings: Option<u64>,
     pub objdir_bytes: u64,
+    /// The costliest misses this phase, already ordered and truncated by the
+    /// caller.
+    ///
+    /// Emitted per crate because the question these benchmarks exist to answer
+    /// -- why is this project's warm build still slow -- has a crate for an
+    /// answer, and an aggregate cannot name it. A run where five crates carry
+    /// 78 percent of the wall clock and a run where the cost is spread evenly
+    /// have the same hit rate and want opposite fixes.
+    ///
+    /// Bounded by the caller rather than here, because the bound is a
+    /// cardinality decision: one series per crate name per project, and crate
+    /// names are chosen by the repository being benchmarked.
+    pub top_misses: Vec<(String, u64)>,
+    /// Compiles kache looked at but never asked the cache about: probes,
+    /// queries, and anything it declined.
+    ///
+    /// The hit rate divides hits by what was *resolved*, so what is never
+    /// consulted sits outside it entirely. Without this the denominator cannot
+    /// be reconstructed from the metrics, and a fall in coverage looks
+    /// identical to a fall in hit rate.
+    pub unconsulted: Option<u64>,
 }
 
 impl OtlpRun {
@@ -118,6 +139,8 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
     let mut weighted_points = Vec::new();
     let mut leak_points = Vec::new();
     let mut objdir_points = Vec::new();
+    let mut miss_cost_points = Vec::new();
+    let mut unconsulted_points = Vec::new();
 
     for phase in &run.phases {
         let phase_attrs = common_attrs(run, Some(phase.name));
@@ -128,6 +151,38 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
         ));
         if let Some(saved) = phase.time_saved_s {
             saved_points.push(as_double(saved as f64, &run.time_unix_nano, &phase_attrs));
+        }
+        if let Some(unconsulted) = phase.unconsulted {
+            unconsulted_points.push(as_double(
+                unconsulted as f64,
+                &run.time_unix_nano,
+                &phase_attrs,
+            ));
+        }
+        // Deliberately not one series per crate. Every other attribute here is
+        // a bounded vocabulary -- 18 projects, 3 tools, 3 phases -- and a crate
+        // name is not: it comes from the dependency tree of whatever is being
+        // benchmarked. `attribute_set_is_the_allowlist` holds that line.
+        //
+        // What a metric can carry is the shape: how much of the build the
+        // costliest misses account for. A project whose top ten misses are 78
+        // percent of the wall clock and one where they are 5 percent have the
+        // same hit rate and want opposite fixes, and that difference fits in a
+        // number. Which crate it is stays in the bench artifact and the trace,
+        // where a name costs nothing.
+        if !phase.top_misses.is_empty() {
+            let costliest = phase.top_misses.iter().map(|(_, s)| *s).max().unwrap_or(0);
+            let summed: u64 = phase.top_misses.iter().map(|(_, s)| *s).sum();
+            miss_cost_points.push(as_double(
+                costliest as f64,
+                &run.time_unix_nano,
+                &unit_attrs(run, phase.name, "costliest"),
+            ));
+            miss_cost_points.push(as_double(
+                summed as f64,
+                &run.time_unix_nano,
+                &unit_attrs(run, phase.name, "top"),
+            ));
         }
         push_unit_points(&mut unit_points, run, phase);
         hit_rate_points.push(as_double(
@@ -185,6 +240,16 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
         )],
     ));
     metrics.push(gauge("kache.bench.objdir.size", "By", objdir_points));
+    if !miss_cost_points.is_empty() {
+        metrics.push(gauge("kache.bench.miss.cost", "s", miss_cost_points));
+    }
+    if !unconsulted_points.is_empty() {
+        metrics.push(gauge(
+            "kache.bench.cache.unconsulted",
+            "{unit}",
+            unconsulted_points,
+        ));
+    }
     if let Some(disk) = run.disk_measured_bytes {
         metrics.push(gauge(
             "kache.bench.disk.consumed",
@@ -279,6 +344,10 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    pub(super) fn payload_for_kache_run() -> serde_json::Value {
+        serialize_metrics(&kache_run())
+    }
+
     fn kache_run() -> OtlpRun {
         OtlpRun {
             project: "bench-firefox".into(),
@@ -304,6 +373,8 @@ mod tests {
                     weighted_hit_rate_pct: Some(0.0),
                     leak_warnings: Some(0),
                     objdir_bytes: 8_000_000_000,
+                    top_misses: Vec::new(),
+                    unconsulted: Some(3),
                 },
                 OtlpPhase {
                     name: "warm",
@@ -318,6 +389,8 @@ mod tests {
                     weighted_hit_rate_pct: Some(97.5),
                     leak_warnings: Some(2),
                     objdir_bytes: 8_100_000_000,
+                    top_misses: vec![("gecko".into(), 97), ("style".into(), 42)],
+                    unconsulted: Some(11),
                 },
             ],
         }
@@ -484,6 +557,8 @@ mod tests {
             weighted_hit_rate_pct: Some(80.0),
             leak_warnings: Some(0),
             objdir_bytes: 1,
+            top_misses: Vec::new(),
+            unconsulted: None,
         }];
         let body = serialize_metrics(&run);
         let duration = &metric(&body, "kache.bench.build.duration")["gauge"]["dataPoints"][0];
@@ -517,6 +592,8 @@ mod tests {
                 weighted_hit_rate_pct: None,
                 leak_warnings: None,
                 objdir_bytes: 9,
+                top_misses: Vec::new(),
+                unconsulted: None,
             }],
         };
         let body = serialize_metrics(&run);
@@ -563,5 +640,96 @@ mod tests {
             std::fs::read_to_string(dir.path().join(SCHEMA_VERSION_FILE)).unwrap(),
             "1\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod costliest_misses {
+    use serde_json::Value;
+
+    fn points<'a>(body: &'a Value, name: &str) -> &'a Vec<Value> {
+        body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not in the payload"))["gauge"]["dataPoints"]
+            .as_array()
+            .unwrap()
+    }
+
+    fn attr<'a>(point: &'a Value, key: &str) -> Option<&'a str> {
+        point["attributes"]
+            .as_array()?
+            .iter()
+            .find(|a| a["key"] == key)?["value"]["stringValue"]
+            .as_str()
+    }
+
+    fn pick<'a>(body: &'a Value, name: &str, phase: &str, result: &str) -> &'a Value {
+        points(body, name)
+            .iter()
+            .find(|p| {
+                attr(p, "kache.bench.phase") == Some(phase)
+                    && attr(p, "kache.bench.result") == Some(result)
+            })
+            .unwrap_or_else(|| panic!("no {name} point for {phase}/{result}"))
+    }
+
+    /// What the metric is for: one number saying how much of a build its worst
+    /// misses carry. A project whose costliest ten are most of the wall clock
+    /// and one where they are noise have the same hit rate and want opposite
+    /// fixes, and nothing emitted before this could tell them apart.
+    #[test]
+    fn the_costliest_miss_and_the_top_group_are_separate_series() {
+        let body = super::tests::payload_for_kache_run();
+        assert_eq!(
+            pick(&body, "kache.bench.miss.cost", "warm", "costliest")["asDouble"],
+            97.0
+        );
+        assert_eq!(
+            pick(&body, "kache.bench.miss.cost", "warm", "top")["asDouble"],
+            139.0
+        );
+    }
+
+    /// No crate name reaches the payload. Every attribute here is a bounded
+    /// vocabulary; a crate name comes from the dependency tree of whatever is
+    /// being benchmarked, and one series per crate is the cost this avoids.
+    #[test]
+    fn no_crate_name_is_emitted() {
+        let body = super::tests::payload_for_kache_run();
+        let dumped = body.to_string();
+        assert!(
+            !dumped.contains("gecko"),
+            "a crate name reached the payload"
+        );
+        assert!(!dumped.contains("kache.bench.crate"));
+    }
+
+    /// A phase with no costly misses opens no series at all.
+    #[test]
+    fn a_phase_without_costly_misses_contributes_nothing() {
+        let body = super::tests::payload_for_kache_run();
+        assert!(
+            points(&body, "kache.bench.miss.cost")
+                .iter()
+                .all(|p| attr(p, "kache.bench.phase") == Some("warm")),
+            "the cold phase declared no top misses and must not appear"
+        );
+    }
+
+    /// What was never asked of the cache sits outside the hit rate, so it has
+    /// to be its own series or the denominator cannot be rebuilt.
+    #[test]
+    fn what_was_never_consulted_is_its_own_series() {
+        let body = super::tests::payload_for_kache_run();
+        let pts = points(&body, "kache.bench.cache.unconsulted");
+        assert_eq!(pts.len(), 2, "one per phase");
+        let warm = pts
+            .iter()
+            .find(|p| attr(p, "kache.bench.phase") == Some("warm"))
+            .unwrap();
+        assert_eq!(warm["asDouble"], 11.0);
     }
 }

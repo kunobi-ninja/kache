@@ -219,12 +219,7 @@ impl Platform for MacOsPlatform {
         //   2. lldb's adjacent-bundle lookup is by `<binary>.dSYM` sibling
         //      path, which is exactly this location.
         let bundle_dir = binary.with_file_name(format!("{file_name}.dSYM"));
-        let status = match Command::new("dsymutil")
-            .arg(binary)
-            .arg("-o")
-            .arg(&bundle_dir)
-            .status()
-        {
+        let status = match debug_bundle_command(binary, &bundle_dir)?.status() {
             Ok(status) => status,
             Err(err) => {
                 // Best-effort per the trait contract: no dsymutil (unusual
@@ -254,6 +249,24 @@ impl Platform for MacOsPlatform {
             }
         }
     }
+}
+
+/// Resolve paths before changing the child's cwd: cached macOS debug links
+/// use `-oso_prefix` to make OSO records relative to the binary's output dir.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Command> {
+    let binary = std::path::absolute(binary)?;
+    let bundle_dir = std::path::absolute(bundle_dir)?;
+    let output_dir = binary
+        .parent()
+        .context("debug binary has no parent directory")?;
+    let mut command = Command::new("dsymutil");
+    command
+        .current_dir(output_dir)
+        .arg(&binary)
+        .arg("-o")
+        .arg(bundle_dir);
+    Ok(command)
 }
 
 /// Tar `bundle_dir`'s contents (paths relative to the bundle root, e.g.
@@ -595,6 +608,66 @@ pub(crate) mod tests {
                 "Contents/Resources/DWARF/fake".to_string(),
             ],
             "every file, relative to the bundle root, in sorted order"
+        );
+    }
+
+    #[test]
+    fn debug_bundle_command_resolves_relative_arguments_before_changing_directory() {
+        let binary = Path::new("target/debug/deps/demo");
+        let bundle = Path::new("target/debug/deps/demo.dSYM");
+        let command = debug_bundle_command(binary, bundle).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            command.get_current_dir(),
+            Some(cwd.join("target/debug/deps").as_path())
+        );
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(args.len(), 3);
+        // Windows absolute() normalizes separators; compare paths, not argv bytes.
+        assert_eq!(Path::new(args[0]), cwd.join(binary));
+        assert_eq!(args[1], "-o");
+        assert_eq!(Path::new(args[2]), cwd.join(bundle));
+    }
+
+    #[test]
+    fn macos_debug_bundle_contains_symbols_with_output_relative_oso_paths() {
+        if std::env::consts::OS != "macos" {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let binary = compile_debug_c_binary(&dir).expect("macOS C compiler must work");
+        // Relink with the same OSO prefix kache injects for Rust executables.
+        assert!(
+            Command::new("cc")
+                .arg(dir.join("hello.o"))
+                .arg(format!("-Wl,-oso_prefix,{}/", dir.display()))
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let staging = tempfile::tempdir().unwrap();
+        MacOsPlatform
+            .package_debug_bundle(&binary, staging.path())
+            .unwrap()
+            .unwrap();
+        let dwarf = dir.join("hello-bin.dSYM/Contents/Resources/DWARF/hello-bin");
+        let dump = Command::new("dwarfdump")
+            .arg("--debug-info")
+            .arg(dwarf)
+            .output()
+            .unwrap();
+        assert!(dump.status.success());
+        let info = String::from_utf8_lossy(&dump.stdout);
+        assert!(
+            info.contains("hello.c"),
+            "bundle must contain the source compile unit: {info}"
+        );
+        assert!(
+            info.contains("DW_TAG_subprogram"),
+            "bundle must contain function debug info: {info}"
         );
     }
 

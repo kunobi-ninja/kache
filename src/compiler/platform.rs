@@ -253,6 +253,7 @@ impl Platform for MacOsPlatform {
 
 /// Resolve paths before changing the child's cwd: cached macOS debug links
 /// use `-oso_prefix` to make OSO records relative to the binary's output dir.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Command> {
     let binary = std::path::absolute(binary)?;
     let bundle_dir = std::path::absolute(bundle_dir)?;

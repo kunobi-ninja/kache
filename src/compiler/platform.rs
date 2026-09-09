@@ -621,14 +621,12 @@ pub(crate) mod tests {
             command.get_current_dir(),
             Some(cwd.join("target/debug/deps").as_path())
         );
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            vec![
-                cwd.join(binary).into_os_string(),
-                "-o".into(),
-                cwd.join(bundle).into_os_string()
-            ]
-        );
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(args.len(), 3);
+        // Windows absolute() normalizes separators; compare paths, not argv bytes.
+        assert_eq!(Path::new(args[0]), cwd.join(binary));
+        assert_eq!(args[1], "-o");
+        assert_eq!(Path::new(args[2]), cwd.join(bundle));
     }
 
     #[test]

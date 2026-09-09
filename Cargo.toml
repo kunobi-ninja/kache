@@ -69,10 +69,10 @@ filetime = "0.2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
-zstd = "0.13"
+zstd = "0.14"
 bytesize = "2"
 chrono = { version = "0.4", features = ["serde"] }
-dirs = "6"
+dirs = "7"
 home = "0.5.12"
 tar = "0.4"
 futures = "0.3"
@@ -80,7 +80,7 @@ glob = "0.3"
 libc = "0.2"
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
-interprocess = { version = "2.4.2", features = ["tokio"] }
+interprocess = { version = "2.4.4", features = ["tokio"] }
 unicode-normalization = "0.1"
 # Used by `src/compiler/flags.rs` (the cc / future Swift / future MSVC
 # flag classifier). The `regex` crate is linear-time by construction
@@ -92,7 +92,7 @@ regex = { version = "1", default-features = false, features = ["std", "perf"] }
 [target.'cfg(windows)'.dependencies]
 # Use the same Visual Studio and Windows SDK discovery path as Rust build
 # tooling, including shells where VsDevCmd has not populated PATH/LIB.
-find-msvc-tools = "0.1.9"
+find-msvc-tools = "0.1.12"
 # `pure` drops blake3's C SIMD (`c/blake3_neon.c` / SSE intrinsics), whose
 # arm64 NEON path doesn't cross-compile under cargo-xwin's clang + MSVC
 # sysroot. Windows-only so native/Linux/macOS keep the fast C SIMD backend.

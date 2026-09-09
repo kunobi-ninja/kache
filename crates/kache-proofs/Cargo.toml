@@ -1,6 +1,6 @@
 [package]
 name = "kache-proofs"
-version = "0.18.0"
+version = "0.19.0"
 publish = false
 edition = "2024"
 description = "Repository-only formal verification harnesses for kache."

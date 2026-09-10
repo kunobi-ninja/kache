@@ -49,12 +49,19 @@
 //! header size INCLUDES those bytes. The path-derived `cc` name therefore
 //! lives inside the member data itself. The exact stored name bytes (including
 //! encoding/padding), parsed timestamp, and object DATA are all hashed.
-//! - only structurally valid, known Mach-O `MH_OBJECT` files
-//!   without debug sections, STABS, or embedded compiler bitcode/LTO. Darwin's
-//!   linker
-//!   records `archive(member)` (and archive-member time) in `N_OSO` debug-map
-//!   entries. Unsupported, malformed, debug-bearing, bitcode, and ARM64_32
-//!   objects therefore use the path-bound fallback;
+//! - only structurally valid, known Mach-O `MH_OBJECT` files without STABS
+//!   or embedded compiler bitcode/LTO. DWARF (`__DWARF,__debug_*` /
+//!   `__apple_*`, S_ATTR_DEBUG) is hashed like any other member bytes, so a
+//!   path a compiler left in `DW_AT_comp_dir` is identity-bearing, never a
+//!   false hit. Darwin's linker records `archive(member)` (and archive-member
+//!   time) in `N_OSO` debug-map entries for such members, but every cached
+//!   macOS debug link already makes those records checkout-independent —
+//!   ld64 `-oso_prefix` relative to `--out-dir` (`compiler/rustc.rs`) plus
+//!   the store-time `.dSYM` (#319) — exactly as for the debug-bearing Rust
+//!   objects every dev-profile rlib bundles; a `cc`-built archive is no
+//!   different once rustc has bundled its members into the rlib. Unsupported,
+//!   malformed, STABS, bitcode, and ARM64_32 objects therefore use the
+//!   path-bound fallback;
 //! - the ranlib member (`__.SYMDEF[ SORTED]` / `__.SYMDEF_64[ SORTED]`) DATA
 //!   **as-is**, tagged with its trimmed name: `_64` reads the same bytes with
 //!   a different word width and ` SORTED` changes the lookup contract, so the
@@ -71,7 +78,7 @@
 //!
 //! ## Out of scope -> path-bound fallback (`None`)
 //! Thin archives (`!<thin>`), Windows COFF `.lib`, GNU/BSD mixed layouts,
-//! debug-bearing Mach-O, compiler bitcode/LTO, ARM64_32, unknown object formats,
+//! STABS-bearing Mach-O, compiler bitcode/LTO, ARM64_32, unknown object formats,
 //! and anything malformed. Thin archives are made uncacheable because their
 //! external member bytes are absent from the container. Other fallbacks bind
 //! both the archive bytes and lexical absolute archive path.
@@ -206,7 +213,7 @@ fn gnu_archive_hash(bytes: &[u8]) -> Option<String> {
                 // bitcode uses archive-path-derived LTO identifiers, and an
                 // unknown format may have equally path-sensitive semantics.
                 let known_object = if has_macho_magic(data) {
-                    is_known_no_debug_macho_object(data)
+                    is_known_portable_macho_object(data)
                 } else {
                     is_known_elf_relocatable_object(data)
                 };
@@ -326,10 +333,14 @@ fn bsd_archive_hash(bytes: &[u8]) -> Option<String> {
         } else {
             // ld64 writes an N_OSO debug-map entry containing
             // `archive(member)` (and the member timestamp) for debug-bearing
-            // Mach-O objects. Dropping the name/header is therefore safe only
-            // after a bounded, fail-closed Mach-O inspection proves this is a
-            // known MH_OBJECT without debug sections, STABS, or bitcode.
-            if !is_known_no_debug_macho_object(content) {
+            // Mach-O objects. The exact stored name and timestamp are
+            // committed above, and the record's path half is already
+            // checkout-independent for every cached debug link (`-oso_prefix`,
+            // store-time `.dSYM` — see the module docs), so DWARF binds nothing
+            // further. Hashing the content is safe only after a bounded,
+            // fail-closed Mach-O inspection proves this is a known MH_OBJECT
+            // without STABS or bitcode.
+            if !is_known_portable_macho_object(content) {
                 return None;
             }
             // The exact stored name was committed above; frame the object
@@ -430,10 +441,12 @@ struct MachSymtab {
 
 /// Prove that `bytes` is a supported Mach-O relocatable object whose behavior
 /// is independent of the containing archive path after name/time are hashed.
-/// All arithmetic and table walks are bounded by the input slice. Any doubt
-/// returns `false`, selecting the caller's path-bound fallback.
-fn is_known_no_debug_macho_object(bytes: &[u8]) -> bool {
-    parse_known_no_debug_macho_object(bytes).is_some()
+/// DWARF is admitted (see the module docs); STABS, bitcode/LTO carriers, and
+/// unknown shapes are not. All arithmetic and table walks are bounded by the
+/// input slice. Any doubt returns `false`, selecting the caller's path-bound
+/// fallback.
+fn is_known_portable_macho_object(bytes: &[u8]) -> bool {
+    parse_known_portable_macho_object(bytes).is_some()
 }
 
 fn has_macho_magic(bytes: &[u8]) -> bool {
@@ -600,7 +613,7 @@ fn parse_known_elf_relocatable_object(bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
-fn parse_known_no_debug_macho_object(bytes: &[u8]) -> Option<()> {
+fn parse_known_portable_macho_object(bytes: &[u8]) -> Option<()> {
     let magic = bytes.get(..4)?;
     let (endian, is_64) = match magic {
         b"\xce\xfa\xed\xfe" => (MachEndian::Little, false),
@@ -841,7 +854,18 @@ fn validate_macho_segment(
 }
 
 fn macho_segment_is_portable(name: &[u8]) -> bool {
-    name != b"__DWARF" && !is_macho_lto_segment(name)
+    !is_macho_lto_segment(name)
+}
+
+/// DWARF exactly as clang emits it: a `__debug_*` or `__apple_*` section in
+/// the `__DWARF` segment, flagged S_ATTR_DEBUG. ld64 reads these only to
+/// write the debug map (see the module docs); the bytes are hashed like any
+/// other member content. Any other spelling — a debug section in a code
+/// segment, a `__DWARF` section without the flag — stays fail-closed.
+fn macho_section_is_dwarf(section_segment: &[u8], section_name: &[u8], flags: u32) -> bool {
+    section_segment == b"__DWARF"
+        && flags & S_ATTR_DEBUG != 0
+        && (section_name.starts_with(b"__debug_") || section_name.starts_with(b"__apple_"))
 }
 
 fn macho_section_is_portable(section_segment: &[u8], section_name: &[u8], flags: u32) -> bool {
@@ -850,13 +874,14 @@ fn macho_section_is_portable(section_segment: &[u8], section_name: &[u8], flags:
     // is not source-level debug data and does not cause an N_OSO entry; a
     // no-debug C/C++ object commonly contains it.
     let compact_unwind = section_segment == b"__LD" && section_name == b"__compact_unwind";
-    (flags & S_ATTR_DEBUG == 0 || compact_unwind)
-        && section_segment != b"__DWARF"
-        && !section_name.starts_with(b"__debug_")
-        && !section_name.starts_with(b"__zdebug_")
-        && !is_macho_lto_segment(section_segment)
-        && section_name != b"__bitcode"
-        && section_name != b"__bundle"
+    macho_section_is_dwarf(section_segment, section_name, flags)
+        || ((flags & S_ATTR_DEBUG == 0 || compact_unwind)
+            && section_segment != b"__DWARF"
+            && !section_name.starts_with(b"__debug_")
+            && !section_name.starts_with(b"__zdebug_")
+            && !is_macho_lto_segment(section_segment)
+            && section_name != b"__bitcode"
+            && section_name != b"__bundle")
 }
 
 fn is_macho_zerofill(flags: u32) -> bool {
@@ -1813,6 +1838,19 @@ mod tests {
         )
     }
 
+    /// DWARF as clang emits it for a `-g` translation unit.
+    fn dwarf_macho(payload: &[u8]) -> Vec<u8> {
+        macho_object(
+            MachEndian::Little,
+            true,
+            "__DWARF",
+            "__debug_info",
+            S_ATTR_DEBUG,
+            N_SECT,
+            payload,
+        )
+    }
+
     fn read_le_u32(bytes: &[u8], offset: usize) -> u32 {
         u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
     }
@@ -1916,7 +1954,7 @@ mod tests {
         for command in commands {
             let object = macho_with_extra_command(base.clone(), &command);
             assert!(
-                parse_known_no_debug_macho_object(&object).is_some(),
+                parse_known_portable_macho_object(&object).is_some(),
                 "supported load command {} must parse",
                 read_le_u32(&command, 0)
             );
@@ -1928,7 +1966,7 @@ mod tests {
         let base = no_debug_macho(b"command payload");
         let mut wrong_file_type = base.clone();
         write_le_u32(&mut wrong_file_type, 12, 2);
-        assert!(parse_known_no_debug_macho_object(&wrong_file_type).is_none());
+        assert!(parse_known_portable_macho_object(&wrong_file_type).is_none());
 
         let symtab_offset = 32 + usize::try_from(read_le_u32(&base, 36)).unwrap();
         let mut duplicate_symtab_command = base[symtab_offset..symtab_offset + 24].to_vec();
@@ -1937,12 +1975,12 @@ mod tests {
             write_le_u32(&mut duplicate_symtab_command, offset, shifted);
         }
         let duplicate_symtab = macho_with_extra_command(base.clone(), &duplicate_symtab_command);
-        assert!(parse_known_no_debug_macho_object(&duplicate_symtab).is_none());
+        assert!(parse_known_portable_macho_object(&duplicate_symtab).is_none());
 
         let with_dysymtab = macho_with_extra_command(base.clone(), &macho_command(LC_DYSYMTAB, 80));
         let duplicate_dysymtab =
             macho_with_extra_command(with_dysymtab, &macho_command(LC_DYSYMTAB, 80));
-        assert!(parse_known_no_debug_macho_object(&duplicate_dysymtab).is_none());
+        assert!(parse_known_portable_macho_object(&duplicate_dysymtab).is_none());
 
         for command in [
             macho_command(LC_SYMTAB, 16),
@@ -1952,7 +1990,7 @@ mod tests {
             macho_command(LC_UUID, 16),
         ] {
             let object = macho_with_extra_command(base.clone(), &command);
-            assert!(parse_known_no_debug_macho_object(&object).is_none());
+            assert!(parse_known_portable_macho_object(&object).is_none());
         }
     }
 
@@ -1968,14 +2006,30 @@ mod tests {
     #[test]
     fn macho_section_policy_checks_each_marker_independently() {
         assert!(macho_segment_is_portable(b"__TEXT"));
-        for segment in [
-            &b"__DWARF"[..],
-            &b"__LLVM"[..],
-            &b"__GNU_LTO"[..],
-            &b"__GNU_OFFLD_LTO"[..],
-        ] {
+        assert!(macho_segment_is_portable(b"__DWARF"));
+        for segment in [&b"__LLVM"[..], &b"__GNU_LTO"[..], &b"__GNU_OFFLD_LTO"[..]] {
             assert!(!macho_segment_is_portable(segment));
         }
+
+        // Segment, S_ATTR_DEBUG, and a DWARF section name are each required
+        // for a section to count as clang's DWARF.
+        assert!(macho_section_is_dwarf(
+            b"__DWARF",
+            b"__debug_line",
+            S_ATTR_DEBUG
+        ));
+        assert!(macho_section_is_dwarf(
+            b"__DWARF",
+            b"__apple_types",
+            S_ATTR_DEBUG
+        ));
+        assert!(!macho_section_is_dwarf(b"__DWARF", b"__debug_line", 0));
+        assert!(!macho_section_is_dwarf(
+            b"__TEXT",
+            b"__debug_line",
+            S_ATTR_DEBUG
+        ));
+        assert!(!macho_section_is_dwarf(b"__DWARF", b"__text", S_ATTR_DEBUG));
 
         for (segment, section, flags, expected) in [
             (&b"__TEXT"[..], &b"__text"[..], 0, true),
@@ -1988,7 +2042,14 @@ mod tests {
             ),
             (&b"__LD"[..], &b"__text"[..], S_ATTR_DEBUG, false),
             (&b"__TEXT"[..], &b"__text"[..], S_ATTR_DEBUG, false),
+            (&b"__DWARF"[..], &b"__debug_info"[..], S_ATTR_DEBUG, true),
+            (&b"__DWARF"[..], &b"__debug_str"[..], S_ATTR_DEBUG, true),
+            (&b"__DWARF"[..], &b"__apple_names"[..], S_ATTR_DEBUG, true),
+            (&b"__DWARF"[..], &b"__debug_info"[..], 0, false),
+            (&b"__DWARF"[..], &b"__text"[..], S_ATTR_DEBUG, false),
             (&b"__DWARF"[..], &b"__text"[..], 0, false),
+            (&b"__DWARF"[..], &b"__zdebug_info"[..], S_ATTR_DEBUG, false),
+            (&b"__TEXT"[..], &b"__debug_info"[..], S_ATTR_DEBUG, false),
             (&b"__TEXT"[..], &b"__debug_info"[..], 0, false),
             (&b"__TEXT"[..], &b"__zdebug_info"[..], 0, false),
             (&b"__LLVM"[..], &b"__text"[..], 0, false),
@@ -2032,7 +2093,7 @@ mod tests {
             SEGMENT_FILEOFF,
             u64::from(data_offset + 1),
         );
-        assert!(parse_known_no_debug_macho_object(&starts_before_segment).is_none());
+        assert!(parse_known_portable_macho_object(&starts_before_segment).is_none());
 
         let mut ends_after_segment = base.clone();
         write_le_u64(
@@ -2041,15 +2102,15 @@ mod tests {
             u64::from(data_offset - 1),
         );
         write_le_u64(&mut ends_after_segment, SEGMENT_FILESIZE, 4);
-        assert!(parse_known_no_debug_macho_object(&ends_after_segment).is_none());
+        assert!(parse_known_portable_macho_object(&ends_after_segment).is_none());
 
         let mut ordinary_out_of_bounds = base.clone();
         write_le_u32(&mut ordinary_out_of_bounds, SECTION_OFFSET, u32::MAX);
-        assert!(parse_known_no_debug_macho_object(&ordinary_out_of_bounds).is_none());
+        assert!(parse_known_portable_macho_object(&ordinary_out_of_bounds).is_none());
 
         let mut zero_sized = ordinary_out_of_bounds.clone();
         write_le_u64(&mut zero_sized, SECTION_SIZE, 0);
-        assert!(parse_known_no_debug_macho_object(&zero_sized).is_some());
+        assert!(parse_known_portable_macho_object(&zero_sized).is_some());
 
         let mut zerofill = macho_object(
             MachEndian::Little,
@@ -2061,30 +2122,30 @@ mod tests {
             b"code",
         );
         write_le_u32(&mut zerofill, SECTION_OFFSET, u32::MAX);
-        assert!(parse_known_no_debug_macho_object(&zerofill).is_some());
+        assert!(parse_known_portable_macho_object(&zerofill).is_some());
 
         let mut bad_relocation = base;
         write_le_u32(&mut bad_relocation, SECTION_RELOFF, u32::MAX);
         write_le_u32(&mut bad_relocation, SECTION_NRELOC, 1);
-        assert!(parse_known_no_debug_macho_object(&bad_relocation).is_none());
+        assert!(parse_known_portable_macho_object(&bad_relocation).is_none());
     }
 
     #[test]
     fn data_in_code_alignment_applies_only_to_that_command() {
         assert!(
-            parse_known_no_debug_macho_object(&macho_with_linkedit_command(LC_DATA_IN_CODE, 0))
+            parse_known_portable_macho_object(&macho_with_linkedit_command(LC_DATA_IN_CODE, 0))
                 .is_some()
         );
         assert!(
-            parse_known_no_debug_macho_object(&macho_with_linkedit_command(LC_DATA_IN_CODE, 8))
+            parse_known_portable_macho_object(&macho_with_linkedit_command(LC_DATA_IN_CODE, 8))
                 .is_some()
         );
         assert!(
-            parse_known_no_debug_macho_object(&macho_with_linkedit_command(LC_DATA_IN_CODE, 7))
+            parse_known_portable_macho_object(&macho_with_linkedit_command(LC_DATA_IN_CODE, 7))
                 .is_none()
         );
         assert!(
-            parse_known_no_debug_macho_object(&macho_with_linkedit_command(
+            parse_known_portable_macho_object(&macho_with_linkedit_command(
                 LC_LINKER_OPTIMIZATION_HINT,
                 7,
             ))
@@ -2393,7 +2454,7 @@ mod tests {
             for is_64 in [false, true] {
                 let object = macho_object(endian, is_64, "__TEXT", "__text", 0, N_SECT, b"code");
                 assert!(
-                    is_known_no_debug_macho_object(&object),
+                    is_known_portable_macho_object(&object),
                     "supported MH_OBJECT must pass its endian/width gate"
                 );
             }
@@ -2408,7 +2469,7 @@ mod tests {
             N_SECT,
             b"unwind",
         );
-        assert!(is_known_no_debug_macho_object(&compact_unwind));
+        assert!(is_known_portable_macho_object(&compact_unwind));
     }
 
     #[test]
@@ -2423,41 +2484,107 @@ mod tests {
             b"code",
         );
         object[4..8].copy_from_slice(&0x0200_000c_u32.to_le_bytes());
-        assert!(!is_known_no_debug_macho_object(&object));
+        assert!(!is_known_portable_macho_object(&object));
 
         let archive = bsd_archive(&[("PerfUtils.o", 16, &object)]);
         assert!(portable_static_archive_hash(&archive).is_none());
     }
 
     #[test]
-    fn bsd_debug_sections_and_stabs_fall_back() {
-        let debug_section = macho_object(
-            MachEndian::Little,
-            true,
-            "__DWARF",
-            "__debug_info",
-            S_ATTR_DEBUG,
-            N_SECT,
-            b"debug",
+    fn bsd_dwarf_hashes_structurally_and_stabs_fall_back() {
+        // A `cc`-built dev-profile object carries DWARF. It gets the
+        // structural hash — path-independent, bound to name, time, and the
+        // DWARF bytes themselves — instead of the path-bound fallback that
+        // re-keyed every such archive per checkout.
+        let dwarf = dwarf_macho(b"debug");
+        let bsd = bsd_archive(&[
+            ("__.SYMDEF SORTED", 20, BSD_SYMDEF),
+            ("cafca65b3467684e-a.o", 20, &dwarf),
+        ]);
+        let hash = portable_static_archive_hash(&bsd).expect("DWARF member parses");
+        assert!(hash.starts_with("bsd-ar-v2:"));
+        let edited = bsd_archive(&[
+            ("__.SYMDEF SORTED", 20, BSD_SYMDEF),
+            ("cafca65b3467684e-a.o", 20, &dwarf_macho(b"debuG")),
+        ]);
+        assert_ne!(
+            portable_static_archive_hash(&edited).unwrap(),
+            hash,
+            "DWARF bytes are identity-bearing"
         );
-        let stab = macho_object(
-            MachEndian::Little,
-            true,
-            "__TEXT",
-            "__text",
-            0,
-            0x64, // N_SO: any N_STAB entry is name/time-sensitive in ld64
-            b"code",
-        );
-        for object in [&debug_section, &stab] {
-            let archive = bsd_archive(&[("derived-name.o", 16, object)]);
-            assert!(portable_static_archive_hash(&archive).is_none());
-        }
 
-        // A GNU-layout archive can carry Mach-O too; its `//` names are just as
-        // capable of entering ld64's N_OSO entry and must use the same guard.
-        let gnu_debug = archive(&[("debug.o/", &debug_section)]);
-        assert!(portable_static_archive_hash(&gnu_debug).is_none());
+        // A GNU-layout archive can carry Mach-O too; the shared gate admits
+        // the same object there.
+        let gnu = archive(&[("debug.o/", &dwarf)]);
+        assert!(
+            portable_static_archive_hash(&gnu)
+                .unwrap()
+                .starts_with("gnu-ar-v2:")
+        );
+
+        // STABS entries stay name/time-sensitive in ld64 and fall back, with
+        // or without DWARF alongside, under both layouts.
+        for (segment, section, flags) in [
+            ("__TEXT", "__text", 0),
+            ("__DWARF", "__debug_info", S_ATTR_DEBUG),
+        ] {
+            let stab = macho_object(
+                MachEndian::Little,
+                true,
+                segment,
+                section,
+                flags,
+                0x64, // N_SO: any N_STAB entry is name/time-sensitive in ld64
+                b"code",
+            );
+            assert!(!is_known_portable_macho_object(&stab));
+            assert!(
+                portable_static_archive_hash(&bsd_archive(&[("derived-name.o", 16, &stab)]))
+                    .is_none()
+            );
+            assert!(portable_static_archive_hash(&archive(&[("stab.o/", &stab)])).is_none());
+        }
+    }
+
+    #[test]
+    fn only_clang_shaped_dwarf_is_admitted() {
+        // Segment, S_ATTR_DEBUG, and a DWARF section name are each required;
+        // any other spelling of a debug section keeps the path-bound fallback.
+        for (segment, section, flags) in [
+            ("__DWARF", "__debug_info", 0),
+            ("__DWARF", "__text", S_ATTR_DEBUG),
+            ("__DWARF", "__text", 0),
+            ("__DWARF", "__zdebug_info", S_ATTR_DEBUG),
+            ("__TEXT", "__debug_info", S_ATTR_DEBUG),
+            ("__TEXT", "__debug_info", 0),
+        ] {
+            let object = macho_object(
+                MachEndian::Little,
+                true,
+                segment,
+                section,
+                flags,
+                N_SECT,
+                b"x",
+            );
+            assert!(
+                !is_known_portable_macho_object(&object),
+                "{segment},{section} flags={flags:#x} must fail closed"
+            );
+            assert!(portable_static_archive_hash(&bsd_archive(&[("x.o", 4, &object)])).is_none());
+        }
+        for section in ["__debug_line", "__apple_names"] {
+            let object = macho_object(
+                MachEndian::Little,
+                true,
+                "__DWARF",
+                section,
+                S_ATTR_DEBUG,
+                N_SECT,
+                b"x",
+            );
+            assert!(is_known_portable_macho_object(&object), "{section}");
+        }
     }
 
     #[test]
@@ -2650,7 +2777,7 @@ mod tests {
             .status()
             .expect("system C compiler runs");
         assert!(status.success(), "cc -c -g0 failed");
-        assert!(is_known_no_debug_macho_object(
+        assert!(is_known_portable_macho_object(
             &std::fs::read(&seed_object).unwrap()
         ));
 
@@ -2691,12 +2818,14 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn real_darwin_debug_object_falls_back() {
+    fn real_darwin_debug_object_hashes_structurally() {
         use std::process::Command;
+        // A real `cc -c -g` object carries DWARF (`__DWARF,__debug_*` flagged
+        // S_ATTR_DEBUG). It must pass the gate, and an archive of it must get
+        // the structural BSD hash — the same one from any directory.
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("probe.c");
         let object = dir.path().join("cafca65b3467684e-debug.o");
-        let archive = dir.path().join("libprobe.a");
         std::fs::write(
             &source,
             b"int kache_archive_debug_probe(void) { return 701; }\n",
@@ -2713,21 +2842,36 @@ mod tests {
             .expect("system C compiler runs");
         assert!(status.success(), "cc -c -g failed");
         assert!(
-            !is_known_no_debug_macho_object(&std::fs::read(&object).unwrap()),
-            "debug-bearing Mach-O must fail the name-normalization gate"
+            is_known_portable_macho_object(&std::fs::read(&object).unwrap()),
+            "debug-bearing Mach-O passes the gate"
         );
 
-        let status = Command::new("ar")
-            .arg("crs")
-            .arg(&archive)
-            .arg(&object)
-            .env("ZERO_AR_DATE", "1")
-            .status()
-            .expect("system ar runs");
-        assert!(status.success(), "ar crs failed");
-        let bytes = std::fs::read(&archive).unwrap();
-        assert!(bsd_archive_hash(&bytes).is_none());
-        assert!(portable_static_archive_hash(&bytes).is_none());
+        let mut digests = Vec::new();
+        for name in ["PerfUtils", "OtherName"] {
+            let archive_dir = dir.path().join(name);
+            std::fs::create_dir_all(&archive_dir).unwrap();
+            let archive = archive_dir.join("libprobe.a");
+            let status = Command::new("ar")
+                .arg("crs")
+                .arg(&archive)
+                .arg(&object)
+                .env("ZERO_AR_DATE", "1")
+                .status()
+                .expect("system ar runs");
+            assert!(status.success(), "ar crs failed");
+            let bytes = std::fs::read(&archive).unwrap();
+            let hash = bsd_archive_hash(&bytes).expect("BSD arm claims a DWARF-bearing archive");
+            assert_portable_hash_shape(&hash);
+            assert_eq!(
+                portable_static_archive_hash(&bytes).as_deref(),
+                Some(hash.as_str())
+            );
+            digests.push(hash);
+        }
+        assert_eq!(
+            digests[0], digests[1],
+            "a DWARF-bearing archive hashes the same from any directory"
+        );
     }
 
     fn assert_portable_hash_shape(hash: &str) {

@@ -1,0 +1,53 @@
+# kache-e2e fixture for kunobi-ninja/kache#1004.
+#
+# data.c returns DATA_DIR, an absolute path under the checkout passed with -D.
+# -ffile-prefix-map rewrites __FILE__ and debug info but not string literals, so
+# data.o carries that path. The cc key used to map it to <CC_ROOT>, and a build
+# at another path restored an object naming the first checkout.
+#
+# Contracts:
+#   1. Every phase's binary names its own checkout (verify). A relocated build
+#      that restored the cold data.o prints "stale path" and fails.
+#   2. The relocated compile of data.c misses; main.c embeds no path and hits.
+name = "e2e-cc-literal-path"
+tags = ["suite:e2e", "lang:cc", "case:path-normalization"]
+
+# gnu/clang only: the prefix maps are disabled for the MSVC `cl` dialect.
+os = ["linux", "macos"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE cc"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/app"
+expected_stdout_contains = ["app ok"]
+
+# main.o is portable: a hit restores it byte-identical, at any path. data.o is
+# left out on purpose: the relocate phase compares against the cold bytes, and
+# a correct relocated data.o differs from them.
+[diff]
+artifacts = ["build/main.o"]
+
+# Both objects are stored: data.o under a key bound to this checkout.
+[assertions.cold]
+min_entries_after = 2
+
+# Same checkout: both objects hit, the checkout-bound one included.
+[assertions.warm]
+min_hits = 2
+
+[assertions.noop]
+should_not_recompile = false
+
+# Another path: main.o hits, data.o misses and recompiles.
+[assertions.relocate]
+min_hits = 1
+min_misses = 1

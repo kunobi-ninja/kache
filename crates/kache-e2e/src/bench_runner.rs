@@ -559,12 +559,14 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         profile.checks.measure.for_phase(Phase::Warm.name()),
     );
 
-    // Apparent size of each clone's objdir. On APFS the warm
-    // clone's apparent size double-counts the bytes it reflinked from
-    // the cache — print_summary subtracts those to expose "unique to
+    // Allocated size of each pool, each inode once. On APFS the warm clone
+    // still double-counts the bytes it reflinked from the cache (a reflink is
+    // a second inode) — print_summary subtracts those to expose "unique to
     // this clone" disk usage.
-    let cold_objdir_bytes = dir_size_kb(&clone_a.join(&objdir)).saturating_mul(1024);
-    let warm_objdir_bytes = dir_size_kb(&clone_b.join(&objdir)).saturating_mul(1024);
+    let disk =
+        crate::disk_usage::measure(&cache_dir, &[clone_a.join(&objdir), clone_b.join(&objdir)]);
+    let cold_objdir_bytes = disk.objdir_bytes[0];
+    let warm_objdir_bytes = disk.objdir_bytes[1];
 
     // Verify: the measured free-space delta should land near the
     // sharing-corrected estimate of the three-pool footprint. They agree on
@@ -651,10 +653,11 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         warm: warm_metrics,
         speedup: round2(speedup),
         warm_same_tree_speedup,
-        cache_size_mb: round1(dir_size_kb(&cache_dir) as f64 / 1024.0),
+        cache_size_mb: bytes_to_mib(disk.cache_bytes),
         cold_objdir_bytes,
         warm_objdir_bytes,
         disk_measured_bytes,
+        disk_footprint_bytes: disk.total_bytes,
         key_stability: stability,
         warm_leak_samples,
         verdict,
@@ -683,6 +686,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
             cache_size_bytes: crate::bench_otlp::OtlpRun::bytes_from_mib(result.cache_size_mb),
             key_stability_pct: Some(result.key_stability.stable_pct),
             disk_measured_bytes: result.disk_measured_bytes,
+            disk_footprint_bytes: result.disk_footprint_bytes,
             phases: otlp_phases(
                 &result.cold,
                 result.warm_same_tree.as_ref(),
@@ -1591,7 +1595,8 @@ fn run_pull_bench(
         profile.checks.measure.for_phase(Phase::Pull.name()),
     );
 
-    let cold_objdir_bytes = dir_size_kb(&clone_a.join(objdir)).saturating_mul(1024);
+    let disk = crate::disk_usage::measure(cache_dir, &[clone_a.join(objdir)]);
+    let cold_objdir_bytes = disk.objdir_bytes[0];
     let pull_objdir_bytes = cold_objdir_bytes; // same path; objdir was wiped+rebuilt
 
     let result = PullBenchResult {
@@ -1604,9 +1609,10 @@ fn run_pull_bench(
         cache_tool_version: cache_tool_version.map(String::from),
         cold: cold_metrics,
         pull: pull_metrics,
-        cache_size_mb: round1(dir_size_kb(cache_dir) as f64 / 1024.0),
+        cache_size_mb: bytes_to_mib(disk.cache_bytes),
         cold_objdir_bytes,
         pull_objdir_bytes,
+        disk_footprint_bytes: disk.total_bytes,
         verdict,
         measure_warnings,
         reports: [
@@ -1642,6 +1648,7 @@ fn run_pull_bench(
             cache_size_bytes: crate::bench_otlp::OtlpRun::bytes_from_mib(result.cache_size_mb),
             key_stability_pct: None,
             disk_measured_bytes: None,
+            disk_footprint_bytes: result.disk_footprint_bytes,
             phases: vec![
                 otlp_phase("cold", &result.cold, result.cold_objdir_bytes),
                 otlp_phase("pull", &result.pull, result.pull_objdir_bytes),
@@ -1721,9 +1728,10 @@ fn run_sccache_bench(
         speedup,
         profile.checks.measure.for_phase(Phase::Warm.name()),
     );
-    let cold_objdir_bytes = dir_size_kb(&clone_a.join(objdir)).saturating_mul(1024);
-    let warm_objdir_bytes = dir_size_kb(&clone_b.join(objdir)).saturating_mul(1024);
-    let cache_dir_bytes = dir_size_kb(cache_dir).saturating_mul(1024);
+    let disk = crate::disk_usage::measure(cache_dir, &[clone_a.join(objdir), clone_b.join(objdir)]);
+    let cold_objdir_bytes = disk.objdir_bytes[0];
+    let warm_objdir_bytes = disk.objdir_bytes[1];
+    let cache_dir_bytes = disk.cache_bytes;
     let sum_apparent_bytes = cold_objdir_bytes
         .saturating_add(warm_objdir_bytes)
         .saturating_add(cache_dir_bytes);
@@ -1753,6 +1761,7 @@ fn run_sccache_bench(
         warm_objdir_bytes,
         sum_apparent_bytes,
         disk_measured_bytes,
+        disk_footprint_bytes: disk.total_bytes,
         measure_warnings,
         reports: [
             "report-cold.sccache.json",
@@ -1787,6 +1796,7 @@ fn run_sccache_bench(
             cache_size_bytes: result.cache_dir_bytes,
             key_stability_pct: None,
             disk_measured_bytes: result.disk_measured_bytes,
+            disk_footprint_bytes: result.disk_footprint_bytes,
             phases: vec![
                 otlp_sccache_phase("cold", &result.cold, result.cold_objdir_bytes),
                 otlp_sccache_phase("warm", &result.warm, result.warm_objdir_bytes),
@@ -2515,34 +2525,6 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
-/// Apparent size of `dir` in KiB: recursive file lengths, not following
-/// symlinks. Returns 0 on error; this is a reported metric, not load-bearing.
-fn dir_size_kb(dir: &Path) -> u64 {
-    fn walk(dir: &Path, acc: &mut u64) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            let Ok(md) = path.symlink_metadata() else {
-                continue;
-            };
-            if md.file_type().is_symlink() {
-                continue;
-            }
-            if md.is_dir() {
-                walk(&path, acc);
-            } else {
-                *acc += md.len();
-            }
-        }
-    }
-
-    let mut bytes = 0;
-    walk(dir, &mut bytes);
-    bytes / 1024
-}
-
 /// Available bytes on the filesystem backing `path`, via `df -kP`.
 ///
 /// `-kP` forces 1024-byte blocks and the POSIX one-line-per-filesystem format,
@@ -2741,6 +2723,8 @@ struct MbxBenchResult {
     sum_apparent_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_measured_bytes: Option<u64>,
+    /// Cache and both objdirs on disk together, each inode once.
+    disk_footprint_bytes: u64,
     measure_warnings: Vec<String>,
     reports: Vec<String>,
 }
@@ -2930,9 +2914,10 @@ fn run_mbx_bench(
         speedup,
         profile.checks.measure.for_phase(Phase::Warm.name()),
     );
-    let cold_objdir_bytes = dir_size_kb(&clone_a.join(objdir)).saturating_mul(1024);
-    let warm_objdir_bytes = dir_size_kb(&clone_b.join(objdir)).saturating_mul(1024);
-    let cache_dir_bytes = dir_size_kb(cache_dir).saturating_mul(1024);
+    let disk = crate::disk_usage::measure(cache_dir, &[clone_a.join(objdir), clone_b.join(objdir)]);
+    let cold_objdir_bytes = disk.objdir_bytes[0];
+    let warm_objdir_bytes = disk.objdir_bytes[1];
+    let cache_dir_bytes = disk.cache_bytes;
     let sum_apparent_bytes = cold_objdir_bytes
         .saturating_add(warm_objdir_bytes)
         .saturating_add(cache_dir_bytes);
@@ -2954,6 +2939,7 @@ fn run_mbx_bench(
         warm_objdir_bytes,
         sum_apparent_bytes,
         disk_measured_bytes,
+        disk_footprint_bytes: disk.total_bytes,
         measure_warnings,
         reports: [
             "report-cold.mbx.json",
@@ -2984,6 +2970,7 @@ fn run_mbx_bench(
             cache_size_bytes: result.cache_dir_bytes,
             key_stability_pct: None,
             disk_measured_bytes: result.disk_measured_bytes,
+            disk_footprint_bytes: result.disk_footprint_bytes,
             phases: vec![
                 otlp_mbx_phase("cold", &result.cold, result.cold_objdir_bytes),
                 otlp_mbx_phase("warm", &result.warm, result.warm_objdir_bytes),
@@ -3031,11 +3018,12 @@ fn print_mbx_summary(r: &MbxBenchResult, archive_dir: &Path) {
     );
     eprintln!("{bar}");
     eprintln!(
-        "  disk: cold obj {} + warm obj {} + cache {} = {} apparent{}",
+        "  disk: cold obj {} + warm obj {} + cache {} = {}, {} footprint{}",
         human_bytes(r.cold_objdir_bytes),
         human_bytes(r.warm_objdir_bytes),
         human_bytes(r.cache_dir_bytes),
         human_bytes(r.sum_apparent_bytes),
+        human_bytes(r.disk_footprint_bytes),
         r.disk_measured_bytes
             .map(|measured| format!(", {} measured", human_bytes(measured)))
             .unwrap_or_default()
@@ -3073,6 +3061,8 @@ struct SccacheBenchResult {
     sum_apparent_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_measured_bytes: Option<u64>,
+    /// Cache and both objdirs on disk together, each inode once.
+    disk_footprint_bytes: u64,
     measure_warnings: Vec<String>,
     reports: Vec<String>,
 }
@@ -3286,6 +3276,10 @@ fn print_sccache_summary(r: &SccacheBenchResult, work_dir: &Path) {
         "    sum apparent  {:>10}   cold obj + warm obj + sccache cache",
         human_bytes(r.sum_apparent_bytes)
     );
+    eprintln!(
+        "    footprint     {:>10}   all pools on disk, each inode once",
+        human_bytes(r.disk_footprint_bytes)
+    );
     if let Some(measured) = r.disk_measured_bytes {
         eprintln!(
             "    measured      {:>10}   actual free-space delta (cold+warm builds)",
@@ -3491,6 +3485,11 @@ fn write_summary(
             human_bytes(measured),
         )?;
     }
+    writeln!(
+        out,
+        "    footprint     {:>10}   all pools on disk, each inode once",
+        human_bytes(r.disk_footprint_bytes),
+    )?;
     writeln!(out, "{bar}")?;
 
     // ── diagnostics: did the run actually exercise kache? ──
@@ -3630,6 +3629,10 @@ fn print_pull_summary(r: &PullBenchResult, archive_dir: &Path) {
         r.pull.event_log.passed_through,
     );
     eprintln!("cache size  : {:.1} MiB", r.cache_size_mb);
+    eprintln!(
+        "footprint   : {}   cache + objdir on disk, each inode once",
+        human_bytes(r.disk_footprint_bytes)
+    );
     if r.verdict.ok {
         eprintln!("VERDICT     : ok");
     } else {
@@ -3674,9 +3677,10 @@ struct BenchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     warm_same_tree_speedup: Option<f64>,
     cache_size_mb: f64,
-    /// Apparent bytes of clone-a's objdir after the cold build.
+    /// Bytes allocated to clone-a's objdir after the cold build, each inode
+    /// once.
     cold_objdir_bytes: u64,
-    /// Apparent bytes of clone-b's objdir after the warm build.
+    /// Bytes allocated to clone-b's objdir after the warm build.
     /// Of these, ~`warm.storage.reflinked_bytes` are CoW-shared with the
     /// cache on APFS — print_summary subtracts that to report "unique
     /// to this clone".
@@ -3688,6 +3692,10 @@ struct BenchResult {
     /// delta wouldn't cover the full three-pool layout).
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_measured_bytes: Option<u64>,
+    /// Cache and both objdirs on disk together, each inode once, read from
+    /// the filesystem after the run. A hardlink shared between the cache and
+    /// an objdir counts once here.
+    disk_footprint_bytes: u64,
     /// Cross-clone cache-key stability — the deterministic correctness
     /// signal.
     key_stability: KeyStability,
@@ -3731,6 +3739,8 @@ struct PullBenchResult {
     cache_size_mb: f64,
     cold_objdir_bytes: u64,
     pull_objdir_bytes: u64,
+    /// Cache and objdir on disk together, each inode once.
+    disk_footprint_bytes: u64,
     verdict: Verdict,
     measure_warnings: Vec<String>,
     reports: Vec<String>,
@@ -4506,6 +4516,7 @@ mod tests {
                 cache_size_bytes: 0,
                 key_stability_pct: None,
                 disk_measured_bytes: None,
+                disk_footprint_bytes: 0,
                 phases: Vec::new(),
             },
         );
@@ -5311,6 +5322,7 @@ mod tests {
             cold_objdir_bytes: 1 << 30,
             warm_objdir_bytes: 1 << 30,
             disk_measured_bytes: None,
+            disk_footprint_bytes: 1 << 31,
             key_stability: KeyStability::default(),
             warm_leak_samples: Vec::new(),
             verdict: verdict_with(true),
@@ -5473,18 +5485,6 @@ mod tests {
     }
 
     #[test]
-    fn dir_size_kb_sums_file_bytes_recursively() {
-        let dir = std::env::temp_dir().join(format!("kb-dirsize-{}", std::process::id()));
-        let sub = dir.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(dir.join("a.bin"), vec![0u8; 1024]).unwrap();
-        std::fs::write(sub.join("b.bin"), vec![0u8; 2048]).unwrap();
-        assert_eq!(dir_size_kb(&dir), 3);
-        assert_eq!(dir_size_kb(&dir.join("does-not-exist")), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn pull_bench_result_serializes_with_pull_phase() {
         let r = PullBenchResult {
             project: "bench-firefox-pull".into(),
@@ -5499,6 +5499,7 @@ mod tests {
             cache_size_mb: 1.0,
             cold_objdir_bytes: 10,
             pull_objdir_bytes: 20,
+            disk_footprint_bytes: 25,
             verdict: Verdict {
                 ok: true,
                 issues: vec![],

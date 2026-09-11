@@ -45,7 +45,7 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -1567,6 +1567,121 @@ fn parse_preprocess_dependencies(raw: &str, cwd: &Path) -> Result<Vec<PathBuf>> 
 struct PreprocessHash {
     hash: String,
     fingerprints: Option<Vec<crate::cache_key::CcPreprocessMemoInput>>,
+    /// The expansion spells out a checkout root, so its object does too and
+    /// the key is bound to this checkout (see [`hash_cc_expansion`]).
+    path_bound: bool,
+}
+
+/// The `-E` key probe's argv: the preprocess args plus the same
+/// `-ffile-prefix-map` rules the real compile gets.
+///
+/// With the maps applied, `__FILE__` expands to its sentinel exactly as it
+/// will in the object. A checkout root still spelled out in the expansion is
+/// then text the compiler copies into the object verbatim, such as a `-D`
+/// value or a string in a generated header (kunobi-ninja/kache#1004).
+fn key_preprocess_args(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Vec<String> {
+    compose_cc_args(
+        &build_preprocess_args(parsed),
+        file_prefix_map_args(prefix_maps),
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CcExpansionHash {
+    hash: String,
+    path_bound: bool,
+}
+
+/// Hash a preprocessor expansion for the cc key.
+///
+/// The probe ran with the compile's prefix maps (see [`key_preprocess_args`]),
+/// so any root left in the expansion is one `-ffile-prefix-map` does not
+/// rewrite, and the object will carry it. Mapping it to a sentinel would give
+/// every checkout the same key for objects that differ. Such an expansion is
+/// hashed as it is instead: the key hits in this checkout and misses in every
+/// other one. A portable expansion hashes its mapped form, as before.
+///
+/// A bound hash also folds every mapped root, not only the ones the expansion
+/// spells out. `execute` skips the object scan for a bound key, so a root that
+/// reaches the object some other way must still separate two checkouts even
+/// when the expansion only names a root they share, such as a base dir.
+fn hash_cc_expansion(raw: Vec<u8>, prefix_maps: &[CcPrefixMap]) -> CcExpansionHash {
+    let mapped = apply_cc_prefix_maps_to_bytes(raw.clone(), prefix_maps);
+    if mapped == raw {
+        return CcExpansionHash {
+            hash: blake3::hash(&mapped).to_hex().to_string(),
+            path_bound: false,
+        };
+    }
+    let mut roots: Vec<&str> = prefix_maps
+        .iter()
+        .map(|map| map.from.as_str())
+        .filter(|from| !from.is_empty())
+        .collect();
+    roots.sort_unstable();
+    roots.dedup();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache.cc.path-bound-expansion.v1\0");
+    for root in roots {
+        hasher.update(root.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(b"\n");
+    hasher.update(&raw);
+    CcExpansionHash {
+        hash: hasher.finalize().to_hex().to_string(),
+        path_bound: true,
+    }
+}
+
+/// Whether `bytes` contain the raw spelling of any mapped root.
+///
+/// A plain substring search, unlike [`apply_cc_prefix_maps_to_bytes`]: object
+/// files separate strings with NUL bytes, which the configured-root token rule
+/// does not treat as a boundary, and a missed root here is a false hit.
+fn bytes_embed_mapped_root(bytes: &[u8], prefix_maps: &[CcPrefixMap]) -> bool {
+    prefix_maps
+        .iter()
+        .map(|map| map.from.as_bytes())
+        .filter(|from| !from.is_empty())
+        .any(|from| {
+            bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == from[0])
+                .any(|(start, _)| bytes[start..].starts_with(from))
+        })
+}
+
+/// Whether the object at `path` embeds a raw mapped root.
+fn cc_object_embeds_mapped_root(path: &Path, prefix_maps: &[CcPrefixMap]) -> std::io::Result<bool> {
+    std::fs::read(path).map(|bytes| bytes_embed_mapped_root(&bytes, prefix_maps))
+}
+
+/// Why a successful compile's outputs must not be stored, if they must not.
+///
+/// Only a key bound to this checkout may hold an object that names it.
+/// Anything the scan cannot vouch for is not stored either: an object that
+/// cannot be read, or outputs with no object to read (`object_embeds_root`
+/// returns `None`). With no artifacts there is nothing to store or scan.
+fn cc_unsafe_to_store(
+    no_artifacts: bool,
+    key_path_bound: bool,
+    object_embeds_root: impl FnOnce() -> Option<std::io::Result<bool>>,
+) -> Option<String> {
+    if no_artifacts || key_path_bound {
+        return None;
+    }
+    match object_embeds_root() {
+        None => Some("has no object to check for checkout roots".to_string()),
+        Some(Ok(false)) => None,
+        Some(Ok(true)) => {
+            Some("embeds a checkout root the prefix maps did not rewrite".to_string())
+        }
+        Some(Err(error)) => Some(format!(
+            "could not be read to check for checkout roots: {error}"
+        )),
+    }
 }
 
 fn preprocess_hash(
@@ -1575,7 +1690,7 @@ fn preprocess_hash(
     file_hasher: &crate::cache_key::FileHasher<'_>,
     capture_dependencies: bool,
 ) -> Result<PreprocessHash> {
-    let pp_args = build_preprocess_args(parsed);
+    let pp_args = key_preprocess_args(parsed, prefix_maps);
     let dep_temp = if capture_dependencies {
         match tempfile::Builder::new()
             .prefix("kache-cc-preprocess-")
@@ -1616,7 +1731,7 @@ fn preprocess_hash(
         // dependency flags. Preserve the existing cache-key behavior and just
         // leave this invocation unmemoized.
         tracing::debug!("cc preprocess dependency capture failed; retrying without memo capture");
-        output = run(&build_preprocess_args(parsed))?;
+        output = run(&key_preprocess_args(parsed, prefix_maps))?;
     }
     if !output.status.success() {
         // Preprocess failed — the real compile would also fail.
@@ -1639,36 +1754,45 @@ fn preprocess_hash(
         // nothing → passthrough.
         anyhow::bail!("cc -E key probe produced no output");
     }
-    let stdout = apply_cc_prefix_maps_to_bytes(output.stdout, prefix_maps);
-    let hash = blake3::hash(&stdout).to_hex().to_string();
-    let fingerprints = dep_path.as_deref().and_then(|path| {
-        let dependencies = std::fs::read_to_string(path)
-            .context("reading cc preprocess dependency file")
-            .and_then(|raw| {
-                let cwd = std::env::current_dir().context("reading cc compiler directory")?;
-                parse_preprocess_dependencies(&raw, &cwd)
-            });
-        match dependencies {
-            Ok(paths) => {
-                // Record each input under its prefix-mapped spelling, the form
-                // the expansion above was hashed in. That is what lets another
-                // checkout read the memo: the path a second worktree resolves
-                // an input to differs, the mapped name does not.
-                let mapped: Vec<(String, PathBuf)> = paths
-                    .into_iter()
-                    .map(|path| (cc_mapped_path(&path, prefix_maps), path))
-                    .collect();
-                file_hasher.cc_preprocess_fingerprints(&mapped, &|path| {
-                    cc_mapped_content_hash(path, prefix_maps)
-                })
+    let CcExpansionHash { hash, path_bound } = hash_cc_expansion(output.stdout, prefix_maps);
+    // A path-bound expansion is never memoized. The memo is read from other
+    // checkouts through mapped names, and a hit skips the probe that would
+    // have noticed the root.
+    let fingerprints = dep_path
+        .as_deref()
+        .filter(|_| !path_bound)
+        .and_then(|path| {
+            let dependencies = std::fs::read_to_string(path)
+                .context("reading cc preprocess dependency file")
+                .and_then(|raw| {
+                    let cwd = std::env::current_dir().context("reading cc compiler directory")?;
+                    parse_preprocess_dependencies(&raw, &cwd)
+                });
+            match dependencies {
+                Ok(paths) => {
+                    // Record each input under its prefix-mapped spelling, the form
+                    // the expansion above was hashed in. That is what lets another
+                    // checkout read the memo: the path a second worktree resolves
+                    // an input to differs, the mapped name does not.
+                    let mapped: Vec<(String, PathBuf)> = paths
+                        .into_iter()
+                        .map(|path| (cc_mapped_path(&path, prefix_maps), path))
+                        .collect();
+                    file_hasher.cc_preprocess_fingerprints(&mapped, &|path| {
+                        cc_mapped_content_hash(path, prefix_maps)
+                    })
+                }
+                Err(error) => {
+                    tracing::debug!("cc preprocess dependency capture unavailable: {error:#}");
+                    None
+                }
             }
-            Err(error) => {
-                tracing::debug!("cc preprocess dependency capture unavailable: {error:#}");
-                None
-            }
-        }
-    });
-    Ok(PreprocessHash { hash, fingerprints })
+        });
+    Ok(PreprocessHash {
+        hash,
+        fingerprints,
+        path_bound,
+    })
 }
 
 /// Whether a positional argument looks like a C-family source file
@@ -3912,7 +4036,10 @@ fn cc_preprocess_memo_key(
     let compiler_path = super::resolve_program_on_path(&parsed.program)?;
     let compiler_metadata = std::fs::metadata(&compiler_path).ok()?;
     let mut hasher = blake3::Hasher::new();
-    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v3");
+    // v4: the probe now runs with the compile's prefix maps, and path-bound
+    // expansions are never recorded. A v3 record may hold the mapped hash of
+    // one of those, which would give another checkout its key (#1004).
+    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v4");
     fold_cc_memo_field(
         &mut hasher,
         b"compiler-program",
@@ -4677,6 +4804,9 @@ pub struct CcCompiler {
     /// The shadowing digest folded into the key, with the read set it was
     /// resolved from, so the publish-time recheck can reproduce it exactly.
     pending_include_dir_digest: RefCell<Option<(String, Option<Vec<PathBuf>>)>>,
+    /// The last key bound itself to this checkout's roots. `execute` stores an
+    /// object that embeds a raw root only under such a key.
+    key_path_bound: Cell<bool>,
 }
 
 const C_FAMILY_DRIVERS: [(&str, ToolFamily); 7] = [
@@ -4758,6 +4888,7 @@ impl CcCompiler {
             base_dirs: Vec::new(),
             pending_preprocess_memo: RefCell::new(None),
             pending_include_dir_digest: RefCell::new(None),
+            key_path_bound: Cell::new(false),
         }
     }
 
@@ -5050,6 +5181,7 @@ impl Compiler for CcCompiler {
         // Preconditions (guaranteed by the wrapper checking
         // refuse_reasons first): `-c` mode, exactly one source.
         self.pending_preprocess_memo.borrow_mut().take();
+        self.key_path_bound.set(false);
         let mut hasher = blake3::Hasher::new();
         let trace_name = cc_trace_name(parsed);
         let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
@@ -5083,6 +5215,12 @@ impl Compiler for CcCompiler {
             }
         }
         prefix_sentinels.sort_unstable();
+
+        // Expansions that spell out a checkout root are hashed raw (see
+        // `hash_cc_expansion`). Naming the scheme retires entries stored before
+        // it, which mapped those roots to a sentinel and could hand another
+        // checkout an object naming this one (kunobi-ninja/kache#1004).
+        hasher.update(b"expansion_roots:literal-bound.v1\n");
 
         hasher.update(b"prefix_maps:");
         for sentinel in prefix_sentinels {
@@ -5401,6 +5539,7 @@ impl Compiler for CcCompiler {
         } else {
             let preprocessed =
                 preprocess_hash(parsed, &prefix_maps, ctx.file_hasher, memo_key.is_some())?;
+            self.key_path_bound.set(preprocessed.path_bound);
             let read_inputs = preprocessed.fingerprints.as_ref().map(|inputs| {
                 inputs
                     .iter()
@@ -5532,6 +5671,23 @@ impl Compiler for CcCompiler {
             discover_cc_output_artifacts(parsed)
         } else {
             ArtifactSet::empty()
+        };
+        // Safety net for #1004. The key probe catches roots in the expansion.
+        // A root that reaches the object some other way would still be stored
+        // under a key every checkout shares, so keep the object for this build
+        // and store nothing. It only sees roots spelled out as plain bytes.
+        let unsafe_to_store =
+            cc_unsafe_to_store(artifacts.is_empty(), self.key_path_bound.get(), || {
+                parsed
+                    .object_output_path()
+                    .map(|path| cc_object_embeds_mapped_root(&path, &prefix_maps))
+            });
+        let artifacts = match unsafe_to_store {
+            None => artifacts,
+            Some(reason) => {
+                tracing::warn!("cc: {} {reason}; not caching it", cc_trace_name(parsed));
+                ArtifactSet::empty()
+            }
         };
 
         Ok(CompileResult {
@@ -9005,6 +9161,42 @@ mod tests {
 
     // ── build_preprocess_args ───────────────────────────────────
 
+    /// #1004: the key probe expands `__FILE__` the way the compile will, so a
+    /// root left in the expansion really is a literal the object will carry.
+    #[test]
+    fn key_probe_runs_with_the_compile_prefix_maps() {
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o"])).unwrap();
+        let maps = vec![
+            CcPrefixMap {
+                from: "/w/src".to_string(),
+                to: "<CC_SOURCE>".to_string(),
+            },
+            CcPrefixMap {
+                from: "/w".to_string(),
+                to: CC_ROOT_SENTINEL.to_string(),
+            },
+        ];
+        let pp = key_preprocess_args(&parsed, &maps);
+        let mut expected = build_preprocess_args(&parsed);
+        expected.extend(file_prefix_map_args(&maps));
+        assert_eq!(pp, expected);
+        assert_eq!(
+            key_preprocess_args(&parsed, &[]),
+            build_preprocess_args(&parsed)
+        );
+
+        // The maps go ahead of a `--` separator, as in the real compile, or the
+        // driver would read them as extra inputs.
+        let separated = CcArgs::parse(&s(&["clang", "-c", "-o", "foo.o", "--", "foo.c"])).unwrap();
+        let pp = key_preprocess_args(&separated, &maps);
+        let separator = pp.iter().position(|a| a == "--").expect("`--` is kept");
+        let first_map = pp
+            .iter()
+            .position(|a| a.starts_with("-ffile-prefix-map="))
+            .expect("maps are passed");
+        assert!(first_map < separator, "{pp:?}");
+    }
+
     #[test]
     fn build_preprocess_args_forces_dash_e_dash_p_and_strips_mode() {
         let parsed =
@@ -9473,6 +9665,63 @@ mod tests {
         );
     }
 
+    /// #1004 through the real preprocessor. With the compile's maps on the
+    /// probe, `__FILE__` stays portable and memoizable, while a `-D` checkout
+    /// path binds the key to its checkout and is never memoized.
+    #[cfg(unix)]
+    #[test]
+    fn real_probe_separates_file_macro_from_literal_roots() {
+        let probe = |with_literal: bool| {
+            let tree = tempfile::TempDir::new().unwrap();
+            let root = tree.path().canonicalize().unwrap();
+            let src = root.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let source = src.join("x.c");
+            std::fs::write(
+                &source,
+                "const char *f(void) { return __FILE__; }\n\
+                 #ifdef DATA\nconst char *d(void) { return DATA; }\n#endif\n",
+            )
+            .unwrap();
+            let mut args = vec![
+                "cc".to_string(),
+                "-c".to_string(),
+                source.to_string_lossy().into_owned(),
+                "-o".to_string(),
+                root.join("x.o").to_string_lossy().into_owned(),
+            ];
+            if with_literal {
+                args.push(format!("-DDATA=\"{}/data\"", root.display()));
+            }
+            let parsed = CcArgs::parse(&args).unwrap();
+            let maps = cc_prefix_maps_for(&parsed, &root);
+            let hasher = crate::cache_key::FileHasher::persistent(&root.join("idx.sqlite"));
+            let hashed = preprocess_hash(&parsed, &maps, &hasher, true).unwrap();
+            (tree, hashed)
+        };
+
+        let (_a, portable_a) = probe(false);
+        let (_b, portable_b) = probe(false);
+        assert!(!portable_a.path_bound && !portable_b.path_bound);
+        assert_eq!(
+            portable_a.hash, portable_b.hash,
+            "__FILE__ must stay portable"
+        );
+        assert!(
+            portable_a
+                .fingerprints
+                .as_ref()
+                .is_some_and(|inputs| !inputs.is_empty()),
+            "dependency capture still works with the maps on the probe"
+        );
+
+        let (_c, literal_a) = probe(true);
+        let (_d, literal_b) = probe(true);
+        assert!(literal_a.path_bound && literal_b.path_bound);
+        assert_ne!(literal_a.hash, literal_b.hash);
+        assert!(literal_a.fingerprints.is_none(), "never memoized");
+    }
+
     #[test]
     fn cc_prefix_maps_derive_common_source_and_build_root() {
         let root = tempfile::TempDir::new().unwrap();
@@ -9617,6 +9866,132 @@ mod tests {
             "X=/proc/self/cwd/foo.c",
             "the /proc/self map must not rewrite the /proc/self/cwd just emitted"
         );
+    }
+
+    fn clone_root_maps(clone: &str) -> Vec<CcPrefixMap> {
+        vec![CcPrefixMap {
+            from: format!("/Users/me/work/{clone}"),
+            to: CC_ROOT_SENTINEL.to_string(),
+        }]
+    }
+
+    /// #1004: a root still spelled out after the probe (a `-D` value, a string
+    /// in a generated header) lands in the object verbatim, so two checkouts
+    /// must not share the key. The same checkout still does.
+    #[test]
+    fn expansion_with_a_literal_root_binds_the_key_to_the_checkout() {
+        let expansion = |clone: &str| {
+            format!(r#"const char *d(void) {{ return "/Users/me/work/{clone}/data"; }}"#)
+                .into_bytes()
+        };
+        let a = hash_cc_expansion(expansion("clone-a"), &clone_root_maps("clone-a"));
+        let b = hash_cc_expansion(expansion("clone-b"), &clone_root_maps("clone-b"));
+        assert!(a.path_bound && b.path_bound);
+        assert_ne!(a.hash, b.hash, "another checkout must not share the key");
+        assert_eq!(
+            a,
+            hash_cc_expansion(expansion("clone-a"), &clone_root_maps("clone-a")),
+            "the same checkout keeps its key"
+        );
+    }
+
+    /// A bound key skips the object scan, so it must separate checkouts even
+    /// when the expansion names only a root they share. Here both expansions
+    /// spell the same configured base dir and are byte-identical.
+    #[test]
+    fn bound_expansion_folds_every_root_not_only_the_one_it_names() {
+        let maps = |clone: &str| {
+            let mut maps = clone_root_maps(clone);
+            maps.push(CcPrefixMap {
+                from: "/opt/shared".to_string(),
+                to: "/kache/base-dir-0".to_string(),
+            });
+            maps
+        };
+        let expansion = br#"const char *s = "/opt/shared/data";"#.to_vec();
+        let a = hash_cc_expansion(expansion.clone(), &maps("clone-a"));
+        let b = hash_cc_expansion(expansion, &maps("clone-b"));
+        assert!(a.path_bound && b.path_bound);
+        assert_ne!(a.hash, b.hash);
+    }
+
+    /// The probe runs with the compile's maps, so `__FILE__` arrives as the
+    /// sentinel. Such an expansion stays portable and hashes as it always did.
+    #[test]
+    fn expansion_without_raw_roots_stays_portable() {
+        let expansion = format!(r#"const char *f = "{CC_ROOT_SENTINEL}/src/x.c";"#).into_bytes();
+        let a = hash_cc_expansion(expansion.clone(), &clone_root_maps("clone-a"));
+        let b = hash_cc_expansion(expansion.clone(), &clone_root_maps("clone-b"));
+        assert!(!a.path_bound);
+        assert_eq!(a, b);
+        assert_eq!(a.hash, blake3::hash(&expansion).to_hex().to_string());
+    }
+
+    /// #1004 safety net: a raw root in an object stored under a portable key
+    /// would reach every checkout. Only a checkout-bound key may hold one.
+    #[test]
+    fn store_gate_keeps_raw_roots_out_of_portable_keys() {
+        let never = || -> Option<std::io::Result<bool>> { panic!("scanned without a need") };
+        assert_eq!(cc_unsafe_to_store(true, false, never), None);
+        assert_eq!(cc_unsafe_to_store(false, true, never), None);
+        let no_object = cc_unsafe_to_store(false, false, || None).unwrap();
+        assert!(no_object.contains("no object"), "{no_object}");
+        assert_eq!(cc_unsafe_to_store(false, false, || Some(Ok(false))), None);
+        let embeds = cc_unsafe_to_store(false, false, || Some(Ok(true))).unwrap();
+        assert!(embeds.contains("embeds a checkout root"), "{embeds}");
+        let unreadable =
+            cc_unsafe_to_store(false, false, || Some(Err(std::io::Error::other("gone")))).unwrap();
+        assert!(
+            unreadable.contains("could not be read") && unreadable.contains("gone"),
+            "{unreadable}"
+        );
+    }
+
+    #[test]
+    fn object_root_check_reads_the_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let maps = clone_root_maps("clone-a");
+        let dirty = dir.path().join("dirty.o");
+        std::fs::write(&dirty, b"\x7fELF\0/Users/me/work/clone-a/data\0").unwrap();
+        let clean = dir.path().join("clean.o");
+        std::fs::write(&clean, format!("\x7fELF\0{CC_ROOT_SENTINEL}/data\0")).unwrap();
+        assert!(cc_object_embeds_mapped_root(&dirty, &maps).unwrap());
+        assert!(!cc_object_embeds_mapped_root(&clean, &maps).unwrap());
+        assert!(cc_object_embeds_mapped_root(&dir.path().join("missing.o"), &maps).is_err());
+    }
+
+    #[test]
+    fn object_scan_finds_raw_roots_the_token_mapper_skips() {
+        let maps = clone_root_maps("clone-a");
+        assert!(bytes_embed_mapped_root(
+            b"\0\0/Users/me/work/clone-a/data\0",
+            &maps
+        ));
+        let other = format!("\0{CC_ROOT_SENTINEL}/data\0/Users/me/work/clone-b\0");
+        assert!(!bytes_embed_mapped_root(other.as_bytes(), &maps));
+        assert!(
+            !bytes_embed_mapped_root(b"/Users/me/work/clone-", &maps),
+            "a prefix of the root is not the root"
+        );
+
+        // A configured base dir maps only at token starts, and NUL is not one.
+        // The scan must still see it, or the object would be stored.
+        let configured = vec![CcPrefixMap {
+            from: "/base".to_string(),
+            to: "/kache/base-dir-0".to_string(),
+        }];
+        let object = b"x\0/base/data\0".to_vec();
+        assert_eq!(
+            apply_cc_prefix_maps_to_bytes(object.clone(), &configured),
+            object
+        );
+        assert!(bytes_embed_mapped_root(&object, &configured));
+
+        let empty = vec![CcPrefixMap {
+            from: String::new(),
+            to: CC_ROOT_SENTINEL.to_string(),
+        }];
+        assert!(!bytes_embed_mapped_root(b"anything", &empty));
     }
 
     #[test]

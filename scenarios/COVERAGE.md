@@ -38,6 +38,7 @@ came from the second pass.
 | Flag modeling (gcc / clang / clang-cl) | `e2e-cc-bench-flags`, `e2e-cc-bench-flags-gnu`, `e2e-cc-cl-debug`, `e2e-cc-cl-xclang-deps` |
 | Realistic flag-soup canaries | `e2e-cc-flag-soup`, `e2e-rust-flag-soup`, `e2e-cmake-ninja-flagset` |
 | `__FILE__` / out-of-tree base-dir handling (#410) | `e2e-cc-file-macro-oot`, `e2e-cmake-file-macro-oot` |
+| Checkout paths in string literals stay checkout-bound (#1004) | `e2e-cc-literal-path` |
 | CMake launcher + Ninja generator | `e2e-cmake-out-of-tree`, `e2e-cmake-file-macro-oot`, `e2e-cmake-ninja-flagset` |
 | Unsupported-flag passthrough | `e2e-c-passthrough` |
 | Refusal by invocation shape (multi-source, response file) | `e2e-cc-multi-source`, `e2e-cc-response-file` |

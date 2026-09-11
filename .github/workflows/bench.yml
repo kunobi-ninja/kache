@@ -35,7 +35,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, surrealdb, lance, opendal, eza, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, hk, hk-pull, hk-mbx, opendal-mbx, lance-mbx, substrate-mbx, surrealdb-mbx]
+        options: [all, substrate, surrealdb, lance, opendal, eza, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, hk, hk-nopred, hk-pull, hk-mbx, opendal-mbx, lance-mbx, substrate-mbx, surrealdb-mbx]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -139,6 +139,9 @@ jobs:
           # `--warm-same-tree` adds the same-path warm phase between cold and the
           # cross-clone warm. Minutes, not hours; a C compiler is all it needs.
           hk='{"name":"hk","cmd":"bench hk --warm-same-tree","dir":"bench-hk","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          # hk with input predictions off: the control for the arm above, so
+          # the same nightly shows what predictions are worth (#1000).
+          hk_nopred='{"name":"hk-nopred","cmd":"bench hk-nopred --warm-same-tree","dir":"bench-hk-nopred","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
           # Same subject on the temporal axis: cold at the parent commit, then
           # rebuild the child in the same worktree with the store warm.
           hk_pull='{"name":"hk-pull","cmd":"bench hk-pull","dir":"bench-hk-pull","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
@@ -178,6 +181,7 @@ jobs:
             llvm)                 inc="[$llvm]" ;;
             firefox-pull)         inc="[$firefox_pull]" ;;
             hk)                   inc="[$hk]" ;;
+            hk-nopred)            inc="[$hk_nopred]" ;;
             hk-pull)              inc="[$hk_pull]" ;;
             hk-mbx)               inc="[$hk_mbx]" ;;
             eza)                  inc="[$eza]" ;;
@@ -191,7 +195,7 @@ jobs:
             # and wastefully run the whole Linux `all` matrix alongside.
             firefox-windows)      inc="[]" ;;
             firefox-pull-windows) inc="[]" ;;
-            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull,$hk,$hk_pull,$hk_mbx,$eza,$opendal_mbx,$lance_mbx,$substrate_mbx,$surrealdb_mbx]" ;;
+            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull,$hk,$hk_nopred,$hk_pull,$hk_mbx,$eza,$opendal_mbx,$lance_mbx,$substrate_mbx,$surrealdb_mbx]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
           if [ "$inc" = "[]" ]; then

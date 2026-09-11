@@ -116,27 +116,38 @@ impl Tally {
 }
 
 #[cfg(unix)]
-fn file_id(metadata: &Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    Some((metadata.dev(), metadata.ino()))
-}
+use unix::{allocated_bytes, file_id};
 
-/// No stable inode identity on this platform: every path counts.
 #[cfg(not(unix))]
-fn file_id(_metadata: &Metadata) -> Option<(u64, u64)> {
-    None
-}
+use other::{allocated_bytes, file_id};
 
-/// `st_blocks` is in 512-byte units on every Unix, whatever the block size.
 #[cfg(unix)]
-fn allocated_bytes(metadata: &Metadata) -> u64 {
+mod unix {
+    use std::fs::Metadata;
     use std::os::unix::fs::MetadataExt;
-    metadata.blocks() * 512
+
+    pub(super) fn file_id(metadata: &Metadata) -> Option<(u64, u64)> {
+        Some((metadata.dev(), metadata.ino()))
+    }
+
+    /// `st_blocks` is in 512-byte units on every Unix, whatever the block size.
+    pub(super) fn allocated_bytes(metadata: &Metadata) -> u64 {
+        metadata.blocks() * 512
+    }
 }
 
+/// Without inode identity or block counts every path counts at its length.
 #[cfg(not(unix))]
-fn allocated_bytes(metadata: &Metadata) -> u64 {
-    metadata.len()
+mod other {
+    use std::fs::Metadata;
+
+    pub(super) fn file_id(_metadata: &Metadata) -> Option<(u64, u64)> {
+        None
+    }
+
+    pub(super) fn allocated_bytes(metadata: &Metadata) -> u64 {
+        metadata.len()
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -214,6 +214,15 @@ gitignore = true
 # consumer tests; mutating it tests the harness instead of filesystem behavior.
 # windows_identity combines a shifted u32 with an unshifted u32. Their bits do
 # not overlap, so replacing OR with XOR produces the same u64 for every input.
+#
+# `print_pull_summary` and `print_sccache_summary` are `print_mbx_summary`'s
+# shape: they only write the human summary to the e2e driver's stderr. The
+# numbers they print come from `disk_usage::measure`, `bytes_to_mib` and the
+# phase parsers, which are tested directly.
+#
+# `disk_usage::other` is the non-Unix fallback for inode identity and
+# allocated size. The ubuntu lane never compiles it; `disk_usage::unix` and
+# the measurement walk stay in scope.
 exclude_globs = ["crates/kache-fs/src/apfs.rs"]
 exclude_re = [
     "crates/kache-fs/src/copy.rs:.*(native_reflink_macos|native_reflink_windows|native_reflink_unsupported|windows_cluster_size)",
@@ -270,6 +279,9 @@ exclude_re = [
     "replace run_sccache_bench .* with Ok",
     "replace run_mbx_bench .* with Ok",
     "replace print_mbx_summary with \\(\\)",
+    "replace print_pull_summary with \\(\\)",
+    "replace print_sccache_summary with \\(\\)",
+    "crates/kache-e2e/src/disk_usage.rs:.*other::",
     "replace run_cold_phase .* with Ok",
     "src/cache_fs.rs:.*replace probe_windows",
     "src/cache_fs.rs:.*replace statfs_total_bytes_macos",

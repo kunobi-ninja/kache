@@ -1,0 +1,72 @@
+# hk with input-set predictions off: the control arm for bench-hk.
+#
+# bench-hk runs with predictions on. This scenario is the same subject, the
+# same commit, the same wiring and the same phases, with predictions forced
+# off, so one nightly measures both sides on the same runner pool. Compare the
+# warm-same-tree phases: wall clock, total key time and dep-info pre-pass
+# count. That difference is the evidence kunobi-ninja/kache#1000 asks for
+# before predictions can default on.
+#
+# Predictions are set to 0 explicitly rather than left to the default, so this
+# arm stays a control after the default changes. Remove it once #1000 is
+# decided.
+name = "bench-hk-nopred"
+tags = ["suite:bench", "project:hk", "backend:kache", "lang:rust", "lang:cc"]
+
+requires = ["cargo", "rustc", "cc"]
+
+setup = [
+  "echo '[bench] bench-hk-nopred needs a C compiler (aws-lc-sys cc builder, vendored libgit2); cmake only as the aws-lc-sys fallback.'",
+]
+
+build = """
+# Predictions off: every rustc unit runs the dep-info pre-pass. This is the
+# baseline bench-hk's predictions are measured against (kunobi-ninja/kache#1000).
+export KACHE_INPUT_PREDICTIONS=0
+
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+export KACHE_BASE_DIR="$repo"
+
+cargo build --locked
+"""
+
+# Same wiring as bench-hk; see that scenario for why.
+[env]
+HOST_CC = "{kache} cc"
+HOST_CXX = "{kache} c++"
+CC_KNOWN_WRAPPER_CUSTOM = "kache"
+
+[source]
+kind   = "clone"
+repo   = "https://github.com/jdx/hk.git"
+# Must match bench-hk's ref, or the two arms measure different code.
+ref    = "fc29ead1456ba7c1f62826c284126410a4014b00"
+objdir = "target"
+
+[[file]]
+path = "rust-toolchain.toml"
+content = """
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+"""
+
+# The same validity floors as bench-hk, so a broken control fails loudly
+# instead of reporting a flattering or meaningless baseline.
+[checks.assert.warm-same-tree]
+max_passthrough_pct = 40.0
+max_errors = 0
+min_hits = 200
+min_restored_bytes = 67108864 # 64 MiB
+
+[checks.assert.warm]
+min_key_stability_pct = 50.0
+max_passthrough_pct = 40.0
+max_errors = 0
+min_hits = 200
+min_restored_bytes = 67108864 # 64 MiB

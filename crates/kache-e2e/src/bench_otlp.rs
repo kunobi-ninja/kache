@@ -35,6 +35,11 @@ pub struct OtlpRun {
     pub project: String,
     pub git_ref: String,
     pub cache_tool: &'static str,
+    /// The build of the cache tool that ran, as its `--version` printed it
+    /// (`kache 0.19.0`). The same string the bench summary JSON carries as
+    /// `cache_tool_version`, so a step in a series can be matched to a tool
+    /// release. One value per release, not per run.
+    pub cache_tool_version: String,
     pub time_unix_nano: String,
     pub verdict_ok: bool,
     pub speedup: Option<f64>,
@@ -103,6 +108,13 @@ impl OtlpRun {
     pub fn bytes_from_mib(mib: f64) -> u64 {
         (mib * 1024.0 * 1024.0).round() as u64
     }
+
+    /// The summary's `cache_tool_version`, or `<tool> unknown` when `--version`
+    /// printed nothing usable. An empty string would read as a missing
+    /// attribute rather than an unknown build.
+    pub fn tool_version_or_unknown(cache_tool: &str, version: Option<&str>) -> String {
+        version.map_or_else(|| format!("{cache_tool} unknown"), str::to_string)
+    }
 }
 
 pub fn write_otlp(work_dir: &Path, run: &OtlpRun) -> Result<()> {
@@ -126,6 +138,7 @@ pub fn serialize_metrics(run: &OtlpRun) -> Value {
                 "attributes": [
                     str_attr("kache.telemetry.schema_version", &SCHEMA_VERSION.to_string()),
                     str_attr("kache.bench.git_ref", &run.git_ref),
+                    str_attr("kache.bench.cache_tool_version", &run.cache_tool_version),
                 ]
             },
             "scopeMetrics": [{
@@ -378,6 +391,7 @@ mod tests {
             project: "bench-firefox".into(),
             git_ref: "FIREFOX_140_0_RELEASE".into(),
             cache_tool: "kache",
+            cache_tool_version: "kache 0.19.0".into(),
             time_unix_nano: "1700000000000000000".into(),
             verdict_ok: true,
             speedup: Some(4.2),
@@ -532,6 +546,7 @@ mod tests {
         let expected: std::collections::BTreeSet<_> = [
             "kache.telemetry.schema_version",
             "kache.bench.git_ref",
+            "kache.bench.cache_tool_version",
             "kache.bench.project",
             "kache.bench.cache_tool",
             "kache.bench.phase",
@@ -541,6 +556,32 @@ mod tests {
         .map(str::to_string)
         .collect();
         assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn resource_carries_the_cache_tool_version() {
+        let body = serialize_metrics(&kache_run());
+        let resource = &body["resourceMetrics"][0]["resource"];
+        assert_eq!(
+            attr_map(resource)["kache.bench.cache_tool_version"],
+            "kache 0.19.0"
+        );
+    }
+
+    #[test]
+    fn tool_version_is_the_summary_value_when_known() {
+        assert_eq!(
+            OtlpRun::tool_version_or_unknown("mbx", Some("mbx 1.10.1")),
+            "mbx 1.10.1"
+        );
+    }
+
+    #[test]
+    fn unknown_tool_version_names_the_tool() {
+        assert_eq!(
+            OtlpRun::tool_version_or_unknown("sccache", None),
+            "sccache unknown"
+        );
     }
 
     #[test]
@@ -601,6 +642,7 @@ mod tests {
             project: "bench-firefox-sccache".into(),
             git_ref: "FIREFOX_140_0_RELEASE".into(),
             cache_tool: "sccache",
+            cache_tool_version: "sccache 0.10.0".into(),
             time_unix_nano: "1".into(),
             verdict_ok: true,
             speedup: Some(1.1),

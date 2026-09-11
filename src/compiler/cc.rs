@@ -1663,13 +1663,13 @@ fn cc_object_embeds_mapped_root(path: &Path, prefix_maps: &[CcPrefixMap]) -> std
 /// Only a key bound to this checkout may hold an object that names it.
 /// Anything the scan cannot vouch for is not stored either: an object that
 /// cannot be read, or outputs with no object to read (`object_embeds_root`
-/// returns `None`).
+/// returns `None`). With no artifacts there is nothing to store or scan.
 fn cc_unsafe_to_store(
-    has_artifacts: bool,
+    no_artifacts: bool,
     key_path_bound: bool,
     object_embeds_root: impl FnOnce() -> Option<std::io::Result<bool>>,
 ) -> Option<String> {
-    if !has_artifacts || key_path_bound {
+    if no_artifacts || key_path_bound {
         return None;
     }
     match object_embeds_root() {
@@ -5677,7 +5677,7 @@ impl Compiler for CcCompiler {
         // under a key every checkout shares, so keep the object for this build
         // and store nothing. It only sees roots spelled out as plain bytes.
         let unsafe_to_store =
-            cc_unsafe_to_store(!artifacts.is_empty(), self.key_path_bound.get(), || {
+            cc_unsafe_to_store(artifacts.is_empty(), self.key_path_bound.get(), || {
                 parsed
                     .object_output_path()
                     .map(|path| cc_object_embeds_mapped_root(&path, &prefix_maps))
@@ -9932,15 +9932,15 @@ mod tests {
     #[test]
     fn store_gate_keeps_raw_roots_out_of_portable_keys() {
         let never = || -> Option<std::io::Result<bool>> { panic!("scanned without a need") };
-        assert_eq!(cc_unsafe_to_store(false, false, never), None);
-        assert_eq!(cc_unsafe_to_store(true, true, never), None);
-        let no_object = cc_unsafe_to_store(true, false, || None).unwrap();
+        assert_eq!(cc_unsafe_to_store(true, false, never), None);
+        assert_eq!(cc_unsafe_to_store(false, true, never), None);
+        let no_object = cc_unsafe_to_store(false, false, || None).unwrap();
         assert!(no_object.contains("no object"), "{no_object}");
-        assert_eq!(cc_unsafe_to_store(true, false, || Some(Ok(false))), None);
-        let embeds = cc_unsafe_to_store(true, false, || Some(Ok(true))).unwrap();
+        assert_eq!(cc_unsafe_to_store(false, false, || Some(Ok(false))), None);
+        let embeds = cc_unsafe_to_store(false, false, || Some(Ok(true))).unwrap();
         assert!(embeds.contains("embeds a checkout root"), "{embeds}");
         let unreadable =
-            cc_unsafe_to_store(true, false, || Some(Err(std::io::Error::other("gone")))).unwrap();
+            cc_unsafe_to_store(false, false, || Some(Err(std::io::Error::other("gone")))).unwrap();
         assert!(
             unreadable.contains("could not be read") && unreadable.contains("gone"),
             "{unreadable}"

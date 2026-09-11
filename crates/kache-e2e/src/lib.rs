@@ -16,6 +16,7 @@ mod bench_otlp;
 pub mod bench_profile;
 pub mod bench_runner;
 pub mod daemon;
+mod disk_usage;
 pub mod fixture;
 pub mod fixture_runner;
 pub mod phase;

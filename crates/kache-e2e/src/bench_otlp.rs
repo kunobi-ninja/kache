@@ -46,6 +46,10 @@ pub struct OtlpRun {
     pub cache_size_bytes: u64,
     pub key_stability_pct: Option<f64>,
     pub disk_measured_bytes: Option<u64>,
+    /// Every pool the run left on disk, cache and objdirs, each inode once.
+    /// Read from the filesystem, so unlike `disk_measured_bytes` it does not
+    /// move with other jobs on the same volume. See [`crate::disk_usage`].
+    pub disk_footprint_bytes: u64,
     pub phases: Vec<OtlpPhase>,
 }
 
@@ -295,6 +299,15 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
             vec![as_int(disk, &run.time_unix_nano, &run_attrs)],
         ));
     }
+    metrics.push(gauge(
+        "kache.bench.disk.footprint",
+        "By",
+        vec![as_int(
+            run.disk_footprint_bytes,
+            &run.time_unix_nano,
+            &run_attrs,
+        )],
+    ));
     if let Some(stable) = run.key_stability_pct {
         metrics.push(gauge(
             "kache.bench.key_stability",
@@ -398,6 +411,7 @@ mod tests {
             cache_size_bytes: 12 * 1024 * 1024,
             key_stability_pct: Some(96.9),
             disk_measured_bytes: Some(3_000_000_000),
+            disk_footprint_bytes: 2_500_000_000,
             phases: vec![
                 OtlpPhase {
                     name: "cold",
@@ -512,6 +526,14 @@ mod tests {
         let point = &metric(&body, "kache.bench.cache.size")["gauge"]["dataPoints"][0];
         assert_eq!(point["asInt"], "12582912");
         assert!(point.get("asDouble").is_none());
+    }
+
+    #[test]
+    fn disk_footprint_is_emitted_in_bytes() {
+        let body = serialize_metrics(&kache_run());
+        let footprint = metric(&body, "kache.bench.disk.footprint");
+        assert_eq!(footprint["unit"], "By");
+        assert_eq!(footprint["gauge"]["dataPoints"][0]["asInt"], "2500000000");
     }
 
     #[test]
@@ -649,6 +671,7 @@ mod tests {
             cache_size_bytes: 100,
             key_stability_pct: None,
             disk_measured_bytes: None,
+            disk_footprint_bytes: 300,
             phases: vec![OtlpPhase {
                 name: "warm",
                 wall_s: 10,

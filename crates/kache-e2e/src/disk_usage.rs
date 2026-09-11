@@ -18,6 +18,11 @@
 //! extents with the first, so on a CoW filesystem (APFS, btrfs, XFS) the
 //! shared bytes are counted once per copy. Linux runners on ext4 cannot
 //! reflink, so their numbers are exact.
+//!
+//! Outside Unix the standard library exposes neither inode identity nor
+//! allocated blocks, so every path counts at its length. A directory that
+//! cannot be read measures as empty: these numbers are reported, never gated
+//! on.
 
 use std::collections::HashSet;
 use std::fs::Metadata;
@@ -63,6 +68,10 @@ pub(crate) fn measure(cache_dir: &Path, objdirs: &[PathBuf]) -> DiskUsage {
 /// without entering `skip` or following symlinks. Every inode counted here is
 /// also offered to `total`, which keeps its own record of what it has seen.
 fn pool_bytes(root: &Path, skip: &[PathBuf], total: &mut Tally) -> u64 {
+    // An objdir that is the cache directory itself is measured as the objdir.
+    if skip.iter().any(|dir| dir == root) {
+        return 0;
+    }
     let mut pool = Tally::default();
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
@@ -237,6 +246,31 @@ mod tests {
 
         assert_eq!(usage.cache_bytes, own_bytes);
         assert_eq!(usage.total_bytes, own_bytes);
+    }
+
+    #[test]
+    fn an_objdir_that_is_the_cache_dir_is_not_counted_as_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let bytes = write(&cache.join("blob"), 10_000);
+
+        let usage = measure(&cache, std::slice::from_ref(&cache));
+
+        assert_eq!(usage.cache_bytes, 0);
+        assert_eq!(usage.objdir_bytes, vec![bytes]);
+        assert_eq!(usage.total_bytes, bytes);
+    }
+
+    #[test]
+    fn the_same_objdir_twice_counts_once_in_total() {
+        let root = tempfile::tempdir().unwrap();
+        let objdir = root.path().join("target");
+        let bytes = write(&objdir.join("artifact"), 10_000);
+
+        let usage = measure(&root.path().join("no-cache"), &[objdir.clone(), objdir]);
+
+        assert_eq!(usage.objdir_bytes, vec![bytes, bytes]);
+        assert_eq!(usage.total_bytes, bytes);
     }
 
     #[test]

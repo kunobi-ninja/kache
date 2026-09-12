@@ -1195,9 +1195,6 @@ pub fn report(
     } else {
         crate::report::generate_report(config, window, top)?
     };
-    if record {
-        record_session(config, &report)?;
-    }
 
     let text = match format {
         "json" => crate::report::format_json(&report)?,
@@ -1213,6 +1210,17 @@ pub fn report(
         eprintln!("Report written to {}", path.display());
     } else {
         println!("{text}");
+    }
+
+    // The session line is a side effect of the report: a cache dir it cannot
+    // write costs that line and a warning, never the report or the exit code.
+    let recorded = if record {
+        record_session(config, &report)
+    } else {
+        Ok(())
+    };
+    if let Err(e) = recorded {
+        eprintln!("warning: this session was not recorded: {e:#}");
     }
 
     Ok(())
@@ -7281,6 +7289,34 @@ mod tests {
         assert_eq!(record.root_hash.as_deref().map(str::len), Some(16));
         assert_eq!(record.summary.total_crates, 0);
         assert_eq!(record.machine.store_max, config.max_size);
+    }
+
+    /// Recording is a side effect. A cache dir it cannot write (a read-only
+    /// mount, another owner) costs the session line, never the report.
+    #[test]
+    fn report_record_that_cannot_write_still_delivers_the_report() {
+        let cache = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(cache.path().to_path_buf(), None);
+        // A file where the telemetry dir goes fails create_dir_all the way a
+        // read-only mount does, and root cannot write past it.
+        std::fs::write(cache.path().join("telemetry"), b"").unwrap();
+
+        let result = report(
+            &config,
+            "json",
+            SinceWindow::DEFAULT,
+            crate::report::ReportFilter {
+                root: None,
+                last_build: false,
+            },
+            Some(out.path().join("report.json")),
+            10,
+            true,
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(out.path().join("report.json").is_file());
     }
 
     #[test]

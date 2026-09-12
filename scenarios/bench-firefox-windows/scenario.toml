@@ -105,6 +105,15 @@ path         = "gfx/wr/webrender/src/texture_cache.rs"
 mode         = "patch"
 content_file = "../bench-firefox/patches/firefox-cbindgen-visibility.patch"
 
+# Mozilla's upstream bindgen fix for gecko-profiler (Bug 2038918). With
+# libclang 21 or newer, bindgen emits a `std::vector::_Scary_val` alias that
+# names `_Val_types`, which does not exist, and the build stops with E0425.
+# Not in FIREFOX_151_0_RELEASE; the pull scenario's ref already has it (#1017).
+[[file]]
+path         = "tools/profiler/rust-api/build.rs"
+mode         = "patch"
+content_file = "../bench-firefox/patches/firefox-gecko-profiler-bindgen.patch"
+
 # v1 gates. min_key_stability_pct is relaxed (cross-path convergence on Windows
 # is unsolved); max_passthrough_pct + max_errors are the meaningful gates that
 # catch an unclassified clang-cl flag falling through to passthrough (#438).

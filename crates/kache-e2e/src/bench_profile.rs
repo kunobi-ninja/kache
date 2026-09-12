@@ -1086,7 +1086,7 @@ diff --git a/hello.txt b/hello.txt
     }
 
     #[test]
-    fn shipped_firefox_windows_profile_uses_only_the_upstream_cbindgen_fix() {
+    fn shipped_firefox_windows_profile_uses_only_upstream_firefox_fixes() {
         let p = BenchProfile::load(&repo_profile("firefox-windows"))
             .expect("firefox-windows.toml loads");
         assert_eq!(p.name, "bench-firefox-windows");
@@ -1094,15 +1094,14 @@ diff --git a/hello.txt b/hello.txt
             .files
             .iter()
             .filter(|file| file.mode == FileMode::Patch)
+            .map(|file| file.content_file.as_deref().expect("patch file"))
             .collect::<Vec<_>>();
-        assert_eq!(patches.len(), 1);
-        assert!(
-            patches[0]
-                .content_file
-                .as_deref()
-                .expect("patch file")
-                .ends_with("firefox-cbindgen-visibility.patch")
-        );
+        // Both are Mozilla's own fixes that FIREFOX_151_0_RELEASE lacks:
+        // cbindgen visibility (Bug 2046162) and the gecko-profiler bindgen
+        // alias under libclang 21 (Bug 2038918, #1017).
+        assert_eq!(patches.len(), 2, "{patches:?}");
+        assert!(patches[0].ends_with("firefox-cbindgen-visibility.patch"));
+        assert!(patches[1].ends_with("firefox-gecko-profiler-bindgen.patch"));
         let mozconfig = p
             .files
             .iter()

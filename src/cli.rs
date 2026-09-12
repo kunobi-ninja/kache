@@ -397,9 +397,9 @@ pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot 
     }
     for table in MACHINE_INDEX_TABLES {
         let top: rusqlite::Result<Option<i64>> =
-            db.query_row(&table_rows_sql(table), [], |row| row.get(0));
+            db.query_row(&rowid_high_water_sql(table), [], |row| row.get(0));
         if let Ok(top) = top {
-            snap.table_rows
+            snap.rowid_high_water
                 .push((table, top.unwrap_or(0).max(0) as u64));
         }
     }
@@ -408,7 +408,7 @@ pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot 
 
 /// A table's rowid high-water mark: one seek to the last leaf of its b-tree,
 /// where `COUNT(*)` would read every page of a table that can hold gigabytes.
-fn table_rows_sql(table: &str) -> String {
+fn rowid_high_water_sql(table: &str) -> String {
     format!("SELECT MAX(rowid) FROM {table}")
 }
 
@@ -608,13 +608,14 @@ pub fn stats(
         #[derive(serde::Serialize)]
         struct Body<'a> {
             disk: crate::machine::DiskView,
-            /// This machine's shared index (`index.db` plus `-wal`) and rows
-            /// per table (rowid high-water marks), as `kache telemetry write`
-            /// reports them.
+            /// This machine's shared index (`index.db` plus `-wal`) and each
+            /// table's largest rowid, as `kache telemetry write` reports them.
+            /// The rowid grows with every insert and replacement; it is not
+            /// a row count.
             #[serde(skip_serializing_if = "Option::is_none")]
             index_bytes: Option<u64>,
             #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-            index_rows: std::collections::BTreeMap<&'static str, u64>,
+            index_rowid_high_water: std::collections::BTreeMap<&'static str, u64>,
             /// The last GC run and running totals from `gc_stats.json`.
             #[serde(skip_serializing_if = "Option::is_none")]
             gc: Option<crate::report::GcStatsPersisted>,
@@ -646,7 +647,7 @@ pub fn stats(
             Body {
                 disk: disk.clone(),
                 index_bytes: machine.index_bytes,
-                index_rows: machine.table_rows.iter().copied().collect(),
+                index_rowid_high_water: machine.rowid_high_water.iter().copied().collect(),
                 gc: machine.gc.clone(),
                 entries: snap.entry_count,
                 hit_rate_pct: hit_rate,
@@ -716,18 +717,18 @@ pub fn stats(
 fn machine_lines(machine: &crate::otel::MachineSnapshot) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(bytes) = machine.index_bytes {
-        let mut rows = machine.table_rows.clone();
+        let mut rows = machine.rowid_high_water.clone();
         rows.sort_by_key(|&(_, rows)| std::cmp::Reverse(rows));
         let top: Vec<String> = rows
             .iter()
             .take(3)
-            .map(|(table, rows)| format!("{table} ~{rows}"))
+            .map(|(table, rows)| format!("{table} {rows}"))
             .collect();
         if top.is_empty() {
             lines.push(format!("Index:     {}", ByteSize(bytes)));
         } else {
             lines.push(format!(
-                "Index:     {} (rows: {})",
+                "Index:     {} (rowid high-water: {})",
                 ByteSize(bytes),
                 top.join(", ")
             ));
@@ -7075,7 +7076,7 @@ mod tests {
 
         let empty = machine_snapshot(&config);
         assert!(empty.index_bytes.is_none());
-        assert!(empty.table_rows.is_empty());
+        assert!(empty.rowid_high_water.is_empty());
         assert!(empty.gc.is_none());
         assert!(
             !config.index_db_path().exists(),
@@ -7087,7 +7088,11 @@ mod tests {
             .unwrap();
         let snap = machine_snapshot(&config);
         assert!(snap.index_bytes.is_some_and(|bytes| bytes > 0));
-        let tables: Vec<_> = snap.table_rows.iter().map(|(table, _)| *table).collect();
+        let tables: Vec<_> = snap
+            .rowid_high_water
+            .iter()
+            .map(|(table, _)| *table)
+            .collect();
         assert!(
             tables.contains(&"entries") && tables.contains(&"blobs"),
             "{tables:?}"
@@ -7100,7 +7105,7 @@ mod tests {
         let machine = crate::otel::MachineSnapshot {
             host: "ci-mini".to_string(),
             index_bytes: Some(29_074_419_712),
-            table_rows: vec![
+            rowid_high_water: vec![
                 ("entries", 2),
                 ("file_hashes", 13_286_285),
                 ("cc_preprocess_memos", 874_517),
@@ -7125,7 +7130,10 @@ mod tests {
         };
         let lines = machine_lines(&machine);
         assert!(lines[0].starts_with("Index:"), "{lines:?}");
-        assert!(lines[0].contains("file_hashes ~13286285"), "{lines:?}");
+        assert!(
+            lines[0].contains("(rowid high-water: file_hashes 13286285"),
+            "{lines:?}"
+        );
         assert!(
             !lines[0].contains("blobs"),
             "only the three largest tables: {lines:?}"
@@ -7142,8 +7150,32 @@ mod tests {
         assert!(machine_lines(&crate::otel::MachineSnapshot::default()).is_empty());
     }
 
-    /// Row counts on a 27 GiB index must not read the table. The high-water
-    /// query seeks to the last row (`Last`) and stops, so its step count does
+    /// Why the figure is not called rows: `INSERT OR REPLACE` on a TEXT key,
+    /// the way `file_hashes` and the memo tables are written, deletes the old
+    /// row and inserts the new one at the next rowid.
+    #[test]
+    fn rowid_high_water_counts_replacements_not_rows() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE file_hashes (path TEXT PRIMARY KEY, hash TEXT)")
+            .unwrap();
+        for hash in ["a", "b", "c"] {
+            db.execute(
+                "INSERT OR REPLACE INTO file_hashes VALUES ('src/lib.rs', ?1)",
+                [hash],
+            )
+            .unwrap();
+        }
+        let high_water: i64 = db
+            .query_row(&rowid_high_water_sql("file_hashes"), [], |row| row.get(0))
+            .unwrap();
+        let rows: i64 = db
+            .query_row("SELECT COUNT(*) FROM file_hashes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((high_water, rows), (3, 1));
+    }
+
+    /// The rowid high-water mark on a 27 GiB index must not read the table.
+    /// The query seeks to the last row (`Last`) and stops, so its step count does
     /// not grow with the table; a scan steps once per row, and `COUNT(*)` is a
     /// single `Count` step that still reads every page.
     #[test]
@@ -7156,14 +7188,14 @@ mod tests {
         )
         .unwrap();
 
-        let mut stmt = db.prepare(&table_rows_sql("memos")).unwrap();
+        let mut stmt = db.prepare(&rowid_high_water_sql("memos")).unwrap();
         let top: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(top, 5000);
         let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
         assert!(steps < 100, "{steps} VM steps for one high-water mark");
 
         let mut explain = db
-            .prepare(&format!("EXPLAIN {}", table_rows_sql("memos")))
+            .prepare(&format!("EXPLAIN {}", rowid_high_water_sql("memos")))
             .unwrap();
         let opcodes: Vec<String> = explain
             .query_map([], |row| row.get(1))
@@ -7195,7 +7227,11 @@ mod tests {
         let waited = started.elapsed();
 
         assert!(snap.index_bytes.is_some(), "file sizes need no lock");
-        assert!(snap.table_rows.is_empty(), "{:?}", snap.table_rows);
+        assert!(
+            snap.rowid_high_water.is_empty(),
+            "{:?}",
+            snap.rowid_high_water
+        );
         assert!(
             waited < std::time::Duration::from_secs(4),
             "waited {waited:?} on a locked index"

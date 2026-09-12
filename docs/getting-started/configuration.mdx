@@ -254,7 +254,9 @@ That writes `metrics.otlp.json` and `schema_version` in the directory. `--scenar
 
 ### Machine telemetry
 
-On a host where several jobs share one cache, such as a CI machine with several runner slots, the same payload also describes the machine's shared cache: `kache.cache.index.size` (`index.db` plus `-wal`), `kache.cache.index.rows` per table, the last GC run as `kache.cache.gc.last_run.*`, and GC totals as cumulative sums (`kache.cache.gc.runs`, `.entries_evicted`, `.bytes_freed`, `.entries_failed`, `.entries_locked`). The host is `service.instance.id`. These figures never wait: the index is read `query_only` with a 25 ms busy timeout, and a figure it cannot answer at once is left out. Table rows are rowid high-water marks, so they overstate a table that shrank. `kache stats` shows the same figures, and `kache stats --json` carries them as `index_bytes`, `index_rows` and `gc`.
+On a host where several jobs share one cache, such as a CI machine with several runner slots, the same payload also describes the machine's shared cache: `kache.cache.index.size` (`index.db` plus `-wal`), `kache.cache.index.rowid_high_water` per table, the last GC run as `kache.cache.gc.last_run.*`, and GC totals as cumulative sums (`kache.cache.gc.runs`, `.entries_evicted`, `.bytes_freed`, `.entries_failed`, `.entries_locked`). The host is `service.instance.id`. These figures never wait: the index is read `query_only` with a 25 ms busy timeout, and a figure it cannot answer at once is left out. `kache stats` shows the same figures, and `kache stats --json` carries them as `index_bytes`, `index_rowid_high_water` and `gc`.
+
+Read `rowid_high_water` as a write counter, not a row count. It is the largest rowid in each table. Several tables (`file_hashes`, `cc_preprocess_memos`, `input_predictions`, `eviction_tombstones`) are written with `INSERT OR REPLACE`, which gives a replaced row a new rowid, so the figure grows with every insert and every replacement and does not fall when rows are deleted. For how big the index is, use `kache.cache.index.size`.
 
 To keep per-build numbers at machine level, add `--record` to `kache report`:
 

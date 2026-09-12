@@ -435,11 +435,13 @@ pub(crate) struct MachineSnapshot {
     pub host: String,
     /// `index.db` plus its `-wal`, in bytes.
     pub index_bytes: Option<u64>,
-    /// Rowid high-water mark per index table: the largest rowid, not a row
-    /// count. Deletions leave it where it was, so it overstates a table that
-    /// shrank; in exchange it is one b-tree descent, where `COUNT(*)` reads the
-    /// table or its smallest index.
-    pub table_rows: Vec<(&'static str, u64)>,
+    /// The largest rowid per index table. This counts writes, not rows: the
+    /// tables written with `INSERT OR REPLACE` give a replaced row the next
+    /// rowid, so it grows with every insert and every replacement, and a
+    /// delete never lowers it. Its one merit is cost, a single b-tree descent
+    /// where `COUNT(*)` reads the whole table. Index size is the figure to
+    /// trust for how big the index is.
+    pub rowid_high_water: Vec<(&'static str, u64)>,
     pub gc: Option<crate::report::GcStatsPersisted>,
 }
 
@@ -452,11 +454,11 @@ fn machine_metrics(snap: &MachineSnapshot, now: &str) -> Vec<Value> {
             vec![as_int(bytes, now, &[])],
         ));
     }
-    if !snap.table_rows.is_empty() {
+    if !snap.rowid_high_water.is_empty() {
         metrics.push(gauge(
-            "kache.cache.index.rows",
-            "{row}",
-            snap.table_rows
+            "kache.cache.index.rowid_high_water",
+            "1",
+            snap.rowid_high_water
                 .iter()
                 .map(|(table, rows)| as_int(*rows, now, &[str_attr("kache.cache.table", table)]))
                 .collect(),
@@ -688,7 +690,7 @@ mod tests {
         MachineSnapshot {
             host: "ci-mini".to_string(),
             index_bytes: Some(29_074_419_712),
-            table_rows: vec![("entries", 2_085_333), ("cc_preprocess_memos", 874_517)],
+            rowid_high_water: vec![("entries", 2_085_333), ("cc_preprocess_memos", 874_517)],
             gc: Some(crate::report::GcStatsPersisted {
                 last_run: "2026-09-12T12:11:05+00:00".to_string(),
                 entries_evicted: 560,
@@ -738,7 +740,10 @@ mod tests {
             names.contains("kache.cache.uploads"),
             "daemon counters stay"
         );
-        assert!(names.contains("kache.cache.index.rows"), "{names:?}");
+        assert!(
+            names.contains("kache.cache.index.rowid_high_water"),
+            "{names:?}"
+        );
         let resource = body["resourceMetrics"][0]["resource"]["attributes"]
             .as_array()
             .unwrap();
@@ -748,7 +753,8 @@ mod tests {
             )
         );
 
-        let rows = metric(&body, "kache.cache.index.rows");
+        let rows = metric(&body, "kache.cache.index.rowid_high_water");
+        assert_eq!(rows["unit"], "1", "a write counter, not rows");
         let points = rows["gauge"]["dataPoints"].as_array().unwrap();
         assert_eq!(points.len(), 2);
         assert_eq!(

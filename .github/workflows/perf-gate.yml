@@ -236,8 +236,8 @@ jobs:
           reshim: false
 
       # Disk-full mid-build is the worst failure mode on the emptyDir-backed
-      # work volume. Each side needs two debug objdirs plus a store; the base
-      # side's scratch is deleted before the head side starts (see below), so
+      # work volume. Each side needs two debug objdirs plus a store; the first
+      # side's scratch is deleted before the second side starts (see below), so
       # the floor covers one side plus kache's own target tree with headroom.
       - name: Free-disk precheck
         run: |
@@ -318,6 +318,7 @@ jobs:
           cp target/release/kache-scenario "$RUNNER_TEMP/instrument/kache-scenario"
           cp -R scenarios "$RUNNER_TEMP/instrument/scenarios"
           cp scripts/perf-gate-compare.sh "$RUNNER_TEMP/instrument/perf-gate-compare.sh"
+          cp scripts/perf-gate-side.sh "$RUNNER_TEMP/instrument/perf-gate-side.sh"
 
       - name: Build kache from the merge base
         env:
@@ -341,34 +342,6 @@ jobs:
           "$RUNNER_TEMP/kache-base" --version
           "$RUNNER_TEMP/kache-head" --version
 
-      # The merge base runs FIRST and its scratch is deleted before the head
-      # side starts, so peak disk is one side, not two. Ordering is fixed rather
-      # than randomised: with a fixed order any thermal or cache-warmth drift
-      # biases every PR the same way, which is easier to reason about than a
-      # bias that changes run to run.
-      - name: Benchmark the merge base
-        timeout-minutes: 40
-        env:
-          RUSTC_WRAPPER: ""
-          # The subject pins its own toolchain via the rust-toolchain.toml the
-          # scenario injects; a forced RUSTUP_TOOLCHAIN would override it.
-          RUSTUP_TOOLCHAIN: ""
-        run: |
-          set -euo pipefail
-          "$RUNNER_TEMP/instrument/kache-scenario" \
-            --kache "$RUNNER_TEMP/kache-base" \
-            --scenarios "$RUNNER_TEMP/instrument/scenarios" \
-            --select suite:bench --select backend:kache \
-            --profile "$BENCH_PROFILE" \
-            --warm-same-tree \
-            --work-dir "tmp/perf-gate/base"
-          cp "tmp/perf-gate/base/$BENCH_SCENARIO.json" "$RUNNER_TEMP/base.json"
-          mkdir -p "$RUNNER_TEMP/logs/base"
-          cp tmp/perf-gate/base/*.log "$RUNNER_TEMP/logs/base/" || true
-          # Free the objdirs, worktrees and store before the head side runs.
-          # `clone-ref` is a SIBLING of the work dir, so it needs its own rm.
-          rm -rf tmp/perf-gate/base tmp/perf-gate/base-clone-ref
-
       # The harness clones third-party subjects over https. Anonymous
       # requests share this cluster's egress quota, and when it is exhausted
       # GitHub answers 401, which git reports as "could not read Username"
@@ -384,23 +357,56 @@ jobs:
           git config --global --replace-all \
             "http.https://github.com/.extraheader" "AUTHORIZATION: basic $header"
 
-      - name: Benchmark the PR head
-        timeout-minutes: 40
+      # Which side runs first alternates with the run number. The first side
+      # on a fresh pod pays for a cold page cache and any runner warm-up, and a
+      # fixed order handed that cost to the merge base on every pull request,
+      # so the head always read a little faster. The scenario's untimed
+      # `prepare` step keeps crate downloads and the toolchain install out of
+      # both sides' timings; alternating spreads what remains across runs
+      # instead of tilting every run the same way. A re-run keeps its run
+      # number, so it keeps its order.
+      - name: Choose which side runs first
+        id: order
         env:
-          RUSTC_WRAPPER: ""
-          RUSTUP_TOOLCHAIN: ""
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/instrument/kache-scenario" \
-            --kache "$RUNNER_TEMP/kache-head" \
-            --scenarios "$RUNNER_TEMP/instrument/scenarios" \
-            --select suite:bench --select backend:kache \
-            --profile "$BENCH_PROFILE" \
-            --warm-same-tree \
-            --work-dir "tmp/perf-gate/head"
-          cp "tmp/perf-gate/head/$BENCH_SCENARIO.json" "$RUNNER_TEMP/head.json"
-          mkdir -p "$RUNNER_TEMP/logs/head"
-          cp tmp/perf-gate/head/*.log "$RUNNER_TEMP/logs/head/" || true
+          if [ $((RUN_NUMBER % 2)) -eq 0 ]; then
+            first="base"
+            second="head"
+          else
+            first="head"
+            second="base"
+          fi
+          echo "Side order for run $RUN_NUMBER: $first first, then $second"
+          {
+            echo "first=$first"
+            echo "second=$second"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "Perf gate side order for run $RUN_NUMBER: \`$first\` first, then \`$second\`."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Each side deletes its scratch when it finishes, so peak disk is one
+      # side, not two.
+      - name: Benchmark the first side (${{ steps.order.outputs.first }})
+        timeout-minutes: 40
+        env:
+          SIDE: ${{ steps.order.outputs.first }}
+          RUSTC_WRAPPER: ""
+          # The subject pins its own toolchain via the rust-toolchain.toml the
+          # scenario injects; a forced RUSTUP_TOOLCHAIN would override it.
+          RUSTUP_TOOLCHAIN: ""
+        run: '"$RUNNER_TEMP/instrument/perf-gate-side.sh" "$SIDE"'
+
+      - name: Benchmark the second side (${{ steps.order.outputs.second }})
+        timeout-minutes: 40
+        env:
+          SIDE: ${{ steps.order.outputs.second }}
+          RUSTC_WRAPPER: ""
+          RUSTUP_TOOLCHAIN: ""
+        run: '"$RUNNER_TEMP/instrument/perf-gate-side.sh" "$SIDE"'
 
       # The threshold and the validity gates live in the script, so `just`
       # users and CI apply exactly the same rules. Non-zero exit = regression or

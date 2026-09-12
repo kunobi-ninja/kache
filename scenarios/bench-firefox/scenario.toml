@@ -154,7 +154,5 @@ known_passthrough = [
   "uncacheable|cc include candidate <path> is unreadable",
   "unsupported|rustc build-script probe",
   "uncacheable|cc -E key probe exited 1",
-  "unsupported|cc unsupported flag(s): -mavxvnni — not yet",
   "uncacheable|cc: resolved invocation unavailable for probe-captured flags",
-  "unsupported|cc unsupported flag(s): -fno-stack-protector -fno-asynchronous-unwind-tables — not yet",
 ]

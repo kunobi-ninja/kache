@@ -97,5 +97,4 @@ max_errors = 0
 # Any other reason warns; delete an entry once it is fixed.
 known_passthrough = [
   "unsupported|rustc build-script probe",
-  "unsupported|cc unsupported flag(s): -funroll-loops — not yet",
 ]

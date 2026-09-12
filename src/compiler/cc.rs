@@ -694,8 +694,8 @@ impl CcArgs {
     ///   kache explicitly models (`FlagClass::ModeledInKey`) plus the
     ///   resolved `cc -###` tokens (`FlagClass::CapturedByProbe`). A
     ///   flag whose object-file effect is in none of those — an
-    ///   unmodeled codegen flag (`-Ofast`, `-funroll-loops`,
-    ///   `-fsanitize=address`), profiling (`-pg`), or a flag kache has
+    ///   unmodeled codegen flag (`-Ofast`, `-fsanitize=address`),
+    ///   profiling (`-pg`), or a flag kache has
     ///   never seen — would miscache. The table is the source of truth;
     ///   anything it does not classify is refused with the offending
     ///   flags named in the reason.
@@ -2317,6 +2317,14 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // End-of-options marker. Does not change object bytes; Firefox's
+        // Windows clang-cl nightly still refused it as an unclassified flag.
+        matcher: Matcher::Exact("--"),
+        class: FlagClass::NoObjectEffect,
+        source: "Firefox Windows 0.20 nightly — end-of-options marker.",
+        dialect: None,
+    },
+    FlagSpec {
         // MSVC `/c` slash spelling of the compile-mode marker (cl only).
         // The parser already routes `/c` to CompileMode::Compile via
         // CC_ARG_SPECS; this row tells the unsupported-flag classifier the
@@ -2423,15 +2431,15 @@ pub static CC_FLAGS: &[FlagSpec] = &[
     FlagSpec {
         matcher: Matcher::Regex(concat!(
             r"-f(?:no-)?(?:",
-            "associative-math|data-sections|fast-math|finite-math-only|",
-            "function-sections|math-errno|merge-all-constants|omit-frame-pointer|",
-            "reciprocal-math|rounding-math|semantic-interposition|signaling-nans|",
-            "signed-zeros|strict-aliasing|trapping-math|unsafe-math-optimizations|",
-            "unwind-tables|wrapv",
+            "associative-math|asynchronous-unwind-tables|data-sections|fast-math|",
+            "finite-math-only|function-sections|math-errno|merge-all-constants|",
+            "omit-frame-pointer|reciprocal-math|rounding-math|semantic-interposition|",
+            "signaling-nans|signed-zeros|strict-aliasing|trapping-math|",
+            "unsafe-math-optimizations|unroll-loops|unwind-tables|wrapv",
             ")",
         )),
         class: FlagClass::CapturedByProbe,
-        source: "#114/#245/#418/#422/#426/#580/#856 — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class).",
+        source: "#114/#245/#418/#422/#426/#580/#856 + 0.20 nightly — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class). unroll-loops / asynchronous-unwind-tables from lance/Firefox passthroughs.",
         dialect: None,
     },
     FlagSpec {
@@ -2466,9 +2474,13 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
-        matcher: Matcher::Exact("-fstack-protector-strong"),
+        // Firefox nightly still passed `-fno-stack-protector` through because
+        // only `-fstack-protector-strong` was listed. Cover the family
+        // (bare / -strong / -all, both polarities); clang forwards the
+        // resulting -stack-protector* token to -cc1.
+        matcher: Matcher::Regex(r"-f(?:no-)?stack-protector(?:-strong|-all)?"),
         class: FlagClass::CapturedByProbe,
-        source: "Issue #114 — stack-protector codegen mode.",
+        source: "Issue #114 + Firefox 0.20 nightly — stack-protector family, both polarities.",
         dialect: None,
     },
     FlagSpec {
@@ -2872,7 +2884,7 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         // (`-mtune=`, `-mcpu=`, `-mcmodel=`) and unmodeled `-m` flags still
         // refuse. `-mabi=` is modeled separately above.
         matcher: Matcher::Regex(
-            r"^-m(?:no-)?(?:32|64|mmx|sse|sse2|sse3|ssse3|sse4|sse4\.1|sse4\.2|sse4a|avx|avx2|avx512[a-z0-9]+|fma|fma4|f16c|bmi|bmi2|abm|popcnt|lzcnt|aes|vaes|pclmul|vpclmulqdq|gfni|sha|movbe|rdrnd|rdseed|adx|fsgsbase|xsave|xsaveopt|xsavec|xsaves|prfchw|clflushopt|clwb|cldemote|fxsr)$",
+            r"^-m(?:no-)?(?:32|64|mmx|sse|sse2|sse3|ssse3|sse4|sse4\.1|sse4\.2|sse4a|avx|avx2|avxvnni|avx512[a-z0-9]+|fma|fma4|f16c|bmi|bmi2|abm|popcnt|lzcnt|aes|vaes|pclmul|vpclmulqdq|gfni|sha|movbe|rdrnd|rdseed|adx|fsgsbase|xsave|xsaveopt|xsavec|xsaves|prfchw|clflushopt|clwb|cldemote|fxsr)$",
         ),
         class: FlagClass::CapturedByProbe,
         source: "Issue #375 (extended, Firefox nightly bench) — x86 width + SIMD/ISA codec feature flags; resolved into target-cpu/target-feature tokens.",
@@ -7696,7 +7708,6 @@ mod tests {
             // / -mrecip= are now CapturedByProbe — modeled from the Firefox bench — so
             // they are deliberately NOT here; these remain genuinely unmodeled.)
             "-fsanitize=address",
-            "-funroll-loops",
             "-fno-pic",
             "-mtune=skylake",
             // unmodeled optimization / debug variants
@@ -7768,10 +7779,20 @@ mod tests {
             "-mssse3",
             "-mfma",
             "-mavx512f",
+            "-mavxvnni",
             "-mno-sse3",
             // zstd-sys merge-all-constants knob (#856)
             "-fmerge-all-constants",
             "-fno-merge-all-constants",
+            // Firefox / lance 0.20 nightly passthroughs
+            "-funroll-loops",
+            "-fno-unroll-loops",
+            "-fno-stack-protector",
+            "-fstack-protector",
+            "-fstack-protector-strong",
+            "-fno-asynchronous-unwind-tables",
+            "-fasynchronous-unwind-tables",
+            "--",
         ] {
             let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
             assert!(
@@ -7838,6 +7859,8 @@ mod tests {
             "function-sections",
             "data-sections",
             "unwind-tables",
+            "asynchronous-unwind-tables",
+            "unroll-loops",
             "fast-math",
             "finite-math-only",
         ] {
@@ -9017,7 +9040,7 @@ mod tests {
             "foo.c",
             "-o",
             "foo.o",
-            "-funroll-loops",
+            "-mtune=skylake",
             "-fsanitize=address",
         ]);
         let detail = descs
@@ -9025,7 +9048,7 @@ mod tests {
             .find(|d| d.contains("unsupported flag"))
             .expect("expected an unsupported-flag refuse reason");
         assert!(
-            detail.contains("-funroll-loops"),
+            detail.contains("-mtune=skylake"),
             "reason should name the flag: {detail}"
         );
         assert!(

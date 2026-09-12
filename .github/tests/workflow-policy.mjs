@@ -128,9 +128,9 @@ function resolveRunner(source, context) {
     : source;
 }
 for (const [name, expression] of routing) {
-  const os = /:(test-macos|macOS)$/.test(name)
+  const os = /:(cargo-macos|macOS)$/.test(name)
     ? "MACOS"
-    : /:(test-windows|Windows)$/.test(name)
+    : /:(cargo-windows|Windows)$/.test(name)
       ? "WINDOWS"
       : "LINUX";
   const platform = `CI_RUNNER_${os}`;

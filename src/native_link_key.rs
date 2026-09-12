@@ -138,14 +138,69 @@ fn print_file_name(driver: &Path, name: &str) -> Option<PathBuf> {
 /// Line Tools vs Xcode spell the same SDK differently and would over-key.
 /// `SDKROOT`, when set, is the SDK that is queried — reporting the default
 /// SDK's version beside another SDK's root would describe an SDK no link used.
+///
+/// Apple's `xcrun` accepts a filesystem path as `--sdk`. xcbuild's `xcrun`
+/// only accepts a name such as `macosx`. When `xcrun` rejects a path that is
+/// still a real SDK directory, read the same version and build from
+/// `SystemVersion.plist` inside that root.
 #[cfg(target_os = "macos")]
 pub(crate) fn sdk_identity_for(root: Option<String>) -> Result<Option<String>> {
     let sdk = root.as_deref().unwrap_or("macosx");
-    let version = xcrun(&["--sdk", sdk, "--show-sdk-version"])
-        .ok_or_else(|| anyhow::anyhow!("xcrun --show-sdk-version failed"))?;
-    let build = xcrun(&["--sdk", sdk, "--show-sdk-build-version"])
-        .ok_or_else(|| anyhow::anyhow!("xcrun --show-sdk-build-version failed"))?;
-    Ok(Some(format!("{version} ({build})")))
+    if let Some(identity) = xcrun_identity(sdk) {
+        return Ok(Some(identity));
+    }
+    let path = Path::new(sdk);
+    if path.is_dir() {
+        return identity_from_sdk_root(path).map(Some);
+    }
+    bail!("xcrun --show-sdk-version failed");
+}
+
+#[cfg(target_os = "macos")]
+fn xcrun_identity(sdk: &str) -> Option<String> {
+    let version = xcrun(&["--sdk", sdk, "--show-sdk-version"])?;
+    let build = xcrun(&["--sdk", sdk, "--show-sdk-build-version"])?;
+    Some(format!("{version} ({build})"))
+}
+
+/// `ProductVersion` / `ProductBuildVersion` as `xcrun --show-sdk-version` and
+/// `--show-sdk-build-version` report them for this root.
+///
+/// Compiled in tests on every OS so the Linux mutation lane can kill mutants
+/// in the plist fallback (`#[cfg(any(test, target_os = "macos"))]`).
+#[cfg(any(test, target_os = "macos"))]
+fn identity_from_sdk_root(root: &Path) -> Result<String> {
+    let plist = root.join("System/Library/CoreServices/SystemVersion.plist");
+    let body = std::fs::read_to_string(&plist).with_context(|| {
+        format!(
+            "xcrun rejected --sdk {} and {} is unreadable",
+            root.display(),
+            plist.display()
+        )
+    })?;
+    let version = plist_string(&body, "ProductVersion").ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} has no ProductVersion; not a usable macOS SDK",
+            plist.display()
+        )
+    })?;
+    let build = plist_string(&body, "ProductBuildVersion").ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} has no ProductBuildVersion; not a usable macOS SDK",
+            plist.display()
+        )
+    })?;
+    Ok(format!("{version} ({build})"))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn plist_string(body: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let rest = body.split(&needle).nth(1)?;
+    let rest = rest.trim_start().strip_prefix("<string>")?;
+    let (value, _) = rest.split_once("</string>")?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1670,6 +1725,81 @@ mod tests {
         assert!(
             overridden.is_err(),
             "an unusable SDKROOT must not report the default SDK: {overridden:?}"
+        );
+    }
+
+    const SYSTEM_VERSION_PLIST: &str = "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+	<key>ProductBuildVersion</key>
+	<string>23E208</string>
+	<key>ProductVersion</key>
+	<string>14.4</string>
+</dict>
+</plist>
+";
+
+    fn write_system_version_plist(root: &Path, body: &str) {
+        let plist_dir = root.join("System/Library/CoreServices");
+        std::fs::create_dir_all(&plist_dir).unwrap();
+        std::fs::write(plist_dir.join("SystemVersion.plist"), body).unwrap();
+    }
+
+    #[test]
+    fn plist_string_reads_xml_string_values_and_rejects_empty() {
+        assert_eq!(
+            plist_string(SYSTEM_VERSION_PLIST, "ProductVersion").as_deref(),
+            Some("14.4")
+        );
+        assert_eq!(
+            plist_string(SYSTEM_VERSION_PLIST, "ProductBuildVersion").as_deref(),
+            Some("23E208")
+        );
+        assert_eq!(plist_string(SYSTEM_VERSION_PLIST, "ProductName"), None);
+        assert_eq!(
+            plist_string(
+                "<key>ProductVersion</key>\n<string>   </string>",
+                "ProductVersion"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn identity_from_sdk_root_reads_system_version_plist() {
+        let dir = tempfile::tempdir().unwrap();
+        write_system_version_plist(dir.path(), SYSTEM_VERSION_PLIST);
+        assert_eq!(identity_from_sdk_root(dir.path()).unwrap(), "14.4 (23E208)");
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(identity_from_sdk_root(empty.path()).is_err());
+
+        let missing_version = tempfile::tempdir().unwrap();
+        write_system_version_plist(
+            missing_version.path(),
+            "<key>ProductBuildVersion</key><string>23E208</string>",
+        );
+        assert!(identity_from_sdk_root(missing_version.path()).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sdk_identity_reads_a_filesystem_sdkroot_when_xcrun_rejects_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_system_version_plist(dir.path(), SYSTEM_VERSION_PLIST);
+
+        let identity = sdk_identity_for(Some(dir.path().display().to_string()))
+            .unwrap()
+            .expect("a real SDK directory must be identifiable without xcrun --sdk <path>");
+        assert_eq!(identity, "14.4 (23E208)");
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            sdk_identity_for(Some(empty.path().display().to_string())).is_err(),
+            "a directory that is not an SDK must not report the default SDK"
         );
     }
 

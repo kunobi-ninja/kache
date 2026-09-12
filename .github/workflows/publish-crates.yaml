@@ -83,9 +83,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ./scripts/require-ci-green.sh "$(git rev-parse HEAD)" \
-            "Check (Linux)" "Nix package" "CoW filesystem (btrfs)" \
+            "Check (Linux)" "Nix package (Linux)" "Nix package (macOS)" \
+            "CoW filesystem (btrfs)" \
             "E2E smoke (Linux)" "E2E smoke (macOS)" "E2E smoke (Windows)" \
-            "Test (macOS)" "Test (Windows)"
+            "cargo test (macOS)" "cargo test (Windows)"
 
       # Package set comes from scripts/crates-io.py (every publishable workspace
       # member, dependency order). Adding a crate does not require a workflow edit.

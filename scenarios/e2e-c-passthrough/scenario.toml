@@ -1,20 +1,16 @@
 # kache-e2e fixture: a build kache must NOT cache.
 #
-# The inverse of c-hello. The `-c` compile passes `-funroll-loops`, an
+# The inverse of c-hello. The `-c` compile passes `-mtune=skylake`, an
 # unmodeled codegen flag. kache's classifier refuses it (no row in
 # `CC_FLAGS` matches), the compile passes through to the real
 # compiler uncached, and every phase lands ZERO cache entries.
 #
 # Choice of flag: this fixture needs "an unmodeled codegen flag the
 # classifier will refuse". `-march=native` was the original pick;
-# #115 disproved its permanence (the probe captures host-resolved
-# cpu/features, so `-march=*` caches per-machine). `-ffast-math` was
-# the next pick, but the Firefox nightly bench showed it forcing real
-# media TUs through uncached, so it is now modeled as `CapturedByProbe`
-# (its codegen effect IS in the resolved `cc -###` tokens). The current
-# pick is `-funroll-loops` — a genuine codegen optimization still
-# unmodeled. If a future PR DOES model it, that PR should pick a new
-# unmodeled flag here.
+# #115 disproved its permanence. `-ffast-math` then `-funroll-loops`
+# followed; both are now `CapturedByProbe` after nightlies showed
+# them on real TUs. The current pick is `-mtune=skylake`. If a future
+# PR DOES model it, that PR should pick a new unmodeled flag here.
 #
 # This is the e2e cell for the unmodeled-codegen-flag passthrough
 # behavior. c-hello proves a clean compile caches; this proves an
@@ -44,7 +40,7 @@ clean = "make clean"
 run = "./build/main"
 expected_stdout_contains = ["c-passthrough ok"]
 
-# Cold: `-march=native` is unmodeled → the compile is refused →
+# Cold: `-mtune=skylake` is unmodeled → the compile is refused →
 # passthrough → no kache event → nothing in the cache.
 [assertions.cold]
 max_entries_after = 0

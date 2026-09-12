@@ -354,6 +354,74 @@ pub(crate) fn snapshot_from_direct_reads(
     }
 }
 
+/// Index tables whose size explains a store: the entry and blob maps that grow
+/// with the cache, and the key-side caches and tombstones beside them.
+const MACHINE_INDEX_TABLES: [&str; 7] = [
+    "entries",
+    "blobs",
+    "entry_blobs",
+    "file_hashes",
+    "cc_preprocess_memos",
+    "input_predictions",
+    "eviction_tombstones",
+];
+
+/// Read the shared cache without getting in a build's way: no schema work, no
+/// writes (`query_only`), a 25 ms busy timeout, and no daemon, so a figure the
+/// index is too busy to answer is left out rather than waited for. The
+/// connection is read-write only because SQLite needs the WAL's shared memory
+/// to read a WAL database, and a read-only open cannot create it on an idle
+/// host.
+pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot {
+    let db_path = config.index_db_path();
+    let index_bytes = index_file_bytes(config);
+    let mut snap = crate::otel::MachineSnapshot {
+        host: crate::otel::host_name(),
+        index_bytes,
+        gc: crate::report::read_gc_stats(&config.cache_dir),
+        ..Default::default()
+    };
+    if index_bytes.is_none() {
+        return snap;
+    }
+    let Ok(db) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return snap;
+    };
+    if db.pragma_update(None, "busy_timeout", "25").is_err()
+        || db.pragma_update(None, "query_only", "ON").is_err()
+    {
+        return snap;
+    }
+    for table in MACHINE_INDEX_TABLES {
+        let top: rusqlite::Result<Option<i64>> =
+            db.query_row(&table_rows_sql(table), [], |row| row.get(0));
+        if let Ok(top) = top {
+            snap.table_rows
+                .push((table, top.unwrap_or(0).max(0) as u64));
+        }
+    }
+    snap
+}
+
+/// A table's rowid high-water mark: one seek to the last leaf of its b-tree,
+/// where `COUNT(*)` would read every page of a table that can hold gigabytes.
+fn table_rows_sql(table: &str) -> String {
+    format!("SELECT MAX(rowid) FROM {table}")
+}
+
+/// `index.db` plus its `-wal`, or `None` when there is no index yet.
+fn index_file_bytes(config: &Config) -> Option<u64> {
+    let db_path = config.index_db_path();
+    let mut wal = db_path.clone().into_os_string();
+    wal.push("-wal");
+    std::fs::metadata(&db_path)
+        .ok()
+        .map(|db| db.len() + std::fs::metadata(&wal).map(|w| w.len()).unwrap_or(0))
+}
+
 /// Write cache counters as OTLP JSON for Kartero (`metrics.otlp.json` +
 /// `schema_version`). Uses the running daemon when reachable; otherwise the
 /// local store. Does not auto-start a daemon, so a finished bench dumps what
@@ -409,6 +477,7 @@ pub fn telemetry_write(
     crate::otel::write_otlp(
         dir,
         &otel_snapshot_from_stats(config, &snap),
+        &machine_snapshot(config),
         crate::VERSION,
         scenario,
         phase,
@@ -503,11 +572,22 @@ pub fn stats(
         .unwrap_or(snap.total_size);
     let disk = crate::machine::disk_view(&config.store_dir(), store_bytes, snap.max_size);
     let host_config = host_config_in_effect(&crate::config::host_config_status());
+    let machine = machine_snapshot(config);
 
     if json {
         #[derive(serde::Serialize)]
         struct Body<'a> {
             disk: crate::machine::DiskView,
+            /// This machine's shared index (`index.db` plus `-wal`) and rows
+            /// per table (rowid high-water marks), as `kache telemetry write`
+            /// reports them.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            index_bytes: Option<u64>,
+            #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+            index_rows: std::collections::BTreeMap<&'static str, u64>,
+            /// The last GC run and running totals from `gc_stats.json`.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            gc: Option<crate::report::GcStatsPersisted>,
             entries: usize,
             hit_rate_pct: f64,
             local_hits: usize,
@@ -535,6 +615,9 @@ pub fn stats(
             "stats",
             Body {
                 disk: disk.clone(),
+                index_bytes: machine.index_bytes,
+                index_rows: machine.table_rows.iter().copied().collect(),
+                gc: machine.gc.clone(),
                 entries: snap.entry_count,
                 hit_rate_pct: hit_rate,
                 local_hits: snap.event_stats.local_hits,
@@ -560,6 +643,9 @@ pub fn stats(
         println!("Host config: {path}");
     }
     if let Some(line) = cloned_targets_line(&disk) {
+        println!("{line}");
+    }
+    for line in machine_lines(&machine) {
         println!("{line}");
     }
 
@@ -592,6 +678,60 @@ pub fn stats(
         }
     }
     Ok(())
+}
+
+/// `kache stats` lines for the machine's shared index and GC record: what the
+/// cache costs the host beyond its artifacts, and whether GC keeps up. Pure,
+/// like [`render_stats`].
+fn machine_lines(machine: &crate::otel::MachineSnapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(bytes) = machine.index_bytes {
+        let mut rows = machine.table_rows.clone();
+        rows.sort_by_key(|&(_, rows)| std::cmp::Reverse(rows));
+        let top: Vec<String> = rows
+            .iter()
+            .take(3)
+            .map(|(table, rows)| format!("{table} ~{rows}"))
+            .collect();
+        if top.is_empty() {
+            lines.push(format!("Index:     {}", ByteSize(bytes)));
+        } else {
+            lines.push(format!(
+                "Index:     {} (rows: {})",
+                ByteSize(bytes),
+                top.join(", ")
+            ));
+        }
+    }
+    if let Some(gc) = &machine.gc {
+        let source = if gc.source.is_empty() {
+            "daemon"
+        } else {
+            gc.source.as_str()
+        };
+        let mut line = format!(
+            "GC:        last run {} ({source}): {} evicted",
+            gc.last_run, gc.entries_evicted
+        );
+        if gc.entries_failed > 0 {
+            line.push_str(&format!(
+                ", {} failed ({} lost the index write lock)",
+                gc.entries_failed, gc.entries_locked
+            ));
+        }
+        lines.push(line);
+        if gc.totals.runs > 0 {
+            lines.push(format!(
+                "           since {}: {} runs, {} evicted, {} failed ({} locked)",
+                gc.totals.since,
+                gc.totals.runs,
+                gc.totals.entries_evicted,
+                gc.totals.entries_failed,
+                gc.totals.entries_locked
+            ));
+        }
+    }
+    lines
 }
 
 /// Render the `kache stats` summary lines from a fetched snapshot. Pure (no I/O)
@@ -6884,6 +7024,141 @@ mod tests {
         let stats = crate::report::read_gc_stats(&config.cache_dir).unwrap();
         assert_eq!(stats.source, "manual");
         assert_eq!(stats.totals.runs, 2);
+    }
+
+    #[test]
+    fn machine_snapshot_reads_a_store_without_creating_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+
+        let empty = machine_snapshot(&config);
+        assert!(empty.index_bytes.is_none());
+        assert!(empty.table_rows.is_empty());
+        assert!(empty.gc.is_none());
+        assert!(
+            !config.index_db_path().exists(),
+            "a snapshot must never create the index"
+        );
+
+        drop(Store::open(&config).unwrap());
+        crate::report::record_gc_run(&config.cache_dir, "auto", &crate::store::GcStats::default())
+            .unwrap();
+        let snap = machine_snapshot(&config);
+        assert!(snap.index_bytes.is_some_and(|bytes| bytes > 0));
+        let tables: Vec<_> = snap.table_rows.iter().map(|(table, _)| *table).collect();
+        assert!(
+            tables.contains(&"entries") && tables.contains(&"blobs"),
+            "{tables:?}"
+        );
+        assert_eq!(snap.gc.expect("gc_stats.json read").totals.runs, 1);
+    }
+
+    #[test]
+    fn stats_lines_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
+        let machine = crate::otel::MachineSnapshot {
+            host: "ci-mini".to_string(),
+            index_bytes: Some(29_074_419_712),
+            table_rows: vec![
+                ("entries", 2),
+                ("file_hashes", 13_286_285),
+                ("cc_preprocess_memos", 874_517),
+                ("eviction_tombstones", 5_425_819),
+                ("blobs", 5),
+            ],
+            gc: Some(crate::report::GcStatsPersisted {
+                last_run: "2026-09-12T12:11:05+00:00".to_string(),
+                source: "auto".to_string(),
+                entries_failed: 40,
+                entries_locked: 40,
+                totals: crate::report::GcTotals {
+                    since: "2026-07-21T00:00:00+00:00".to_string(),
+                    runs: 900,
+                    entries_evicted: 10,
+                    bytes_freed: 0,
+                    entries_failed: 547_695,
+                    entries_locked: 547_695,
+                },
+                ..Default::default()
+            }),
+        };
+        let lines = machine_lines(&machine);
+        assert!(lines[0].starts_with("Index:"), "{lines:?}");
+        assert!(lines[0].contains("file_hashes ~13286285"), "{lines:?}");
+        assert!(
+            !lines[0].contains("blobs"),
+            "only the three largest tables: {lines:?}"
+        );
+        assert!(lines[1].contains("(auto)"), "{lines:?}");
+        assert!(
+            lines[1].contains("40 lost the index write lock"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].contains("547695 failed (547695 locked)"),
+            "{lines:?}"
+        );
+        assert!(machine_lines(&crate::otel::MachineSnapshot::default()).is_empty());
+    }
+
+    /// Row counts on a 27 GiB index must not read the table. The high-water
+    /// query seeks to the last row (`Last`) and stops, so its step count does
+    /// not grow with the table; a scan steps once per row, and `COUNT(*)` is a
+    /// single `Count` step that still reads every page.
+    #[test]
+    fn index_row_figures_seek_instead_of_scanning() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE memos (key TEXT PRIMARY KEY, body BLOB);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+             INSERT INTO memos SELECT 'k' || i, zeroblob(64) FROM n;",
+        )
+        .unwrap();
+
+        let mut stmt = db.prepare(&table_rows_sql("memos")).unwrap();
+        let top: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(top, 5000);
+        let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+        assert!(steps < 100, "{steps} VM steps for one high-water mark");
+
+        let mut explain = db
+            .prepare(&format!("EXPLAIN {}", table_rows_sql("memos")))
+            .unwrap();
+        let opcodes: Vec<String> = explain
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(opcodes.iter().any(|op| op == "Last"), "{opcodes:?}");
+        assert!(!opcodes.iter().any(|op| op == "Count"), "{opcodes:?}");
+    }
+
+    /// `kache stats` must not stall behind the index. The store's own busy
+    /// timeout is 5 s per statement; the snapshot gives up after 25 ms and
+    /// drops the figures it could not read.
+    #[test]
+    fn machine_snapshot_skips_row_figures_on_a_locked_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+        drop(Store::open(&config).unwrap());
+        let holder = rusqlite::Connection::open(config.index_db_path()).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; \
+                 DELETE FROM entries WHERE 0;",
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let snap = machine_snapshot(&config);
+        let waited = started.elapsed();
+
+        assert!(snap.index_bytes.is_some(), "file sizes need no lock");
+        assert!(snap.table_rows.is_empty(), "{:?}", snap.table_rows);
+        assert!(
+            waited < std::time::Duration::from_secs(4),
+            "waited {waited:?} on a locked index"
+        );
+        holder.execute_batch("COMMIT").unwrap();
     }
 
     #[test]

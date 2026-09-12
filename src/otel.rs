@@ -73,14 +73,16 @@ pub(crate) struct OtelSnapshot {
 pub(crate) fn write_otlp(
     dir: &Path,
     snap: &OtelSnapshot,
+    machine: &MachineSnapshot,
     service_version: &str,
     scenario: Option<&str>,
     phase: Option<&str>,
 ) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating telemetry dir {}", dir.display()))?;
-    let body = serialize_metrics(
+    let body = serialize_metrics_with(
         snap,
+        machine,
         DEFAULT_SERVICE_NAME,
         service_version,
         &unix_nano_now(),
@@ -98,6 +100,7 @@ pub(crate) fn write_otlp(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn serialize_metrics(
     snap: &OtelSnapshot,
     service_name: &str,
@@ -106,6 +109,31 @@ pub(crate) fn serialize_metrics(
     scenario: Option<&str>,
     phase: Option<&str>,
 ) -> Value {
+    serialize_metrics_with(
+        snap,
+        &MachineSnapshot::default(),
+        service_name,
+        service_version,
+        time_unix_nano,
+        scenario,
+        phase,
+    )
+}
+
+/// The daemon's counters plus the machine's shared-cache figures, in one
+/// payload so a dashboard can put GC outcomes and index growth next to the
+/// traffic that caused them.
+pub(crate) fn serialize_metrics_with(
+    snap: &OtelSnapshot,
+    machine: &MachineSnapshot,
+    service_name: &str,
+    service_version: &str,
+    time_unix_nano: &str,
+    scenario: Option<&str>,
+    phase: Option<&str>,
+) -> Value {
+    let mut metrics = metrics_for(snap, time_unix_nano);
+    metrics.extend(machine_metrics(machine, time_unix_nano));
     let mut resource = vec![
         str_attr("service.name", service_name),
         str_attr("service.version", service_version),
@@ -125,6 +153,11 @@ pub(crate) fn serialize_metrics(
     if let Some(phase) = phase.filter(|s| !s.is_empty()) {
         resource.push(str_attr("kache.cache.phase", phase));
     }
+    // Several runner slots share one machine's cache; `service.instance.id` is
+    // the OTel key for which instance this is, and one the collector admits.
+    if !machine.host.is_empty() {
+        resource.push(str_attr("service.instance.id", &machine.host));
+    }
     json!({
         "resourceMetrics": [{
             "resource": {
@@ -135,7 +168,7 @@ pub(crate) fn serialize_metrics(
                     "name": SCOPE_NAME,
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                "metrics": metrics_for(snap, time_unix_nano),
+                "metrics": metrics,
             }]
         }]
     })
@@ -389,6 +422,144 @@ fn cum_sum(name: &str, unit: &str, data_points: Vec<Value>) -> Value {
     })
 }
 
+// ── Machine snapshot ────────────────────────────────────────────────────────
+
+/// The host's shared cache, written beside the daemon's counters: the index
+/// every build on the machine reads and writes (its size and the rows in each
+/// table) and the GC runs recorded in `gc_stats.json`. Every figure is
+/// optional, so a busy or missing index costs a gap in the series, never a
+/// wait.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MachineSnapshot {
+    /// Which machine these figures describe, as `service.instance.id`.
+    pub host: String,
+    /// `index.db` plus its `-wal`, in bytes.
+    pub index_bytes: Option<u64>,
+    /// Rowid high-water mark per index table: the largest rowid, not a row
+    /// count. Deletions leave it where it was, so it overstates a table that
+    /// shrank; in exchange it is one b-tree descent, where `COUNT(*)` reads the
+    /// table or its smallest index.
+    pub table_rows: Vec<(&'static str, u64)>,
+    pub gc: Option<crate::report::GcStatsPersisted>,
+}
+
+fn machine_metrics(snap: &MachineSnapshot, now: &str) -> Vec<Value> {
+    let mut metrics = Vec::new();
+    if let Some(bytes) = snap.index_bytes {
+        metrics.push(gauge(
+            "kache.cache.index.size",
+            "By",
+            vec![as_int(bytes, now, &[])],
+        ));
+    }
+    if !snap.table_rows.is_empty() {
+        metrics.push(gauge(
+            "kache.cache.index.rows",
+            "{row}",
+            snap.table_rows
+                .iter()
+                .map(|(table, rows)| as_int(*rows, now, &[str_attr("kache.cache.table", table)]))
+                .collect(),
+        ));
+    }
+    if let Some(gc) = &snap.gc {
+        metrics.extend(gc_metrics(gc, now));
+    }
+    metrics
+}
+
+fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
+    let mut metrics = Vec::new();
+    if let Ok(last_run) = chrono::DateTime::parse_from_rfc3339(&gc.last_run) {
+        metrics.push(gauge(
+            "kache.cache.gc.last_run.time",
+            "s",
+            vec![as_int(last_run.timestamp().max(0) as u64, now, &[])],
+        ));
+    }
+    for (name, unit, value) in [
+        (
+            "kache.cache.gc.last_run.entries_evicted",
+            "{entry}",
+            gc.entries_evicted as u64,
+        ),
+        ("kache.cache.gc.last_run.bytes_freed", "By", gc.bytes_freed),
+        (
+            "kache.cache.gc.last_run.entries_failed",
+            "{entry}",
+            gc.entries_failed as u64,
+        ),
+        (
+            "kache.cache.gc.last_run.entries_locked",
+            "{entry}",
+            gc.entries_locked as u64,
+        ),
+        ("kache.cache.gc.last_run.duration", "ms", gc.duration_ms),
+    ] {
+        metrics.push(gauge(name, unit, vec![as_int(value, now, &[])]));
+    }
+
+    // The totals accumulate across runs and drivers since `since`, which is
+    // exactly what a cumulative sum's start time has to be.
+    let totals = &gc.totals;
+    let start = chrono::DateTime::parse_from_rfc3339(&totals.since)
+        .ok()
+        .and_then(|since| since.timestamp_nanos_opt());
+    if let (true, Some(start)) = (totals.runs > 0, start) {
+        let start = start.max(0).to_string();
+        for (name, unit, value) in [
+            ("kache.cache.gc.runs", "{run}", totals.runs),
+            (
+                "kache.cache.gc.entries_evicted",
+                "{entry}",
+                totals.entries_evicted,
+            ),
+            ("kache.cache.gc.bytes_freed", "By", totals.bytes_freed),
+            (
+                "kache.cache.gc.entries_failed",
+                "{entry}",
+                totals.entries_failed,
+            ),
+            (
+                "kache.cache.gc.entries_locked",
+                "{entry}",
+                totals.entries_locked,
+            ),
+        ] {
+            metrics.push(cum_sum(
+                name,
+                unit,
+                vec![json!({
+                    "asInt": value.to_string(),
+                    "timeUnixNano": now,
+                    "startTimeUnixNano": start,
+                    "attributes": [],
+                })],
+            ));
+        }
+    }
+    metrics
+}
+
+/// This machine's host name, or empty when the OS will not say.
+#[cfg(unix)]
+pub(crate) fn host_name() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for `buf.len()` bytes, and gethostname writes at
+    // most that many.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn host_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +670,156 @@ mod tests {
         assert!(!dumped.contains("cache_key"));
     }
 
+    fn machine_snap() -> MachineSnapshot {
+        MachineSnapshot {
+            host: "ci-mini".to_string(),
+            index_bytes: Some(29_074_419_712),
+            table_rows: vec![("entries", 2_085_333), ("cc_preprocess_memos", 874_517)],
+            gc: Some(crate::report::GcStatsPersisted {
+                last_run: "2026-09-12T12:11:05+00:00".to_string(),
+                entries_evicted: 560,
+                bytes_freed: 8_373_732_071,
+                entries_failed: 3,
+                entries_locked: 2,
+                duration_ms: 5801,
+                totals: crate::report::GcTotals {
+                    since: "2026-09-01T00:00:00+00:00".to_string(),
+                    runs: 4,
+                    entries_evicted: 900,
+                    bytes_freed: 10,
+                    entries_failed: 70,
+                    entries_locked: 60,
+                },
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn metric_names(body: &Value) -> BTreeSet<String> {
+        body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn with_machine(machine: &MachineSnapshot) -> Value {
+        serialize_metrics_with(
+            &sample_snap(),
+            machine,
+            "kache",
+            "0.19.0",
+            "1789200000000000000",
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn machine_figures_ride_with_the_daemon_counters() {
+        let body = with_machine(&machine_snap());
+        let names = metric_names(&body);
+        assert!(
+            names.contains("kache.cache.uploads"),
+            "daemon counters stay"
+        );
+        assert!(names.contains("kache.cache.index.rows"), "{names:?}");
+        let resource = body["resourceMetrics"][0]["resource"]["attributes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            resource.iter().any(
+                |a| a["key"] == "service.instance.id" && a["value"]["stringValue"] == "ci-mini"
+            )
+        );
+
+        let rows = metric(&body, "kache.cache.index.rows");
+        let points = rows["gauge"]["dataPoints"].as_array().unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(
+            points[1]["attributes"][0]["value"]["stringValue"],
+            "cc_preprocess_memos"
+        );
+        assert_eq!(points[1]["asInt"], "874517");
+        assert_eq!(
+            metric(&body, "kache.cache.index.size")["gauge"]["dataPoints"][0]["asInt"],
+            "29074419712"
+        );
+        // Kartero drops attribute keys outside its allowlist; these are the
+        // families it admits.
+        for key in all_attr_keys(&body) {
+            assert!(
+                [
+                    "kache.cache.",
+                    "kache.prefetch.",
+                    "kache.telemetry.",
+                    "service."
+                ]
+                .iter()
+                .any(|family| key.starts_with(family)),
+                "{key} is not allowlisted"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_totals_are_cumulative_sums_from_their_first_run() {
+        let body = with_machine(&machine_snap());
+        let runs = metric(&body, "kache.cache.gc.runs");
+        assert_eq!(
+            runs["sum"]["aggregationTemporality"],
+            "AGGREGATION_TEMPORALITY_CUMULATIVE"
+        );
+        let point = &runs["sum"]["dataPoints"][0];
+        assert_eq!(point["asInt"], "4");
+        let since = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00+00:00")
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        assert_eq!(point["startTimeUnixNano"], since.to_string());
+        assert_eq!(
+            metric(&body, "kache.cache.gc.entries_locked")["sum"]["dataPoints"][0]["asInt"],
+            "60"
+        );
+        assert_eq!(
+            metric(&body, "kache.cache.gc.last_run.entries_locked")["gauge"]["dataPoints"][0]["asInt"],
+            "2"
+        );
+    }
+
+    #[test]
+    fn gc_stats_without_totals_emit_no_cumulative_sums() {
+        let mut snap = machine_snap();
+        snap.gc.as_mut().unwrap().totals = crate::report::GcTotals::default();
+        let names = metric_names(&with_machine(&snap));
+        assert!(names.contains("kache.cache.gc.last_run.entries_evicted"));
+        assert!(!names.contains("kache.cache.gc.runs"), "{names:?}");
+    }
+
+    /// A snapshot with nothing readable (no index yet, no GC record) must leave
+    /// the daemon payload exactly as it was.
+    #[test]
+    fn an_empty_machine_snapshot_adds_nothing() {
+        let plain = serialize_metrics(&sample_snap(), "kache", "0.19.0", "1", None, None);
+        let with_empty = serialize_metrics_with(
+            &sample_snap(),
+            &MachineSnapshot::default(),
+            "kache",
+            "0.19.0",
+            "1",
+            None,
+            None,
+        );
+        assert_eq!(plain, with_empty);
+        assert!(
+            !metric_names(&plain)
+                .iter()
+                .any(|name| name.starts_with("kache.cache.index.")
+                    || name.starts_with("kache.cache.gc."))
+        );
+    }
+
     #[test]
     fn scope_is_cache_not_bench() {
         let body = serialize_metrics(&sample_snap(), "kache", "0.16.0", "1", None, None);
@@ -586,7 +907,15 @@ mod tests {
     #[test]
     fn write_otlp_emits_kartero_sidecars() {
         let dir = tempfile::tempdir().unwrap();
-        write_otlp(dir.path(), &sample_snap(), "0.16.0", None, None).unwrap();
+        write_otlp(
+            dir.path(),
+            &sample_snap(),
+            &MachineSnapshot::default(),
+            "0.16.0",
+            None,
+            None,
+        )
+        .unwrap();
         let metrics = dir.path().join(METRICS_FILE);
         let version = dir.path().join(SCHEMA_VERSION_FILE);
         assert!(metrics.is_file());

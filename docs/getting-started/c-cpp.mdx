@@ -115,6 +115,7 @@ Kache currently passes through:
 - response files
 - precompiled headers and modules
 - coverage and split-DWARF builds
+- assembly, including inline `asm` in C, that reads another file with `.incbin` or `.include`, or that uses assembler macros and repetitions (`.macro`, `.irp`, `.irpc`, `.rept`, `.altmacro`) able to generate those directives: the assembler reads the file after preprocessing, so the key cannot see it. Inline `asm` whose text is a computed expression rather than a string literal is passed through for the same reason. These compiles run the compiler directly, skipping a configured `KACHE_FALLBACK` wrapper, because a wrapper that keys on preprocessor output cannot see the file either.
 - flags it has not classified
 
 Inspect passthrough reasons in the monitor or logs:

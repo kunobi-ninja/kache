@@ -39,6 +39,7 @@ came from the second pass.
 | Realistic flag-soup canaries | `e2e-cc-flag-soup`, `e2e-rust-flag-soup`, `e2e-cmake-ninja-flagset` |
 | `__FILE__` / out-of-tree base-dir handling (#410) | `e2e-cc-file-macro-oot`, `e2e-cmake-file-macro-oot` |
 | Checkout paths in string literals stay checkout-bound (#1004) | `e2e-cc-literal-path` |
+| Files read by the assembler (`.incbin`, `.include`, macro-built) are never cached (#1015) | `e2e-cc-asm-incbin` |
 | CMake launcher + Ninja generator | `e2e-cmake-out-of-tree`, `e2e-cmake-file-macro-oot`, `e2e-cmake-ninja-flagset` |
 | Unsupported-flag passthrough | `e2e-c-passthrough` |
 | Refusal by invocation shape (multi-source, response file) | `e2e-cc-multi-source`, `e2e-cc-response-file` |

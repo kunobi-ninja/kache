@@ -207,7 +207,7 @@ kache telemetry write ./cache-otlp --scenario bench-firefox --phase warm
 
 Writes `metrics.otlp.json` and `schema_version` for Kartero. Metric names are `kache.cache.*` / `kache.prefetch.*` (scope `kache.cache`), never `kache.bench.*`. `--scenario` must match `kache.bench.project`. `--phase` is `cold`, `warm`, or `pull` so dumps from the same scenario do not collide. The rustc wrapper does not write these files.
 
-The payload also carries this host's shared cache: index size and a rowid high-water mark per table (`kache.cache.index.*`; it grows with every insert and replacement, so it is not a row count) and GC outcomes (`kache.cache.gc.*`: last run, plus cumulative totals including evictions that failed and those that lost the index write lock), with the host as `service.instance.id`. Those figures never wait on a busy index.
+The payload also carries this host's shared cache: index size and a rowid high-water mark per table (`kache.cache.index.*`; it grows with every insert and replacement, so it is not a row count) and GC outcomes (`kache.cache.gc.*`: last run, plus cumulative totals including evictions that failed and those that lost the index write lock). Those figures never wait on a busy index.
 
 ## `kache why-miss`
 

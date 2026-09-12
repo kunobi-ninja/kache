@@ -153,11 +153,8 @@ pub(crate) fn serialize_metrics_with(
     if let Some(phase) = phase.filter(|s| !s.is_empty()) {
         resource.push(str_attr("kache.cache.phase", phase));
     }
-    // Several runner slots share one machine's cache; `service.instance.id` is
-    // the OTel key for which instance this is, and one the collector admits.
-    if !machine.host.is_empty() {
-        resource.push(str_attr("service.instance.id", &machine.host));
-    }
+    // No host attribute: the file's shipper adds host identity, and a new
+    // resource attribute would split the existing daemon counter series.
     json!({
         "resourceMetrics": [{
             "resource": {
@@ -425,14 +422,12 @@ fn cum_sum(name: &str, unit: &str, data_points: Vec<Value>) -> Value {
 // ── Machine snapshot ────────────────────────────────────────────────────────
 
 /// The host's shared cache, written beside the daemon's counters: the index
-/// every build on the machine reads and writes (its size and the rows in each
-/// table) and the GC runs recorded in `gc_stats.json`. Every figure is
+/// every build on the machine reads and writes (its size and each table's largest
+/// rowid) and the GC runs recorded in `gc_stats.json`. Every figure is
 /// optional, so a busy or missing index costs a gap in the series, never a
 /// wait.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MachineSnapshot {
-    /// Which machine these figures describe, as `service.instance.id`.
-    pub host: String,
     /// `index.db` plus its `-wal`, in bytes.
     pub index_bytes: Option<u64>,
     /// The largest rowid per index table. This counts writes, not rows: the
@@ -688,7 +683,6 @@ mod tests {
 
     fn machine_snap() -> MachineSnapshot {
         MachineSnapshot {
-            host: "ci-mini".to_string(),
             index_bytes: Some(29_074_419_712),
             rowid_high_water: vec![("entries", 2_085_333), ("cc_preprocess_memos", 874_517)],
             gc: Some(crate::report::GcStatsPersisted {
@@ -748,9 +742,10 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(
-            resource.iter().any(
-                |a| a["key"] == "service.instance.id" && a["value"]["stringValue"] == "ci-mini"
-            )
+            !resource
+                .iter()
+                .any(|a| a["key"] == "service.instance.id" || a["key"] == "host.name"),
+            "no host identity in the payload: {resource:?}"
         );
 
         let rows = metric(&body, "kache.cache.index.rowid_high_water");

@@ -366,17 +366,15 @@ const MACHINE_INDEX_TABLES: [&str; 7] = [
     "eviction_tombstones",
 ];
 
-/// Read the shared cache without getting in a build's way: no schema work, no
-/// writes (`query_only`), a 25 ms busy timeout, and no daemon, so a figure the
-/// index is too busy to answer is left out rather than waited for. The
-/// connection is read-write only because SQLite needs the WAL's shared memory
-/// to read a WAL database, and a read-only open cannot create it on an idle
-/// host.
+/// Read the shared cache without getting in a build's way: a read-only
+/// connection (`query_only`, 25 ms busy timeout), no schema work and no
+/// daemon, so a figure the index is too busy to answer is left out rather
+/// than waited for. Read-only also means closing the connection can never
+/// checkpoint the WAL into `index.db`.
 pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot {
     let db_path = config.index_db_path();
     let index_bytes = index_file_bytes(config);
     let mut snap = crate::otel::MachineSnapshot {
-        host: crate::otel::host_name(),
         index_bytes,
         gc: crate::report::read_gc_stats(&config.cache_dir),
         ..Default::default()
@@ -384,17 +382,9 @@ pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot 
     if index_bytes.is_none() {
         return snap;
     }
-    let Ok(db) = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
+    let Ok(db) = crate::store::open_index_db_readonly(&db_path) else {
         return snap;
     };
-    if db.pragma_update(None, "busy_timeout", "25").is_err()
-        || db.pragma_update(None, "query_only", "ON").is_err()
-    {
-        return snap;
-    }
     for table in MACHINE_INDEX_TABLES {
         let top: rusqlite::Result<Option<i64>> =
             db.query_row(&rowid_high_water_sql(table), [], |row| row.get(0));
@@ -7150,10 +7140,56 @@ mod tests {
         assert_eq!(snap.gc.expect("gc_stats.json read").totals.runs, 1);
     }
 
+    /// The last read-write connection to a WAL database checkpoints on close,
+    /// copying the WAL into `index.db`: a write, on a 27 GiB file, that a
+    /// snapshot must never make. A read-only connection leaves both files as
+    /// it found them.
+    #[test]
+    fn machine_snapshot_never_checkpoints_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+        drop(Store::open(&config).unwrap());
+        let db_path = config.index_db_path();
+        let mut wal_path = db_path.clone().into_os_string();
+        wal_path.push("-wal");
+        {
+            // A writer that exits without checkpointing, as a killed build does.
+            let writer = rusqlite::Connection::open(&db_path).unwrap();
+            writer
+                .set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    true,
+                )
+                .unwrap();
+            writer
+                .execute_batch(
+                    "PRAGMA wal_autocheckpoint = 0;
+                     CREATE TABLE probe (x INTEGER);
+                     INSERT INTO probe VALUES (1);",
+                )
+                .unwrap();
+        }
+        let db_before = std::fs::read(&db_path).unwrap();
+        let wal_before = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(wal_before > 0, "the setup leaves frames in the WAL");
+
+        machine_snapshot(&config);
+
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            db_before,
+            "index.db must not be written"
+        );
+        assert_eq!(
+            std::fs::metadata(&wal_path).map(|m| m.len()).ok(),
+            Some(wal_before),
+            "the WAL must be left in place"
+        );
+    }
+
     #[test]
     fn stats_lines_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
         let machine = crate::otel::MachineSnapshot {
-            host: "ci-mini".to_string(),
             index_bytes: Some(29_074_419_712),
             rowid_high_water: vec![
                 ("entries", 2),

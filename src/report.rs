@@ -59,10 +59,22 @@ pub struct GcTotals {
 
 pub(crate) const GC_STATS_FILE: &str = "gc_stats.json";
 
-/// Read `cache_dir/gc_stats.json`, or `None` when absent or unparseable.
+/// Read `cache_dir/gc_stats.json`, or `None` when it is absent. A file that
+/// does not parse also reads as `None`, with a warning, because the next GC
+/// run then starts the totals over.
 pub(crate) fn read_gc_stats(cache_dir: &Path) -> Option<GcStatsPersisted> {
-    let content = std::fs::read_to_string(cache_dir.join(GC_STATS_FILE)).ok()?;
-    serde_json::from_str(&content).ok()
+    let path = cache_dir.join(GC_STATS_FILE);
+    let content = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&content) {
+        Ok(stats) => Some(stats),
+        Err(e) => {
+            tracing::warn!(
+                "{} does not parse ({e}); the next GC run starts its totals over",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 /// Record one finished GC run: replace the last-run fields and add to the
@@ -3869,6 +3881,38 @@ mod tests {
         assert_eq!(stats.totals.entries_failed, 7);
         assert_eq!(stats.totals.entries_locked, 6);
         assert!(!stats.totals.since.is_empty());
+    }
+
+    /// A gc_stats.json that no longer parses makes the next GC run start its
+    /// totals over. Losing months of totals has to show in the log.
+    #[test]
+    fn unparseable_gc_stats_warns_that_totals_start_over() {
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(GC_STATS_FILE), b"{\"totals\": ").unwrap();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = std::sync::Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(std::sync::Arc::clone(&writer)))
+            .finish();
+
+        let read = tracing::subscriber::with_default(subscriber, || read_gc_stats(dir.path()));
+
+        assert!(read.is_none());
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains("starts its totals over"), "{log}");
     }
 
     /// A file written before totals existed must still load, start its totals

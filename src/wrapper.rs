@@ -10,6 +10,7 @@ use crate::cache_key::FileHashStats;
 use crate::cache_key::FileHasher;
 use crate::compile;
 use crate::compiler::cc::CcCompiler;
+use crate::compiler::nvcc::NvccCompiler;
 use crate::compiler::rustc::RustcCompiler;
 use crate::compiler::{
     ArtifactKind, ArtifactSet, Compiler, KeyCtx, classify_by_filename, plan_post_restore, platform,
@@ -656,6 +657,89 @@ fn wrapper_entry() -> std::time::Instant {
         }
         None => std::time::Instant::now(),
     }
+}
+
+/// Run kache as a CUDA `nvcc` compiler wrapper (`CUDACXX="kache nvcc"`,
+/// `NVCC="kache nvcc"`, or `CMAKE_CUDA_COMPILER_LAUNCHER=kache`).
+///
+/// Phase 1 (kunobi-ninja/kache#1024): parse → refuse-check → passthrough.
+/// Every invocation runs the real `nvcc` with the original argv; the value
+/// is recognition + a recorded passthrough reason (visible in
+/// `report`/`why-miss`), proving the dispatch path before phase 2 wires
+/// key → local store → remote check/upload.
+pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
+    let start = wrapper_entry();
+    // Shared with the cc knob for now; a dedicated `[nvcc]` knob is a
+    // follow-up once the flag set deserves its own namespace (#1024).
+    let compiler =
+        NvccCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone());
+    let parsed = compiler
+        .parse(wrapper_args)
+        .context("parsing nvcc arguments")?;
+    let event_root = nvcc_event_root();
+
+    // The crate-name slot in events / metadata is the source file
+    // name — the closest analogue to rustc's crate name.
+    let crate_name = parsed
+        .sources
+        .first()
+        .and_then(|s| s.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let refuse = compiler.refuse_reasons(&parsed);
+    // Phase 1 has no store path yet: even a cacheable-looking invocation
+    // passes through, with an explicit reason instead of a fake hit.
+    let reason = if refuse.is_empty() {
+        "unsupported|nvcc cache store/restore not yet wired (phase 1, kunobi-ninja/kache#1024)"
+            .to_string()
+    } else {
+        refuse_reason_string(&refuse)
+    };
+    tracing::debug!("nvcc: passthrough ({reason})");
+    nvcc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason)
+}
+
+/// Run an `nvcc` invocation without caching — invoke the compiler with
+/// the original argv, propagate the exit code.
+///
+/// A refusal promises to preserve `nvcc`'s behavior exactly, so this
+/// never injects flags (prefix maps, `SOURCE_DATE_EPOCH`): those belong
+/// to the phase-2 cache-miss execution path.
+fn nvcc_passthrough(parsed: &crate::compiler::nvcc::NvccArgs) -> Result<PassthroughOutput> {
+    crate::opcounts::record_compiler_run();
+    let status = std::process::Command::new(&parsed.program)
+        .args(&parsed.rest)
+        .status()
+        .with_context(|| format!("executing {}", parsed.program))?;
+    Ok(PassthroughOutput {
+        exit_code: status.code().unwrap_or(1),
+        fallback: false,
+    })
+}
+
+fn nvcc_passthrough_with_event<R: Into<String>>(
+    config: &Config,
+    parsed: &crate::compiler::nvcc::NvccArgs,
+    crate_name: &str,
+    root: &str,
+    start: std::time::Instant,
+    reason: R,
+) -> Result<i32> {
+    let output = nvcc_passthrough(parsed)?;
+    log_passthrough_event(
+        config,
+        root,
+        crate_name,
+        start.elapsed().as_millis() as u64,
+        reason.into(),
+        &output,
+    );
+    Ok(output.exit_code)
+}
+
+fn nvcc_event_root() -> String {
+    event_root_string(event_root_override().or_else(|| std::env::current_dir().ok()))
 }
 
 /// Run kache as a C-family compiler wrapper (`CC=kache cc`,
@@ -8672,6 +8756,52 @@ exit 0
             std::fs::read_to_string(&capture).unwrap(),
             format!("-c\n-o\n{output_arg}\n"),
             "unsafe output passthrough must bypass fallback and cache-only flags"
+        );
+    }
+
+    /// Phase 1 nvcc (#1024): a parsed invocation runs the real compiler
+    /// with the original argv and propagates its exit code — and records
+    /// the passthrough reason. The nonzero exit kills the `Ok(0)` /
+    /// `Ok(1)` / `Ok(-1)` body mutants in both `run_nvcc` and
+    /// `nvcc_passthrough_with_event`; the sentinel root kills the
+    /// `nvcc_event_root` value mutants.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_passthrough_propagates_exit_code_and_reasons() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let fake_nvcc = dir.path().join("nvcc");
+        let shell =
+            crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+        std::fs::write(&fake_nvcc, format!("#!{}\nexit 3\n", shell.display())).unwrap();
+        std::fs::set_permissions(&fake_nvcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _root_guard = TestEnvGuard::set("KACHE_EVENT_ROOT", "/nvcc-phase1-root");
+        let config = test_config(dir.path().join("cache"));
+        let exit = run_nvcc(
+            &config,
+            &s(&[
+                &fake_nvcc.to_string_lossy(),
+                "-c",
+                "kernel.cu",
+                "-o",
+                "kernel.o",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(exit, 3);
+
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].root, "/nvcc-phase1-root");
+        assert_eq!(events[0].crate_name, "kernel.cu");
+        assert_eq!(events[0].result, EventResult::Passthrough);
+        assert!(
+            events[0].passthrough_reason.contains("not yet wired"),
+            "unexpected reason: {}",
+            events[0].passthrough_reason
         );
     }
 

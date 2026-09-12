@@ -23,6 +23,7 @@ use crate::link::LinkStrategy;
 
 pub mod cc;
 pub mod flags;
+pub mod nvcc;
 pub mod platform;
 pub mod rustc;
 
@@ -760,7 +761,7 @@ pub trait Compiler {
 /// Registration is deliberately concrete and local: adding an adapter means
 /// adding its module-owned descriptor here, with no broad enum of possible
 /// future tool kinds.
-pub const COMPILER_ADAPTERS: &[CompilerAdapter] = &[rustc::ADAPTER, cc::ADAPTER];
+pub const COMPILER_ADAPTERS: &[CompilerAdapter] = &[rustc::ADAPTER, cc::ADAPTER, nvcc::ADAPTER];
 
 /// Detect which compiler adapter an argv vector is invoking.
 ///
@@ -895,8 +896,9 @@ fn is_program_on_path(program: &str) -> bool {
 ///
 /// Cargo preserves `RUSTC` when it invokes `RUSTC_WRAPPER`, which identifies
 /// custom drivers such as Kani's `kani-compiler` without maintaining a list of
-/// tool names. `nvcc` remains an explicit passthrough because Kache supports it
-/// as a compiler launcher but cannot safely cache its multi-phase outputs.
+/// tool names. (`nvcc` used to live here; since kunobi-ninja/kache#1024 it has
+/// its own adapter and dispatches to `run_nvcc`, which passes through with a
+/// recorded reason until the cache path lands.)
 pub(crate) fn is_passthrough_compiler_invocation(args: &[String]) -> bool {
     let rustc = std::env::var_os("RUSTC");
     is_passthrough_compiler_invocation_with(args, rustc.as_deref())
@@ -912,12 +914,7 @@ pub(crate) fn is_passthrough_compiler_invocation_with(
     if is_kache_subcommand_or_flag(program) {
         return false;
     }
-    let is_configured_rustc =
-        configured_rustc.is_some_and(|rustc| rustc == std::ffi::OsStr::new(program.as_str()));
-    let is_nvcc = command_basename(program)
-        .map(strip_windows_exe_suffix)
-        .is_some_and(|name| name.eq_ignore_ascii_case("nvcc"));
-    is_configured_rustc || is_nvcc
+    configured_rustc.is_some_and(|rustc| rustc == std::ffi::OsStr::new(program.as_str()))
 }
 
 pub fn is_workspace_wrapper_chain(args: &[String]) -> bool {
@@ -1187,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_compiler_accepts_configured_rustc_and_nvcc() {
+    fn passthrough_compiler_accepts_configured_rustc() {
         assert!(is_passthrough_compiler_invocation_with(
             &s(&["/home/user/.kani/kani-0.67.0/bin/kani-compiler", "-vV"]),
             Some(std::ffi::OsStr::new(
@@ -1198,11 +1195,13 @@ mod tests {
             &s(&["custom-rustc-driver", "--crate-name", "demo"]),
             Some(std::ffi::OsStr::new("custom-rustc-driver")),
         ));
-        assert!(is_passthrough_compiler_invocation_with(
+        // nvcc has its own adapter since #1024: it dispatches to run_nvcc,
+        // not to the generic passthrough.
+        assert!(!is_passthrough_compiler_invocation_with(
             &s(&[r"C:\CUDA\bin\nvcc.exe", "-c", "kernel.cu"]),
             None,
         ));
-        assert!(is_passthrough_compiler_invocation_with(
+        assert!(!is_passthrough_compiler_invocation_with(
             &s(&["nvcc", "-c", "kernel.cu"]),
             None,
         ));

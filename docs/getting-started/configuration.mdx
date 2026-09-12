@@ -266,7 +266,7 @@ kache report --format github --since 24h --record
 
 After rendering the report as usual, it appends one JSON line to `telemetry/sessions.jsonl` in the cache dir: the report's summary and timing breakdown (hit overhead, key, dep-info pre-pass, restore, wait, prediction mismatches), plus load average, CPUs and index size at that moment. Use it at the end of a CI job: the report reads the runtime dir, which the job's cleanup deletes. The root is recorded as a hash, never as a path. Without `--record`, `kache report` writes nothing.
 
-Every GC driver (daemon sweep, auto-GC worker, `kache gc` without a daemon) records its run in `gc_stats.json` in the cache dir, including evictions that failed and how many of those lost the index write lock to running builds.
+Every GC driver (the daemon's sweep and its eviction after an upload, the auto-GC worker, and `kache gc` run locally, `--stale-schema` and `--max-age` included) records its run in `gc_stats.json` in the cache dir, including evictions that failed and how many of those lost the index write lock to running builds.
 
 None of this runs unless you ask for it. The machine figures are computed only by `kache telemetry write` and `kache stats`, and both only read: file sizes, `gc_stats.json`, and one seek per table for its row mark, never a count over a table. Nothing is sent over the network, and the daemon does nothing new. `telemetry/sessions.jsonl` exists only after a `kache report --record`. The one change that is always on is GC accounting: the auto-GC worker and `kache gc` now update the same `gc_stats.json` the daemon already wrote, once per GC run.
 

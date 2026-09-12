@@ -5639,7 +5639,13 @@ impl Daemon {
                     size,
                     self.config.max_size
                 );
-                let _ = store.evict();
+                // Under gc.lock like every driver, so the totals cannot race.
+                if let Ok(stats) = store.evict()
+                    && let Err(e) =
+                        crate::report::record_gc_run(&self.config.cache_dir, "daemon", &stats)
+                {
+                    tracing::warn!("recording upload-triggered GC run: {e:#}");
+                }
             }
             Ok(())
         });
@@ -11761,6 +11767,41 @@ mod tests {
             !store.contains("upload_evict_key"),
             "eviction should run once gc.lock is available"
         );
+    }
+
+    /// Upload-triggered eviction is a GC driver too: without a record, the
+    /// evictions it makes (and the ones it fails) never reach the totals.
+    #[test]
+    fn upload_triggered_eviction_records_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+
+        let src_file = dir.path().join("big.rlib");
+        std::fs::write(&src_file, vec![0u8; 200]).unwrap();
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                "upload_evict_key",
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(src_file.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        std::fs::remove_file(&src_file).unwrap();
+        store.set_last_accessed_for_test("upload_evict_key", "-1 hour");
+
+        Daemon::new(config).maybe_evict_after_upload();
+
+        let recorded = crate::report::read_gc_stats(dir.path()).expect("gc_stats.json written");
+        assert_eq!(recorded.source, "daemon");
+        assert_eq!(recorded.totals.runs, 1);
+        assert_eq!(recorded.entries_evicted, 1);
     }
 
     #[test]

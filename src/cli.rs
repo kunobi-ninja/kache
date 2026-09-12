@@ -3097,6 +3097,26 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
     )
 }
 
+/// Record a GC run `kache gc` made itself. A failed write costs the record,
+/// never the GC.
+fn record_manual_gc_run(config: &Config, stats: &crate::store::GcStats) {
+    if let Err(e) = crate::report::record_gc_run(&config.cache_dir, "manual", stats) {
+        tracing::warn!("recording GC run: {e:#}");
+    }
+}
+
+/// `kache gc --max-age` run locally because the daemon could not take it. The
+/// caller holds gc.lock, so the recorded totals cannot race another driver.
+fn evict_older_than_recorded(
+    store: &Store,
+    config: &Config,
+    hours: u64,
+) -> Result<crate::store::GcStats> {
+    let stats = store.evict_older_than(hours)?;
+    record_manual_gc_run(config, &stats);
+    Ok(stats)
+}
+
 /// Run garbage collection via the daemon.
 pub fn gc(
     config: &Config,
@@ -3117,6 +3137,7 @@ pub fn gc(
             }
         };
         let stats = store.evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)?;
+        record_manual_gc_run(config, &stats);
         if json {
             return emit_gc_json(config, false, &stats);
         }
@@ -3206,7 +3227,7 @@ pub fn gc(
                     print!("Running eviction...");
                     std::io::Write::flush(&mut std::io::stdout()).ok();
                 }
-                let evict_stats = store.evict_older_than(hours)?;
+                let evict_stats = evict_older_than_recorded(&store, config, hours)?;
                 combined = evict_stats.clone();
                 if human_gc_output(json) {
                     let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
@@ -7067,6 +7088,35 @@ mod tests {
         let stats = crate::report::read_gc_stats(&config.cache_dir).unwrap();
         assert_eq!(stats.source, "manual");
         assert_eq!(stats.totals.runs, 2);
+    }
+
+    #[test]
+    fn stale_schema_gc_records_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+
+        gc(&config, None, true, true).unwrap();
+
+        let stats =
+            crate::report::read_gc_stats(&config.cache_dir).expect("stale-schema run recorded");
+        assert_eq!(stats.source, "manual");
+        assert_eq!(stats.totals.runs, 1);
+    }
+
+    /// `kache gc --max-age` with no reachable daemon evicts locally; that run
+    /// counts like any other.
+    #[test]
+    fn age_gc_without_a_daemon_records_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+        let store = Store::open(&config).unwrap();
+        let _gc_lock = store.try_gc_lock().unwrap().expect("gc lock");
+
+        evict_older_than_recorded(&store, &config, 24).unwrap();
+
+        let stats = crate::report::read_gc_stats(&config.cache_dir).expect("age run recorded");
+        assert_eq!(stats.source, "manual");
+        assert_eq!(stats.totals.runs, 1);
     }
 
     #[test]

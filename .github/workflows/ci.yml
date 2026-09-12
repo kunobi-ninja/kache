@@ -1238,6 +1238,40 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
 
+  # Branch protection still requires the pre-rename check names. These jobs
+  # report those contexts from the renamed jobs. Drop once protection lists
+  # Nix package (Linux), Nix package (macOS), cargo test (macOS), and
+  # cargo test (Windows).
+  nix-package-alias:
+    name: Nix package
+    needs: nix-package
+    if: always() && needs.nix-package.result != 'skipped'
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    timeout-minutes: 5
+    steps:
+      - name: Mirror nix-package
+        run: test "${{ needs.nix-package.result }}" = "success"
+
+  cargo-macos-alias:
+    name: Test (macOS)
+    needs: cargo-macos
+    if: always() && needs.cargo-macos.result != 'skipped'
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    timeout-minutes: 5
+    steps:
+      - name: Mirror cargo-macos
+        run: test "${{ needs.cargo-macos.result }}" = "success"
+
+  cargo-windows-alias:
+    name: Test (Windows)
+    needs: cargo-windows
+    if: always() && needs.cargo-windows.result != 'skipped'
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    timeout-minutes: 5
+    steps:
+      - name: Mirror cargo-windows
+        run: test "${{ needs.cargo-windows.result }}" = "success"
+
   # --- Release (only on v* tags) ---
   release:
     # This `if:` and the `version-consistency` job's `if: github.ref_type ==

@@ -25,7 +25,7 @@
 //! `/MANIFESTFILE:` and `/PDBSTRIPPED:` are only text in the key, so a file
 //! rebuilt under an unchanged name would otherwise restore a stale executable.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -1937,10 +1937,12 @@ mod tests {
         environment
             .variables
             .insert("VSCMD_ARG_HOST_ARCH".into(), "mystery".into());
-        assert!(selected_architecture(&environment, "arm64")
-            .unwrap_err()
-            .to_string()
-            .contains("VSCMD_ARG_HOST_ARCH"));
+        assert!(
+            selected_architecture(&environment, "arm64")
+                .unwrap_err()
+                .to_string()
+                .contains("VSCMD_ARG_HOST_ARCH")
+        );
 
         environment.variables.insert("EMPTY".into(), "  ".into());
         assert_eq!(environment.var("EMPTY"), None);
@@ -2075,9 +2077,11 @@ mod tests {
             environment.command_environment(WindowsTool::Cl, &compiler),
             environment.compiler_command_env.as_slice()
         );
-        assert!(environment
-            .command_environment(WindowsTool::Cl, Path::new("other-cl.exe"))
-            .is_empty());
+        assert!(
+            environment
+                .command_environment(WindowsTool::Cl, Path::new("other-cl.exe"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2231,16 +2235,18 @@ mod tests {
         );
 
         std::fs::write(second.join("vcruntimed.lib"), b"different").unwrap();
-        assert!(hash_windows_runtime_libraries(
-            &environment,
-            "x64",
-            "10.0.26100.0",
-            "10.0.26100.0",
-            std::slice::from_ref(&first),
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("conflicting files"));
+        assert!(
+            hash_windows_runtime_libraries(
+                &environment,
+                "x64",
+                "10.0.26100.0",
+                "10.0.26100.0",
+                std::slice::from_ref(&first),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting files")
+        );
 
         for (names, expected) in [
             (
@@ -2308,14 +2314,16 @@ mod tests {
         );
 
         let missing = root.path().join("missing");
-        assert!(windows_library_dirs(
-            &environment,
-            "x64",
-            "10.0.26100.0",
-            "10.0.26100.0",
-            &[missing],
-        )
-        .is_err());
+        assert!(
+            windows_library_dirs(
+                &environment,
+                "x64",
+                "10.0.26100.0",
+                "10.0.26100.0",
+                &[missing],
+            )
+            .is_err()
+        );
         let mut invalid_lib = environment.clone();
         invalid_lib.variables.insert(
             "LIB".into(),
@@ -2600,16 +2608,18 @@ mod tests {
         .unwrap();
         assert_eq!(identity.linker, LINK_BANNER);
 
-        assert!(probe_windows_msvc_identity_with(
-            Some(&directory.path().join("cl.exe")),
-            "x64",
-            &[],
-            &environment,
-            |_, _| unreachable!(),
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("neither link.exe nor lld-link.exe"));
+        assert!(
+            probe_windows_msvc_identity_with(
+                Some(&directory.path().join("cl.exe")),
+                "x64",
+                &[],
+                &environment,
+                |_, _| unreachable!(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("neither link.exe nor lld-link.exe")
+        );
         for variable in ["LINK", "_LINK_"] {
             let mut with_options = environment.clone();
             with_options

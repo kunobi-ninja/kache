@@ -8739,7 +8739,10 @@ fn warn_if_remote_is_env_only(config: &Config) -> bool {
     if set.is_empty() {
         return false;
     }
-    let (file_config, _) = Config::load_raw_file_config();
+    // The merged view, host layer included: a remote the host config declares
+    // is one the daemon has, and telling the user to move it into the chosen
+    // file would be wrong.
+    let file_config = Config::load_file_config().unwrap_or_default();
     if file_config
         .cache
         .as_ref()
@@ -9149,6 +9152,22 @@ mod tests {
             "a file-configured remote must stay quiet"
         );
 
+        // The chosen file has no remote, but the host config does: the daemon
+        // has that remote too, so moving it into the chosen file is not the fix.
+        std::fs::write(&config_path, "[cache]\n").unwrap();
+        let host_path = dir.path().join("host.toml");
+        std::fs::write(
+            &host_path,
+            "[cache.remote]\ntype = \"s3\"\nbucket = \"from-host\"\n",
+        )
+        .unwrap();
+        let restore_host = crate::config::set_host_config_for_test(&host_path);
+        assert!(
+            !warn_if_remote_is_env_only(&config),
+            "a host-configured remote must stay quiet"
+        );
+
+        drop(restore_host);
         drop(clear);
         drop(restore_config);
     }

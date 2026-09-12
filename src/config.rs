@@ -980,7 +980,8 @@ fn normalize_base_dirs(raw: impl IntoIterator<Item = String>) -> Result<Vec<Stri
 
 /// The `KACHE_*` env vars suppressed by `[cache] ignore_env`: every file-backed
 /// setting. Deliberately excludes bootstrap/operational vars that have no file
-/// representation — `KACHE_CONFIG` (locates the file itself), `KACHE_DISABLED`
+/// representation — `KACHE_CONFIG` and `KACHE_HOST_CONFIG` (locate the files
+/// themselves), `KACHE_DISABLED`
 /// (operational kill switch), `KACHE_SOCKET_PATH`,
 /// `KACHE_LOG`/`KACHE_LOG_FILE`/`KACHE_PROGRESS`, `KACHE_NAMESPACE`, `KACHE_BASE_DIR` — and S3 credentials
 /// (`KACHE_S3_ACCESS_KEY`/`KACHE_S3_SECRET_KEY`), which are secrets, not config.
@@ -1620,33 +1621,47 @@ impl Config {
         Ok(())
     }
 
+    /// Load the chosen file laid over the host layer (see [`HOST_CONFIG_PATH`]).
+    /// The chosen file is still picked exactly as before; the host file only
+    /// fills in the keys it leaves unset.
     fn load_file_config_with_provenance(
         config_path: PathBuf,
     ) -> (Result<FileConfig>, ConfigFileProvenance) {
+        let host = read_host_config_snapshot();
+        let host_layer = host_config_layer(host.as_ref());
         match std::fs::read(&config_path) {
             Ok(bytes) => {
                 let provenance = ConfigFileProvenance::from_snapshot(
                     config_path,
                     ConfigFileState::Present,
                     &bytes,
+                    host.as_ref(),
                 );
                 let parsed = std::str::from_utf8(&bytes)
                     .context("reading kache config file as UTF-8")
-                    .and_then(|content| {
-                        toml::from_str(content).context("parsing kache config file")
-                    });
+                    .and_then(|content| parse_layered_file_config(content, host_layer));
                 (parsed, provenance)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let provenance =
-                    ConfigFileProvenance::from_snapshot(config_path, ConfigFileState::Absent, &[]);
-                (Ok(FileConfig::default()), provenance)
+                let provenance = ConfigFileProvenance::from_snapshot(
+                    config_path,
+                    ConfigFileState::Absent,
+                    &[],
+                    host.as_ref(),
+                );
+                // With no chosen file, the host layer is the whole file config.
+                // It already passed the schema check in `parse_host_config`.
+                let host_only = host_layer
+                    .and_then(|table| toml::Value::Table(table).try_into().ok())
+                    .unwrap_or_default();
+                (Ok(host_only), provenance)
             }
             Err(error) => {
                 let provenance = ConfigFileProvenance::from_snapshot(
                     config_path,
                     ConfigFileState::Unreadable,
                     &[],
+                    host.as_ref(),
                 );
                 (Err(error).context("reading kache config file"), provenance)
             }
@@ -1654,8 +1669,8 @@ impl Config {
     }
 
     /// Legacy file-only load used by config helpers that do not need to carry
-    /// provenance beyond this call.
-    fn load_file_config() -> Result<FileConfig> {
+    /// provenance beyond this call. Includes the host layer.
+    pub(crate) fn load_file_config() -> Result<FileConfig> {
         let path = normalize_config_path(resolve_config_path());
         Self::load_file_config_with_provenance(path).0
     }
@@ -2410,9 +2425,307 @@ pub(crate) fn default_cache_dir() -> PathBuf {
 
 const PROJECT_CONFIG_NAME: &str = ".kache.toml";
 
+/// Machine-wide config, read underneath whichever single file
+/// [`resolve_config_path`] picks. It lets a host owner set a key for every
+/// build on the machine, including CI jobs whose `KACHE_CONFIG` points at a
+/// file the job writes itself.
+pub(crate) const HOST_CONFIG_PATH: &str = "/etc/kache/config.toml";
+
+/// Tables a higher layer replaces whole instead of merging key by key. A
+/// remote or a planner is one coherent description: laying a project's
+/// `type = "s3"` over a host's `path = "/mnt/kache"` would name a remote
+/// neither file configured.
+const HOST_ATOMIC_TABLES: &[&[&str]] = &[&["cache", "remote"], &["cache", "planner"]];
+
+/// Top-level tables the host layer never contributes. Workspace declarations
+/// describe one Cargo workspace and are only read from its own `.kache.toml`.
+const HOST_EXCLUDED_TABLES: &[&str] = &["workspace"];
+
+/// Where to read the host layer from, or `None` when there is none to read.
+///
+/// `KACHE_HOST_CONFIG` names another file, and an empty value turns the layer
+/// off, for debugging a machine. Unit tests never read the real `/etc`: they
+/// have no host layer unless a test points its own thread at a file with
+/// [`set_host_config_for_test`].
+pub(crate) fn host_config_path() -> Option<PathBuf> {
+    match std::env::var("KACHE_HOST_CONFIG") {
+        Ok(value) if value.is_empty() => None,
+        Ok(value) => Some(shellexpand(&value)),
+        #[cfg(test)]
+        Err(_) => HOST_CONFIG_FOR_TEST.with(|path| path.borrow().clone()),
+        #[cfg(not(test))]
+        Err(_) => Some(PathBuf::from(HOST_CONFIG_PATH)),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread host path for unit tests. A thread-local, unlike
+    /// `KACHE_HOST_CONFIG`, cannot leak into tests running on other threads.
+    static HOST_CONFIG_FOR_TEST: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the calling thread's previous test host path when dropped.
+#[cfg(test)]
+pub(crate) struct HostConfigForTest(Option<PathBuf>);
+
+#[cfg(test)]
+impl Drop for HostConfigForTest {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        HOST_CONFIG_FOR_TEST.with(|path| *path.borrow_mut() = previous);
+    }
+}
+
+/// Point this thread's host layer at `path` until the guard drops.
+#[cfg(test)]
+pub(crate) fn set_host_config_for_test(path: &std::path::Path) -> HostConfigForTest {
+    HostConfigForTest(HOST_CONFIG_FOR_TEST.with(|current| current.replace(Some(path.into()))))
+}
+
+/// The host file as read at one moment, shared by the merge and the
+/// provenance fingerprint so both see the same bytes.
+#[derive(Debug, Clone)]
+struct HostConfigSnapshot {
+    path: PathBuf,
+    state: ConfigFileState,
+    bytes: Vec<u8>,
+}
+
+/// Read the host file. `None` when the layer is off or the file is absent,
+/// so a machine without one resolves exactly as it did before the layer
+/// existed.
+fn read_host_config_snapshot() -> Option<HostConfigSnapshot> {
+    let path = host_config_path()?;
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(HostConfigSnapshot {
+            path,
+            state: ConfigFileState::Present,
+            bytes,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(HostConfigSnapshot {
+            path,
+            state: ConfigFileState::Unreadable,
+            bytes: Vec::new(),
+        }),
+    }
+}
+
+/// Parse the host file into a table ready to merge. It is checked against
+/// the config schema on its own, so a typo is reported against the host file
+/// instead of surfacing later as an error in the chosen one.
+fn parse_host_config(host: &HostConfigSnapshot) -> Result<toml::Table> {
+    if matches!(host.state, ConfigFileState::Unreadable) {
+        anyhow::bail!("cannot read {}", host.path.display());
+    }
+    let content = std::str::from_utf8(&host.bytes).context("reading host config as UTF-8")?;
+    let mut table: toml::Table = toml::from_str(content).context("parsing host config")?;
+    for name in HOST_EXCLUDED_TABLES {
+        if table.remove(*name).is_some() {
+            tracing::warn!(
+                "host config {}: ignoring [{name}], which only a project's .kache.toml may set",
+                host.path.display()
+            );
+        }
+    }
+    toml::Value::Table(table.clone())
+        .try_into::<FileConfig>()
+        .context("host config does not match the kache config schema")?;
+    Ok(table)
+}
+
+/// The host layer to merge under the chosen file, or `None`. A host file that
+/// cannot be read or parsed is warned about and skipped: one bad machine-wide
+/// file must not change how every build on the host resolves its settings.
+fn host_config_layer(host: Option<&HostConfigSnapshot>) -> Option<toml::Table> {
+    let host = host?;
+    match parse_host_config(host) {
+        Ok(table) => Some(table),
+        Err(error) => {
+            tracing::warn!("ignoring host config {}: {error:#}", host.path.display());
+            None
+        }
+    }
+}
+
+fn is_host_atomic_table(path: &[String]) -> bool {
+    HOST_ATOMIC_TABLES.iter().any(|table| {
+        table.len() == path.len() && table.iter().zip(path).all(|(want, key)| *want == key)
+    })
+}
+
+/// Lay `over` onto `base` key by key: a key `over` sets replaces that key in
+/// `base`, and keys it does not set keep `base`'s value. Nested tables merge
+/// recursively, except those in [`HOST_ATOMIC_TABLES`], which `over` replaces
+/// whole. Arrays and scalars are always replaced, never concatenated.
+fn merge_config_tables(base: &mut toml::Table, over: toml::Table) {
+    merge_config_tables_at(base, over, &mut Vec::new());
+}
+
+fn merge_config_tables_at(base: &mut toml::Table, over: toml::Table, path: &mut Vec<String>) {
+    for (key, value) in over {
+        path.push(key.clone());
+        let recurse = !is_host_atomic_table(path)
+            && matches!(value, toml::Value::Table(_))
+            && matches!(base.get(&key), Some(toml::Value::Table(_)));
+        if recurse {
+            if let (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) =
+                (base.get_mut(&key), value)
+            {
+                merge_config_tables_at(existing, incoming, path);
+            }
+        } else {
+            base.insert(key, value);
+        }
+        path.pop();
+    }
+}
+
+/// Parse the chosen file's content, laid over the host layer when there is
+/// one. With no host layer this is exactly the single-file parse.
+fn parse_layered_file_config(content: &str, host: Option<toml::Table>) -> Result<FileConfig> {
+    let Some(mut merged) = host else {
+        return toml::from_str(content).context("parsing kache config file");
+    };
+    let chosen: toml::Table = toml::from_str(content).context("parsing kache config file")?;
+    merge_config_tables(&mut merged, chosen);
+    toml::Value::Table(merged)
+        .try_into()
+        .context("parsing kache config file")
+}
+
+/// What the host layer contributes, as `kache doctor` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostConfigStatus {
+    /// `KACHE_HOST_CONFIG` is set but empty: there is no host layer.
+    Disabled,
+    /// The host file does not exist.
+    Absent { path: PathBuf },
+    /// The host file exists but cannot be read or parsed, so it is ignored.
+    Invalid { path: PathBuf, error: String },
+    /// The host file is merged; `keys` says where each of its keys resolves.
+    Present {
+        path: PathBuf,
+        keys: Vec<HostConfigKey>,
+    },
+}
+
+/// One key the host file sets, and which layer's value is in effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostConfigKey {
+    /// Dotted key, such as `cache.input_predictions`. A table replaced whole
+    /// (see [`HOST_ATOMIC_TABLES`]) appears once, as `cache.remote`.
+    pub key: String,
+    pub source: HostKeySource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostKeySource {
+    /// The host value is in effect.
+    Host,
+    /// The chosen config file sets the same key.
+    ChosenFile(PathBuf),
+    /// A `KACHE_*` variable overrides it.
+    Env(&'static str),
+}
+
+/// Resolve what the host layer contributes and what overrides each of its
+/// keys: the environment first, then the chosen file.
+pub(crate) fn host_config_status() -> HostConfigStatus {
+    let Some(path) = host_config_path() else {
+        return HostConfigStatus::Disabled;
+    };
+    let Some(host) = read_host_config_snapshot() else {
+        return HostConfigStatus::Absent { path };
+    };
+    let table = match parse_host_config(&host) {
+        Ok(table) => table,
+        Err(error) => {
+            return HostConfigStatus::Invalid {
+                path: host.path,
+                error: format!("{error:#}"),
+            };
+        }
+    };
+    let chosen_path = normalize_config_path(resolve_config_path());
+    let chosen: toml::Table = std::fs::read_to_string(&chosen_path)
+        .ok()
+        .and_then(|content| toml::from_str(&content).ok())
+        .unwrap_or_default();
+    let ignore_env = Config::ignore_env_enabled(&Config::load_file_config());
+    let mut keys = Vec::new();
+    collect_host_keys(
+        &table,
+        Some(&chosen),
+        &mut Vec::new(),
+        &chosen_path,
+        ignore_env,
+        &mut keys,
+    );
+    HostConfigStatus::Present {
+        path: host.path,
+        keys,
+    }
+}
+
+fn collect_host_keys(
+    host: &toml::Table,
+    chosen: Option<&toml::Table>,
+    path: &mut Vec<String>,
+    chosen_path: &std::path::Path,
+    ignore_env: bool,
+    out: &mut Vec<HostConfigKey>,
+) {
+    for (key, value) in host {
+        path.push(key.clone());
+        let chosen_value = chosen.and_then(|table| table.get(key));
+        match value {
+            toml::Value::Table(inner) if !is_host_atomic_table(path) => {
+                let chosen_inner = match chosen_value {
+                    Some(toml::Value::Table(table)) => Some(table),
+                    _ => None,
+                };
+                collect_host_keys(inner, chosen_inner, path, chosen_path, ignore_env, out);
+            }
+            _ => {
+                let source = if let Some(var) = env_override_for(path, ignore_env) {
+                    HostKeySource::Env(var)
+                } else if chosen_value.is_some() {
+                    HostKeySource::ChosenFile(chosen_path.to_path_buf())
+                } else {
+                    HostKeySource::Host
+                };
+                out.push(HostConfigKey {
+                    key: path.join("."),
+                    source,
+                });
+            }
+        }
+        path.pop();
+    }
+}
+
+/// The set `KACHE_*` variable conventionally named after a `[cache]` key
+/// (`cache.input_predictions` is `KACHE_INPUT_PREDICTIONS`), if it is one of
+/// the file-backed variables. Keys whose variable does not follow that
+/// convention are not detected; the environment still wins over both files.
+fn env_override_for(path: &[String], ignore_env: bool) -> Option<&'static str> {
+    if ignore_env || path.len() != 2 || path[0] != "cache" {
+        return None;
+    }
+    let wanted = format!("KACHE_{}", path[1].to_ascii_uppercase());
+    IGNORE_ENV_GATED_VARS
+        .iter()
+        .copied()
+        .find(|name| *name == wanted && std::env::var_os(name).is_some())
+}
+
 /// Exact config-file snapshot used by one [`Config::load_with_provenance`].
 /// The fingerprint includes the normalized absolute path, presence state, and
-/// bytes. It is stable across processes running the same kache build.
+/// bytes, plus the host file's when one exists. It is stable across processes
+/// running the same kache build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigFileProvenance {
     pub path: PathBuf,
@@ -2427,13 +2740,28 @@ enum ConfigFileState {
 }
 
 impl ConfigFileProvenance {
-    fn from_snapshot(path: PathBuf, state: ConfigFileState, bytes: &[u8]) -> Self {
+    fn from_snapshot(
+        path: PathBuf,
+        state: ConfigFileState,
+        bytes: &[u8],
+        host: Option<&HostConfigSnapshot>,
+    ) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"kache.config-file-provenance.v1\0");
         hasher.update(path.as_os_str().as_encoded_bytes());
         hasher.update(&[0, state as u8]);
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
+        // Folded in only when a host file exists, so a machine without one
+        // fingerprints exactly as before, and editing the host file restarts
+        // a daemon the same way editing the chosen file does.
+        if let Some(host) = host {
+            hasher.update(b"\0host\0");
+            hasher.update(host.path.as_os_str().as_encoded_bytes());
+            hasher.update(&[0, host.state as u8]);
+            hasher.update(&(host.bytes.len() as u64).to_le_bytes());
+            hasher.update(&host.bytes);
+        }
         Self {
             path,
             fingerprint: hasher.finalize().to_hex().to_string(),
@@ -2469,12 +2797,16 @@ fn normalize_config_path_from(path: PathBuf, current_dir: Option<&std::path::Pat
 }
 
 pub(crate) fn config_file_provenance_at(path: PathBuf) -> ConfigFileProvenance {
+    let host = read_host_config_snapshot();
+    let host = host.as_ref();
     match std::fs::read(&path) {
-        Ok(bytes) => ConfigFileProvenance::from_snapshot(path, ConfigFileState::Present, &bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            ConfigFileProvenance::from_snapshot(path, ConfigFileState::Absent, &[])
+        Ok(bytes) => {
+            ConfigFileProvenance::from_snapshot(path, ConfigFileState::Present, &bytes, host)
         }
-        Err(_) => ConfigFileProvenance::from_snapshot(path, ConfigFileState::Unreadable, &[]),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ConfigFileProvenance::from_snapshot(path, ConfigFileState::Absent, &[], host)
+        }
+        Err(_) => ConfigFileProvenance::from_snapshot(path, ConfigFileState::Unreadable, &[], host),
     }
 }
 
@@ -3522,8 +3854,12 @@ remote_key_cache_refresh_secs = 900
 
         let (loaded, absent) = Config::load_file_config_with_provenance(missing.clone());
         assert!(loaded.is_ok(), "a missing config file means defaults");
-        let expected_absent =
-            ConfigFileProvenance::from_snapshot(missing.clone(), ConfigFileState::Absent, &[]);
+        let expected_absent = ConfigFileProvenance::from_snapshot(
+            missing.clone(),
+            ConfigFileState::Absent,
+            &[],
+            None,
+        );
         assert_eq!(absent, expected_absent);
         assert_eq!(config_file_provenance_at(missing), absent);
         assert!(!config_file_has_changed(&absent));
@@ -3539,10 +3875,290 @@ remote_key_cache_refresh_secs = 900
             unreadable_path.clone(),
             ConfigFileState::Unreadable,
             &[],
+            None,
         );
         assert_eq!(unreadable, expected_unreadable);
         assert_eq!(config_file_provenance_at(unreadable_path), unreadable);
         assert!(!config_file_has_changed(&unreadable));
+    }
+
+    /// Write a host file and, when given, a chosen file under `dir`.
+    fn write_host_and_chosen(
+        dir: &std::path::Path,
+        host: &str,
+        chosen: Option<&str>,
+    ) -> (PathBuf, PathBuf) {
+        let host_path = dir.join("host.toml");
+        std::fs::write(&host_path, host).unwrap();
+        let chosen_path = dir.join("chosen.toml");
+        if let Some(chosen) = chosen {
+            std::fs::write(&chosen_path, chosen).unwrap();
+        }
+        (host_path, chosen_path)
+    }
+
+    #[test]
+    fn host_layer_is_off_in_unit_tests_and_when_the_variable_is_empty() {
+        let _lock = config_path_lock();
+        {
+            let _host = set_env_for_test("KACHE_HOST_CONFIG", None);
+            assert_eq!(host_config_path(), None, "unit tests never read /etc");
+        }
+        {
+            let _host = set_env_for_test("KACHE_HOST_CONFIG", Some(std::ffi::OsStr::new("")));
+            assert_eq!(host_config_path(), None, "an empty value turns it off");
+        }
+        let _host = set_env_for_test(
+            "KACHE_HOST_CONFIG",
+            Some(std::ffi::OsStr::new("/srv/kache.toml")),
+        );
+        assert_eq!(host_config_path(), Some(PathBuf::from("/srv/kache.toml")));
+        // Outside tests, this is the default. The docs name the same path.
+        assert_eq!(HOST_CONFIG_PATH, "/etc/kache/config.toml");
+    }
+
+    /// Backward compatibility: with no host file, the chosen file resolves
+    /// exactly as it did before the host layer, down to the fingerprint.
+    #[test]
+    fn a_missing_host_file_changes_nothing() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let chosen = dir.path().join("chosen.toml");
+        let content = "[cache]\nlocal_max_size = \"10GiB\"\n";
+        std::fs::write(&chosen, content).unwrap();
+        let _host = set_host_config_for_test(&dir.path().join("absent.toml"));
+
+        let (loaded, provenance) = Config::load_file_config_with_provenance(chosen.clone());
+        assert_eq!(
+            loaded.unwrap().cache.unwrap().local_max_size.as_deref(),
+            Some("10GiB")
+        );
+        assert_eq!(
+            provenance,
+            ConfigFileProvenance::from_snapshot(
+                chosen,
+                ConfigFileState::Present,
+                content.as_bytes(),
+                None,
+            ),
+            "no host file must fingerprint exactly as before"
+        );
+    }
+
+    /// The CI shape: kache-action's `KACHE_CONFIG` file sets only the remote,
+    /// and the host's keys still apply alongside it.
+    #[test]
+    fn host_keys_apply_under_a_kache_config_that_does_not_set_them() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache]\ninput_predictions = true\nlocal_max_size = \"50GiB\"\n",
+            Some("[cache.remote]\ntype = \"s3\"\nbucket = \"ci\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+
+        let cache = Config::load_file_config().unwrap().cache.unwrap();
+        assert_eq!(cache.input_predictions, Some(true));
+        assert_eq!(cache.local_max_size.as_deref(), Some("50GiB"));
+        assert_eq!(
+            cache.remote.unwrap().bucket.as_deref(),
+            Some("ci"),
+            "the chosen file's nested table survives the merge"
+        );
+    }
+
+    #[test]
+    fn the_chosen_file_beats_the_host_key_by_key() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache]\ninput_predictions = true\nlocal_max_size = \"50GiB\"\n",
+            Some("[cache]\nlocal_max_size = \"10GiB\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+
+        let cache = Config::load_file_config().unwrap().cache.unwrap();
+        assert_eq!(cache.local_max_size.as_deref(), Some("10GiB"));
+        assert_eq!(
+            cache.input_predictions,
+            Some(true),
+            "a key the chosen file leaves unset still comes from the host"
+        );
+    }
+
+    #[test]
+    fn the_environment_beats_both_files() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache]\ninput_predictions = true\n",
+            Some("[cache]\nlocal_max_size = \"10GiB\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+        let file = Config::load_file_config();
+
+        {
+            let _env = set_env_for_test("KACHE_INPUT_PREDICTIONS", None);
+            assert!(Config::input_predictions_enabled(&file), "host value");
+        }
+        let _env = set_env_for_test("KACHE_INPUT_PREDICTIONS", Some(std::ffi::OsStr::new("0")));
+        assert!(
+            !Config::input_predictions_enabled(&file),
+            "the environment overrides the host file"
+        );
+    }
+
+    /// A remote is one description: mixing a host `path` into a project's
+    /// `type = "s3"` would configure a remote neither file named.
+    #[test]
+    fn a_chosen_remote_replaces_the_host_remote_whole() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache.remote]\ntype = \"filesystem\"\npath = \"/mnt/kache\"\n",
+            Some("[cache.remote]\ntype = \"s3\"\nbucket = \"ci\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+
+        let remote = Config::load_file_config()
+            .unwrap()
+            .cache
+            .unwrap()
+            .remote
+            .unwrap();
+        assert_eq!(remote._type.as_deref(), Some("s3"));
+        assert_eq!(remote.bucket.as_deref(), Some("ci"));
+        assert_eq!(remote.path, None, "no host remote key may leak in");
+    }
+
+    #[test]
+    fn a_malformed_host_file_is_ignored_and_reported() {
+        let _lock = config_path_lock();
+        for host_content in [
+            "[cache\nthis is not toml",
+            "[cache]\nlocal_max_size = 5\n", // valid TOML, wrong type
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, chosen) = write_host_and_chosen(
+                dir.path(),
+                host_content,
+                Some("[cache]\nlocal_max_size = \"10GiB\"\n"),
+            );
+            let _host = set_host_config_for_test(&host);
+            let _chosen = set_kache_config_for_test(&chosen);
+
+            let cache = Config::load_file_config()
+                .expect("a bad host file must not break the chosen one")
+                .cache
+                .unwrap();
+            assert_eq!(cache.local_max_size.as_deref(), Some("10GiB"));
+            assert!(
+                matches!(host_config_status(), HostConfigStatus::Invalid { .. }),
+                "{host_content:?} must be reported"
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_layer_never_contributes_workspace_declarations() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[workspace]\nextra = 1\n\n[cache]\ninput_predictions = true\n",
+            None,
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+
+        let file = Config::load_file_config().unwrap();
+        assert!(file.workspace.is_none());
+        assert_eq!(
+            file.cache.unwrap().input_predictions,
+            Some(true),
+            "with no chosen file, the host layer is the whole file config"
+        );
+    }
+
+    /// A running daemon restarts on a changed fingerprint, so editing the
+    /// host file has to change it, and removing the file restores the
+    /// fingerprint a host-less machine has.
+    #[test]
+    fn editing_the_host_file_changes_the_fingerprint() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let content = "[cache]\nlocal_max_size = \"10GiB\"\n";
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache]\ninput_predictions = true\n",
+            Some(content),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+
+        let (_, provenance) = Config::load_with_provenance().unwrap();
+        assert!(!config_file_has_changed(&provenance));
+        std::fs::write(&host, "[cache]\ninput_predictions = false\n").unwrap();
+        assert!(config_file_has_changed(&provenance), "host edit");
+
+        std::fs::remove_file(&host).unwrap();
+        assert_eq!(
+            config_file_provenance_at(provenance.path.clone()).fingerprint,
+            ConfigFileProvenance::from_snapshot(
+                provenance.path.clone(),
+                ConfigFileState::Present,
+                content.as_bytes(),
+                None,
+            )
+            .fingerprint
+        );
+    }
+
+    #[test]
+    fn host_status_names_what_overrides_each_key() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache]\ninput_predictions = true\nlocal_max_size = \"50GiB\"\nlocal_only = true\n\n\
+             [cache.remote]\ntype = \"s3\"\nbucket = \"host\"\n",
+            Some("[cache]\nlocal_max_size = \"10GiB\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+        let _predictions =
+            set_env_for_test("KACHE_INPUT_PREDICTIONS", Some(std::ffi::OsStr::new("1")));
+        let _local_only = set_env_for_test("KACHE_LOCAL_ONLY", None);
+
+        let HostConfigStatus::Present { keys, .. } = host_config_status() else {
+            panic!("the host file must be present");
+        };
+        let source = |key: &str| {
+            keys.iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("{key} missing from {keys:?}"))
+                .source
+                .clone()
+        };
+        assert_eq!(
+            source("cache.input_predictions"),
+            HostKeySource::Env("KACHE_INPUT_PREDICTIONS")
+        );
+        assert_eq!(
+            source("cache.local_max_size"),
+            HostKeySource::ChosenFile(normalize_config_path(chosen))
+        );
+        assert_eq!(source("cache.local_only"), HostKeySource::Host);
+        assert_eq!(source("cache.remote"), HostKeySource::Host);
+        assert_eq!(keys.len(), 4, "a replaced-whole table is listed once");
     }
 
     #[test]

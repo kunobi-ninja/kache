@@ -3893,6 +3893,40 @@ const DAEMON_CHECK_LABELS: [&str; 5] = [
     "Service exe",
 ];
 
+/// Wording for the "Host config" check, as `(pass, detail, fix hint)`. Pure,
+/// so each state is testable without a host file on the machine.
+fn doctor_host_config_check(
+    status: &crate::config::HostConfigStatus,
+) -> (bool, String, Option<String>) {
+    use crate::config::{HostConfigStatus, HostKeySource};
+    match status {
+        HostConfigStatus::Disabled => (true, "off (KACHE_HOST_CONFIG is empty)".to_string(), None),
+        HostConfigStatus::Absent { path } => (true, format!("none at {}", path.display()), None),
+        HostConfigStatus::Invalid { path, error } => (
+            false,
+            format!("{} is ignored: {error}", path.display()),
+            Some(format!("fix or remove {}", path.display())),
+        ),
+        HostConfigStatus::Present { path, keys } => {
+            let keys = if keys.is_empty() {
+                "sets nothing".to_string()
+            } else {
+                keys.iter()
+                    .map(|entry| match &entry.source {
+                        HostKeySource::Host => entry.key.clone(),
+                        HostKeySource::ChosenFile(file) => {
+                            format!("{} (overridden by {})", entry.key, file.display())
+                        }
+                        HostKeySource::Env(var) => format!("{} (overridden by {var})", entry.key),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            (true, format!("{}: {keys}", path.display()), None)
+        }
+    }
+}
+
 /// Whether a failing doctor check is informational rather than an issue:
 /// daemon checks when no remote/planner needs a daemon (#443), the
 /// compiler probe when there is no `cc` at all to diagnose (#626), and
@@ -4214,6 +4248,16 @@ pub fn doctor(
         pass: cargo_pass,
         detail: cargo_detail,
         fix: cargo_fix,
+    });
+
+    // 3b. Host config layer
+    let (host_pass, host_detail, host_fix) =
+        doctor_host_config_check(&crate::config::host_config_status());
+    checks.push(Check {
+        label: "Host config",
+        pass: host_pass,
+        detail: host_detail,
+        fix: host_fix,
     });
 
     // 4. Cache directory
@@ -6346,6 +6390,62 @@ mod tests {
 
     /// Which failing checks are informational: the full truth table for
     /// daemon-optional and probe-no-compiler downgrades.
+    /// Each host-config state reads the way `kache doctor` should say it: an
+    /// unusable file is the only failure, and an overridden key names what
+    /// wins over it.
+    #[test]
+    fn doctor_host_config_check_wording() {
+        use crate::config::{HostConfigKey, HostConfigStatus, HostKeySource};
+        let path = std::path::PathBuf::from("/etc/kache/config.toml");
+
+        assert!(doctor_host_config_check(&HostConfigStatus::Disabled).0);
+
+        let (pass, detail, fix) =
+            doctor_host_config_check(&HostConfigStatus::Absent { path: path.clone() });
+        assert!(pass);
+        assert!(
+            detail.contains("none at /etc/kache/config.toml"),
+            "{detail}"
+        );
+        assert!(fix.is_none());
+
+        let (pass, detail, fix) = doctor_host_config_check(&HostConfigStatus::Invalid {
+            path: path.clone(),
+            error: "parsing host config".to_string(),
+        });
+        assert!(!pass);
+        assert!(detail.contains("is ignored"), "{detail}");
+        assert!(fix.unwrap().contains("fix or remove"));
+
+        let (pass, detail, _) = doctor_host_config_check(&HostConfigStatus::Present {
+            path,
+            keys: vec![
+                HostConfigKey {
+                    key: "cache.input_predictions".to_string(),
+                    source: HostKeySource::Host,
+                },
+                HostConfigKey {
+                    key: "cache.local_max_size".to_string(),
+                    source: HostKeySource::ChosenFile("/job/kache-action.toml".into()),
+                },
+                HostConfigKey {
+                    key: "cache.local_only".to_string(),
+                    source: HostKeySource::Env("KACHE_LOCAL_ONLY"),
+                },
+            ],
+        });
+        assert!(pass);
+        assert!(detail.contains("cache.input_predictions, "), "{detail}");
+        assert!(
+            detail.contains("cache.local_max_size (overridden by /job/kache-action.toml)"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("cache.local_only (overridden by KACHE_LOCAL_ONLY)"),
+            "{detail}"
+        );
+    }
+
     #[test]
     fn doctor_check_optionality_truth_table() {
         // Daemon labels downgrade exactly when the daemon is optional.

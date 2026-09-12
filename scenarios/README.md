@@ -112,7 +112,7 @@ delete an entry once kache caches that case.
 [checks.measure.warm]
 known_passthrough = [
   "unsupported|rustc build-script probe",
-  "unsupported|cc unsupported flag(s): -mtune=skylake — not yet",
+  "unsupported|cc unsupported flag(s): -Ofast — not yet",
 ]
 ```
 

@@ -8759,6 +8759,52 @@ exit 0
         );
     }
 
+    /// Phase 1 nvcc (#1024): a parsed invocation runs the real compiler
+    /// with the original argv and propagates its exit code — and records
+    /// the passthrough reason. The nonzero exit kills the `Ok(0)` /
+    /// `Ok(1)` / `Ok(-1)` body mutants in both `run_nvcc` and
+    /// `nvcc_passthrough_with_event`; the sentinel root kills the
+    /// `nvcc_event_root` value mutants.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_passthrough_propagates_exit_code_and_reasons() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let fake_nvcc = dir.path().join("nvcc");
+        let shell =
+            crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+        std::fs::write(&fake_nvcc, format!("#!{}\nexit 3\n", shell.display())).unwrap();
+        std::fs::set_permissions(&fake_nvcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _root_guard = TestEnvGuard::set("KACHE_EVENT_ROOT", "/nvcc-phase1-root");
+        let config = test_config(dir.path().join("cache"));
+        let exit = run_nvcc(
+            &config,
+            &s(&[
+                &fake_nvcc.to_string_lossy(),
+                "-c",
+                "kernel.cu",
+                "-o",
+                "kernel.o",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(exit, 3);
+
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].root, "/nvcc-phase1-root");
+        assert_eq!(events[0].crate_name, "kernel.cu");
+        assert_eq!(events[0].result, EventResult::Passthrough);
+        assert!(
+            events[0].passthrough_reason.contains("not yet wired"),
+            "unexpected reason: {}",
+            events[0].passthrough_reason
+        );
+    }
+
     /// #1015: a fallback wrapper such as sccache keys on the same preprocessor
     /// output, so it would serve the stale object kache just refused to cache.
     /// Only that refusal skips it; other key failures keep the fallback.

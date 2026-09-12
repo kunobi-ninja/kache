@@ -1079,6 +1079,30 @@ fn rustc_args_for_direct_preclean(args: &[String]) -> Option<&[String]> {
     }
 }
 
+/// Which wrapper entry point an adapter dispatches to.
+///
+/// Pure so the dispatch choice is unit-testable: `run_wrapper_mode` only
+/// executes it. `None` means the adapter has no wrapper entry point yet
+/// (the caller bails with the adapter's identity).
+fn wrapper_target(adapter: &compiler::CompilerAdapter) -> Option<WrapperTarget> {
+    if adapter.id() == compiler::rustc::RUSTC_ID {
+        Some(WrapperTarget::Rustc)
+    } else if adapter.id() == compiler::cc::CC_ID {
+        Some(WrapperTarget::Cc)
+    } else if adapter.id() == compiler::nvcc::NVCC_ID {
+        Some(WrapperTarget::Nvcc)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperTarget {
+    Rustc,
+    Cc,
+    Nvcc,
+}
+
 fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // Re-entrancy guard. If a child compiler kache spawns is itself a
     // kache wrapper — e.g. `cc` on PATH shadowed by `kache cc` — the
@@ -1153,18 +1177,15 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
             args.first()
         );
     };
-    let exit_code = if adapter.id() == compiler::rustc::RUSTC_ID {
-        wrapper::run(&config, args)?
-    } else if adapter.id() == compiler::cc::CC_ID {
-        wrapper::run_cc(&config, args)?
-    } else if adapter.id() == compiler::nvcc::NVCC_ID {
-        wrapper::run_nvcc(&config, args)?
-    } else {
-        anyhow::bail!(
+    let exit_code = match wrapper_target(adapter) {
+        Some(WrapperTarget::Rustc) => wrapper::run(&config, args)?,
+        Some(WrapperTarget::Cc) => wrapper::run_cc(&config, args)?,
+        Some(WrapperTarget::Nvcc) => wrapper::run_nvcc(&config, args)?,
+        None => anyhow::bail!(
             "detected compiler adapter {} ({}) has no wrapper dispatch",
             adapter.id(),
             adapter.display_name()
-        );
+        ),
     };
     std::process::exit(exit_code);
 }
@@ -1350,6 +1371,36 @@ mod tests {
         assert!(!is_cc_compiler_invocation(&["rustc".to_string()]));
         assert!(!is_cc_compiler_invocation(&["other-tool".to_string()]));
         assert!(!is_cc_compiler_invocation(&["nvcc".to_string()]));
+    }
+
+    #[test]
+    fn wrapper_target_routes_every_adapter() {
+        let adapter_for = |argv: &[&str]| {
+            compiler::detect_compiler(
+                &argv
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("adapter must match")
+        };
+        assert_eq!(
+            wrapper_target(adapter_for(&["rustc", "--crate-name", "foo"])),
+            Some(WrapperTarget::Rustc)
+        );
+        assert_eq!(
+            wrapper_target(adapter_for(&["cc", "-c", "foo.c"])),
+            Some(WrapperTarget::Cc)
+        );
+        assert_eq!(
+            wrapper_target(adapter_for(&["nvcc", "-c", "kernel.cu"])),
+            Some(WrapperTarget::Nvcc)
+        );
+        let unknown =
+            compiler::CompilerAdapter::new(compiler::CompilerId::new("unwired"), "unwired", |_| {
+                false
+            });
+        assert_eq!(wrapper_target(&unknown), None);
     }
 
     #[cfg(unix)]

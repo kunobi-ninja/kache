@@ -89,6 +89,91 @@ pub struct NvccArgs {
     pub unknown_flags: Vec<String>,
 }
 
+/// Flags taking a separate value (`-D FOO`, `-gencode arch=..,code=..`).
+/// Checked before [`JOINED_PREFIXES`], so `-MF` takes a value while
+/// `-MFout.d` matches the joined form. Every entry is deferred (known but
+/// unkeyed) until phase 2 promotes it into the cache key.
+const VALUE_FLAGS: &[&str] = &[
+    "-D",
+    "-U",
+    "-I",
+    "-isystem",
+    "-iquote",
+    "-include",
+    "-O",
+    "-std",
+    "--std",
+    "-x",
+    "-L",
+    "-l",
+    "-MF",
+    "-MT",
+    "-MQ",
+    "-Xcompiler",
+    "-Xlinker",
+    "-Xptxas",
+    "-Xnvlink",
+    "--compiler-options",
+    "-gencode",
+    "-arch",
+    "-code",
+];
+
+/// Joined prefixes (`-O2`, `-DFOO`, `-arch=sm_80`, `-Werror`). Checked
+/// after [`VALUE_FLAGS`].
+///
+/// NOTE for phase 2: `-march=native` (and any host-resolved value) must
+/// refuse, never key — a resolved-through-probe classification like cc's
+/// `CapturedByProbe`, not a verbatim accept.
+const JOINED_PREFIXES: &[&str] = &[
+    "-D",
+    "-U",
+    "-I",
+    "-O",
+    "-std=",
+    "--std=",
+    "-x",
+    "-g",
+    "-m",
+    "--expt-",
+    "-Xfatbin",
+    "-MF",
+    "-MT",
+    "-MQ",
+    "-Xcompiler",
+    "-Xlinker",
+    "-Xptxas",
+    "-Xnvlink",
+    "-gencode",
+    "-arch=",
+    "-code=",
+    "--gpu-architecture=",
+    "--gpu-code=",
+    "--W",
+    "-W",
+];
+
+/// Bare flags with no value (`-M`, `-shared`, `-v`). Recorded deferred
+/// like the tables above. Kept as data, not match arms, so extending
+/// coverage is adding a string, not a branch.
+const BARE_DEFERRED_FLAGS: &[&str] = &[
+    "-M",
+    "-MM",
+    "-MD",
+    "-MMD",
+    "-MG",
+    "-MP",
+    "--generate-dependencies",
+    "-shared",
+    "--shared",
+    "-static",
+    "-v",
+    "--verbose",
+    "-w",
+    "-Wall",
+    "-W",
+];
+
 /// Source extensions `nvcc` accepts on a compile line. `.cu` is the CUDA
 /// language; the host extensions let `nvcc` drive plain C/C++ files too
 /// (common via `CUDACXX` wrappers covering a whole project).
@@ -185,12 +270,15 @@ impl NvccArgs {
                 "--version" | "-V" | "--help" | "-h" | "--dryrun" => {
                     set_vote(Vote::Query, NvccMode::Query, &mut parsed);
                 }
-                "--time" => parsed.unknown_flags.push(arg.to_string()),
                 "-o" => {
                     let value = take_value(&mut i, "-o")?;
                     parsed.output = Some(PathBuf::from(value));
                 }
-                _ if arg.starts_with("-o") && arg.len() > 2 && !arg.starts_with("-O") => {
+                // Joined `-oout.o`. (No length check: the exact `"-o"` arm
+                // above already claims the bare spelling, so anything
+                // reaching here carries a value.) `-O*` excluded —
+                // optimization levels are deferred flags, not outputs.
+                _ if arg.starts_with("-o") && !arg.starts_with("-O") => {
                     parsed.output = Some(PathBuf::from(&arg[2..]));
                 }
                 _ if arg == "-rdc" => parsed.separate_device_code = true,
@@ -198,87 +286,18 @@ impl NvccArgs {
                     let value = arg.rsplit('=').next().unwrap_or("");
                     parsed.separate_device_code = matches!(value, "true" | "1");
                 }
-                // Dependency-output flags: recorded so phase 2 can find the
-                // `.d` sidecar; the `-M` *listing* mode still compiles, so
-                // no mode vote.
-                "-M" | "-MM" | "-MD" | "-MMD" | "-MG" | "-MP" | "--generate-dependencies" => {
+                // Known-but-unmodeled flags (see the tables): recorded so
+                // phase 2 promotes entries instead of discovering flags
+                // from scratch. Table lookup, not `||` chains, so adding
+                // coverage is adding a string.
+                _ if BARE_DEFERRED_FLAGS.contains(&arg) => {
                     parsed.deferred_flags.push(arg.to_string());
                 }
-                "-MF" | "-MT" | "-MQ" => {
+                _ if VALUE_FLAGS.contains(&arg) => {
                     let value = take_value(&mut i, arg)?;
                     parsed.deferred_flags.push(format!("{arg} {value}"));
                 }
-                _ if arg.starts_with("-MF") || arg.starts_with("-MT") || arg.starts_with("-MQ") => {
-                    parsed.deferred_flags.push(arg.to_string());
-                }
-                // Verbatim-forwarded / codegen-defining flags: known,
-                // keyed in phase 2, refused until then.
-                _ if arg == "-Xcompiler"
-                    || arg == "-Xlinker"
-                    || arg == "-Xptxas"
-                    || arg == "-Xnvlink"
-                    || arg == "--compiler-options"
-                    || arg == "-gencode"
-                    || arg == "-arch"
-                    || arg == "-code" =>
-                {
-                    let value = take_value(&mut i, arg)?;
-                    parsed.deferred_flags.push(format!("{arg} {value}"));
-                }
-                _ if arg.starts_with("-Xcompiler")
-                    || arg.starts_with("-Xlinker")
-                    || arg.starts_with("-Xptxas")
-                    || arg.starts_with("-Xnvlink")
-                    || arg.starts_with("-gencode")
-                    || arg.starts_with("-arch=")
-                    || arg.starts_with("-code=")
-                    || arg.starts_with("--gpu-architecture=")
-                    || arg.starts_with("--gpu-code=") =>
-                {
-                    parsed.deferred_flags.push(arg.to_string());
-                }
-                _ if arg == "-D"
-                    || arg == "-U"
-                    || arg == "-I"
-                    || arg == "-isystem"
-                    || arg == "-iquote"
-                    || arg == "-include"
-                    || arg == "-O"
-                    || arg == "-std"
-                    || arg == "--std"
-                    || arg == "-x"
-                    || arg == "-L"
-                    || arg == "-l" =>
-                {
-                    let value = take_value(&mut i, arg)?;
-                    parsed.deferred_flags.push(format!("{arg} {value}"));
-                }
-                _ if arg.starts_with("-D")
-                    || arg.starts_with("-U")
-                    || arg.starts_with("-I")
-                    || arg.starts_with("-O")
-                    || arg.starts_with("-std=")
-                    || arg.starts_with("--std=")
-                    || arg.starts_with("-x")
-                    || arg.starts_with("-g")
-                    || arg.starts_with("-m")
-                    || arg.starts_with("--expt-")
-                    || arg.starts_with("-Xfatbin") =>
-                {
-                    parsed.deferred_flags.push(arg.to_string());
-                }
-                _ if arg == "-shared"
-                    || arg == "--shared"
-                    || arg == "-static"
-                    || arg == "-v"
-                    || arg == "--verbose"
-                    || arg == "-w"
-                    || arg == "-Wall"
-                    || arg == "-W" =>
-                {
-                    parsed.deferred_flags.push(arg.to_string());
-                }
-                _ if arg.starts_with("--W") || arg.starts_with("-W") => {
+                _ if JOINED_PREFIXES.iter().any(|p| arg.starts_with(p)) => {
                     parsed.deferred_flags.push(arg.to_string());
                 }
                 _ if arg.starts_with('@') => parsed.response_file = true,
@@ -408,15 +427,14 @@ impl NvccArgs {
     }
 }
 
-/// Allow-list entry matching: exact flag, or the flag's head before its
-/// first value separator (`-O2` covered by `-O`, `-gencode arch=…` by
-/// `-gencode`). Deliberately prefix-simple — auditing stays explicit.
+/// Allow-list entry matching: the flag verbatim (`-DFOO` covers the
+/// deferred entry `"-D FOO"` only when listed whole), or the entry head
+/// before its first value separator (`-O` covers `-O2`, `-gencode`
+/// covers `-gencode arch=..`). Deliberately explicit — auditing stays a
+/// conscious act, and the boundary form keeps `-O2` from smuggling in an
+/// unrelated `-Ox` spelling.
 fn flag_matches(allow: &str, flag: &str) -> bool {
-    flag == allow
-        || flag
-            .split([' ', '='])
-            .next()
-            .is_some_and(|head| head == allow)
+    flag == allow || flag.starts_with(allow) && flag[allow.len()..].starts_with([' ', '='])
 }
 
 /// The `nvcc` compiler: recognition today, full [`Compiler`] in phase 2.
@@ -614,7 +632,7 @@ mod tests {
         let parsed = parse_ok(&["nvcc", "-c", "k.cu", "--fancy-new-flag", "-o", "k.o"]);
         assert_eq!(parsed.unknown_flags, vec!["--fancy-new-flag".to_string()]);
         assert!(!parsed.refuse_reasons(&[]).is_empty());
-        // Allow-listed by head: caching proceeds past the flag check.
+        // Allow-listed verbatim: caching proceeds past the flag check.
         let reasons = parsed.refuse_reasons(&["--fancy-new-flag".to_string()]);
         assert!(reasons.is_empty(), "unexpected refusals: {reasons:?}");
     }
@@ -634,5 +652,181 @@ mod tests {
         assert!(NvccArgs::parse(&s(&["nvcc", "-c", "k.cu", "-o"])).is_err());
         assert!(NvccArgs::parse(&s(&["nvcc", "-c", "k.cu", "-gencode"])).is_err());
         assert!(NvccArgs::parse(&[]).is_err());
+    }
+
+    /// Every non-compile mode pins its refusal: deleting a mode arm must
+    /// change the mode (caught here), not just shuffle the reason.
+    #[test]
+    fn every_emit_mode_names_its_refusal() {
+        let cases: &[(&[&str], NvccMode, &str)] = &[
+            (
+                &["nvcc", "-E", "k.cu"],
+                NvccMode::Preprocess,
+                "preprocessor",
+            ),
+            (
+                &["nvcc", "--lib", "a.o", "-o", "lib.a"],
+                NvccMode::Lib,
+                "--lib",
+            ),
+            (&["nvcc", "-ptx", "k.cu"], NvccMode::EmitPtx, "-ptx"),
+            (&["nvcc", "-cubin", "k.cu"], NvccMode::EmitCubin, "-cubin"),
+            (
+                &["nvcc", "-fatbin", "k.cu"],
+                NvccMode::EmitFatbin,
+                "-fatbin",
+            ),
+            (
+                &["nvcc", "--optix-ir", "k.cu"],
+                NvccMode::EmitOptixIr,
+                "--optix-ir",
+            ),
+        ];
+        for (argv, mode, reason_part) in cases {
+            let parsed = parse_ok(argv);
+            assert_eq!(parsed.mode, *mode, "wrong mode for {argv:?}");
+            assert!(
+                parsed.refuse_reasons(&[]).iter().any(|r| {
+                    matches!(r, RefuseReason::Unsupported(d) if d.contains(reason_part))
+                }),
+                "missing {reason_part:?} refusal for {argv:?}"
+            );
+        }
+    }
+
+    /// Each flag table contributes: a bare flag, a separate-value flag,
+    /// and joined forms must all land deferred (never unknown).
+    #[test]
+    fn every_flag_table_lands_deferred() {
+        let parsed = parse_ok(&[
+            "nvcc",
+            "-c",
+            "k.cu",
+            "-o",
+            "k.o",
+            "-M",
+            "-MD",
+            "-MF",
+            "deps.d",
+            "-MFdeps2.d",
+            "-shared",
+            "-v",
+            "-D",
+            "FOO=1",
+            "-I/usr/include",
+            "-arch=sm_80",
+            "--gpu-architecture=compute_80",
+            "-Werror",
+            "-m64",
+        ]);
+        assert_eq!(parsed.mode, NvccMode::Compile);
+        assert!(
+            parsed.unknown_flags.is_empty(),
+            "unexpected unknowns: {:?}",
+            parsed.unknown_flags
+        );
+        for expected in [
+            "-M",
+            "-MD",
+            "-MF deps.d",
+            "-MFdeps2.d",
+            "-shared",
+            "-v",
+            "-D FOO=1",
+            "-I/usr/include",
+            "-arch=sm_80",
+            "--gpu-architecture=compute_80",
+            "-Werror",
+            "-m64",
+        ] {
+            assert!(
+                parsed.deferred_flags.iter().any(|f| f == expected),
+                "missing deferred {expected:?} in {:?}",
+                parsed.deferred_flags
+            );
+        }
+    }
+
+    #[test]
+    fn bare_rdc_sets_separable() {
+        let parsed = parse_ok(&["nvcc", "-c", "-rdc", "k.cu", "-o", "k.o"]);
+        assert!(parsed.separate_device_code);
+    }
+
+    /// Linker inputs are positional unknowns, never sources: a `-c` line
+    /// over `.o` files has no source to key.
+    #[test]
+    fn linker_inputs_are_not_sources() {
+        let parsed = parse_ok(&["nvcc", "-c", "a.o", "-o", "app"]);
+        assert!(parsed.sources.is_empty());
+        assert_eq!(parsed.unknown_flags, vec!["a.o".to_string()]);
+        assert!(
+            parsed.refuse_reasons(&[]).iter().any(|r| {
+                matches!(r, RefuseReason::Unsupported(d) if d.contains("source-less"))
+            })
+        );
+    }
+
+    /// Dash-prefixed positionals are flags (unknown), never sources — even
+    /// when the tail looks like a source extension.
+    #[test]
+    fn dash_prefixed_positionals_are_never_sources() {
+        let parsed = parse_ok(&["nvcc", "-c", "-q.cu", "-o", "k.o"]);
+        assert!(parsed.sources.is_empty());
+        assert_eq!(parsed.unknown_flags, vec!["-q.cu".to_string()]);
+    }
+
+    /// `--time` has no dedicated arm: it falls through to the unknown
+    /// bucket, which refuses identically. Pinned so a future arm addition
+    /// is a conscious change.
+    #[test]
+    fn time_falls_through_to_unknown() {
+        let parsed = parse_ok(&["nvcc", "-c", "k.cu", "--time", "-o", "k.o"]);
+        assert_eq!(parsed.unknown_flags, vec!["--time".to_string()]);
+        assert!(!parsed.refuse_reasons(&[]).is_empty());
+    }
+
+    #[test]
+    fn flag_matches_boundary_rules() {
+        assert!(flag_matches("--fancy-new-flag", "--fancy-new-flag"));
+        assert!(flag_matches("-O", "-O 2"));
+        assert!(flag_matches("-gencode", "-gencode=arch"));
+        // No smuggling: `-O` must not cover `-O2`, and an unrelated flag
+        // or a longer allow entry never matches.
+        assert!(!flag_matches("-O", "-O2"));
+        assert!(!flag_matches("-O", "--fancy"));
+        assert!(!flag_matches("--long-flag", "-D"));
+    }
+
+    #[test]
+    fn allowlist_head_does_not_smuggle() {
+        let parsed = parse_ok(&["nvcc", "-c", "k.cu", "-O2", "-o", "k.o"]);
+        assert!(!parsed.refuse_reasons(&["-O".to_string()]).is_empty());
+        // ...but the verbatim entry still works.
+        assert!(parsed.refuse_reasons(&["-O2".to_string()]).is_empty());
+    }
+
+    /// The trait surface phase 2 builds on: refusals delegate, and the
+    /// unimplemented key/execute fail loudly instead of faking success.
+    #[test]
+    fn compiler_trait_delegates_and_stubs_fail() {
+        let compiler = NvccCompiler::with_extra_allowlist_flags(Vec::new());
+        let link = parse_ok(&["nvcc", "a.o", "b.o", "-o", "app"]);
+        assert!(!compiler.refuse_reasons(&link).is_empty());
+
+        let temp = tempfile::tempdir().unwrap();
+        let file_hasher = crate::cache_key::FileHasher::new();
+        let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+        let ctx = crate::compiler::KeyCtx {
+            file_hasher: &file_hasher,
+            path_normalizer: &path_normalizer,
+            cache_dir: &temp.path().join("cache"),
+            key_salt: None,
+            key_env_vars: &[],
+            extra_inputs_digest: None,
+        };
+        let compile = parse_ok(&["nvcc", "-c", "k.cu", "-o", "k.o"]);
+        assert!(compiler.cache_key(&compile, &ctx).is_err());
+        assert!(compiler.execute(&compile).is_err());
     }
 }

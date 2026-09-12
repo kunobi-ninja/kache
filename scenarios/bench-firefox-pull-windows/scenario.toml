@@ -50,4 +50,17 @@ max_errors          = 0
 max_passthrough_pct = 40.0
 
 [checks.measure.pull]
+# Reasons kache still passes real compiles through for, from the nightly.
+# Any other reason warns; delete an entry once it is fixed.
+known_passthrough = [
+  "unsupported|cc preprocessor mode -E to stdout",
+  "uncacheable|determining native Windows MSVC link identity: selected Windows linker is neither",
+  "uncacheable|determining native Windows MSVC link identity: explicit Windows linker input files",
+  "unsupported|cc unsupported flag(s): -- — not yet",
+  "unsupported|cc link mode",
+  "unsupported|cc unsupported flag(s): -Wall -Wno-parentheses -Wno-unused-function — not yet",
+  "uncacheable|cc -E key probe exited 1",
+  "unsupported|rustc build-script probe",
+  "unsupported|cc unsupported flag(s): -Zl — not yet",
+]
 min_hit_rate_pct = 10.0

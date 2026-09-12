@@ -95,3 +95,11 @@ max_passthrough_pct = 40.0
 max_errors = 0
 min_hits = 200
 min_restored_bytes = 67108864 # 64 MiB
+
+[checks.measure.warm]
+# Reasons kache still passes real compiles through for, from the nightly.
+# Any other reason warns; delete an entry once it is fixed.
+known_passthrough = [
+  "unsupported|rustc build-script probe",
+  "unsupported|cc link mode",
+]

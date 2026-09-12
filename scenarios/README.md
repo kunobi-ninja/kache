@@ -98,6 +98,22 @@ fields are not evaluated. The fields are `min_key_stability_pct`,
 last two are validity floors: a phase that recompiled everything reports no hits
 and restores no bytes, and without them its wall-clock reads as a flatteringly
 fast build. `checks.measure` warnings are advisory only.
+
+`checks.measure.<phase>` can also list `known_passthrough`: the reasons the
+scenario still passes real compiles through for, as prefixes of the label the
+bench exports (`category|detail`, with paths shown as `<path>`). Any other
+reason warns, so a newly unsupported flag or file shows up the first night it
+appears. Probes (`not-a-compile`) are never checked. The goal is an empty list:
+delete an entry once kache caches that case.
+
+```toml
+[checks.measure.warm]
+known_passthrough = [
+  "unsupported|rustc build-script probe",
+  "unsupported|cc unsupported flag(s): -funroll-loops — not yet",
+]
+```
+
 `{cache}` expands to the selected compiler-cache binary (`kache` by default,
 `sccache` with `--cache-backend sccache`); `{kache}` remains supported for
 older scenarios.

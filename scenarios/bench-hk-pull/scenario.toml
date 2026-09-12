@@ -73,4 +73,10 @@ min_hits            = 200
 min_restored_bytes  = 67108864 # 64 MiB
 
 [checks.measure.pull]
+# Reasons kache still passes real compiles through for, from the nightly.
+# Any other reason warns; delete an entry once it is fixed.
+known_passthrough = [
+  "unsupported|rustc build-script probe",
+  "unsupported|cc link mode",
+]
 min_hit_rate_pct = 90.0

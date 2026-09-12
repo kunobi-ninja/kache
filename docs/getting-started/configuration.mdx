@@ -7,9 +7,10 @@ Kache resolves settings in this order:
 
 1. environment variable
 2. config file
-3. built-in default
+3. [host config](#host-config)
+4. built-in default
 
-`KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_SOCKET_PATH`, logging controls, progress controls, and credentials are operational settings. They do not all have TOML equivalents.
+`KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_HOST_CONFIG`, `KACHE_SOCKET_PATH`, logging controls, progress controls, and credentials are operational settings. They do not all have TOML equivalents.
 
 ## Config file
 
@@ -38,6 +39,24 @@ region = "us-east-1"
 ```
 
 Use `type = "filesystem"` with `path = "/mnt/kache"` for a shared filesystem remote. Only `s3` and `filesystem` are compiled remote backends.
+
+### Host config
+
+A machine owner can set keys for every build on the machine in `/etc/kache/config.toml`. Kache reads it underneath the chosen file and merges the two key by key: a key the chosen file sets wins, and a key it leaves unset comes from the host file. Environment variables still win over both.
+
+This reaches CI jobs too. kache-action points `KACHE_CONFIG` at a file of its own that only sets `[cache.remote]`, so a host file like this applies to every job on the runner:
+
+```toml title="/etc/kache/config.toml"
+[cache]
+input_predictions = true
+```
+
+- `[cache.remote]` and `[cache.planner]` are replaced whole. If the chosen file declares one, none of the host file's keys for it apply.
+- The host file never contributes `[workspace]` declarations. Those belong to a project's `.kache.toml`.
+- A host `ignore_env = true` applies to every build on the machine.
+- A host file that cannot be read or parsed is ignored with a warning. `kache doctor` reports it, and lists each host key with whatever overrides it.
+- `KACHE_HOST_CONFIG` reads another path instead. An empty value turns the host layer off.
+- `kache config` edits the chosen file, never the host file.
 
 ## Core settings
 
@@ -257,6 +276,6 @@ Set `cache.ignore_env` in a controlled project config to ignore environment over
 ignore_env = true
 ```
 
-It does not suppress `KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_SOCKET_PATH`, credentials, logging, progress, or other environment-only controls. Kache warns when it ignores a set variable.
+It does not suppress `KACHE_DISABLED`, `KACHE_CONFIG`, `KACHE_HOST_CONFIG`, `KACHE_SOCKET_PATH`, credentials, logging, progress, or other environment-only controls. Kache warns when it ignores a set variable.
 
-The daemon reads configuration at startup and watches the active config file. File changes trigger a graceful restart. Environment changes require starting a new daemon from that environment; an installed service uses its service definition, not your current shell.
+The daemon reads configuration at startup and watches the active config file and the host config. File changes trigger a graceful restart. Environment changes require starting a new daemon from that environment; an installed service uses its service definition, not your current shell.

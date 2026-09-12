@@ -7,14 +7,15 @@ The repository benchmark harness builds real projects in separate checkouts. Thi
 
 ## Nightly benchmark matrix
 
-The [Bench workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) is scheduled every night at 04:37 UTC. It runs:
+The [Bench workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) is scheduled every night at 03:37 Zurich time (01:37 UTC in summer, 02:37 UTC in winter). It runs:
 
 - Firefox cold/warm builds on Linux and Windows
 - LLVM, Substrate, SurrealDB, Lance, and OpenDAL cold/warm builds
 - Firefox through sccache for comparison
 - Firefox source-update builds on Linux and Windows
 - hk cold, warm and next-commit builds on Linux: a mid-size Rust CLI whose build scripts compile C and assembly through cc-rs, wired the way `kache init` configures a machine
-- The same hk build through mbx at its latest release, for a side-by-side comparison
+- hk with input predictions off, as the control for the hk arm's warm phases
+- The hk, Lance, OpenDAL, Substrate and SurrealDB builds through mbx at its latest release, for side-by-side comparisons
 - eza cold, warm and cross-worktree builds on Linux: the smallest subject in the matrix and the only one built through a fat-LTO release profile, with its bundled libgit2 and zlib compiled through the same cc-rs wiring
 
 Jobs upload their reports, Perfetto traces, and logs even when a benchmark fails. GitHub retains those artifacts for 30 days.

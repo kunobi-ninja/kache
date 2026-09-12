@@ -1729,51 +1729,58 @@ fn cc_string_literals(src: &[u8]) -> CcStringLiterals {
     let mut joining = false;
     let mut i = 0;
     while let Some(&byte) = src.get(i) {
-        if byte.is_ascii_whitespace() {
-            i += 1;
-            continue;
-        }
-        // Comments only survive a `-C` probe. The compiler reads one as a
-        // blank, so literals on either side still join.
-        if byte == b'/' && matches!(src.get(i + 1), Some(b'*' | b'/')) {
-            i = cc_skip_comment(src, i);
-            continue;
-        }
-        let word_end = cc_word_end(src, i);
-        let word = &src[i..word_end];
-        let quote = src.get(word_end).copied();
-        let plain = word.is_empty() || CC_LITERAL_PREFIXES.contains(&word);
-        let raw_paren = (quote == Some(b'"') && CC_RAW_STRING_PREFIXES.contains(&word))
-            .then(|| cc_raw_delimiter(src, word_end))
-            .flatten();
-        let next = if raw_paren.is_some() || (quote == Some(b'"') && plain) {
-            if !joining {
-                literals.text.push(b'\n');
-            }
-            joining = true;
-            match raw_paren {
-                Some(paren) => cc_read_raw_string(src, word_end, paren, &mut literals.text),
-                None => cc_read_string(src, word_end, &mut literals),
-            }
+        let next = if byte.is_ascii_whitespace() {
+            i + 1
+        } else if byte == b'/' && matches!(src.get(i + 1), Some(b'*' | b'/')) {
+            // Comments only survive a `-C` probe. The compiler reads one as a
+            // blank, so literals on either side still join.
+            cc_skip_comment(src, i)
         } else {
-            joining = false;
-            if quote == Some(b'\'') && plain {
-                cc_skip_char_literal(src, word_end)
-            } else if word.is_empty() {
-                i + 1
-            } else {
-                if matches!(word, b"asm" | b"__asm" | b"__asm__")
-                    && !cc_asm_text_is_literal(src, word_end)
-                {
-                    literals.computed_asm = true;
-                }
-                word_end
-            }
+            cc_read_token(src, i, &mut literals, &mut joining)
         };
         debug_assert!(next > i, "string literal reader must advance");
         i = next;
     }
     literals
+}
+
+/// Read the token starting at `i`, which is not a blank or a comment, and
+/// return the index after it. String literals are decoded into `literals`;
+/// `joining` tracks whether the previous token was one.
+fn cc_read_token(
+    src: &[u8],
+    i: usize,
+    literals: &mut CcStringLiterals,
+    joining: &mut bool,
+) -> usize {
+    let word_end = cc_word_end(src, i);
+    let word = &src[i..word_end];
+    let quote = src.get(word_end).copied();
+    let plain = word.is_empty() || CC_LITERAL_PREFIXES.contains(&word);
+    let raw_paren = (quote == Some(b'"') && CC_RAW_STRING_PREFIXES.contains(&word))
+        .then(|| cc_raw_delimiter(src, word_end))
+        .flatten();
+    if raw_paren.is_some() || (quote == Some(b'"') && plain) {
+        if !*joining {
+            literals.text.push(b'\n');
+        }
+        *joining = true;
+        return match raw_paren {
+            Some(paren) => cc_read_raw_string(src, word_end, paren, &mut literals.text),
+            None => cc_read_string(src, word_end, literals),
+        };
+    }
+    *joining = false;
+    if quote == Some(b'\'') && plain {
+        return cc_skip_char_literal(src, word_end);
+    }
+    if word.is_empty() {
+        return i + 1;
+    }
+    if matches!(word, b"asm" | b"__asm" | b"__asm__") && !cc_asm_text_is_literal(src, word_end) {
+        literals.computed_asm = true;
+    }
+    word_end
 }
 
 /// End of the identifier or number starting at `start`, or `start` if neither
@@ -1785,13 +1792,15 @@ fn cc_word_end(src: &[u8], start: usize) -> usize {
         return start;
     }
     let number = src[start].is_ascii_digit();
-    let mut i = start + 1;
+    let mut i = start;
     while let Some(byte) = src.get(i) {
         let separator = number && *byte == b'\'' && src.get(i + 1).is_some_and(is_word);
         if !is_word(byte) && !separator {
             break;
         }
-        i += 1;
+        let next = i + 1;
+        debug_assert!(next > i, "word reader must advance");
+        i = next;
     }
     i
 }
@@ -1802,14 +1811,16 @@ fn cc_word_end(src: &[u8], start: usize) -> usize {
 fn cc_read_string(src: &[u8], open: usize, literals: &mut CcStringLiterals) -> usize {
     let mut i = open + 1;
     while let Some(&byte) = src.get(i) {
-        match byte {
+        let next = match byte {
             b'"' | b'\n' => return i + 1,
-            b'\\' => i = cc_decode_escape(src, i + 1, literals),
+            b'\\' => cc_decode_escape(src, i + 1, literals),
             _ => {
                 literals.text.push(byte);
-                i += 1;
+                i + 1
             }
-        }
+        };
+        debug_assert!(next > i, "string reader must advance");
+        i = next;
     }
     i
 }
@@ -1930,11 +1941,13 @@ fn cc_read_raw_string(src: &[u8], open: usize, paren: usize, out: &mut Vec<u8>) 
 fn cc_skip_char_literal(src: &[u8], open: usize) -> usize {
     let mut i = open + 1;
     while let Some(&byte) = src.get(i) {
-        match byte {
-            b'\\' => i += 2,
+        let next = match byte {
+            b'\\' => i + 2,
             b'\'' | b'\n' => return i + 1,
-            _ => i += 1,
-        }
+            _ => i + 1,
+        };
+        debug_assert!(next > i, "character literal reader must advance");
+        i = next;
     }
     i
 }
@@ -1959,13 +1972,15 @@ fn cc_skip_comment(src: &[u8], start: usize) -> usize {
 /// `asm` statement.
 fn cc_asm_text_is_literal(src: &[u8], after: usize) -> bool {
     let skip_blanks = |mut i: usize| loop {
-        if src.get(i).is_some_and(u8::is_ascii_whitespace) {
-            i += 1;
+        let next = if src.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i + 1
         } else if src.get(i) == Some(&b'/') && matches!(src.get(i + 1), Some(b'*' | b'/')) {
-            i = cc_skip_comment(src, i);
+            cc_skip_comment(src, i)
         } else {
             return i;
-        }
+        };
+        debug_assert!(next > i, "asm reader must advance");
+        i = next;
     };
     let mut i = skip_blanks(after);
     loop {
@@ -10412,6 +10427,7 @@ mod tests {
         );
         assert_eq!(found(".inc\\()bin \"p.bin\""), Some(r"\()"));
         assert_eq!(found(".altmacro\n"), Some(".altmacro"));
+        assert_eq!(found(".altmacro_x"), None);
 
         // The compiler joins and decodes C strings after preprocessing.
         assert_eq!(
@@ -10505,6 +10521,20 @@ mod tests {
         assert_eq!(text("// \"x\n\"ok\""), "\nok");
         assert_eq!(text("x = 1 / 2; s = \"ok\";"), "\nok");
         assert_eq!(text("/* \"x"), "");
+        // `/*/` does not close the comment it opens.
+        assert_eq!(text(r#"/*/ "x" */ s = "ok";"#), "\nok");
+        // A raw string ends exactly after its delimiter: an adjacent literal
+        // still joins it.
+        assert_eq!(text(r#"s = R"ab(xyz)ab" "k";"#), "\nxyzk");
+        // `R` before a blank is a word, even with `x(` after it.
+        assert_eq!(text(r#"R x(y); s = "ok";"#), "\nok");
+        // A quote after a digit separates digits only when a digit follows.
+        assert_eq!(text(r#"x = 1'"'; s = "ok";"#), "\nok");
+        // An escape in a character literal skips exactly two bytes.
+        assert_eq!(text(r#"'\'' "ok""#), "\nok");
+        // `\u{...}` is a code point, `\x{...}` a byte.
+        assert_eq!(cc_string_literals(br#""\u{e9}""#).text, b"\n\xc3\xa9");
+        assert_eq!(cc_string_literals(br#""\x{e9}""#).text, b"\n\xe9");
         assert_eq!(
             cc_assembler_hidden_input(b"/* \" */ asm(\".inc\" \"bin \\\"p\\\"\");"),
             Some(".incbin")
@@ -10523,6 +10553,9 @@ mod tests {
         assert!(!computed(r#"__asm__(R"(nop)");"#));
         assert!(!computed(r#"__asm(u8"nop");"#));
         assert!(!computed("int asm = 1; myasm(x);"));
+        // A comment inside `asm(...)` is a blank, not the text.
+        assert!(computed("asm(/* c */ x);"));
+        assert!(!computed(r#"asm(/* c */ "nop");"#));
         assert!(!computed(
             r#"asm(/* why */ "nop"); asm volatile // why
             ("nop");"#

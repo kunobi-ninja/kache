@@ -1,13 +1,15 @@
 # kache-e2e fixture for kunobi-ninja/kache#1015.
 #
 # blob.S and inline.c pull build/payload.txt in at assembly time, in two forms
-# that never spell `.incbin` in the preprocessor output: blob.S splits the
-# directive name with `\()` inside `.rept`, and inline.c splits it across two
-# C string literals that the compiler joins after preprocessing. No depfile
-# lists the payload, so the cc key cannot see it. The payload holds a checksum
-# of the checkout path: it differs between checkouts while both sources stay
-# identical, and no object carries a path. Before the fix the relocated build
-# restored the first checkout's objects and main.c printed "stale payload".
+# that never spell `.incbin` in the preprocessor output: blob.S builds the
+# directive name from a macro argument (`.\op` invoked as `emit incbin`), and
+# inline.c splits it across two C string literals that the compiler joins
+# after preprocessing. No depfile lists the payload, so the cc key cannot see
+# it. The payload holds a checksum of the checkout path: it differs between
+# checkouts while both sources stay identical, and no object carries a path.
+# Before the fix the relocated build restored the first checkout's objects and
+# main.c printed "stale payload". The `.rept` plus `\()` form is covered by unit
+# tests only: GNU as does not accept `\()` inside `.rept`.
 #
 # Contracts:
 #   1. Every phase's binary carries its own checkout's payload (verify).

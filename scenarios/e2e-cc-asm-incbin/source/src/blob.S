@@ -8,8 +8,10 @@
 #endif
         .globl SYM(asm_payload)
 SYM(asm_payload):
-/* `\()` splits the directive name, so the expansion never spells `.incbin`. */
-        .rept 1
-        .inc\()bin "payload.txt"
-        .endr
+/* The directive name is only assembled from the macro argument, so the
+   expansion never spells `.incbin`. GNU as and LLVM both accept this form. */
+        .macro emit op, file
+        .\op "\file"
+        .endm
+        emit incbin, payload.txt
         .byte 0

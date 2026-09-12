@@ -289,6 +289,10 @@ exclude_re = [
     "replace print_sccache_summary with \\(\\)",
     "crates/kache-e2e/src/disk_usage.rs:.*other::",
     "crates/kache-e2e/src/bench_host.rs:.*(macos|other)::",
+    # Struct-field mutants inside the macOS readers: the `AttrList` shape above.
+    # Anchored on the enclosing function, because `HostInfo` and `LoadSample`
+    # are also built by the Linux readers, which stay in scope.
+    "expression in macos::(host_facts|load_sample)",
     "replace run_cold_phase .* with Ok",
     "src/cache_fs.rs:.*replace probe_windows",
     "src/cache_fs.rs:.*replace statfs_total_bytes_macos",

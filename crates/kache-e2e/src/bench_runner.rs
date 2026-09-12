@@ -5436,6 +5436,34 @@ mod tests {
         assert_eq!(failed, vec!["min_key_stability_pct", "max_passthrough_pct"]);
     }
 
+    /// The passthrough gate reads "at most `max_passthrough_pct`", so a rate
+    /// exactly at the limit passes. 2 of 8 is 25% with no rounding, unlike the
+    /// shared fixture's 3 of 10, whose `f64` rate lands just above 30.
+    #[test]
+    fn verdict_passthrough_exactly_at_the_limit_passes() {
+        let stability = KeyStability {
+            stable_pct: Some(100.0),
+            stable: 4,
+            compared: 4,
+        };
+        let mut warm = phase_metrics_for_verdict(0);
+        warm.event_log.total = 8;
+        warm.event_log.passed_through = 2;
+        let spec = ScenarioAssertSpec {
+            max_passthrough_pct: Some(25.0),
+            ..Default::default()
+        };
+
+        let verdict = Verdict::evaluate(&stability, &warm, Some(&spec));
+
+        let check = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "max_passthrough_pct")
+            .expect("passthrough check is configured");
+        assert!(check.passed, "25% at a 25% limit, got {}", check.actual);
+    }
+
     /// The PR perf gate's core safety property: a phase that recompiled the
     /// world must be rejected, not reported as a fast build. Zero hits and zero
     /// restored bytes are the two ways "this measured nothing" shows up.

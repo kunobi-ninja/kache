@@ -1929,6 +1929,7 @@ mod tests {
                 ),
                 modified_input_guard: None,
                 input_predictions: None,
+                record_sessions: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
                 auto_gc: None,

@@ -1205,7 +1205,8 @@ pub fn report(
 
     // The session line is a side effect of the report: a cache dir it cannot
     // write costs that line and a warning, never the report or the exit code.
-    let recorded = if record {
+    // `record_sessions` records every report as `--record` does.
+    let recorded = if record || config.record_sessions {
         record_session(config, &report)
     } else {
         Ok(())
@@ -7360,6 +7361,24 @@ mod tests {
         files
     }
 
+    /// `record_sessions` (env or config) makes a plain `kache report` record
+    /// exactly as `--record` would, so a host can opt in once for every job.
+    #[test]
+    fn report_records_without_the_flag_when_record_sessions_is_on() {
+        let cache = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(cache.path().to_path_buf(), None);
+        config.record_sessions = true;
+
+        report_run(&config, out.path(), false);
+
+        let log = std::fs::read_to_string(session_log_path(&config)).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        let record: crate::report::SessionRecord =
+            serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(record.schema, crate::report::SESSION_RECORD_SCHEMA);
+    }
+
     /// Recording is opt-in: a plain `kache report` leaves the cache dir
     /// exactly as it found it.
     #[test]
@@ -8694,6 +8713,7 @@ mod tests {
             remote_readonly: false,
             modified_input_guard: false,
             input_predictions: false,
+            record_sessions: false,
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,

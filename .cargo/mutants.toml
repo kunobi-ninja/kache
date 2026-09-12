@@ -223,6 +223,12 @@ gitignore = true
 # `disk_usage::other` is the non-Unix fallback for inode identity and
 # allocated size. The ubuntu lane never compiles it; `disk_usage::unix` and
 # the measurement walk stay in scope.
+#
+# `bench_host::macos` and `bench_host::other` are the same shape: thin
+# wrappers around `sysctl` and `mount`, and a constant fallback, that the
+# ubuntu lane never compiles. Their parsers and the procfs readers are
+# platform-neutral and stay in scope; the macOS Test lane runs the real
+# wrappers through the host smoke test.
 exclude_globs = ["crates/kache-fs/src/apfs.rs"]
 exclude_re = [
     "crates/kache-fs/src/copy.rs:.*(native_reflink_macos|native_reflink_windows|native_reflink_unsupported|windows_cluster_size)",
@@ -282,6 +288,7 @@ exclude_re = [
     "replace print_pull_summary with \\(\\)",
     "replace print_sccache_summary with \\(\\)",
     "crates/kache-e2e/src/disk_usage.rs:.*other::",
+    "crates/kache-e2e/src/bench_host.rs:.*(macos|other)::",
     "replace run_cold_phase .* with Ok",
     "src/cache_fs.rs:.*replace probe_windows",
     "src/cache_fs.rs:.*replace statfs_total_bytes_macos",

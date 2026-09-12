@@ -36,7 +36,7 @@ It measures one mid-size subject — `bench-pr-cargo`, the `rust-lang/cargo` tre
 
 The pull request head and its merge base are both measured, back to back on the same runner, so the report is a delta rather than a comparison against a stored figure from another machine. A warm build more than 5% slower than the merge base fails the gate. Cold and cross-worktree deltas are reported without failing while their noise floor is still being established. The numbers land as a comment on the pull request.
 
-The engine times every phase in milliseconds (`wall_ms` in the result JSON) and the gate takes its delta on that field. The subject's warm build runs about 15 seconds on the gate's runner, where a whole-second tick would already be 7% of the build, more than the threshold. The whole-second `wall_s` next to it is derived from `wall_ms` and keeps its role in the nightly reports and their telemetry.
+The engine times every phase in milliseconds (`wall_ms` in the result JSON) and the gate takes its delta on that field. The subject's warm build runs about 15 seconds on the gate's runner, where a whole-second tick would already be 7% of the build, more than the threshold. The whole-second `wall_s` next to it is derived from `wall_ms` and stays in the result JSON for older readers. Speedups and the nightly telemetry are computed from `wall_ms`.
 
 The gate refuses to compare a warm build shorter than 5 seconds. Below that, 5% of the build is within the fixed cost of spawning the shell, cargo, and its dependency resolution on a shared runner, so a delta would measure the runner rather than kache. The refusal is reported as `INVALID MEASUREMENT`, distinct from a failing delta.
 

@@ -21,8 +21,9 @@ pub fn stop(kache_path: &Path, cache_dir: &Path) {
 /// Best-effort: start a kache daemon bound to `cache_dir`.
 ///
 /// The wrapper falls back to no-daemon mode if this fails, so callers should
-/// warn but not fail the scenario.
-pub fn start(kache_path: &Path, cache_dir: &Path, kache_config: &Path) {
+/// warn but not fail the scenario. Returns whether `kache daemon start`
+/// succeeded, so a bench can record that its phase ran without one.
+pub fn start(kache_path: &Path, cache_dir: &Path, kache_config: &Path) -> bool {
     match Command::new(kache_path)
         .args(["daemon", "start"])
         .env("KACHE_CACHE_DIR", cache_dir)
@@ -31,8 +32,17 @@ pub fn start(kache_path: &Path, cache_dir: &Path, kache_config: &Path) {
         .stderr(Stdio::null())
         .status()
     {
-        Ok(s) if s.success() => eprintln!("[bench] daemon started"),
-        Ok(s) => eprintln!("[bench] WARN: daemon start exited {s} (running w/o daemon)"),
-        Err(e) => eprintln!("[bench] WARN: daemon start failed ({e}) (running w/o daemon)"),
+        Ok(s) if s.success() => {
+            eprintln!("[bench] daemon started");
+            true
+        }
+        Ok(s) => {
+            eprintln!("[bench] WARN: daemon start exited {s} (running w/o daemon)");
+            false
+        }
+        Err(e) => {
+            eprintln!("[bench] WARN: daemon start failed ({e}) (running w/o daemon)");
+            false
+        }
     }
 }

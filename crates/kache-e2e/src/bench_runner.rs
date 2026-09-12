@@ -568,44 +568,17 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     let cold_objdir_bytes = disk.objdir_bytes[0];
     let warm_objdir_bytes = disk.objdir_bytes[1];
 
-    // Verify: the measured free-space delta should land near the
-    // sharing-corrected estimate of the three-pool footprint. They agree on
-    // any filesystem — on a CoW one because the shared bytes are subtracted,
-    // on a non-CoW one because hardlinked shared bytes are subtracted the same
-    // way (or nothing is shared and the estimate stays at the apparent sum).
-    // A gap therefore means the storage byte accounting is off (not merely
-    // "no CoW"), which is worth surfacing. A 20% band absorbs the cache
-    // snapshot, logs, and df noise.
-    if let Some(measured) = disk_measured_bytes {
-        let warm_st = &warm_metrics.storage;
-        // Hardlinked bytes (store ingest and warm restore) are one inode in
-        // two pools, exactly like reflinked bytes — both are sharing, not a
-        // second copy, so both are subtracted from the apparent sum.
-        let store_shared = cold_metrics
-            .storage
-            .store_reflinked_bytes
-            .saturating_add(cold_metrics.storage.store_hardlinked_bytes)
-            .saturating_add(warm_st.store_reflinked_bytes)
-            .saturating_add(warm_st.store_hardlinked_bytes);
-        let shared_total = warm_st
-            .reflinked_bytes
-            .saturating_add(warm_st.hardlinked_bytes)
-            .saturating_add(store_shared);
-        let sum_apparent = cold_objdir_bytes
-            .saturating_add(warm_objdir_bytes)
-            .saturating_add(warm_st.blob_bytes);
-        let estimate = sum_apparent.saturating_sub(shared_total);
-        let within_band = measured <= estimate.saturating_mul(6) / 5
-            && measured >= estimate.saturating_mul(4) / 5;
-        if estimate > 0 && !within_band {
-            measure_warnings.push(format!(
-                "disk: measured on-disk {} diverges from the sharing-corrected estimate {} \
-                 (apparent {}) — storage byte accounting may be off",
-                human_bytes(measured),
-                human_bytes(estimate),
-                human_bytes(sum_apparent),
-            ));
-        }
+    // Check kache's storage stats against the footprint read from the
+    // filesystem. The same runs that measure the free-space delta qualify:
+    // see `measures_disk_footprint`.
+    if measures_disk_footprint(config.retry, config.warm_same_tree) {
+        measure_warnings.extend(footprint_warning(
+            cold_objdir_bytes,
+            warm_objdir_bytes,
+            &cold_metrics.storage,
+            &warm_metrics.storage,
+            disk.total_bytes,
+        ));
     }
 
     // With `--trace-keys`, both phases logged every key-input the hasher
@@ -724,6 +697,43 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
 /// spurious accounting warning.
 fn measures_disk_footprint(retry: bool, warm_same_tree: bool) -> bool {
     !retry && !warm_same_tree
+}
+
+/// A warning when the footprint read from the filesystem is more than 20% off
+/// what kache's storage stats predict for the three pools.
+///
+/// The prediction is the pools' sizes minus the hardlinked bytes: a hardlink is
+/// one inode in two pools and counts once in the footprint too. Reflinked
+/// bytes are not subtracted, because a reflink is a second inode and the
+/// footprint counts it as well. A gap therefore means the storage accounting
+/// is off. The band absorbs logs, the event log and block rounding.
+fn footprint_warning(
+    cold_objdir_bytes: u64,
+    warm_objdir_bytes: u64,
+    cold: &StorageInfo,
+    warm: &StorageInfo,
+    footprint_bytes: u64,
+) -> Option<String> {
+    let pools = cold_objdir_bytes
+        .saturating_add(warm_objdir_bytes)
+        .saturating_add(warm.blob_bytes);
+    let hardlinked = cold
+        .store_hardlinked_bytes
+        .saturating_add(warm.store_hardlinked_bytes)
+        .saturating_add(warm.hardlinked_bytes);
+    let predicted = pools.saturating_sub(hardlinked);
+    let within_band = footprint_bytes <= predicted.saturating_mul(6) / 5
+        && footprint_bytes >= predicted.saturating_mul(4) / 5;
+    (predicted > 0 && !within_band).then(|| {
+        format!(
+            "disk: footprint {} diverges from the {} kache's storage stats predict \
+             (pools {}, hardlinked {}) — storage byte accounting may be off",
+            human_bytes(footprint_bytes),
+            human_bytes(predicted),
+            human_bytes(pools),
+            human_bytes(hardlinked),
+        )
+    })
 }
 
 /// Speedup of a warm phase against the cold build that seeded it, rounded for
@@ -3476,9 +3486,8 @@ fn write_summary(
         human_bytes(store_shared),
     )?;
     if let Some(measured) = r.disk_measured_bytes {
-        // Ground truth: the volume's free-space delta across the two build
-        // phases. CoW/dedup/compression-honest and filesystem-agnostic — it
-        // VERIFIES the estimate above rather than trusting kache's own tally.
+        // The volume's free-space drop across the two build phases. It also
+        // counts other writes to the volume, so it is shown, not checked.
         writeln!(
             out,
             "    measured      {:>10}   actual free-space delta (cold+warm builds)",
@@ -3685,11 +3694,11 @@ struct BenchResult {
     /// cache on APFS — print_summary subtracts that to report "unique
     /// to this clone".
     warm_objdir_bytes: u64,
-    /// Real disk the cold+warm builds consumed, measured as the volume's
-    /// free-space delta across both phases. CoW/dedup/compression-honest and
-    /// filesystem-agnostic — the ground-truth check on the `approx_on_disk`
-    /// estimate. `None` on `--retry` (cold is restored, not built, so the
-    /// delta wouldn't cover the full three-pool layout).
+    /// The volume's free-space drop across both phases. It also moves with
+    /// anything else written to the volume meanwhile, so it is reported but
+    /// not checked; `disk_footprint_bytes` is what the storage stats are
+    /// checked against. `None` on `--retry` (cold is restored, not built, so
+    /// the delta wouldn't cover the full three-pool layout).
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_measured_bytes: Option<u64>,
     /// Cache and both objdirs on disk together, each inode once, read from
@@ -5202,6 +5211,56 @@ mod tests {
 
     /// The free-space delta is only meaningful for a plain full run. Both
     /// opt-outs are independent, so all four combinations are pinned.
+    /// Pools of 1500 (objdirs 600 + 400, store 500) with 500 hardlinked (cold
+    /// ingest 200, warm ingest 100, warm restore 200): 1000 predicted.
+    fn footprint_fixture() -> (StorageInfo, StorageInfo) {
+        let cold = StorageInfo {
+            store_hardlinked_bytes: 200,
+            ..Default::default()
+        };
+        let warm = StorageInfo {
+            store_hardlinked_bytes: 100,
+            hardlinked_bytes: 200,
+            blob_bytes: 500,
+            // A reflink is a second inode, which the footprint counts too.
+            reflinked_bytes: 300,
+            store_reflinked_bytes: 300,
+            ..Default::default()
+        };
+        (cold, warm)
+    }
+
+    #[test]
+    fn a_footprint_within_a_fifth_of_the_prediction_does_not_warn() {
+        let (cold, warm) = footprint_fixture();
+        for footprint in [800, 1000, 1200] {
+            assert_eq!(
+                footprint_warning(600, 400, &cold, &warm, footprint),
+                None,
+                "{footprint}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_footprint_past_a_fifth_of_the_prediction_warns() {
+        let (cold, warm) = footprint_fixture();
+        for footprint in [799, 1201] {
+            let warning = footprint_warning(600, 400, &cold, &warm, footprint)
+                .unwrap_or_else(|| panic!("no warning at {footprint}"));
+            assert!(
+                warning.contains("storage byte accounting may be off"),
+                "{warning}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_predicted_never_warns() {
+        let empty = StorageInfo::default();
+        assert_eq!(footprint_warning(0, 0, &empty, &empty, 5), None);
+    }
+
     #[test]
     fn only_a_plain_full_run_measures_its_disk_footprint() {
         assert!(measures_disk_footprint(false, false));

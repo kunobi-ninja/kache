@@ -8175,13 +8175,6 @@ mod tests {
     #[test]
     fn classifier_does_not_overreach_gecko_darwin_family() {
         for flag in &[
-            // (The inverse forms #114 once left out — -fmath-errno,
-            // -fstrict-aliasing, -fno-unwind-tables, -fomit-frame-pointer — are
-            // now modeled via the sorted codegen-knob stem list, both polarities.
-            // The deliberately-refused boundary below is the NON-knob lookalikes.)
-            // Adjacent stack-protector variants not on the list
-            "-fstack-protector",
-            "-fstack-protector-all",
             // Lookalike that isn't the macOS deployment-target flag
             "-mmacosx-min-version=10.15",
         ] {
@@ -8189,6 +8182,19 @@ mod tests {
             assert!(
                 descs.iter().any(|d| d.contains("unsupported flag")),
                 "{flag} is NOT on the #114 list and must still refuse, got: {descs:?}"
+            );
+        }
+        // The stack-protector family is now classified (Firefox nightly
+        // passed `-fno-stack-protector` through while only `-strong` was listed).
+        for flag in &[
+            "-fstack-protector",
+            "-fstack-protector-all",
+            "-fno-stack-protector",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} is the stack-protector family and must classify, got: {descs:?}"
             );
         }
     }

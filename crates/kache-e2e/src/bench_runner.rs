@@ -447,8 +447,8 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // cache already works in and is noted in the summary.
     let warm_same_tree_metrics = if config.warm_same_tree {
         reset_event_log(&event_log)?;
-        daemon::start(&kache, &cache_dir, &kache_config);
-        let wall_ms = build(
+        let daemon_started = daemon::start(&kache, &cache_dir, &kache_config);
+        let same_tree_run = build(
             &profile,
             &clone_a,
             Phase::WarmSameTree.name(),
@@ -480,9 +480,10 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         let (leaks, _) = scan_leak_warnings(
             &work_dir.join(format!("wrapper-{}.log", Phase::WarmSameTree.name())),
         );
-        Some(PhaseMetrics::from_report(
-            &report, &raw, wall_ms, events, leaks,
-        ))
+        Some(
+            PhaseMetrics::from_report(&report, &raw, same_tree_run.wall_ms, events, leaks)
+                .with_build_context(same_tree_run.load, daemon_started),
+        )
     } else {
         None
     };
@@ -496,8 +497,8 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // what cold populated. Bring the daemon up first so the restore uses the
     // async file-hash prefetch path instead of hashing every input inline
     // (cold's daemon was stopped before its report capture).
-    daemon::start(&kache, &cache_dir, &kache_config);
-    let warm_ms = build(
+    let warm_daemon_started = daemon::start(&kache, &cache_dir, &kache_config);
+    let warm_run = build(
         &profile,
         &clone_b,
         Phase::Warm.name(),
@@ -530,20 +531,14 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // measurement.
     let disk_measured_bytes = disk_delta(disk_free_before, available_bytes(&work_dir));
 
-    // Speedups stay on whole seconds: the nightly JSON and the kartero payload
-    // carry them, and the perf gate reads `wall_ms` directly instead.
-    let warm_s = whole_seconds(warm_ms);
-    let speedup = if warm_s > 0 {
-        cold_metrics.wall_s as f64 / warm_s as f64
-    } else {
-        0.0
-    };
+    // Taken on milliseconds; see `phase_speedup`.
+    let speedup = phase_speedup(cold_metrics.wall_ms, warm_run.wall_ms);
     // Same-tree speedup against the SAME run's cold build — the "did the warm
     // build actually beat the cold one that seeded it" number a timing gate
     // needs before it trusts a wall-clock delta. Present only when the phase ran.
     let warm_same_tree_speedup = warm_same_tree_metrics
         .as_ref()
-        .map(|m| phase_speedup(cold_metrics.wall_s, m.wall_s));
+        .map(|m| phase_speedup(cold_metrics.wall_ms, m.wall_ms));
 
     // Cross-clone cache-key stability: for the deterministic correctness
     // signal, see how many crates produced an identical key in both
@@ -551,7 +546,8 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     let stability = key_stability(&cold_raw, &warm_raw);
 
     let mut warm_metrics =
-        PhaseMetrics::from_report(&warm, &warm_raw, warm_ms, warm_events, warm_leaks);
+        PhaseMetrics::from_report(&warm, &warm_raw, warm_run.wall_ms, warm_events, warm_leaks)
+            .with_build_context(warm_run.load, warm_daemon_started);
     warm_metrics.prepare = warm_prepare;
     let verdict = Verdict::evaluate(
         &stability,
@@ -563,8 +559,9 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // than folded into it: `verdict` is the shape the nightly telemetry and the
     // report JSON already publish, and both phases name the same checks. Key
     // stability is cross-clone by definition, so it is passed as "nothing
-    // compared" — `Verdict::evaluate` skips that check when the denominator is
-    // zero. Both verdicts drive the exit code (see the end of this function).
+    // compared", whose percentage is unknown, and `Verdict::evaluate` skips
+    // that check. Both verdicts drive the exit code (see the end of this
+    // function).
     let warm_same_tree_verdict = warm_same_tree_metrics.as_ref().map(|metrics| {
         Verdict::evaluate(
             &KeyStability::default(),
@@ -643,10 +640,11 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         run_id: run_id.clone(),
         artifact_dir: run_archive_dir.display().to_string(),
         cache_tool_version: cache_tool_version.clone(),
+        host: crate::bench_host::HostInfo::collect(&work_dir),
         cold: cold_metrics,
         warm_same_tree: warm_same_tree_metrics,
         warm: warm_metrics,
-        speedup: round2(speedup),
+        speedup,
         warm_same_tree_speedup,
         cache_size_mb: bytes_to_mib(disk.cache_bytes),
         cold_objdir_bytes,
@@ -679,7 +677,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
             verdict_ok: result.verdict.ok,
             speedup: Some(result.speedup),
             cache_size_bytes: crate::bench_otlp::OtlpRun::bytes_from_mib(result.cache_size_mb),
-            key_stability_pct: Some(result.key_stability.stable_pct),
+            key_stability_pct: result.key_stability.stable_pct,
             disk_measured_bytes: result.disk_measured_bytes,
             disk_footprint_bytes: result.disk_footprint_bytes,
             phases: otlp_phases(
@@ -758,14 +756,6 @@ fn footprint_warning(
     })
 }
 
-/// Speedup of a warm phase against the cold build that seeded it, rounded for
-/// the report.
-///
-/// Taken on the whole-second `wall_s`, the value the nightly JSON and its
-/// telemetry have always carried; the perf gate does not read speedups, it
-/// compares `wall_ms` directly. Zero when the phase rounded down to zero
-/// seconds: dividing by zero yields an infinity that is not a number any
-/// report should carry.
 /// Space the run consumed: free space before minus free space after, when
 /// both readings exist. `None` when either is missing, and when the tree
 /// grew back (other activity freed more than the builds wrote), which is not
@@ -782,9 +772,16 @@ fn bytes_to_mib(bytes: u64) -> f64 {
     round1(bytes as f64 / (1024.0 * 1024.0))
 }
 
-fn phase_speedup(cold_wall_s: u64, phase_wall_s: u64) -> f64 {
-    if phase_wall_s > 0 {
-        round2(cold_wall_s as f64 / phase_wall_s as f64)
+/// Speedup of a warm phase against the cold build that seeded it, rounded for
+/// the report.
+///
+/// Taken on milliseconds. The whole-second `wall_s` truncates up to a second
+/// off each side, which moves the ratio for a 13 s warm build by as much as
+/// 7%. Zero when the phase took no measurable time: dividing by zero yields an
+/// infinity that is not a number any report should carry.
+fn phase_speedup(cold_wall_ms: u64, phase_wall_ms: u64) -> f64 {
+    if phase_wall_ms > 0 {
+        round2(cold_wall_ms as f64 / phase_wall_ms as f64)
     } else {
         0.0
     }
@@ -819,18 +816,32 @@ fn fmt_wall_clock(wall_ms: u64) -> String {
 /// engine that timed whole seconds only has no milliseconds for cold, so they
 /// are backfilled from the seconds here; a serde default cannot read a sibling
 /// field. The backfilled value is a floor (a recorded 14s was anything up to
-/// 14.999s), which is what a whole-second record can give.
+/// 14.999s), which is what a whole-second record can give. The costliest
+/// misses get the same treatment for `compile_time_ms`.
 fn load_saved_phase<T: serde::de::DeserializeOwned>(mut saved: serde_json::Value) -> Result<T> {
-    if let Some(phase) = saved.as_object_mut()
-        && !phase.contains_key("wall_ms")
-        && let Some(wall_s) = phase.get("wall_s").and_then(serde_json::Value::as_u64)
+    backfill_ms(&mut saved, "wall_s", "wall_ms");
+    if let Some(misses) = saved
+        .get_mut("top_misses")
+        .and_then(serde_json::Value::as_array_mut)
     {
-        phase.insert(
-            "wall_ms".to_string(),
-            serde_json::Value::from(wall_s.saturating_mul(1000)),
-        );
+        for miss in misses {
+            backfill_ms(miss, "compile_time_s", "compile_time_ms");
+        }
     }
     Ok(serde_json::from_value(saved)?)
+}
+
+/// Give `record` its `ms_key` from `seconds_key` when it has only the seconds.
+fn backfill_ms(record: &mut serde_json::Value, seconds_key: &str, ms_key: &str) {
+    if let Some(fields) = record.as_object_mut()
+        && !fields.contains_key(ms_key)
+        && let Some(seconds) = fields.get(seconds_key).and_then(serde_json::Value::as_u64)
+    {
+        fields.insert(
+            ms_key.to_string(),
+            serde_json::Value::from(seconds.saturating_mul(1000)),
+        );
+    }
 }
 
 /// Did any configured assertion say this run is not a valid measurement?
@@ -1036,7 +1047,7 @@ fn otlp_phase(
 ) -> crate::bench_otlp::OtlpPhase {
     crate::bench_otlp::OtlpPhase {
         name,
-        wall_s: metrics.wall_s,
+        wall_ms: metrics.wall_ms,
         time_saved_s: Some(metrics.time_saved_s),
         hits: metrics.hits,
         dups: Some(metrics.dups),
@@ -1044,7 +1055,7 @@ fn otlp_phase(
         errors: Some(metrics.errors),
         total: Some(metrics.total_crates),
         hit_rate_pct: metrics.hit_rate_pct,
-        weighted_hit_rate_pct: Some(metrics.weighted_hit_rate_pct),
+        weighted_hit_rate_pct: metrics.weighted_hit_rate_pct,
         leak_warnings: Some(metrics.leak_warnings),
         objdir_bytes,
         // The two categories kache's own RefuseReason draws: a probe that was
@@ -1065,7 +1076,12 @@ fn otlp_phase(
             .top_misses
             .iter()
             .take(TOP_MISSES_EMITTED)
-            .map(|m| (m.crate_name.clone(), m.compile_time_s))
+            .map(|m| {
+                (
+                    m.crate_name.clone(),
+                    crate::bench_otlp::seconds(m.compile_time_ms),
+                )
+            })
             .collect(),
         // What kache looked at and never asked the cache about: probes,
         // queries, and compiles it declined. The hit rate divides by what was
@@ -1087,7 +1103,7 @@ fn otlp_sccache_phase(
 ) -> crate::bench_otlp::OtlpPhase {
     crate::bench_otlp::OtlpPhase {
         name,
-        wall_s: metrics.wall_s,
+        wall_ms: metrics.wall_ms,
         time_saved_s: None,
         hits: metrics.cache_hits,
         dups: None,
@@ -1404,7 +1420,7 @@ fn build(
     cache_backend: CacheBackend,
     trace_keys: bool,
     sh: &Path,
-) -> Result<u64> {
+) -> Result<BuildRun> {
     let log_path = work_dir.join(format!("build-{phase}.log"));
     let wrapper_log_path = work_dir.join(format!("wrapper-{phase}.log"));
     let mut log =
@@ -1429,6 +1445,7 @@ fn build(
         std::fs::remove_dir_all(&objdir)
             .with_context(|| format!("wiping objdir {}", objdir.display()))?;
     }
+    let load_before = crate::bench_host::LoadSample::take();
     let started = Instant::now();
     let mut cmd = Command::new(sh);
     cmd.arg("-c")
@@ -1512,13 +1529,22 @@ fn build(
         }
     }
     let status = child.wait().context("waiting for build command")?;
+    let wall_ms = elapsed_ms(started.elapsed());
+    let load =
+        crate::bench_host::PhaseLoad::between(&load_before, &crate::bench_host::LoadSample::take());
     if !status.success() {
         bail!(
             "[{phase}] build failed ({status}) — see {}",
             log_path.display()
         );
     }
-    Ok(elapsed_ms(started.elapsed()))
+    Ok(BuildRun { wall_ms, load })
+}
+
+/// One timed build: its wall clock and how busy the host was meanwhile.
+struct BuildRun {
+    wall_ms: u64,
+    load: crate::bench_host::PhaseLoad,
 }
 
 /// Capture kache's report for the phase that just finished: write the
@@ -1591,8 +1617,8 @@ fn run_cold_phase(
         std::fs::remove_dir_all(cache_dir).context("clearing cache dir")?;
     }
     std::fs::create_dir_all(cache_dir)?;
-    daemon::start(kache, cache_dir, kache_config);
-    let cold_ms = build(
+    let daemon_started = daemon::start(kache, cache_dir, kache_config);
+    let cold_run = build(
         profile,
         clone_a,
         Phase::Cold.name(),
@@ -1626,7 +1652,8 @@ fn run_cold_phase(
     source::snapshot_dir(cache_dir, &work_dir.join("cache-after-cold"))?;
 
     Ok((
-        PhaseMetrics::from_report(&cold, &cold_raw, cold_ms, cold_events, cold_leaks),
+        PhaseMetrics::from_report(&cold, &cold_raw, cold_run.wall_ms, cold_events, cold_leaks)
+            .with_build_context(cold_run.load, daemon_started),
         cold_raw,
     ))
 }
@@ -1742,8 +1769,8 @@ fn run_pull_bench(
     // pull: same cache, same path, new source. `build()` wipes the objdir at
     // the start of every phase (unconditionally), so this is a from-scratch
     // rebuild at ref_next and kache is asked about every TU.
-    daemon::start(kache, cache_dir, kache_config);
-    let pull_ms = build(
+    let daemon_started = daemon::start(kache, cache_dir, kache_config);
+    let pull_run = build(
         profile,
         clone_a,
         Phase::Pull.name(),
@@ -1770,17 +1797,14 @@ fn run_pull_bench(
     let (pull_leaks, _pull_leak_samples) =
         scan_leak_warnings(&work_dir.join(format!("wrapper-{}.log", Phase::Pull.name())));
     let mut pull_metrics =
-        PhaseMetrics::from_report(&pull, &pull_raw, pull_ms, pull_events, pull_leaks);
+        PhaseMetrics::from_report(&pull, &pull_raw, pull_run.wall_ms, pull_events, pull_leaks)
+            .with_build_context(pull_run.load, daemon_started);
     pull_metrics.prepare = pull_prepare;
 
-    // No cross-clone comparison: an empty KeyStability (compared == 0) makes
-    // Verdict skip the key-stability check; the pull scenarios also set no
+    // No cross-clone comparison: an empty KeyStability has no percentage, so
+    // Verdict skips the key-stability check; the pull scenarios also set no
     // min_key_stability_pct.
-    let no_stability = KeyStability {
-        stable_pct: 0.0,
-        stable: 0,
-        compared: 0,
-    };
+    let no_stability = KeyStability::default();
     let verdict = Verdict::evaluate(
         &no_stability,
         &pull_metrics,
@@ -1806,6 +1830,7 @@ fn run_pull_bench(
         run_id: run_id.to_string(),
         artifact_dir: run_archive_dir.display().to_string(),
         cache_tool_version: cache_tool_version.map(String::from),
+        host: crate::bench_host::HostInfo::collect(work_dir),
         cold: cold_metrics,
         pull: pull_metrics,
         cache_size_mb: bytes_to_mib(disk.cache_bytes),
@@ -1901,7 +1926,8 @@ fn run_sccache_bench(
         CacheBackend::Sccache,
         false,
         sh,
-    )?;
+    )?
+    .wall_ms;
     let warm_metrics = capture_sccache_report(
         sccache,
         cache_dir,
@@ -1915,13 +1941,8 @@ fn run_sccache_bench(
     ensure_sccache_base_dirs(&warm_metrics, clone_b, Phase::Warm.name())?;
 
     let disk_measured_bytes = disk_delta(disk_free_before, available_bytes(work_dir));
-    // Whole seconds, as for the kache path: the speedup is a nightly value.
-    let warm_s = whole_seconds(warm_ms);
-    let speedup = if warm_s > 0 {
-        cold_metrics.wall_s as f64 / warm_s as f64
-    } else {
-        0.0
-    };
+    // Milliseconds, as for the kache path; see `phase_speedup`.
+    let speedup = phase_speedup(cold_metrics.wall_ms, warm_ms);
     let measure_warnings = sccache_measure_warnings(
         &warm_metrics,
         speedup,
@@ -1953,7 +1974,7 @@ fn run_sccache_bench(
             .or_else(|| cold_metrics.cache_location.clone()),
         cold: cold_metrics,
         warm: warm_metrics,
-        speedup: round2(speedup),
+        speedup,
         cache_size_mb: round1(cache_dir_bytes as f64 / 1024.0 / 1024.0),
         cache_dir_bytes,
         cold_objdir_bytes,
@@ -2035,7 +2056,8 @@ fn run_sccache_cold_phase(
         CacheBackend::Sccache,
         false,
         sh,
-    )?;
+    )?
+    .wall_ms;
     let cold_metrics = capture_sccache_report(
         sccache,
         cache_dir,
@@ -2241,6 +2263,17 @@ fn read_event_log(path: &Path) -> EventLogStats {
     for item in stream {
         let Ok(ev) = item else { continue };
         stats.total += 1;
+        // Annotations the wrapper adds to an event whose outcome alone does
+        // not say it went wrong. They feed the phase's invalid reasons.
+        if has_text(&ev["store_error"]) {
+            stats.store_errors += 1;
+        }
+        if has_text(&ev["lookup_rejection"]) {
+            stats.lookup_rejections += 1;
+        }
+        if ev["fallback"].as_bool().unwrap_or(false) {
+            stats.fallbacks += 1;
+        }
         // Each event has a `size` field (bytes) for the cache entry's
         // artifact payload. Sum it across hit / miss buckets so the
         // summary can express coverage by bytes, not just by count.
@@ -2298,6 +2331,12 @@ fn read_event_log(path: &Path) -> EventLogStats {
     stats.top_passthrough = all.iter().take(8).cloned().collect();
     stats.passthrough_reasons = all;
     stats
+}
+
+/// A non-empty string field. The wrapper omits these when they are empty, and
+/// an older log may carry them as `""`.
+fn has_text(field: &serde_json::Value) -> bool {
+    field.as_str().is_some_and(|text| !text.is_empty())
 }
 
 /// Scan kache's wrapper-mode log file for `PathNormalizer` leak detector
@@ -2707,13 +2746,8 @@ fn key_stability(cold_raw: &serde_json::Value, warm_raw: &serde_json::Value) -> 
             }
         }
     }
-    let pct = if compared == 0 {
-        0.0
-    } else {
-        stable as f64 / compared as f64 * 100.0
-    };
     KeyStability {
-        stable_pct: round1(pct),
+        stable_pct: (compared > 0).then(|| round1(stable as f64 / compared as f64 * 100.0)),
         stable,
         compared,
     }
@@ -2952,7 +2986,7 @@ fn otlp_mbx_phase(
 ) -> crate::bench_otlp::OtlpPhase {
     crate::bench_otlp::OtlpPhase {
         name,
-        wall_s: metrics.wall_s,
+        wall_ms: metrics.wall_ms,
         time_saved_s: Some(metrics.time_saved_s),
         hits: metrics.hits,
         dups: None,
@@ -3035,7 +3069,8 @@ fn run_mbx_cold_phase(
         CacheBackend::Mbx,
         false,
         sh,
-    )?;
+    )?
+    .wall_ms;
     let cold_metrics = capture_mbx_report(work_dir, Phase::Cold.name(), cold_ms)?;
     source::snapshot_dir(cache_dir, &work_dir.join("cache-after-cold"))?;
     Ok(cold_metrics)
@@ -3108,11 +3143,12 @@ fn run_mbx_bench(
         CacheBackend::Mbx,
         false,
         sh,
-    )?;
+    )?
+    .wall_ms;
     let warm_metrics = capture_mbx_report(work_dir, Phase::Warm.name(), warm_ms)?;
 
     let disk_measured_bytes = disk_delta(disk_free_before, available_bytes(work_dir));
-    let speedup = phase_speedup(cold_metrics.wall_s, warm_metrics.wall_s);
+    let speedup = phase_speedup(cold_metrics.wall_ms, warm_metrics.wall_ms);
     let measure_warnings = external_measure_warnings(
         warm_metrics.wall_s,
         warm_metrics.hit_rate_pct,
@@ -3566,8 +3602,12 @@ fn write_summary(
     writeln!(out, "  speedup    : {:.2}x", r.speedup)?;
     writeln!(
         out,
-        "  warm cache : {} hits / {} dups / {} misses   {:.1}% hit rate ({:.1}% weighted)",
-        r.warm.hits, r.warm.dups, r.warm.misses, r.warm.hit_rate_pct, r.warm.weighted_hit_rate_pct
+        "  warm cache : {} hits / {} dups / {} misses   {:.1}% hit rate ({} weighted)",
+        r.warm.hits,
+        r.warm.dups,
+        r.warm.misses,
+        r.warm.hit_rate_pct,
+        fmt_pct(r.warm.weighted_hit_rate_pct)
     )?;
     let el = &r.warm.event_log;
     let cacheable = el.hit_bytes.saturating_add(el.miss_bytes);
@@ -3699,8 +3739,10 @@ fn write_summary(
     // ── diagnostics: did the run actually exercise kache? ──
     writeln!(
         out,
-        "  key stability : {:.1}%   ({} of {} crates kept an identical key across clones)",
-        r.key_stability.stable_pct, r.key_stability.stable, r.key_stability.compared
+        "  key stability : {}   ({} of {} crates kept an identical key across clones)",
+        fmt_pct(r.key_stability.stable_pct),
+        r.key_stability.stable,
+        r.key_stability.compared
     )?;
     if let Some(top) = &r.key_diff_top {
         writeln!(
@@ -3715,6 +3757,13 @@ fn write_summary(
         el.total, el.cached, el.passed_through, el.errored
     )?;
     if let Some(line) = prediction_summary_line(&r.warm.phases, r.cold.phases.dep_info_runs) {
+        writeln!(out, "{line}")?;
+    }
+    for line in invalid_reason_lines(&[
+        (Phase::Cold.name(), Some(&r.cold)),
+        (Phase::WarmSameTree.name(), r.warm_same_tree.as_ref()),
+        (Phase::Warm.name(), Some(&r.warm)),
+    ]) {
         writeln!(out, "{line}")?;
     }
     if !el.top_passthrough.is_empty() {
@@ -3762,10 +3811,13 @@ fn write_summary(
             out,
             "  costliest warm misses (recompiled despite the cache):"
         )?;
-        // Whole seconds: kache's report carries a miss's compile time as such.
-        let fmt = |s: u64| format!("{}m {:02}s", s / 60, s % 60);
         for m in r.warm.top_misses.iter().take(5) {
-            writeln!(out, "    {:>8}  {}", fmt(m.compile_time_s), m.crate_name)?;
+            writeln!(
+                out,
+                "    {:>9}  {}",
+                fmt_wall_clock(m.compile_time_ms),
+                m.crate_name
+            )?;
         }
     }
 
@@ -3815,6 +3867,28 @@ fn write_summary(
     Ok(())
 }
 
+/// A percentage for a summary line, or `n/a` when there is none to show.
+fn fmt_pct(pct: Option<f64>) -> String {
+    pct.map_or_else(|| "n/a".to_string(), |pct| format!("{pct:.1}%"))
+}
+
+/// One summary line per phase that recorded an invalid reason. They are
+/// reported, not blocking: the verdict does not read them yet.
+fn invalid_reason_lines(phases: &[(&str, Option<&PhaseMetrics>)]) -> Vec<String> {
+    phases
+        .iter()
+        .filter_map(|&(name, metrics)| {
+            let reasons = &metrics?.invalid_reasons;
+            (!reasons.is_empty()).then(|| {
+                format!(
+                    "  invalid ({name}) : {}   (reported, not blocking)",
+                    reasons.join(", ")
+                )
+            })
+        })
+        .collect()
+}
+
 fn print_pull_summary(r: &PullBenchResult, archive_dir: &Path) {
     eprintln!("\n===== {} (daily pull) =====", r.project);
     eprintln!("platform    : {}", r.platform);
@@ -3825,13 +3899,19 @@ fn print_pull_summary(r: &PullBenchResult, archive_dir: &Path) {
         r.cold.total_crates, r.cold.hit_rate_pct, r.cold.wall_s
     );
     eprintln!(
-        "pull        : {} crates, {:.1}% hit ({:.1}% weighted), {}s wall, {} passthrough",
+        "pull        : {} crates, {:.1}% hit ({} weighted), {}s wall, {} passthrough",
         r.pull.total_crates,
         r.pull.hit_rate_pct,
-        r.pull.weighted_hit_rate_pct,
+        fmt_pct(r.pull.weighted_hit_rate_pct),
         r.pull.wall_s,
         r.pull.event_log.passed_through,
     );
+    for line in invalid_reason_lines(&[
+        (Phase::Cold.name(), Some(&r.cold)),
+        (Phase::Pull.name(), Some(&r.pull)),
+    ]) {
+        eprintln!("{line}");
+    }
     eprintln!("cache size  : {:.1} MiB", r.cache_size_mb);
     eprintln!(
         "footprint   : {}   cache + objdir on disk, each inode once",
@@ -3868,6 +3948,8 @@ struct BenchResult {
     /// Output of `<cache-tool> --version`.
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_tool_version: Option<String>,
+    /// The machine that ran the bench. Kept out of the OTLP attributes.
+    host: crate::bench_host::HostInfo,
     cold: PhaseMetrics,
     /// The same-worktree warm rebuild, present only under `--warm-same-tree`.
     /// Absent from every nightly scenario's JSON, so downstream readers must
@@ -3938,6 +4020,7 @@ struct PullBenchResult {
     artifact_dir: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_tool_version: Option<String>,
+    host: crate::bench_host::HostInfo,
     cold: PhaseMetrics,
     pull: PhaseMetrics,
     cache_size_mb: f64,
@@ -3978,8 +4061,9 @@ struct PhaseMetrics {
     errors: u64,
     /// Hit rate by count.
     hit_rate_pct: f64,
-    /// Hit rate weighted by compile cost — tracks real time saved.
-    weighted_hit_rate_pct: f64,
+    /// Hit rate weighted by compile cost, which tracks real time saved.
+    /// `None` when the report had no compile times to weigh by.
+    weighted_hit_rate_pct: Option<f64>,
     /// Compile time avoided by cache hits, in seconds.
     time_saved_s: u64,
     /// Costliest cache misses this phase (kache's `top_misses`).
@@ -4000,6 +4084,14 @@ struct PhaseMetrics {
     /// clone before this phase's build. Its time is not part of `wall_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepare: Option<PrepareMetrics>,
+    /// Why this phase's numbers may not mean what they appear to, such as
+    /// `store_errors:3` or `daemon_not_running`. Reported in the summary; the
+    /// verdict does not read them yet. See [`invalid_reasons`].
+    #[serde(default)]
+    invalid_reasons: Vec<String>,
+    /// How contended the host was across the timed build.
+    #[serde(default)]
+    load: crate::bench_host::PhaseLoad,
 }
 
 /// One run of a scenario's `prepare` command.
@@ -4110,9 +4202,11 @@ impl PhaseMetrics {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|m| {
+                        let compile_time_ms = m["compile_time_ms"].as_u64().unwrap_or(0);
                         Some(MissEntry {
                             crate_name: m["crate_name"].as_str()?.to_string(),
-                            compile_time_s: m["compile_time_ms"].as_u64().unwrap_or(0) / 1000,
+                            compile_time_s: whole_seconds(compile_time_ms),
+                            compile_time_ms,
                         })
                     })
                     .collect()
@@ -4127,7 +4221,7 @@ impl PhaseMetrics {
             misses: s.misses,
             errors: sum["errors"].as_u64().unwrap_or(0),
             hit_rate_pct: round1(s.hit_rate_pct),
-            weighted_hit_rate_pct: round1(sum["weighted_hit_rate_pct"].as_f64().unwrap_or(0.0)),
+            weighted_hit_rate_pct: sum["weighted_hit_rate_pct"].as_f64().map(round1),
             time_saved_s: sum["time_saved_ms"].as_u64().unwrap_or(0) / 1000,
             top_misses,
             event_log,
@@ -4135,15 +4229,58 @@ impl PhaseMetrics {
             storage: StorageInfo::from_raw(raw),
             phases: PhaseTimes::from_raw(raw),
             prepare: None,
+            invalid_reasons: Vec::new(),
+            load: crate::bench_host::PhaseLoad::default(),
         }
     }
+
+    /// Attach what the engine saw around the timed build: how loaded the host
+    /// was, and whether the daemon the phase started came up.
+    fn with_build_context(
+        mut self,
+        load: crate::bench_host::PhaseLoad,
+        daemon_started: bool,
+    ) -> Self {
+        self.invalid_reasons = invalid_reasons(&self.event_log, daemon_started);
+        self.load = load;
+        self
+    }
+}
+
+/// Why a phase's numbers may not mean what they appear to.
+///
+/// `store_errors:N` are misses whose store failed, so they will miss again on
+/// every build. `lookup_rejections:N` found an entry and could not use it.
+/// `fallback_passthroughs:N` went to a configured fallback wrapper, whose
+/// cache is not the one being measured. `daemon_not_running` means the
+/// engine's `kache daemon start` for the phase did not succeed, so the build
+/// ran without the prefetch and hashing paths a daemon provides.
+fn invalid_reasons(event_log: &EventLogStats, daemon_started: bool) -> Vec<String> {
+    let mut reasons: Vec<String> = [
+        ("store_errors", event_log.store_errors),
+        ("lookup_rejections", event_log.lookup_rejections),
+        ("fallback_passthroughs", event_log.fallbacks),
+    ]
+    .into_iter()
+    .filter(|&(_, count)| count > 0)
+    .map(|(name, count)| format!("{name}:{count}"))
+    .collect();
+    if !daemon_started {
+        reasons.push("daemon_not_running".to_string());
+    }
+    reasons
 }
 
 /// One expensive cache miss, surfaced from kache's `top_misses`.
 #[derive(Debug, Serialize, Deserialize)]
 struct MissEntry {
     crate_name: String,
+    /// Whole seconds, truncated from `compile_time_ms`. Kept for readers of
+    /// older results.
     compile_time_s: u64,
+    /// The compile time kache's report records for the miss.
+    #[serde(default)]
+    compile_time_ms: u64,
 }
 
 /// kache's storage-savings breakdown for one phase — surfaced from the
@@ -4237,6 +4374,29 @@ struct EventLogStats {
     /// together they form the cacheable-bytes denominator that lets
     /// the summary report a bytes-version of the weighted hit rate.
     miss_bytes: u64,
+    /// Events whose store failed after the compiler ran (`store_error`).
+    #[serde(default)]
+    store_errors: u64,
+    /// Events whose existing entry was rejected before the compiler ran
+    /// (`lookup_rejection`).
+    #[serde(default)]
+    lookup_rejections: u64,
+    /// Events kache handed to a configured fallback wrapper (`fallback`).
+    #[serde(default)]
+    fallbacks: u64,
+}
+
+/// Events that were real compiles: everything but probes and queries.
+fn compile_count(event_log: &EventLogStats) -> u64 {
+    event_log.total.saturating_sub(event_log.probed)
+}
+
+/// Share of real compiles kache declined to cache, in percent. A probe is not
+/// a compile, so it leaves the denominator as well as the numerator. `None`
+/// when nothing but probes ran.
+fn passthrough_pct(event_log: &EventLogStats) -> Option<f64> {
+    let compiles = compile_count(event_log);
+    (compiles > 0).then(|| event_log.passed_through as f64 / compiles as f64 * 100.0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4259,7 +4419,8 @@ struct ReasonCount {
 #[derive(Debug, Serialize, Default)]
 struct KeyStability {
     /// Percentage of compared crates that produced an identical key set.
-    stable_pct: f64,
+    /// `None` when no crate was cached in both clones: there is no ratio.
+    stable_pct: Option<f64>,
     /// Crates whose key was identical across the two clones.
     stable: u64,
     /// Crates kache cached in both clones (the comparison denominator).
@@ -4330,8 +4491,8 @@ impl Verdict {
     /// Applied to one phase's metrics at a time: the cross-clone `warm` phase
     /// against `[checks.assert.warm]`, and — when `--warm-same-tree` ran — the
     /// same-tree phase against `[checks.assert.warm-same-tree]`. Pass a default
-    /// [`KeyStability`] for the latter; a zero denominator skips the
-    /// cross-clone-only stability check.
+    /// [`KeyStability`] for the latter; with no percentage to compare, the
+    /// cross-clone-only stability check is skipped.
     ///
     /// `max_errors` is intentionally NOT a degradation trigger. kache's
     /// `EventResult::Error` counts only wrapped-compiler non-zero exits — never
@@ -4360,25 +4521,24 @@ impl Verdict {
         };
 
         if let Some(min_key_stability_pct) = spec.min_key_stability_pct
-            && stability.compared > 0
+            && let Some(stable_pct) = stability.stable_pct
         {
-            if stability.stable_pct < min_key_stability_pct {
+            if stable_pct < min_key_stability_pct {
                 checks.push(AssertionCheck {
                     name: "min_key_stability_pct",
                     expected: format!(">= {min_key_stability_pct:.1}"),
-                    actual: format!("{:.1}", stability.stable_pct),
+                    actual: format!("{stable_pct:.1}"),
                     passed: false,
                 });
                 issues.push(format!(
-                    "cross-clone key stability {:.1}% — the cache key is not \
-                     path-portable; the warm phase did not validly measure caching",
-                    stability.stable_pct
+                    "cross-clone key stability {stable_pct:.1}% — the cache key is not \
+                     path-portable; the warm phase did not validly measure caching"
                 ));
             } else {
                 checks.push(AssertionCheck {
                     name: "min_key_stability_pct",
                     expected: format!(">= {min_key_stability_pct:.1}"),
-                    actual: format!("{:.1}", stability.stable_pct),
+                    actual: format!("{stable_pct:.1}"),
                     passed: true,
                 });
             }
@@ -4426,9 +4586,8 @@ impl Verdict {
 
         let el = &warm.event_log;
         if let Some(max_passthrough_pct) = spec.max_passthrough_pct
-            && el.total > 0
+            && let Some(pt_pct) = passthrough_pct(el)
         {
-            let pt_pct = el.passed_through as f64 / el.total as f64 * 100.0;
             if pt_pct > max_passthrough_pct {
                 checks.push(AssertionCheck {
                     name: "max_passthrough_pct",
@@ -4439,7 +4598,9 @@ impl Verdict {
                 issues.push(format!(
                     "{:.0}% of compiles ({} of {}) passed through uncached — \
                      kache barely exercised",
-                    pt_pct, el.passed_through, el.total
+                    pt_pct,
+                    el.passed_through,
+                    compile_count(el)
                 ));
             } else {
                 checks.push(AssertionCheck {
@@ -4770,7 +4931,7 @@ mod tests {
     #[test]
     fn wrapped_compile_failures_do_not_degrade_the_run() {
         let stability = KeyStability {
-            stable_pct: 96.9,
+            stable_pct: Some(96.9),
             stable: 560,
             compared: 578,
         };
@@ -5139,7 +5300,7 @@ mod tests {
             misses: 4,
             errors,
             hit_rate_pct: 60.0,
-            weighted_hit_rate_pct: 60.0,
+            weighted_hit_rate_pct: Some(60.0),
             time_saved_s: 0,
             top_misses: Vec::new(),
             event_log: EventLogStats {
@@ -5152,6 +5313,9 @@ mod tests {
                 passthrough_reasons: Vec::new(),
                 hit_bytes: 0,
                 miss_bytes: 0,
+                store_errors: 0,
+                lookup_rejections: 0,
+                fallbacks: 0,
             },
             leak_warnings: 0,
             storage: StorageInfo {
@@ -5170,13 +5334,43 @@ mod tests {
             },
             phases: PhaseTimes::default(),
             prepare: None,
+            invalid_reasons: Vec::new(),
+            load: crate::bench_host::PhaseLoad::default(),
         }
+    }
+
+    /// Stability exactly at the floor passes, just under it fails, and an
+    /// unknown percentage is not checked at all.
+    #[test]
+    fn key_stability_check_passes_at_the_floor_and_skips_the_unknown() {
+        let spec = ScenarioAssertSpec {
+            min_key_stability_pct: Some(80.0),
+            ..Default::default()
+        };
+        let warm = PhaseMetrics::default();
+        let stability = |stable_pct| KeyStability {
+            stable_pct,
+            stable: 0,
+            compared: 0,
+        };
+
+        let at_floor = Verdict::evaluate(&stability(Some(80.0)), &warm, Some(&spec));
+        assert!(at_floor.ok, "{:?}", at_floor.issues);
+        assert_eq!(at_floor.checks[0].actual, "80.0");
+
+        let under = Verdict::evaluate(&stability(Some(79.9)), &warm, Some(&spec));
+        assert!(!under.ok);
+        assert!(under.issues[0].contains("79.9%"), "{:?}", under.issues);
+
+        let unknown = Verdict::evaluate(&stability(None), &warm, Some(&spec));
+        assert!(unknown.ok);
+        assert!(unknown.checks.is_empty());
     }
 
     #[test]
     fn verdict_has_no_hidden_assertions_without_configured_checks() {
         let stability = KeyStability {
-            stable_pct: 0.0,
+            stable_pct: Some(0.0),
             stable: 0,
             compared: 4,
         };
@@ -5192,7 +5386,7 @@ mod tests {
     #[test]
     fn verdict_uses_only_configured_assert_thresholds() {
         let stability = KeyStability {
-            stable_pct: 0.0,
+            stable_pct: Some(0.0),
             stable: 0,
             compared: 4,
         };
@@ -5218,7 +5412,7 @@ mod tests {
     #[test]
     fn verdict_uses_configured_assert_thresholds() {
         let stability = KeyStability {
-            stable_pct: 75.0,
+            stable_pct: Some(75.0),
             stable: 3,
             compared: 4,
         };
@@ -5504,18 +5698,21 @@ mod tests {
         assert!(!measures_disk_footprint(true, true));
     }
 
-    /// The warm-vs-cold speedup, including the zero-second boundary the
-    /// engine's whole-second timing can actually produce on a small subject.
+    /// The warm-vs-cold speedup, taken on milliseconds, including the zero
+    /// boundary.
     #[test]
     fn phase_speedup_divides_cold_by_the_phase_and_guards_zero() {
         // A three-times-faster warm build.
-        assert_eq!(phase_speedup(300, 100), 3.0);
+        assert_eq!(phase_speedup(300_000, 100_000), 3.0);
         // Not a ratio a multiply or a remainder would produce.
-        assert_eq!(phase_speedup(90, 60), 1.5);
+        assert_eq!(phase_speedup(90_000, 60_000), 1.5);
         // Slower than cold is reported as-is; it is the validity gates' job to
         // reject that, not this helper's to hide it.
-        assert_eq!(phase_speedup(60, 120), 0.5);
-        // Exactly one second is the smallest measurable phase and must still
+        assert_eq!(phase_speedup(60_000, 120_000), 0.5);
+        // The milliseconds matter: 100 s over 13.9 s is 7.19x. Truncated to
+        // whole seconds the same builds would read 100 / 13 = 7.69x.
+        assert_eq!(phase_speedup(100_000, 13_900), 7.19);
+        // One millisecond is the smallest measurable phase and must still
         // divide rather than fall into the zero guard.
         assert_eq!(phase_speedup(42, 1), 42.0);
         // Zero: dividing would yield infinity, which no report should carry.
@@ -5604,6 +5801,7 @@ mod tests {
             run_id: "20260901T000000Z-kache-1".to_string(),
             artifact_dir: "tmp/perf-gate/head/runs/x".to_string(),
             cache_tool_version: Some("kache 0.16.1".to_string()),
+            host: crate::bench_host::HostInfo::default(),
             cold: phase(300_000, 0),
             warm_same_tree: Some(phase(100_400, 412)),
             warm: phase(120_900, 400),
@@ -5757,14 +5955,15 @@ mod tests {
         noisy.warm.top_misses = vec![MissEntry {
             crate_name: "libgit2-sys".to_string(),
             compile_time_s: 125,
+            compile_time_ms: 125_400,
         }];
         noisy.measure_warnings = vec!["warm hit rate 12.0% below threshold 50.0%".to_string()];
         let text = summary_text(&noisy);
         assert!(text.contains("costliest warm misses"), "{text}");
-        // A miss's compile time is whole seconds from kache's report, shown as
-        // minutes and zero-padded seconds. 125 rather than 71 because
+        // A miss's compile time is shown from its milliseconds, as minutes and
+        // zero-padded seconds with tenths. 125 s rather than 71 s because
         // 71 - 60 == 71 % 60, which would let a wrong operator print the same.
-        assert!(text.contains("2m 05s  libgit2-sys"), "{text}");
+        assert!(text.contains("2m 05.4s  libgit2-sys"), "{text}");
         assert!(text.contains("MEASURE WARNINGS"), "{text}");
         assert!(text.contains("warm hit rate 12.0%"), "{text}");
     }
@@ -5785,6 +5984,7 @@ mod tests {
             run_id: "run-1".into(),
             artifact_dir: "/tmp/run-1".into(),
             cache_tool_version: Some("kache 0.8.0".into()),
+            host: crate::bench_host::HostInfo::default(),
             cold: PhaseMetrics::default(),
             pull: PhaseMetrics::default(),
             cache_size_mb: 1.0,
@@ -6026,8 +6226,8 @@ mod tests {
         );
         let phase = otlp_mbx_phase("warm", &m, 77);
         assert_eq!(
-            (phase.name, phase.wall_s, phase.objdir_bytes),
-            ("warm", 4, 77)
+            (phase.name, phase.wall_ms, phase.objdir_bytes),
+            ("warm", 4_000, 77)
         );
         assert_eq!((phase.hits, phase.misses, phase.total), (8, 2, Some(10)));
         assert_eq!(phase.time_saved_s, Some(3));
@@ -6246,7 +6446,7 @@ build = "sleep 0.2"
         std::fs::create_dir_all(&work_dir).unwrap();
         let sh = posix_sh().unwrap();
 
-        let wall_ms = build(
+        let run = build(
             &profile,
             &clone,
             "cold",
@@ -6259,6 +6459,7 @@ build = "sleep 0.2"
             &sh,
         )
         .unwrap();
+        let wall_ms = run.wall_ms;
 
         assert!(
             (200..60_000).contains(&wall_ms),
@@ -6267,6 +6468,13 @@ build = "sleep 0.2"
         assert!(!stale.exists(), "the objdir is wiped before the build");
         assert!(work_dir.join("build-cold.log").exists());
         assert!(work_dir.join("wrapper-cold.log").exists());
+        // Both supported unix hosts expose load averages; the build samples
+        // them on each side of the timer.
+        assert!(
+            run.load.loadavg_start.is_some() && run.load.loadavg_end.is_some(),
+            "{:?}",
+            run.load
+        );
     }
 
     fn prepare_fixture(dir: &Path, prepare: Option<&str>) -> BenchProfile {
@@ -6603,34 +6811,399 @@ PREP_MARKER = "{{kache}}"
     /// clone's objdir.
     #[test]
     fn otlp_phases_carry_the_same_tree_warm_only_when_it_ran() {
-        let cold = PhaseMetrics {
-            wall_s: 100,
+        let phase = |wall_ms| PhaseMetrics {
+            wall_ms,
             ..Default::default()
         };
-        let same_tree = PhaseMetrics {
-            wall_s: 20,
-            ..Default::default()
-        };
-        let warm = PhaseMetrics {
-            wall_s: 30,
-            ..Default::default()
-        };
+        let (cold, same_tree, warm) = (phase(100_400), phase(20_000), phase(30_900));
 
         let without = otlp_phases(&cold, None, &warm, 7, 9);
         assert_eq!(
             without
                 .iter()
-                .map(|phase| (phase.name, phase.wall_s, phase.objdir_bytes))
+                .map(|phase| (phase.name, phase.wall_ms, phase.objdir_bytes))
                 .collect::<Vec<_>>(),
-            vec![("cold", 100, 7), ("warm", 30, 9)]
+            vec![("cold", 100_400, 7), ("warm", 30_900, 9)]
         );
 
         let with = otlp_phases(&cold, Some(&same_tree), &warm, 7, 9);
         assert_eq!(
             with.iter()
-                .map(|phase| (phase.name, phase.wall_s, phase.objdir_bytes))
+                .map(|phase| (phase.name, phase.wall_ms, phase.objdir_bytes))
                 .collect::<Vec<_>>(),
-            vec![("cold", 100, 7), ("warm-same-tree", 20, 7), ("warm", 30, 9)]
+            vec![
+                ("cold", 100_400, 7),
+                ("warm-same-tree", 20_000, 7),
+                ("warm", 30_900, 9)
+            ]
         );
+    }
+
+    /// An unknown weighted rate stays unknown on its way to the payload, and a
+    /// sub-second miss keeps its milliseconds instead of truncating to zero.
+    #[test]
+    fn from_report_keeps_unknown_rates_and_sub_second_misses() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "summary": {
+                "hit_rate_pct": 50.0,
+                "total_crates": 2,
+                "local_hits": 1,
+                "prefetch_hits": 0,
+                "remote_hits": 0,
+                "dups": 0,
+                "misses": 1,
+                "errors": 0,
+                "weighted_hit_rate_pct": null,
+                "time_saved_ms": 0
+            },
+            "top_misses": [
+                { "crate_name": "tiny", "compile_time_ms": 400 },
+                { "crate_name": "big", "compile_time_ms": 97_250 }
+            ]
+        });
+        let report: report::KacheReport =
+            serde_json::from_value(raw.clone()).expect("a minimal report parses");
+
+        let metrics = PhaseMetrics::from_report(&report, &raw, 1, EventLogStats::default(), 0);
+
+        assert_eq!(metrics.weighted_hit_rate_pct, None);
+        assert_eq!(
+            metrics
+                .top_misses
+                .iter()
+                .map(|m| (m.crate_name.as_str(), m.compile_time_s, m.compile_time_ms))
+                .collect::<Vec<_>>(),
+            vec![("tiny", 0, 400), ("big", 97, 97_250)]
+        );
+        let otlp = otlp_phase("warm", &metrics, 0);
+        assert_eq!(otlp.weighted_hit_rate_pct, None);
+        assert_eq!(
+            otlp.top_misses,
+            vec![("tiny".to_string(), 0.4), ("big".to_string(), 97.25)]
+        );
+    }
+
+    #[test]
+    fn a_known_weighted_rate_is_rounded_and_carried() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "summary": {
+                "hit_rate_pct": 50.0, "total_crates": 2, "local_hits": 1,
+                "prefetch_hits": 0, "remote_hits": 0, "misses": 1,
+                "weighted_hit_rate_pct": 97.46
+            }
+        });
+        let report: report::KacheReport = serde_json::from_value(raw.clone()).unwrap();
+        let metrics = PhaseMetrics::from_report(&report, &raw, 1, EventLogStats::default(), 0);
+        assert_eq!(metrics.weighted_hit_rate_pct, Some(97.5));
+        assert_eq!(
+            otlp_phase("warm", &metrics, 0).weighted_hit_rate_pct,
+            Some(97.5)
+        );
+    }
+
+    /// `--retry` against an older result: a miss recorded in whole seconds is
+    /// backfilled as a floor, one that has milliseconds keeps them, and fields
+    /// added since then default instead of failing the load.
+    #[test]
+    fn a_saved_miss_without_milliseconds_is_backfilled_from_its_seconds() {
+        let mut saved = serde_json::to_value(PhaseMetrics {
+            top_misses: vec![
+                MissEntry {
+                    crate_name: "old".into(),
+                    compile_time_s: 97,
+                    compile_time_ms: 97_250,
+                },
+                MissEntry {
+                    crate_name: "new".into(),
+                    compile_time_s: 0,
+                    compile_time_ms: 400,
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        saved["top_misses"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("compile_time_ms");
+        for key in ["invalid_reasons", "load"] {
+            saved.as_object_mut().unwrap().remove(key);
+        }
+        for key in ["store_errors", "lookup_rejections", "fallbacks"] {
+            saved["event_log"].as_object_mut().unwrap().remove(key);
+        }
+
+        let loaded: PhaseMetrics = load_saved_phase(saved).unwrap();
+
+        assert_eq!(loaded.top_misses[0].compile_time_ms, 97_000);
+        assert_eq!(loaded.top_misses[1].compile_time_ms, 400);
+        assert!(loaded.invalid_reasons.is_empty());
+        assert_eq!(loaded.event_log.store_errors, 0);
+    }
+
+    /// With nothing compared there is no ratio. Reporting 0% would read as
+    /// "every key leaked", the opposite of "nothing to compare".
+    #[test]
+    fn key_stability_is_unknown_until_a_crate_was_cached_in_both_clones() {
+        let events = |pairs: &[(&str, &str)]| {
+            serde_json::json!({
+                "all_events": pairs
+                    .iter()
+                    .map(|(name, key)| serde_json::json!({ "crate_name": name, "cache_key": key }))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        let disjoint = key_stability(&events(&[("a", "k1")]), &events(&[("b", "k2")]));
+        assert_eq!((disjoint.stable_pct, disjoint.compared), (None, 0));
+
+        let one = key_stability(&events(&[("a", "k1")]), &events(&[("a", "k1")]));
+        assert_eq!(
+            (one.stable_pct, one.stable, one.compared),
+            (Some(100.0), 1, 1)
+        );
+
+        let half = key_stability(
+            &events(&[("a", "k1"), ("b", "k2"), ("c", "k3")]),
+            &events(&[("a", "k1"), ("b", "moved"), ("d", "k4")]),
+        );
+        assert_eq!(
+            (half.stable_pct, half.stable, half.compared),
+            (Some(50.0), 1, 2)
+        );
+    }
+
+    /// The wrapper marks a failed store, a rejected lookup and a fallback on
+    /// the event itself; each is counted once per event that carries it, and
+    /// an empty annotation is not one.
+    #[test]
+    fn the_event_log_counts_the_annotations_that_invalidate_a_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        std::fs::write(
+            &log,
+            concat!(
+                r#"{"result":"miss","store_error":"disk full"}"#,
+                "\n",
+                r#"{"result":"miss","store_error":""}"#,
+                "\n",
+                r#"{"result":"local_hit"}"#,
+                "\n",
+                r#"{"result":"miss","lookup_rejection":"artifact set incomplete"}"#,
+                "\n",
+                r#"{"result":"passthrough","passthrough_reason":"unsupported|x","fallback":true}"#,
+                "\n",
+                r#"{"result":"passthrough","passthrough_reason":"unsupported|y","fallback":false}"#,
+                "\n",
+                r#"{"result":"miss","store_error":"read-only","lookup_rejection":"stale"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let stats = read_event_log(&log);
+
+        assert_eq!(stats.total, 7);
+        assert_eq!(
+            (stats.store_errors, stats.lookup_rejections, stats.fallbacks),
+            (2, 2, 1)
+        );
+    }
+
+    #[test]
+    fn invalid_reasons_name_each_nonzero_count_and_a_missing_daemon() {
+        let clean = EventLogStats::default();
+        assert!(invalid_reasons(&clean, true).is_empty());
+        assert_eq!(invalid_reasons(&clean, false), vec!["daemon_not_running"]);
+
+        let noisy = EventLogStats {
+            store_errors: 3,
+            lookup_rejections: 1,
+            fallbacks: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid_reasons(&noisy, true),
+            vec![
+                "store_errors:3",
+                "lookup_rejections:1",
+                "fallback_passthroughs:2"
+            ]
+        );
+
+        let one = EventLogStats {
+            fallbacks: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            invalid_reasons(&one, false),
+            vec!["fallback_passthroughs:1", "daemon_not_running"]
+        );
+    }
+
+    #[test]
+    fn build_context_sets_the_load_and_the_invalid_reasons() {
+        let load = crate::bench_host::PhaseLoad {
+            cpu_pressure_some_us: Some(42),
+            ..Default::default()
+        };
+        let metrics = PhaseMetrics {
+            event_log: EventLogStats {
+                store_errors: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .with_build_context(load.clone(), false);
+
+        assert_eq!(metrics.load, load);
+        assert_eq!(
+            metrics.invalid_reasons,
+            vec!["store_errors:1", "daemon_not_running"]
+        );
+    }
+
+    /// Probes are not compiles. Counting them in the denominator made a run
+    /// that declined a quarter of its real compiles look like it declined a
+    /// tenth, and pass a ceiling it should have failed.
+    #[test]
+    fn the_passthrough_rate_divides_by_real_compiles_only() {
+        let el = EventLogStats {
+            total: 100,
+            probed: 60,
+            passed_through: 10,
+            ..Default::default()
+        };
+        assert_eq!(compile_count(&el), 40);
+        assert_eq!(passthrough_pct(&el), Some(25.0));
+
+        let probes_only = EventLogStats {
+            total: 5,
+            probed: 5,
+            ..Default::default()
+        };
+        assert_eq!(passthrough_pct(&probes_only), None);
+
+        let single = EventLogStats {
+            total: 1,
+            passed_through: 1,
+            ..Default::default()
+        };
+        assert_eq!(passthrough_pct(&single), Some(100.0));
+
+        let warm = PhaseMetrics {
+            event_log: el,
+            ..Default::default()
+        };
+        let spec = ScenarioAssertSpec {
+            max_passthrough_pct: Some(20.0),
+            ..Default::default()
+        };
+        let verdict = Verdict::evaluate(&KeyStability::default(), &warm, Some(&spec));
+        assert!(!verdict.ok);
+        assert_eq!(verdict.checks[0].actual, "25.0");
+        assert!(
+            verdict.issues[0].contains("(10 of 40)"),
+            "{:?}",
+            verdict.issues
+        );
+    }
+
+    #[test]
+    fn fmt_pct_shows_one_decimal_or_not_available() {
+        assert_eq!(fmt_pct(Some(96.94)), "96.9%");
+        assert_eq!(fmt_pct(None), "n/a");
+    }
+
+    #[test]
+    fn invalid_reason_lines_skip_absent_and_clean_phases() {
+        let flagged = PhaseMetrics {
+            invalid_reasons: vec![
+                "fallback_passthroughs:4".into(),
+                "daemon_not_running".into(),
+            ],
+            ..Default::default()
+        };
+        let clean = PhaseMetrics::default();
+        assert_eq!(
+            invalid_reason_lines(&[
+                ("cold", Some(&clean)),
+                ("warm-same-tree", None),
+                ("pull", Some(&flagged)),
+            ]),
+            vec![
+                "  invalid (pull) : fallback_passthroughs:4, daemon_not_running   (reported, not blocking)"
+            ]
+        );
+    }
+
+    #[test]
+    fn summary_marks_unknown_rates_and_lists_invalid_reasons() {
+        let mut result = bench_result_fixture();
+        let text = summary_text(&result);
+        assert!(text.contains("hit rate (n/a weighted)"), "{text}");
+        assert!(
+            text.contains("key stability : n/a   (0 of 0 crates"),
+            "{text}"
+        );
+        assert!(!text.contains("invalid ("), "{text}");
+
+        result.warm.weighted_hit_rate_pct = Some(97.46);
+        result.key_stability = KeyStability {
+            stable_pct: Some(96.9),
+            stable: 560,
+            compared: 578,
+        };
+        result.warm.invalid_reasons = vec!["store_errors:2".into()];
+        let text = summary_text(&result);
+        assert!(text.contains("hit rate (97.5% weighted)"), "{text}");
+        assert!(
+            text.contains("key stability : 96.9%   (560 of 578 crates"),
+            "{text}"
+        );
+        assert!(
+            text.contains("invalid (warm) : store_errors:2   (reported, not blocking)"),
+            "{text}"
+        );
+        assert!(!text.contains("invalid (cold)"), "{text}");
+    }
+
+    /// Run the stand-in until it actually executed; see
+    /// `write_otlp_until_spawned` for why a spawn can transiently fail.
+    fn daemon_start_until_spawned(kache: &Path, dir: &Path, marker: &Path) -> bool {
+        let mut started = false;
+        for _ in 0..50 {
+            started = daemon::start(kache, dir, &dir.join("kache.toml"));
+            if marker.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        started
+    }
+
+    /// `daemon_not_running` rests on this result, so both answers matter.
+    #[test]
+    fn daemon_start_reports_whether_the_start_succeeded() {
+        let up = tempfile::tempdir().unwrap();
+        let marker = up.path().join("ran");
+        let kache = fake_kache_that_records(up.path(), &marker, 0);
+        assert!(daemon_start_until_spawned(&kache, up.path(), &marker));
+        let args = std::fs::read_to_string(&marker).unwrap();
+        assert!(args.contains("daemon") && args.contains("start"), "{args}");
+
+        let down = tempfile::tempdir().unwrap();
+        let marker = down.path().join("ran");
+        let kache = fake_kache_that_records(down.path(), &marker, 1);
+        assert!(!daemon_start_until_spawned(&kache, down.path(), &marker));
+        assert!(marker.is_file(), "the failing stand-in must have run");
+
+        assert!(!daemon::start(
+            &down.path().join("no-such-kache"),
+            down.path(),
+            &down.path().join("kache.toml")
+        ));
     }
 }

@@ -97,7 +97,9 @@ fields are not evaluated. The fields are `min_key_stability_pct`,
 `max_passthrough_pct`, `max_errors`, `min_hits`, and `min_restored_bytes`. The
 last two are validity floors: a phase that recompiled everything reports no hits
 and restores no bytes, and without them its wall-clock reads as a flatteringly
-fast build. `checks.measure` warnings are advisory only.
+fast build. `max_passthrough_pct` divides by real compiles: probes and
+queries such as `rustc -vV` are left out of both sides of the ratio.
+`checks.measure` warnings are advisory only.
 
 `checks.measure.<phase>` can also list `known_passthrough`: the reasons the
 scenario still passes real compiles through for, as prefixes of the label the

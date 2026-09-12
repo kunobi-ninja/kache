@@ -55,7 +55,9 @@ pub struct OtlpRun {
 
 pub struct OtlpPhase {
     pub name: &'static str,
-    pub wall_s: u64,
+    /// Build wall clock. Exported in seconds with the milliseconds kept: a
+    /// whole second is 7% of a 13 s warm build.
+    pub wall_ms: u64,
     pub time_saved_s: Option<u64>,
     pub hits: u64,
     pub dups: Option<u64>,
@@ -78,7 +80,9 @@ pub struct OtlpPhase {
     /// Bounded by the caller rather than here, because the bound is a
     /// cardinality decision: one series per crate name per project, and crate
     /// names are chosen by the repository being benchmarked.
-    pub top_misses: Vec<(String, u64)>,
+    ///
+    /// `(crate, seconds)`, fractional: a sub-second miss is not a zero.
+    pub top_misses: Vec<(String, f64)>,
     /// Compiles kache looked at but never asked the cache about: probes,
     /// queries, and anything it declined.
     ///
@@ -127,6 +131,11 @@ impl OtlpRun {
     pub fn tool_version_or_unknown(cache_tool: &str, version: Option<&str>) -> String {
         version.map_or_else(|| format!("{cache_tool} unknown"), str::to_string)
     }
+}
+
+/// Milliseconds as fractional seconds, the unit every `s` gauge here carries.
+pub fn seconds(ms: u64) -> f64 {
+    ms as f64 / 1000.0
 }
 
 pub fn write_otlp(work_dir: &Path, run: &OtlpRun) -> Result<()> {
@@ -183,7 +192,7 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
     for phase in &run.phases {
         let phase_attrs = common_attrs(run, Some(phase.name));
         duration_points.push(as_double(
-            phase.wall_s as f64,
+            seconds(phase.wall_ms),
             &run.time_unix_nano,
             &phase_attrs,
         ));
@@ -191,11 +200,7 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
             saved_points.push(as_double(saved as f64, &run.time_unix_nano, &phase_attrs));
         }
         if let Some(unconsulted) = phase.unconsulted {
-            unconsulted_points.push(as_double(
-                unconsulted as f64,
-                &run.time_unix_nano,
-                &phase_attrs,
-            ));
+            unconsulted_points.push(as_int(unconsulted, &run.time_unix_nano, &phase_attrs));
         }
         // Deliberately not one series per crate. Every other attribute here is
         // a bounded vocabulary -- 18 projects, 3 tools, 3 phases -- and a crate
@@ -231,15 +236,15 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
         // number. Which crate it is stays in the bench artifact and the trace,
         // where a name costs nothing.
         if !phase.top_misses.is_empty() {
-            let costliest = phase.top_misses.iter().map(|(_, s)| *s).max().unwrap_or(0);
-            let summed: u64 = phase.top_misses.iter().map(|(_, s)| *s).sum();
+            let costliest = phase.top_misses.iter().map(|(_, s)| *s).fold(0.0, f64::max);
+            let summed: f64 = phase.top_misses.iter().map(|(_, s)| *s).sum();
             miss_cost_points.push(as_double(
-                costliest as f64,
+                costliest,
                 &run.time_unix_nano,
                 &unit_attrs(run, phase.name, "costliest"),
             ));
             miss_cost_points.push(as_double(
-                summed as f64,
+                summed,
                 &run.time_unix_nano,
                 &unit_attrs(run, phase.name, "top"),
             ));
@@ -452,7 +457,7 @@ mod tests {
             phases: vec![
                 OtlpPhase {
                     name: "cold",
-                    wall_s: 400,
+                    wall_ms: 400_000,
                     time_saved_s: Some(0),
                     hits: 0,
                     dups: Some(0),
@@ -470,7 +475,7 @@ mod tests {
                 },
                 OtlpPhase {
                     name: "warm",
-                    wall_s: 95,
+                    wall_ms: 95_400,
                     time_saved_s: Some(280),
                     hits: 480,
                     dups: Some(10),
@@ -481,7 +486,11 @@ mod tests {
                     weighted_hit_rate_pct: Some(97.5),
                     leak_warnings: Some(2),
                     objdir_bytes: 8_100_000_000,
-                    top_misses: vec![("gecko".into(), 97), ("style".into(), 42)],
+                    top_misses: vec![
+                        ("gecko".into(), 97.25),
+                        ("style".into(), 42.0),
+                        ("tiny".into(), 0.5),
+                    ],
                     unconsulted: Some(11),
                     passthrough: vec![("not-a-compile", 12), ("unsupported", 3)],
                     passthrough_reasons: vec![(
@@ -707,7 +716,7 @@ mod tests {
         run.key_stability_pct = None;
         run.phases = vec![OtlpPhase {
             name: "pull",
-            wall_s: 120,
+            wall_ms: 120_000,
             time_saved_s: Some(40),
             hits: 100,
             dups: Some(0),
@@ -746,7 +755,7 @@ mod tests {
             disk_footprint_bytes: 300,
             phases: vec![OtlpPhase {
                 name: "warm",
-                wall_s: 10,
+                wall_ms: 10_000,
                 time_saved_s: None,
                 hits: 4,
                 dups: None,
@@ -780,6 +789,43 @@ mod tests {
             .map(|p| attr_map(p)["kache.bench.result"].clone())
             .collect();
         assert_eq!(results, vec!["hit", "miss", "total"]);
+    }
+
+    #[test]
+    fn seconds_keeps_the_milliseconds() {
+        assert_eq!(seconds(95_400), 95.4);
+        assert_eq!(seconds(999), 0.999);
+        assert_eq!(seconds(0), 0.0);
+    }
+
+    /// The build duration carries the milliseconds the engine timed. Truncated
+    /// to whole seconds, a 13 s warm build moves by up to 7%.
+    #[test]
+    fn build_duration_is_fractional_seconds() {
+        let body = serialize_metrics(&kache_run());
+        let points = metric(&body, "kache.bench.build.duration")["gauge"]["dataPoints"]
+            .as_array()
+            .unwrap();
+        let warm = points
+            .iter()
+            .find(|p| attr_map(p)["kache.bench.phase"] == "warm")
+            .unwrap();
+        assert_eq!(warm["asDouble"], 95.4);
+        assert_eq!(metric(&body, "kache.bench.build.duration")["unit"], "s");
+    }
+
+    /// An unknown weighted rate opens no point for its phase. Emitting zero
+    /// would read as "every compile missed" rather than "nothing to weigh".
+    #[test]
+    fn an_unknown_weighted_rate_is_skipped_per_phase() {
+        let mut run = kache_run();
+        run.phases[0].weighted_hit_rate_pct = None;
+        let body = serialize_metrics(&run);
+        let points = metric(&body, "kache.bench.cache.weighted_hit_rate")["gauge"]["dataPoints"]
+            .as_array()
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(attr_map(&points[0])["kache.bench.phase"], "warm");
     }
 
     #[test]
@@ -854,11 +900,12 @@ mod costliest_misses {
         let body = super::tests::payload_for_kache_run();
         assert_eq!(
             pick(&body, "kache.bench.miss.cost", "warm", "costliest")["asDouble"],
-            97.0
+            97.25
         );
+        // The half-second miss counts: in whole seconds it would be zero.
         assert_eq!(
             pick(&body, "kache.bench.miss.cost", "warm", "top")["asDouble"],
-            139.0
+            139.75
         );
     }
 
@@ -899,7 +946,9 @@ mod costliest_misses {
             .iter()
             .find(|p| attr(p, "kache.bench.phase") == Some("warm"))
             .unwrap();
-        assert_eq!(warm["asDouble"], 11.0);
+        // A count, like every other count in the payload.
+        assert_eq!(warm["asInt"], "11");
+        assert!(warm.get("asDouble").is_none());
     }
 }
 

@@ -8174,16 +8174,19 @@ mod tests {
     /// as wildcards.
     #[test]
     fn classifier_does_not_overreach_gecko_darwin_family() {
-        for flag in &[
-            // Lookalike that isn't the macOS deployment-target flag
+        // Lookalike that isn't the macOS deployment-target flag
+        let descs = refuse_descriptions(&[
+            "cc",
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
             "-mmacosx-min-version=10.15",
-        ] {
-            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
-            assert!(
-                descs.iter().any(|d| d.contains("unsupported flag")),
-                "{flag} is NOT on the #114 list and must still refuse, got: {descs:?}"
-            );
-        }
+        ]);
+        assert!(
+            descs.iter().any(|d| d.contains("unsupported flag")),
+            "-mmacosx-min-version=10.15 is NOT on the #114 list and must still refuse, got: {descs:?}"
+        );
         // The stack-protector family is now classified (Firefox nightly
         // passed `-fno-stack-protector` through while only `-strong` was listed).
         for flag in &[

@@ -15,14 +15,15 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let first = native_archive::portable_static_archive_hash(data);
-    let second = native_archive::portable_static_archive_hash(data);
+    let first = native_archive::portable_static_archive_identity(data);
+    let second = native_archive::portable_static_archive_identity(data);
     assert_eq!(
         first, second,
         "native archive hashing must be deterministic"
     );
 
-    if let Some(hash) = first {
+    if let Some(identity) = first {
+        let hash = identity.digest;
         let digest = hash
             .strip_prefix("gnu-ar-v2:")
             .or_else(|| hash.strip_prefix("bsd-ar-v2:"))

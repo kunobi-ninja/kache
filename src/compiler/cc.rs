@@ -2086,9 +2086,11 @@ pub(crate) struct CcHiddenInput {
 
 impl std::fmt::Display for CcHiddenInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The fixed text leads so one `known_passthrough` prefix in the bench
+        // scenarios covers every construct.
         write!(
             f,
-            "cc: `{}` may make the assembler read a file the cache key cannot see",
+            "cc: the assembler may read a file the cache key cannot see (`{}`)",
             self.construct
         )
     }

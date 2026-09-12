@@ -78,5 +78,7 @@ min_restored_bytes  = 67108864 # 64 MiB
 known_passthrough = [
   "unsupported|rustc build-script probe",
   "unsupported|cc link mode",
+  # aws-lc-sys assembly defines `.macro`s, which can build `.incbin` (#1015).
+  "uncacheable|cc: the assembler may read a file the cache key cannot see",
 ]
 min_hit_rate_pct = 90.0

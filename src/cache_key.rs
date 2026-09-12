@@ -7857,6 +7857,31 @@ mod tests {
         }
     }
 
+    /// Archives under `MIN_PERSISTED_HASH_BYTES` are hashed without a memo
+    /// row; one of exactly that size gets a row.
+    #[test]
+    fn hash_static_lib_memo_threshold_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let fh = FileHasher::persistent(&dir.path().join("index.db"));
+        let cache = fh.cache.as_ref().expect("persistent cache opens");
+        let threshold = usize::try_from(MIN_PERSISTED_HASH_BYTES).unwrap();
+        for (name, len, memoized) in [
+            ("libsmall.a", threshold - 1, false),
+            ("libexact.a", threshold, true),
+        ] {
+            let lib = dir.path().join(name);
+            std::fs::write(&lib, vec![b'x'; len]).unwrap();
+            let hash = fh.hash_static_lib(&lib).unwrap();
+            let fingerprint = FileFingerprint::from_path(&lib).unwrap();
+            let key = FileFingerprint {
+                path: format!("static-ar-v6\0{}", fingerprint.path),
+                ..fingerprint
+            };
+            let expected = memoized.then_some(hash);
+            assert_eq!(cache.get(&key).unwrap(), expected, "{name}");
+        }
+    }
+
     #[test]
     fn thin_static_archive_is_uncacheable() {
         let dir = tempfile::tempdir().unwrap();

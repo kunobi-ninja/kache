@@ -1634,6 +1634,381 @@ fn hash_cc_expansion(raw: Vec<u8>, prefix_maps: &[CcPrefixMap]) -> CcExpansionHa
     }
 }
 
+/// Assembler directives that read another file at assembly time.
+const CC_ASSEMBLER_FILE_DIRECTIVES: [&str; 2] = [".incbin", ".include"];
+
+/// Assembler facilities that substitute into their bodies, and so can build a
+/// file directive whose name never appears in the expansion (`.\op "\file"`
+/// invoked as `emit incbin, payload.bin`, or `.inc\()bin` inside `.rept`).
+const CC_ASSEMBLER_MACRO_DIRECTIVES: [&str; 4] = [".macro", ".irp", ".irpc", ".rept"];
+
+/// Why the assembler may read a file the key cannot see, if it may.
+///
+/// `.incbin` and assembler `.include` run after preprocessing, so no depfile
+/// lists what they read: a changed file would be served from the old object
+/// (kunobi-ninja/kache#1015). They reach the expansion from `.S` and `.s`
+/// sources and from inline `asm` strings in C, where the compiler joins
+/// adjacent literals and decodes escapes only after preprocessing. So the
+/// expansion is checked as written and as the compiler reads its strings, and
+/// an `asm` whose text is computed rather than written is refused outright.
+fn cc_assembler_hidden_input(expansion: &[u8]) -> Option<&'static str> {
+    if let Some(found) = cc_assembler_text_hidden_input(expansion) {
+        return Some(found);
+    }
+    let literals = cc_string_literals(expansion);
+    if literals.computed_asm {
+        return Some("asm((...))");
+    }
+    if literals.named_escape {
+        return Some(r"\N{...}");
+    }
+    cc_assembler_text_hidden_input(&literals.text)
+}
+
+/// The first construct in assembler text that may read an unseen file.
+///
+/// Directives are matched ignoring case, as the assembler does, and must end
+/// at a word boundary. A file directive counts when the next non-blank byte
+/// opens its operand: a quote, or a backslash for an escaped quote in a C
+/// string or a macro argument. That keeps C++ member access such as
+/// `opts.include(` out. A macro facility counts when a blank follows it;
+/// `.altmacro` and the `\()` separator count anywhere.
+fn cc_assembler_text_hidden_input(text: &[u8]) -> Option<&'static str> {
+    let file = CC_ASSEMBLER_FILE_DIRECTIVES.into_iter().find(|directive| {
+        cc_directive_operands(text, directive.as_bytes()).any(|rest| {
+            rest.iter()
+                .find(|byte| !matches!(byte, b' ' | b'\t'))
+                .is_some_and(|byte| matches!(byte, b'"' | b'\\'))
+        })
+    });
+    file.or_else(|| {
+        CC_ASSEMBLER_MACRO_DIRECTIVES.into_iter().find(|directive| {
+            cc_directive_operands(text, directive.as_bytes()).any(|rest| {
+                rest.first()
+                    .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+            })
+        })
+    })
+    .or_else(|| {
+        cc_directive_operands(text, b".altmacro")
+            .next()
+            .map(|_| ".altmacro")
+    })
+    .or_else(|| {
+        text.windows(3)
+            .any(|window| window == br"\()")
+            .then_some(r"\()")
+    })
+}
+
+/// String literals in a C or C++ expansion, read the way the compiler reads
+/// them after preprocessing.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CcStringLiterals {
+    /// Each run of adjacent literals joined, escapes decoded, one run per line.
+    text: Vec<u8>,
+    /// An `asm` whose text is an expression rather than a string literal.
+    computed_asm: bool,
+    /// A C++23 named escape (`\N{LATIN SMALL LETTER B}`). It can spell any
+    /// character, and decoding it would need the Unicode name table.
+    named_escape: bool,
+}
+
+/// Literal prefixes that open a raw string (`R"delim(...)delim"`).
+const CC_RAW_STRING_PREFIXES: [&[u8]; 5] = [b"R", b"u8R", b"uR", b"UR", b"LR"];
+
+/// Encoding prefixes of ordinary string and character literals.
+const CC_LITERAL_PREFIXES: [&[u8]; 4] = [b"u8", b"u", b"U", b"L"];
+
+/// Read the string literals in `src`, skipping character literals and numbers
+/// so a quote inside them cannot throw the reading out of step. Raw strings
+/// are taken as written. Assembly sources are not C; for them the plain text
+/// check is the one that counts, and a misreading here can only refuse more.
+fn cc_string_literals(src: &[u8]) -> CcStringLiterals {
+    let mut literals = CcStringLiterals::default();
+    let mut joining = false;
+    let mut i = 0;
+    while let Some(&byte) = src.get(i) {
+        if byte.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Comments only survive a `-C` probe. The compiler reads one as a
+        // blank, so literals on either side still join.
+        if byte == b'/' && matches!(src.get(i + 1), Some(b'*' | b'/')) {
+            i = cc_skip_comment(src, i);
+            continue;
+        }
+        let word_end = cc_word_end(src, i);
+        let word = &src[i..word_end];
+        let quote = src.get(word_end).copied();
+        let plain = word.is_empty() || CC_LITERAL_PREFIXES.contains(&word);
+        let raw_paren = (quote == Some(b'"') && CC_RAW_STRING_PREFIXES.contains(&word))
+            .then(|| cc_raw_delimiter(src, word_end))
+            .flatten();
+        let next = if raw_paren.is_some() || (quote == Some(b'"') && plain) {
+            if !joining {
+                literals.text.push(b'\n');
+            }
+            joining = true;
+            match raw_paren {
+                Some(paren) => cc_read_raw_string(src, word_end, paren, &mut literals.text),
+                None => cc_read_string(src, word_end, &mut literals),
+            }
+        } else {
+            joining = false;
+            if quote == Some(b'\'') && plain {
+                cc_skip_char_literal(src, word_end)
+            } else if word.is_empty() {
+                i + 1
+            } else {
+                if matches!(word, b"asm" | b"__asm" | b"__asm__")
+                    && !cc_asm_text_is_literal(src, word_end)
+                {
+                    literals.computed_asm = true;
+                }
+                word_end
+            }
+        };
+        debug_assert!(next > i, "string literal reader must advance");
+        i = next;
+    }
+    literals
+}
+
+/// End of the identifier or number starting at `start`, or `start` if neither
+/// starts there. A number takes C++14 digit separators, whose quote would
+/// otherwise read as a character literal.
+fn cc_word_end(src: &[u8], start: usize) -> usize {
+    let is_word = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+    if !src.get(start).is_some_and(is_word) {
+        return start;
+    }
+    let number = src[start].is_ascii_digit();
+    let mut i = start + 1;
+    while let Some(byte) = src.get(i) {
+        let separator = number && *byte == b'\'' && src.get(i + 1).is_some_and(is_word);
+        if !is_word(byte) && !separator {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Decode the string literal whose opening quote is at `open` into
+/// `literals.text`, and return the index after it. A literal cut off by a
+/// newline ends there.
+fn cc_read_string(src: &[u8], open: usize, literals: &mut CcStringLiterals) -> usize {
+    let mut i = open + 1;
+    while let Some(&byte) = src.get(i) {
+        match byte {
+            b'"' | b'\n' => return i + 1,
+            b'\\' => i = cc_decode_escape(src, i + 1, literals),
+            _ => {
+                literals.text.push(byte);
+                i += 1;
+            }
+        }
+    }
+    i
+}
+
+/// Decode the escape whose letter is at `at` into `literals.text`, returning
+/// the index after it. Control escapes other than newline and tab become a
+/// blank: the directive check only needs to know that they separate words. A
+/// named escape is flagged rather than decoded.
+fn cc_decode_escape(src: &[u8], at: usize, literals: &mut CcStringLiterals) -> usize {
+    let out = &mut literals.text;
+    let digits = |from: usize, max: usize, radix: u32| {
+        let len = src[from..]
+            .iter()
+            .take(max)
+            .take_while(|byte| char::from(**byte).is_digit(radix))
+            .count();
+        let value = src[from..from + len].iter().fold(0u32, |value, byte| {
+            value
+                .wrapping_mul(radix)
+                .wrapping_add(char::from(*byte).to_digit(radix).unwrap_or(0))
+        });
+        (value, from + len)
+    };
+    let push_code_point = |out: &mut Vec<u8>, value: u32| {
+        let mut utf8 = [0; 4];
+        let decoded = char::from_u32(value).unwrap_or(' ');
+        out.extend_from_slice(decoded.encode_utf8(&mut utf8).as_bytes());
+    };
+    let Some(&kind) = src.get(at) else {
+        return at;
+    };
+    // C23 and C++23 delimited escapes: `\x{2e}`, `\o{56}`, `\u{62}`. One
+    // without its `}` does not compile, so its object is never stored.
+    if matches!(kind, b'x' | b'o' | b'u') && src.get(at + 1) == Some(&b'{') {
+        let (value, end) = digits(at + 2, usize::MAX, if kind == b'o' { 8 } else { 16 });
+        if kind == b'u' {
+            push_code_point(out, value);
+        } else {
+            out.push(value as u8);
+        }
+        return end + usize::from(src.get(end) == Some(&b'}'));
+    }
+    match kind {
+        b'x' => {
+            let (value, end) = digits(at + 1, usize::MAX, 16);
+            out.push(value as u8);
+            end
+        }
+        b'0'..=b'7' => {
+            let (value, end) = digits(at, 3, 8);
+            out.push(value as u8);
+            end
+        }
+        b'u' | b'U' => {
+            let (value, end) = digits(at + 1, if kind == b'u' { 4 } else { 8 }, 16);
+            push_code_point(out, value);
+            end
+        }
+        b'n' => {
+            out.push(b'\n');
+            at + 1
+        }
+        b't' => {
+            out.push(b'\t');
+            at + 1
+        }
+        b'r' | b'f' | b'v' | b'a' | b'b' => {
+            out.push(b' ');
+            at + 1
+        }
+        b'N' if src.get(at + 1) == Some(&b'{') => {
+            literals.named_escape = true;
+            let close = src[at..]
+                .iter()
+                .position(|byte| matches!(byte, b'}' | b'"' | b'\n'));
+            close.map_or(src.len(), |offset| {
+                at + offset + usize::from(src[at + offset] == b'}')
+            })
+        }
+        other => {
+            out.push(other);
+            at + 1
+        }
+    }
+}
+
+/// The offset of the `(` that ends a raw string's delimiter, if the quote at
+/// `open` starts a valid one: at most 16 characters, none of them a blank,
+/// backslash, parenthesis or quote. Otherwise the prefix is an identifier and
+/// the quote opens an ordinary string, as the compiler would read it.
+fn cc_raw_delimiter(src: &[u8], open: usize) -> Option<usize> {
+    let body = src.get(open + 1..)?;
+    let paren = body.iter().take(17).position(|byte| *byte == b'(')?;
+    body[..paren]
+        .iter()
+        .all(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'\\' | b')' | b'"'))
+        .then_some(paren)
+}
+
+/// Copy the raw string whose opening quote is at `open` and whose delimiter
+/// ends at `paren` into `out`, returning the index after it. Its text is
+/// taken as written, escapes included.
+fn cc_read_raw_string(src: &[u8], open: usize, paren: usize, out: &mut Vec<u8>) -> usize {
+    let body = &src[open + 1..];
+    let mut close = vec![b')'];
+    close.extend_from_slice(&body[..paren]);
+    close.push(b'"');
+    let text = &body[paren + 1..];
+    let len = text
+        .windows(close.len())
+        .position(|window| window == close.as_slice())
+        .unwrap_or(text.len());
+    out.extend_from_slice(&text[..len]);
+    open + 1 + paren + 1 + len + close.len()
+}
+
+/// The index after the character literal whose opening quote is at `open`.
+fn cc_skip_char_literal(src: &[u8], open: usize) -> usize {
+    let mut i = open + 1;
+    while let Some(&byte) = src.get(i) {
+        match byte {
+            b'\\' => i += 2,
+            b'\'' | b'\n' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+/// The index after the `/* */` or `//` comment starting at `start`.
+fn cc_skip_comment(src: &[u8], start: usize) -> usize {
+    let close: &[u8] = if src.get(start + 1) == Some(&b'*') {
+        b"*/"
+    } else {
+        b"\n"
+    };
+    let rest = start + 2;
+    src[rest.min(src.len())..]
+        .windows(close.len())
+        .position(|window| window == close)
+        .map_or(src.len(), |offset| rest + offset + close.len())
+}
+
+/// Whether the `asm` keyword ending at `after` takes a written string. Clang
+/// accepts a constant expression in its place, which can build any text, so
+/// anything else counts as computed. A word not followed by `(` is not an
+/// `asm` statement.
+fn cc_asm_text_is_literal(src: &[u8], after: usize) -> bool {
+    let skip_blanks = |mut i: usize| loop {
+        if src.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        } else if src.get(i) == Some(&b'/') && matches!(src.get(i + 1), Some(b'*' | b'/')) {
+            i = cc_skip_comment(src, i);
+        } else {
+            return i;
+        }
+    };
+    let mut i = skip_blanks(after);
+    loop {
+        let end = cc_word_end(src, i);
+        match &src[i..end] {
+            b"volatile" | b"__volatile__" | b"__volatile" | b"inline" | b"__inline__" | b"goto" => {
+                i = skip_blanks(end)
+            }
+            b"" if src.get(i) == Some(&b'(') => break,
+            _ => return true,
+        }
+    }
+    let start = skip_blanks(i + 1);
+    let end = cc_word_end(src, start);
+    let word = &src[start..end];
+    src.get(end) == Some(&b'"')
+        && (word.is_empty()
+            || CC_LITERAL_PREFIXES.contains(&word)
+            || CC_RAW_STRING_PREFIXES.contains(&word))
+}
+
+/// The text after each whole-word, case-insensitive occurrence of `name`.
+fn cc_directive_operands<'a>(
+    expansion: &'a [u8],
+    name: &'a [u8],
+) -> impl Iterator<Item = &'a [u8]> + 'a {
+    expansion
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'.')
+        .filter_map(move |(start, _)| {
+            let candidate = expansion.get(start..start + name.len())?;
+            if !candidate.eq_ignore_ascii_case(name) {
+                return None;
+            }
+            let rest = &expansion[start + name.len()..];
+            let continues_word = rest
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+            (!continues_word).then_some(rest)
+        })
+}
+
 /// Whether `bytes` contain the raw spelling of any mapped root.
 ///
 /// A plain substring search, unlike [`apply_cc_prefix_maps_to_bytes`]: object
@@ -1683,6 +2058,28 @@ fn cc_unsafe_to_store(
         )),
     }
 }
+
+/// The key cannot see a file the assembler would read (kunobi-ninja/kache#1015).
+///
+/// Its own type so the wrapper can tell it from other key failures: this TU
+/// is unsafe for any cache keyed on the preprocessor output, so it must run
+/// the compiler directly rather than through a configured fallback wrapper.
+#[derive(Debug)]
+pub(crate) struct CcHiddenInput {
+    pub(crate) construct: &'static str,
+}
+
+impl std::fmt::Display for CcHiddenInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cc: `{}` may make the assembler read a file the cache key cannot see",
+            self.construct
+        )
+    }
+}
+
+impl std::error::Error for CcHiddenInput {}
 
 fn preprocess_hash(
     parsed: &CcArgs,
@@ -1753,6 +2150,11 @@ fn preprocess_hash(
         // or a degenerate empty TU. Either way refuse rather than hash
         // nothing → passthrough.
         anyhow::bail!("cc -E key probe produced no output");
+    }
+    if let Some(construct) = cc_assembler_hidden_input(&output.stdout) {
+        // Refuse before the memo can record this TU: a memo hit skips the
+        // probe, and the file the assembler reads is in no fingerprint.
+        return Err(CcHiddenInput { construct }.into());
     }
     let CcExpansionHash { hash, path_bound } = hash_cc_expansion(output.stdout, prefix_maps);
     // A path-bound expansion is never memoized. The memo is read from other
@@ -4039,7 +4441,9 @@ fn cc_preprocess_memo_key(
     // v4: the probe now runs with the compile's prefix maps, and path-bound
     // expansions are never recorded. A v3 record may hold the mapped hash of
     // one of those, which would give another checkout its key (#1004).
-    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v4");
+    // v5: TUs whose expansion `.incbin`s or `.include`s a file are refused. A
+    // v4 record of one would skip the probe that refuses it (#1015).
+    fold_cc_memo_field(&mut hasher, b"schema", b"cc-preprocess-memo-v5");
     fold_cc_memo_field(
         &mut hasher,
         b"compiler-program",
@@ -9671,6 +10075,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn real_probe_separates_file_macro_from_literal_roots() {
+        // Tests that swap PATH or SDKROOT hold this lock; the macOS `cc` shim
+        // exits 72 if it runs while one of them is mid-change.
+        let _lock = crate::test_support::process_state_test_lock();
         let probe = |with_literal: bool| {
             let tree = tempfile::TempDir::new().unwrap();
             let root = tree.path().canonicalize().unwrap();
@@ -9958,6 +10365,228 @@ mod tests {
         assert!(cc_object_embeds_mapped_root(&dirty, &maps).unwrap());
         assert!(!cc_object_embeds_mapped_root(&clean, &maps).unwrap());
         assert!(cc_object_embeds_mapped_root(&dir.path().join("missing.o"), &maps).is_err());
+    }
+
+    /// #1015: files the assembler reads never reach a depfile, so a TU that
+    /// reads one, or defines a macro that could build such a directive, must
+    /// not be cached. Look-alikes must not cost C++ TUs.
+    #[test]
+    fn assembler_file_reads_and_macros_are_refused() {
+        let found = |text: &str| cc_assembler_hidden_input(text.as_bytes());
+        assert_eq!(found(".incbin \"payload.bin\"\n"), Some(".incbin"));
+        assert_eq!(found("\t.INCBIN\t\"payload.bin\""), Some(".incbin"));
+        assert_eq!(
+            found(r#"__asm__(".incbin \"payload.bin\"\n");"#),
+            Some(".incbin")
+        );
+        assert_eq!(found(".macro blob f\n.incbin \\f\n.endm"), Some(".incbin"));
+        assert_eq!(found(".include \"macros.s\""), Some(".include"));
+        assert_eq!(found(".include\"macros.s\""), Some(".include"));
+
+        assert_eq!(found("opts.include(\"x\");"), None);
+        assert_eq!(found("cfg.include = \"x\";"), None);
+        assert_eq!(found(".includes \"x\""), None);
+        assert_eq!(found(".incbin_data \"x\""), None);
+        assert_eq!(found("int x = 1;"), None);
+        assert_eq!(found("end.incbin"), None, "no operand");
+
+        // Macro facilities can assemble a file directive from arguments.
+        assert_eq!(
+            found(".macro emit op, file\n.\\op \"\\file\"\n.endm\nemit incbin, p.bin"),
+            Some(".macro")
+        );
+        assert_eq!(
+            found(".irp op, incbin\n.\\op \"p.bin\"\n.endr"),
+            Some(".irp")
+        );
+        assert_eq!(found("\t.IRPC c, ab\n.endr"), Some(".irpc"));
+        assert_eq!(found(r#"__asm__(".macro emit\n.endm\n");"#), Some(".macro"));
+        assert_eq!(found(".macros x"), None);
+        assert_eq!(found("cfg.macro(x);"), None);
+        assert_eq!(found(".endm"), None);
+
+        // `.rept` bodies take `\()`, which splits a directive name in two.
+        assert_eq!(
+            found(".rept 1\n.inc\\()bin \"p.bin\"\n.endr"),
+            Some(".rept")
+        );
+        assert_eq!(found(".inc\\()bin \"p.bin\""), Some(r"\()"));
+        assert_eq!(found(".altmacro\n"), Some(".altmacro"));
+
+        // The compiler joins and decodes C strings after preprocessing.
+        assert_eq!(
+            found(r#"__asm__(".inc" "bin \"p.bin\"");"#),
+            Some(".incbin")
+        );
+        assert_eq!(
+            found(r#"__asm__(".inc\x62in \"p.bin\"");"#),
+            Some(".incbin")
+        );
+        assert_eq!(found("void f() { asm((text())); }"), Some("asm((...))"));
+    }
+
+    /// C23 delimited escapes survive `-E` as written, so only the string
+    /// reader can see that `\x{2e}incbin` is `.incbin`.
+    #[cfg(unix)]
+    #[test]
+    fn real_probe_refuses_a_directive_behind_a_delimited_escape() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("delimited.c");
+        std::fs::write(
+            &source,
+            "__asm__(\"\\x{2e}incbin \\\"payload.bin\\\"\\n\");\n",
+        )
+        .unwrap();
+        let parsed =
+            CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap(), "-o", "out.o"])).unwrap();
+        let refused = preprocess_hash(&parsed, &[], &crate::cache_key::FileHasher::new(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(".incbin"), "{refused}");
+    }
+
+    /// #1015: an `asm` string hides a directive from a plain text search when
+    /// it is split across literals or spelled with escapes. Read it the way
+    /// the compiler does, without letting quotes in other tokens desync it.
+    #[test]
+    fn string_literals_are_read_as_the_compiler_reads_them() {
+        let text = |src: &str| String::from_utf8(cc_string_literals(src.as_bytes()).text).unwrap();
+        assert_eq!(text(r#"x(".inc" "bin \"p\"");"#), "\n.incbin \"p\"");
+        assert_eq!(text(r#"".inc\x62in""#), "\n.incbin");
+        assert_eq!(text(r#"".inc\142in""#), "\n.incbin");
+        assert_eq!(text(r#"".incbin""#), "\n.incbin");
+        assert_eq!(text(r#"".inc\U00000062in""#), "\n.incbin");
+        assert_eq!(text(r#""a\tb\nc\rd\\e\"""#), "\na\tb\nc d\\e\"");
+        assert_eq!(text(r#"u8".in" L"cbin""#), "\n.incbin");
+        assert_eq!(text(r#"R"x(.inc\x62in ")x""#), "\n.inc\\x62in \"");
+        // A raw delimiter has at most 16 characters and no blank, backslash,
+        // parenthesis or quote. Otherwise `R` is a word and a plain string follows.
+        assert_eq!(text("R\"abc"), "\nabc");
+        assert_eq!(text(r#"R"0123456789abcdef(x)0123456789abcdef""#), "\nx");
+        assert_eq!(
+            text(r#"R"0123456789abcdefg(x)0123456789abcdefg""#),
+            "\n0123456789abcdefg(x)0123456789abcdefg"
+        );
+        assert_eq!(text(r#"R"a b(x)a b""#), "\na b(x)a b");
+        assert_eq!(text(r#"R"a\b(x)a\b""#), "\na (x)a ");
+        assert_eq!(text(r#"R"a)(x)a)""#), "\na)(x)a)");
+        // A named escape can spell any letter; it is flagged, not decoded.
+        let named = cc_string_literals(br#"__asm__(".inc\N{LATIN SMALL LETTER B}in \"p\"");"#);
+        assert!(named.named_escape);
+        assert_eq!(String::from_utf8(named.text).unwrap(), "\n.incin \"p\"");
+        assert!(!cc_string_literals(br#"s = "\\N{x}";"#).named_escape);
+        assert!(!cc_string_literals(br#"s = "\N";"#).named_escape);
+        assert_eq!(
+            cc_assembler_hidden_input(br#"__asm__(".inc\N{LATIN SMALL LETTER B}in \"p\"");"#),
+            Some(r"\N{...}")
+        );
+        assert_eq!(text("\"cut\nx = \"ok\""), "\ncut\nok");
+        // Literals separated by code are separate runs.
+        assert_eq!(text(r#"f(".inc"); g("bin");"#), "\n.inc\nbin");
+        // A quote in a character literal or a number does not open a string.
+        assert_eq!(text(r#"char q = '"'; int n = 1'000; s = "ok";"#), "\nok");
+        assert_eq!(text(r#"c = '\''; w = L'a'; s = "ok";"#), "\nok");
+
+        // C23 and C++23 delimited escapes.
+        assert_eq!(text(r#"".inc\x{62}in""#), "\n.incbin");
+        assert_eq!(text(r#"".inc\o{142}in""#), "\n.incbin");
+        assert_eq!(text(r#"".inc\u{62}in""#), "\n.incbin");
+        assert_eq!(text(r#"".inc\x{62in""#), "\n.incbin", "no closing brace");
+        assert_eq!(text(r#""\o""#), "\no");
+        assert_eq!(
+            cc_assembler_hidden_input(br#"__asm__("\x{2e}incbin \"p\"");"#),
+            Some(".incbin")
+        );
+
+        // A comment is a blank: literals around it join, and a quote inside
+        // it does not open a string. Division is not a comment.
+        assert_eq!(text("\"a\" /* \" */ \"b\""), "\nab");
+        assert_eq!(text("// \"x\n\"ok\""), "\nok");
+        assert_eq!(text("x = 1 / 2; s = \"ok\";"), "\nok");
+        assert_eq!(text("/* \"x"), "");
+        assert_eq!(
+            cc_assembler_hidden_input(b"/* \" */ asm(\".inc\" \"bin \\\"p\\\"\");"),
+            Some(".incbin")
+        );
+    }
+
+    /// Clang accepts a constant expression as the `asm` text, which can build
+    /// any directive. Written strings, symbol labels and plain words pass.
+    #[test]
+    fn asm_with_a_computed_string_is_refused() {
+        let computed = |src: &str| cc_string_literals(src.as_bytes()).computed_asm;
+        assert!(computed("void f() { asm((s())); }"));
+        assert!(computed("__asm__ __volatile__ ( text );"));
+        assert!(!computed(r#"asm volatile goto ("jmp %l0" :::: out);"#));
+        assert!(!computed(r#"extern int f(void) __asm("_" "f");"#));
+        assert!(!computed(r#"__asm__(R"(nop)");"#));
+        assert!(!computed(r#"__asm(u8"nop");"#));
+        assert!(!computed("int asm = 1; myasm(x);"));
+        assert!(!computed(
+            r#"asm(/* why */ "nop"); asm volatile // why
+            ("nop");"#
+        ));
+    }
+
+    /// #1015 through the real preprocessor: assembly and inline `asm` that
+    /// `.incbin` a file are refused; assembly that reads nothing is still keyed.
+    #[cfg(unix)]
+    #[test]
+    fn real_probe_refuses_sources_that_incbin_a_file() {
+        // Tests that swap PATH or SDKROOT hold this lock; the macOS `cc` shim
+        // exits 72 if it runs while one of them is mid-change.
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        std::fs::write(dir.path().join("payload.bin"), "one").unwrap();
+        let probe = |source: String| {
+            let parsed = CcArgs::parse(&s(&["cc", "-c", source.as_str(), "-o", "out.o"])).unwrap();
+            preprocess_hash(&parsed, &[], &crate::cache_key::FileHasher::new(), false)
+        };
+
+        let asm = write(
+            "blob.S",
+            ".globl payload\npayload:\n.incbin \"payload.bin\"\n",
+        );
+        let refused = probe(asm).unwrap_err().to_string();
+        assert!(refused.contains(".incbin"), "{refused}");
+
+        let inline = write("inline.c", "__asm__(\".incbin \\\"payload.bin\\\"\\n\");\n");
+        let refused = probe(inline).unwrap_err().to_string();
+        assert!(refused.contains(".incbin"), "{refused}");
+
+        let generated = write(
+            "macro.S",
+            ".macro emit op, file\n.\\op \"\\file\"\n.endm\nemit incbin, payload.bin\n",
+        );
+        let refused = probe(generated).unwrap_err().to_string();
+        assert!(refused.contains(".macro"), "{refused}");
+
+        let repeated = write("rept.S", ".rept 1\n.inc\\()bin \"payload.bin\"\n.endr\n");
+        let refused = probe(repeated).unwrap_err().to_string();
+        assert!(refused.contains(".rept"), "{refused}");
+
+        let split = write(
+            "split.c",
+            "__asm__(\".inc\" \"bin \\\"payload.bin\\\"\\n\");\n",
+        );
+        let refused = probe(split).unwrap_err().to_string();
+        assert!(refused.contains(".incbin"), "{refused}");
+
+        let escaped = write(
+            "escaped.c",
+            "__asm__(\".inc\\x62in \\\"payload.bin\\\"\\n\");\n",
+        );
+        let refused = probe(escaped).unwrap_err().to_string();
+        assert!(refused.contains(".incbin"), "{refused}");
+
+        let plain = write("plain.S", ".globl answer\nanswer:\n.byte 42\n");
+        assert!(probe(plain).is_ok());
     }
 
     #[test]

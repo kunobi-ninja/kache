@@ -1,0 +1,52 @@
+# kache-e2e fixture for kunobi-ninja/kache#1015.
+#
+# blob.S and inline.c pull build/payload.txt in at assembly time, in two forms
+# that never spell `.incbin` in the preprocessor output: blob.S splits the
+# directive name with `\()` inside `.rept`, and inline.c splits it across two
+# C string literals that the compiler joins after preprocessing. No depfile
+# lists the payload, so the cc key cannot see it. The payload holds a checksum
+# of the checkout path: it differs between checkouts while both sources stay
+# identical, and no object carries a path. Before the fix the relocated build
+# restored the first checkout's objects and main.c printed "stale payload".
+#
+# Contracts:
+#   1. Every phase's binary carries its own checkout's payload (verify).
+#   2. blob.o and inline.o are never stored; only main.o is.
+name = "e2e-cc-asm-incbin"
+tags = ["suite:e2e", "lang:cc"]
+
+# The Makefile and the ELF/Mach-O section syntax are Unix-only.
+os = ["linux", "macos"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE cc"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/app"
+expected_stdout_contains = ["app ok"]
+
+[assertions.cold]
+min_entries_after = 1
+
+# Same checkout: main.o hits; the `.incbin` users recompile.
+[assertions.warm]
+min_hits = 1
+
+[assertions.noop]
+should_not_recompile = false
+
+# Another checkout: EXPECTED differs, so main.o misses too, and verify checks
+# both payloads. The cache then holds main.o for each checkout and nothing
+# else. The entry check sits here, not in cold, so a build that stores the
+# `.incbin` objects reaches this phase and fails on the stale payload itself.
+[assertions.relocate]
+min_misses = 1
+max_entries_after = 2

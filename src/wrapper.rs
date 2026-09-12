@@ -786,14 +786,19 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 crate_name,
                 e
             );
-            return cc_passthrough_with_event(
-                config,
-                &parsed,
-                &crate_name,
-                &event_root,
-                start,
-                format!("uncacheable|{e}"),
-            );
+            let reason = format!("uncacheable|{e}");
+            return if cc_key_error_skips_fallback(&e) {
+                cc_direct_passthrough_with_event(
+                    config,
+                    &parsed,
+                    &crate_name,
+                    &event_root,
+                    start,
+                    reason,
+                )
+            } else {
+                cc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason)
+            };
         }
     };
     let key_ms = key_start.elapsed().as_millis() as u64;
@@ -1128,6 +1133,15 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     );
     print_progress(&crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
+}
+
+/// Whether a failed cc key must bypass the fallback wrapper: the key could not
+/// see a file the assembler reads, and a wrapper keyed on the same
+/// preprocessor output cannot see it either (kunobi-ninja/kache#1015).
+fn cc_key_error_skips_fallback(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::compiler::cc::CcHiddenInput>()
+        .is_some()
 }
 
 /// Format a refusal as the structured passthrough reason `category|detail`
@@ -8659,6 +8673,20 @@ exit 0
             format!("-c\n-o\n{output_arg}\n"),
             "unsafe output passthrough must bypass fallback and cache-only flags"
         );
+    }
+
+    /// #1015: a fallback wrapper such as sccache keys on the same preprocessor
+    /// output, so it would serve the stale object kache just refused to cache.
+    /// Only that refusal skips it; other key failures keep the fallback.
+    #[test]
+    fn only_hidden_input_key_failures_skip_the_fallback() {
+        let hidden = anyhow::Error::new(crate::compiler::cc::CcHiddenInput {
+            construct: ".incbin",
+        });
+        assert!(cc_key_error_skips_fallback(&hidden));
+        assert!(!cc_key_error_skips_fallback(&anyhow::anyhow!(
+            "cc -E key probe exited 1"
+        )));
     }
 
     #[cfg(unix)]

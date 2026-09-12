@@ -928,6 +928,107 @@ fn otlp_phases(
 /// series count.
 const TOP_MISSES_EMITTED: usize = 10;
 
+/// How many passthrough reasons each phase exports, costliest first.
+///
+/// Each is a series per reason label per project. The labels are kache's own
+/// refusal vocabulary with paths removed (see [`reason_label`]), but a flag
+/// list or a linker name still comes from the build being measured, so this
+/// is what bounds the count. The full list stays in the bench artifact.
+const PASSTHROUGH_REASONS_EMITTED: usize = 12;
+
+/// Longest reason label exported, in characters.
+const REASON_LABEL_MAX_CHARS: usize = 160;
+
+/// A passthrough reason with every path in it replaced by `<path>`, so reasons
+/// that differ only in which file they name share one label. A flag keeps its
+/// name: `-I/usr/include` becomes `-I<path>`.
+fn reason_label(reason: &str) -> String {
+    let label = reason
+        .split(' ')
+        .map(path_free_token)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.chars().count() > REASON_LABEL_MAX_CHARS {
+        let mut cut: String = label.chars().take(REASON_LABEL_MAX_CHARS).collect();
+        cut.push('…');
+        cut
+    } else {
+        label
+    }
+}
+
+/// `token` with the path it carries, if any, replaced by `<path>`.
+fn path_free_token(token: &str) -> String {
+    match path_start(token) {
+        Some(start) => format!("{}<path>", &token[..start]),
+        None => token.to_string(),
+    }
+}
+
+/// Byte offset where a path begins inside `token`. A flag may carry one after
+/// its name (`-I/usr`, `--sysroot=/opt/sdk`); anything else only at its start
+/// or after `=`, `(`, `,` or a quote.
+fn path_start(token: &str) -> Option<usize> {
+    let bytes = token.as_bytes();
+    let flag = token.starts_with('-');
+    (0..bytes.len()).find(|&i| {
+        token.is_char_boundary(i)
+            && (i == 0 || flag || matches!(bytes[i - 1], b'=' | b'(' | b',' | b'\'' | b'"'))
+            && starts_path(&token[i..])
+    })
+}
+
+/// Whether `rest` opens with a path: an absolute one of at least two
+/// components, a Windows drive path, or a `./`, `../` or `~/` relative one. A
+/// single leading slash is not enough, because MSVC options look like that
+/// (`/DEF`, `/MANIFESTFILE`).
+fn starts_path(rest: &str) -> bool {
+    let b = rest.as_bytes();
+    let drive =
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    let relative = ["./", "../", "~/", ".\\", "..\\"]
+        .iter()
+        .any(|prefix| rest.starts_with(prefix));
+    let absolute = matches!(b.first(), Some(b'/' | b'\\')) && rest[1..].contains(['/', '\\']);
+    drive || relative || absolute
+}
+
+/// Passthrough reasons merged by [`reason_label`] as `(label, compiles,
+/// elapsed_ms)`, costliest first, at most `limit` of them.
+fn passthrough_reason_series(reasons: &[ReasonCount], limit: usize) -> Vec<(String, u64, u64)> {
+    let mut merged: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for rc in reasons {
+        let entry = merged.entry(reason_label(&rc.reason)).or_default();
+        entry.0 += rc.count;
+        entry.1 += rc.elapsed_ms;
+    }
+    let mut series: Vec<(String, u64, u64)> = merged
+        .into_iter()
+        .map(|(label, (compiles, elapsed_ms))| (label, compiles, elapsed_ms))
+        .collect();
+    series.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
+    series.truncate(limit);
+    series
+}
+
+/// The reasons in `series` for real compiles that match none of the `known`
+/// label prefixes. Probes (`not-a-compile`) are never new: no work makes a
+/// query cacheable.
+fn unknown_passthrough_reasons<'a>(
+    series: &'a [(String, u64, u64)],
+    known: &[String],
+) -> Vec<&'a (String, u64, u64)> {
+    series
+        .iter()
+        .filter(|(label, _, _)| {
+            !label.starts_with("not-a-compile|")
+                && !known
+                    .iter()
+                    .any(|prefix| label.starts_with(prefix.as_str()))
+        })
+        .collect()
+}
+
 fn otlp_phase(
     name: &'static str,
     metrics: &PhaseMetrics,
@@ -954,6 +1055,12 @@ fn otlp_phase(
             ("not-a-compile", metrics.event_log.probed),
             ("unsupported", metrics.event_log.passed_through),
         ],
+        // Which reasons, and what each costs: the backlog behind the
+        // `unsupported` number, in the order worth working through.
+        passthrough_reasons: passthrough_reason_series(
+            &metrics.event_log.passthrough_reasons,
+            PASSTHROUGH_REASONS_EMITTED,
+        ),
         top_misses: metrics
             .top_misses
             .iter()
@@ -993,6 +1100,7 @@ fn otlp_sccache_phase(
         objdir_bytes,
         // sccache reports no passthrough breakdown.
         passthrough: Vec::new(),
+        passthrough_reasons: Vec::new(),
         // sccache reports neither: it has no per-unit cost breakdown, and no
         // count of what it looked at without consulting the cache.
         top_misses: Vec::new(),
@@ -2126,7 +2234,8 @@ fn read_event_log(path: &Path) -> EventLogStats {
     // Keyed by (action, structured reason). The reason is the kache-emitted
     // `category|detail`; print time splits it into the category / description
     // columns.
-    let mut reasons: HashMap<(String, String), u64> = HashMap::new();
+    // Value: (compiles, summed elapsed_ms).
+    let mut reasons: HashMap<(String, String), (u64, u64)> = HashMap::new();
     let stream = serde_json::Deserializer::from_reader(std::io::BufReader::new(file))
         .into_iter::<serde_json::Value>();
     for item in stream {
@@ -2165,26 +2274,29 @@ fn read_event_log(path: &Path) -> EventLogStats {
                     } else {
                         "reject"
                     };
-                    *reasons
+                    let entry = reasons
                         .entry((action.to_string(), reason.to_string()))
-                        .or_default() += 1;
+                        .or_default();
+                    entry.0 += 1;
+                    entry.1 += ev["elapsed_ms"].as_u64().unwrap_or_default();
                 }
             }
             "error" => stats.errored += 1,
             _ => {}
         }
     }
-    let mut top: Vec<ReasonCount> = reasons
+    let mut all: Vec<ReasonCount> = reasons
         .into_iter()
-        .map(|((action, reason), count)| ReasonCount {
+        .map(|((action, reason), (count, elapsed_ms))| ReasonCount {
             action,
             reason,
             count,
+            elapsed_ms,
         })
         .collect();
-    top.sort_by_key(|rc| std::cmp::Reverse(rc.count));
-    top.truncate(8);
-    stats.top_passthrough = top;
+    all.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.reason.cmp(&b.reason)));
+    stats.top_passthrough = all.iter().take(8).cloned().collect();
+    stats.passthrough_reasons = all;
     stats
 }
 
@@ -2856,6 +2968,8 @@ fn otlp_mbx_phase(
         // mapping. The total is comparable; the split is not, so only the
         // total is carried.
         passthrough: vec![("declined", metrics.bypassed)],
+        // Its bypass reasons are its own vocabulary; see `passthrough` above.
+        passthrough_reasons: Vec::new(),
         // No per-unit cost in its report.
         top_misses: Vec::new(),
         unconsulted: Some(metrics.unconsulted),
@@ -4110,6 +4224,10 @@ struct EventLogStats {
     errored: u64,
     /// Most frequent passthrough reasons, most frequent first.
     top_passthrough: Vec<ReasonCount>,
+    /// Every passthrough reason with its count and summed time, most frequent
+    /// first. `top_passthrough` is the head of this list.
+    #[serde(default)]
+    passthrough_reasons: Vec<ReasonCount>,
     /// Bytes of artifact data restored from cache (sum of `size`
     /// over `*_hit` events). The headline numerator of "what
     /// fraction of my build's artifact bytes came from cache".
@@ -4121,7 +4239,7 @@ struct EventLogStats {
     miss_bytes: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReasonCount {
     /// What kache did: `reject` (ran the real compiler) or `fallback`
     /// (delegated to a configured fallback wrapper, e.g. sccache).
@@ -4130,6 +4248,11 @@ struct ReasonCount {
     /// The kache-emitted structured reason, `category|detail`.
     reason: String,
     count: u64,
+    /// Wall time of those compiles, summed. A reason that passes through a
+    /// thousand 20 ms preprocessor runs costs less than one that passes through
+    /// a single 100 s compile, and the count alone says the opposite.
+    #[serde(default)]
+    elapsed_ms: u64,
 }
 
 /// Cross-clone cache-key stability.
@@ -4175,6 +4298,17 @@ fn bench_measure_warnings(
             "speedup {:.2}x below configured warning threshold {:.2}x",
             speedup, min
         ));
+    }
+    if !measure.known_passthrough.is_empty() {
+        let series = passthrough_reason_series(&warm.event_log.passthrough_reasons, usize::MAX);
+        for (label, compiles, elapsed_ms) in
+            unknown_passthrough_reasons(&series, &measure.known_passthrough)
+        {
+            warnings.push(format!(
+                "new passthrough reason ({compiles} compiles, {:.1}s): {label}",
+                *elapsed_ms as f64 / 1000.0
+            ));
+        }
     }
     warnings
 }
@@ -5015,6 +5149,7 @@ mod tests {
                 probed: 0,
                 errored: 0,
                 top_passthrough: Vec::new(),
+                passthrough_reasons: Vec::new(),
                 hit_bytes: 0,
                 miss_bytes: 0,
             },
@@ -5861,6 +5996,7 @@ mod tests {
             max_wall_s: Some(20),
             min_hit_rate_pct: Some(90.0),
             min_speedup: Some(3.0),
+            known_passthrough: Vec::new(),
         };
         assert!(external_measure_warnings(20, 90.0, 3.0, Some(&spec)).is_empty());
         let wall = external_measure_warnings(21, 90.0, 3.0, Some(&spec));
@@ -6257,6 +6393,185 @@ PREP_MARKER = "{{kache}}"
         let j = serde_json::to_value(&prepared).unwrap();
         assert_eq!(j["prepare"]["command"], "cargo fetch --locked");
         assert_eq!(j["prepare"]["wall_ms"], 41_200);
+    }
+
+    fn reason(reason: &str, count: u64, elapsed_ms: u64) -> ReasonCount {
+        ReasonCount {
+            action: "reject".into(),
+            reason: reason.into(),
+            count,
+            elapsed_ms,
+        }
+    }
+
+    #[test]
+    fn a_reason_label_drops_paths_and_keeps_flags() {
+        let cases = [
+            (
+                "uncacheable|cc include candidate /home/runner/obj/dist/pprio.h is unreadable",
+                "uncacheable|cc include candidate <path> is unreadable",
+            ),
+            (
+                "unsupported|cc unsupported flag(s): -I/usr/include -mavx",
+                "unsupported|cc unsupported flag(s): -I<path> -mavx",
+            ),
+            ("x --sysroot=/opt/sdk/usr y", "x --sysroot=<path> y"),
+            ("x path=/a/b y", "x path=<path> y"),
+            ("x a,/a/b y", "x a,<path> y"),
+            ("x '/a/b' \"/c/d\" y", "x '<path> \"<path> y"),
+            ("x (./obj/a.o) y", "x (<path> y"),
+            ("x ../src/a.c ~/b.c y", "x <path> <path> y"),
+            ("x .\\obj\\a.o ..\\b.o y", "x <path> <path> y"),
+            ("x C:\\Users\\me\\a.h C:/b/c y", "x <path> <path> y"),
+            ("x \\\\?\\C:\\a y", "x <path> y"),
+            // An MSVC option, a list of extensions and a relative name are not
+            // paths worth a placeholder.
+            (
+                "x /DEF, (.lib/.a/.obj) obj/a.o y",
+                "x /DEF, (.lib/.a/.obj) obj/a.o y",
+            ),
+            (
+                "unsupported|rustc build-script probe — not yet",
+                "unsupported|rustc build-script probe — not yet",
+            ),
+        ];
+        for (reason, label) in cases {
+            assert_eq!(reason_label(reason), label, "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_long_reason_label_is_cut_at_the_limit() {
+        let label = reason_label(&"a".repeat(REASON_LABEL_MAX_CHARS + 5));
+        assert_eq!(label.chars().count(), REASON_LABEL_MAX_CHARS + 1);
+        assert!(label.ends_with('…'));
+        let exact = "b".repeat(REASON_LABEL_MAX_CHARS);
+        assert_eq!(reason_label(&exact), exact);
+    }
+
+    #[test]
+    fn passthrough_reasons_merge_by_label_and_rank_by_time() {
+        let reasons = [
+            reason("unsupported|cc -E to stdout", 161, 3_000),
+            reason("uncacheable|cc include /a/b/x.h unreadable", 25, 90_000),
+            reason("uncacheable|cc include /a/b/y.h unreadable", 1, 18_000),
+            reason("unsupported|cc link mode", 188, 40_000),
+        ];
+        assert_eq!(
+            passthrough_reason_series(&reasons, 2),
+            vec![
+                (
+                    "uncacheable|cc include <path> unreadable".to_string(),
+                    26,
+                    108_000
+                ),
+                ("unsupported|cc link mode".to_string(), 188, 40_000),
+            ]
+        );
+        // Equal time: the one that passed through more compiles comes first.
+        let tied = [reason("a|one", 1, 500), reason("b|five", 5, 500)];
+        assert_eq!(passthrough_reason_series(&tied, 1)[0].0, "b|five");
+    }
+
+    #[test]
+    fn only_real_compiles_outside_the_known_list_are_new() {
+        let series = vec![
+            (
+                "not-a-compile|query / probe (--print, -vV)".to_string(),
+                264,
+                8_000,
+            ),
+            (
+                "unsupported|rustc build-script probe — not yet".to_string(),
+                12,
+                900,
+            ),
+            (
+                "unsupported|cc unsupported flag(s): -funroll-loops — not yet".to_string(),
+                1,
+                4_000,
+            ),
+        ];
+        let known = vec!["unsupported|rustc build-script probe".to_string()];
+        let new: Vec<&str> = unknown_passthrough_reasons(&series, &known)
+            .into_iter()
+            .map(|(label, _, _)| label.as_str())
+            .collect();
+        assert_eq!(
+            new,
+            vec!["unsupported|cc unsupported flag(s): -funroll-loops — not yet"]
+        );
+    }
+
+    #[test]
+    fn a_passthrough_reason_outside_the_known_list_warns() {
+        let warm = PhaseMetrics {
+            event_log: EventLogStats {
+                passthrough_reasons: vec![
+                    reason("unsupported|rustc build-script probe — not yet", 12, 900),
+                    reason(
+                        "unsupported|cc unsupported flag(s): -funroll-loops — not yet",
+                        1,
+                        4_300,
+                    ),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let known = MeasureSpec {
+            known_passthrough: vec!["unsupported|rustc build-script probe".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            bench_measure_warnings(&warm, 0.0, Some(&known)),
+            vec![
+                "new passthrough reason (1 compiles, 4.3s): unsupported|cc unsupported flag(s): -funroll-loops — not yet"
+                    .to_string()
+            ]
+        );
+        // No list, no check.
+        assert!(bench_measure_warnings(&warm, 0.0, Some(&MeasureSpec::default())).is_empty());
+    }
+
+    #[test]
+    fn the_event_log_sums_count_and_time_per_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let events = [
+            r#"{"result":"passthrough","passthrough_reason":"unsupported|cc link mode","elapsed_ms":1200}"#,
+            r#"{"result":"passthrough","passthrough_reason":"unsupported|cc link mode","elapsed_ms":800}"#,
+            r#"{"result":"passthrough","passthrough_reason":"not-a-compile|query / probe","elapsed_ms":30}"#,
+            r#"{"result":"local_hit","size":10}"#,
+        ];
+        std::fs::write(&log, events.join("\n")).unwrap();
+        let stats = read_event_log(&log);
+        assert_eq!(stats.passthrough_reasons.len(), 2);
+        assert_eq!(stats.top_passthrough.len(), 2);
+        let first = &stats.passthrough_reasons[0];
+        assert_eq!(first.reason, "unsupported|cc link mode");
+        assert_eq!((first.count, first.elapsed_ms), (2, 2_000));
+        assert_eq!(stats.passthrough_reasons[1].elapsed_ms, 30);
+    }
+
+    #[test]
+    fn the_payload_carries_the_costliest_passthrough_reasons() {
+        let reasons: Vec<ReasonCount> = (0..20u64)
+            .map(|i| reason(&format!("unsupported|flag -f{i}"), 1, i * 100))
+            .collect();
+        let metrics = PhaseMetrics {
+            event_log: EventLogStats {
+                passthrough_reasons: reasons,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let phase = otlp_phase("warm", &metrics, 0);
+        assert_eq!(phase.passthrough_reasons.len(), PASSTHROUGH_REASONS_EMITTED);
+        assert_eq!(
+            phase.passthrough_reasons[0],
+            ("unsupported|flag -f19".to_string(), 1, 1_900)
+        );
     }
 
     /// The two refusal categories must reach the payload as two numbers, from

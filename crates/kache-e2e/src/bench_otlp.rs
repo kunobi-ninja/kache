@@ -97,6 +97,14 @@ pub struct OtlpPhase {
     /// engineering backlog, visible as a number. Summed together they say only
     /// "some things were skipped".
     pub passthrough: Vec<(&'static str, u64)>,
+    /// The reasons behind those passthroughs as `(label, compiles,
+    /// elapsed_ms)`, costliest first, already bounded by the caller. The label
+    /// is `category|detail` with paths removed.
+    ///
+    /// `passthrough` says how much was declined; this says what to fix first.
+    /// A reason that passes through a thousand 20 ms preprocessor runs costs
+    /// less than one that passes through a single 100 s compile.
+    pub passthrough_reasons: Vec<(String, u64, u64)>,
 }
 
 impl OtlpRun {
@@ -169,6 +177,8 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
     let mut miss_cost_points = Vec::new();
     let mut unconsulted_points = Vec::new();
     let mut passthrough_points = Vec::new();
+    let mut reason_compile_points = Vec::new();
+    let mut reason_time_points = Vec::new();
 
     for phase in &run.phases {
         let phase_attrs = common_attrs(run, Some(phase.name));
@@ -197,6 +207,21 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
                 *count,
                 &run.time_unix_nano,
                 &unit_attrs(run, phase.name, category),
+            ));
+        }
+        // `kache.bench.reason` is the one attribute whose values come partly
+        // from the build: the refusal vocabulary is kache's own, but a flag
+        // list or a linker name is not. Paths are removed and the caller caps
+        // the reasons per phase, which is what keeps it bounded.
+        for (label, compiles, elapsed_ms) in &phase.passthrough_reasons {
+            let (category, reason) = label.split_once('|').unwrap_or(("other", label.as_str()));
+            let mut attrs = unit_attrs(run, phase.name, category);
+            attrs.push(str_attr("kache.bench.reason", reason));
+            reason_compile_points.push(as_int(*compiles, &run.time_unix_nano, &attrs));
+            reason_time_points.push(as_double(
+                *elapsed_ms as f64 / 1000.0,
+                &run.time_unix_nano,
+                &attrs,
             ));
         }
         // What a metric can carry is the shape: how much of the build the
@@ -283,6 +308,18 @@ fn metrics_for(run: &OtlpRun) -> Vec<Value> {
             "kache.bench.cache.passthrough",
             "{unit}",
             passthrough_points,
+        ));
+    }
+    if !reason_compile_points.is_empty() {
+        metrics.push(gauge(
+            "kache.bench.passthrough.compiles",
+            "{unit}",
+            reason_compile_points,
+        ));
+        metrics.push(gauge(
+            "kache.bench.passthrough.time",
+            "s",
+            reason_time_points,
         ));
     }
     if !unconsulted_points.is_empty() {
@@ -429,6 +466,7 @@ mod tests {
                     top_misses: Vec::new(),
                     unconsulted: Some(3),
                     passthrough: Vec::new(),
+                    passthrough_reasons: Vec::new(),
                 },
                 OtlpPhase {
                     name: "warm",
@@ -446,6 +484,11 @@ mod tests {
                     top_misses: vec![("gecko".into(), 97), ("style".into(), 42)],
                     unconsulted: Some(11),
                     passthrough: vec![("not-a-compile", 12), ("unsupported", 3)],
+                    passthrough_reasons: vec![(
+                        "unsupported|cc link mode (whole-program caching) — not yet".into(),
+                        188,
+                        412_000,
+                    )],
                 },
             ],
         }
@@ -537,6 +580,33 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_reasons_carry_their_category_and_reason() {
+        let body = serialize_metrics(&kache_run());
+        let compiles = &metric(&body, "kache.bench.passthrough.compiles")["gauge"]["dataPoints"][0];
+        let attrs = attr_map(compiles);
+        assert_eq!(attrs["kache.bench.phase"], "warm");
+        assert_eq!(attrs["kache.bench.result"], "unsupported");
+        assert_eq!(
+            attrs["kache.bench.reason"],
+            "cc link mode (whole-program caching) — not yet"
+        );
+        assert_eq!(compiles["asInt"], "188");
+        let time = metric(&body, "kache.bench.passthrough.time");
+        assert_eq!(time["unit"], "s");
+        assert_eq!(time["gauge"]["dataPoints"][0]["asDouble"], 412.0);
+    }
+
+    #[test]
+    fn a_reason_without_a_category_is_filed_as_other() {
+        let mut run = kache_run();
+        run.phases[1].passthrough_reasons = vec![("legacy reason".into(), 3, 1_500)];
+        let body = serialize_metrics(&run);
+        let point = &metric(&body, "kache.bench.passthrough.compiles")["gauge"]["dataPoints"][0];
+        assert_eq!(attr_map(point)["kache.bench.result"], "other");
+        assert_eq!(attr_map(point)["kache.bench.reason"], "legacy reason");
+    }
+
+    #[test]
     fn cache_size_is_bytes_not_megabytes() {
         assert_eq!(OtlpRun::bytes_from_mib(1.5), 1_572_864);
     }
@@ -573,6 +643,7 @@ mod tests {
             "kache.bench.cache_tool",
             "kache.bench.phase",
             "kache.bench.result",
+            "kache.bench.reason",
         ]
         .into_iter()
         .map(str::to_string)
@@ -650,6 +721,7 @@ mod tests {
             top_misses: Vec::new(),
             unconsulted: None,
             passthrough: Vec::new(),
+            passthrough_reasons: Vec::new(),
         }];
         let body = serialize_metrics(&run);
         let duration = &metric(&body, "kache.bench.build.duration")["gauge"]["dataPoints"][0];
@@ -688,6 +760,7 @@ mod tests {
                 top_misses: Vec::new(),
                 unconsulted: None,
                 passthrough: Vec::new(),
+                passthrough_reasons: Vec::new(),
             }],
         };
         let body = serialize_metrics(&run);
@@ -697,6 +770,8 @@ mod tests {
         assert!(!listed.contains(&"kache.bench.leak_warnings"));
         assert!(!listed.contains(&"kache.bench.key_stability"));
         assert!(!listed.contains(&"kache.bench.disk.consumed"));
+        assert!(!listed.contains(&"kache.bench.passthrough.compiles"));
+        assert!(!listed.contains(&"kache.bench.passthrough.time"));
         let units = metric(&body, "kache.bench.compile.units")["gauge"]["dataPoints"]
             .as_array()
             .unwrap();

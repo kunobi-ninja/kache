@@ -300,6 +300,14 @@ pub struct MeasureSpec {
     pub max_wall_s: Option<u64>,
     pub min_hit_rate_pct: Option<f64>,
     pub min_speedup: Option<f64>,
+    /// Passthrough reasons this scenario already has, as prefixes of the
+    /// exported label (`category|detail`, paths shown as `<path>`). When the
+    /// list is not empty, a real compile passed through for any other reason
+    /// raises a warning, so a newly unsupported flag or file shows up the first
+    /// night it appears. Probes (`not-a-compile`) are never checked. Fixing a
+    /// reason means deleting its entry.
+    #[serde(default)]
+    pub known_passthrough: Vec<String>,
 }
 
 /// The common scenario shape both fixture and clone TOML files adapt into.

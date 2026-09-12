@@ -144,3 +144,17 @@ content_file = "patches/firefox-cbindgen-visibility.patch"
 min_key_stability_pct = 50.0
 max_passthrough_pct = 40.0
 max_errors = 0
+
+[checks.measure.warm]
+# Reasons kache still passes real compiles through for, from the nightly.
+# Any other reason warns; delete an entry once it is fixed.
+known_passthrough = [
+  "unsupported|cc link mode",
+  "unsupported|cc preprocessor mode -E to stdout",
+  "uncacheable|cc include candidate <path> is unreadable",
+  "unsupported|rustc build-script probe",
+  "uncacheable|cc -E key probe exited 1",
+  "unsupported|cc unsupported flag(s): -mavxvnni — not yet",
+  "uncacheable|cc: resolved invocation unavailable for probe-captured flags",
+  "unsupported|cc unsupported flag(s): -fno-stack-protector -fno-asynchronous-unwind-tables — not yet",
+]

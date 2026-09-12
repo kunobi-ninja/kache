@@ -91,3 +91,11 @@ message Timestamp {
 min_key_stability_pct = 50.0
 max_passthrough_pct = 40.0
 max_errors = 0
+
+[checks.measure.warm]
+# Reasons kache still passes real compiles through for, from the nightly.
+# Any other reason warns; delete an entry once it is fixed.
+known_passthrough = [
+  "unsupported|rustc build-script probe",
+  "unsupported|cc unsupported flag(s): -funroll-loops — not yet",
+]

@@ -2448,11 +2448,18 @@ const HOST_EXCLUDED_TABLES: &[&str] = &["workspace"];
 /// have no host layer unless a test points its own thread at a file with
 /// [`set_host_config_for_test`].
 pub(crate) fn host_config_path() -> Option<PathBuf> {
+    // A test that points its own thread at a host file wins over the
+    // environment: the repository's cargo `[env]` sets KACHE_HOST_CONFIG to
+    // empty for every test process.
+    #[cfg(test)]
+    if let Some(path) = HOST_CONFIG_FOR_TEST.with(|path| path.borrow().clone()) {
+        return Some(path);
+    }
     match std::env::var("KACHE_HOST_CONFIG") {
         Ok(value) if value.is_empty() => None,
         Ok(value) => Some(shellexpand(&value)),
         #[cfg(test)]
-        Err(_) => HOST_CONFIG_FOR_TEST.with(|path| path.borrow().clone()),
+        Err(_) => None,
         #[cfg(not(test))]
         Err(_) => Some(PathBuf::from(HOST_CONFIG_PATH)),
     }

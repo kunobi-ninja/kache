@@ -1,0 +1,8 @@
+# Every process cargo runs for this repository (unit and integration tests,
+# nextest, `cargo run`) starts with the host config layer turned off, and so
+# does every kache those processes spawn, because children inherit the
+# environment. The self-hosted CI Macs that run kache's own tests carry a real
+# /etc/kache/config.toml; a test must see only the config it writes. A test
+# that wants a host file sets KACHE_HOST_CONFIG on its own command.
+[env]
+KACHE_HOST_CONFIG = ""

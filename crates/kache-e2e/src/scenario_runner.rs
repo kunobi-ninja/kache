@@ -113,7 +113,22 @@ impl Args {
     }
 }
 
+/// Scenarios run on CI hosts that can carry a real `/etc/kache/config.toml`
+/// (the self-hosted Macs set keys there for every build), and an arm must
+/// measure what its scenario configures, not what the host does. Every kache
+/// this process spawns inherits its environment, so turning the host layer
+/// off once here covers all of them. A caller who wants the host layer
+/// exports `KACHE_HOST_CONFIG` explicitly, which is left alone.
+fn turn_off_host_config() {
+    if std::env::var_os("KACHE_HOST_CONFIG").is_none() {
+        // SAFETY: called first thing in `main`, before this process starts
+        // any thread that could read the environment concurrently.
+        unsafe { std::env::set_var("KACHE_HOST_CONFIG", "") };
+    }
+}
+
 pub fn main() -> Result<()> {
+    turn_off_host_config();
     let args = Args::parse();
     let mut select = args.select.clone();
     if let Some(profile) = &args.profile {

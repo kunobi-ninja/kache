@@ -502,6 +502,7 @@ pub fn stats(
         .map(|s| s.total_blob_size)
         .unwrap_or(snap.total_size);
     let disk = crate::machine::disk_view(&config.store_dir(), store_bytes, snap.max_size);
+    let host_config = host_config_in_effect(&crate::config::host_config_status());
 
     if json {
         #[derive(serde::Serialize)]
@@ -523,6 +524,10 @@ pub fn stats(
             since: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             remote: Option<&'a str>,
+            /// The host config file merged under the chosen one, when there is
+            /// one in effect.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            host_config: Option<&'a str>,
         }
         let hit_rate = count_hit_rate(&snap.event_stats);
         let remote = config.remote.as_ref().map(|r| r.describe());
@@ -542,6 +547,7 @@ pub fn stats(
                 since_secs: window.secs(),
                 since: window.label(),
                 remote: remote.as_deref(),
+                host_config: host_config.as_deref(),
             },
             crate::machine::next_for_clones(disk.cloned_into_targets_bytes),
         );
@@ -549,6 +555,9 @@ pub fn stats(
 
     for line in render_stats(&snap, config, window) {
         println!("{line}");
+    }
+    if let Some(path) = &host_config {
+        println!("Host config: {path}");
     }
     if let Some(line) = cloned_targets_line(&disk) {
         println!("{line}");
@@ -3893,6 +3902,15 @@ const DAEMON_CHECK_LABELS: [&str; 5] = [
     "Service exe",
 ];
 
+/// The host config path `kache stats` names, only when the host file is
+/// actually merged in: absent, disabled or unusable files are not in effect.
+fn host_config_in_effect(status: &crate::config::HostConfigStatus) -> Option<String> {
+    match status {
+        crate::config::HostConfigStatus::Present { path, .. } => Some(path.display().to_string()),
+        _ => None,
+    }
+}
+
 /// Wording for the "Host config" check, as `(pass, detail, fix hint)`. Pure,
 /// so each state is testable without a host file on the machine.
 fn doctor_host_config_check(
@@ -6390,6 +6408,33 @@ mod tests {
 
     /// Which failing checks are informational: the full truth table for
     /// daemon-optional and probe-no-compiler downgrades.
+    /// `kache stats` names the host file only while it is merged in.
+    #[test]
+    fn stats_names_the_host_config_only_when_in_effect() {
+        use crate::config::HostConfigStatus;
+        let path = std::path::PathBuf::from("/etc/kache/config.toml");
+        assert_eq!(
+            host_config_in_effect(&HostConfigStatus::Present {
+                path: path.clone(),
+                keys: Vec::new(),
+            })
+            .as_deref(),
+            Some("/etc/kache/config.toml")
+        );
+        assert_eq!(host_config_in_effect(&HostConfigStatus::Disabled), None);
+        assert_eq!(
+            host_config_in_effect(&HostConfigStatus::Absent { path: path.clone() }),
+            None
+        );
+        assert_eq!(
+            host_config_in_effect(&HostConfigStatus::Invalid {
+                path,
+                error: "parsing host config".to_string(),
+            }),
+            None
+        );
+    }
+
     /// Each host-config state reads the way `kache doctor` should say it: an
     /// unusable file is the only failure, and an overridden key names what
     /// wins over it.

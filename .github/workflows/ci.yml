@@ -62,8 +62,9 @@ jobs:
     # the 6h GitHub default — the step-level timeouts below only guard their own
     # steps. (`just ci` itself is additionally capped at 30m.)
     timeout-minutes: 40
-    # `just ci` needs Linux (docker buildx, helm and tarpaulin). macOS has
-    # a dedicated, lighter test job below.
+    # `just ci` needs Linux (docker buildx, helm and tarpaulin). macOS cargo
+    # tests live in `cargo test (macOS)`; the Nix package build is
+    # `Nix package (macOS)`.
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       # mise installs everything in mise.toml (just, helm, sccache,
@@ -648,20 +649,34 @@ jobs:
       - name: cargo deny check
         run: just audit
 
+  # Linux evaluates every system (catches #597-style eval breakage) and builds
+  # the Linux package. macOS actually *builds* the Darwin package: stdenv sets
+  # SDKROOT to the Apple SDK store path and puts xcbuild's xcrun on PATH, which
+  # `cargo test` on a hosted Mac never sees. That is how the SDK-identity
+  # checkPhase failure in nixpkgs#561411 stayed invisible here.
   nix-package:
-    name: Nix package
-    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    name: Nix package (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
-    timeout-minutes: 25
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Linux
+            runner: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+          - os: macOS
+            runner: ${{ fromJSON(!github.event.repository.private && '"macos-latest"' || vars.CI_RUNNER_MACOS) }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       # `--all-systems` is the point: without it the check only evaluates the
       # runner's own system, which is how the x86_64-darwin breakage in #597
       # stayed invisible here. Evaluation is cross-system, so this costs
-      # seconds and needs no emulation.
+      # seconds and needs no emulation. One OS is enough.
       - name: Check flake evaluation
+        if: matrix.os == 'Linux'
         run: nix flake check --all-systems --no-build
       # Builds every check for THIS system, including `checks.package`, which
       # is `pkgs.kache` — so this covers the package build too. Deliberately
@@ -1029,15 +1044,16 @@ jobs:
           path: tmp/e2e/
           retention-days: 14
 
-  # --- macOS test suite ---
+  # --- macOS cargo test ---
   # The Linux `check` job runs the full `just ci` (coverage + docker + helm);
-  # replicating that on macOS isn't worth it. Instead this job runs a focused
-  # `cargo test` pass on a hosted macOS runner so OS-specific
-  # regressions — e.g. the daemon's Unix-socket EOF behaviour, which once hung
-  # the suite on macOS while passing on Linux — are caught before merge.
+  # replicating that on macOS isn't worth it. This is `cargo test` + clippy on
+  # a hosted Mac with Apple's toolchain, not the Nix package (that's
+  # `Nix package (macOS)`). Catches OS-specific regressions — e.g. the
+  # daemon's Unix-socket EOF behaviour, which once hung the suite on macOS
+  # while passing on Linux — before merge.
   # Blocking: macOS is a first-class supported platform.
-  test-macos:
-    name: Test (macOS)
+  cargo-macos:
+    name: cargo test (macOS)
     runs-on: ${{ fromJSON(!github.event.repository.private && '"macos-latest"' || vars.CI_RUNNER_MACOS) }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
@@ -1119,15 +1135,15 @@ jobs:
         env:
           RUSTC_WRAPPER: ""
 
-  # --- Windows test suite ---
-  # Mirrors `test-macos`: the Linux `check` job runs the full `just ci` and
-  # macOS has its own focused pass, but until now nothing ran `cargo test` (or
+  # --- Windows cargo test ---
+  # Mirrors `cargo test (macOS)`: the Linux `check` job runs the full `just ci`
+  # and macOS has its own cargo pass. Nothing used to run `cargo test` (or
   # clippy) on Windows — so Windows-only regressions slipped through every gate
   # (e.g. #348: the build-session marker write failing under a mandatory file
   # lock). Use the same hosted Windows image as the e2e job's Windows arm.
   # Blocking: Windows is a first-class supported platform.
-  test-windows:
-    name: Test (Windows)
+  cargo-windows:
+    name: cargo test (Windows)
     runs-on: ${{ fromJSON(!github.event.repository.private && '"windows-latest"' || vars.CI_RUNNER_WINDOWS) }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
@@ -1166,7 +1182,7 @@ jobs:
           [ -z "$missing" ] || exit 1
           echo "all build/fixture tools present"
       # Keep Rust + mise install/cache/state under the per-run temp dir. See the
-      # e2e and test-macos jobs for the full rationale.
+      # e2e and cargo-macos jobs for the full rationale.
       - name: Isolate tool state
         run: |
           mkdir -p \
@@ -1240,8 +1256,8 @@ jobs:
         cow-filesystem,
         nix-package,
         e2e,
-        test-macos,
-        test-windows,
+        cargo-macos,
+        cargo-windows,
         version-consistency,
       ]
     # IN-ORG MIRROR of zondax/_workflows@7f61511 (v11) — a byte-identical import.

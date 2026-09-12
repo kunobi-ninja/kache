@@ -64,6 +64,10 @@ buildRustPackage {
     "--skip=store::tests::test_exclude_from_indexing_sets_tmutil_xattr"
   ];
 
+  # planner_client / remote_backend tests bind 127.0.0.1. Darwin's Nix sandbox
+  # denies that unless this is set.
+  __darwinAllowLocalNetworking = true;
+
   # The suite runs ~2000 tests at full parallelism; nix-daemon's default soft
   # descriptor limit (often 1024) is low enough for the parallel run to hit
   # EMFILE, which surfaced as spurious single-test failures in flake builds

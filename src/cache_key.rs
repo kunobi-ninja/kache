@@ -1611,7 +1611,9 @@ pub fn compute_cache_key(
     // text by the generic codegen fold, so that identity refuses them rather
     // than let a rebuilt file under the same name restore a stale executable.
     // Libraries inherited only through rlib metadata are not exposed in this
-    // argv and are outside that direct-input identity.
+    // argv and are outside that direct-input identity. An invocation that
+    // links a `static=` archive itself keeps a DWARF-bearing Mach-O archive
+    // path-bound; see [`StaticLibUse`].
     // Linker order/section-order/map files and opaque response files require
     // side-input/output handling beyond the archive key. Fail closed instead
     // of caching an invocation whose auxiliary behavior cannot be reproduced.
@@ -1625,7 +1627,7 @@ pub fn compute_cache_key(
         tracing::trace!("[key:{}] link_lib:{}", crate_name, lib);
 
         if let Some((path, content_hash)) =
-            resolve_native_static_lib(lib, &native_search_dirs, file_hasher)?
+            resolve_native_static_lib(lib, &native_search_dirs, file_hasher, static_lib_use(args))?
         {
             hasher.update(b"link_lib_content:");
             hasher.update(content_hash.as_bytes());
@@ -2078,6 +2080,7 @@ fn resolve_native_static_lib(
     spec: &str,
     search_dirs: &[PathBuf],
     file_hasher: &FileHasher<'_>,
+    usage: StaticLibUse,
 ) -> Result<Option<(PathBuf, String)>> {
     let Some(name) = clean_static_lib_name(spec) else {
         return Ok(None);
@@ -2109,8 +2112,43 @@ fn resolve_native_static_lib(
     };
     // Every parse/read failure is uncacheable, never name-only: this archive is
     // bundled into the output, so omitting an existing file would be a false hit.
-    let hash = file_hasher.hash_static_lib(&path)?;
+    let hash = file_hasher.hash_static_lib_for(&path, usage)?;
     Ok(Some((path, hash)))
+}
+
+/// How an invocation uses a `static=` archive. It decides whether an archive
+/// with DWARF-bearing Mach-O members may share its structural digest across
+/// checkouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticLibUse {
+    /// The invocation does not link the archive: rustc bundles it into its
+    /// rlib (or staticlib) output. A later cached debug link names rlib
+    /// members `<rlib>(member)` under `--out-dir`, which the `-oso_prefix`
+    /// kache injects there makes relative.
+    Bundled,
+    /// The invocation links the archive itself (bin, test, dylib, cdylib,
+    /// proc-macro). ld64 writes the archive's absolute path into the `N_OSO`
+    /// entry of every DWARF-bearing member.
+    Linked,
+}
+
+impl StaticLibUse {
+    /// Memo namespace. The two uses can hash one file differently, so they
+    /// never share a row.
+    fn memo_namespace(self) -> &'static str {
+        match self {
+            Self::Bundled => "static-ar-v6-bundled",
+            Self::Linked => "static-ar-v6",
+        }
+    }
+}
+
+fn static_lib_use(args: &RustcArgs) -> StaticLibUse {
+    if args.is_executable_output() {
+        StaticLibUse::Linked
+    } else {
+        StaticLibUse::Bundled
+    }
 }
 
 /// Auxiliary linker files are not yet captured/restored as cache artifacts.
@@ -2671,11 +2709,13 @@ fn is_ident_continue(byte: u8) -> bool {
 // the `path_normalizer` module docs for the full story.
 
 /// Compute a linked `static=` archive's cache-key digest. A proven GNU/BSD
-/// archive gets the structural member-identity hash; every other non-thin
-/// archive gets a digest of both its bytes and lexical absolute path because
-/// linkers can expose `archive-path(member)`. Thin archives are uncacheable:
-/// rustc reads external members whose bytes are absent from the container.
-fn compute_static_lib_hash(path: &Path) -> Result<String> {
+/// archive gets the structural member-identity hash, unless the invocation
+/// links an archive with DWARF-bearing Mach-O members itself. Every other
+/// non-thin archive gets a digest of both its bytes and lexical absolute path
+/// because linkers can expose `archive-path(member)`. Thin archives are
+/// uncacheable: rustc reads external members whose bytes are absent from the
+/// container.
+fn compute_static_lib_hash(path: &Path, usage: StaticLibUse) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if bytes.starts_with(b"!<thin>\n") {
         anyhow::bail!(
@@ -2683,8 +2723,10 @@ fn compute_static_lib_hash(path: &Path) -> Result<String> {
             path.display()
         );
     }
-    if let Some(portable) = crate::native_archive::portable_static_archive_hash(&bytes) {
-        return Ok(portable);
+    if let Some(identity) = crate::native_archive::portable_static_archive_identity(&bytes)
+        && !(usage == StaticLibUse::Linked && identity.macho_dwarf_members)
+    {
+        return Ok(identity.digest);
     }
 
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
@@ -3771,14 +3813,21 @@ impl<'db> FileHasher<'db> {
     /// applied either way, and every scheme is domain-tagged.
     /// Scoped to `static=` (this method) on purpose — `.rlib`s are also `ar`
     /// archives but are hashed whole via [`Self::hash`].
+    /// This is the strict [`StaticLibUse::Linked`] reading; rlib bundling
+    /// goes through [`Self::hash_static_lib_for`].
     pub fn hash_static_lib(&self, path: &Path) -> Result<String> {
+        self.hash_static_lib_for(path, StaticLibUse::Linked)
+    }
+
+    /// [`Self::hash_static_lib`] for a known [`StaticLibUse`].
+    pub fn hash_static_lib_for(&self, path: &Path, usage: StaticLibUse) -> Result<String> {
         // Without a persistent cache (daemonless / tests), compute directly —
         // still honoring the too-new guard.
         let Some(cache) = &self.cache else {
             if let Ok(fingerprint) = FileFingerprint::from_path(path) {
                 self.note_too_new(&fingerprint);
             }
-            return compute_static_lib_hash(path);
+            return compute_static_lib_hash(path, usage);
         };
         let fingerprint = match FileFingerprint::from_path(path) {
             Ok(fp) => fp,
@@ -3787,7 +3836,7 @@ impl<'db> FileHasher<'db> {
                     "static-lib hash metadata lookup failed for {}: {e}",
                     path.display()
                 );
-                return compute_static_lib_hash(path);
+                return compute_static_lib_hash(path, usage);
             }
         };
         self.note_too_new(&fingerprint);
@@ -3796,7 +3845,7 @@ impl<'db> FileHasher<'db> {
         // archive read is cheap and not worth a row.
         let size = fingerprint.size;
         if size < MIN_PERSISTED_HASH_BYTES {
-            let hash = compute_static_lib_hash(path)?;
+            let hash = compute_static_lib_hash(path, usage)?;
             self.record_miss(size);
             return Ok(hash);
         }
@@ -3811,9 +3860,10 @@ impl<'db> FileHasher<'db> {
         // predates the GCC Mach-O LTO gate, and v5 predates admitting
         // DWARF-bearing Mach-O members (a v5 row would keep serving the
         // path-bound digest of an unchanged archive). None may be served
-        // after the final archive hardening.
+        // after the final archive hardening. Bundled and linked uses get
+        // separate rows because a DWARF archive hashes differently for each.
         let key = FileFingerprint {
-            path: format!("static-ar-v6\0{}", fingerprint.path),
+            path: format!("{}\0{}", usage.memo_namespace(), fingerprint.path),
             size: fingerprint.size,
             mtime_ns: fingerprint.mtime_ns,
             ctime_ns: fingerprint.ctime_ns,
@@ -3827,7 +3877,7 @@ impl<'db> FileHasher<'db> {
             Ok(None) => {}
             Err(e) => tracing::debug!("static-lib hash cache lookup failed: {e}"),
         }
-        let hash = compute_static_lib_hash(path)?;
+        let hash = compute_static_lib_hash(path, usage)?;
         self.record_miss(size);
         if let Err(e) = cache.put(&key, &hash) {
             tracing::debug!("static-lib hash cache update failed: {e}");
@@ -7264,7 +7314,7 @@ mod tests {
         let dirs = vec![dir.path().to_path_buf()];
 
         // A `static=` lib present in a search dir resolves and content-hashes.
-        let (path, h1) = resolve_native_static_lib("static=foo", &dirs, &fh)
+        let (path, h1) = resolve_native_static_lib("static=foo", &dirs, &fh, StaticLibUse::Bundled)
             .unwrap()
             .expect("static lib in a search dir must resolve");
         assert_eq!(path, lib);
@@ -7272,14 +7322,15 @@ mod tests {
         // `cc` emits the same OUT_DIR once per compiled archive. Repeating an
         // identical `-L native=...` must still resolve the one physical file.
         let duplicate_dirs = vec![dir.path().to_path_buf(), dir.path().to_path_buf()];
-        let (duplicate_path, _) = resolve_native_static_lib("static=foo", &duplicate_dirs, &fh)
-            .unwrap()
-            .expect("duplicate search dirs must not make one archive ambiguous");
+        let (duplicate_path, _) =
+            resolve_native_static_lib("static=foo", &duplicate_dirs, &fh, StaticLibUse::Bundled)
+                .unwrap()
+                .expect("duplicate search dirs must not make one archive ambiguous");
         assert_eq!(duplicate_path, lib);
 
         // Changed bytes → different hash (this is the false hit we close).
         std::fs::write(&lib, b"v2 different bytes").unwrap();
-        let (_, h2) = resolve_native_static_lib("static=foo", &dirs, &fh)
+        let (_, h2) = resolve_native_static_lib("static=foo", &dirs, &fh, StaticLibUse::Bundled)
             .unwrap()
             .unwrap();
         assert_ne!(h1, h2, "content change must change the resolved hash");
@@ -7287,22 +7338,22 @@ mod tests {
         // `dylib=`/bare are referenced not bundled → never content-hashed; a
         // missing lib and a modifier/rename spec also do not resolve.
         assert!(
-            resolve_native_static_lib("dylib=foo", &dirs, &fh)
+            resolve_native_static_lib("dylib=foo", &dirs, &fh, StaticLibUse::Bundled)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            resolve_native_static_lib("foo", &dirs, &fh)
+            resolve_native_static_lib("foo", &dirs, &fh, StaticLibUse::Bundled)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            resolve_native_static_lib("static:+verbatim=foo", &dirs, &fh)
+            resolve_native_static_lib("static:+verbatim=foo", &dirs, &fh, StaticLibUse::Bundled)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            resolve_native_static_lib("static=absent", &dirs, &fh)
+            resolve_native_static_lib("static=absent", &dirs, &fh, StaticLibUse::Bundled)
                 .unwrap()
                 .is_none()
         );
@@ -7316,6 +7367,7 @@ mod tests {
                 "static=foo",
                 &[dir.path().to_path_buf(), other_dir.path().to_path_buf()],
                 &fh,
+                StaticLibUse::Bundled,
             )
             .is_err(),
             "distinct search-dir matches must fail closed"
@@ -7325,7 +7377,7 @@ mod tests {
         // ambiguous.
         std::fs::write(dir.path().join("foo.lib"), b"msvc import lib").unwrap();
         assert!(
-            resolve_native_static_lib("static=foo", &dirs, &fh).is_err(),
+            resolve_native_static_lib("static=foo", &dirs, &fh, StaticLibUse::Bundled).is_err(),
             "ambiguous .a/.lib match must fail closed"
         );
     }
@@ -7708,6 +7760,101 @@ mod tests {
         assert!(first_hash.starts_with("path-ar-v1:"));
         assert!(second_hash.starts_with("path-ar-v1:"));
         assert_ne!(first_hash, second_hash);
+    }
+
+    #[test]
+    fn static_lib_use_follows_executable_output() {
+        let use_of = |crate_type: &str, test: bool| {
+            let mut argv = vec![
+                "rustc".to_string(),
+                "src/lib.rs".to_string(),
+                "--crate-type".to_string(),
+                crate_type.to_string(),
+            ];
+            if test {
+                argv.push("--test".to_string());
+            }
+            static_lib_use(&RustcArgs::parse(&argv).unwrap())
+        };
+        assert_eq!(use_of("lib", false), StaticLibUse::Bundled);
+        assert_eq!(use_of("rlib", false), StaticLibUse::Bundled);
+        assert_eq!(use_of("bin", false), StaticLibUse::Linked);
+        assert_eq!(use_of("cdylib", false), StaticLibUse::Linked);
+        assert_eq!(use_of("proc-macro", false), StaticLibUse::Linked);
+        assert_eq!(use_of("lib", true), StaticLibUse::Linked);
+    }
+
+    /// A DWARF-bearing Mach-O archive shares its structural digest across
+    /// checkouts only when rustc bundles it into an rlib. An invocation that
+    /// links it itself writes the archive's absolute path into `N_OSO`, so
+    /// the digest stays path-bound there.
+    #[test]
+    fn linked_dwarf_archive_stays_path_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let fh = FileHasher::new();
+        let hash_in = |name: &str, bytes: &[u8], usage: StaticLibUse| {
+            let lib_dir = dir.path().join(name);
+            std::fs::create_dir_all(&lib_dir).unwrap();
+            let lib = lib_dir.join("libprobe.a");
+            std::fs::write(&lib, bytes).unwrap();
+            fh.hash_static_lib_for(&lib, usage).unwrap()
+        };
+
+        let dwarf = crate::native_archive::dwarf_bsd_archive_for_tests(b"debug");
+        let bundled = hash_in("a", &dwarf, StaticLibUse::Bundled);
+        assert!(bundled.starts_with("bsd-ar-v2:"));
+        assert_eq!(bundled, hash_in("b", &dwarf, StaticLibUse::Bundled));
+
+        let linked = hash_in("a", &dwarf, StaticLibUse::Linked);
+        assert!(linked.starts_with("path-ar-v1:"));
+        assert_ne!(linked, hash_in("b", &dwarf, StaticLibUse::Linked));
+        // The unqualified method is the linked reading.
+        assert_eq!(
+            fh.hash_static_lib(&dir.path().join("a/libprobe.a"))
+                .unwrap(),
+            linked
+        );
+
+        // Without DWARF, a linked archive keeps the structural digest.
+        let plain = gnu_ar_one_object(b"object");
+        let linked_plain = hash_in("c", &plain, StaticLibUse::Linked);
+        assert!(linked_plain.starts_with("gnu-ar-v2:"));
+        assert_eq!(linked_plain, hash_in("d", &plain, StaticLibUse::Linked));
+    }
+
+    #[test]
+    fn hash_static_lib_memo_rows_are_per_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let fh = FileHasher::persistent(&dir.path().join("index.db"));
+        let lib = dir.path().join("libbig.a");
+        // Large enough for the persistent memo.
+        std::fs::write(
+            &lib,
+            crate::native_archive::dwarf_bsd_archive_for_tests(&vec![0x41_u8; 70_000]),
+        )
+        .unwrap();
+
+        let bundled = fh.hash_static_lib_for(&lib, StaticLibUse::Bundled).unwrap();
+        let linked = fh.hash_static_lib_for(&lib, StaticLibUse::Linked).unwrap();
+        assert!(bundled.starts_with("bsd-ar-v2:"));
+        assert!(linked.starts_with("path-ar-v1:"));
+        assert_eq!(
+            fh.hash_static_lib_for(&lib, StaticLibUse::Bundled).unwrap(),
+            bundled
+        );
+
+        let fingerprint = FileFingerprint::from_path(&lib).unwrap();
+        let cache = fh.cache.as_ref().expect("persistent cache opens");
+        for (namespace, expected) in [
+            ("static-ar-v6-bundled", &bundled),
+            ("static-ar-v6", &linked),
+        ] {
+            let key = FileFingerprint {
+                path: format!("{namespace}\0{}", fingerprint.path),
+                ..fingerprint.clone()
+            };
+            assert_eq!(cache.get(&key).unwrap().as_ref(), Some(expected));
+        }
     }
 
     #[test]

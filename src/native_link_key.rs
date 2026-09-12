@@ -25,7 +25,7 @@
 //! `/MANIFESTFILE:` and `/PDBSTRIPPED:` are only text in the key, so a file
 //! rebuilt under an unchanged name would otherwise restore a stale executable.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -165,7 +165,10 @@ fn xcrun_identity(sdk: &str) -> Option<String> {
 
 /// `ProductVersion` / `ProductBuildVersion` as `xcrun --show-sdk-version` and
 /// `--show-sdk-build-version` report them for this root.
-#[cfg(target_os = "macos")]
+///
+/// Compiled in tests on every OS so the Linux mutation lane can kill mutants
+/// in the plist fallback (`#[cfg(any(test, target_os = "macos"))]`).
+#[cfg(any(test, target_os = "macos"))]
 fn identity_from_sdk_root(root: &Path) -> Result<String> {
     let plist = root.join("System/Library/CoreServices/SystemVersion.plist");
     let body = std::fs::read_to_string(&plist).with_context(|| {
@@ -190,7 +193,7 @@ fn identity_from_sdk_root(root: &Path) -> Result<String> {
     Ok(format!("{version} ({build})"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "macos"))]
 fn plist_string(body: &str, key: &str) -> Option<String> {
     let needle = format!("<key>{key}</key>");
     let rest = body.split(&needle).nth(1)?;
@@ -1725,16 +1728,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn sdk_identity_reads_a_filesystem_sdkroot_when_xcrun_rejects_the_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let plist_dir = root.join("System/Library/CoreServices");
-        std::fs::create_dir_all(&plist_dir).unwrap();
-        std::fs::write(
-            plist_dir.join("SystemVersion.plist"),
-            "\
+    const SYSTEM_VERSION_PLIST: &str = "\
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
 \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
@@ -1746,11 +1740,58 @@ mod tests {
 	<string>14.4</string>
 </dict>
 </plist>
-",
-        )
-        .unwrap();
+";
 
-        let identity = sdk_identity_for(Some(root.display().to_string()))
+    fn write_system_version_plist(root: &Path, body: &str) {
+        let plist_dir = root.join("System/Library/CoreServices");
+        std::fs::create_dir_all(&plist_dir).unwrap();
+        std::fs::write(plist_dir.join("SystemVersion.plist"), body).unwrap();
+    }
+
+    #[test]
+    fn plist_string_reads_xml_string_values_and_rejects_empty() {
+        assert_eq!(
+            plist_string(SYSTEM_VERSION_PLIST, "ProductVersion").as_deref(),
+            Some("14.4")
+        );
+        assert_eq!(
+            plist_string(SYSTEM_VERSION_PLIST, "ProductBuildVersion").as_deref(),
+            Some("23E208")
+        );
+        assert_eq!(plist_string(SYSTEM_VERSION_PLIST, "ProductName"), None);
+        assert_eq!(
+            plist_string(
+                "<key>ProductVersion</key>\n<string>   </string>",
+                "ProductVersion"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn identity_from_sdk_root_reads_system_version_plist() {
+        let dir = tempfile::tempdir().unwrap();
+        write_system_version_plist(dir.path(), SYSTEM_VERSION_PLIST);
+        assert_eq!(identity_from_sdk_root(dir.path()).unwrap(), "14.4 (23E208)");
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(identity_from_sdk_root(empty.path()).is_err());
+
+        let missing_version = tempfile::tempdir().unwrap();
+        write_system_version_plist(
+            missing_version.path(),
+            "<key>ProductBuildVersion</key><string>23E208</string>",
+        );
+        assert!(identity_from_sdk_root(missing_version.path()).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sdk_identity_reads_a_filesystem_sdkroot_when_xcrun_rejects_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_system_version_plist(dir.path(), SYSTEM_VERSION_PLIST);
+
+        let identity = sdk_identity_for(Some(dir.path().display().to_string()))
             .unwrap()
             .expect("a real SDK directory must be identifiable without xcrun --sdk <path>");
         assert_eq!(identity, "14.4 (23E208)");
@@ -1896,12 +1937,10 @@ mod tests {
         environment
             .variables
             .insert("VSCMD_ARG_HOST_ARCH".into(), "mystery".into());
-        assert!(
-            selected_architecture(&environment, "arm64")
-                .unwrap_err()
-                .to_string()
-                .contains("VSCMD_ARG_HOST_ARCH")
-        );
+        assert!(selected_architecture(&environment, "arm64")
+            .unwrap_err()
+            .to_string()
+            .contains("VSCMD_ARG_HOST_ARCH"));
 
         environment.variables.insert("EMPTY".into(), "  ".into());
         assert_eq!(environment.var("EMPTY"), None);
@@ -2036,11 +2075,9 @@ mod tests {
             environment.command_environment(WindowsTool::Cl, &compiler),
             environment.compiler_command_env.as_slice()
         );
-        assert!(
-            environment
-                .command_environment(WindowsTool::Cl, Path::new("other-cl.exe"))
-                .is_empty()
-        );
+        assert!(environment
+            .command_environment(WindowsTool::Cl, Path::new("other-cl.exe"))
+            .is_empty());
     }
 
     #[test]
@@ -2194,18 +2231,16 @@ mod tests {
         );
 
         std::fs::write(second.join("vcruntimed.lib"), b"different").unwrap();
-        assert!(
-            hash_windows_runtime_libraries(
-                &environment,
-                "x64",
-                "10.0.26100.0",
-                "10.0.26100.0",
-                std::slice::from_ref(&first),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("conflicting files")
-        );
+        assert!(hash_windows_runtime_libraries(
+            &environment,
+            "x64",
+            "10.0.26100.0",
+            "10.0.26100.0",
+            std::slice::from_ref(&first),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("conflicting files"));
 
         for (names, expected) in [
             (
@@ -2273,16 +2308,14 @@ mod tests {
         );
 
         let missing = root.path().join("missing");
-        assert!(
-            windows_library_dirs(
-                &environment,
-                "x64",
-                "10.0.26100.0",
-                "10.0.26100.0",
-                &[missing],
-            )
-            .is_err()
-        );
+        assert!(windows_library_dirs(
+            &environment,
+            "x64",
+            "10.0.26100.0",
+            "10.0.26100.0",
+            &[missing],
+        )
+        .is_err());
         let mut invalid_lib = environment.clone();
         invalid_lib.variables.insert(
             "LIB".into(),
@@ -2567,18 +2600,16 @@ mod tests {
         .unwrap();
         assert_eq!(identity.linker, LINK_BANNER);
 
-        assert!(
-            probe_windows_msvc_identity_with(
-                Some(&directory.path().join("cl.exe")),
-                "x64",
-                &[],
-                &environment,
-                |_, _| unreachable!(),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("neither link.exe nor lld-link.exe")
-        );
+        assert!(probe_windows_msvc_identity_with(
+            Some(&directory.path().join("cl.exe")),
+            "x64",
+            &[],
+            &environment,
+            |_, _| unreachable!(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("neither link.exe nor lld-link.exe"));
         for variable in ["LINK", "_LINK_"] {
             let mut with_options = environment.clone();
             with_options

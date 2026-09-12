@@ -56,7 +56,6 @@ known_passthrough = [
   "unsupported|cc preprocessor mode -E to stdout",
   "uncacheable|determining native Windows MSVC link identity: selected Windows linker is neither",
   "uncacheable|determining native Windows MSVC link identity: explicit Windows linker input files",
-  "unsupported|cc unsupported flag(s): -- — not yet",
   "unsupported|cc link mode",
   "unsupported|cc unsupported flag(s): -Wall -Wno-parentheses -Wno-unused-function — not yet",
   "uncacheable|cc -E key probe exited 1",

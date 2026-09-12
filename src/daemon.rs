@@ -1424,6 +1424,10 @@ pub struct GcPolicyOutcome {
     pub disk_bytes_reclaimed: u64,
     #[serde(default)]
     pub entries_unreclaimable: usize,
+    #[serde(default)]
+    pub entries_failed: usize,
+    #[serde(default)]
+    pub entries_locked: usize,
 }
 
 impl From<&crate::store::GcStats> for GcPolicyOutcome {
@@ -1434,6 +1438,8 @@ impl From<&crate::store::GcStats> for GcPolicyOutcome {
             disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
             entries_pinned: stats.entries_pinned,
             entries_unreclaimable: stats.entries_unreclaimable,
+            entries_failed: stats.entries_failed,
+            entries_locked: stats.entries_locked,
         }
     }
 }
@@ -5817,6 +5823,12 @@ impl Daemon {
             disk_bytes_reclaimed: dedup_stats.disk_bytes_reclaimed
                 + evict_stats.disk_bytes_reclaimed
                 + age_evict_stats.disk_bytes_reclaimed,
+            entries_failed: dedup_stats.entries_failed
+                + evict_stats.entries_failed
+                + age_evict_stats.entries_failed,
+            entries_locked: dedup_stats.entries_locked
+                + evict_stats.entries_locked
+                + age_evict_stats.entries_locked,
         };
 
         tracing::info!(
@@ -5827,18 +5839,13 @@ impl Daemon {
             stats.duration_ms,
         );
 
-        // Persist GC stats for report consumption
-        let gc_stats_path = self.config.cache_dir.join("gc_stats.json");
-        let persisted = crate::report::GcStatsPersisted {
-            last_run: chrono::Utc::now().to_rfc3339(),
-            entries_evicted: stats.entries_evicted,
-            bytes_freed: stats.bytes_freed,
-            disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
-            blobs_removed: stats.blobs_removed,
-            duration_ms: stats.duration_ms,
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&persisted) {
-            let _ = std::fs::write(&gc_stats_path, json);
+        // Persist GC stats for reports and machine telemetry. Still under
+        // gc.lock, so the running totals cannot race another driver.
+        if let Err(e) = crate::report::record_gc_run(&self.config.cache_dir, "daemon", &stats) {
+            tracing::debug!(
+                "gc: could not record {}: {e:#}",
+                crate::report::GC_STATS_FILE
+            );
         }
 
         Ok(GcRunReport {

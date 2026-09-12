@@ -11,8 +11,9 @@ use crate::since::SinceWindow;
 
 // ── Data Model ──────────────────────────────────────────────────────────────
 
-/// Persisted GC stats written by the daemon to gc_stats.json.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `gc_stats.json`: the last GC run, whichever driver ran it, plus running
+/// totals across all of them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GcStatsPersisted {
     pub last_run: String,
     pub entries_evicted: usize,
@@ -21,6 +22,87 @@ pub struct GcStatsPersisted {
     pub disk_bytes_reclaimed: u64,
     pub blobs_removed: usize,
     pub duration_ms: u64,
+    /// `daemon` (its sweep, or `kache gc` routed through it), `auto` (the
+    /// detached worker a wrapper spawns when the store outgrows its limit) or
+    /// `manual` (`kache gc` with no daemon). Empty in files written before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default)]
+    pub entries_pinned: usize,
+    #[serde(default)]
+    pub entries_failed: usize,
+    #[serde(default)]
+    pub entries_locked: usize,
+    #[serde(default)]
+    pub totals: GcTotals,
+}
+
+/// Running GC totals since `since`, the first run recorded with totals. The
+/// last run alone cannot show a sweep that has been losing every eviction to
+/// lock contention for weeks; these can.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GcTotals {
+    #[serde(default)]
+    pub since: String,
+    #[serde(default)]
+    pub runs: u64,
+    #[serde(default)]
+    pub entries_evicted: u64,
+    #[serde(default)]
+    pub bytes_freed: u64,
+    #[serde(default)]
+    pub entries_failed: u64,
+    #[serde(default)]
+    pub entries_locked: u64,
+}
+
+pub(crate) const GC_STATS_FILE: &str = "gc_stats.json";
+
+/// Read `cache_dir/gc_stats.json`, or `None` when absent or unparseable.
+pub(crate) fn read_gc_stats(cache_dir: &Path) -> Option<GcStatsPersisted> {
+    let content = std::fs::read_to_string(cache_dir.join(GC_STATS_FILE)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Record one finished GC run: replace the last-run fields and add to the
+/// totals. The read-modify-write is only race-free under `gc.lock`, which every
+/// caller holds, so two drivers never both read the same old totals.
+pub fn record_gc_run(cache_dir: &Path, source: &str, stats: &crate::store::GcStats) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let mut totals = read_gc_stats(cache_dir)
+        .map(|previous| previous.totals)
+        .unwrap_or_default();
+    if totals.since.is_empty() {
+        totals.since = now.clone();
+    }
+    totals.runs = totals.runs.saturating_add(1);
+    totals.entries_evicted = totals
+        .entries_evicted
+        .saturating_add(stats.entries_evicted as u64);
+    totals.bytes_freed = totals.bytes_freed.saturating_add(stats.bytes_freed);
+    totals.entries_failed = totals
+        .entries_failed
+        .saturating_add(stats.entries_failed as u64);
+    totals.entries_locked = totals
+        .entries_locked
+        .saturating_add(stats.entries_locked as u64);
+
+    let persisted = GcStatsPersisted {
+        last_run: now,
+        entries_evicted: stats.entries_evicted,
+        bytes_freed: stats.bytes_freed,
+        disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
+        blobs_removed: stats.blobs_removed,
+        duration_ms: stats.duration_ms,
+        source: source.to_string(),
+        entries_pinned: stats.entries_pinned,
+        entries_failed: stats.entries_failed,
+        entries_locked: stats.entries_locked,
+        totals,
+    };
+    let json = serde_json::to_string_pretty(&persisted)?;
+    kache_store::atomic::atomic_replace(&cache_dir.join(GC_STATS_FILE), json.as_bytes())
 }
 
 /// GC summary included in build reports when GC ran recently.
@@ -3686,6 +3768,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("gc_stats.json"), b"not json").unwrap();
         assert!(load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now())).is_none());
+    }
+
+    #[test]
+    fn record_gc_run_keeps_the_last_run_and_totals_across_drivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = crate::store::GcStats {
+            entries_evicted: 3,
+            bytes_freed: 100,
+            entries_failed: 2,
+            entries_locked: 2,
+            ..Default::default()
+        };
+        let second = crate::store::GcStats {
+            entries_evicted: 1,
+            bytes_freed: 50,
+            entries_failed: 5,
+            entries_locked: 4,
+            ..Default::default()
+        };
+        record_gc_run(dir.path(), "daemon", &first).unwrap();
+        record_gc_run(dir.path(), "auto", &second).unwrap();
+
+        let stats = read_gc_stats(dir.path()).unwrap();
+        assert_eq!(stats.source, "auto");
+        assert_eq!(
+            stats.entries_evicted, 1,
+            "last-run fields describe the latest run"
+        );
+        assert_eq!(stats.entries_failed, 5);
+        assert_eq!(stats.entries_locked, 4);
+        assert_eq!(stats.totals.runs, 2);
+        assert_eq!(stats.totals.entries_evicted, 4);
+        assert_eq!(stats.totals.bytes_freed, 150);
+        assert_eq!(stats.totals.entries_failed, 7);
+        assert_eq!(stats.totals.entries_locked, 6);
+        assert!(!stats.totals.since.is_empty());
+    }
+
+    /// A file written before totals existed must still load, start its totals
+    /// at the next run, and keep feeding the report's GC section.
+    #[test]
+    fn record_gc_run_starts_totals_over_a_pre_totals_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gc_stats(dir.path(), Utc::now() - chrono::Duration::hours(1));
+        let old = read_gc_stats(dir.path()).expect("the old format still parses");
+        assert!(old.source.is_empty());
+        assert_eq!(old.totals, GcTotals::default());
+
+        let run = crate::store::GcStats {
+            entries_evicted: 2,
+            ..Default::default()
+        };
+        record_gc_run(dir.path(), "manual", &run).unwrap();
+
+        let stats = read_gc_stats(dir.path()).unwrap();
+        assert_eq!(stats.totals.runs, 1);
+        assert_eq!(stats.totals.entries_evicted, 2);
+        let gc = load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now()))
+            .expect("the recorded run is inside the window");
+        assert_eq!(gc.entries_evicted, 2);
     }
 
     fn test_event(

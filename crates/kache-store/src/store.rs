@@ -790,6 +790,30 @@ pub struct GcStats {
     /// Best-effort private bytes actually returned by unlinking store names.
     #[serde(default)]
     pub disk_bytes_reclaimed: u64,
+    /// Entries eviction selected but failed to remove: an unreadable
+    /// `meta.json` (#276), a SQLite error. Counted rather than only logged, so
+    /// a sweep that keeps failing shows up in its own stats instead of only
+    /// as warning lines nobody reads.
+    #[serde(default)]
+    pub entries_failed: usize,
+    /// The part of [`Self::entries_failed`] that was SQLite write contention
+    /// (`SQLITE_BUSY` / `SQLITE_LOCKED`): the sweep lost the write lock to live
+    /// builds, as opposed to finding a damaged entry.
+    #[serde(default)]
+    pub entries_locked: usize,
+}
+
+/// Whether `err` carries SQLite write contention (`SQLITE_BUSY` or
+/// `SQLITE_LOCKED`) anywhere in its cause chain. Bad data and I/O errors are
+/// not contention; GC counts the two apart.
+pub fn is_sqlite_contention(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<SqlError>(),
+            Some(SqlError::SqliteFailure(code, _))
+                if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        )
+    })
 }
 
 /// Registered blob bytes and blob rows an entry removal released — blobs
@@ -3612,6 +3636,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     // A corrupt entry (unloadable meta.json) refuses removal to
                     // avoid leaking blob refcounts (#276); skip it and keep
                     // evicting the rest rather than aborting the whole sweep.
+                    stats.entries_failed += 1;
+                    if is_sqlite_contention(&e) {
+                        stats.entries_locked += 1;
+                    }
                     tracing::warn!("gc: skipping eviction of {key}: {e:#}");
                     continue;
                 }
@@ -7135,6 +7163,94 @@ mod tests {
         let stats = store.evict().unwrap();
         assert!(stats.entries_evicted > 0);
         assert!(!store.contains("key1"));
+    }
+
+    /// Put one 200-byte entry into a 100-byte store and age it past the pin
+    /// grace, so the next size eviction selects it.
+    fn store_with_one_evictable_entry(dir: &Path, key: &str) -> (Store, Config) {
+        let mut config = test_config(dir);
+        config.max_size = 100;
+        let store = Store::open(&config).unwrap();
+        let output_file = dir.join("big.rlib");
+        std::fs::write(&output_file, vec![0u8; 200]).unwrap();
+        store
+            .put(
+                key,
+                "big_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output_file.clone(), "libbig.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&output_file);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = ?1",
+                params![key],
+            )
+            .unwrap();
+        (store, config)
+    }
+
+    #[test]
+    fn evict_counts_an_entry_it_fails_to_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _config) = store_with_one_evictable_entry(dir.path(), "broken");
+        std::fs::write(store.entry_dir("broken").join("meta.json"), b"{not json").unwrap();
+
+        let stats = store.evict().unwrap();
+
+        assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(
+            stats.entries_failed, 1,
+            "the refused removal is counted: {stats:?}"
+        );
+        assert_eq!(stats.entries_locked, 0, "bad data is not lock contention");
+        assert_eq!(store.entry_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn evict_counts_lock_contention_apart_from_bad_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, config) = store_with_one_evictable_entry(dir.path(), "busy");
+        // A second writer holding the database, as a live build does when it
+        // records a hit; the removal waits out the busy timeout and fails.
+        let blocker = Connection::open(config.index_db_path()).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let stats = store.evict().unwrap();
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        assert_eq!(stats.entries_evicted, 0);
+        assert_eq!(stats.entries_failed, 1, "{stats:?}");
+        assert_eq!(
+            stats.entries_locked, 1,
+            "contention is counted as locked: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn is_sqlite_contention_matches_busy_and_locked_only() {
+        let sqlite = |code: i32| {
+            anyhow::Error::from(SqlError::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+            .context("removing entry")
+        };
+        assert!(is_sqlite_contention(&sqlite(rusqlite::ffi::SQLITE_BUSY)));
+        assert!(is_sqlite_contention(&sqlite(rusqlite::ffi::SQLITE_LOCKED)));
+        assert!(!is_sqlite_contention(&sqlite(
+            rusqlite::ffi::SQLITE_CORRUPT
+        )));
+        assert!(!is_sqlite_contention(&anyhow::anyhow!(
+            "meta.json unparseable"
+        )));
     }
 
     #[cfg(unix)]

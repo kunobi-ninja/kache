@@ -2813,6 +2813,21 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
+    // Still under gc.lock, so the totals update cannot race another driver.
+    // The auto-GC worker used to discard this outcome entirely. A failed write
+    // must not fail the sweep it describes.
+    let source = if mode == GcMode::Background {
+        "auto"
+    } else {
+        "manual"
+    };
+    if let Err(e) = crate::report::record_gc_run(&config.cache_dir, source, &combined) {
+        tracing::debug!(
+            "gc: could not record {}: {e:#}",
+            crate::report::GC_STATS_FILE
+        );
+    }
+
     Ok(combined)
 }
 
@@ -2835,6 +2850,8 @@ fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats)
     total.disk_bytes_reclaimed = total
         .disk_bytes_reclaimed
         .saturating_add(part.disk_bytes_reclaimed);
+    total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
+    total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
     total.skipped |= part.skipped;
 }
 
@@ -2850,6 +2867,8 @@ fn gc_stats_from_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store:
         total.entries_unreclaimable = total
             .entries_unreclaimable
             .saturating_add(part.entries_unreclaimable);
+        total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
+        total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
     }
     total
 }
@@ -6793,6 +6812,8 @@ mod tests {
                 entries_pinned: (n * 100) as usize,
                 disk_bytes_reclaimed: n * 1_000,
                 entries_unreclaimable: (n * 10_000) as usize,
+                entries_failed: (n * 100_000) as usize,
+                entries_locked: (n * 1_000_000) as usize,
             }
         }
         let report = crate::daemon::GcBreakdown {
@@ -6807,6 +6828,8 @@ mod tests {
         assert_eq!(total.entries_pinned, 600);
         assert_eq!(total.disk_bytes_reclaimed, 6_000);
         assert_eq!(total.entries_unreclaimable, 60_000);
+        assert_eq!(total.entries_failed, 600_000);
+        assert_eq!(total.entries_locked, 6_000_000);
 
         let mut accumulated = crate::store::GcStats {
             entries_evicted: 1,
@@ -6817,6 +6840,8 @@ mod tests {
             entries_unreclaimable: 5,
             disk_bytes_reclaimed: 6,
             skipped: false,
+            entries_failed: 8,
+            entries_locked: 9,
         };
         let part = crate::store::GcStats {
             entries_evicted: 10,
@@ -6827,6 +6852,8 @@ mod tests {
             entries_unreclaimable: 50,
             disk_bytes_reclaimed: 60,
             skipped: true,
+            entries_failed: 80,
+            entries_locked: 90,
         };
         add_gc_stats(&mut accumulated, &part);
         assert_eq!(accumulated.entries_evicted, 11);
@@ -6836,7 +6863,27 @@ mod tests {
         assert_eq!(accumulated.duration_ms, 77);
         assert_eq!(accumulated.entries_unreclaimable, 55);
         assert_eq!(accumulated.disk_bytes_reclaimed, 66);
+        assert_eq!(accumulated.entries_failed, 88);
+        assert_eq!(accumulated.entries_locked, 99);
         assert!(accumulated.skipped);
+    }
+
+    /// The auto-GC worker used to throw its outcome away, so a machine where
+    /// only the worker ever ran GC had no `gc_stats.json` at all.
+    #[test]
+    fn local_gc_records_its_run_with_the_driver_that_ran_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+
+        run_gc_local(&config, GcMode::Background).unwrap();
+        let stats = crate::report::read_gc_stats(&config.cache_dir).expect("worker run recorded");
+        assert_eq!(stats.source, "auto");
+        assert_eq!(stats.totals.runs, 1);
+
+        run_gc_local(&config, GcMode::Cli).unwrap();
+        let stats = crate::report::read_gc_stats(&config.cache_dir).unwrap();
+        assert_eq!(stats.source, "manual");
+        assert_eq!(stats.totals.runs, 2);
     }
 
     #[test]

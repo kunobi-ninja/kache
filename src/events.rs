@@ -565,6 +565,14 @@ fn append_log_line(event_log_path: &Path, line: String) -> Result<()> {
     write_result
 }
 
+/// Append one JSON record to a JSONL log under the same exclusive sidecar lock
+/// as the event log, for logs outside the event, summary and transfer set such
+/// as the machine-level session records in the cache dir.
+pub fn append_json_line<T: Serialize>(log_path: &Path, record: &T) -> Result<()> {
+    let line = serde_json::to_string(record).context("serializing log record")?;
+    append_log_line(log_path, line)
+}
+
 /// Append a build event to the event log file.
 /// Uses an exclusive sidecar file lock so concurrent wrapper processes cannot
 /// interleave JSON lines.

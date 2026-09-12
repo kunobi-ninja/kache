@@ -334,6 +334,12 @@ enum Commands {
         /// Number of top entries to show
         #[arg(long, default_value = "10")]
         top: usize,
+
+        /// Also append this report's summary and timing, with the host's load,
+        /// to `<cache dir>/telemetry/sessions.jsonl`, which outlives the
+        /// runtime dir a CI job deletes
+        #[arg(long)]
+        record: bool,
     },
 
     /// Open the configuration editor
@@ -804,6 +810,7 @@ fn main() -> Result<()> {
             root,
             output,
             top,
+            record,
         }) => {
             let window = parse_since_window(&since)?;
             cli::report(
@@ -813,6 +820,7 @@ fn main() -> Result<()> {
                 report::ReportFilter { root, last_build },
                 output,
                 top,
+                record,
             )
         }
         Some(Commands::Stats {

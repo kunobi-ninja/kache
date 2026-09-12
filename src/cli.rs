@@ -422,6 +422,36 @@ fn index_file_bytes(config: &Config) -> Option<u64> {
         .map(|db| db.len() + std::fs::metadata(&wal).map(|w| w.len()).unwrap_or(0))
 }
 
+/// The machine-level session log. In the cache dir, which every job on the
+/// host shares, not the runtime dir a CI job deletes when it ends.
+pub(crate) fn session_log_path(config: &Config) -> std::path::PathBuf {
+    config.cache_dir.join("telemetry").join("sessions.jsonl")
+}
+
+/// Append `report` to the machine-level session log (`kache report
+/// --record`): its summary and timing breakdown, plus what the host looked
+/// like at that moment. Meant for the end of a CI job, before its runtime dir
+/// and the events in it are deleted.
+pub(crate) fn record_session(config: &Config, report: &crate::report::BuildReport) -> Result<()> {
+    let machine = crate::report::SessionMachine {
+        load_1m: crate::otel::load_average_1m(),
+        cpus: std::thread::available_parallelism()
+            .ok()
+            .and_then(|n| u32::try_from(n.get()).ok()),
+        index_bytes: index_file_bytes(config),
+        store_max: config.max_size,
+    };
+    let record =
+        crate::report::SessionRecord::from_report(report, crate::otel::host_name(), machine);
+    let path = session_log_path(config);
+    crate::events::append_json_line(&path, &record)?;
+    crate::events::rotate_if_needed(
+        &path,
+        config.event_log_max_size,
+        config.event_log_keep_lines,
+    )
+}
+
 /// Write cache counters as OTLP JSON for Kartero (`metrics.otlp.json` +
 /// `schema_version`). Uses the running daemon when reachable; otherwise the
 /// local store. Does not auto-start a daemon, so a finished bench dumps what
@@ -1158,12 +1188,16 @@ pub fn report(
     filter: crate::report::ReportFilter,
     output: Option<std::path::PathBuf>,
     top: usize,
+    record: bool,
 ) -> Result<()> {
     let report = if filter.root.is_some() || filter.last_build {
         crate::report::generate_report_with_filter(config, window, top, &filter)?
     } else {
         crate::report::generate_report(config, window, top)?
     };
+    if record {
+        record_session(config, &report)?;
+    }
 
     let text = match format {
         "json" => crate::report::format_json(&report)?,
@@ -7159,6 +7193,94 @@ mod tests {
             "waited {waited:?} on a locked index"
         );
         holder.execute_batch("COMMIT").unwrap();
+    }
+
+    fn report_run(config: &Config, out: &std::path::Path, record: bool) {
+        report(
+            config,
+            "json",
+            SinceWindow::DEFAULT,
+            crate::report::ReportFilter {
+                root: Some(std::path::PathBuf::from("/ci/runner-3/_work/secret-repo")),
+                last_build: false,
+            },
+            Some(out.join("report.json")),
+            10,
+            record,
+        )
+        .unwrap();
+    }
+
+    /// Every file under `dir` with its contents.
+    fn tree_contents(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let body = std::fs::read(&path).unwrap();
+                    files.push((path, body));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// Recording is opt-in: a plain `kache report` leaves the cache dir
+    /// exactly as it found it.
+    #[test]
+    fn report_without_record_leaves_the_cache_dir_unchanged() {
+        let cache = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(cache.path().to_path_buf(), None);
+        drop(Store::open(&config).unwrap());
+        let before = tree_contents(cache.path());
+
+        report_run(&config, out.path(), false);
+
+        assert!(out.path().join("report.json").is_file());
+        assert!(!cache.path().join("telemetry").exists());
+        assert_eq!(tree_contents(cache.path()), before);
+    }
+
+    /// The report reads events from the runtime dir, which CI deletes with the
+    /// job, so a recorded session has to land in the cache dir, without the
+    /// path.
+    #[test]
+    fn report_record_appends_one_line_to_the_cache_dir_not_the_runtime_dir() {
+        let cache = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(cache.path().to_path_buf(), None);
+        config.runtime_dir = runtime.path().to_path_buf();
+        let line_count = || {
+            std::fs::read_to_string(session_log_path(&config))
+                .unwrap()
+                .lines()
+                .count()
+        };
+
+        report_run(&config, out.path(), true);
+        assert_eq!(line_count(), 1, "one line per recorded session");
+        report_run(&config, out.path(), true);
+        assert_eq!(line_count(), 2, "a second record appends, never rewrites");
+
+        assert!(!runtime.path().join("telemetry").exists());
+        let log = std::fs::read_to_string(session_log_path(&config)).unwrap();
+        let lines: Vec<_> = log.lines().collect();
+        assert!(
+            !log.contains("secret-repo"),
+            "the root is hashed, never written"
+        );
+        let record: crate::report::SessionRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(record.schema, crate::report::SESSION_RECORD_SCHEMA);
+        assert_eq!(record.root_hash.as_deref().map(str::len), Some(16));
+        assert_eq!(record.summary.total_crates, 0);
+        assert_eq!(record.machine.store_max, config.max_size);
     }
 
     #[test]

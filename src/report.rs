@@ -105,6 +105,71 @@ pub fn record_gc_run(cache_dir: &Path, source: &str, stats: &crate::store::GcSta
     kache_store::atomic::atomic_replace(&cache_dir.join(GC_STATS_FILE), json.as_bytes())
 }
 
+/// Schema of one line in `cache_dir/telemetry/sessions.jsonl`.
+pub const SESSION_RECORD_SCHEMA: u32 = 1;
+
+/// One build session's report, kept at machine level. `kache report` reads
+/// events from the runtime dir, which CI deletes with the job; this line is
+/// what survives, in the cache dir every job on the host shares.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub ts: String,
+    pub schema: u32,
+    pub kache_version: String,
+    pub host: String,
+    /// The report window as its heading shows it: `24h`, `build session`.
+    pub window: String,
+    /// First 16 hex digits of blake3(root), never the path itself: enough to
+    /// tell builds of one tree apart across jobs without recording where the
+    /// tree lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
+    pub summary: ReportSummary,
+    pub timing: TimingBreakdown,
+    pub machine: SessionMachine,
+}
+
+/// The host when the session was recorded: the context that separates a slow
+/// cache from a busy machine.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SessionMachine {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_1m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_bytes: Option<u64>,
+    pub store_max: u64,
+}
+
+impl SessionRecord {
+    pub fn from_report(report: &BuildReport, host: String, machine: SessionMachine) -> Self {
+        let meta = &report.meta;
+        let window = meta.window_label();
+        let (root, session_id) = match &meta.session {
+            Some(session) => (Some(session.root.clone()), session.session_id.clone()),
+            None => (meta.root_filter.clone(), String::new()),
+        };
+        let root_hash = root
+            .filter(|root| !root.is_empty())
+            .map(|root| blake3::hash(root.as_bytes()).to_hex().as_str()[..16].to_string());
+        Self {
+            ts: Utc::now().to_rfc3339(),
+            schema: SESSION_RECORD_SCHEMA,
+            kache_version: meta.kache_version.clone(),
+            host,
+            window,
+            root_hash,
+            session_id,
+            summary: report.summary.clone(),
+            timing: report.timing.clone(),
+            machine,
+        }
+    }
+}
+
 /// GC summary included in build reports when GC ran recently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcSummary {
@@ -219,7 +284,7 @@ fn default_trace_display_time_unit() -> String {
     "ms".to_string()
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportSummary {
     pub hit_rate_pct: f64,
     pub weighted_hit_rate_pct: Option<f64>,
@@ -280,7 +345,7 @@ pub struct ReportTimeline {
     pub error_count: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimingBreakdown {
     pub hit_time_ms: u64,
     pub miss_time_ms: u64,

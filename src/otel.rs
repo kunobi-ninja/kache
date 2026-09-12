@@ -560,6 +560,20 @@ pub(crate) fn host_name() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_default()
 }
 
+/// The one-minute load average, where the OS reports one.
+#[cfg(unix)]
+pub(crate) fn load_average_1m() -> Option<f64> {
+    let mut loads = [0f64; 3];
+    // SAFETY: `loads` holds the three samples getloadavg may write.
+    let n = unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
+    (n >= 1).then_some(loads[0])
+}
+
+#[cfg(not(unix))]
+pub(crate) fn load_average_1m() -> Option<f64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

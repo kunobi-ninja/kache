@@ -230,20 +230,21 @@ impl NvccArgs {
             }
         };
 
-        let argv = parsed.rest.clone();
-        let mut i = 0;
-        while i < argv.len() {
-            let arg = argv[i].as_str();
-            // Value-taking flags in `--flag value` form consume argv[i+1].
-            // `take_value` bails on a missing value — a truncated line is a
-            // parse error, and the wrapper surfaces the real compiler's
-            // diagnostic via passthrough (fail-closed, never miskey).
-            let take_value = |i: &mut usize, flag: &str| -> Result<String> {
-                *i += 1;
-                argv.get(*i)
-                    .cloned()
-                    .with_context(|| format!("nvcc: {flag} missing value"))
-            };
+        // Iterator, not an index: there is no counter to mutate, so the
+        // loop cannot hang on a bad increment — a truncated line ends the
+        // iteration and `take_value` bails fail-closed (never miskeyed).
+        let mut argv = parsed.rest.clone().into_iter();
+        while let Some(arg) = argv.next() {
+            let arg = arg.as_str();
+            // Value-taking flags in `--flag value` form consume the next
+            // item. A missing value bails: truncated line, parse error, and
+            // the wrapper surfaces the real compiler's diagnostic via
+            // passthrough.
+            let take_value =
+                |argv: &mut std::vec::IntoIter<String>, flag: &str| -> Result<String> {
+                    argv.next()
+                        .with_context(|| format!("nvcc: {flag} missing value"))
+                };
             match arg {
                 "-c" | "--compile" => set_vote(Vote::Compile, NvccMode::Compile, &mut parsed),
                 "-dc" | "--device-c" => {
@@ -271,7 +272,7 @@ impl NvccArgs {
                     set_vote(Vote::Query, NvccMode::Query, &mut parsed);
                 }
                 "-o" => {
-                    let value = take_value(&mut i, "-o")?;
+                    let value = take_value(&mut argv, "-o")?;
                     parsed.output = Some(PathBuf::from(value));
                 }
                 // Joined `-oout.o`. (No length check: the exact `"-o"` arm
@@ -294,7 +295,7 @@ impl NvccArgs {
                     parsed.deferred_flags.push(arg.to_string());
                 }
                 _ if VALUE_FLAGS.contains(&arg) => {
-                    let value = take_value(&mut i, arg)?;
+                    let value = take_value(&mut argv, arg)?;
                     parsed.deferred_flags.push(format!("{arg} {value}"));
                 }
                 _ if JOINED_PREFIXES.iter().any(|p| arg.starts_with(p)) => {
@@ -312,7 +313,6 @@ impl NvccArgs {
                     }
                 }
             }
-            i += 1;
         }
         Ok(parsed)
     }

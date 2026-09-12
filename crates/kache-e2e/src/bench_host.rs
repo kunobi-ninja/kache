@@ -208,6 +208,35 @@ fn bsd_mounts(text: &str) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
+/// Host facts from BSD-style sources: a `sysctl -n <name>` lookup and the
+/// `mount` table. Platform-neutral so every host compiles and tests the field
+/// mapping; only the macOS module feeds it real commands.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn bsd_host_facts(
+    sysctl: impl Fn(&str) -> Option<String>,
+    mount_table: Option<String>,
+    work_dir: &Path,
+) -> HostInfo {
+    HostInfo {
+        logical_cpus: sysctl("hw.logicalcpu").and_then(|v| v.parse().ok()),
+        cpu_model: sysctl("machdep.cpu.brand_string"),
+        memory_bytes: sysctl("hw.memsize").and_then(|v| v.parse().ok()),
+        kernel_release: sysctl("kern.osrelease"),
+        work_dir_fs: mount_table.and_then(|text| fs_type_for(work_dir, &bsd_mounts(&text))),
+        ..HostInfo::default()
+    }
+}
+
+/// A load sample from a BSD `sysctl` lookup. BSD has no pressure-stall
+/// counters, so only the load average is filled in.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn bsd_load_sample(sysctl: impl Fn(&str) -> Option<String>) -> LoadSample {
+    LoadSample {
+        loadavg: sysctl("vm.loadavg").as_deref().and_then(parse_loadavg),
+        ..LoadSample::default()
+    }
+}
+
 fn read(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
@@ -391,23 +420,15 @@ mod macos {
     }
 
     pub(super) fn host_facts(work_dir: &Path) -> HostInfo {
-        let work_dir = canonical(work_dir);
-        HostInfo {
-            logical_cpus: sysctl("hw.logicalcpu").and_then(|v| v.parse().ok()),
-            cpu_model: sysctl("machdep.cpu.brand_string"),
-            memory_bytes: sysctl("hw.memsize").and_then(|v| v.parse().ok()),
-            kernel_release: sysctl("kern.osrelease"),
-            work_dir_fs: stdout_of(&mut Command::new("mount"))
-                .and_then(|text| fs_type_for(&work_dir, &bsd_mounts(&text))),
-            ..HostInfo::default()
-        }
+        bsd_host_facts(
+            sysctl,
+            stdout_of(&mut Command::new("mount")),
+            &canonical(work_dir),
+        )
     }
 
     pub(super) fn load_sample() -> LoadSample {
-        LoadSample {
-            loadavg: sysctl("vm.loadavg").as_deref().and_then(parse_loadavg),
-            ..LoadSample::default()
-        }
+        bsd_load_sample(sysctl)
     }
 }
 
@@ -583,6 +604,52 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn bsd_host_facts_map_each_sysctl_and_the_mount_table() {
+        let sysctl = |name: &str| {
+            match name {
+                "hw.logicalcpu" => Some("10"),
+                "machdep.cpu.brand_string" => Some("Apple M1 Pro"),
+                "hw.memsize" => Some("17179869184"),
+                "kern.osrelease" => Some("24.6.0"),
+                _ => None,
+            }
+            .map(str::to_string)
+        };
+        let mounts = "/dev/disk3s1s1 on / (apfs, local, read-only, journaled)\n\
+                      /dev/disk5s1 on /Volumes/Work (hfs, local, journaled)\n";
+        let facts = bsd_host_facts(
+            sysctl,
+            Some(mounts.to_string()),
+            Path::new("/Volumes/Work/kache"),
+        );
+        assert_eq!(facts.logical_cpus, Some(10));
+        assert_eq!(facts.cpu_model.as_deref(), Some("Apple M1 Pro"));
+        assert_eq!(facts.memory_bytes, Some(17_179_869_184));
+        assert_eq!(facts.kernel_release.as_deref(), Some("24.6.0"));
+        assert_eq!(facts.work_dir_fs.as_deref(), Some("hfs"));
+    }
+
+    #[test]
+    fn bsd_host_facts_leave_unreadable_values_unknown() {
+        let sysctl = |name: &str| (name == "hw.logicalcpu").then(|| "ten".to_string());
+        let facts = bsd_host_facts(sysctl, None, Path::new("/Volumes/Work"));
+        assert_eq!(facts.logical_cpus, None);
+        assert_eq!(facts.cpu_model, None);
+        assert_eq!(facts.memory_bytes, None);
+        assert_eq!(facts.kernel_release, None);
+        assert_eq!(facts.work_dir_fs, None);
+    }
+
+    #[test]
+    fn bsd_load_sample_reads_the_sysctl_load_average() {
+        let sample = bsd_load_sample(|name: &str| {
+            (name == "vm.loadavg").then(|| "{ 1.93 2.05 2.14 }\n".to_string())
+        });
+        assert_eq!(sample.loadavg, Some([1.93, 2.05, 2.14]));
+        assert_eq!(bsd_load_sample(|_: &str| None).loadavg, None);
     }
 
     #[test]

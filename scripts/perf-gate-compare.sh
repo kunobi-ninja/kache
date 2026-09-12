@@ -16,6 +16,11 @@
 # compares, and `wall_s`, the whole-second view the nightly reports and their
 # telemetry carry.
 #
+# Beside the wall clocks, the warm build's deterministic counts (hits, misses,
+# passthroughs, dep-info pre-pass runs) are compared when both results carry
+# them. More warm misses or passthroughs than the merge base fails the gate
+# on its own: a count does not move with the runner.
+#
 # Writes a markdown report to <markdown-out> for the step summary and the PR
 # comment, prints the same table to stdout, and exits non-zero when the gate
 # fails.
@@ -184,6 +189,61 @@ runner_drift="$(awk -v bc="$base_cold" -v hc="$head_cold" -v bw="$base_warm" -v 
         print (warm_pct > lim + 0 && cold_pct > lim + 0 && warm_pct <= cold_pct) ? "yes" : "no"
     }')"
 
+# ── Deterministic counts ─────────────────────────────────────────────────────
+# Wall clocks move with the runner; counts do not. Both sides build the same
+# subject at the same commit into an empty store, so the warm build's counts
+# depend on kache alone. A warm miss the merge base did not have is a compile
+# the head no longer serves from the cache, and a new passthrough is one it no
+# longer tries to cache. Either fails the gate whatever the wall clock says,
+# and the runner-drift pardon above does not apply to it. Fewer is never a
+# failure. The other rows are context for the reviewer.
+#
+# A row appears only when both result JSONs carry the field, so a result from
+# an older engine is compared on what it has rather than rejected. The table
+# itself appears only when at least one blocking count could be compared;
+# hits alone say nothing the validity gates above have not already checked.
+count_rows=()
+count_failures=()
+blocking_counts=0
+
+count_row() {
+    local label="$1" path="$2" blocking="$3"
+    local b h delta
+    b="$(field "$base_json" "$path")"
+    h="$(field "$head_json" "$path")"
+    if [ -z "$b" ] || [ -z "$h" ]; then
+        return 0
+    fi
+    delta=$((h - b))
+    if [ "$delta" -gt 0 ]; then
+        delta="+$delta"
+    fi
+    count_rows+=("| $label | $b | $h | $delta |")
+    if [ "$blocking" = "blocking" ]; then
+        blocking_counts=$((blocking_counts + 1))
+        if [ "$h" -gt "$b" ]; then
+            count_failures+=("$label rose from $b to $h")
+        fi
+    fi
+}
+
+count_row "hits" .warm_same_tree.hits reported
+count_row "misses" .warm_same_tree.misses blocking
+count_row "passthroughs" .warm_same_tree.event_log.passed_through blocking
+count_row "dep-info pre-pass runs" .warm_same_tree.phases.dep_info_runs reported
+
+count_table() {
+    [ "$blocking_counts" -gt 0 ] || return 0
+    echo "| warm build count | merge base | PR head | delta |"
+    echo "| --- | ---: | ---: | ---: |"
+    printf '%s\n' "${count_rows[@]}"
+    echo
+    echo "Counts do not move with the runner. More misses or passthroughs than the"
+    echo "merge base fails the gate whatever the wall clock says; the other rows are"
+    echo "reported only."
+    echo
+}
+
 # ── Where the warm build's time went ─────────────────────────────────────────
 # The wall-clock rows above say a build got slower. This says which part of the
 # wrapper did it, from the same phase totals the Perfetto trace draws per crate.
@@ -243,7 +303,11 @@ phase_table() {
 
 # The workflow's report step parses this first line into the commit status:
 # it strips the leading `## Perf gate: ` and keeps the rest. Keep the grammar.
-if [ "$regressed" = "yes" ] && [ "$runner_drift" = "yes" ]; then
+# A count failure leads: it is the one verdict the runner cannot explain.
+if [ "${#count_failures[@]}" -gt 0 ]; then
+    count_summary="$(printf '%s; ' "${count_failures[@]}")"
+    headline="## Perf gate: FAIL — warm build ${count_summary%; } (wall-clock ${warm_pct}%)"
+elif [ "$regressed" = "yes" ] && [ "$runner_drift" = "yes" ]; then
     headline="## Perf gate: pass — warm build ${warm_pct}% (limit +${WARM_REGRESSION_LIMIT_PCT}%; cold ${cold_pct}% on the same runner)"
 elif [ "$regressed" = "yes" ]; then
     headline="## Perf gate: FAIL — warm build ${warm_pct}% (limit +${WARM_REGRESSION_LIMIT_PCT}%)"
@@ -268,10 +332,19 @@ fi
     echo
     echo "Milliseconds (merge base / PR head): cold ${base_cold} / ${head_cold}, warm ${base_warm} / ${head_warm}, cross-worktree ${base_cross} / ${head_cross}."
     echo
+    count_table
     phase_table
 } | tee "$md_out"
 
+gate_status=0
+if [ "${#count_failures[@]}" -gt 0 ]; then
+    for f in "${count_failures[@]}"; do
+        echo "::error::perf gate: warm build $f; counts do not move with the runner, so this is the cache"
+    done
+    gate_status=1
+fi
 if [ "$regressed" = "yes" ] && [ "$runner_drift" != "yes" ]; then
     echo "::error::perf gate: warm wall-clock regressed ${warm_pct}% (merge base ${base_warm} ms, PR head ${head_warm} ms; limit +${WARM_REGRESSION_LIMIT_PCT}%)"
-    exit 1
+    gate_status=1
 fi
+exit "$gate_status"

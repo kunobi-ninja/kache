@@ -204,6 +204,105 @@ run_gate "$work/base.json" "$work/nullphase.json"
 expect_status "a null same-tree phase is rejected" 1
 expect_line "a null phase is reported as missing, not as lacking wall_ms" "PR head: no warm-same-tree phase in the result JSON"
 
+# --- deterministic counts -----------------------------------------------------
+#
+# The warm build's counts, added to a result the way the engine writes them.
+#   counts <path> <misses> <passthroughs>
+counts() {
+    jq --argjson m "$2" --argjson p "$3" \
+        '.warm_same_tree.misses = $m
+         | .warm_same_tree.event_log.passed_through = $p
+         | .warm_same_tree.phases.dep_info_runs = 315' \
+        "$1" >"$1.tmp" && mv "$1.tmp" "$1"
+}
+
+expect_no_line() {
+    local name="$1" substr="$2"
+    if [[ "$out" != *"$substr"* ]]; then ok "$name"; else no "$name" "output had '$substr': $out"; fi
+}
+
+# The results above carry hits but no miss or passthrough counts, so their
+# output is exactly what it was before counts were compared.
+result "$work/base.json" 112400 14600 17000
+result "$work/head.json" 108100 15100 16200
+run_gate "$work/base.json" "$work/head.json"
+expect_no_line "no count table without a blocking count on both sides" "| warm build count |"
+
+# Misses on one side only: nothing to compare, so nothing blocks.
+counts "$work/head.json" 9 99
+run_gate "$work/base.json" "$work/head.json"
+expect_status "counts on one side only do not fail" 0
+expect_no_line "counts on one side only print no table" "| warm build count |"
+
+counts "$work/base.json" 2 12
+counts "$work/head.json" 2 12
+run_gate "$work/base.json" "$work/head.json"
+expect_status "equal counts pass" 0
+expect_headline "equal counts keep the wall-clock headline" \
+    "## Perf gate: pass — warm build +3.4% (limit +5.0%)"
+expect_line "the count table has a header" "| warm build count | merge base | PR head | delta |"
+expect_line "hits are reported" "| hits | 783 | 783 | 0 |"
+expect_line "misses are reported" "| misses | 2 | 2 | 0 |"
+expect_line "passthroughs are reported" "| passthroughs | 12 | 12 | 0 |"
+expect_line "dep-info runs are reported" "| dep-info pre-pass runs | 315 | 315 | 0 |"
+
+# One more warm miss fails even though the wall clock is inside the limit.
+counts "$work/head.json" 3 12
+run_gate "$work/base.json" "$work/head.json"
+expect_status "one extra warm miss fails" 1
+expect_headline "the count failure leads the headline" \
+    "## Perf gate: FAIL — warm build misses rose from 2 to 3 (wall-clock +3.4%)"
+expect_line "the extra miss shows as a positive delta" "| misses | 2 | 3 | +1 |"
+expect_line "the extra miss is annotated" \
+    "::error::perf gate: warm build misses rose from 2 to 3; counts do not move with the runner, so this is the cache"
+
+counts "$work/head.json" 1 12
+run_gate "$work/base.json" "$work/head.json"
+expect_status "one fewer warm miss passes" 0
+expect_line "the saved miss shows as a negative delta" "| misses | 2 | 1 | -1 |"
+
+counts "$work/head.json" 2 13
+run_gate "$work/base.json" "$work/head.json"
+expect_status "one extra passthrough fails" 1
+expect_headline "the passthrough failure leads the headline" \
+    "## Perf gate: FAIL — warm build passthroughs rose from 12 to 13 (wall-clock +3.4%)"
+
+counts "$work/head.json" 2 11
+run_gate "$work/base.json" "$work/head.json"
+expect_status "one fewer passthrough passes" 0
+
+# Hits and dep-info runs are context, not verdicts.
+counts "$work/head.json" 2 12
+jq '.warm_same_tree.hits = 700 | .warm_same_tree.phases.dep_info_runs = 400' \
+    "$work/head.json" >"$work/moved.json"
+run_gate "$work/base.json" "$work/moved.json"
+expect_status "fewer hits and more dep-info runs alone do not fail" 0
+expect_line "a hit drop shows as a negative delta" "| hits | 783 | 700 | -83 |"
+
+# The runner-drift pardon covers the wall clock, never a count.
+result "$work/base.json" 106500 14800 17000
+result "$work/head.json" 117500 15837 18000
+counts "$work/base.json" 2 12
+counts "$work/head.json" 3 12
+run_gate "$work/base.json" "$work/head.json"
+expect_status "an extra miss fails even when the runner drifted" 1
+expect_headline "a pardoned wall move does not hide the count failure" \
+    "## Perf gate: FAIL — warm build misses rose from 2 to 3 (wall-clock +7.0%)"
+
+counts "$work/head.json" 3 14
+run_gate "$work/base.json" "$work/head.json"
+expect_headline "two count failures are joined in the headline" \
+    "## Perf gate: FAIL — warm build misses rose from 2 to 3; passthroughs rose from 12 to 14 (wall-clock +7.0%)"
+
+# A wall regression and a count regression both annotate.
+result "$work/base.json" 112400 14600 17000
+result "$work/head.json" 108100 16000 16200
+counts "$work/base.json" 2 12
+counts "$work/head.json" 3 12
+run_gate "$work/base.json" "$work/head.json"
+expect_status "a wall and a count regression fail together" 1
+expect_line "the wall regression is still annotated" "::error::perf gate: warm wall-clock regressed +9.6%"
+
 run_gate "$work/base.json" "$work/does-not-exist.json"
 expect_status "a missing input is an error" 1
 expect_line "the missing input is named" "missing benchmark result"

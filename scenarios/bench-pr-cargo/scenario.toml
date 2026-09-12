@@ -46,6 +46,12 @@ setup = [
   "echo '[bench] bench-pr-cargo needs: a C compiler, pkg-config, and OpenSSL headers (libgit2-sys/curl-sys). Debian: apt install build-essential pkg-config libssl-dev. macOS: xcode-select --install && brew install openssl@3 pkg-config.'",
 ]
 
+# Downloads the locked crates and, through the injected rust-toolchain.toml,
+# installs the pinned toolchain before any timed build. The gate runs both
+# sides on one runner with a shared ~/.cargo, so without this the first side's
+# cold build pays for every download and the second side's does not.
+prepare = "cargo fetch --locked"
+
 # Build the `cargo` binary at the DEV profile, not release. Two reasons:
 #   * Time. The gate runs the subject three times per side and twice per PR
 #     (head + merge base) on one machine. A release build of this graph is the

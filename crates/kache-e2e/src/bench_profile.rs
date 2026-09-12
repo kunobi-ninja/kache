@@ -81,6 +81,16 @@ pub struct BenchProfile {
     #[serde(default)]
     pub setup_marker: Option<String>,
 
+    /// Untimed preparation, run via `sh -c` in each checkout after the file
+    /// injections and before the first phase that builds there (e.g.
+    /// `cargo fetch --locked`). Without it the first timed build pays for
+    /// dependency downloads and toolchain installs that every later build,
+    /// and every later run on the same machine, gets for free. Runs with
+    /// the scenario `[env]` but without the cache wrapper, so it cannot seed
+    /// or observe the cache; it must fetch, not compile.
+    #[serde(default)]
+    pub prepare: Option<String>,
+
     /// Build command, run via `sh -c` in the checkout with the kache env
     /// injected. Wall-clock of this command is the measured build time.
     pub build: String,
@@ -292,6 +302,11 @@ impl BenchProfile {
     /// Interpolated build command.
     pub fn build_command(&self, kache: &Path) -> String {
         self.interpolate(&self.build, kache)
+    }
+
+    /// Interpolated preparation command, if the scenario declares one.
+    pub fn prepare_command(&self, kache: &Path) -> Option<String> {
+        self.prepare.as_deref().map(|c| self.interpolate(c, kache))
     }
 
     /// Whether setup should be skipped because its marker already exists
@@ -631,12 +646,19 @@ content = "value"
         let profiles = BenchProfile::discover(&root, &selectors).unwrap();
 
         for profile in profiles {
-            let commands = std::iter::once(("build", profile.build.as_str())).chain(
-                profile
-                    .setup
-                    .iter()
-                    .map(|command| ("setup", command.as_str())),
-            );
+            let commands = std::iter::once(("build", profile.build.as_str()))
+                .chain(
+                    profile
+                        .setup
+                        .iter()
+                        .map(|command| ("setup", command.as_str())),
+                )
+                .chain(
+                    profile
+                        .prepare
+                        .as_deref()
+                        .map(|command| ("prepare", command)),
+                );
             for (kind, command) in commands {
                 let output = std::process::Command::new("sh")
                     .args(["-n", "-c", command])
@@ -698,6 +720,54 @@ CC = "{kache} cc"
         assert_eq!(
             p.build_env(kache),
             vec![("CC".to_string(), "/usr/local/bin/kache cc".to_string())]
+        );
+    }
+
+    #[test]
+    fn prepare_is_optional_and_interpolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let without = write_profile(
+            dir.path(),
+            "plain",
+            r#"
+name = "plain"
+repo = "r"
+ref  = "v1"
+objdir = "target"
+build = "b"
+"#,
+        );
+        let p = BenchProfile::load(&without).unwrap();
+        assert_eq!(p.prepare_command(Path::new("/k")), None);
+
+        let with = write_profile(
+            dir.path(),
+            "prepared",
+            r#"
+name = "prepared"
+repo = "r"
+ref  = "v1"
+objdir = "obj"
+build = "b"
+prepare = "{kache} fetch --into {objdir}"
+"#,
+        );
+        let p = BenchProfile::load(&with).unwrap();
+        assert_eq!(
+            p.prepare_command(Path::new("/k")).as_deref(),
+            Some("/k fetch --into obj")
+        );
+    }
+
+    /// The perf gate's subject must fetch before its first timed build, or
+    /// whichever side runs first pays for the downloads and the other does
+    /// not.
+    #[test]
+    fn shipped_pr_cargo_profile_fetches_before_timing() {
+        let p = BenchProfile::load(&repo_profile("pr-cargo")).expect("pr-cargo loads");
+        assert_eq!(
+            p.prepare_command(Path::new("/k")).as_deref(),
+            Some("cargo fetch --locked")
         );
     }
 

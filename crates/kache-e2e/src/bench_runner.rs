@@ -343,6 +343,26 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         profile.apply_files(clone, &kache)?;
     }
 
+    // Untimed preparation, one per clone, before either is built. clone-a is
+    // first built by cold, clone-b by the cross-clone warm phase; each phase
+    // records the step that ran for its clone.
+    let cold_prepare = prepare_clone(
+        &profile,
+        &clone_a,
+        Phase::Cold.name(),
+        &kache,
+        &work_dir,
+        &sh,
+    )?;
+    let warm_prepare = prepare_clone(
+        &profile,
+        &clone_b,
+        Phase::Warm.name(),
+        &kache,
+        &work_dir,
+        &sh,
+    )?;
+
     // Snapshot the volume's free space before any build runs, so the real
     // footprint of the cold+warm builds can be measured (free-space delta) and
     // used to VERIFY the sharing-corrected disk-layout estimate. Clones already
@@ -398,7 +418,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // cold: either run it fresh (full run) or restore the snapshot saved
     // by a prior full run (`--retry`) and reuse cold's metrics. Either
     // way we emerge with `cold_metrics` + `cold_raw`.
-    let (cold_metrics, cold_raw) = if config.retry {
+    let (mut cold_metrics, cold_raw) = if config.retry {
         retry_load_cold(&profile.name, &kache, &cache_dir, &work_dir)?
     } else {
         run_cold_phase(
@@ -413,6 +433,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
             &sh,
         )?
     };
+    cold_metrics.prepare = cold_prepare;
 
     // warm-same-tree (opt-in): rebuild clone-a — the tree cold just built — with
     // its objdir wiped and the store left warm. Same absolute path, so the
@@ -529,8 +550,9 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // clones. A path leak in the key shows up here as a near-zero rate.
     let stability = key_stability(&cold_raw, &warm_raw);
 
-    let warm_metrics =
+    let mut warm_metrics =
         PhaseMetrics::from_report(&warm, &warm_raw, warm_ms, warm_events, warm_leaks);
+    warm_metrics.prepare = warm_prepare;
     let verdict = Verdict::evaluate(
         &stability,
         &warm_metrics,
@@ -866,6 +888,7 @@ fn is_run_artifact(name: &str) -> bool {
         || name.starts_with("build-")
         || name.starts_with("wrapper-")
         || name.starts_with("trace-")
+        || name.starts_with("prepare-")
         || name.starts_with("key-diff.")
         || (name.starts_with("bench-") && name.ends_with(".json"))
         || name == crate::bench_otlp::METRICS_FILE
@@ -1186,6 +1209,59 @@ fn run_setup(
         run(Command::new(sh).arg("-c").arg(step).current_dir(clone))?;
     }
     Ok(())
+}
+
+/// Run the scenario's `prepare` command in `clone`, untimed as far as the
+/// phases are concerned, and return what ran and how long it took. `None`
+/// when the scenario declares no `prepare`.
+///
+/// Called once per clone, after the file injections (a pinned
+/// `rust-toolchain.toml` must already be in place for the toolchain install to
+/// happen here) and before `phase`, the first phase that builds in that clone.
+/// The scenario `[env]` is applied so the command resolves the same toolchain
+/// as the build. The cache wrapper is removed: a fetch has nothing to cache,
+/// and a stray wrapper call would land in the next phase's event log.
+fn prepare_clone(
+    profile: &BenchProfile,
+    clone: &Path,
+    phase: &str,
+    kache: &Path,
+    work_dir: &Path,
+    sh: &Path,
+) -> Result<Option<PrepareMetrics>> {
+    let Some(command) = profile.prepare_command(kache) else {
+        return Ok(None);
+    };
+    let log_path = work_dir.join(format!("prepare-{phase}.log"));
+    let log =
+        File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
+    eprintln!(
+        "\n[bench] [{phase}] preparing {} (`{command}`; untimed; output -> prepare-{phase}.log)",
+        clone.display()
+    );
+    let started = Instant::now();
+    let status = Command::new(sh)
+        .arg("-c")
+        .arg(&command)
+        .current_dir(clone)
+        .envs(profile.build_env(kache))
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .stdout(Stdio::from(
+            log.try_clone().context("cloning prepare-log handle")?,
+        ))
+        .stderr(Stdio::from(log))
+        .status()
+        .with_context(|| format!("spawning prepare command in {}", clone.display()))?;
+    if !status.success() {
+        bail!(
+            "[{phase}] prepare failed ({status}); see {}",
+            log_path.display()
+        );
+    }
+    let wall_ms = elapsed_ms(started.elapsed());
+    eprintln!("[bench] [{phase}] prepared in {}", fmt_wall_clock(wall_ms));
+    Ok(Some(PrepareMetrics { command, wall_ms }))
 }
 
 /// Build the project in `clone` with kache wired in; return the build's wall
@@ -1522,9 +1598,10 @@ fn run_pull_bench(
     )?;
     run_setup(profile, clone_a, kache, force_setup, sh)?;
     profile.apply_files(clone_a, kache)?;
+    let cold_prepare = prepare_clone(profile, clone_a, Phase::Cold.name(), kache, work_dir, sh)?;
 
     // cold: empty cache, build ref A in clone-a -> populate.
-    let (cold_metrics, _cold_raw) = run_cold_phase(
+    let (mut cold_metrics, _cold_raw) = run_cold_phase(
         profile,
         kache,
         cache_dir,
@@ -1535,6 +1612,7 @@ fn run_pull_bench(
         trace_keys,
         sh,
     )?;
+    cold_metrics.prepare = cold_prepare;
 
     // Reset the event log so the pull report covers only the pull build.
     if event_log.exists() {
@@ -1550,6 +1628,8 @@ fn run_pull_bench(
         .arg(clone_a)
         .args(["checkout", "--detach", ref_next]))?;
     profile.apply_files(clone_a, kache)?;
+    // ref_next can lock different dependencies, so it is prepared again.
+    let pull_prepare = prepare_clone(profile, clone_a, Phase::Pull.name(), kache, work_dir, sh)?;
 
     // pull: same cache, same path, new source. `build()` wipes the objdir at
     // the start of every phase (unconditionally), so this is a from-scratch
@@ -1581,8 +1661,9 @@ fn run_pull_bench(
     let pull_events = read_event_log(event_log);
     let (pull_leaks, _pull_leak_samples) =
         scan_leak_warnings(&work_dir.join(format!("wrapper-{}.log", Phase::Pull.name())));
-    let pull_metrics =
+    let mut pull_metrics =
         PhaseMetrics::from_report(&pull, &pull_raw, pull_ms, pull_events, pull_leaks);
+    pull_metrics.prepare = pull_prepare;
 
     // No cross-clone comparison: an empty KeyStability (compared == 0) makes
     // Verdict skip the key-stability check; the pull scenarios also set no
@@ -3801,6 +3882,20 @@ struct PhaseMetrics {
     /// The wall-clock above says a build got slower; this says which part of
     /// the wrapper did it.
     phases: PhaseTimes,
+    /// The scenario's untimed `prepare` step, when it ran in this phase's
+    /// clone before this phase's build. Its time is not part of `wall_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare: Option<PrepareMetrics>,
+}
+
+/// One run of a scenario's `prepare` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PrepareMetrics {
+    /// The interpolated command that ran.
+    command: String,
+    /// How long it took. Reported so a slow fetch is visible, never added to
+    /// a phase's wall clock.
+    wall_ms: u64,
 }
 
 /// Wrapper time by phase, in wrapper order, summed over every cacheable crate
@@ -3925,6 +4020,7 @@ impl PhaseMetrics {
             leak_warnings,
             storage: StorageInfo::from_raw(raw),
             phases: PhaseTimes::from_raw(raw),
+            prepare: None,
         }
     }
 }
@@ -4938,6 +5034,7 @@ mod tests {
                 dedup_saved_bytes: 0,
             },
             phases: PhaseTimes::default(),
+            prepare: None,
         }
     }
 
@@ -6034,6 +6131,132 @@ build = "sleep 0.2"
         assert!(!stale.exists(), "the objdir is wiped before the build");
         assert!(work_dir.join("build-cold.log").exists());
         assert!(work_dir.join("wrapper-cold.log").exists());
+    }
+
+    fn prepare_fixture(dir: &Path, prepare: Option<&str>) -> BenchProfile {
+        let path = dir.join("prep.toml");
+        let prepare = prepare
+            .map(|c| format!("prepare = {}\n", toml::Value::String(c.to_string())))
+            .unwrap_or_default();
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+name = "prep"
+repo = "https://example.com/prep.git"
+ref = "v1"
+objdir = "target"
+build = "true"
+{prepare}
+[env]
+PREP_MARKER = "{{kache}}"
+"#
+            ),
+        )
+        .unwrap();
+        BenchProfile::load(&path).unwrap()
+    }
+
+    /// `prepare` runs in the clone with the scenario env, without the cache
+    /// wrapper (whatever the ambient environment sets), and reports its own
+    /// time so it never has to hide inside a phase's wall clock.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_runs_in_the_clone_with_the_scenario_env_and_no_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = r#"sleep 0.2; echo "$PREP_MARKER ${RUSTC_WRAPPER:-unset} ${RUSTC_WORKSPACE_WRAPPER:-unset}" > prepared.txt"#;
+        let profile = prepare_fixture(dir.path(), Some(command));
+        let clone = dir.path().join("clone");
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        let got = prepare_clone(
+            &profile,
+            &clone,
+            "cold",
+            Path::new("/k"),
+            &work_dir,
+            &posix_sh().unwrap(),
+        )
+        .unwrap()
+        .expect("a declared prepare runs");
+
+        assert_eq!(got.command, command);
+        assert!(
+            (200..60_000).contains(&got.wall_ms),
+            "a 200ms sleep must time as at least 200ms, got {}ms",
+            got.wall_ms
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join("prepared.txt")).unwrap(),
+            "/k unset unset\n"
+        );
+        assert!(work_dir.join("prepare-cold.log").exists());
+    }
+
+    #[test]
+    fn prepare_is_a_no_op_when_the_scenario_declares_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = prepare_fixture(dir.path(), None);
+        let got = prepare_clone(
+            &profile,
+            dir.path(),
+            "cold",
+            Path::new("/k"),
+            dir.path(),
+            &posix_sh().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got, None);
+        assert!(!dir.path().join("prepare-cold.log").exists());
+    }
+
+    #[test]
+    fn a_failed_prepare_fails_the_run_and_names_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = prepare_fixture(dir.path(), Some("exit 3"));
+        let err = prepare_clone(
+            &profile,
+            dir.path(),
+            "warm",
+            Path::new("/k"),
+            dir.path(),
+            &posix_sh().unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("[warm] prepare failed"), "{err}");
+        assert!(err.contains("prepare-warm.log"), "{err}");
+    }
+
+    #[test]
+    fn prepare_logs_are_archived_with_the_run() {
+        assert!(is_run_artifact("prepare-cold.log"));
+        assert!(is_run_artifact("prepare-warm.log"));
+        assert!(is_run_artifact("key-diff.json"));
+        assert!(!is_run_artifact("prepared.txt"));
+    }
+
+    /// A phase that ran no prepare step serializes exactly as before, and a
+    /// saved phase from before the field existed still loads.
+    #[test]
+    fn phase_prepare_is_omitted_when_absent_and_recorded_when_present() {
+        let plain = serde_json::to_value(PhaseMetrics::default()).unwrap();
+        assert!(plain.get("prepare").is_none(), "{plain}");
+        let loaded: PhaseMetrics = serde_json::from_value(plain).unwrap();
+        assert_eq!(loaded.prepare, None);
+
+        let prepared = PhaseMetrics {
+            prepare: Some(PrepareMetrics {
+                command: "cargo fetch --locked".to_string(),
+                wall_ms: 41_200,
+            }),
+            ..Default::default()
+        };
+        let j = serde_json::to_value(&prepared).unwrap();
+        assert_eq!(j["prepare"]["command"], "cargo fetch --locked");
+        assert_eq!(j["prepare"]["wall_ms"], 41_200);
     }
 
     /// The two refusal categories must reach the payload as two numbers, from

@@ -124,6 +124,17 @@ Perfetto/Chrome trace format; sccache benchmark runs write
 stats commands. `--trace-keys` is kache-only and adds `key-diff.{json,md}` for
 cache-key divergence analysis.
 
+### Untimed preparation
+
+`prepare = "cargo fetch --locked"` runs once in each clone after the file
+injections and before the first phase that builds there, outside the timer.
+Use it for work the first timed build would otherwise absorb: dependency
+downloads and toolchain installs. It sees the scenario `[env]` but not the
+cache wrapper, so it must fetch, not compile. Its output goes to
+`prepare-<phase>.log`, and the result JSON records the command and its
+`wall_ms` under that phase's `prepare` key, separate from the phase's own
+wall clock.
+
 Backend-specific benchmark scenarios should keep their source patches under the
 scenario's own `patches/` directory so kache and sccache requirements remain
 auditable if they diverge.

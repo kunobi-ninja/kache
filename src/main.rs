@@ -1157,6 +1157,8 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         wrapper::run(&config, args)?
     } else if adapter.id() == compiler::cc::CC_ID {
         wrapper::run_cc(&config, args)?
+    } else if adapter.id() == compiler::nvcc::NVCC_ID {
+        wrapper::run_nvcc(&config, args)?
     } else {
         anyhow::bail!(
             "detected compiler adapter {} ({}) has no wrapper dispatch",
@@ -1641,9 +1643,8 @@ mod tests {
             ),
             LogMode::Wrapper
         );
-        // The same generic passthrough revives the existing nvcc compatibility
-        // path, which was previously unreachable because log-mode detection
-        // rejected nvcc before `run_wrapper_mode` could pass it through.
+        // nvcc dispatches to run_nvcc via its adapter (#1024), which is
+        // wrapper-mode logging like every other compiler path.
         assert_eq!(
             detect_log_mode_with_rustc(
                 &[

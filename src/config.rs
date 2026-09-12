@@ -313,11 +313,14 @@ pub struct Config {
     /// `=true` or `[cache] modified_input_guard`; env wins over the file.
     pub modified_input_guard: bool,
     /// Opt-in input-set predictions: when on, each rustc invocation remembers
-    /// the source closure its dep-info pre-pass discovered, so a later build of
-    /// the same unit can derive the key without spawning the pre-pass again.
-    /// Recording only for now — nothing reads a record back yet. Off by
-    /// default. Set via `KACHE_INPUT_PREDICTIONS=1`/`=true` or
-    /// `[cache] input_predictions`; env wins over the file.
+    /// the source closure its dep-info pre-pass discovered, and a later build
+    /// of the same unit derives the key from that record instead of spawning
+    /// the pre-pass (kunobi-ninja/kache#939). Every path and env value in the
+    /// record is re-validated first, and any doubt runs the pre-pass;
+    /// `KACHE_VERIFY_INPUT_PREDICTIONS=sampled|always` cross-checks records
+    /// against it and counts disagreements. Off by default until
+    /// kunobi-ninja/kache#1000 decides. Set via `KACHE_INPUT_PREDICTIONS=1`/
+    /// `=true` or `[cache] input_predictions`; env wins over the file.
     pub input_predictions: bool,
     /// Experimental daemon-assisted local hits (kunobi-ninja/kache#565): when
     /// on, a primary rustc invocation skips opening the local SQLite store and

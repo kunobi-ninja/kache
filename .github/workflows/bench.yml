@@ -37,7 +37,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, substrate, surrealdb, lance, opendal, eza, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, hk, hk-nopred, hk-pull, hk-mbx, opendal-mbx, lance-mbx, substrate-mbx, surrealdb-mbx]
+        options: [all, hk-comparison, substrate, surrealdb, lance, opendal, eza, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, substrate-mbx, surrealdb-mbx]
         default: all
       extra_args:
         description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
@@ -148,9 +148,13 @@ jobs:
           # rebuild the child in the same worktree with the store warm.
           hk_pull='{"name":"hk-pull","cmd":"bench hk-pull","dir":"bench-hk-pull","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
           # The same hk shape through mbx, for a side-by-side comparison
-          # (as firefox-sccache is for firefox). mbx comes from mise at its
-          # latest release; the run records the version it measured.
-          hk_mbx='{"name":"hk-mbx","cmd":"bench-mbx hk","dir":"bench-hk-mbx","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          # (as firefox-sccache is for firefox). The workflow installs the
+          # latest mbx release; the run records the version it measured.
+          hk_mbx='{"name":"hk-mbx","cmd":"bench-mbx hk --warm-same-tree","dir":"bench-hk-mbx","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          # Timing arms; hk-pull keeps exhaustive prediction verification.
+          hk_pull_perf='{"name":"hk-pull-perf","cmd":"bench hk-pull-perf","dir":"bench-hk-pull-perf","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          hk_pull_nopred='{"name":"hk-pull-nopred","cmd":"bench hk-pull-nopred","dir":"bench-hk-pull-nopred","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          hk_pull_mbx='{"name":"hk-pull-mbx","cmd":"bench-mbx hk-pull","dir":"bench-hk-pull-mbx","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
           # eza: the smallest subject and the only one built through a fat-LTO
           # release profile, so the final unit is one whole-program codegen
           # instead of many small ones. Its bundled libgit2 and zlib put the
@@ -182,10 +186,14 @@ jobs:
             firefox-sccache)      inc="[$firefox_sccache]" ;;
             llvm)                 inc="[$llvm]" ;;
             firefox-pull)         inc="[$firefox_pull]" ;;
+            hk-comparison)       inc="[$hk,$hk_nopred,$hk_mbx,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx]" ;;
             hk)                   inc="[$hk]" ;;
             hk-nopred)            inc="[$hk_nopred]" ;;
             hk-pull)              inc="[$hk_pull]" ;;
             hk-mbx)               inc="[$hk_mbx]" ;;
+            hk-pull-perf)         inc="[$hk_pull_perf]" ;;
+            hk-pull-nopred)       inc="[$hk_pull_nopred]" ;;
+            hk-pull-mbx)          inc="[$hk_pull_mbx]" ;;
             eza)                  inc="[$eza]" ;;
             opendal-mbx)          inc="[$opendal_mbx]" ;;
             lance-mbx)            inc="[$lance_mbx]" ;;
@@ -197,7 +205,7 @@ jobs:
             # and wastefully run the whole Linux `all` matrix alongside.
             firefox-windows)      inc="[]" ;;
             firefox-pull-windows) inc="[]" ;;
-            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull,$hk,$hk_nopred,$hk_pull,$hk_mbx,$eza,$opendal_mbx,$lance_mbx,$substrate_mbx,$surrealdb_mbx]" ;;
+            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_mbx,$hk_pull_mbx,$eza,$opendal_mbx,$lance_mbx,$substrate_mbx,$surrealdb_mbx]" ;;
           esac
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
           if [ "$inc" = "[]" ]; then
@@ -491,7 +499,7 @@ jobs:
       # Only the arms that pass `--warm-same-tree` write this directory; the
       # step is skipped elsewhere so a missing phase never reads as a warning.
       - name: Upload cache telemetry (warm-same-tree)
-        if: always() && contains(matrix.cmd, '--warm-same-tree')
+        if: always() && contains(matrix.cmd, '--warm-same-tree') && !endsWith(matrix.name, '-mbx')
         timeout-minutes: 10
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

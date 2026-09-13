@@ -1,18 +1,11 @@
-# hk (jdx/hk) through mbx: the same subject, commit, toolchain and build
-# command as bench-hk, driven by mbx instead of kache, so the two arms read
-# side by side. mbx fronts Cargo and installs its own C shims for build
-# scripts, so this scenario sets no compiler wiring; the harness puts its
-# `cargo` shim on PATH and points MBX_CACHE_DIR at the store.
-#
-# Nightly arm: hk-mbx in bench.yml includes --warm-same-tree.
-# The workflow installs the latest mbx release and records its version.
-name = "bench-hk-mbx"
+# Next-commit hk rebuild through mbx, matching bench-hk-pull.
+name = "bench-hk-pull-mbx"
 tags = ["suite:bench", "project:hk", "backend:mbx", "lang:rust", "lang:cc"]
 
 requires = ["cargo", "rustc", "cc"]
 
 setup = [
-  "echo '[bench] bench-hk-mbx needs a C compiler (aws-lc-sys cc builder, vendored libgit2); cmake only as the aws-lc-sys fallback.'",
+  "echo '[bench] bench-hk-pull-mbx needs a C compiler (aws-lc-sys cc builder, vendored libgit2); cmake only as the aws-lc-sys fallback.'",
 ]
 
 # Same portability knobs as bench-hk so the two arms build identical
@@ -31,7 +24,8 @@ cargo build --locked
 [source]
 kind   = "clone"
 repo   = "https://github.com/jdx/hk.git"
-ref    = "fc29ead1456ba7c1f62826c284126410a4014b00"
+ref    = "27bb615768b85c9ac88e2abf8895219b44462871"
+ref_next = "fc29ead1456ba7c1f62826c284126410a4014b00"
 objdir = "target"
 
 [[file]]
@@ -43,5 +37,5 @@ profile = "minimal"
 """
 
 # Advisory only, as for the sccache arm: the number is the point.
-[checks.measure.warm]
+[checks.measure.pull]
 min_hit_rate_pct = 50.0

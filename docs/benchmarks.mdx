@@ -14,13 +14,19 @@ The [Bench workflow](https://github.com/kunobi-ninja/kache/actions/workflows/ben
 - Firefox through sccache for comparison
 - Firefox source-update builds on Linux and Windows
 - hk cold, warm and next-commit builds on Linux: a mid-size Rust CLI whose build scripts compile C and assembly through cc-rs, wired the way `kache init` configures a machine
-- hk with input predictions off, as the control for the hk arm's warm phases
-- The hk, Lance, OpenDAL, Substrate and SurrealDB builds through mbx at its latest release, for side-by-side comparisons
+- hk with input predictions on and off for warm and next-commit timings; `hk-pull` separately checks every prediction
+- The hk, Lance, OpenDAL, Substrate and SurrealDB builds through mbx at its latest release; hk includes same-checkout and next-commit rebuilds
 - eza cold, warm and cross-worktree builds on Linux: the smallest subject in the matrix and the only one built through a fat-LTO release profile, with its bundled libgit2 and zlib compiled through the same cc-rs wiring
 
 Jobs upload their reports, Perfetto traces, and logs even when a benchmark fails. GitHub retains those artifacts for 30 days.
 
 A scheduled run is not automatically a valid result. Check that the individual job succeeded and that its benchmark verdict is `ok` before using its timing or hit-rate numbers.
+
+To run these six comparisons in CI, dispatch **Bench** with `hk-comparison`.
+Individual scenarios can also be selected. They use the same
+pinned hk commits and Rust toolchain. Each job exports the existing benchmark
+reports and OTLP metrics. Jobs run on separate runners, so compare several runs
+before attributing small timing differences to a cache setting.
 
 ## Per-pull-request perf gate
 
@@ -61,6 +67,9 @@ just bench-pr              # one side of the per-PR perf gate
 
 just bench-sccache
 just bench-sccache firefox
+
+just bench-mbx hk --warm-same-tree
+just bench-mbx hk-pull
 ```
 
 Firefox is a large mixed Rust/C++ workload and needs about 50 GB of scratch space. Run benchmark builds sequentially on an otherwise quiet host.

@@ -235,7 +235,7 @@ sccache-check:
 # Builds a benchmark scenario (see scenarios/) twice against one shared kache
 # cache — cold (empty cache) then warm (cache populated by cold) — and
 # reports cold/warm wall-clock, speedup, hit rate, and a correctness verdict.
-# Tens of minutes to hours, tens of GB of disk; NOT run in CI. Flags pass through
+# Runs in the nightly Bench workflow. Flags pass through
 # (`just bench firefox --skip-clone`). See scenarios/README.md.
 # Omit PROFILE to list the matching benchmark profiles.
 # PROFILE is a name filter — e.g. `firefox` matches `bench-firefox`.

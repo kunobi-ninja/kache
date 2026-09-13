@@ -3374,6 +3374,18 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: Some(Dialect::Cl),
     },
     FlagSpec {
+        matcher: Matcher::Exact("-Oy"),
+        class: FlagClass::CapturedByProbe,
+        source: "clang-cl omit frame pointer (MSVC spelling of -fomit-frame-pointer). Keyed via -### resolved tokens. -Oy- was modeled in #285; Firefox Windows uses the enable polarity.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/Oy"),
+        class: FlagClass::CapturedByProbe,
+        source: "clang-cl omit frame pointer (slash spelling). Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-Oy-"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #285 — clang-cl frame-pointer omission disabled. Keyed via -### resolved tokens.",
@@ -6486,6 +6498,8 @@ mod tests {
             "-guard:cf,nochecks",
             "-Gy",
             "-Gw",
+            "-Oy",
+            "/Oy",
             "-Oy-",
             "-fms-compatibility-version=19.50",
             "-MD",
@@ -6705,7 +6719,7 @@ mod tests {
             "-guard:cf,nochecks",
             "-Gy",
             "-Gw",
-            "-Oy-",
+            "-Oy",
             "-Zc:inline",
             "-MD",
         ]))
@@ -8119,6 +8133,25 @@ mod tests {
         assert!(
             descs.iter().any(|d| d.contains("unsupported flag")),
             "an unknown -f flag must still refuse, got: {descs:?}"
+        );
+    }
+
+    #[test]
+    fn firefox_windows_oy_no_longer_refuses() {
+        // clang-cl `-Oy` is the MSVC spelling of `-fomit-frame-pointer`.
+        // #285 modeled only `-Oy-` (disable). Firefox Windows still passes
+        // the enable polarity on thousands of TUs.
+        for flag in ["-Oy", "/Oy"] {
+            let descs = refuse_descriptions(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unsupported flag")),
+                "Firefox Windows {flag} must classify, got: {descs:?}"
+            );
+        }
+        let disable = refuse_descriptions(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", "-Oy-"]);
+        assert!(
+            !disable.iter().any(|d| d.contains("unsupported flag")),
+            "-Oy- must stay classified, got: {disable:?}"
         );
     }
 
@@ -12309,7 +12342,7 @@ mod tests {
             "-guard:cf,nochecks",
             "-Gy",
             "-Gw",
-            "-Oy-",
+            "-Oy",
             "-Zc:inline",
             "-Zc:wchar_t",
             "-MD",

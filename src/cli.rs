@@ -11488,18 +11488,59 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
     }
 }
 
-/// True when `dir` already holds the canonical compiler-name farm pointing
-/// at this kache binary. Used by `kache init` so a second run is a no-op.
+/// True when `dir` already holds the canonical compiler-name farm for the
+/// active shim target. Used by `kache init` so a second run is a no-op.
 #[cfg(unix)]
-fn shim_dir_is_ready(dir: &std::path::Path) -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+fn shim_dir_is_ready_for_executable(dir: &std::path::Path, exe: &std::path::Path) -> bool {
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
     crate::compiler::shim::SHIM_NAMES.iter().all(|name| {
         let link = dir.join(name);
         std::fs::canonicalize(&link).is_ok_and(|real| real == exe)
     })
+}
+
+#[cfg(unix)]
+fn shim_dir_is_ready(dir: &std::path::Path) -> bool {
+    shim_target_executable().is_ok_and(|exe| shim_dir_is_ready_for_executable(dir, &exe))
+}
+
+/// Return Homebrew's stable executable path when `exe` is in a Cellar keg.
+///
+/// The `opt/<formula>` symlink is repointed on upgrade, unlike a versioned keg
+/// path. Keep this path non-canonical when writing compiler shims; callers that
+/// compare executable identities still canonicalize their inputs.
+#[cfg(unix)]
+fn homebrew_opt_shim_target(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let bin = exe.parent()?;
+    if bin.file_name()? != "bin" {
+        return None;
+    }
+    let version = bin.parent()?;
+    let formula = version.parent()?;
+    let cellar = formula.parent()?;
+    if cellar.file_name()? != "Cellar" {
+        return None;
+    }
+
+    let target = cellar
+        .parent()?
+        .join("opt")
+        .join(formula.file_name()?)
+        .join("bin")
+        .join(exe.file_name()?);
+    target.is_file().then_some(target)
+}
+
+#[cfg(unix)]
+fn shim_target_for_executable(exe: std::path::PathBuf) -> std::path::PathBuf {
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    homebrew_opt_shim_target(&exe).unwrap_or(exe)
+}
+
+#[cfg(unix)]
+fn shim_target_executable() -> Result<std::path::PathBuf> {
+    let exe = std::env::current_exe().context("locating the kache binary")?;
+    Ok(shim_target_for_executable(exe))
 }
 
 /// Populate `dir` with compiler-name symlinks pointing at this kache binary
@@ -11528,11 +11569,9 @@ fn install_shims_named_with_output(
     extra_names: &[String],
     verbose: bool,
 ) -> anyhow::Result<()> {
-    let exe = std::env::current_exe().context("locating the kache binary")?;
-    // Resolve so the shims survive kache being invoked through its own
-    // symlink, and so `resolve_real_compiler`'s identity check (which
-    // canonicalizes) reliably recognizes them as kache.
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    // Resolve aliases for identity checks, but preserve Homebrew's opt path in
+    // the links so a formula upgrade repoints the existing shim farm.
+    let exe = shim_target_executable()?;
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating shim directory {}", dir.display()))?;
 
@@ -11620,6 +11659,81 @@ mod shim_install_tests {
 
     fn is_symlink(path: &std::path::Path) -> bool {
         std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    }
+
+    #[test]
+    fn homebrew_shim_target_uses_the_upgrade_stable_opt_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("homebrew");
+        let keg = prefix.join("Cellar/kache/0.20.0");
+        let exe = keg.join("bin/kache");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"kache").unwrap();
+
+        let prefix = std::fs::canonicalize(&prefix).unwrap();
+        let opt = prefix.join("opt/kache");
+        std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(prefix.join("Cellar/kache/0.20.0"), &opt).unwrap();
+
+        let target = super::shim_target_for_executable(exe.clone());
+        assert_eq!(target, opt.join("bin/kache"));
+        assert_eq!(
+            std::fs::canonicalize(target).unwrap(),
+            std::fs::canonicalize(exe).unwrap(),
+            "the stable opt link must resolve to this keg"
+        );
+    }
+
+    #[test]
+    fn homebrew_opt_target_refreshes_shims_after_an_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("homebrew");
+        let old_keg = prefix.join("Cellar/kache/0.19.0");
+        let new_keg = prefix.join("Cellar/kache/0.20.0");
+        let old_exe = old_keg.join("bin/kache");
+        let new_exe = new_keg.join("bin/kache");
+        for exe in [&old_exe, &new_exe] {
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            std::fs::write(exe, b"kache").unwrap();
+        }
+
+        let prefix = std::fs::canonicalize(&prefix).unwrap();
+        let opt = prefix.join("opt/kache");
+        std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(prefix.join("Cellar/kache/0.20.0"), &opt).unwrap();
+
+        let shims = dir.path().join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        for name in SHIM_NAMES {
+            std::os::unix::fs::symlink(opt.join("bin/kache"), shims.join(name)).unwrap();
+        }
+
+        let target = super::shim_target_for_executable(old_exe.clone());
+        assert!(super::shim_dir_is_ready_for_executable(&shims, &target));
+        assert!(
+            !super::shim_dir_is_ready_for_executable(&shims, &old_exe),
+            "a versioned old-keg target must be refreshed through opt"
+        );
+    }
+
+    #[test]
+    fn homebrew_shim_target_requires_a_cellar_keg_with_a_live_opt_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_opt = dir.path().join("Cellar/kache/0.20.0/bin/kache");
+        std::fs::create_dir_all(missing_opt.parent().unwrap()).unwrap();
+        std::fs::write(&missing_opt, b"kache").unwrap();
+        assert_eq!(
+            super::shim_target_for_executable(missing_opt.clone()),
+            std::fs::canonicalize(&missing_opt).unwrap()
+        );
+
+        let outside_cellar = dir.path().join("packages/kache/0.20.0/bin/kache");
+        std::fs::create_dir_all(outside_cellar.parent().unwrap()).unwrap();
+        std::fs::write(&outside_cellar, b"kache").unwrap();
+        assert_eq!(
+            super::shim_target_for_executable(outside_cellar.clone()),
+            std::fs::canonicalize(&outside_cellar).unwrap()
+        );
     }
 
     #[test]

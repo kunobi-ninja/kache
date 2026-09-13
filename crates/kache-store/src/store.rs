@@ -801,6 +801,12 @@ pub struct GcStats {
     /// builds, as opposed to finding a damaged entry.
     #[serde(default)]
     pub entries_locked: usize,
+    /// Time spent in the eviction writes themselves, each entry's removal
+    /// with its busy waits, summed over the run. Next to `entries_locked` it
+    /// shows how much of a sweep went to waiting on builds for the index
+    /// write lock.
+    #[serde(default)]
+    pub evict_write_ms: u64,
 }
 
 /// Whether `err` carries SQLite write contention (`SQLITE_BUSY` or
@@ -3577,6 +3583,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         durable_upload_keys: &std::collections::HashSet<String>,
     ) -> GcStats {
         let mut stats = GcStats::default();
+        let mut eviction_writes = std::time::Duration::ZERO;
         let (mut current_size, target) = match stop_at {
             Some((current, target)) => (current, Some(target)),
             None => (0, None),
@@ -3597,7 +3604,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 continue;
             }
             let features = by_key.get(key.as_str()).copied();
-            match self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE)) {
+            let write_started = std::time::Instant::now();
+            let removal = self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE));
+            eviction_writes += write_started.elapsed();
+            match removal {
                 Ok(GuardedRemoval::Reclaimed(reclaim)) => {
                     stats.entries_evicted += 1;
                     // Budget on bytes the removal *actually* freed on disk, not
@@ -3645,6 +3655,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
+        stats.evict_write_ms = eviction_writes.as_millis() as u64;
         stats
     }
 
@@ -7232,6 +7243,9 @@ mod tests {
             stats.entries_locked, 1,
             "contention is counted as locked: {stats:?}"
         );
+        // The removal that lost the lock fails at once instead of waiting out
+        // the store's 5 s busy timeout, so this run's eviction write time
+        // stays small; the lost-lock count above is the figure to watch.
     }
 
     #[test]

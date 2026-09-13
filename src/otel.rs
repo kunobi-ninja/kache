@@ -492,6 +492,11 @@ fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
             gc.entries_locked as u64,
         ),
         ("kache.cache.gc.last_run.duration", "ms", gc.duration_ms),
+        (
+            "kache.cache.gc.last_run.evict_write",
+            "ms",
+            gc.evict_write_ms,
+        ),
     ] {
         metrics.push(gauge(name, unit, vec![as_int(value, now, &[])]));
     }
@@ -653,6 +658,7 @@ mod tests {
                 entries_failed: 3,
                 entries_locked: 2,
                 duration_ms: 5801,
+                evict_write_ms: 4200,
                 ..Default::default()
             }),
         }
@@ -763,6 +769,7 @@ mod tests {
             ("kache.cache.gc.last_run.entries_failed", "3"),
             ("kache.cache.gc.last_run.entries_locked", "2"),
             ("kache.cache.gc.last_run.duration", "5801"),
+            ("kache.cache.gc.last_run.evict_write", "4200"),
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))

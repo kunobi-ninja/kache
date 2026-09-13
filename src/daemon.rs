@@ -1428,6 +1428,8 @@ pub struct GcPolicyOutcome {
     pub entries_failed: usize,
     #[serde(default)]
     pub entries_locked: usize,
+    #[serde(default)]
+    pub evict_write_ms: u64,
 }
 
 impl From<&crate::store::GcStats> for GcPolicyOutcome {
@@ -1440,6 +1442,7 @@ impl From<&crate::store::GcStats> for GcPolicyOutcome {
             entries_unreclaimable: stats.entries_unreclaimable,
             entries_failed: stats.entries_failed,
             entries_locked: stats.entries_locked,
+            evict_write_ms: stats.evict_write_ms,
         }
     }
 }
@@ -5834,6 +5837,9 @@ impl Daemon {
             entries_locked: dedup_stats.entries_locked
                 + evict_stats.entries_locked
                 + age_evict_stats.entries_locked,
+            evict_write_ms: dedup_stats.evict_write_ms
+                + evict_stats.evict_write_ms
+                + age_evict_stats.evict_write_ms,
         };
 
         tracing::info!(
@@ -5845,7 +5851,7 @@ impl Daemon {
         );
 
         // Persist GC stats for reports and machine telemetry. Still under
-        // gc.lock, so the running totals cannot race another driver.
+        // gc.lock, so the record cannot race another driver.
         if let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats) {
             tracing::debug!(
                 "gc: could not record {}: {e:#}",

@@ -34,6 +34,9 @@ pub struct GcStatsPersisted {
     pub entries_failed: usize,
     #[serde(default)]
     pub entries_locked: usize,
+    /// Time the run spent in its eviction writes, busy waits included.
+    #[serde(default)]
+    pub evict_write_ms: u64,
 }
 
 pub(crate) const GC_STATS_FILE: &str = "gc_stats.json";
@@ -78,6 +81,9 @@ pub struct GcRunRecord {
     pub entries_pinned: usize,
     pub entries_unreclaimable: usize,
     pub duration_ms: u64,
+    /// Time spent in eviction writes, busy waits included.
+    #[serde(default)]
+    pub evict_write_ms: u64,
 }
 
 impl GcRunRecord {
@@ -95,6 +101,7 @@ impl GcRunRecord {
             entries_pinned: stats.entries_pinned,
             entries_unreclaimable: stats.entries_unreclaimable,
             duration_ms: stats.duration_ms,
+            evict_write_ms: stats.evict_write_ms,
         }
     }
 }
@@ -138,6 +145,7 @@ pub(crate) fn write_last_gc_run(
         entries_pinned: stats.entries_pinned,
         entries_failed: stats.entries_failed,
         entries_locked: stats.entries_locked,
+        evict_write_ms: stats.evict_write_ms,
     };
     let json = serde_json::to_string_pretty(&persisted)?;
     kache_store::atomic::atomic_replace(&cache_dir.join(GC_STATS_FILE), json.as_bytes())
@@ -3890,6 +3898,7 @@ mod tests {
             entries_unreclaimable: 1,
             entries_failed: 5,
             entries_locked: 3,
+            evict_write_ms: 11,
             ..Default::default()
         };
 
@@ -3926,6 +3935,7 @@ mod tests {
                 entries_pinned: 4,
                 entries_unreclaimable: 1,
                 duration_ms: 9,
+                evict_write_ms: 11,
             }
         );
         assert_eq!(records[1].source, "manual");
@@ -3981,6 +3991,7 @@ mod tests {
             entries_pinned: 6,
             entries_failed: 5,
             entries_locked: 4,
+            evict_write_ms: 12,
             ..Default::default()
         };
         write_last_gc_run(dir.path(), "daemon", &first).unwrap();
@@ -4001,6 +4012,7 @@ mod tests {
             ),
             ("auto", 1, 50, 40, 4, 7, 6, 5, 4)
         );
+        assert_eq!(stats.evict_write_ms, 12);
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join(GC_STATS_FILE)).unwrap())
                 .unwrap();

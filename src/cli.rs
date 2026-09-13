@@ -740,6 +740,9 @@ fn machine_lines(machine: &crate::otel::MachineSnapshot) -> Vec<String> {
                 gc.entries_failed, gc.entries_locked
             ));
         }
+        if gc.evict_write_ms > 0 {
+            line.push_str(&format!(", {} ms in index writes", gc.evict_write_ms));
+        }
         lines.push(line);
     }
     lines
@@ -3016,6 +3019,7 @@ fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats)
         .saturating_add(part.disk_bytes_reclaimed);
     total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
     total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
+    total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
     total.skipped |= part.skipped;
 }
 
@@ -3033,6 +3037,7 @@ fn gc_stats_from_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store:
             .saturating_add(part.entries_unreclaimable);
         total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
         total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
+        total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
     }
     total
 }
@@ -6999,6 +7004,7 @@ mod tests {
                 entries_unreclaimable: (n * 10_000) as usize,
                 entries_failed: (n * 100_000) as usize,
                 entries_locked: (n * 1_000_000) as usize,
+                evict_write_ms: n * 10_000_000,
             }
         }
         let report = crate::daemon::GcBreakdown {
@@ -7015,6 +7021,7 @@ mod tests {
         assert_eq!(total.entries_unreclaimable, 60_000);
         assert_eq!(total.entries_failed, 600_000);
         assert_eq!(total.entries_locked, 6_000_000);
+        assert_eq!(total.evict_write_ms, 60_000_000);
 
         let mut accumulated = crate::store::GcStats {
             entries_evicted: 1,
@@ -7027,6 +7034,7 @@ mod tests {
             skipped: false,
             entries_failed: 8,
             entries_locked: 9,
+            evict_write_ms: 11,
         };
         let part = crate::store::GcStats {
             entries_evicted: 10,
@@ -7039,6 +7047,7 @@ mod tests {
             skipped: true,
             entries_failed: 80,
             entries_locked: 90,
+            evict_write_ms: 110,
         };
         add_gc_stats(&mut accumulated, &part);
         assert_eq!(accumulated.entries_evicted, 11);
@@ -7050,6 +7059,7 @@ mod tests {
         assert_eq!(accumulated.disk_bytes_reclaimed, 66);
         assert_eq!(accumulated.entries_failed, 88);
         assert_eq!(accumulated.entries_locked, 99);
+        assert_eq!(accumulated.evict_write_ms, 121);
         assert!(accumulated.skipped);
     }
 
@@ -7211,6 +7221,7 @@ mod tests {
                 source: "auto".to_string(),
                 entries_failed: 40,
                 entries_locked: 40,
+                evict_write_ms: 4200,
                 ..Default::default()
             }),
         };
@@ -7229,6 +7240,7 @@ mod tests {
             lines[1].contains("40 lost the index write lock"),
             "{lines:?}"
         );
+        assert!(lines[1].ends_with(", 4200 ms in index writes"), "{lines:?}");
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(machine_lines(&crate::otel::MachineSnapshot::default()).is_empty());
     }

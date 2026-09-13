@@ -62,6 +62,8 @@ Kache is a larger process than ccache. On a tree of many tiny `.c` files, measur
 
 `kache doctor` checks the current terminal's PATH. If init saved shell setup but doctor still reports inactive shims, open a new terminal or run the activation command. Init cannot change its parent shell's environment.
 
+If Homebrew shims were created by an older Kache version, run `kache init` once after upgrading. It replaces Kache-owned links to a versioned Cellar keg with links through Homebrew's `opt` path, which stays valid across later formula upgrades. Other files in the shim directory are left alone.
+
 ## Prefix method
 
 For a single project that honors `CC` and `CXX`:

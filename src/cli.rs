@@ -12166,6 +12166,7 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
             return Ok(false);
         }
         if !shims_ready {
+            migrate_homebrew_shims(&shim_dir, &shim_target_executable()?)?;
             install_shims_named_with_output(&shim_dir, false, &[], false)?;
             anyhow::ensure!(
                 shim_dir_is_ready(&shim_dir),
@@ -12197,11 +12198,60 @@ fn init_compiler_setup(yes: bool, no_shell: bool, check: bool) -> Result<bool> {
 /// active shim target. Used by `kache init` so a second run is a no-op.
 #[cfg(unix)]
 fn shim_dir_is_ready_for_executable(dir: &std::path::Path, exe: &std::path::Path) -> bool {
-    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let resolved = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let homebrew_opt = homebrew_opt_shim_target(&resolved).as_deref() == Some(exe);
     crate::compiler::shim::SHIM_NAMES.iter().all(|name| {
         let link = dir.join(name);
-        std::fs::canonicalize(&link).is_ok_and(|real| real == exe)
+        if homebrew_opt {
+            std::fs::read_link(&link).is_ok_and(|target| target == exe)
+        } else {
+            std::fs::canonicalize(&link).is_ok_and(|real| real == resolved)
+        }
     })
+}
+
+/// Refresh links written by older Kache releases without replacing other files.
+#[cfg(unix)]
+fn migrate_homebrew_shims(dir: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    let Ok(resolved) = std::fs::canonicalize(target) else {
+        return Ok(());
+    };
+    if homebrew_opt_shim_target(&resolved).as_deref() != Some(target) {
+        return Ok(());
+    }
+    let Some(formula) = target.parent().and_then(std::path::Path::parent) else {
+        return Ok(());
+    };
+    let Some(prefix) = formula.parent().and_then(std::path::Path::parent) else {
+        return Ok(());
+    };
+    let Some(formula_name) = formula.file_name() else {
+        return Ok(());
+    };
+    let cellar_formula = prefix.join("Cellar").join(formula_name);
+    for name in crate::compiler::shim::SHIM_NAMES {
+        let link = dir.join(name);
+        let Ok(previous) = std::fs::read_link(&link) else {
+            continue;
+        };
+        let owned = previous.file_name() == target.file_name()
+            && previous
+                .parent()
+                .is_some_and(|bin| bin.file_name().is_some_and(|n| n == "bin"))
+            && previous
+                .parent()
+                .and_then(std::path::Path::parent)
+                .and_then(std::path::Path::parent)
+                == Some(cellar_formula.as_path());
+        if !owned {
+            continue;
+        }
+        std::fs::remove_file(&link)
+            .with_context(|| format!("removing old shim {}", link.display()))?;
+        std::os::unix::fs::symlink(target, &link)
+            .with_context(|| format!("refreshing shim {}", link.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -12419,6 +12469,70 @@ mod shim_install_tests {
             !super::shim_dir_is_ready_for_executable(&shims, &old_exe),
             "a versioned old-keg target must be refreshed through opt"
         );
+    }
+
+    #[test]
+    fn migrates_versioned_homebrew_shims_before_and_after_upgrade() {
+        for formula in ["kache", "kache-unstable"] {
+            let dir = tempfile::tempdir().unwrap();
+            let prefix = dir.path().join("homebrew");
+            let current = prefix.join(format!("Cellar/{formula}/0.20.0/bin/kache"));
+            std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+            std::fs::write(&current, b"kache").unwrap();
+            let prefix = std::fs::canonicalize(prefix).unwrap();
+            let opt = prefix.join(format!("opt/{formula}"));
+            std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(current.parent().unwrap().parent().unwrap(), &opt).unwrap();
+            let target = opt.join("bin/kache");
+            let shims = dir.path().join("shims");
+            std::fs::create_dir_all(&shims).unwrap();
+
+            for old_version in ["0.20.0", "0.19.0"] {
+                let old = prefix.join(format!("Cellar/{formula}/{old_version}/bin/kache"));
+                for name in SHIM_NAMES {
+                    let link = shims.join(name);
+                    if std::fs::symlink_metadata(&link).is_ok() {
+                        std::fs::remove_file(&link).unwrap();
+                    }
+                    std::os::unix::fs::symlink(&old, &link).unwrap();
+                }
+                assert!(!super::shim_dir_is_ready_for_executable(&shims, &target));
+                super::migrate_homebrew_shims(&shims, &target).unwrap();
+                assert!(super::shim_dir_is_ready_for_executable(&shims, &target));
+                for name in SHIM_NAMES {
+                    assert_eq!(std::fs::read_link(shims.join(name)).unwrap(), target);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn migration_preserves_unrelated_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("homebrew");
+        let current = prefix.join("Cellar/kache/0.20.0/bin/kache");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, b"kache").unwrap();
+        let prefix = std::fs::canonicalize(prefix).unwrap();
+        let opt = prefix.join("opt/kache");
+        std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(current.parent().unwrap().parent().unwrap(), &opt).unwrap();
+        let shims = dir.path().join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        let link = shims.join("cc");
+        std::os::unix::fs::symlink("/usr/bin/clang", &link).unwrap();
+        let other_formula = shims.join("gcc");
+        let unstable = prefix.join("Cellar/kache-unstable/0.19.0/bin/kache");
+        std::os::unix::fs::symlink(&unstable, &other_formula).unwrap();
+        let regular_file = shims.join("clang");
+        std::fs::write(&regular_file, b"custom compiler").unwrap();
+        super::migrate_homebrew_shims(&shims, &opt.join("bin/kache")).unwrap();
+        assert_eq!(
+            std::fs::read_link(link).unwrap(),
+            std::path::Path::new("/usr/bin/clang")
+        );
+        assert_eq!(std::fs::read_link(other_formula).unwrap(), unstable);
+        assert_eq!(std::fs::read(regular_file).unwrap(), b"custom compiler");
     }
 
     #[test]

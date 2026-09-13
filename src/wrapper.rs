@@ -1771,9 +1771,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 &target,
                 "", // profile: n/a (opt level is in the key)
                 &prepared.files,
-                if parsed.mode == crate::compiler::cc::CompileMode::Preprocess
-                    && parsed.output.is_none()
-                {
+                if crate::compiler::cc::cc_expansion_is_stdout(&parsed) {
                     ""
                 } else {
                     &result.stdout
@@ -2008,7 +2006,9 @@ fn cc_cache_entry_rejection_reason(
         crate::compiler::cc::CompileMode::Compile if !has_object => {
             Some("matching entry lacks the object artifact required by this invocation")
         }
-        crate::compiler::cc::CompileMode::Preprocess if parsed.output.is_none() && !has_stdout => {
+        crate::compiler::cc::CompileMode::Preprocess
+            if crate::compiler::cc::cc_expansion_is_stdout(parsed) && !has_stdout =>
+        {
             Some(
                 "matching entry lacks the preprocessor stdout artifact required by this invocation",
             )
@@ -2282,7 +2282,7 @@ fn restore_cc_from_cache(
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
 ) -> Result<()> {
-    if parsed.mode == crate::compiler::cc::CompileMode::Preprocess && parsed.output.is_none() {
+    if crate::compiler::cc::cc_expansion_is_stdout(parsed) {
         return restore_cc_stdout_from_cache(store, meta, &mut std::io::stdout());
     }
     if parsed.requires_compiler_output_semantics() {

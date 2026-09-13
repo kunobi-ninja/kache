@@ -75,6 +75,11 @@ pub enum ToolFamily {
 /// Store name for a `-E` expansion that went to stdout (no `-o`).
 pub(crate) const CC_STDOUT_STORE_NAME: &str = "stdout.i";
 
+/// `-E` without `-o` (and without `-o -`): the expansion is process stdout.
+pub(crate) fn cc_expansion_is_stdout(parsed: &CcArgs) -> bool {
+    parsed.mode == CompileMode::Preprocess && parsed.output.is_none()
+}
+
 impl ToolFamily {
     /// The flag dialect this family speaks (Gnu and Clang share one).
     pub fn dialect(self) -> Dialect {
@@ -6316,7 +6321,7 @@ impl Compiler for CcCompiler {
         } else {
             ArtifactSet::empty()
         };
-        if exit_code == 0 && parsed.mode == CompileMode::Preprocess && parsed.output.is_none() {
+        if exit_code == 0 && cc_expansion_is_stdout(parsed) {
             match stage_cc_stdout_artifact(&output.stdout) {
                 Ok((artifact, temp)) => {
                     artifacts = ArtifactSet::new(vec![artifact]);
@@ -11925,6 +11930,72 @@ mod tests {
         assert!(
             !result.keepalive.is_empty(),
             "the staging file must outlive execute"
+        );
+    }
+
+    #[test]
+    fn cc_expansion_is_stdout_only_without_dash_o() {
+        let stdout = CcArgs::parse(&s(&["cc", "-E", "unit.c"])).unwrap();
+        let named = CcArgs::parse(&s(&["cc", "-E", "unit.c", "-o", "unit.i"])).unwrap();
+        let compile = CcArgs::parse(&s(&["cc", "-c", "unit.c", "-o", "unit.o"])).unwrap();
+        assert!(cc_expansion_is_stdout(&stdout));
+        assert!(!cc_expansion_is_stdout(&named));
+        assert!(!cc_expansion_is_stdout(&compile));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stdout_preprocess_does_not_stage_an_artifact() {
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&s(&["cc", "-E", "/no/such/kache-missing.c"]))
+            .unwrap();
+        let result = execute_retrying_etxtbsy(&compiler, &parsed).expect("cc -E should spawn");
+        assert_ne!(result.exit_code, 0);
+        assert!(
+            result.artifacts.is_empty(),
+            "a failed -E must not cache stdout, got {:?}",
+            result
+                .artifacts
+                .outputs()
+                .iter()
+                .map(|a| &a.store_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_named_preprocess_does_not_stage_stdout_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("unit.c");
+        let out = dir.path().join("unit.i");
+        std::fs::write(&source, "int named;\n").unwrap();
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&s(&[
+                "cc",
+                "-E",
+                source.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ]))
+            .unwrap();
+        let result = execute_retrying_etxtbsy(&compiler, &parsed).expect("cc -E -o should run");
+        assert_eq!(result.exit_code, 0, "stderr={}", result.stderr);
+        assert!(
+            result
+                .artifacts
+                .outputs()
+                .iter()
+                .all(|a| a.store_name != CC_STDOUT_STORE_NAME),
+            "named -E must not replace the -o file with a stdout blob, got {:?}",
+            result
+                .artifacts
+                .outputs()
+                .iter()
+                .map(|a| &a.store_name)
+                .collect::<Vec<_>>()
         );
     }
 

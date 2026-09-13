@@ -1726,7 +1726,7 @@ impl Config {
                 // It already passed the schema check in `parse_host_config`.
                 let host_only = host_layer
                     .and_then(|mut table| {
-                        yield_host_remote_to_env(&mut table, None);
+                        yield_host_tables_to_env(&mut table, None);
                         toml::Value::Table(table).try_into().ok()
                     })
                     .unwrap_or_default();
@@ -2655,30 +2655,47 @@ const REMOTE_ENV_VARS: &[&str] = &[
     "KACHE_S3_USER_AGENT",
 ];
 
-/// Drop the host remote when the environment describes one and the chosen
-/// file declares none. A host `type = "filesystem"` otherwise picks the
-/// backend before `KACHE_S3_BUCKET` is read, and a job whose remote lives
-/// only in its environment would write to the host's remote instead.
-fn yield_host_remote_to_env(host: &mut toml::Table, chosen: Option<&toml::Table>) {
+/// The variables that describe a planner on their own, without a file.
+const PLANNER_ENV_VARS: &[&str] = &[
+    "KACHE_PLANNER_ENDPOINT",
+    "KACHE_PLANNER_TIMEOUT_MS",
+    "KACHE_PLANNER_TOKEN",
+];
+
+/// `[cache]` tables whose host copy gives way to the environment, with the
+/// variables that describe each. Without this, a host `type = "filesystem"`
+/// picks the backend before `KACHE_S3_BUCKET` is read, and a job that sets
+/// only `KACHE_PLANNER_ENDPOINT` gets the host planner's token sent to an
+/// endpoint the job chose.
+const HOST_TABLES_YIELDING_TO_ENV: &[(&str, &[&str])] =
+    &[("remote", REMOTE_ENV_VARS), ("planner", PLANNER_ENV_VARS)];
+
+/// Drop each host table in [`HOST_TABLES_YIELDING_TO_ENV`] that the
+/// environment describes and the chosen file does not declare, so no host
+/// key for it applies.
+fn yield_host_tables_to_env(host: &mut toml::Table, chosen: Option<&toml::Table>) {
     let chosen_cache = chosen
         .and_then(|table| table.get("cache"))
         .and_then(toml::Value::as_table);
-    // A chosen remote replaces the host remote whole anyway, and a chosen
-    // `ignore_env` means kache does not read the environment's remote.
-    if chosen_cache.is_some_and(|cache| {
-        cache.contains_key("remote")
-            || cache.get("ignore_env").and_then(toml::Value::as_bool) == Some(true)
-    }) {
+    // A chosen `ignore_env` means kache does not read these variables.
+    if chosen_cache
+        .and_then(|cache| cache.get("ignore_env"))
+        .and_then(toml::Value::as_bool)
+        == Some(true)
+    {
         return;
     }
-    let Some(var) = REMOTE_ENV_VARS
-        .iter()
-        .find(|name| std::env::var_os(name).is_some())
-    else {
-        return;
-    };
-    if remove_config_key(host, &["cache", "remote"]) {
-        tracing::debug!("{var} is set, so the host config's [cache.remote] does not apply");
+    for (table, vars) in HOST_TABLES_YIELDING_TO_ENV {
+        // A chosen table replaces the host one whole anyway.
+        if chosen_cache.is_some_and(|cache| cache.contains_key(*table)) {
+            continue;
+        }
+        let Some(var) = vars.iter().find(|name| std::env::var_os(name).is_some()) else {
+            continue;
+        };
+        if remove_config_key(host, &["cache", table]) {
+            tracing::debug!("{var} is set, so the host config's [cache.{table}] does not apply");
+        }
     }
 }
 
@@ -2736,7 +2753,7 @@ fn parse_layered_file_config(content: &str, host: Option<toml::Table>) -> Result
         return toml::from_str(content).context("parsing kache config file");
     };
     let chosen: toml::Table = toml::from_str(content).context("parsing kache config file")?;
-    yield_host_remote_to_env(&mut merged, Some(&chosen));
+    yield_host_tables_to_env(&mut merged, Some(&chosen));
     merge_config_tables(&mut merged, chosen);
     toml::Value::Table(merged)
         .try_into()
@@ -4216,6 +4233,56 @@ remote_key_cache_refresh_secs = 900
         );
     }
 
+    /// A job that sets only `KACHE_PLANNER_ENDPOINT`, with no
+    /// `[cache.planner]` in its file, must not get the host planner's token:
+    /// kache would send it to the endpoint the job chose.
+    #[test]
+    fn an_environment_planner_never_gets_the_host_planner_token() {
+        let _lock = config_path_lock();
+        let _unset: Vec<_> = PLANNER_ENV_VARS
+            .iter()
+            .chain(["KACHE_LOCAL_ONLY"].iter())
+            .map(|name| set_env_for_test(name, None))
+            .collect();
+        let host_planner = "[cache.planner]\nendpoint = \"http://host-planner\"\n\
+                            token = \"host-secret\"\ntimeout_ms = 1234\n";
+        let job_endpoint = std::ffi::OsStr::new("http://job-planner");
+
+        for chosen_content in [Some("[cache]\n"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let (host, chosen) = write_host_and_chosen(dir.path(), host_planner, chosen_content);
+            let _host = set_host_config_for_test(&host);
+            let _chosen = set_kache_config_for_test(&chosen);
+
+            let planner = Config::load_planner_config().expect("the host planner applies");
+            assert_eq!(planner.token.as_deref(), Some("host-secret"));
+            assert_eq!(planner.timeout_ms, 1234);
+
+            let _endpoint = set_env_for_test("KACHE_PLANNER_ENDPOINT", Some(job_endpoint));
+            let planner = Config::load_planner_config().expect("the environment's planner");
+            assert_eq!(planner.endpoint, "http://job-planner");
+            assert_eq!(
+                planner.token, None,
+                "the host token must not reach a job-chosen endpoint ({chosen_content:?})"
+            );
+            assert_eq!(planner.timeout_ms, DEFAULT_PLANNER_TIMEOUT_MS);
+        }
+
+        // A planner the chosen file declares keeps per-field env overrides.
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            host_planner,
+            Some("[cache.planner]\nendpoint = \"http://project\"\ntoken = \"project-secret\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+        let _endpoint = set_env_for_test("KACHE_PLANNER_ENDPOINT", Some(job_endpoint));
+        let planner = Config::load_planner_config().expect("the chosen planner");
+        assert_eq!(planner.endpoint, "http://job-planner");
+        assert_eq!(planner.token.as_deref(), Some("project-secret"));
+    }
+
     /// A job whose remote lives only in its environment (`KACHE_S3_BUCKET`,
     /// no `[cache.remote]` in its file) keeps that remote on a machine whose
     /// host file declares a filesystem remote.
@@ -4518,6 +4585,12 @@ remote_key_cache_refresh_secs = 900
             .map(|(var, _)| *var)
             .collect();
         assert_eq!(remote, REMOTE_ENV_VARS);
+        let planner: Vec<&str> = ENV_FILE_KEYS
+            .iter()
+            .filter(|(_, key)| key.starts_with("cache.planner."))
+            .map(|(var, _)| *var)
+            .collect();
+        assert_eq!(planner, PLANNER_ENV_VARS);
     }
 
     /// Each key in [`ENV_FILE_KEYS`] is one the config file has: a value set

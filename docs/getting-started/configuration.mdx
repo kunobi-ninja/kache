@@ -52,7 +52,7 @@ input_predictions = true
 ```
 
 - `[cache.remote]`, `[cache.planner]` and `[cache.volumes]` are replaced whole. If the chosen file declares one, none of the host file's keys for it apply.
-- A remote set only through `KACHE_S3_*` variables also replaces the host remote, as long as the chosen file declares no `[cache.remote]`.
+- A remote set only through `KACHE_S3_*` variables also replaces the host remote, as long as the chosen file declares no `[cache.remote]`. The same goes for `KACHE_PLANNER_*` and `[cache.planner]`, so a host planner token is never sent to an endpoint the environment picked.
 - The host file never contributes `[workspace]` declarations. Those belong to a project's `.kache.toml`.
 - The host file cannot set `ignore_env`. Kache ignores it with a warning, so environment variables always win over both files.
 - A host file that cannot be read or parsed is ignored with a warning. `kache doctor` reports it, and lists each host key with whatever overrides it.

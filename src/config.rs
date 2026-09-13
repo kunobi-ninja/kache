@@ -2869,6 +2869,39 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn cache_cc_links_env_one_and_true_enable_zero_does_not() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[cache]\nlocal_only = true\n").unwrap();
+        let _cfg = set_kache_config_for_test(&config_path);
+        let cache_dir = dir.path().join("store");
+        let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(cache_dir.as_os_str()));
+
+        {
+            let _env = set_env_for_test("KACHE_CACHE_CC_LINKS", None);
+            assert!(
+                !Config::load().unwrap().cache_cc_links,
+                "link cache stays off without env or file"
+            );
+        }
+        for on in ["1", "true", "TRUE"] {
+            let _env = set_env_for_test("KACHE_CACHE_CC_LINKS", Some(on.as_ref()));
+            assert!(
+                Config::load().unwrap().cache_cc_links,
+                "{on} must enable cache_cc_links"
+            );
+        }
+        for off in ["0", "false", "no", ""] {
+            let _env = set_env_for_test("KACHE_CACHE_CC_LINKS", Some(off.as_ref()));
+            assert!(
+                !Config::load().unwrap().cache_cc_links,
+                "{off:?} must not enable cache_cc_links"
+            );
+        }
+    }
+
     struct TestEnvGuard {
         key: &'static str,
         previous: Option<OsString>,

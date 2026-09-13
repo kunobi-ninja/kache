@@ -5386,6 +5386,11 @@ impl CcCompiler {
         self
     }
 
+    /// clang-cl's `-###` dump uses Windows path tokens; GNU/clang do not.
+    fn cc_link_probe_is_windows_aware(family: ToolFamily) -> bool {
+        family.dialect() != Dialect::Cl
+    }
+
     fn cache_key_for_link(&self, parsed: &CcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"cc_link_key_version:1\n");
@@ -5405,7 +5410,7 @@ impl CcCompiler {
                 args: &parsed.rest,
                 key_args: &config_args,
                 per_tu_paths: &[],
-                windows_aware: parsed.family.dialect() != Dialect::Cl,
+                windows_aware: Self::cc_link_probe_is_windows_aware(parsed.family),
             },
         )?;
         hasher.update(b"compiler_version:");
@@ -5732,10 +5737,12 @@ impl Compiler for CcCompiler {
         // signal to the wrapper that this invocation is cacheable.
         let mut reasons = parsed.refuse_reasons(&self.extra_allowlist_flags);
         if self.cache_cc_links && parsed.mode == CompileMode::Link {
+            // Link mode short-circuits CcArgs::refuse_reasons before
+            // feature checks such as `@file`, so only the link-mode
+            // reason is present to strip. expand_cc_response_files
+            // still folds `@file` contents into the key.
             reasons.retain(|reason| match reason {
-                RefuseReason::Unsupported(detail) => {
-                    !detail.contains("cc link mode") && !detail.contains("response file")
-                }
+                RefuseReason::Unsupported(detail) => !detail.contains("cc link mode"),
                 _ => true,
             });
             if parsed.output.is_none() {
@@ -8867,6 +8874,85 @@ mod tests {
         fs::write(&a, b"obj-a-v1").unwrap();
         let restored = compiler.cache_key(&parsed, &ctx).unwrap();
         assert_eq!(first, restored, "restoring object bytes must hit again");
+
+        let libdir = dir.path().join("libfoo.a");
+        fs::write(&libdir, b"not-an-input-archive").unwrap();
+        let object = a.to_string_lossy().into_owned();
+        for (flag, next) in [
+            ("-L", libdir.clone()),
+            ("-o", dir.path().join("out.a")),
+            ("-I", dir.path().join("hdr.o")),
+            ("-include", dir.path().join("forced.o")),
+        ] {
+            fs::write(&next, b"skip-me").unwrap();
+            let inputs = cc_link_file_inputs(&s(&[object.as_str(), flag, next.to_str().unwrap()]));
+            assert_eq!(
+                inputs,
+                vec![a.clone()],
+                "{flag} must skip the next path even when it looks like a link input, got {inputs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cc_link_probe_is_windows_aware_for_gnu_not_clang_cl() {
+        assert!(CcCompiler::cc_link_probe_is_windows_aware(ToolFamily::Gnu));
+        assert!(CcCompiler::cc_link_probe_is_windows_aware(
+            ToolFamily::Clang
+        ));
+        assert!(!CcCompiler::cc_link_probe_is_windows_aware(
+            ToolFamily::ClangCl
+        ));
+    }
+
+    #[test]
+    fn discover_cc_link_sidecars_finds_a_map_next_to_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("prog");
+        let map = dir.path().join("prog.map");
+        fs::write(&bin, b"elf").unwrap();
+        fs::write(&map, b"map").unwrap();
+        let sidecars = discover_cc_link_sidecars(&bin);
+        assert!(
+            sidecars.iter().any(|a| a.path == map),
+            "a sibling .map must be discovered, got {sidecars:?}"
+        );
+
+        let object = dir.path().join("unit.o");
+        fs::write(&object, b"obj").unwrap();
+        fs::write(dir.path().join("unit.map"), b"map").unwrap();
+        let compile =
+            CcArgs::parse(&s(&["cc", "-c", "unit.c", "-o", object.to_str().unwrap()])).unwrap();
+        let compile_arts = discover_cc_output_artifacts(&compile);
+        assert!(
+            compile_arts
+                .outputs()
+                .iter()
+                .all(|a| a.path.extension().and_then(|e| e.to_str()) != Some("map")),
+            "compile mode must not pick up link sidecars: {:?}",
+            compile_arts
+                .outputs()
+                .iter()
+                .map(|a| &a.path)
+                .collect::<Vec<_>>()
+        );
+        let link = CcArgs::parse(&s(&[
+            "cc",
+            object.to_str().unwrap(),
+            "-o",
+            bin.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let link_arts = discover_cc_output_artifacts(&link);
+        assert!(
+            link_arts.outputs().iter().any(|a| a.path == map),
+            "link mode must include the sibling map, got {:?}",
+            link_arts
+                .outputs()
+                .iter()
+                .map(|a| &a.path)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[cfg(unix)]

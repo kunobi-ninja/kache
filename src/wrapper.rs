@@ -1141,7 +1141,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
     }
     if store_decision.should_store
-        && parsed.mode == crate::compiler::cc::CompileMode::Compile
+        && cc_store_revalidates_include_dirs(parsed.mode)
         && !compiler.include_dir_names_still_match(&parsed)
     {
         tracing::debug!(
@@ -1359,6 +1359,10 @@ fn cc_preprocess_restore_target(
         .file_name()
         .is_some_and(|name| name.to_string_lossy() == cached_name);
     names_match.then_some(target)
+}
+
+fn cc_store_revalidates_include_dirs(mode: crate::compiler::cc::CompileMode) -> bool {
+    mode == crate::compiler::cc::CompileMode::Compile
 }
 
 fn cc_cache_entry_rejection_reason(
@@ -1711,7 +1715,7 @@ fn restore_cc_from_cache(
         let mut permissions = std::fs::metadata(&output)
             .with_context(|| format!("cc restore: stat {}", output.display()))?
             .permissions();
-        permissions.set_mode(permissions.mode() | 0o111);
+        permissions.set_mode(0o755);
         std::fs::set_permissions(&output, permissions)
             .with_context(|| format!("cc restore: chmod +x {}", output.display()))?;
     }
@@ -7059,6 +7063,72 @@ mod tests {
             cc_cache_entry_rejection_reason(&compile, &entry("unit.i")),
             Some("matching entry lacks the object artifact required by this invocation")
         );
+
+        let link_args: Vec<String> = ["cc", "a.o", "b.o", "-o", "prog"]
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect();
+        let link = CcArgs::parse(&link_args).unwrap();
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&link, &entry_meta_with_files(&[])),
+            Some("matching entry lacks the link artifact required by this invocation"),
+            "an empty link entry cannot serve the binary"
+        );
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&link, &entry("prog")),
+            None,
+            "any stored file is enough for a link hit"
+        );
+        assert!(
+            cc_store_revalidates_include_dirs(crate::compiler::cc::CompileMode::Compile),
+            "object compiles re-check include-dir names before store"
+        );
+        assert!(
+            !cc_store_revalidates_include_dirs(crate::compiler::cc::CompileMode::Link),
+            "links have no include-dir snapshot and must still store"
+        );
+    }
+
+    #[test]
+    fn restore_cc_from_cache_writes_the_link_binary_and_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let bin_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let map_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        create_blob(&store, bin_hash, b"ELF");
+        create_blob(&store, map_hash, b"MAP");
+
+        let output = dir.path().join("prog");
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcCompiler::new()
+            .parse(&s(&["cc", "a.o", "b.o", "-o", &output_str]))
+            .unwrap();
+        let meta = entry_meta(
+            "cc-link-key",
+            vec![
+                cached_file("prog", bin_hash),
+                cached_file("prog.map", map_hash),
+            ],
+            &[],
+        );
+
+        restore_cc_from_cache(&store, &parsed, &meta).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"ELF");
+        assert_eq!(
+            std::fs::read(dir.path().join("prog.map")).unwrap(),
+            b"MAP",
+            "link sidecars must land next to the binary"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o100,
+                0,
+                "restored link outputs must be owner-executable"
+            );
+        }
     }
 
     #[test]

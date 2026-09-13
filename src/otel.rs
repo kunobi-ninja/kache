@@ -514,7 +514,7 @@ fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
 }
 
 /// Fill `loads` with the 1, 5 and 15 minute load averages and return how
-/// many the OS wrote, or -1 where it keeps none. Only the syscall, so what
+/// many the OS wrote, or zero where it keeps none. Only the syscall, so what
 /// counts as a sample is decided in [`one_minute_load`].
 pub(crate) fn sample_load_averages(loads: &mut [f64; 3]) -> i32 {
     #[cfg(unix)]
@@ -525,7 +525,7 @@ pub(crate) fn sample_load_averages(loads: &mut [f64; 3]) -> i32 {
     #[cfg(not(unix))]
     {
         let _ = loads;
-        -1
+        i32::default()
     }
 }
 

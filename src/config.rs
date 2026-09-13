@@ -1652,7 +1652,10 @@ impl Config {
                 // With no chosen file, the host layer is the whole file config.
                 // It already passed the schema check in `parse_host_config`.
                 let host_only = host_layer
-                    .and_then(|table| toml::Value::Table(table).try_into().ok())
+                    .and_then(|mut table| {
+                        yield_host_remote_to_env(&mut table, None);
+                        toml::Value::Table(table).try_into().ok()
+                    })
                     .unwrap_or_default();
                 (Ok(host_only), provenance)
             }
@@ -2564,6 +2567,43 @@ fn remove_config_key(table: &mut toml::Table, path: &[&str]) -> bool {
     }
 }
 
+/// The variables that describe an S3 remote on their own, without a file.
+const REMOTE_ENV_VARS: &[&str] = &[
+    "KACHE_S3_BUCKET",
+    "KACHE_S3_ENDPOINT",
+    "KACHE_S3_REGION",
+    "KACHE_S3_PREFIX",
+    "KACHE_S3_PROFILE",
+    "KACHE_S3_USER_AGENT",
+];
+
+/// Drop the host remote when the environment describes one and the chosen
+/// file declares none. A host `type = "filesystem"` otherwise picks the
+/// backend before `KACHE_S3_BUCKET` is read, and a job whose remote lives
+/// only in its environment would write to the host's remote instead.
+fn yield_host_remote_to_env(host: &mut toml::Table, chosen: Option<&toml::Table>) {
+    let chosen_cache = chosen
+        .and_then(|table| table.get("cache"))
+        .and_then(toml::Value::as_table);
+    // A chosen remote replaces the host remote whole anyway, and a chosen
+    // `ignore_env` means kache does not read the environment's remote.
+    if chosen_cache.is_some_and(|cache| {
+        cache.contains_key("remote")
+            || cache.get("ignore_env").and_then(toml::Value::as_bool) == Some(true)
+    }) {
+        return;
+    }
+    let Some(var) = REMOTE_ENV_VARS
+        .iter()
+        .find(|name| std::env::var_os(name).is_some())
+    else {
+        return;
+    };
+    if remove_config_key(host, &["cache", "remote"]) {
+        tracing::debug!("{var} is set, so the host config's [cache.remote] does not apply");
+    }
+}
+
 /// The host layer to merge under the chosen file, or `None`. A host file that
 /// cannot be read or parsed is warned about and skipped: one bad machine-wide
 /// file must not change how every build on the host resolves its settings.
@@ -2618,6 +2658,7 @@ fn parse_layered_file_config(content: &str, host: Option<toml::Table>) -> Result
         return toml::from_str(content).context("parsing kache config file");
     };
     let chosen: toml::Table = toml::from_str(content).context("parsing kache config file")?;
+    yield_host_remote_to_env(&mut merged, Some(&chosen));
     merge_config_tables(&mut merged, chosen);
     toml::Value::Table(merged)
         .try_into()
@@ -4065,6 +4106,44 @@ remote_key_cache_refresh_secs = 900
         assert_eq!(remote._type.as_deref(), Some("s3"));
         assert_eq!(remote.bucket.as_deref(), Some("ci"));
         assert_eq!(remote.path, None, "no host remote key may leak in");
+    }
+
+    /// A job whose remote lives only in its environment (`KACHE_S3_BUCKET`,
+    /// no `[cache.remote]` in its file) keeps that remote on a machine whose
+    /// host file declares a filesystem remote.
+    #[test]
+    fn an_environment_remote_beats_a_host_remote() {
+        let _lock = config_path_lock();
+        let _unset: Vec<_> = REMOTE_ENV_VARS
+            .iter()
+            .map(|name| set_env_for_test(name, None))
+            .collect();
+        for chosen_content in [Some("[cache]\nlocal_max_size = \"10GiB\"\n"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let host_content = format!(
+                "[cache.remote]\ntype = \"filesystem\"\npath = {:?}\n",
+                dir.path().join("remote")
+            );
+            let (host, chosen) = write_host_and_chosen(dir.path(), &host_content, chosen_content);
+            let _host = set_host_config_for_test(&host);
+            let _chosen = set_kache_config_for_test(&chosen);
+            let backend = || {
+                Config::load_remote_config(&Config::load_file_config())
+                    .unwrap()
+                    .expect("a remote is configured")
+                    .backend
+            };
+
+            assert!(
+                matches!(backend(), RemoteBackendConfig::Filesystem(_)),
+                "with no S3 environment the host remote applies ({chosen_content:?})"
+            );
+            let _bucket = set_env_for_test("KACHE_S3_BUCKET", Some(std::ffi::OsStr::new("ci")));
+            let RemoteBackendConfig::S3(s3) = backend() else {
+                panic!("the environment's S3 remote must win ({chosen_content:?})");
+            };
+            assert_eq!(s3.bucket, "ci");
+        }
     }
 
     #[test]

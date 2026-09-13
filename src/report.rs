@@ -11,8 +11,8 @@ use crate::since::SinceWindow;
 
 // ── Data Model ──────────────────────────────────────────────────────────────
 
-/// `gc_stats.json`: the last GC run, whichever driver ran it, plus running
-/// totals across all of them.
+/// `gc_stats.json`: the last GC run, whichever driver ran it. Files written
+/// by earlier versions can carry a `totals` object, which is ignored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GcStatsPersisted {
     pub last_run: String,
@@ -34,34 +34,13 @@ pub struct GcStatsPersisted {
     pub entries_failed: usize,
     #[serde(default)]
     pub entries_locked: usize,
-    #[serde(default)]
-    pub totals: GcTotals,
-}
-
-/// Running GC totals since `since`, the first run recorded with totals. The
-/// last run alone cannot show a sweep that has been losing every eviction to
-/// lock contention for weeks; these can.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GcTotals {
-    #[serde(default)]
-    pub since: String,
-    #[serde(default)]
-    pub runs: u64,
-    #[serde(default)]
-    pub entries_evicted: u64,
-    #[serde(default)]
-    pub bytes_freed: u64,
-    #[serde(default)]
-    pub entries_failed: u64,
-    #[serde(default)]
-    pub entries_locked: u64,
 }
 
 pub(crate) const GC_STATS_FILE: &str = "gc_stats.json";
 
 /// Read `cache_dir/gc_stats.json`, or `None` when it is absent. A file that
-/// does not parse also reads as `None`, with a warning, because the next GC
-/// run then starts the totals over.
+/// does not parse also reads as `None`, with a warning, so a damaged record
+/// does not pass silently.
 pub(crate) fn read_gc_stats(cache_dir: &Path) -> Option<GcStatsPersisted> {
     let path = cache_dir.join(GC_STATS_FILE);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -69,7 +48,7 @@ pub(crate) fn read_gc_stats(cache_dir: &Path) -> Option<GcStatsPersisted> {
         Ok(stats) => Some(stats),
         Err(e) => {
             tracing::warn!(
-                "{} does not parse ({e}); the next GC run starts its totals over",
+                "{} does not parse ({e}); the next GC run replaces it",
                 path.display()
             );
             None
@@ -77,31 +56,11 @@ pub(crate) fn read_gc_stats(cache_dir: &Path) -> Option<GcStatsPersisted> {
     }
 }
 
-/// Record one finished GC run: replace the last-run fields and add to the
-/// totals. The read-modify-write is only race-free under `gc.lock`, which every
-/// caller holds, so two drivers never both read the same old totals.
+/// Record one finished GC run in `gc_stats.json`, replacing the previous
+/// one. Callers hold `gc.lock`.
 pub fn record_gc_run(cache_dir: &Path, source: &str, stats: &crate::store::GcStats) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    let mut totals = read_gc_stats(cache_dir)
-        .map(|previous| previous.totals)
-        .unwrap_or_default();
-    if totals.since.is_empty() {
-        totals.since = now.clone();
-    }
-    totals.runs = totals.runs.saturating_add(1);
-    totals.entries_evicted = totals
-        .entries_evicted
-        .saturating_add(stats.entries_evicted as u64);
-    totals.bytes_freed = totals.bytes_freed.saturating_add(stats.bytes_freed);
-    totals.entries_failed = totals
-        .entries_failed
-        .saturating_add(stats.entries_failed as u64);
-    totals.entries_locked = totals
-        .entries_locked
-        .saturating_add(stats.entries_locked as u64);
-
     let persisted = GcStatsPersisted {
-        last_run: now,
+        last_run: Utc::now().to_rfc3339(),
         entries_evicted: stats.entries_evicted,
         bytes_freed: stats.bytes_freed,
         disk_bytes_reclaimed: stats.disk_bytes_reclaimed,
@@ -111,7 +70,6 @@ pub fn record_gc_run(cache_dir: &Path, source: &str, stats: &crate::store::GcSta
         entries_pinned: stats.entries_pinned,
         entries_failed: stats.entries_failed,
         entries_locked: stats.entries_locked,
-        totals,
     };
     let json = serde_json::to_string_pretty(&persisted)?;
     kache_store::atomic::atomic_replace(&cache_dir.join(GC_STATS_FILE), json.as_bytes())
@@ -3847,8 +3805,10 @@ mod tests {
         assert!(load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now())).is_none());
     }
 
+    /// gc_stats.json is the last run only: a second run replaces every field,
+    /// and the file keeps the keys that older readers require.
     #[test]
-    fn record_gc_run_keeps_the_last_run_and_totals_across_drivers() {
+    fn record_gc_run_keeps_only_the_last_run() {
         let dir = tempfile::tempdir().unwrap();
         let first = crate::store::GcStats {
             entries_evicted: 3,
@@ -3860,6 +3820,10 @@ mod tests {
         let second = crate::store::GcStats {
             entries_evicted: 1,
             bytes_freed: 50,
+            disk_bytes_reclaimed: 40,
+            blobs_removed: 4,
+            duration_ms: 7,
+            entries_pinned: 6,
             entries_failed: 5,
             entries_locked: 4,
             ..Default::default()
@@ -3868,25 +3832,39 @@ mod tests {
         record_gc_run(dir.path(), "auto", &second).unwrap();
 
         let stats = read_gc_stats(dir.path()).unwrap();
-        assert_eq!(stats.source, "auto");
         assert_eq!(
-            stats.entries_evicted, 1,
-            "last-run fields describe the latest run"
+            (
+                stats.source.as_str(),
+                stats.entries_evicted,
+                stats.bytes_freed,
+                stats.disk_bytes_reclaimed,
+                stats.blobs_removed,
+                stats.duration_ms,
+                stats.entries_pinned,
+                stats.entries_failed,
+                stats.entries_locked,
+            ),
+            ("auto", 1, 50, 40, 4, 7, 6, 5, 4)
         );
-        assert_eq!(stats.entries_failed, 5);
-        assert_eq!(stats.entries_locked, 4);
-        assert_eq!(stats.totals.runs, 2);
-        assert_eq!(stats.totals.entries_evicted, 4);
-        assert_eq!(stats.totals.bytes_freed, 150);
-        assert_eq!(stats.totals.entries_failed, 7);
-        assert_eq!(stats.totals.entries_locked, 6);
-        assert!(!stats.totals.since.is_empty());
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join(GC_STATS_FILE)).unwrap())
+                .unwrap();
+        assert!(raw.get("totals").is_none(), "{raw}");
+        for key in [
+            "last_run",
+            "entries_evicted",
+            "bytes_freed",
+            "blobs_removed",
+            "duration_ms",
+        ] {
+            assert!(raw.get(key).is_some(), "older readers require {key}: {raw}");
+        }
     }
 
-    /// A gc_stats.json that no longer parses makes the next GC run start its
-    /// totals over. Losing months of totals has to show in the log.
+    /// A gc_stats.json that no longer parses is replaced by the next GC run.
+    /// That has to show in the log rather than pass silently.
     #[test]
-    fn unparseable_gc_stats_warns_that_totals_start_over() {
+    fn unparseable_gc_stats_warns_before_it_is_replaced() {
         struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Capture {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -3912,31 +3890,36 @@ mod tests {
         assert!(read.is_none());
         let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(log.contains("WARN"), "{log}");
-        assert!(log.contains("starts its totals over"), "{log}");
+        assert!(log.contains("the next GC run replaces it"), "{log}");
     }
 
-    /// A file written before totals existed must still load, start its totals
-    /// at the next run, and keep feeding the report's GC section.
+    /// Files written while gc_stats.json carried running totals still load,
+    /// and the next run writes the last-run record without them.
     #[test]
-    fn record_gc_run_starts_totals_over_a_pre_totals_file() {
+    fn gc_stats_with_totals_from_an_earlier_version_still_parses() {
         let dir = tempfile::tempdir().unwrap();
-        write_gc_stats(dir.path(), Utc::now() - chrono::Duration::hours(1));
-        let old = read_gc_stats(dir.path()).expect("the old format still parses");
-        assert!(old.source.is_empty());
-        assert_eq!(old.totals, GcTotals::default());
+        std::fs::write(
+            dir.path().join(GC_STATS_FILE),
+            r#"{"last_run":"2026-09-12T12:11:05+00:00","entries_evicted":2,"bytes_freed":9,"blobs_removed":1,"duration_ms":3,"source":"auto","totals":{"since":"2026-09-01T00:00:00+00:00","runs":4}}"#,
+        )
+        .unwrap();
+        let old = read_gc_stats(dir.path()).expect("the earlier format parses");
+        assert_eq!(
+            (old.entries_evicted, old.bytes_freed, old.source.as_str()),
+            (2, 9, "auto")
+        );
 
         let run = crate::store::GcStats {
-            entries_evicted: 2,
+            entries_evicted: 5,
             ..Default::default()
         };
         record_gc_run(dir.path(), "manual", &run).unwrap();
 
-        let stats = read_gc_stats(dir.path()).unwrap();
-        assert_eq!(stats.totals.runs, 1);
-        assert_eq!(stats.totals.entries_evicted, 2);
+        let raw = std::fs::read_to_string(dir.path().join(GC_STATS_FILE)).unwrap();
+        assert!(!raw.contains("totals"), "{raw}");
         let gc = load_gc_summary(dir.path(), SinceWindow::DEFAULT.cutoff(Utc::now()))
             .expect("the recorded run is inside the window");
-        assert_eq!(gc.entries_evicted, 2);
+        assert_eq!(gc.entries_evicted, 5);
     }
 
     fn test_event(

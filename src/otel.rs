@@ -496,45 +496,6 @@ fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
         metrics.push(gauge(name, unit, vec![as_int(value, now, &[])]));
     }
 
-    // The totals accumulate across runs and drivers since `since`, which is
-    // exactly what a cumulative sum's start time has to be.
-    let totals = &gc.totals;
-    let start = chrono::DateTime::parse_from_rfc3339(&totals.since)
-        .ok()
-        .and_then(|since| since.timestamp_nanos_opt());
-    if let (true, Some(start)) = (totals.runs > 0, start) {
-        let start = start.max(0).to_string();
-        for (name, unit, value) in [
-            ("kache.cache.gc.runs", "{run}", totals.runs),
-            (
-                "kache.cache.gc.entries_evicted",
-                "{entry}",
-                totals.entries_evicted,
-            ),
-            ("kache.cache.gc.bytes_freed", "By", totals.bytes_freed),
-            (
-                "kache.cache.gc.entries_failed",
-                "{entry}",
-                totals.entries_failed,
-            ),
-            (
-                "kache.cache.gc.entries_locked",
-                "{entry}",
-                totals.entries_locked,
-            ),
-        ] {
-            metrics.push(cum_sum(
-                name,
-                unit,
-                vec![json!({
-                    "asInt": value.to_string(),
-                    "timeUnixNano": now,
-                    "startTimeUnixNano": start,
-                    "attributes": [],
-                })],
-            ));
-        }
-    }
     metrics
 }
 
@@ -692,14 +653,6 @@ mod tests {
                 entries_failed: 3,
                 entries_locked: 2,
                 duration_ms: 5801,
-                totals: crate::report::GcTotals {
-                    since: "2026-09-01T00:00:00+00:00".to_string(),
-                    runs: 4,
-                    entries_evicted: 900,
-                    bytes_freed: 10,
-                    entries_failed: 70,
-                    entries_locked: 60,
-                },
                 ..Default::default()
             }),
         }
@@ -778,38 +731,43 @@ mod tests {
         }
     }
 
+    /// GC figures describe the last run only, as gauges. Adding runs up is
+    /// the backend's job, over the lines in `gc-runs.jsonl`.
     #[test]
-    fn gc_totals_are_cumulative_sums_from_their_first_run() {
+    fn gc_figures_are_last_run_gauges() {
         let body = with_machine(&machine_snap());
-        let runs = metric(&body, "kache.cache.gc.runs");
-        assert_eq!(
-            runs["sum"]["aggregationTemporality"],
-            "AGGREGATION_TEMPORALITY_CUMULATIVE"
-        );
-        let point = &runs["sum"]["dataPoints"][0];
-        assert_eq!(point["asInt"], "4");
-        let since = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00+00:00")
+        let got: Vec<(String, String)> = body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
             .unwrap()
-            .timestamp_nanos_opt()
-            .unwrap();
-        assert_eq!(point["startTimeUnixNano"], since.to_string());
-        assert_eq!(
-            metric(&body, "kache.cache.gc.entries_locked")["sum"]["dataPoints"][0]["asInt"],
-            "60"
-        );
-        assert_eq!(
-            metric(&body, "kache.cache.gc.last_run.entries_locked")["gauge"]["dataPoints"][0]["asInt"],
-            "2"
-        );
-    }
-
-    #[test]
-    fn gc_stats_without_totals_emit_no_cumulative_sums() {
-        let mut snap = machine_snap();
-        snap.gc.as_mut().unwrap().totals = crate::report::GcTotals::default();
-        let names = metric_names(&with_machine(&snap));
-        assert!(names.contains("kache.cache.gc.last_run.entries_evicted"));
-        assert!(!names.contains("kache.cache.gc.runs"), "{names:?}");
+            .iter()
+            .filter(|m| m["name"].as_str().unwrap().starts_with("kache.cache.gc."))
+            .map(|m| {
+                assert!(m.get("sum").is_none(), "no cumulative sums: {m}");
+                (
+                    m["name"].as_str().unwrap().to_string(),
+                    m["gauge"]["dataPoints"][0]["asInt"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect();
+        let last_run = chrono::DateTime::parse_from_rfc3339("2026-09-12T12:11:05+00:00")
+            .unwrap()
+            .timestamp()
+            .to_string();
+        let want: Vec<(String, String)> = [
+            ("kache.cache.gc.last_run.time", last_run.as_str()),
+            ("kache.cache.gc.last_run.entries_evicted", "560"),
+            ("kache.cache.gc.last_run.bytes_freed", "8373732071"),
+            ("kache.cache.gc.last_run.entries_failed", "3"),
+            ("kache.cache.gc.last_run.entries_locked", "2"),
+            ("kache.cache.gc.last_run.duration", "5801"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        assert_eq!(got, want);
     }
 
     /// A snapshot with nothing readable (no index yet, no GC record) must leave

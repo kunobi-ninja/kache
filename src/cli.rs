@@ -741,16 +741,6 @@ fn machine_lines(machine: &crate::otel::MachineSnapshot) -> Vec<String> {
             ));
         }
         lines.push(line);
-        if gc.totals.runs > 0 {
-            lines.push(format!(
-                "           since {}: {} runs, {} evicted, {} failed ({} locked)",
-                gc.totals.since,
-                gc.totals.runs,
-                gc.totals.entries_evicted,
-                gc.totals.entries_failed,
-                gc.totals.entries_locked
-            ));
-        }
     }
     lines
 }
@@ -7073,12 +7063,10 @@ mod tests {
         run_gc_local(&config, GcMode::Background).unwrap();
         let stats = crate::report::read_gc_stats(&config.cache_dir).expect("worker run recorded");
         assert_eq!(stats.source, "auto");
-        assert_eq!(stats.totals.runs, 1);
 
         run_gc_local(&config, GcMode::Cli).unwrap();
         let stats = crate::report::read_gc_stats(&config.cache_dir).unwrap();
         assert_eq!(stats.source, "manual");
-        assert_eq!(stats.totals.runs, 2);
     }
 
     #[test]
@@ -7091,7 +7079,6 @@ mod tests {
         let stats =
             crate::report::read_gc_stats(&config.cache_dir).expect("stale-schema run recorded");
         assert_eq!(stats.source, "manual");
-        assert_eq!(stats.totals.runs, 1);
     }
 
     /// `kache gc --max-age` with no reachable daemon evicts locally; that run
@@ -7107,7 +7094,6 @@ mod tests {
 
         let stats = crate::report::read_gc_stats(&config.cache_dir).expect("age run recorded");
         assert_eq!(stats.source, "manual");
-        assert_eq!(stats.totals.runs, 1);
     }
 
     #[test]
@@ -7138,7 +7124,7 @@ mod tests {
             tables.contains(&"entries") && tables.contains(&"blobs"),
             "{tables:?}"
         );
-        assert_eq!(snap.gc.expect("gc_stats.json read").totals.runs, 1);
+        assert_eq!(snap.gc.expect("gc_stats.json read").source, "auto");
     }
 
     /// The last read-write connection to a WAL database checkpoints on close,
@@ -7204,14 +7190,6 @@ mod tests {
                 source: "auto".to_string(),
                 entries_failed: 40,
                 entries_locked: 40,
-                totals: crate::report::GcTotals {
-                    since: "2026-07-21T00:00:00+00:00".to_string(),
-                    runs: 900,
-                    entries_evicted: 10,
-                    bytes_freed: 0,
-                    entries_failed: 547_695,
-                    entries_locked: 547_695,
-                },
                 ..Default::default()
             }),
         };
@@ -7230,10 +7208,7 @@ mod tests {
             lines[1].contains("40 lost the index write lock"),
             "{lines:?}"
         );
-        assert!(
-            lines[2].contains("547695 failed (547695 locked)"),
-            "{lines:?}"
-        );
+        assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(machine_lines(&crate::otel::MachineSnapshot::default()).is_empty());
     }
 

@@ -11771,7 +11771,7 @@ mod tests {
     }
 
     /// Upload-triggered eviction is a GC driver too: without a record, the
-    /// evictions it makes (and the ones it fails) never reach the totals.
+    /// evictions it makes (and the ones it fails) never reach gc_stats.json.
     #[test]
     fn upload_triggered_eviction_records_its_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -11801,7 +11801,6 @@ mod tests {
 
         let recorded = crate::report::read_gc_stats(dir.path()).expect("gc_stats.json written");
         assert_eq!(recorded.source, "daemon");
-        assert_eq!(recorded.totals.runs, 1);
         assert_eq!(recorded.entries_evicted, 1);
     }
 

@@ -376,6 +376,7 @@ pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot 
     let index_bytes = index_file_bytes(config);
     let mut snap = crate::otel::MachineSnapshot {
         index_bytes,
+        wal_bytes: index_wal_bytes(config),
         gc: crate::report::read_gc_stats(&config.cache_dir),
         ..Default::default()
     };
@@ -410,6 +411,17 @@ fn index_file_bytes(config: &Config) -> Option<u64> {
     std::fs::metadata(&db_path)
         .ok()
         .map(|db| db.len() + std::fs::metadata(&wal).map(|w| w.len()).unwrap_or(0))
+}
+
+/// The index's `-wal` file alone: 0 when it is absent, `None` when there is
+/// no index. A WAL that stays large means checkpoints are not keeping up
+/// with the writes.
+fn index_wal_bytes(config: &Config) -> Option<u64> {
+    let db_path = config.index_db_path();
+    std::fs::metadata(&db_path).ok()?;
+    let mut wal = db_path.into_os_string();
+    wal.push("-wal");
+    Some(std::fs::metadata(&wal).map(|w| w.len()).unwrap_or(0))
 }
 
 /// The machine-level session log. In the cache dir, which every job on the
@@ -604,9 +616,12 @@ pub fn stats(
             /// a row count.
             #[serde(skip_serializing_if = "Option::is_none")]
             index_bytes: Option<u64>,
+            /// The `-wal` file alone, also counted in `index_bytes`.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            index_wal_bytes: Option<u64>,
             #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
             index_rowid_high_water: std::collections::BTreeMap<&'static str, u64>,
-            /// The last GC run and running totals from `gc_stats.json`.
+            /// The last GC run, from `gc_stats.json`.
             #[serde(skip_serializing_if = "Option::is_none")]
             gc: Option<crate::report::GcStatsPersisted>,
             entries: usize,
@@ -637,6 +652,7 @@ pub fn stats(
             Body {
                 disk: disk.clone(),
                 index_bytes: machine.index_bytes,
+                index_wal_bytes: machine.wal_bytes,
                 index_rowid_high_water: machine.rowid_high_water.iter().copied().collect(),
                 gc: machine.gc.clone(),
                 entries: snap.entry_count,
@@ -714,11 +730,15 @@ fn machine_lines(machine: &crate::otel::MachineSnapshot) -> Vec<String> {
             .take(3)
             .map(|(table, rows)| format!("{table} {rows}"))
             .collect();
+        let wal = machine
+            .wal_bytes
+            .map(|wal| format!(", WAL {}", ByteSize(wal)))
+            .unwrap_or_default();
         if top.is_empty() {
-            lines.push(format!("Index:     {}", ByteSize(bytes)));
+            lines.push(format!("Index:     {}{wal}", ByteSize(bytes)));
         } else {
             lines.push(format!(
-                "Index:     {} (rowid high-water: {})",
+                "Index:     {}{wal} (rowid high-water: {})",
                 ByteSize(bytes),
                 top.join(", ")
             ));
@@ -7135,6 +7155,7 @@ mod tests {
 
         let empty = machine_snapshot(&config);
         assert!(empty.index_bytes.is_none());
+        assert!(empty.wal_bytes.is_none());
         assert!(empty.rowid_high_water.is_empty());
         assert!(empty.gc.is_none());
         assert!(
@@ -7145,7 +7166,12 @@ mod tests {
         drop(Store::open(&config).unwrap());
         crate::report::record_gc_run(&config, "auto", &crate::store::GcStats::default()).unwrap();
         let snap = machine_snapshot(&config);
-        assert!(snap.index_bytes.is_some_and(|bytes| bytes > 0));
+        let db_len = std::fs::metadata(config.index_db_path()).unwrap().len();
+        let mut wal_path = config.index_db_path().into_os_string();
+        wal_path.push("-wal");
+        let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(snap.wal_bytes, Some(wal_len));
+        assert_eq!(snap.index_bytes, Some(db_len + wal_len));
         let tables: Vec<_> = snap
             .rowid_high_water
             .iter()
@@ -7209,6 +7235,7 @@ mod tests {
     fn stats_lines_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
         let machine = crate::otel::MachineSnapshot {
             index_bytes: Some(29_074_419_712),
+            wal_bytes: Some(1_073_741_824),
             rowid_high_water: vec![
                 ("entries", 2),
                 ("file_hashes", 13_286_285),
@@ -7227,6 +7254,14 @@ mod tests {
         };
         let lines = machine_lines(&machine);
         assert!(lines[0].starts_with("Index:"), "{lines:?}");
+        assert!(
+            lines[0].contains(&format!(
+                "{}, WAL {} (rowid high-water:",
+                ByteSize(29_074_419_712),
+                ByteSize(1_073_741_824)
+            )),
+            "{lines:?}"
+        );
         assert!(
             lines[0].contains("(rowid high-water: file_hashes 13286285"),
             "{lines:?}"

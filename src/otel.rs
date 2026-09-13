@@ -430,6 +430,8 @@ fn cum_sum(name: &str, unit: &str, data_points: Vec<Value>) -> Value {
 pub(crate) struct MachineSnapshot {
     /// `index.db` plus its `-wal`, in bytes.
     pub index_bytes: Option<u64>,
+    /// The `-wal` file alone, also inside `index_bytes`.
+    pub wal_bytes: Option<u64>,
     /// The largest rowid per index table. This counts writes, not rows: the
     /// tables written with `INSERT OR REPLACE` give a replaced row the next
     /// rowid, so it grows with every insert and every replacement, and a
@@ -445,6 +447,13 @@ fn machine_metrics(snap: &MachineSnapshot, now: &str) -> Vec<Value> {
     if let Some(bytes) = snap.index_bytes {
         metrics.push(gauge(
             "kache.cache.index.size",
+            "By",
+            vec![as_int(bytes, now, &[])],
+        ));
+    }
+    if let Some(bytes) = snap.wal_bytes {
+        metrics.push(gauge(
+            "kache.cache.index.wal.size",
             "By",
             vec![as_int(bytes, now, &[])],
         ));
@@ -650,6 +659,7 @@ mod tests {
     fn machine_snap() -> MachineSnapshot {
         MachineSnapshot {
             index_bytes: Some(29_074_419_712),
+            wal_bytes: Some(1_073_741_824),
             rowid_high_water: vec![("entries", 2_085_333), ("cc_preprocess_memos", 874_517)],
             gc: Some(crate::report::GcStatsPersisted {
                 last_run: "2026-09-12T12:11:05+00:00".to_string(),
@@ -720,6 +730,9 @@ mod tests {
             metric(&body, "kache.cache.index.size")["gauge"]["dataPoints"][0]["asInt"],
             "29074419712"
         );
+        let wal = metric(&body, "kache.cache.index.wal.size");
+        assert_eq!(wal["unit"], "By");
+        assert_eq!(wal["gauge"]["dataPoints"][0]["asInt"], "1073741824");
         // Kartero drops attribute keys outside its allowlist; these are the
         // families it admits.
         for key in all_attr_keys(&body) {

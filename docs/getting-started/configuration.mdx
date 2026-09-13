@@ -53,7 +53,7 @@ input_predictions = true
 
 - `[cache.remote]` and `[cache.planner]` are replaced whole. If the chosen file declares one, none of the host file's keys for it apply.
 - The host file never contributes `[workspace]` declarations. Those belong to a project's `.kache.toml`.
-- A host `ignore_env = true` applies to every build on the machine.
+- The host file cannot set `ignore_env`. Kache ignores it with a warning, so environment variables always win over both files.
 - A host file that cannot be read or parsed is ignored with a warning. `kache doctor` reports it, and lists each host key with whatever overrides it.
 - `KACHE_HOST_CONFIG` reads another path instead. An empty value turns the host layer off.
 - `kache config` edits the chosen file, never the host file.

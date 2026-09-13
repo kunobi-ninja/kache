@@ -2437,9 +2437,17 @@ pub(crate) const HOST_CONFIG_PATH: &str = "/etc/kache/config.toml";
 /// neither file configured.
 const HOST_ATOMIC_TABLES: &[&[&str]] = &[&["cache", "remote"], &["cache", "planner"]];
 
-/// Top-level tables the host layer never contributes. Workspace declarations
+/// Keys the host layer never contributes, and why. Workspace declarations
 /// describe one Cargo workspace and are only read from its own `.kache.toml`.
-const HOST_EXCLUDED_TABLES: &[&str] = &["workspace"];
+/// A host `ignore_env` would turn off the environment for every build on the
+/// machine, and the environment wins over both files.
+const HOST_EXCLUDED_KEYS: &[(&[&str], &str)] = &[
+    (&["workspace"], "only a project's .kache.toml may set it"),
+    (
+        &["cache", "ignore_env"],
+        "environment variables always win over the host file",
+    ),
+];
 
 /// Where to read the host layer from, or `None` when there is none to read.
 ///
@@ -2529,11 +2537,12 @@ fn parse_host_config(host: &HostConfigSnapshot) -> Result<toml::Table> {
     }
     let content = std::str::from_utf8(&host.bytes).context("reading host config as UTF-8")?;
     let mut table: toml::Table = toml::from_str(content).context("parsing host config")?;
-    for name in HOST_EXCLUDED_TABLES {
-        if table.remove(*name).is_some() {
+    for (key, reason) in HOST_EXCLUDED_KEYS {
+        if remove_config_key(&mut table, key) {
             tracing::warn!(
-                "host config {}: ignoring [{name}], which only a project's .kache.toml may set",
-                host.path.display()
+                "host config {}: ignoring {}: {reason}",
+                host.path.display(),
+                key.join(".")
             );
         }
     }
@@ -2541,6 +2550,18 @@ fn parse_host_config(host: &HostConfigSnapshot) -> Result<toml::Table> {
         .try_into::<FileConfig>()
         .context("host config does not match the kache config schema")?;
     Ok(table)
+}
+
+/// Remove the key at `path`, a table or a value. `true` when it was there.
+fn remove_config_key(table: &mut toml::Table, path: &[&str]) -> bool {
+    match path {
+        [] => false,
+        [key] => table.remove(*key).is_some(),
+        [first, rest @ ..] => match table.get_mut(*first) {
+            Some(toml::Value::Table(inner)) => remove_config_key(inner, rest),
+            _ => false,
+        },
+    }
 }
 
 /// The host layer to merge under the chosen file, or `None`. A host file that
@@ -4092,6 +4113,42 @@ remote_key_cache_refresh_secs = 900
             file.cache.unwrap().input_predictions,
             Some(true),
             "with no chosen file, the host layer is the whole file config"
+        );
+    }
+
+    /// A host `ignore_env = true` would switch the environment off for every
+    /// build on the machine, putting the host file above it.
+    #[test]
+    fn a_host_ignore_env_cannot_silence_the_environment() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache]\nignore_env = true\ninput_predictions = true\n",
+            Some("[cache]\nlocal_max_size = \"10GiB\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+        let _env = set_env_for_test("KACHE_INPUT_PREDICTIONS", Some(std::ffi::OsStr::new("0")));
+
+        let file = Config::load_file_config();
+        let cache = file.as_ref().unwrap().cache.as_ref().unwrap();
+        assert_eq!(cache.ignore_env, None, "the host key is dropped");
+        assert_eq!(
+            cache.input_predictions,
+            Some(true),
+            "the rest still applies"
+        );
+        assert!(
+            !Config::input_predictions_enabled(&file),
+            "the environment overrides the host file"
+        );
+        let HostConfigStatus::Present { keys, .. } = host_config_status() else {
+            panic!("the host file must be present");
+        };
+        assert!(
+            keys.iter().all(|entry| entry.key != "cache.ignore_env"),
+            "doctor must not list a key that has no effect: {keys:?}"
         );
     }
 

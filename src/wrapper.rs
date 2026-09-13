@@ -8953,9 +8953,19 @@ exit 0
     #[test]
     fn cc_event_root_honors_override() {
         let _lock = crate::test_support::process_state_test_lock();
-        let _guard = TestEnvGuard::set("KACHE_EVENT_ROOT", "/cc-root-sentinel");
+        let sentinel = if cfg!(windows) {
+            r"C:\cc-root-sentinel"
+        } else {
+            "/cc-root-sentinel"
+        };
+        let _guard = TestEnvGuard::set("KACHE_EVENT_ROOT", sentinel);
         let parsed = parse_cc(&["gcc", "-c", "foo.c", "-o", "foo.o"]);
-        assert_eq!(cc_event_root(&parsed), "/cc-root-sentinel");
+        assert_eq!(
+            cc_event_root(&parsed),
+            std::path::PathBuf::from(sentinel)
+                .to_string_lossy()
+                .as_ref()
+        );
     }
 
     fn spool_intent_count(config: &Config) -> usize {

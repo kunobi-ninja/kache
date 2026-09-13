@@ -40,6 +40,7 @@ nvcc -c src/kernel.cu -o build/kernel.o -arch=sm_80
 - `nvcc`'s version and the host compiler's version (a host upgrade changes the object, probed via `nvcc --dryrun`);
 - the modeled flags verbatim — compile mode, GPU `-arch` / `-gencode` / `-code`, `-std`, `-O`, defines, and the `-Xcompiler` / `-Xptxas` forwarding flags;
 - the dependency closure: the raw content of the source plus every header `nvcc -M` reports. Hashing raw contents (not preprocessed output) captures host-only code, so any source or header edit invalidates the entry.
+- the driver environment: `NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS` are folded in verbatim, so the same checkout with different driver flags keys apart.
 
 ## Remote sharing
 
@@ -53,9 +54,12 @@ Anything Kache does not model runs the real `nvcc` uncached, including:
 - standalone `-ptx` / `-cubin` / `-fatbin` / `--optix-ir` emission;
 - relocatable and separable device code (`-rdc`, `-dc`);
 - device debug (`-G`);
+- machine-resolved values (`-march=native`, `-arch=native`, …) — one key must never cover different objects, so these refuse even when allow-listed;
 - dep-info without an explicit path (bare `-M` / `-MD` / `-MMD`) — request `-MF <file>` instead;
 - compiles without `-o`;
 - `-keep` / `--save-temps`, profiling (`--time`), response files (`@file`);
 - any flag outside the built-in table (see below).
 
 To opt an unmodeled-but-safe flag into caching, add it to the extra allow-list (`[cc] extra_allowlist_flags` or `KACHE_CC_EXTRA_ALLOWLIST_FLAGS`), which the `nvcc` adapter also honors. List explicit flag values. Flags that hide preprocessor inputs (`-Xcompiler -I…`, `-Xcompiler -D…`) stay refused: they would escape dependency tracking.
+
+`NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS` codegen tuning (`-O2`, `-gencode …`) is cached normally. Values that would change what is built or hide inputs (`-G`, `-I…`, `-march=native`) pass through uncached instead.

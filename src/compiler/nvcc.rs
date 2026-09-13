@@ -107,16 +107,35 @@ pub struct NvccArgs {
 /// `-MFout.d` matches the joined form. Every entry is deferred (known but
 /// unkeyed) until phase 2 promotes it into the cache key.
 const VALUE_FLAGS: &[&str] = &[
-    "-D", "-U", "-I", "-isystem", "-iquote", "-include", "-O", "-std", "--std", "-x", "-L", "-l",
-    "-MT", "-MQ", "-Xlinker", "-Xptxas", "-Xnvlink", "-gencode", "-arch", "-code",
+    "-D",
+    "-U",
+    "-I",
+    "-isystem",
+    "-iquote",
+    "-include",
+    "-O",
+    "-std",
+    "--std",
+    "-x",
+    "-L",
+    "-l",
+    "-MT",
+    "-MQ",
+    "-Xlinker",
+    "-Xptxas",
+    "-Xnvlink",
+    "-gencode",
+    "-arch",
+    "-code",
+    "--gpu-architecture",
+    "--gpu-code",
+    "-march",
+    "-mcpu",
+    "-mtune",
 ];
 
 /// Joined prefixes (`-O2`, `-DFOO`, `-arch=sm_80`, `-Werror`). Checked
 /// after [`VALUE_FLAGS`].
-///
-/// NOTE for phase 2: `-march=native` (and any host-resolved value) must
-/// refuse, never key — a resolved-through-probe classification like cc's
-/// `CapturedByProbe`, not a verbatim accept.
 const JOINED_PREFIXES: &[&str] = &[
     "-D",
     "-U",
@@ -430,6 +449,11 @@ impl NvccArgs {
                 "nvcc -Xcompiler hides preprocessor flags (-I/-D/…) from dependency tracking — not yet supported",
             ));
         }
+        if nvcc_has_native_resolution(&self.deferred_flags, &self.unknown_flags) {
+            reasons.push(RefuseReason::Unsupported(
+                "nvcc host- or device-resolved value (native) — not yet supported",
+            ));
+        }
         // Deferred flags are keyed verbatim (see `cache_key`); only truly
         // unrecognized flags refuse. The allow-list covers those: a user
         // who has audited a flag opts it in explicitly.
@@ -479,22 +503,143 @@ fn flag_matches(allow: &str, flag: &str) -> bool {
     flag == allow || flag.starts_with(allow) && flag[allow.len()..].starts_with([' ', '='])
 }
 
+/// Flag substrings whose value the driver resolves per machine: host
+/// `-march`/`-mcpu`/`-mtune`, CUDA `-arch`/`-gencode`/`-code`. Keying
+/// them verbatim would share one key across different objects — a
+/// stale hit, the fatal direction. This is a soundness veto, not a
+/// modeling gap: it fires even on allow-listed flags. Substring match
+/// so `-Xcompiler -march=native` (value riding inside the entry) and
+/// `-gencode arch=native,…` are caught with the direct spellings; a
+/// user `-DARCH=native` define matches nothing (no leading dash before
+/// `arch`) and stays keyed, correctly.
+const NVCC_NATIVE_MARKERS: &[&str] = &[
+    "-march=native",
+    "-mcpu=native",
+    "-mtune=native",
+    "-march native",
+    "-mcpu native",
+    "-mtune native",
+    "-arch=native",
+    "-arch native",
+    "--gpu-architecture=native",
+    "--gpu-architecture native",
+    "-code=native",
+    "--gpu-code=native",
+    "arch=native",
+];
+
+/// Does any modeled or unmodeled flag carry a machine-resolved value?
+fn nvcc_has_native_resolution(deferred: &[String], unknown: &[String]) -> bool {
+    deferred
+        .iter()
+        .chain(unknown.iter())
+        .any(|entry| NVCC_NATIVE_MARKERS.iter().any(|m| entry.contains(m)))
+}
+
 /// Preprocessor-affecting tokens: if one hides inside an `-Xcompiler`
-/// value, header inputs escape the `-M` closure. Substring-conservative
-/// on purpose — an over-refusal is a passthrough, an under-refusal is a
-/// stale hit.
+/// value (or an `NVCC_PREPEND/APPEND_FLAGS` value), header inputs
+/// escape the `-M` closure. Substring-conservative on purpose — an
+/// over-refusal is a passthrough, an under-refusal is a stale hit.
 const NVCC_PP_TOKENS: &[&str] = &["-I", "-D", "-U", "-isystem", "-iquote", "-include"];
+
+/// Does one whitespace/comma-separated token smuggle a preprocessor
+/// flag? Shared by the `-Xcompiler` check and the driver-env check so
+/// the two cannot drift apart.
+fn nvcc_pp_token(token: &str) -> bool {
+    NVCC_PP_TOKENS
+        .iter()
+        .any(|f| token == *f || token.starts_with(f))
+}
 
 /// Does any `-Xcompiler` / `--compiler-options` value smuggle a
 /// preprocessor flag past dependency tracking?
 fn nvcc_xcompiler_smuggles_pp(values: &[String]) -> bool {
-    values.iter().any(|value| {
-        value.split([',', ' ', '\t']).any(|token| {
-            NVCC_PP_TOKENS
-                .iter()
-                .any(|f| token == *f || token.starts_with(f))
-        })
+    values
+        .iter()
+        .any(|value| value.split([',', ' ', '\t']).any(nvcc_pp_token))
+}
+
+/// Mode-altering flags that must never arrive via `NVCC_PREPEND_FLAGS`
+/// / `NVCC_APPEND_FLAGS`: the adapter keys and restores a `-c` object
+/// compile, and these would silently change what is built. Exact
+/// tokens plus `=`-joined relocatable-code spellings.
+const NVCC_ENV_BLOCKED_EXACT: &[&str] = &[
+    "-G",
+    "--device-debug",
+    "-dc",
+    "--device-c",
+    "-rdc",
+    "-dlink",
+    "--device-link",
+    "--lib",
+    "-ptx",
+    "--ptx",
+    "-cubin",
+    "--cubin",
+    "-fatbin",
+    "--fatbin",
+    "--optix-ir",
+    "-E",
+    "--preprocess",
+    "-keep",
+    "--save-temps",
+    "--time",
+];
+const NVCC_ENV_BLOCKED_PREFIX: &[&str] = &["-rdc=", "--relocatable-device-code="];
+
+/// Does a driver-env value alter the compilation mode (or smuggle
+/// preprocessor inputs)? Pure and directly unit-tested; the
+/// environment read lives in [`nvcc_driver_env_flags`].
+fn nvcc_env_value_blocked(value: &str) -> bool {
+    // Split like `-Xcompiler` values: comma-separated forwarding is
+    // real there, and treating commas as separators here only ever
+    // over-refuses (safe direction).
+    value.split([',', ' ', '\t']).any(|token| {
+        NVCC_ENV_BLOCKED_EXACT.contains(&token)
+            || NVCC_ENV_BLOCKED_PREFIX.iter().any(|p| token.starts_with(p))
+            || nvcc_pp_token(token)
     })
+}
+
+/// Validate one driver-env value: no mode alteration, no
+/// machine-resolved `native`, both of which the key cannot see.
+/// Called from [`nvcc_driver_env_flags`], so a violation bails the key
+/// into passthrough instead of miscaching.
+fn nvcc_check_env_value(var: &str, value: &str) -> Result<()> {
+    if nvcc_env_value_blocked(value) {
+        anyhow::bail!(
+            "nvcc: {var} alters the compilation mode or hides preprocessor inputs; only codegen tuning is supported (not yet supported)"
+        );
+    }
+    if NVCC_NATIVE_MARKERS.iter().any(|m| value.contains(m)) {
+        anyhow::bail!("nvcc: {var} carries a machine-resolved (native) value — not yet supported");
+    }
+    Ok(())
+}
+
+/// Invisible driver inputs: `NVCC_PREPEND_FLAGS` /
+/// `NVCC_APPEND_FLAGS` inject flags outside argv, so the key must see
+/// them. Returns `(VAR, value)` pairs for key folding (verbatim — the
+/// same build replays the same environment through the same process).
+/// Empty/unset vars contribute nothing (byte-identical key).
+/// Non-UTF-8 values bail: lossy matching could alias two different
+/// environments under one key.
+fn nvcc_driver_env_flags() -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for var in ["NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS"] {
+        let Some(os) = std::env::var_os(var) else {
+            continue;
+        };
+        let value = os
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("nvcc: {var} is not valid UTF-8"))?;
+        if value.trim().is_empty() {
+            continue;
+        }
+        nvcc_check_env_value(var, &value)?;
+        out.push((var.to_string(), value));
+    }
+    Ok(out)
 }
 
 /// Deferred entries forwarded to `nvcc -M`: only flags that affect
@@ -924,6 +1069,16 @@ impl Compiler for NvccCompiler {
         hasher.update(b"\n");
         let mut config_args = vec!["-c".to_string()];
         config_args.extend(parsed.deferred_flags.iter().cloned());
+        // Invisible driver inputs join the probe sharing key: a `-ccbin`
+        // smuggled through the environment changes the discovered host,
+        // so environments must not share probe records. Validated here
+        // (mode-altering or native values bail into passthrough below).
+        let env_flags = nvcc_driver_env_flags()?;
+        config_args.extend(
+            env_flags
+                .iter()
+                .map(|(var, value)| format!("{var}={value}")),
+        );
         let resolved = crate::probe::probe(
             ctx.cache_dir,
             &crate::probe::NvccProber,
@@ -956,7 +1111,8 @@ impl Compiler for NvccCompiler {
 
         // Modeled flags, verbatim and in invocation order (`-I` order is
         // search order — significant). Plus allow-listed unknowns, same
-        // verbatim fold as cc: opting in is keying.
+        // verbatim fold as cc: opting in is keying. Plus the validated
+        // driver-env flags (same strings the probe sharing key saw).
         hasher.update(b"flags:");
         for flag in parsed
             .deferred_flags
@@ -969,6 +1125,13 @@ impl Compiler for NvccCompiler {
         {
             hasher.update(flag.as_bytes());
             hasher.update(b"\x1f");
+        }
+        for (var, value) in &env_flags {
+            hasher.update(b"env:");
+            hasher.update(var.as_bytes());
+            hasher.update(b"=");
+            hasher.update(value.as_bytes());
+            hasher.update(b"\n");
         }
         hasher.update(b"\n");
 
@@ -1617,6 +1780,129 @@ mod tests {
             "-fPIC",
         ]);
         assert!(parsed.refuse_reasons(&[]).is_empty());
+    }
+
+    /// Machine-resolved values refuse with the native reason, in every
+    /// spelling: direct, separate-value, smuggled through `-Xcompiler`,
+    /// and embedded in `-gencode`.
+    #[test]
+    fn native_resolution_refuses() {
+        for native in [
+            vec!["nvcc", "-c", "k.cu", "-o", "k.o", "-march=native"],
+            vec!["nvcc", "-c", "k.cu", "-o", "k.o", "-march", "native"],
+            vec!["nvcc", "-c", "k.cu", "-o", "k.o", "-mcpu=native"],
+            vec![
+                "nvcc",
+                "-c",
+                "k.cu",
+                "-o",
+                "k.o",
+                "-Xcompiler",
+                "-march=native",
+            ],
+            vec!["nvcc", "-c", "k.cu", "-o", "k.o", "-arch=native"],
+            vec!["nvcc", "-c", "k.cu", "-o", "k.o", "-arch", "native"],
+            vec![
+                "nvcc",
+                "-c",
+                "k.cu",
+                "-o",
+                "k.o",
+                "-gencode",
+                "arch=native,code=sm_90",
+            ],
+            vec![
+                "nvcc",
+                "-c",
+                "k.cu",
+                "-o",
+                "k.o",
+                "--gpu-architecture=native",
+            ],
+        ] {
+            let parsed = parse_ok(&native);
+            assert!(
+                parsed
+                    .refuse_reasons(&[])
+                    .iter()
+                    .any(|r| { matches!(r, RefuseReason::Unsupported(d) if d.contains("native")) }),
+                "{native:?} must refuse"
+            );
+        }
+        // The veto survives the allow-list: auditing a flag in cannot
+        // bless a per-machine value.
+        let parsed = parse_ok(&["nvcc", "-c", "k.cu", "-o", "k.o", "--march=native"]);
+        assert!(
+            parsed
+                .refuse_reasons(&["--march=native".to_string()])
+                .iter()
+                .any(|r| { matches!(r, RefuseReason::Unsupported(d) if d.contains("native")) })
+        );
+        // One native entry among clean ones still vetoes the line.
+        let parsed = parse_ok(&["nvcc", "-c", "k.cu", "-o", "k.o", "-O2", "-march=native"]);
+        assert!(
+            parsed
+                .refuse_reasons(&[])
+                .iter()
+                .any(|r| { matches!(r, RefuseReason::Unsupported(d) if d.contains("native")) })
+        );
+        // Near-misses stay keyed: concrete arches and defines that merely
+        // mention native.
+        for fine in [
+            vec!["nvcc", "-c", "k.cu", "-o", "k.o", "-arch=sm_80"],
+            vec!["nvcc", "-c", "k.cu", "-o", "k.o", "-DARCH=native"],
+            vec!["nvcc", "-c", "k.cu", "-o", "k.o", "-I/opt/native/include"],
+        ] {
+            let parsed = parse_ok(&fine);
+            assert!(
+                parsed.refuse_reasons(&[]).is_empty(),
+                "{fine:?} must stay cacheable"
+            );
+        }
+    }
+
+    /// Driver-env values: mode-altering and smuggled-preprocessor
+    /// inputs refuse; plain codegen tuning passes through to keying.
+    #[test]
+    fn env_value_blocked_classification() {
+        for blocked in [
+            "-G",
+            "--device-debug -O2",
+            "-dc",
+            "-rdc=true",
+            "--relocatable-device-code=true",
+            "-dlink",
+            "--lib",
+            "-ptx",
+            "-E",
+            "-DFOO",
+            "-I/opt/x",
+            "-O2,-isystem/x",
+        ] {
+            assert!(
+                nvcc_env_value_blocked(blocked),
+                "{blocked:?} must be blocked"
+            );
+        }
+        for clean in [
+            "",
+            "-O2",
+            "-gencode arch=sm_80,code=sm_80",
+            "-fPIC",
+            "--expt-relaxed-constexpr",
+        ] {
+            assert!(
+                !nvcc_env_value_blocked(clean),
+                "{clean:?} must pass to keying"
+            );
+        }
+    }
+
+    #[test]
+    fn env_value_native_veto() {
+        assert!(nvcc_check_env_value("NVCC_PREPEND_FLAGS", "-march=native").is_err());
+        assert!(nvcc_check_env_value("NVCC_APPEND_FLAGS", "-O2").is_ok());
+        assert!(nvcc_check_env_value("NVCC_PREPEND_FLAGS", "").is_ok());
     }
 
     #[test]

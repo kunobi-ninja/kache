@@ -10325,6 +10325,55 @@ exit 0
         );
     }
 
+    /// Invisible driver inputs join the key: setting
+    /// `NVCC_PREPEND_FLAGS` busts it (miss, then hit under the new
+    /// environment), while smuggled preprocessor inputs pass through
+    /// uncached instead of miscaching.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_driver_env_joins_the_key() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (_work, _nvcc, count, argv) = setup_nvcc_case(&dir, None, None, 0, 0);
+        let config = test_config(dir.path().join("cache"));
+
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
+
+        let _prepend = TestEnvGuard::set("NVCC_PREPEND_FLAGS", "-O2");
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap(),
+            "run\nrun\n",
+            "driver env change must bust the key"
+        );
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap(),
+            "run\nrun\n",
+            "same environment must hit"
+        );
+        drop(_prepend);
+
+        let _smuggled = TestEnvGuard::set("NVCC_PREPEND_FLAGS", "-I/secret");
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap(),
+            "run\nrun\nrun\n",
+            "smuggled preprocessor inputs must recompile, never store"
+        );
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert!(
+            events
+                .last()
+                .unwrap()
+                .passthrough_reason
+                .contains("uncacheable"),
+            "smuggled inputs pass through with reason"
+        );
+    }
+
     /// A too-cheap compile is skipped (never stored): the rerun
     /// compiles again.
     #[cfg(unix)]

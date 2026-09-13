@@ -6745,6 +6745,128 @@ PREP_MARKER = "{{kache}}"
 
     #[cfg(unix)]
     #[test]
+    fn mbx_pull_reports_both_revisions_and_rejects_empty_restores() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run(Command::new("git").arg("init").arg("-q").arg(&repo)).unwrap();
+        let mut refs = Vec::new();
+        for revision in ["parent", "child"] {
+            std::fs::write(repo.join("revision"), revision).unwrap();
+            run(Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["add", "revision"]))
+            .unwrap();
+            run(Command::new("git").arg("-C").arg(&repo).args([
+                "-c",
+                "user.name=Bench Test",
+                "-c",
+                "user.email=bench@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-qm",
+                revision,
+            ]))
+            .unwrap();
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            refs.push(String::from_utf8(output.stdout).unwrap().trim().to_owned());
+        }
+        let scenarios = root.join("scenarios");
+        let scenario = scenarios.join("bench-fixture");
+        std::fs::create_dir_all(&scenario).unwrap();
+        for hits in [0, 1] {
+            std::fs::write(
+                scenario.join("scenario.toml"),
+                format!(
+                    r#"
+name = "bench-fixture"
+tags = ["suite:bench", "backend:mbx"]
+build = '''
+test ! -e "$CARGO_TARGET_DIR/built" || exit 9
+mkdir -p "$CARGO_TARGET_DIR"
+cp revision "$CARGO_TARGET_DIR/built"
+cat revision
+printf '{{"hits": {hits}}}' > "$MBX_STATS_REPORT"
+'''
+[source]
+kind = "clone"
+repo = "{}"
+ref = "{}"
+ref_next = "{}"
+objdir = "target"
+"#,
+                    repo.display(),
+                    refs[0],
+                    refs[1]
+                ),
+            )
+            .unwrap();
+            let work = root.join(format!("run-{hits}"));
+            let result = run_bench(BenchRunConfig {
+                kache: "/usr/bin/true".into(),
+                sccache: "/usr/bin/true".into(),
+                mbx: "/usr/bin/true".into(),
+                cache_backend: CacheBackend::Mbx,
+                scenarios: scenarios.clone(),
+                select: vec!["suite:bench".into()],
+                git_ref: None,
+                work_dir: Some(work.clone()),
+                skip_clone: false,
+                force_setup: false,
+                retry: false,
+                trace_keys: false,
+                warm_same_tree: false,
+            });
+            if hits == 0 {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("mbx pull restored nothing")
+                );
+            } else {
+                result.unwrap();
+            }
+            assert!(
+                std::fs::read_to_string(work.join("build-cold.log"))
+                    .unwrap()
+                    .contains("parent")
+            );
+            assert!(
+                std::fs::read_to_string(work.join("build-pull.log"))
+                    .unwrap()
+                    .contains("child")
+            );
+            let report: serde_json::Value = read_json(&work.join("bench-fixture.json")).unwrap();
+            assert_eq!(report["verdict"]["ok"], hits == 1);
+            assert_eq!(report["pull"]["hits"], hits);
+            let otlp: serde_json::Value = read_json(&work.join("metrics.otlp.json")).unwrap();
+            let metrics = otlp["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+                .as_array()
+                .unwrap();
+            let verdict = metrics
+                .iter()
+                .find(|m| m["name"] == "kache.bench.verdict.ok")
+                .unwrap();
+            assert_eq!(verdict["gauge"]["dataPoints"][0]["asInt"], hits.to_string());
+            let archive = Path::new(report["artifact_dir"].as_str().unwrap());
+            assert!(archive.join("report-pull.mbx.json").is_file());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn mbx_same_tree_build_owns_and_wipes_the_real_target() {
         let temp = tempfile::tempdir().unwrap();
         let work = temp.path().canonicalize().unwrap();

@@ -53,7 +53,7 @@ use std::process::Command;
 /// struct's shape or the probe logic changes in a way that would make
 /// an old on-disk record wrong: a mismatch turns the record into a
 /// cache miss (re-probe), never a wrong hit.
-pub const PROBE_SCHEMA_VERSION: u32 = 4;
+pub const PROBE_SCHEMA_VERSION: u32 = 5;
 
 /// The memoized result of probing a compiler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +73,13 @@ pub struct ResolvedConfig {
     /// sentinelled (see [`resolve`]). `None` when `-###` produced no
     /// resolvable compile line.
     pub resolved_tokens: Option<Vec<String>>,
+    /// First line of the **host** compiler's `--version` output — the
+    /// C++ compiler a driver compiler (today: `nvcc`) delegates code
+    /// generation to. A host upgrade changes emitted objects with the
+    /// driver itself unchanged, so drivers that need it fold this into
+    /// the cache key alongside [`Self::version_line`]. `None` for
+    /// probers without a host compiler (cc probes the compiler itself).
+    pub host_version_line: Option<String>,
 }
 
 /// What to probe.
@@ -156,8 +163,189 @@ impl Prober for CcProber {
                 req.windows_aware,
                 req.per_tu_paths,
             ),
+            host_version_line: None,
         })
     }
+}
+
+/// Prober for the CUDA `nvcc` driver (kunobi-ninja/kache#1024).
+///
+/// Captures the two version identities an nvcc cache key needs, both of
+/// which depend only on installed toolchains (never on the TU), so the
+/// record stays shareable across a build's translation units:
+///
+/// 1. nvcc's own version (`nvcc --version`).
+/// 2. the **host** compiler's version — nvcc drives gcc/clang/cl for
+///    host code, and a host upgrade changes emitted objects with nvcc
+///    itself unchanged. The host binary is discovered by scanning
+///    `nvcc --dryrun` output for the first known host-compiler command
+///    (any subcommand line names the same driver binary, so no `-c`
+///    requirement); its version is the first combined-output line of
+///    `<host> --version` (exit status ignored — `cl` banners to stderr
+///    with a nonzero status).
+///
+/// Deliberately NOT hashed: the `--dryrun` token stream itself. Its
+/// install- and temp-path scrubbing is unvalidated against real nvcc,
+/// and a missed temp path would make keys unstable (zero hits, silently)
+/// while versions + flags + the `-M` content closure already cover the
+/// dispatch space (same driver version + same flags = same plan).
+/// Revisit with real-nvcc fixtures before hashing any of it.
+///
+/// Any failure — missing binary, failing `--version`/`--dryrun`, no
+/// recognizable host, empty host banner — fails the probe, and the
+/// caller passes the compile through uncached. A probe fault is never
+/// a compile fault, and never a guessed key.
+pub struct NvccProber;
+
+impl Prober for NvccProber {
+    fn id(&self) -> &'static str {
+        "nvcc"
+    }
+
+    fn probe(&self, req: &ProbeRequest<'_>) -> Result<ResolvedConfig> {
+        let version_line = nvcc_version_line(req.compiler)?;
+        // Mirror the real compile's argv so dispatch resolves exactly as
+        // it would for the TU. Nothing from this output is hashed (see
+        // above) — only the host binary path is read out of it.
+        let mut dryrun_args = vec!["--dryrun".to_string()];
+        dryrun_args.extend(req.args.iter().cloned());
+        let dryrun = Command::new(req.compiler)
+            .env("LC_ALL", "C")
+            .args(&dryrun_args)
+            .output()
+            .with_context(|| format!("running `{} --dryrun`", req.compiler))?;
+        if !dryrun.status.success() {
+            anyhow::bail!("`{} --dryrun` exited {}", req.compiler, dryrun.status);
+        }
+        let dryrun_text = String::from_utf8_lossy(&dryrun.stdout).into_owned();
+        let host = find_nvcc_host_compiler(&dryrun_text).with_context(|| {
+            format!(
+                "`{} --dryrun` names no recognizable host compiler",
+                req.compiler
+            )
+        })?;
+        let host_version_line = host_version_line(&host)?;
+        let compiler_name = Path::new(req.compiler)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(req.compiler)
+            .to_string();
+
+        Ok(ResolvedConfig {
+            schema_version: PROBE_SCHEMA_VERSION,
+            prober: self.id().to_string(),
+            compiler_name,
+            version_line,
+            resolved_tokens: None,
+            host_version_line: Some(host_version_line),
+        })
+    }
+}
+
+/// First line of `nvcc --version` (stdout). Mirrors [`CcProber`]: the
+/// command must succeed and name a version.
+fn nvcc_version_line(nvcc: &str) -> Result<String> {
+    let output = Command::new(nvcc)
+        .env("LC_ALL", "C")
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running `{nvcc} --version`"))?;
+    if !output.status.success() {
+        anyhow::bail!("`{nvcc} --version` exited {}", output.status);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("unknown")
+        .to_string())
+}
+
+/// Host-compiler driver names nvcc may dispatch to, matched against the
+/// command basename (directories and a `.exe` suffix stripped,
+/// case-insensitive). Deliberately bare names: version-suffixed and
+/// target-prefixed spellings resolve through [`is_nvcc_host_command`].
+const NVCC_HOST_COMPILERS: &[&str] = &["gcc", "g++", "clang", "clang++", "cc", "c++", "cl"];
+
+/// Numeric `MAJOR[.MINOR...]` version suffix (`gcc-13`, `clang++-17`).
+fn strip_nvcc_host_version(name: &str) -> &str {
+    match name.rsplit_once('-') {
+        Some((head, suffix))
+            if !suffix.is_empty()
+                && suffix
+                    .split('.')
+                    .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            head
+        }
+        _ => name,
+    }
+}
+
+/// Is this `nvcc --dryrun` command word a known host-compiler driver?
+/// Bare and versioned names match directly; target-prefixed cross
+/// toolchains (`aarch64-linux-gnu-gcc`) match on the trailing driver
+/// name. Anything else — nvcc itself, `cudafe++`, `cicc`, `ptxas`,
+/// `fatbinary`, wrappers — is not a host compiler.
+fn is_nvcc_host_command(command: &str) -> bool {
+    let Some(base) = command.rsplit(['/', '\\']).next().filter(|n| !n.is_empty()) else {
+        return false;
+    };
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .unwrap_or(base);
+    let bare = strip_nvcc_host_version(base);
+    if NVCC_HOST_COMPILERS
+        .iter()
+        .any(|known| bare.eq_ignore_ascii_case(known))
+    {
+        return true;
+    }
+    bare.rsplit('-').next().is_some_and(|tail| {
+        tail != bare
+            && NVCC_HOST_COMPILERS
+                .iter()
+                .any(|k| tail.eq_ignore_ascii_case(k))
+    })
+}
+
+/// Find the host compiler binary in `nvcc --dryrun` output: the first
+/// output line whose command basename is a known host driver. Returns
+/// the command exactly as nvcc spelled it (path included) so the
+/// version probe runs that same binary.
+fn find_nvcc_host_compiler(dryrun: &str) -> Option<String> {
+    dryrun.lines().find_map(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("#$").unwrap_or(line).trim();
+        let command = line.split_whitespace().next()?;
+        if is_nvcc_host_command(command) {
+            Some(command.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// First non-empty combined-output line of `<host> --version`. Exit
+/// status is ignored: `cl` banners to stderr and exits nonzero, which
+/// still identifies it. Empty output means unidentifiable — bail.
+fn host_version_line(host: &str) -> Result<String> {
+    let output = Command::new(host)
+        .env("LC_ALL", "C")
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running `{host} --version`"))?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    combined
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("`{host} --version` produced no version line"))
 }
 
 /// Compiler family detected via `-E` preprocessing probe.
@@ -227,6 +415,7 @@ pub fn probe_compiler_family(program: &str) -> Option<ProbedFamily> {
             &ResolvedConfig {
                 schema_version: PROBE_SCHEMA_VERSION,
                 prober: "cc-family".to_string(),
+                host_version_line: None,
                 compiler_name: std::path::Path::new(program)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -608,6 +797,7 @@ mod tests {
                 compiler_name: "fake".to_string(),
                 version_line: "fake 1.0".to_string(),
                 resolved_tokens: None,
+                host_version_line: None,
             })
         }
     }
@@ -1002,6 +1192,7 @@ mod tests {
                 compiler_name: "dummy".to_string(),
                 version_line: "gnu".to_string(),
                 resolved_tokens: None,
+                host_version_line: None,
             },
         );
         assert_eq!(probe_compiler_family(prog), Some(ProbedFamily::Gnu));
@@ -1016,6 +1207,7 @@ mod tests {
                 compiler_name: "dummy".to_string(),
                 version_line: "clang".to_string(),
                 resolved_tokens: None,
+                host_version_line: None,
             },
         );
         assert_eq!(probe_compiler_family(prog), Some(ProbedFamily::Clang));
@@ -1030,6 +1222,7 @@ mod tests {
                 compiler_name: "dummy".to_string(),
                 version_line: "none".to_string(),
                 resolved_tokens: None,
+                host_version_line: None,
             },
         );
         assert_eq!(probe_compiler_family(prog), None);
@@ -1180,5 +1373,192 @@ mod tests {
 
         // The fixture exits non-zero unless every spawn pins LC_ALL=C, so
         // reaching each successful assertion above proves the environment.
+    }
+
+    #[test]
+    fn nvcc_host_command_spellings() {
+        for host in [
+            "gcc",
+            "/usr/bin/gcc",
+            "g++",
+            "clang++-17",
+            "gcc-13",
+            "aarch64-linux-gnu-gcc",
+            r"C:\VS\bin\cl.exe",
+            "CL.EXE",
+            "/usr/bin/cc",
+        ] {
+            assert!(is_nvcc_host_command(host), "{host} must match");
+        }
+        for other in [
+            "",
+            "nvcc",
+            "/usr/local/cuda/bin/nvcc",
+            "cudafe++",
+            "cicc",
+            "ptxas",
+            "fatbinary",
+            "my-gcc-wrapper",
+            "gcc-",
+            "clang-1a2",
+            "ld",
+            "ar",
+        ] {
+            assert!(!is_nvcc_host_command(other), "{other} must not match");
+        }
+    }
+
+    #[test]
+    fn nvcc_host_found_in_dryrun_plan() {
+        let dryrun = "#$ _SPACE_= \n\
+            #$ _CUDART_=cudart\n\
+            #$ _HERE_=/usr/local/cuda/bin\n\
+            /usr/local/cuda/bin/cudafe++ --m64 --diag_error=host --stub_file_name /tmp/tmpxft_1.cu.cpp --gen_c_file_name /tmp/tmpxft_1.cudafe1.c kernel.cu\n\
+            #$ gcc -D__CUDA_ARCH__=800 -c -x c++ -o /tmp/tmpxft_1.o /tmp/tmpxft_1.cudafe1.cpp\n\
+            /usr/bin/gcc -D__CUDA_ARCH__=800 -c -x c++ -o /tmp/tmpxft_1.o /tmp/tmpxft_1.cudafe1.cpp\n";
+        assert_eq!(find_nvcc_host_compiler(dryrun), Some("gcc".to_string()));
+        // Without the `#$` line, the full command path is preserved for
+        // the version probe.
+        let dryrun = dryrun
+            .lines()
+            .filter(|l| !l.trim_start_matches("#$ ").starts_with("gcc"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            find_nvcc_host_compiler(&dryrun),
+            Some("/usr/bin/gcc".to_string())
+        );
+        // cudafe++ lines never match, even first.
+        assert_eq!(
+            find_nvcc_host_compiler("/usr/local/cuda/bin/cudafe++ --m64 x.cu\n"),
+            None
+        );
+        assert_eq!(find_nvcc_host_compiler(""), None);
+        assert_eq!(find_nvcc_host_compiler("#$ _SPACE_= \n"), None);
+    }
+
+    /// Write an executable shell script. Tests that spawn it retry a
+    /// transient ETXTBSY through [`retry_nvcc_probe_spawn`] instead.
+    #[cfg(unix)]
+    fn write_nvcc_fixture(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// ETXTBSY: a concurrent test's fork can still hold a just-written
+    /// script's fd at exec time. Only spawn failures (io::Error in the
+    /// chain) retry — a genuine probe refusal fails immediately.
+    #[cfg(unix)]
+    fn is_nvcc_spawn_busy(err: &anyhow::Error) -> bool {
+        err.chain()
+            .filter_map(|c| c.downcast_ref::<std::io::Error>())
+            .any(|e| e.raw_os_error() == Some(libc::ETXTBSY))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_probe_captures_both_versions() {
+        let temp = TempDir::new().unwrap();
+        let host = write_nvcc_fixture(temp.path(), "host-gcc", "printf '%s\\n' 'gcc (GCC) 13.2.0'");
+        let host_str = host.to_string_lossy().into_owned();
+        let nvcc = write_nvcc_fixture(
+            temp.path(),
+            "nvcc",
+            &format!(
+                "if [ \"$1\" = \"--version\" ]; then\n\
+                 printf '%s\\n' 'nvcc: NVIDIA (R) Cuda compiler driver' 'Copyright (c) 2005-2024 NVIDIA Corporation' 'Cuda compilation tools, release 12.6, V12.6.77'\n\
+                 elif [ \"$1\" = \"--dryrun\" ]; then\n\
+                 printf '%s\\n' '#$ _HERE_=/usr/local/cuda/bin' '{host_str} -D__CUDA_ARCH__=800 -c -x c++ -o /tmp/x.o /tmp/x.cpp'\n\
+                 else exit 99\nfi"
+            ),
+        );
+
+        let req = ProbeRequest {
+            compiler: nvcc.to_str().unwrap(),
+            args: &["-c".to_string(), "k.cu".to_string()],
+            key_args: &["-c".to_string()],
+            per_tu_paths: &["k.cu".to_string()],
+            windows_aware: false,
+        };
+        let mut config = NvccProber.probe(&req);
+        for _ in 0..10 {
+            match &config {
+                Err(e) if is_nvcc_spawn_busy(e) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    config = NvccProber.probe(&req);
+                }
+                _ => break,
+            }
+        }
+        let config = config.expect("probe succeeds");
+        assert_eq!(config.prober, "nvcc");
+        assert_eq!(config.version_line, "nvcc: NVIDIA (R) Cuda compiler driver");
+        assert_eq!(
+            config.host_version_line,
+            Some("gcc (GCC) 13.2.0".to_string())
+        );
+        assert_eq!(config.resolved_tokens, None);
+        assert_eq!(config.schema_version, PROBE_SCHEMA_VERSION);
+    }
+
+    /// An empty-but-successful `--version` still identifies (as
+    /// unknown) instead of failing: the probe needs *a* stable string,
+    /// and bailing here would only cost a cacheable compile.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_empty_version_line_is_unknown() {
+        let temp = TempDir::new().unwrap();
+        let quiet = write_nvcc_fixture(temp.path(), "nvcc-quiet", "exit 0");
+        assert_eq!(
+            nvcc_version_line(quiet.to_str().unwrap()).unwrap(),
+            "unknown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_probe_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        // --version exits nonzero.
+        let bad_version = write_nvcc_fixture(temp.path(), "nvcc-badver", "exit 3");
+        // --dryrun exits nonzero.
+        let bad_dryrun = write_nvcc_fixture(
+            temp.path(),
+            "nvcc-baddry",
+            "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'nvcc mock'; else exit 4; fi",
+        );
+        // --dryrun names no host compiler.
+        let no_host = write_nvcc_fixture(
+            temp.path(),
+            "nvcc-nohost",
+            "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'nvcc mock'; else printf '%s\\n' '#$ nothing here'; fi",
+        );
+        // Host banner is empty.
+        let empty_host = write_nvcc_fixture(temp.path(), "host-empty", "exit 0");
+        let empty_host_nvcc = write_nvcc_fixture(
+            temp.path(),
+            "nvcc-emptyhost",
+            &format!(
+                "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'nvcc mock'; else printf '%s\\n' '{host} -c x.o'; fi",
+                host = empty_host.display()
+            ),
+        );
+        for nvcc in [&bad_version, &bad_dryrun, &no_host, &empty_host_nvcc] {
+            let req = ProbeRequest {
+                compiler: nvcc.to_str().unwrap(),
+                args: &[],
+                key_args: &[],
+                per_tu_paths: &[],
+                windows_aware: false,
+            };
+            assert!(
+                NvccProber.probe(&req).is_err(),
+                "{} must fail the probe",
+                nvcc.display()
+            );
+        }
     }
 }

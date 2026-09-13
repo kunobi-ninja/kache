@@ -5,6 +5,7 @@
     "quick-start",
     "comparison",
     "c-cpp",
+    "cuda",
     "mutation-testing",
     "configuration"
   ]

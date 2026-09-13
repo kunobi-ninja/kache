@@ -667,12 +667,34 @@ fn wrapper_entry() -> std::time::Instant {
 /// is recognition + a recorded passthrough reason (visible in
 /// `report`/`why-miss`), proving the dispatch path before phase 2 wires
 /// key → local store → remote check/upload.
+/// Run kache as a CUDA `nvcc` compiler wrapper (`CUDACXX="kache nvcc"`,
+/// `NVCC="kache nvcc"`, or `CMAKE_CUDA_COMPILER_LAUNCHER=kache`).
+///
+/// Caches the single-source `-c` object compile: parse, refuse-check,
+/// cache key (`nvcc --version` plus host version plus flags plus the
+/// `-M` content closure), local lookup, remote check, then restore on
+/// hit or compile plus store plus upload on miss. Anything else goes
+/// through [`nvcc_passthrough`].
+///
+/// Scope notes (kunobi-ninja/kache#1024): main store only (no volume
+/// routing or scheduler admission yet); no fallback wrapper; any
+/// restore failure recompiles via passthrough (nvcc always rewrites
+/// `-o` outputs fresh, so no partial-restore abort).
 pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = wrapper_entry();
+    let invocation_start_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as i64)
+        .unwrap_or(0);
+    crate::link::set_windows_hardlink_restore(config.windows_hardlink);
+    crate::link::set_storage_layout_advice(config.storage_layout_advice);
+    crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
+    warn_nonlocal_cache_fs_once(config);
     // Shared with the cc knob for now; a dedicated `[nvcc]` knob is a
     // follow-up once the flag set deserves its own namespace (#1024).
     let compiler =
-        NvccCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone());
+        NvccCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
+            .with_base_dirs(config.base_dirs.clone());
     let parsed = compiler
         .parse(wrapper_args)
         .context("parsing nvcc arguments")?;
@@ -687,17 +709,365 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Refuse-to-cache check: non-empty = this invocation isn't a
+    // cacheable single-source `-c` compile. Passthrough.
     let refuse = compiler.refuse_reasons(&parsed);
-    // Phase 1 has no store path yet: even a cacheable-looking invocation
-    // passes through, with an explicit reason instead of a fake hit.
-    let reason = if refuse.is_empty() {
-        "unsupported|nvcc cache store/restore not yet wired (phase 1, kunobi-ninja/kache#1024)"
-            .to_string()
-    } else {
-        refuse_reason_string(&refuse)
+    if !refuse.is_empty() {
+        let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
+        tracing::debug!("nvcc: passthrough ({})", reasons.join("; "));
+        let reason = refuse_reason_string(&refuse);
+        return nvcc_passthrough_with_event(
+            config,
+            &parsed,
+            &crate_name,
+            &event_root,
+            start,
+            reason,
+        );
+    }
+
+    // User bypass rules (#222): declared per project, evaluated before any key
+    // work, same fail-closed contract as `exclude` below — a match only ever
+    // means "do not cache".
+    if let Some(reason) = Config::user_bypass_reason(&crate_name, &parsed.rest) {
+        tracing::debug!("nvcc invocation bypassed by user rule: {reason}");
+        return nvcc_passthrough_with_event(
+            config,
+            &parsed,
+            &crate_name,
+            &event_root,
+            start,
+            reason,
+        );
+    }
+
+    let current_dir = std::env::current_dir().ok();
+    let exclude_roots: Vec<_> = current_dir.iter().cloned().collect();
+    if let Some(source) = parsed.sources.first()
+        && Config::source_excluded(source, &exclude_roots)
+    {
+        tracing::debug!("nvcc source excluded from cache: {}", source.display());
+        return nvcc_passthrough_with_event(
+            config,
+            &parsed,
+            &crate_name,
+            &event_root,
+            start,
+            format!("source excluded: {}", source.display()),
+        );
+    }
+
+    // Never compile over an output that still shares a read-only cache
+    // blob: the write would fail (EACCES) or, worse, poison the shared
+    // inode. Bail loudly instead.
+    nvcc_legacy_blob_check(config, &parsed)?;
+
+    let store = match Store::open(config) {
+        Ok(store) => store,
+        Err(e) => {
+            warn_store_unavailable_once(config, &e);
+            return nvcc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                &event_root,
+                start,
+                format!("store unavailable: {e}"),
+            );
+        }
     };
-    tracing::debug!("nvcc: passthrough ({reason})");
-    nvcc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason)
+
+    // Compute the cache key (probes `nvcc --version` + host version,
+    // runs `nvcc -M` for the dependency closure). On any failure fall
+    // back to passthrough, which runs the real compiler and surfaces
+    // the real diagnostic.
+    let key_start = std::time::Instant::now();
+    let mut file_hasher = store.file_hasher();
+    file_hasher.arm_too_new_guard(invocation_start_ns, 0);
+    let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+    let key_ctx = KeyCtx {
+        file_hasher: &file_hasher,
+        path_normalizer: &path_normalizer,
+        cache_dir: &config.cache_dir,
+        key_salt: config.key_salt.as_deref(),
+        key_env_vars: &config.key_env_vars,
+        extra_inputs_digest: None,
+    };
+    let cache_key = match compiler.cache_key(&parsed, &key_ctx) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::debug!("nvcc cache key failed for {crate_name}: {e} — passthrough");
+            return nvcc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                &event_root,
+                start,
+                format!("uncacheable|{e}"),
+            );
+        }
+    };
+    let key_ms = key_start.elapsed().as_millis() as u64;
+    tracing::debug!("nvcc cache key for {}: {}", crate_name, &cache_key[..16]);
+
+    // ── Local cache lookup ───────────────────────────────────────
+    let lookup_start = std::time::Instant::now();
+    let lookup = match lookup_local_entry(&store, None, &cache_key) {
+        Ok(lookup) => lookup,
+        Err(e) => {
+            tracing::warn!("nvcc local store lookup failed for {crate_name}: {e} — recompiling");
+            return nvcc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                &event_root,
+                start,
+                format!("store lookup failed: {e}"),
+            );
+        }
+    };
+    let lookup_ms = lookup_start.elapsed().as_millis() as u64;
+    let mut lookup_rejection = String::new();
+    if let Some((hit_store, meta)) = lookup {
+        if meta.files.is_empty() {
+            // Poisoned entry — evict and recompile.
+            tracing::warn!("nvcc cache entry for {crate_name} has no files, evicting");
+            lookup_rejection = "matching entry has no cached artifacts".to_string();
+            let _ = hit_store.remove_entry(&cache_key);
+        } else if let Some(reason) = nvcc_cache_entry_rejection_reason(&parsed, &meta) {
+            tracing::warn!(
+                "nvcc cache entry for {crate_name} lacks artifacts required by this invocation ({reason}), evicting"
+            );
+            lookup_rejection = reason.to_string();
+            let _ = hit_store.remove_entry(&cache_key);
+        } else {
+            let restore_start = std::time::Instant::now();
+            if let Err(e) = restore_nvcc_from_cache(hit_store, &parsed, &meta) {
+                tracing::warn!(
+                    "restoring nvcc cache hit for {crate_name} failed: {e} — recompiling"
+                );
+                return nvcc_passthrough_with_event(
+                    config,
+                    &parsed,
+                    &crate_name,
+                    &event_root,
+                    start,
+                    format!("restore failed: {e}"),
+                );
+            }
+            let restore_ms = restore_start.elapsed().as_millis() as u64;
+            let elapsed = start.elapsed().as_millis() as u64;
+            let size: u64 = meta.files.iter().map(|f| f.size).sum();
+            tracing::debug!(
+                "nvcc local cache hit for {crate_name} ({})",
+                &cache_key[..16]
+            );
+            log_event(
+                config,
+                &event_root,
+                &crate_name,
+                EventResult::LocalHit,
+                elapsed,
+                meta.compile_time_ms,
+                size,
+                &cache_key,
+                key_ms,
+                lookup_ms,
+                restore_ms,
+                0,
+            );
+            print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
+            replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+            return Ok(0);
+        }
+    }
+
+    if let Some(exit) = nvcc_try_remote_hit(
+        config,
+        &store,
+        &parsed,
+        &cache_key,
+        &crate_name,
+        &event_root,
+        start,
+        key_ms,
+        lookup_ms,
+    )? {
+        return Ok(exit);
+    }
+
+    // ── Cache miss — compile, then store ─────────────────────────
+    // Recheck the blob sharing at the last wrapper boundary: key
+    // computation took long enough for another process to restore over
+    // our outputs.
+    nvcc_legacy_blob_check(config, &parsed)?;
+
+    let mut committed = None;
+    let mut _build_lock = None;
+    match store.claim_build(&cache_key) {
+        Ok(BuildClaim::Acquired(lock)) => _build_lock = Some(lock),
+        Ok(BuildClaim::Committed(meta)) => committed = Some(*meta),
+        Ok(BuildClaim::Contended) => {
+            tracing::debug!("waiting for nvcc {crate_name} to be built by another process");
+            committed = store
+                .wait_for_committed(&cache_key)
+                .unwrap_or(false)
+                .then(|| store.get(&cache_key).ok().flatten())
+                .flatten()
+                .filter(|meta| nvcc_cache_entry_rejection_reason(&parsed, meta).is_none());
+        }
+        Err(e) => {
+            tracing::debug!("nvcc claim_build failed ({e:#}); compiling without a key lock");
+        }
+    }
+
+    if let Some(meta) =
+        committed.filter(|meta| nvcc_cache_entry_rejection_reason(&parsed, meta).is_none())
+    {
+        let restore_start = std::time::Instant::now();
+        if let Err(e) = restore_nvcc_from_cache(&store, &parsed, &meta) {
+            tracing::warn!(
+                "restoring nvcc coalesced hit for {crate_name} failed: {e} — recompiling"
+            );
+            return nvcc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                &event_root,
+                start,
+                format!("restore failed: {e}"),
+            );
+        }
+        let restore_ms = restore_start.elapsed().as_millis() as u64;
+        let elapsed = start.elapsed().as_millis() as u64;
+        let size: u64 = meta.files.iter().map(|f| f.size).sum();
+        log_event(
+            config,
+            &event_root,
+            &crate_name,
+            EventResult::LocalHit,
+            elapsed,
+            meta.compile_time_ms,
+            size,
+            &cache_key,
+            key_ms,
+            lookup_ms,
+            restore_ms,
+            0,
+        );
+        print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
+        replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+        return Ok(0);
+    }
+
+    let compile_start = std::time::Instant::now();
+    let result = match compiler.execute(&parsed) {
+        Ok(r) => r,
+        // A spawn-level failure must not abort the build: fall back to
+        // passthrough so the user sees the real compiler error rather
+        // than a kache anyhow chain.
+        Err(e) => {
+            return nvcc_passthrough_with_event(
+                config,
+                &parsed,
+                &crate_name,
+                &event_root,
+                start,
+                format!("compiler spawn failed: {e}"),
+            );
+        }
+    };
+    let compile_time_ms = compile_start.elapsed().as_millis() as u64;
+
+    if !result.stdout.is_empty() {
+        print!("{}", result.stdout);
+    }
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr);
+    }
+
+    // Only store a clean compile that produced its object. Anything
+    // else returns the exit code and lets the build see the failure.
+    let store_start = std::time::Instant::now();
+    let mut store_put = StorePutResult::default();
+    let mut store_error = String::new();
+    let store_candidate = should_store_cc_result(result.exit_code, !result.artifacts.is_empty());
+    // nvcc entries are portable by construction (prefix-mapped objects,
+    // pinned epoch, rewritten dep-info), so every stored entry may
+    // publish to a writable remote.
+    let admitted = store_admits_compile(config, compile_time_ms, true);
+    let store_decision = cc_store_decision(store_candidate, admitted);
+    if store_decision.admission_skipped {
+        tracing::debug!(
+            crate_name = %crate_name,
+            compile_time_ms,
+            min_store_compile_ms = config.min_store_compile_ms,
+            "admission: compile too cheap to store"
+        );
+    }
+    if store_decision.should_store {
+        let depinfo_anchor = nvcc_depinfo_rewrite_root(&parsed);
+        let target = crate::compiler::nvcc::nvcc_target_label(&parsed.deferred_flags);
+        match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
+            Ok(prepared) => match store.put_with_compile_time_independent(
+                &cache_key,
+                &crate_name,
+                &[], // crate_types: n/a for nvcc objects
+                &[], // features: n/a
+                &target,
+                "", // profile: n/a (opt level is in the key)
+                &prepared.files,
+                &result.stdout,
+                &result.stderr,
+                compile_time_ms,
+            ) {
+                Ok(put) => {
+                    store_put = put;
+                    // Store grew — throttled size check + detached background GC if over
+                    // budget (kunobi-ninja/kache#497). Never blocks the compile path.
+                    maybe_spawn_auto_gc(config, &store);
+                    maybe_enqueue_nvcc_upload(config, &store, &cache_key, &crate_name);
+                }
+                Err(e) => {
+                    store_error = store_error_for_event(&e);
+                    tracing::warn!(
+                        "failed to store nvcc cache entry for {crate_name}: {store_error}"
+                    );
+                }
+            },
+            Err(e) => {
+                store_error = store_error_for_event(&e);
+                tracing::warn!(
+                    "failed to prepare nvcc cache entry for {crate_name}: {store_error}"
+                );
+            }
+        }
+    }
+    let store_ms = store_start.elapsed().as_millis() as u64;
+
+    let elapsed = start.elapsed().as_millis() as u64;
+    let size = result.artifacts.total_size();
+    let event_result = event_result_for_store_admission(store_candidate, admitted, store_put);
+    log_event_with_store_and_lookup_outcome(
+        config,
+        &event_root,
+        &crate_name,
+        event_result,
+        elapsed,
+        compile_time_ms,
+        size,
+        &cache_key,
+        key_ms,
+        FileHashStats::default(),
+        lookup_ms,
+        0,
+        store_ms,
+        store_put,
+        store_error,
+        lookup_rejection,
+    );
+    print_progress(&crate_name, event_result, elapsed, size);
+    Ok(result.exit_code)
 }
 
 /// Run an `nvcc` invocation without caching — invoke the compiler with
@@ -740,6 +1110,247 @@ fn nvcc_passthrough_with_event<R: Into<String>>(
 
 fn nvcc_event_root() -> String {
     event_root_string(event_root_override().or_else(|| std::env::current_dir().ok()))
+}
+
+/// Refuse to invoke the compiler over outputs that still share a
+/// read-only cache blob (same contract as the cc path): the write
+/// would fail with EACCES, and a chmod could not help since the inode
+/// is shared with the store.
+fn nvcc_legacy_blob_check(config: &Config, parsed: &crate::compiler::nvcc::NvccArgs) -> Result<()> {
+    let store_dir = config.store_dir();
+    let mut outputs = Vec::new();
+    if let Some(object) = parsed.object_output_path() {
+        outputs.push(object);
+    }
+    if let Some(depfile) = parsed.depinfo_output_path() {
+        outputs.push(depfile);
+    }
+    for output in outputs {
+        if let Some(blob) = Store::matching_readonly_blob_inode(&store_dir, &output)? {
+            anyhow::bail!(
+                "refusing to invoke the compiler because {} still shares the \
+                 read-only cache blob {}; remove the build output and retry",
+                output.display(),
+                blob.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Why a cached entry cannot satisfy this invocation, if it cannot: no
+/// object, or a requested dep-info the entry lacks. `None` restores.
+fn nvcc_cache_entry_rejection_reason(
+    parsed: &crate::compiler::nvcc::NvccArgs,
+    meta: &crate::store::EntryMeta,
+) -> Option<&'static str> {
+    let has_object = meta
+        .files
+        .iter()
+        .any(|file| classify_by_filename(&file.name) == ArtifactKind::Object);
+    let has_depinfo = meta
+        .files
+        .iter()
+        .any(|file| classify_by_filename(&file.name) == ArtifactKind::DepInfo);
+
+    if !has_object {
+        Some("matching entry lacks the object artifact required by this invocation")
+    } else if parsed.depinfo_output_path().is_some() && !has_depinfo {
+        Some("matching entry lacks dep-info required by this invocation")
+    } else {
+        None
+    }
+}
+
+fn nvcc_depinfo_rewrite_root(
+    parsed: &crate::compiler::nvcc::NvccArgs,
+) -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    nvcc_depinfo_rewrite_root_from_cwd(parsed, &cwd)
+}
+
+fn nvcc_depinfo_rewrite_root_from_cwd(
+    parsed: &crate::compiler::nvcc::NvccArgs,
+    cwd: &Path,
+) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    parsed.depinfo_output_path()?;
+
+    let object_anchor = parsed.object_output_path().and_then(|object| {
+        absolute_clean_path(&object, cwd)
+            .parent()
+            .map(Path::to_path_buf)
+    })?;
+    let source_anchor = parsed
+        .sources
+        .first()
+        .map(|source| absolute_clean_path(source, cwd))
+        .and_then(|source| source.parent().map(Path::to_path_buf));
+
+    source_anchor
+        .and_then(|source| common_path_prefix(&source, &object_anchor))
+        .filter(|root| root.components().any(|c| matches!(c, Component::Normal(_))))
+        .or(Some(object_anchor))
+}
+
+/// Restore a cached nvcc entry: the object to `-o`, the dep-info to
+/// `-MF` when requested (entries without it restore fine — the flag
+/// decides). Unknown kinds are skipped, never placed. Any failure
+/// bails to recompilation: nvcc rewrites `-o` outputs fresh, so a
+/// half-restored state is safe to compile over.
+fn restore_nvcc_from_cache(
+    store: &Store,
+    parsed: &crate::compiler::nvcc::NvccArgs,
+    meta: &crate::store::EntryMeta,
+) -> Result<()> {
+    let depinfo_anchor =
+        nvcc_depinfo_rewrite_root(parsed).unwrap_or_else(|| Path::new(".").to_path_buf());
+    let mut prepared = Vec::new();
+    let mut targets = std::collections::HashSet::new();
+
+    for cached in &meta.files {
+        let kind = classify_by_filename(&cached.name);
+        let target = match kind {
+            ArtifactKind::Object => parsed
+                .object_output_path()
+                .context("nvcc restore: cannot determine object output path")?,
+            ArtifactKind::DepInfo => match parsed.depinfo_output_path() {
+                Some(path) => path,
+                None => {
+                    tracing::debug!(
+                        "nvcc restore: cached dep-info {} not requested by invocation; skipping",
+                        cached.name
+                    );
+                    continue;
+                }
+            },
+            _ => {
+                tracing::debug!(
+                    "nvcc restore: cached artifact {} has unsupported kind {:?}; skipping",
+                    cached.name,
+                    kind
+                );
+                continue;
+            }
+        };
+
+        // Recheck immediately before the path-based restore: the
+        // initial check ran before key computation, and another
+        // process may have restored over our outputs since.
+        if cc_output_path_requires_passthrough(&target) {
+            anyhow::bail!(
+                "nvcc restore: output path changed and now requires compiler passthrough semantics"
+            );
+        }
+        anyhow::ensure!(
+            targets.insert(target.clone()),
+            "nvcc restore: cache entry maps multiple artifacts to {}",
+            target.display()
+        );
+        prepared.push(prepare_cc_cached_artifact(
+            store,
+            cached,
+            &target,
+            kind,
+            &depinfo_anchor,
+        )?);
+    }
+    publish_prepared_cc_artifacts(prepared)
+}
+
+/// After a local miss, ask the daemon for an exact remote entry.
+/// Returns `Some(exit)` when the hit was restored (or the restore fell
+/// through to passthrough). `None` means continue to compile.
+/// nvcc entries are portable by construction, so every stored entry
+/// may publish: the only gate is a configured remote.
+fn nvcc_try_remote_hit(
+    config: &Config,
+    store: &Store,
+    parsed: &crate::compiler::nvcc::NvccArgs,
+    cache_key: &str,
+    crate_name: &str,
+    event_root: &str,
+    start: std::time::Instant,
+    key_ms: u64,
+    lookup_ms: u64,
+) -> Result<Option<i32>> {
+    if config.remote.is_none() {
+        return Ok(None);
+    }
+    let entry_dir = store.entry_dir(cache_key);
+    let shard_dir = crate::daemon::remote_check_shard_dir_arg(&config.cache_dir, store.cache_dir());
+    let Some(result) = crate::daemon::send_remote_check(
+        config,
+        cache_key,
+        &entry_dir,
+        crate_name,
+        shard_dir.as_deref().map(Path::new),
+    ) else {
+        return Ok(None);
+    };
+    if !result.found {
+        return Ok(None);
+    }
+    let Ok(Some(meta)) = store.get(cache_key) else {
+        return Ok(None);
+    };
+    let event_result = if result.prefetched {
+        tracing::debug!(
+            "nvcc prefetch cache hit for {crate_name} ({})",
+            &cache_key[..16]
+        );
+        EventResult::PrefetchHit
+    } else {
+        tracing::debug!(
+            "nvcc remote cache hit for {crate_name} ({})",
+            &cache_key[..16]
+        );
+        EventResult::RemoteHit
+    };
+    let restore_start = std::time::Instant::now();
+    if let Err(e) = restore_nvcc_from_cache(store, parsed, &meta) {
+        tracing::warn!(
+            "restoring nvcc remote cache hit for {crate_name} failed: {e} — recompiling"
+        );
+        return Ok(Some(nvcc_passthrough_with_event(
+            config,
+            parsed,
+            crate_name,
+            event_root,
+            start,
+            format!("restore failed: {e}"),
+        )?));
+    }
+    let restore_ms = restore_start.elapsed().as_millis() as u64;
+    let elapsed = start.elapsed().as_millis() as u64;
+    let size: u64 = meta.files.iter().map(|f| f.size).sum();
+    log_event(
+        config,
+        event_root,
+        crate_name,
+        event_result,
+        elapsed,
+        meta.compile_time_ms,
+        size,
+        cache_key,
+        key_ms,
+        lookup_ms,
+        restore_ms,
+        0,
+    );
+    print_progress(crate_name, event_result, elapsed, size);
+    replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+    Ok(Some(0))
+}
+
+fn maybe_enqueue_nvcc_upload(config: &Config, store: &Store, cache_key: &str, crate_name: &str) {
+    if config.remote.is_none() {
+        return;
+    }
+    let entry_dir = store.entry_dir(cache_key);
+    if let Err(e) = crate::daemon::send_upload_job(config, cache_key, &entry_dir, crate_name) {
+        tracing::warn!("failed to send upload job to daemon: {e}");
+    }
 }
 
 /// Run kache as a C-family compiler wrapper (`CC=kache cc`,
@@ -8759,7 +9370,7 @@ exit 0
         );
     }
 
-    /// Phase 1 nvcc (#1024): a parsed invocation runs the real compiler
+    /// Phase 1 nvcc (#1024): a refused invocation runs the real compiler
     /// with the original argv and propagates its exit code — and records
     /// the passthrough reason. The nonzero exit kills the `Ok(0)` /
     /// `Ok(1)` / `Ok(-1)` body mutants in both `run_nvcc` and
@@ -8784,10 +9395,10 @@ exit 0
             &config,
             &s(&[
                 &fake_nvcc.to_string_lossy(),
-                "-c",
-                "kernel.cu",
+                "-dlink",
+                "a.o",
                 "-o",
-                "kernel.o",
+                "dlink.o",
             ]),
         )
         .unwrap();
@@ -8796,13 +9407,798 @@ exit 0
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].root, "/nvcc-phase1-root");
-        assert_eq!(events[0].crate_name, "kernel.cu");
         assert_eq!(events[0].result, EventResult::Passthrough);
         assert!(
-            events[0].passthrough_reason.contains("not yet wired"),
+            events[0].passthrough_reason.contains("device-link"),
             "unexpected reason: {}",
             events[0].passthrough_reason
         );
+    }
+
+    /// Write the fake nvcc toolchain with baked-in paths (no
+    /// environment needed, so tests stay parallel): `nvcc` answers
+    /// `--version`, `--dryrun` (naming `host`), `-M` (the source plus
+    /// `headers`), and compiles by writing `-o`/`-MF` outputs while
+    /// recording invocations, argv, and `SOURCE_DATE_EPOCH`. Only the
+    /// exit codes (`exit_code`, `m_exit_code`) baked in as literals.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn write_fake_nvcc_toolchain(
+        dir: &Path,
+        source: &Path,
+        headers: &str,
+        version: &str,
+        host_version: &str,
+        count: &Path,
+        argv_record: Option<&Path>,
+        epoch_record: Option<&Path>,
+        exit_code: i32,
+        m_exit_code: i32,
+    ) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shell =
+            crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
+        let host = dir.join("host-gcc");
+        std::fs::write(
+            &host,
+            format!(
+                "#!{}\nprintf '%s\\n' '{hv}'\n",
+                shell.display(),
+                hv = host_version
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nvcc = dir.join("nvcc");
+        let argv_line = argv_record
+            .map(|p| {
+                format!(
+                    "if [ -n \"{p}\" ]; then printf '%s\\n' \"$@\" >> \"{p}\"; fi\n",
+                    p = p.display()
+                )
+            })
+            .unwrap_or_default();
+        let epoch_line = epoch_record
+            .map(|p| {
+                format!(
+                    "if [ -n \"{p}\" ]; then printf '%s\\n' \"${{SOURCE_DATE_EPOCH:-<unset>}}\" >> \"{p}\"; fi\n",
+                    p = p.display()
+                )
+            })
+            .unwrap_or_default();
+        std::fs::write(
+            &nvcc,
+            format!(
+                "#!{sh}\n\
+                 if [ \"$1\" = \"--version\" ]; then\n\
+                 printf '%s\\n' '{ver}'\n\
+                 exit 0\n\
+                 fi\n\
+                 if [ \"$1\" = \"--dryrun\" ]; then\n\
+                 printf '%s\\n' '#$ _HERE_=/usr/local/cuda/bin' '{host} -c -x c++'\n\
+                 exit 0\n\
+                 fi\n\
+                 if [ \"$1\" = \"-M\" ]; then\n\
+                 shift\n\
+                 printf '%s:' \"fake.o\"\n\
+                 printf ' %s' \"$1\"\n\
+                 for f in {headers}; do printf ' %s' \"$f\"; done\n\
+                 printf '\\n'\n\
+                 exit {m_exit_code}\n\
+                 fi\n\
+                 printf 'run\\n' >> \"{count}\"\n\
+                 {argv_line}                 {epoch_line}                 out=\"\"; dep=\"\"\n\
+                 while [ $# -gt 0 ]; do\n\
+                 case \"$1\" in\n\
+                 -o) out=\"$2\"; shift 2;;\n\
+                 -o*) out=\"${{1#-o}}\"; shift;;\n\
+                 -MF) dep=\"$2\"; shift 2;;\n\
+                 -MF*) dep=\"${{1#-MF}}\"; shift;;\n\
+                 *) shift;;\n\
+                 esac\n\
+                 done\n\
+                 printf 'object-bytes\\n' > \"$out\"\n\
+                 if [ -n \"$dep\" ]; then printf '%s: %s %s\\n' \"$out\" \"{source}\" \"{headers}\" > \"$dep\"; fi\n\
+                 exit {exit_code}\n",
+                sh = shell.display(),
+                host = host.display(),
+                source = source.display(),
+                count = count.display(),
+                ver = version,
+                headers = headers,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&nvcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (nvcc, host)
+    }
+
+    /// One standard fake-toolchain project: `work/kernel.cu` including
+    /// `work/inc/h.h`, the toolchain scripts, and the standard compile
+    /// argv. All paths are baked into the scripts, so tests need no
+    /// environment and run parallel. `argv_record` / `epoch_record` name
+    /// optional record files under `dir` (argv capture, epoch capture).
+    /// Returns `(work, nvcc, count, argv)`.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn setup_nvcc_case(
+        dir: &tempfile::TempDir,
+        argv_record: Option<&str>,
+        epoch_record: Option<&str>,
+        exit_code: i32,
+        m_exit_code: i32,
+    ) -> (PathBuf, PathBuf, PathBuf, Vec<String>) {
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("inc")).unwrap();
+        std::fs::write(
+            work.join("kernel.cu"),
+            "#include \"inc/h.h\"\n__global__ void k() {}\n",
+        )
+        .unwrap();
+        std::fs::write(work.join("inc").join("h.h"), "#pragma once\n").unwrap();
+        let count = dir.path().join("count");
+        let argv_path = argv_record.map(|name| dir.path().join(name));
+        let epoch_path = epoch_record.map(|name| dir.path().join(name));
+        let (nvcc, _host) = write_fake_nvcc_toolchain(
+            dir.path(),
+            &work.join("kernel.cu"),
+            work.join("inc/h.h").to_str().unwrap(),
+            "nvcc: NVIDIA (R) Cuda compiler driver",
+            "gcc (GCC) 13.2.0",
+            &count,
+            argv_path.as_deref(),
+            epoch_path.as_deref(),
+            exit_code,
+            m_exit_code,
+        );
+        let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+        (work, nvcc, count, argv)
+    }
+
+    /// A fake-toolchain nvcc invocation over absolute tempdir paths (the
+    /// wrapper never chdirs in tests). Returns the argv vector.
+    #[cfg(unix)]
+    fn nvcc_compile_argv(nvcc: &Path, work: &Path, extra: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            nvcc.to_string_lossy().into_owned(),
+            "-c".to_string(),
+            work.join("kernel.cu").to_string_lossy().into_owned(),
+            "-o".to_string(),
+            work.join("kernel.o").to_string_lossy().into_owned(),
+            "-MF".to_string(),
+            work.join("kernel.d").to_string_lossy().into_owned(),
+            format!("-I{}", work.join("inc").display()),
+            "-DUSE_CUDA".to_string(),
+            "-gencode".to_string(),
+            "arch=compute_80,code=sm_80".to_string(),
+        ];
+        argv.extend(extra.iter().map(|e| e.to_string()));
+        argv
+    }
+
+    /// Miss, then hit: the second identical invocation restores the
+    /// object and the dep-info without reforking the compiler, and the
+    /// dep-info round-trips byte-identically (store relativize +
+    /// restore expand are inverses under one anchor).
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_miss_then_hit_round_trips_object_and_depinfo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (work, _nvcc, count, argv) = setup_nvcc_case(&dir, Some("argv"), Some("epoch"), 0, 0);
+        let argv_file = dir.path().join("argv");
+        let epoch_file = dir.path().join("epoch");
+        let config = test_config(dir.path().join("cache"));
+
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
+        assert_eq!(
+            std::fs::read_to_string(work.join("kernel.o")).unwrap(),
+            "object-bytes\n"
+        );
+        // The execute path injected the prefix maps and pinned the epoch.
+        let recorded_argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            recorded_argv.contains("-ffile-prefix-map="),
+            "missing prefix-map injection in: {recorded_argv}"
+        );
+        assert_eq!(std::fs::read_to_string(&epoch_file).unwrap(), "0\n");
+        let stored_depinfo = std::fs::read(work.join("kernel.d")).unwrap();
+
+        std::fs::remove_file(work.join("kernel.o")).unwrap();
+        std::fs::remove_file(work.join("kernel.d")).unwrap();
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap(),
+            "run\n",
+            "hit must not refork the compiler"
+        );
+        assert_eq!(
+            std::fs::read(work.join("kernel.o")).unwrap(),
+            b"object-bytes\n"
+        );
+        assert_eq!(
+            std::fs::read(work.join("kernel.d")).unwrap(),
+            stored_depinfo
+        );
+
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].result, EventResult::Miss);
+        assert_eq!(events[1].result, EventResult::LocalHit);
+        // No remote configured: nothing is queued for upload.
+        assert_eq!(spool_intent_count(&config), 0);
+    }
+
+    /// A dep-info the entry lacks evicts and recompiles: an object-only
+    /// entry cannot satisfy `-MF`, and the recompiled entry (object +
+    /// dep-info) hits afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_depinfo_demand_evicts_and_recompiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (work, nvcc, count, _) = setup_nvcc_case(&dir, None, None, 0, 0);
+        let config = test_config(dir.path().join("cache"));
+
+        // Without -MF: object-only entry.
+        let bare = vec![
+            nvcc.to_string_lossy().into_owned(),
+            "-c".to_string(),
+            work.join("kernel.cu").to_string_lossy().into_owned(),
+            "-o".to_string(),
+            work.join("kernel.o").to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run_nvcc(&config, &bare).unwrap(), 0);
+        // With -MF: the object-only entry cannot satisfy it — evict,
+        // recompile, store both artifacts…
+        let with_dep = nvcc_compile_argv(&nvcc, &work, &[]);
+        assert_eq!(run_nvcc(&config, &with_dep).unwrap(), 0);
+        // …and the combined entry hits.
+        std::fs::remove_file(work.join("kernel.o")).unwrap();
+        std::fs::remove_file(work.join("kernel.d")).unwrap();
+        assert_eq!(run_nvcc(&config, &with_dep).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap(),
+            "run\nrun\n",
+            "exactly two compiles: miss, then evict-and-recompile"
+        );
+        assert!(work.join("kernel.o").is_file());
+        assert!(work.join("kernel.d").is_file());
+    }
+
+    /// A configured remote without a reachable daemon falls through to
+    /// the local path: check (absent) → compile → queued upload intent.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_remote_absent_daemon_falls_through_to_compile() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("inc")).unwrap();
+        std::fs::write(work.join("kernel.cu"), "__global__ void k() {}\n").unwrap();
+        std::fs::write(work.join("inc").join("h.h"), "#pragma once\n").unwrap();
+        let count = dir.path().join("count");
+        let headers = work.join("inc").join("h.h");
+        let (nvcc, _host) = write_fake_nvcc_toolchain(
+            dir.path(),
+            &work.join("kernel.cu"),
+            headers.to_str().unwrap(),
+            "nvcc: NVIDIA (R) Cuda compiler driver",
+            "gcc (GCC) 13.2.0",
+            &count,
+            None,
+            None,
+            0,
+            0,
+        );
+
+        let _isolated = isolate_daemon_autostart(dir.path());
+        let mut config = test_config(dir.path().join("cache"));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+
+        let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
+        assert_eq!(spool_intent_count(&config), 1);
+    }
+
+    /// Remote-hit plumbing without a real download: seed the entry
+    /// with a live miss, then drive `nvcc_try_remote_hit` against the
+    /// fake daemon directly (mirrors the cc remote-hit tests — the
+    /// seeded local entry stands in for the download).
+    #[cfg(unix)]
+    fn seed_nvcc_entry(
+        config: &Config,
+        argv: &[String],
+    ) -> (Store, crate::compiler::nvcc::NvccArgs, String) {
+        let store = Store::open(config).unwrap();
+        let compiler =
+            NvccCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone());
+        let parsed = compiler.parse(argv).unwrap();
+        assert_eq!(run_nvcc(config, argv).unwrap(), 0);
+        let file_hasher = FileHasher::new();
+        let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+        let ctx = KeyCtx {
+            file_hasher: &file_hasher,
+            path_normalizer: &path_normalizer,
+            cache_dir: &config.cache_dir,
+            key_salt: config.key_salt.as_deref(),
+            key_env_vars: &config.key_env_vars,
+            extra_inputs_digest: None,
+        };
+        let key = compiler.cache_key(&parsed, &ctx).unwrap();
+        (store, parsed, key)
+    }
+
+    /// No configured remote: the daemon is never contacted and the
+    /// local entry is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_try_remote_hit_skips_daemon_without_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("inc")).unwrap();
+        std::fs::write(work.join("kernel.cu"), "__global__ void k() {}\n").unwrap();
+        std::fs::write(work.join("inc").join("h.h"), "#pragma once\n").unwrap();
+
+        let count = dir.path().join("count");
+        let headers = work.join("inc").join("h.h");
+        let (nvcc, _host) = write_fake_nvcc_toolchain(
+            dir.path(),
+            &work.join("kernel.cu"),
+            headers.to_str().unwrap(),
+            "nvcc: NVIDIA (R) Cuda compiler driver",
+            "gcc (GCC) 13.2.0",
+            &count,
+            None,
+            None,
+            0,
+            0,
+        );
+
+        let config = test_config(dir.path().join("cache"));
+        let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+        let (store, parsed, key) = seed_nvcc_entry(&config, &argv);
+        std::fs::remove_file(work.join("kernel.o")).unwrap();
+        std::fs::remove_file(work.join("kernel.d")).unwrap();
+
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+        wait_until_reachable(&config.socket_path());
+        let requests_before = daemon.request_count();
+        let start = std::time::Instant::now();
+
+        assert!(
+            nvcc_try_remote_hit(
+                &config,
+                &store,
+                &parsed,
+                &key,
+                "kernel.cu",
+                "/nvcc-root",
+                start,
+                0,
+                0,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            daemon.request_count(),
+            requests_before,
+            "no remote must mean no RemoteCheck"
+        );
+        assert!(
+            !work.join("kernel.o").exists(),
+            "skipping the daemon must not restore"
+        );
+    }
+
+    /// A remote miss restores nothing, even with a seeded local entry —
+    /// but the daemon is asked.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_try_remote_hit_does_not_restore_on_remote_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("inc")).unwrap();
+        std::fs::write(work.join("kernel.cu"), "__global__ void k() {}\n").unwrap();
+        std::fs::write(work.join("inc").join("h.h"), "#pragma once\n").unwrap();
+
+        let count = dir.path().join("count");
+        let headers = work.join("inc").join("h.h");
+        let (nvcc, _host) = write_fake_nvcc_toolchain(
+            dir.path(),
+            &work.join("kernel.cu"),
+            headers.to_str().unwrap(),
+            "nvcc: NVIDIA (R) Cuda compiler driver",
+            "gcc (GCC) 13.2.0",
+            &count,
+            None,
+            None,
+            0,
+            0,
+        );
+
+        let mut config = test_config(dir.path().join("cache"));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+        let (store, parsed, key) = seed_nvcc_entry(&config, &argv);
+        std::fs::remove_file(work.join("kernel.o")).unwrap();
+        std::fs::remove_file(work.join("kernel.d")).unwrap();
+
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+        wait_until_reachable(&config.socket_path());
+        let start = std::time::Instant::now();
+
+        assert!(
+            nvcc_try_remote_hit(
+                &config,
+                &store,
+                &parsed,
+                &key,
+                "kernel.cu",
+                "/nvcc-root",
+                start,
+                0,
+                0,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            daemon.request_count() >= 1,
+            "a configured remote must ask the daemon"
+        );
+        assert!(
+            !work.join("kernel.o").exists(),
+            "found=false must not restore even with a seeded entry"
+        );
+    }
+
+    /// A found remote entry restores without compiling and reports
+    /// RemoteHit.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_try_remote_hit_restores_on_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("inc")).unwrap();
+        std::fs::write(work.join("kernel.cu"), "__global__ void k() {}\n").unwrap();
+        std::fs::write(work.join("inc").join("h.h"), "#pragma once\n").unwrap();
+
+        let count = dir.path().join("count");
+        let headers = work.join("inc").join("h.h");
+        let (nvcc, _host) = write_fake_nvcc_toolchain(
+            dir.path(),
+            &work.join("kernel.cu"),
+            headers.to_str().unwrap(),
+            "nvcc: NVIDIA (R) Cuda compiler driver",
+            "gcc (GCC) 13.2.0",
+            &count,
+            None,
+            None,
+            0,
+            0,
+        );
+
+        let mut config = test_config(dir.path().join("cache"));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+        let (store, parsed, key) = seed_nvcc_entry(&config, &argv);
+        std::fs::remove_file(work.join("kernel.o")).unwrap();
+        std::fs::remove_file(work.join("kernel.d")).unwrap();
+
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+        wait_until_reachable(&config.socket_path());
+        let start = std::time::Instant::now();
+
+        assert_eq!(
+            nvcc_try_remote_hit(
+                &config,
+                &store,
+                &parsed,
+                &key,
+                "kernel.cu",
+                "/nvcc-root",
+                start,
+                0,
+                0,
+            )
+            .unwrap(),
+            Some(0)
+        );
+        assert!(work.join("kernel.o").is_file());
+        assert!(work.join("kernel.d").is_file());
+        assert!(
+            daemon.request_count() >= 1,
+            "a configured remote must ask the daemon"
+        );
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.last().unwrap().result, EventResult::RemoteHit);
+    }
+
+    /// A failing compile stores nothing and propagates the exit code:
+    /// the rerun compiles again.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_failed_compile_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_work, _nvcc, count, argv) = setup_nvcc_case(&dir, None, None, 1, 0);
+        let config = test_config(dir.path().join("cache"));
+
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 1);
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap(),
+            "run\nrun\n",
+            "failures must never store"
+        );
+    }
+
+    /// A failing key (here: `-M` exits) passes through to a live
+    /// compile and stores nothing.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_key_failure_passes_through_uncached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_work, _nvcc, count, argv) = setup_nvcc_case(&dir, None, None, 0, 1);
+        let config = test_config(dir.path().join("cache"));
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap(),
+            "run\nrun\n",
+            "key failures must never store"
+        );
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert!(
+            events.iter().all(|e| e.result == EventResult::Passthrough
+                && e.passthrough_reason.contains("uncacheable")),
+            "key failures pass through with reason"
+        );
+    }
+
+    /// Key sensitivity: a header edit and a flag change each bust the
+    /// key (closure contents and verbatim flags are folded).
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_header_and_flag_edits_bust_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("inc")).unwrap();
+        std::fs::write(work.join("kernel.cu"), "#include \"inc/h.h\"\n").unwrap();
+        std::fs::write(work.join("inc").join("h.h"), "#pragma once\n").unwrap();
+        let count = dir.path().join("count");
+        let headers = work.join("inc").join("h.h");
+        let (nvcc, _host) = write_fake_nvcc_toolchain(
+            dir.path(),
+            &work.join("kernel.cu"),
+            headers.to_str().unwrap(),
+            "nvcc: NVIDIA (R) Cuda compiler driver",
+            "gcc (GCC) 13.2.0",
+            &count,
+            None,
+            None,
+            0,
+            0,
+        );
+
+        let config = test_config(dir.path().join("cache"));
+
+        let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
+
+        std::fs::write(work.join("inc").join("h.h"), "#pragma once\n// edit\n").unwrap();
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap(),
+            "run\nrun\n",
+            "header edit must bust the key"
+        );
+
+        let changed = nvcc_compile_argv(&nvcc, &work, &["-DOTHER"]);
+        assert_eq!(run_nvcc(&config, &changed).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap(),
+            "run\nrun\nrun\n",
+            "flag change must bust the key"
+        );
+    }
+
+    /// A too-cheap compile is skipped (never stored): the rerun
+    /// compiles again.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_admission_skipped_when_too_cheap() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("inc")).unwrap();
+        std::fs::write(work.join("kernel.cu"), "__global__ void k() {}\n").unwrap();
+        std::fs::write(work.join("inc").join("h.h"), "#pragma once\n").unwrap();
+        let count = dir.path().join("count");
+        let headers = work.join("inc").join("h.h");
+        let (nvcc, _host) = write_fake_nvcc_toolchain(
+            dir.path(),
+            &work.join("kernel.cu"),
+            headers.to_str().unwrap(),
+            "nvcc: NVIDIA (R) Cuda compiler driver",
+            "gcc (GCC) 13.2.0",
+            &count,
+            None,
+            None,
+            0,
+            0,
+        );
+
+        let mut config = test_config(dir.path().join("cache"));
+        config.min_store_compile_ms = u64::MAX;
+
+        let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap(),
+            "run\nrun\n",
+            "skipped compiles must never store"
+        );
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert!(
+            events.iter().all(|e| e.result == EventResult::Skipped),
+            "cheap compiles report Skipped"
+        );
+    }
+
+    /// Compiling over an output that still shares a read-only cache
+    /// blob refuses loudly instead of failing with EACCES (or worse).
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_legacy_blob_check_refuses_shared_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let content = b"cached object";
+        let hash = blake3::hash(content).to_hex().to_string();
+        create_blob(&store, &hash, content);
+        let blob = store.blob_path(&hash);
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let output = dir.path().join("kernel.o");
+        std::fs::hard_link(&blob, &output).unwrap();
+        drop(store);
+
+        let nvcc = dir.path().join("nvcc");
+        let argv = vec![
+            nvcc.to_string_lossy().into_owned(),
+            "-c".to_string(),
+            "kernel.cu".to_string(),
+            "-o".to_string(),
+            output.to_string_lossy().into_owned(),
+        ];
+        let err = run_nvcc(&config, &argv).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("read-only cache blob"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            output.metadata().unwrap().ino(),
+            blob.metadata().unwrap().ino()
+        );
+    }
+
+    /// Entry/invocation compatibility, all four combinations: the
+    /// object is always required; the dep-info only when requested.
+    #[test]
+    fn nvcc_cache_entry_rejection_covers_all_combinations() {
+        let with_dep = |extra: &[&str]| {
+            let mut argv = vec!["nvcc", "-c", "k.cu", "-o", "k.o"];
+            argv.extend(extra);
+            NvccCompiler::with_extra_allowlist_flags(Vec::new())
+                .parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+                .unwrap()
+        };
+        let requested = with_dep(&["-MF", "k.d"]);
+        let unrequested = with_dep(&[]);
+        let object_only = entry_meta_with_files(&["k.o"]);
+        let both = entry_meta_with_files(&["k.o", "k.d"]);
+        let dep_only = entry_meta_with_files(&["k.d"]);
+        let empty = entry_meta_with_files(&[]);
+
+        assert!(nvcc_cache_entry_rejection_reason(&requested, &both).is_none());
+        assert!(nvcc_cache_entry_rejection_reason(&unrequested, &object_only).is_none());
+        assert!(nvcc_cache_entry_rejection_reason(&unrequested, &both).is_none());
+        assert!(nvcc_cache_entry_rejection_reason(&requested, &object_only).is_some());
+        assert!(nvcc_cache_entry_rejection_reason(&requested, &dep_only).is_some());
+        assert!(nvcc_cache_entry_rejection_reason(&requested, &empty).is_some());
+        assert!(nvcc_cache_entry_rejection_reason(&unrequested, &empty).is_some());
+    }
+
+    /// A cached entry whose blob is gone fails the restore loudly
+    /// (fail-closed) instead of restoring thin air.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_restore_fails_closed_on_missing_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join("inc")).unwrap();
+        std::fs::write(work.join("kernel.cu"), "__global__ void k() {}\n").unwrap();
+        std::fs::write(work.join("inc").join("h.h"), "#pragma once\n").unwrap();
+
+        let count = dir.path().join("count");
+        let headers = work.join("inc").join("h.h");
+        let (nvcc, _host) = write_fake_nvcc_toolchain(
+            dir.path(),
+            &work.join("kernel.cu"),
+            headers.to_str().unwrap(),
+            "nvcc: NVIDIA (R) Cuda compiler driver",
+            "gcc (GCC) 13.2.0",
+            &count,
+            None,
+            None,
+            0,
+            0,
+        );
+
+        let config = test_config(dir.path().join("cache"));
+        let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+        let (store, parsed, key) = seed_nvcc_entry(&config, &argv);
+
+        let meta = store.get(&key).unwrap().unwrap();
+        for file in &meta.files {
+            std::fs::remove_file(store.blob_path(&file.hash)).unwrap();
+        }
+        let err = restore_nvcc_from_cache(&store, &parsed, &meta).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("evicted"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Dep-info anchors: same-tree outputs anchor on the common prefix,
+    /// disjoint trees fall back to the object dir, and no dep-info
+    /// request needs no anchor at all.
+    #[test]
+    fn nvcc_depinfo_rewrite_root_anchors() {
+        let parsed = crate::compiler::nvcc::NvccCompiler::with_extra_allowlist_flags(Vec::new())
+            .parse(&[
+                "nvcc".to_string(),
+                "-c".to_string(),
+                "src/k.cu".to_string(),
+                "-o".to_string(),
+                "build/k.o".to_string(),
+                "-MF".to_string(),
+                "build/k.d".to_string(),
+            ])
+            .unwrap();
+        let cwd = Path::new("/work");
+        assert_eq!(
+            nvcc_depinfo_rewrite_root_from_cwd(&parsed, cwd),
+            Some(PathBuf::from("/work"))
+        );
+
+        let parsed = crate::compiler::nvcc::NvccCompiler::with_extra_allowlist_flags(Vec::new())
+            .parse(&[
+                "nvcc".to_string(),
+                "-c".to_string(),
+                "src/k.cu".to_string(),
+                "-o".to_string(),
+                "/elsewhere/k.o".to_string(),
+                "-MF".to_string(),
+                "/elsewhere/k.d".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(
+            nvcc_depinfo_rewrite_root_from_cwd(&parsed, cwd),
+            Some(PathBuf::from("/elsewhere"))
+        );
+
+        let parsed = crate::compiler::nvcc::NvccCompiler::with_extra_allowlist_flags(Vec::new())
+            .parse(&["nvcc".to_string(), "-c".to_string(), "k.cu".to_string()])
+            .unwrap();
+        assert_eq!(nvcc_depinfo_rewrite_root_from_cwd(&parsed, cwd), None);
     }
 
     /// #1015: a fallback wrapper such as sccache keys on the same preprocessor

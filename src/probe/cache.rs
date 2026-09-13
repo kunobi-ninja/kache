@@ -270,6 +270,7 @@ mod tests {
             compiler_name: "clang".to_string(),
             version_line: version.to_string(),
             resolved_tokens: None,
+            host_version_line: None,
         }
     }
 

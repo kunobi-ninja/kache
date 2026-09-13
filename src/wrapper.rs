@@ -1771,7 +1771,13 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 &target,
                 "", // profile: n/a (opt level is in the key)
                 &prepared.files,
-                &result.stdout,
+                if parsed.mode == crate::compiler::cc::CompileMode::Preprocess
+                    && parsed.output.is_none()
+                {
+                    ""
+                } else {
+                    &result.stdout
+                },
                 &result.stderr,
                 compile_time_ms,
             ) {
@@ -1993,12 +1999,23 @@ fn cc_cache_entry_rejection_reason(
         .files
         .iter()
         .any(|file| cc_preprocess_restore_target(parsed, &file.name).is_some());
+    let has_stdout = meta
+        .files
+        .iter()
+        .any(|file| file.name == crate::compiler::cc::CC_STDOUT_STORE_NAME);
 
     match parsed.mode {
         crate::compiler::cc::CompileMode::Compile if !has_object => {
             Some("matching entry lacks the object artifact required by this invocation")
         }
-        crate::compiler::cc::CompileMode::Preprocess if !has_named_output => {
+        crate::compiler::cc::CompileMode::Preprocess if parsed.output.is_none() && !has_stdout => {
+            Some(
+                "matching entry lacks the preprocessor stdout artifact required by this invocation",
+            )
+        }
+        crate::compiler::cc::CompileMode::Preprocess
+            if parsed.output.is_some() && !has_named_output =>
+        {
             Some("matching entry lacks the preprocessed output required by this invocation")
         }
         crate::compiler::cc::CompileMode::Link if meta.files.is_empty() => {
@@ -2236,6 +2253,24 @@ fn publish_prepared_cc_artifacts_with(
     Ok(())
 }
 
+fn restore_cc_stdout_from_cache(
+    store: &Store,
+    meta: &crate::store::EntryMeta,
+    writer: &mut impl std::io::Write,
+) -> Result<()> {
+    let cached = meta
+        .files
+        .iter()
+        .find(|file| file.name == crate::compiler::cc::CC_STDOUT_STORE_NAME)
+        .context("cc restore: -E stdout entry has no stdout.i blob")?;
+    let blob = store.blob_path(&cached.hash);
+    let mut file = std::fs::File::open(&blob)
+        .with_context(|| format!("cc restore: opening {}", blob.display()))?;
+    std::io::copy(&mut file, writer).context("cc restore: writing -E stdout")?;
+    writer.flush().context("cc restore: flushing -E stdout")?;
+    Ok(())
+}
+
 /// Restore cached cc artifacts to this invocation's output paths.
 ///
 /// Every artifact is staged first. Absent paths use no-clobber publication;
@@ -2247,6 +2282,9 @@ fn restore_cc_from_cache(
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
 ) -> Result<()> {
+    if parsed.mode == crate::compiler::cc::CompileMode::Preprocess && parsed.output.is_none() {
+        return restore_cc_stdout_from_cache(store, meta, &mut std::io::stdout());
+    }
     if parsed.requires_compiler_output_semantics() {
         anyhow::bail!("cc restore: existing output requires compiler passthrough semantics");
     }
@@ -7604,6 +7642,31 @@ mod tests {
             std::fs::read(&output).unwrap(),
             b"# 1 \"unit.c\"\nint expanded;\n",
             "the cached expansion must reach the path -o named"
+        );
+
+        let stdout_parsed = CcCompiler::new()
+            .parse(&s(&["cc", "-E", "unit.c"]))
+            .unwrap();
+        let stdout_meta = entry_meta(
+            "cc-stdout-key",
+            vec![cached_file(crate::compiler::cc::CC_STDOUT_STORE_NAME, hash)],
+            &[],
+        );
+        let mut restored = Vec::new();
+        restore_cc_stdout_from_cache(&store, &stdout_meta, &mut restored).unwrap();
+        assert_eq!(
+            restored, b"# 1 \"unit.c\"\nint expanded;\n",
+            "a stdout -E hit must replay the blob on stdout"
+        );
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&stdout_parsed, &stdout_meta),
+            None
+        );
+        assert_eq!(
+            cc_cache_entry_rejection_reason(&stdout_parsed, &meta),
+            Some(
+                "matching entry lacks the preprocessor stdout artifact required by this invocation"
+            )
         );
 
         // An entry naming some other file is not this invocation's output, and

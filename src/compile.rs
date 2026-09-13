@@ -21,6 +21,10 @@ pub struct CompileResult {
     pub stderr: String,
     /// Full artifact set produced by this compilation.
     pub artifacts: ArtifactSet,
+    /// Temp files backing `artifacts`. Held so Drop does not delete them
+    /// before the store put copies the bytes.
+    #[allow(dead_code)]
+    pub keepalive: Vec<tempfile::TempPath>,
 }
 
 /// A securely-created standard rustc response file that owns its lifetime.
@@ -233,6 +237,7 @@ pub fn run_rustc(
         stdout,
         stderr,
         artifacts,
+        keepalive: Vec::new(),
     })
 }
 

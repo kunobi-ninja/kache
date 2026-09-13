@@ -60,7 +60,6 @@ max_passthrough_pct = 40.0
 # Any other reason warns; delete an entry once it is fixed.
 known_passthrough = [
   "unsupported|cc link mode",
-  "unsupported|cc preprocessor mode -E to stdout",
   "unsupported|rustc build-script probe",
   "uncacheable|cc -E key probe exited 1",
   "uncacheable|cc: resolved invocation unavailable for probe-captured flags",

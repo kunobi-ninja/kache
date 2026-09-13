@@ -24,10 +24,10 @@
 //! What passes through (refused, see [`CcArgs::refuse_reasons`]):
 //! - Link mode unless `[cache] cache_cc_links` / `KACHE_CACHE_CC_LINKS` is on
 //!   (epic #762 / #259)
-//! - Preprocess (`-E`) / assemble (`-S`) modes
+//! - Assemble (`-S`) mode
 //! - Multi-source compiles, multi-arch fat binaries
 //! - Response files, coverage instrumentation, split DWARF,
-//!   precompiled headers, modules, output-to-stdout
+//!   precompiled headers, modules, `-o -`
 //! - Any flag not classified by [`CC_FLAGS`] (see [`classify_cc_flag`])
 //!   — an unmodeled codegen flag, a cross-target, profiling, or simply
 //!   a flag kache has not classified. Refused so an unknown flag is
@@ -50,7 +50,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -71,6 +71,9 @@ pub enum ToolFamily {
     /// clang in MSVC driver mode (`clang-cl` or `--driver-mode=cl`).
     ClangCl,
 }
+
+/// Store name for a `-E` expansion that went to stdout (no `-o`).
+pub(crate) const CC_STDOUT_STORE_NAME: &str = "stdout.i";
 
 impl ToolFamily {
     /// The flag dialect this family speaks (Gnu and Clang share one).
@@ -701,9 +704,8 @@ impl CcArgs {
     ///   anything it does not classify is refused with the offending
     ///   flags named in the reason.
     /// - **Output to stdout** (`-o -`): not a cacheable artifact.
-    /// - **Preprocess / Assemble mode**: `-E` and `-S` produce
-    ///   developer-facing output that's rarely worth caching and
-    ///   tangles with the cc-crate probe pattern.
+    /// - **Assemble mode**: `-S` is still refused. `-E` to a named file
+    ///   or to stdout is cached.
     pub fn refuse_reasons(&self, extra_allowlist_flags: &[String]) -> Vec<RefuseReason> {
         let mut reasons = Vec::new();
 
@@ -728,14 +730,8 @@ impl CcArgs {
             CompileMode::Link => reasons.push(RefuseReason::Unsupported(
                 "cc link mode (whole-program caching) — not yet",
             )),
-            // `-E` writing to a named file is an ordinary single-output
-            // compile: the expansion is the artifact, and the key already
-            // covers everything that can change it. Writing to stdout would
-            // need the entry to carry an output no file holds, so that shape
-            // keeps its own refusal and stays countable.
-            CompileMode::Preprocess if self.output.is_none() => reasons.push(
-                RefuseReason::Unsupported("cc preprocessor mode -E to stdout — not yet"),
-            ),
+            // `-E` to a named file or to stdout is a single-output compile:
+            // the expansion is the artifact. `-o -` is still refused below.
             CompileMode::Preprocess => {}
             CompileMode::Assemble => {
                 reasons.push(RefuseReason::Unsupported("cc assembly mode -S — not yet"))
@@ -6314,34 +6310,48 @@ impl Compiler for CcCompiler {
         let discovers_outputs = matches!(parsed.mode, CompileMode::Compile)
             || (parsed.mode == CompileMode::Link && self.cache_cc_links)
             || (parsed.mode == CompileMode::Preprocess && parsed.output.is_some());
-        let artifacts = if exit_code == 0 && discovers_outputs {
+        let mut keepalive = Vec::new();
+        let mut artifacts = if exit_code == 0 && discovers_outputs {
             discover_cc_output_artifacts(parsed)
         } else {
             ArtifactSet::empty()
         };
-        // Safety net for #1004. The key probe catches roots in the expansion.
-        // A root that reaches the object some other way would still be stored
-        // under a key every checkout shares, so keep the object for this build
-        // and store nothing. It only sees roots spelled out as plain bytes.
-        let unsafe_to_store =
-            cc_unsafe_to_store(artifacts.is_empty(), self.key_path_bound.get(), || {
-                parsed
-                    .object_output_path()
-                    .map(|path| cc_object_embeds_mapped_root(&path, &prefix_maps))
-            });
-        let artifacts = match unsafe_to_store {
-            None => artifacts,
-            Some(reason) => {
-                tracing::warn!("cc: {} {reason}; not caching it", cc_trace_name(parsed));
-                ArtifactSet::empty()
+        if exit_code == 0 && parsed.mode == CompileMode::Preprocess && parsed.output.is_none() {
+            match stage_cc_stdout_artifact(&output.stdout) {
+                Ok((artifact, temp)) => {
+                    artifacts = ArtifactSet::new(vec![artifact]);
+                    keepalive.push(temp);
+                }
+                Err(error) => {
+                    tracing::warn!("cc: staging -E stdout failed: {error:#}; not caching it");
+                }
             }
-        };
+        } else {
+            // Safety net for #1004. The key probe catches roots in the expansion.
+            // A root that reaches the object some other way would still be stored
+            // under a key every checkout shares, so keep the object for this build
+            // and store nothing. It only sees roots spelled out as plain bytes.
+            let unsafe_to_store =
+                cc_unsafe_to_store(artifacts.is_empty(), self.key_path_bound.get(), || {
+                    parsed
+                        .object_output_path()
+                        .map(|path| cc_object_embeds_mapped_root(&path, &prefix_maps))
+                });
+            artifacts = match unsafe_to_store {
+                None => artifacts,
+                Some(reason) => {
+                    tracing::warn!("cc: {} {reason}; not caching it", cc_trace_name(parsed));
+                    ArtifactSet::empty()
+                }
+            };
+        }
 
         Ok(CompileResult {
             exit_code,
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
             artifacts,
+            keepalive,
         })
     }
 
@@ -6353,6 +6363,30 @@ impl Compiler for CcCompiler {
         // .dylib, etc.).
         classify_by_filename(name)
     }
+}
+
+fn stage_cc_stdout_artifact(bytes: &[u8]) -> Result<(Artifact, tempfile::TempPath)> {
+    let mut staged = tempfile::Builder::new()
+        .prefix("kache-cc-stdout-")
+        .suffix(".i")
+        .tempfile()
+        .context("cc: creating -E stdout staging file")?;
+    staged
+        .write_all(bytes)
+        .context("cc: writing -E stdout staging file")?;
+    staged
+        .flush()
+        .context("cc: flushing -E stdout staging file")?;
+    let temp = staged.into_temp_path();
+    Ok((
+        Artifact {
+            path: temp.to_path_buf(),
+            store_name: CC_STDOUT_STORE_NAME.to_string(),
+            kind: ArtifactKind::Other("stdout"),
+            required: true,
+        },
+        temp,
+    ))
 }
 
 fn expand_cc_response_files(args: &[String]) -> Result<Vec<String>> {
@@ -8257,8 +8291,8 @@ mod tests {
         );
         let stdout = refuse_descriptions(&["clang-cl", "-E", "foo.c"]);
         assert!(
-            stdout.iter().any(|d| d.contains("to stdout")),
-            "-E to stdout is not a flag row: {stdout:?}"
+            !stdout.iter().any(|d| d.contains("to stdout")),
+            "-E to stdout must cache, got: {stdout:?}"
         );
     }
 
@@ -11839,11 +11873,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    /// `-E` to a named file is a cacheable single-output compile; `-E` to
-    /// stdout still is not, and says so in its own words so the two can be
-    /// counted apart in a report.
+    /// `-E` to a named file and `-E` to stdout are both cacheable.
+    /// `-o -` is still refused.
     #[test]
-    fn preprocess_to_a_file_is_cacheable_and_to_stdout_is_not() {
+    fn preprocess_to_a_file_and_to_stdout_are_cacheable() {
         let to_file = CcArgs::parse(&s(&["cc", "-E", "unit.c", "-o", "unit.i"])).unwrap();
         assert_eq!(to_file.mode, CompileMode::Preprocess);
         assert!(
@@ -11858,13 +11891,58 @@ mod tests {
         );
 
         let to_stdout = CcArgs::parse(&s(&["cc", "-E", "unit.c"])).unwrap();
-        let reasons = to_stdout.refuse_reasons(&[]);
+        assert_eq!(to_stdout.mode, CompileMode::Preprocess);
+        assert!(to_stdout.output.is_none(), "-E without -o writes stdout");
+        assert!(
+            to_stdout.refuse_reasons(&[]).is_empty(),
+            "-E to stdout must cache: {:?}",
+            to_stdout.refuse_reasons(&[])
+        );
+
+        let dash_o = CcArgs::parse(&s(&["cc", "-E", "unit.c", "-o", "-"])).unwrap();
+        let reasons = dash_o.refuse_reasons(&[]);
         assert!(
             reasons.iter().any(|reason| matches!(
                 reason,
                 RefuseReason::Unsupported(message) if message.contains("to stdout")
             )),
-            "stdout has no file to store: {reasons:?}"
+            "-o - is still refused: {reasons:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_stages_preprocess_stdout_as_an_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("unit.c");
+        std::fs::write(&source, "int kache_stdout_marker;\n").unwrap();
+        let compiler = CcCompiler::new();
+        let parsed = compiler
+            .parse(&s(&["cc", "-E", source.to_str().unwrap()]))
+            .unwrap();
+        assert!(parsed.output.is_none());
+        let result = execute_retrying_etxtbsy(&compiler, &parsed).expect("cc -E should run");
+        assert_eq!(result.exit_code, 0, "stderr={}", result.stderr);
+        assert_eq!(result.artifacts.outputs().len(), 1);
+        assert_eq!(
+            result.artifacts.outputs()[0].store_name,
+            CC_STDOUT_STORE_NAME
+        );
+        let staged = std::fs::read(&result.artifacts.outputs()[0].path).unwrap();
+        assert!(
+            staged
+                .windows(b"kache_stdout_marker".len())
+                .any(|w| w == b"kache_stdout_marker"),
+            "staged stdout must hold the expansion, got {}",
+            String::from_utf8_lossy(&staged)
+        );
+        assert!(
+            result.stdout.contains("kache_stdout_marker"),
+            "miss path still prints the expansion on stdout"
+        );
+        assert!(
+            !result.keepalive.is_empty(),
+            "the staging file must outlive execute"
         );
     }
 

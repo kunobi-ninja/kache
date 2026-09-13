@@ -10098,10 +10098,7 @@ mod tests {
             .unwrap();
         let reasons = compiler.refuse_reasons(&parsed);
         let descs: Vec<_> = reasons.iter().map(|r| r.description()).collect();
-        assert!(
-            descs.is_empty(),
-            "-E to stdout must cache, got: {descs:?}"
-        );
+        assert!(descs.is_empty(), "-E to stdout must cache, got: {descs:?}");
 
         // Link mode — also `Unsupported` with "— not yet".
         // Same short-circuit: the flag classifier's complaint about

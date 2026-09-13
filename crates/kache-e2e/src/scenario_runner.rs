@@ -113,7 +113,22 @@ impl Args {
     }
 }
 
+/// Scenarios run on CI hosts that can carry a real `/etc/kache/config.toml`
+/// (the self-hosted Macs set keys there for every build), and an arm must
+/// measure what its scenario configures, not what the host does. Every kache
+/// this process spawns inherits its environment, so turning the host layer
+/// off once here covers all of them. A caller who wants the host layer
+/// exports `KACHE_HOST_CONFIG` explicitly, which is left alone.
+fn turn_off_host_config() {
+    if std::env::var_os("KACHE_HOST_CONFIG").is_none() {
+        // SAFETY: called first thing in `main`, before this process starts
+        // any thread that could read the environment concurrently.
+        unsafe { std::env::set_var("KACHE_HOST_CONFIG", "") };
+    }
+}
+
 pub fn main() -> Result<()> {
+    turn_off_host_config();
     let args = Args::parse();
     let mut select = args.select.clone();
     if let Some(profile) = &args.profile {
@@ -250,6 +265,33 @@ fn profile_hint(name: &str, cache_backend: CacheBackend) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every kache the runner spawns inherits its environment, so the runner
+    /// turns the host layer off, and leaves a value the caller set alone.
+    #[test]
+    fn the_runner_turns_the_host_layer_off_unless_the_caller_set_it() {
+        let previous = std::env::var_os("KACHE_HOST_CONFIG");
+        // SAFETY: no other test in this crate reads or writes this variable,
+        // and it is restored before any assertion can panic.
+        unsafe { std::env::remove_var("KACHE_HOST_CONFIG") };
+        turn_off_host_config();
+        let unset = std::env::var_os("KACHE_HOST_CONFIG");
+        unsafe { std::env::set_var("KACHE_HOST_CONFIG", "/srv/kache.toml") };
+        turn_off_host_config();
+        let set = std::env::var_os("KACHE_HOST_CONFIG");
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("KACHE_HOST_CONFIG", value),
+                None => std::env::remove_var("KACHE_HOST_CONFIG"),
+            }
+        }
+
+        assert_eq!(unset.as_deref(), Some(std::ffi::OsStr::new("")));
+        assert_eq!(
+            set.as_deref(),
+            Some(std::ffi::OsStr::new("/srv/kache.toml"))
+        );
+    }
 
     /// Every clone-benchmark option, on its own, must be recognised as one.
     /// The check is a long disjunction, and a term that stops contributing

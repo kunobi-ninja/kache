@@ -8739,7 +8739,9 @@ fn warn_if_remote_is_env_only(config: &Config) -> bool {
     if set.is_empty() {
         return false;
     }
-    let (file_config, _) = Config::load_raw_file_config();
+    // The merged view. With these variables set, a host remote yields to them
+    // in this build, so a remote left here is one the chosen file declares.
+    let file_config = Config::load_file_config().unwrap_or_default();
     if file_config
         .cache
         .as_ref()
@@ -8747,9 +8749,10 @@ fn warn_if_remote_is_env_only(config: &Config) -> bool {
     {
         return false;
     }
+    let daemon_remote = daemon_remote_after_env_strip(&crate::config::host_config_status());
     let message = format!(
         "kache: a remote is configured only in this build's environment ({vars}), and the \n         \
-         background daemon does not inherit it — the daemon will run local-only.\n         \
+         background daemon does not inherit it — {daemon_remote}.\n         \
          A daemon outlives the build that starts it and cannot watch an environment for \n         \
          changes, so an inherited remote would silently depend on which build happened to \n         \
          start it (kunobi-ninja/kache#706).\n         \
@@ -8761,6 +8764,22 @@ fn warn_if_remote_is_env_only(config: &Config) -> bool {
     let marker = crate::wrapper::warn_marker_path("daemon-remote-env", &config.cache_dir);
     crate::wrapper::warn_once_per_session(&marker, crate::wrapper::WARN_SESSION_SECS, &message);
     true
+}
+
+/// What the daemon falls back to once it drops the build's remote variables:
+/// the host config's remote when the host file declares one, else none.
+fn daemon_remote_after_env_strip(host: &crate::config::HostConfigStatus) -> String {
+    match host {
+        crate::config::HostConfigStatus::Present { path, keys }
+            if keys.iter().any(|entry| entry.key == "cache.remote") =>
+        {
+            format!(
+                "the daemon will use the remote in the host config {} instead",
+                path.display()
+            )
+        }
+        _ => "the daemon will run local-only".to_string(),
+    }
 }
 
 /// Spawn `kache daemon run` detached, without leaking this process's
@@ -9104,6 +9123,39 @@ mod tests {
         }
     }
 
+    /// The env-only warning says what the daemon falls back to: the host
+    /// config's remote only when the host file declares one.
+    #[test]
+    fn env_only_warning_names_the_host_remote_only_when_the_host_declares_one() {
+        use crate::config::{HostConfigKey, HostConfigStatus, HostKeySource};
+        let path = std::path::PathBuf::from("/etc/kache/config.toml");
+        let key = |key: &str| HostConfigKey {
+            key: key.to_string(),
+            source: HostKeySource::Host,
+        };
+
+        let with_remote = HostConfigStatus::Present {
+            path: path.clone(),
+            keys: vec![key("cache.input_predictions"), key("cache.remote")],
+        };
+        assert_eq!(
+            daemon_remote_after_env_strip(&with_remote),
+            "the daemon will use the remote in the host config /etc/kache/config.toml instead"
+        );
+        let without_remote = HostConfigStatus::Present {
+            path: path.clone(),
+            keys: vec![key("cache.input_predictions")],
+        };
+        assert_eq!(
+            daemon_remote_after_env_strip(&without_remote),
+            "the daemon will run local-only"
+        );
+        assert_eq!(
+            daemon_remote_after_env_strip(&HostConfigStatus::Absent { path }),
+            "the daemon will run local-only"
+        );
+    }
+
     /// The warning is the entire discoverability half of #706: making the
     /// daemon deterministic turns "sometimes works" into "never works" for an
     /// env-only setup, which is only an improvement if the user is told. A
@@ -9149,6 +9201,23 @@ mod tests {
             "a file-configured remote must stay quiet"
         );
 
+        // The chosen file has no remote, but the host config does. The build
+        // uses the environment's remote over the host's, while the daemon,
+        // which drops these variables, would use the host's: still env-only.
+        std::fs::write(&config_path, "[cache]\n").unwrap();
+        let host_path = dir.path().join("host.toml");
+        std::fs::write(
+            &host_path,
+            "[cache.remote]\ntype = \"s3\"\nbucket = \"from-host\"\n",
+        )
+        .unwrap();
+        let restore_host = crate::config::set_host_config_for_test(&host_path);
+        assert!(
+            warn_if_remote_is_env_only(&config),
+            "an env remote over a host remote must warn"
+        );
+
+        drop(restore_host);
         drop(clear);
         drop(restore_config);
     }

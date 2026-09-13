@@ -114,6 +114,11 @@ pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
 /// `config` pins `KACHE_CONFIG`. `None` unsets it so the child discovers its
 /// configuration the way a real build would.
 ///
+/// The host config layer is turned off: the self-hosted CI Macs carry a real
+/// `/etc/kache/config.toml`, and a test must see only the config it writes.
+/// A test that wants a host file calls `.env("KACHE_HOST_CONFIG", path)` on
+/// the returned command.
+///
 /// Not every test binary spawns children, so the rest see it as dead.
 #[allow(dead_code)]
 pub fn hermetic_command(
@@ -129,7 +134,8 @@ pub fn hermetic_command(
         .env_remove("KACHE_EVENT_ROOT")
         .env_remove("KACHE_ACTIVE")
         .env_remove("RUSTC_WRAPPER")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env("KACHE_HOST_CONFIG", "");
     match config {
         Some(path) => command.env("KACHE_CONFIG", path),
         None => command.env_remove("KACHE_CONFIG"),

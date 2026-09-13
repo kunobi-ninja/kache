@@ -6366,10 +6366,14 @@ fn discover_cc_link_sidecars(output: &Path) -> Vec<Artifact> {
             .unwrap_or_default()
     ));
     if dsym.is_dir() {
+        let file_name = output
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         sidecars.push(Artifact {
             path: dsym,
             kind: ArtifactKind::DebugBundle,
-            store_name: "dsym.tar".to_string(),
+            store_name: format!("{file_name}.dsym.tar"),
             required: false,
         });
     }
@@ -8952,6 +8956,28 @@ mod tests {
                 .iter()
                 .map(|a| &a.path)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn discover_cc_link_sidecars_names_a_dsym_dir_as_dsym_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("prog");
+        fs::write(&bin, b"elf").unwrap();
+        let dsym = dir.path().join("prog.dSYM");
+        fs::create_dir_all(dsym.join("Contents/Resources/DWARF")).unwrap();
+        fs::write(dsym.join("Contents/Resources/DWARF/prog"), b"dwarf").unwrap();
+
+        let sidecars = discover_cc_link_sidecars(&bin);
+        let bundle = sidecars
+            .iter()
+            .find(|a| a.kind == ArtifactKind::DebugBundle)
+            .expect("a sibling .dSYM directory must be discovered");
+        assert_eq!(bundle.path, dsym);
+        assert_eq!(
+            bundle.store_name, "prog.dsym.tar",
+            "unpack_debug_bundle requires a .dsym.tar store name, got {}",
+            bundle.store_name
         );
     }
 

@@ -274,12 +274,10 @@ fn debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Command> {
 /// entries are file-only, sorted by path, with mtime/uid/gid pinned to 0 and
 /// fixed modes. Reproducible tar bytes mean two identical dSYMs dedupe to one
 /// content-addressed store blob (kunobi-ninja/kache#319).
-// Reachable only through `MacOsPlatform::package_debug_bundle`; on other
-// hosts nothing outside the tests constructs `MacOsPlatform`, so the
-// compile-everywhere/test-anywhere convention needs the helpers exempted
-// from dead-code there.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn build_deterministic_tar(bundle_dir: &Path, tar_path: &Path) -> Result<()> {
+///
+/// Used by macOS rustc ingest and by the C/C++ link store when a compiler
+/// already left a `.dSYM` directory next to the binary.
+pub(crate) fn build_deterministic_tar(bundle_dir: &Path, tar_path: &Path) -> Result<()> {
     let mut files = Vec::new();
     collect_files_recursively(bundle_dir, bundle_dir, &mut files)?;
     // Sort by the relative path's byte representation so the entry order
@@ -315,7 +313,6 @@ fn build_deterministic_tar(bundle_dir: &Path, tar_path: &Path) -> Result<()> {
 /// Collect every regular file under `dir`, as paths relative to `root`.
 /// Directories are implied by their files (the unpacker `create_dir_all`s
 /// parents), which keeps the archive minimal and the byte layout stable.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn collect_files_recursively(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))? {
         let entry = entry.with_context(|| format!("reading dir entry in {}", dir.display()))?;

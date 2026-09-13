@@ -1525,11 +1525,10 @@ fn prepare_cc_cached_artifact(
     kind: ArtifactKind,
     depinfo_anchor: &Path,
 ) -> Result<link::PreparedWritableTarget> {
-    let plan = plan_post_restore(kind);
-    anyhow::ensure!(
-        plan.iter().all(|action| action.is_content_transform()),
-        "cc restore: artifact requires a post-publish path mutation"
-    );
+    let transforms: Vec<_> = plan_post_restore(kind)
+        .into_iter()
+        .filter(|action| action.is_content_transform())
+        .collect();
 
     let blob = store.blob_path(&cached.hash);
     if !blob.exists() {
@@ -1541,7 +1540,7 @@ fn prepare_cc_cached_artifact(
         );
     }
 
-    if plan.is_empty() {
+    if transforms.is_empty() {
         return link::prepare_writable_target_from_file(&blob, target).with_context(|| {
             format!(
                 "cc restore: staging {} -> {}",
@@ -1553,11 +1552,26 @@ fn prepare_cc_cached_artifact(
 
     let mut content = std::fs::read(&blob)
         .with_context(|| format!("cc restore: reading blob {}", blob.display()))?;
-    for action in plan {
+    for action in transforms {
         content = action.transform(content, depinfo_anchor);
     }
     link::prepare_writable_target_from_bytes(target, &content)
         .with_context(|| format!("cc restore: staging transformed {}", target.display()))
+}
+
+fn apply_cc_post_publish_actions(published: &[(PathBuf, ArtifactKind)]) -> Result<()> {
+    let host = platform::current();
+    for (path, kind) in published {
+        for action in plan_post_restore(*kind) {
+            if action.is_content_transform() {
+                continue;
+            }
+            action.apply(path, &*host).with_context(|| {
+                format!("cc restore: applying {action:?} to {}", path.display())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn publish_prepared_cc_artifacts(prepared: Vec<link::PreparedWritableTarget>) -> Result<()> {
@@ -1629,6 +1643,7 @@ fn restore_cc_from_cache(
     let depinfo_anchor =
         cc_depinfo_rewrite_root(parsed).unwrap_or_else(|| Path::new(".").to_path_buf());
     let mut prepared = Vec::new();
+    let mut published_kinds = Vec::new();
     let mut targets = std::collections::HashSet::new();
 
     for cached in &meta.files {
@@ -1705,8 +1720,10 @@ fn restore_cc_from_cache(
             kind,
             &depinfo_anchor,
         )?);
+        published_kinds.push((target, kind));
     }
     publish_prepared_cc_artifacts(prepared)?;
+    apply_cc_post_publish_actions(&published_kinds)?;
     #[cfg(unix)]
     if parsed.mode == crate::compiler::cc::CompileMode::Link
         && let Some(output) = parsed.object_output_path()
@@ -2978,10 +2995,11 @@ fn prepare_cc_store_files(
     let mut files = Vec::with_capacity(artifacts.outputs().len());
     let mut temporary_files = Vec::with_capacity(artifacts.outputs().len());
     for artifact in artifacts.outputs() {
-        let mut staged = tempfile::Builder::new()
+        let staged = tempfile::Builder::new()
             .prefix("kache-cc-artifact-")
             .tempfile()
             .context("cc store: creating private artifact staging file")?;
+        let staged = staged.into_temp_path();
 
         if artifact.kind == ArtifactKind::DepInfo {
             let anchor = depinfo_anchor.context("cc store: missing dep-info rewrite anchor")?;
@@ -2994,21 +3012,33 @@ fn prepare_cc_store_files(
                 })?;
             let normalized =
                 link::rewrite_depinfo_content(&content, anchor, link::DepInfoMode::Relativize);
-            staged
-                .write_all(normalized.as_bytes())
+            std::fs::write(&staged, normalized.as_bytes())
                 .context("cc store: writing normalized dep-info staging file")?;
+        } else if artifact.kind == ArtifactKind::DebugBundle
+            && std::fs::metadata(&artifact.path).is_ok_and(|meta| meta.is_dir())
+        {
+            platform::build_deterministic_tar(&artifact.path, &staged).with_context(|| {
+                format!(
+                    "cc store: packaging debug bundle {}",
+                    artifact.path.display()
+                )
+            })?;
         } else {
             let mut source = std::fs::File::open(&artifact.path).with_context(|| {
                 format!("cc store: opening artifact {}", artifact.path.display())
             })?;
-            std::io::copy(&mut source, &mut staged).with_context(|| {
+            let mut dest = std::fs::File::create(&staged).with_context(|| {
+                format!(
+                    "cc store: creating staging file for {}",
+                    artifact.path.display()
+                )
+            })?;
+            std::io::copy(&mut source, &mut dest).with_context(|| {
                 format!("cc store: copying artifact {}", artifact.path.display())
             })?;
+            dest.flush()
+                .context("cc store: flushing private artifact staging file")?;
         }
-        staged
-            .flush()
-            .context("cc store: flushing private artifact staging file")?;
-        let staged = staged.into_temp_path();
         files.push((staged.to_path_buf(), artifact.store_name.clone()));
         temporary_files.push(staged);
     }
@@ -7149,6 +7179,102 @@ mod tests {
                 "restored link outputs must be owner-executable"
             );
         }
+    }
+
+    #[test]
+    fn restore_cc_from_cache_signs_an_exe_and_a_dylib() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let exe_hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let so_hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        create_blob(&store, exe_hash, b"MZ exe");
+        create_blob(&store, so_hash, b"\x7fELF so");
+
+        let exe = dir.path().join("out.exe");
+        let exe_str = exe.to_string_lossy().into_owned();
+        let parsed = CcCompiler::new()
+            .parse(&s(&["cc", "a.o", "-o", &exe_str]))
+            .unwrap();
+        restore_cc_from_cache(
+            &store,
+            &parsed,
+            &entry_meta("cc-exe-key", vec![cached_file("app.exe", exe_hash)], &[]),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"MZ exe");
+
+        let dylib = dir.path().join("libfoo.so");
+        let dylib_str = dylib.to_string_lossy().into_owned();
+        let parsed = CcCompiler::new()
+            .parse(&s(&["cc", "a.o", "-o", &dylib_str]))
+            .unwrap();
+        restore_cc_from_cache(
+            &store,
+            &parsed,
+            &entry_meta("cc-so-key", vec![cached_file("libfoo.so", so_hash)], &[]),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&dylib).unwrap(), b"\x7fELF so");
+    }
+
+    #[test]
+    fn prepare_cc_store_files_tars_a_dsym_directory_and_restore_unpacks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+
+        let dsym = dir.path().join("prog.dSYM");
+        std::fs::create_dir_all(dsym.join("Contents/Resources/DWARF")).unwrap();
+        std::fs::write(dsym.join("Contents/Resources/DWARF/prog"), b"dwarf-bytes").unwrap();
+
+        let artifacts = ArtifactSet::new(vec![crate::compiler::Artifact {
+            path: dsym,
+            kind: ArtifactKind::DebugBundle,
+            store_name: "prog.dsym.tar".to_string(),
+            required: false,
+        }]);
+        let prepared = prepare_cc_store_files(&artifacts, None).unwrap();
+        assert_eq!(prepared.files.len(), 1);
+        assert_eq!(prepared.files[0].1, "prog.dsym.tar");
+        let tar_bytes = std::fs::read(&prepared.files[0].0).unwrap();
+        assert!(
+            !tar_bytes.is_empty(),
+            "a .dSYM directory must be stored as a tar, not copied as a file"
+        );
+
+        let tar_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let bin_hash = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        create_blob(&store, tar_hash, &tar_bytes);
+        create_blob(&store, bin_hash, b"ELF");
+        let output = dir.path().join("build").join("prog");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        let output_str = output.to_string_lossy().into_owned();
+        let parsed = CcCompiler::new()
+            .parse(&s(&["cc", "a.o", "-o", &output_str]))
+            .unwrap();
+        restore_cc_from_cache(
+            &store,
+            &parsed,
+            &entry_meta(
+                "cc-dsym-key",
+                vec![
+                    cached_file("prog", bin_hash),
+                    cached_file("prog.dsym.tar", tar_hash),
+                ],
+                &[],
+            ),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"ELF");
+
+        let tar_path = dir.path().join("build").join("prog.dsym.tar");
+        assert!(tar_path.is_file(), "the bundle tar itself must be restored");
+        let dwarf = dir
+            .path()
+            .join("build")
+            .join("prog.dSYM/Contents/Resources/DWARF/prog");
+        assert_eq!(std::fs::read(&dwarf).unwrap(), b"dwarf-bytes");
     }
 
     #[test]

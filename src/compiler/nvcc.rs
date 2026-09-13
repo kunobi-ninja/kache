@@ -568,20 +568,20 @@ fn parse_nvcc_make_deps(text: &str) -> Result<Vec<PathBuf>> {
         }
     }
     // Split target from deps at the first colon that is not a Windows
-    // drive-letter colon (`C:\…` / `C:/…`).
-    let mut search_from = 0;
-    let separator = loop {
-        let Some(relative) = joined[search_from..].find(':') else {
-            anyhow::bail!("nvcc -M output has no target separator");
-        };
-        let index = search_from + relative;
-        let bytes = joined.as_bytes();
-        if index == 1 && bytes[0].is_ascii_alphabetic() {
-            search_from = index + 1;
-            continue;
-        }
-        break index;
-    };
+    // drive-letter colon (`C:\…` / `C:/…`). No manual index arithmetic:
+    // an off-by-sign mutation here would loop forever instead of
+    // failing loudly.
+    let separator = joined
+        .match_indices(':')
+        .map(|(index, _)| index)
+        .find(|&index| {
+            !(index == 1
+                && joined
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|b| b.is_ascii_alphabetic()))
+        })
+        .with_context(|| "nvcc -M output has no target separator")?;
     let deps = joined[separator + 1..]
         .split_whitespace()
         .map(|dep| PathBuf::from(dep.replace(ESCAPED_SPACE, " ")))
@@ -1699,6 +1699,78 @@ mod tests {
             parsed,
             vec![PathBuf::from("C:\\s\\k.cu"), PathBuf::from("C:\\s\\k.h")]
         );
+    }
+
+    #[test]
+    fn absolutize_joins_relative_and_passes_absolute() {
+        let cwd = Path::new("/work/tree");
+        assert_eq!(
+            nvcc_absolutize(Path::new("src/k.cu"), cwd),
+            PathBuf::from("/work/tree/src/k.cu")
+        );
+        assert_eq!(
+            nvcc_absolutize(Path::new("/elsewhere/k.cu"), cwd),
+            PathBuf::from("/elsewhere/k.cu")
+        );
+    }
+
+    #[test]
+    fn canonicalize_falls_back_to_self() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            nvcc_canonicalize_or_self(dir.path()),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+        let missing = dir.path().join("nope");
+        assert_eq!(nvcc_canonicalize_or_self(&missing), missing);
+    }
+
+    #[test]
+    fn normalize_disabled_by_knob() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let previous = std::env::var_os("KACHE_NVCC_PATH_NORMALIZE");
+        unsafe {
+            std::env::set_var("KACHE_NVCC_PATH_NORMALIZE", "0");
+        }
+        let maps = nvcc_prefix_maps(Path::new("k.cu"), None, &[]);
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("KACHE_NVCC_PATH_NORMALIZE", value);
+            },
+            None => unsafe {
+                std::env::remove_var("KACHE_NVCC_PATH_NORMALIZE");
+            },
+        }
+        assert!(maps.is_empty());
+    }
+
+    #[test]
+    fn epoch_passthrough_knob_disables_the_pin() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let previous_epoch = std::env::var_os("SOURCE_DATE_EPOCH");
+        let previous_knob = std::env::var_os("KACHE_NVCC_SOURCE_DATE_EPOCH");
+        unsafe {
+            std::env::remove_var("SOURCE_DATE_EPOCH");
+            std::env::set_var("KACHE_NVCC_SOURCE_DATE_EPOCH", "wallclock");
+        }
+        let epoch = nvcc_effective_source_date_epoch();
+        match previous_epoch {
+            Some(value) => unsafe {
+                std::env::set_var("SOURCE_DATE_EPOCH", value);
+            },
+            None => unsafe {
+                std::env::remove_var("SOURCE_DATE_EPOCH");
+            },
+        }
+        match previous_knob {
+            Some(value) => unsafe {
+                std::env::set_var("KACHE_NVCC_SOURCE_DATE_EPOCH", value);
+            },
+            None => unsafe {
+                std::env::remove_var("KACHE_NVCC_SOURCE_DATE_EPOCH");
+            },
+        }
+        assert_eq!(epoch, None);
     }
 
     #[test]

@@ -979,12 +979,12 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     };
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
 
-    if !result.stdout.is_empty() {
-        print!("{}", result.stdout);
-    }
-    if !result.stderr.is_empty() {
-        eprint!("{}", result.stderr);
-    }
+    replay_diagnostics(
+        &result.stdout,
+        &result.stderr,
+        std::io::stdout(),
+        std::io::stderr(),
+    );
 
     // Only store a clean compile that produced its object. Anything
     // else returns the exit code and lets the build see the failure.
@@ -1579,12 +1579,12 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
             // Replay the cached compiler diagnostics so warnings still
             // surface on a cache hit.
-            if !meta.stdout.is_empty() {
-                print!("{}", meta.stdout);
-            }
-            if !meta.stderr.is_empty() {
-                eprint!("{}", meta.stderr);
-            }
+            replay_diagnostics(
+                &meta.stdout,
+                &meta.stderr,
+                std::io::stdout(),
+                std::io::stderr(),
+            );
 
             compiler.commit_preprocess_memo(&file_hasher);
 
@@ -1721,12 +1721,12 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     miss_guard.record_compile_rss(&crate_name);
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
 
-    if !result.stdout.is_empty() {
-        print!("{}", result.stdout);
-    }
-    if !result.stderr.is_empty() {
-        eprint!("{}", result.stderr);
-    }
+    replay_diagnostics(
+        &result.stdout,
+        &result.stderr,
+        std::io::stdout(),
+        std::io::stderr(),
+    );
 
     // Only store on a clean compile that actually produced its
     // object file. A failed compile (exit != 0) or one whose output
@@ -8948,6 +8948,16 @@ exit 0
         crate::compiler::cc::CcArgs::parse(&s(args)).unwrap()
     }
 
+    /// `cc_event_root` honors the override exactly (pins whole-body
+    /// mutants on a helper the diff would otherwise leave uncovered).
+    #[test]
+    fn cc_event_root_honors_override() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let _guard = TestEnvGuard::set("KACHE_EVENT_ROOT", "/cc-root-sentinel");
+        let parsed = parse_cc(&["gcc", "-c", "foo.c", "-o", "foo.o"]);
+        assert_eq!(cc_event_root(&parsed), "/cc-root-sentinel");
+    }
+
     fn spool_intent_count(config: &Config) -> usize {
         let dir = config.upload_spool_dir();
         match std::fs::read_dir(&dir) {
@@ -10175,6 +10185,34 @@ exit 0
         assert!(
             format!("{err:#}").contains("evicted"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    /// The env-reading wrapper honors the same anchor rule against the
+    /// real working directory (kills whole-body mutants on the wrapper
+    /// that the `_from_cwd` tests cannot see).
+    #[test]
+    fn nvcc_depinfo_rewrite_root_uses_current_dir() {
+        let parsed = crate::compiler::nvcc::NvccCompiler::with_extra_allowlist_flags(Vec::new())
+            .parse(&[
+                "nvcc".to_string(),
+                "-c".to_string(),
+                "src/k.cu".to_string(),
+                "-o".to_string(),
+                "build/k.o".to_string(),
+                "-MF".to_string(),
+                "build/k.d".to_string(),
+            ])
+            .unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let anchor = nvcc_depinfo_rewrite_root(&parsed).unwrap();
+        assert!(
+            anchor.starts_with(&cwd),
+            "anchor {anchor:?} must live under the current dir {cwd:?}"
+        );
+        assert_eq!(
+            Some(anchor),
+            nvcc_depinfo_rewrite_root_from_cwd(&parsed, &cwd)
         );
     }
 

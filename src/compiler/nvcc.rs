@@ -680,9 +680,7 @@ pub(crate) fn nvcc_prefix_maps(
     };
     for (from, to) in crate::path_normalizer::configured_base_dir_prefix_maps(configured_base_dirs)
     {
-        if !from.is_empty() && !maps.iter().any(|m| m.from == from) {
-            maps.push(NvccPrefixMap { from, to });
-        }
+        nvcc_push_unique_map(&mut maps, from, to);
     }
     let mut roots = vec![cwd.clone()];
     if let Some(parent) = nvcc_absolutize(source, &cwd).parent() {
@@ -695,13 +693,11 @@ pub(crate) fn nvcc_prefix_maps(
     }
     for root in roots {
         for candidate in [root.clone(), nvcc_canonicalize_or_self(&root)] {
-            let from = candidate.to_string_lossy().to_string();
-            if !from.is_empty() && !maps.iter().any(|m| m.from == from) {
-                maps.push(NvccPrefixMap {
-                    from,
-                    to: NVCC_ROOT_SENTINEL.to_string(),
-                });
-            }
+            nvcc_push_unique_map(
+                &mut maps,
+                candidate.to_string_lossy().into_owned(),
+                NVCC_ROOT_SENTINEL.to_string(),
+            );
         }
     }
     maps.sort_by(|a, b| {
@@ -711,6 +707,12 @@ pub(crate) fn nvcc_prefix_maps(
             .then_with(|| a.from.cmp(&b.from))
     });
     maps
+}
+
+fn nvcc_push_unique_map(maps: &mut Vec<NvccPrefixMap>, from: String, to: String) {
+    if !from.is_empty() && !maps.iter().any(|m| m.from == from) {
+        maps.push(NvccPrefixMap { from, to });
+    }
 }
 
 /// Replace a machine-local prefix with its sentinel. The match must end
@@ -1713,6 +1715,70 @@ mod tests {
         let mut sorted = positions.clone();
         sorted.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(positions, sorted);
+    }
+
+    #[test]
+    fn prefix_map_push_skips_empty_and_duplicate_from() {
+        let mut maps = Vec::new();
+        nvcc_push_unique_map(&mut maps, String::new(), NVCC_ROOT_SENTINEL.to_string());
+        assert!(maps.is_empty(), "empty from must not become a prefix map");
+        nvcc_push_unique_map(
+            &mut maps,
+            "/a/proj".to_string(),
+            NVCC_ROOT_SENTINEL.to_string(),
+        );
+        nvcc_push_unique_map(
+            &mut maps,
+            "/a/proj".to_string(),
+            "/kache/base-dir-0".to_string(),
+        );
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].to, NVCC_ROOT_SENTINEL);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_drops_artifacts_when_object_embeds_mapped_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let nvcc = dir.path().join("nvcc");
+        let src = dir.path().join("k.cu");
+        let obj = dir.path().join("k.o");
+        std::fs::write(&src, "void k(void) {}\n").unwrap();
+        let payload = dir.path().join("payload");
+        std::fs::write(&payload, format!("ELF{}", dir.path().display())).unwrap();
+        std::fs::write(
+            &nvcc,
+            format!(
+                "#!/bin/sh\nout=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then out=$a; fi\n  prev=$a\ndone\ncp '{}' \"$out\"\n",
+                payload.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&nvcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let parsed = parse_ok(&[
+            nvcc.to_str().unwrap(),
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
+        let result = NvccCompiler::with_extra_allowlist_flags(Vec::new())
+            .execute(&parsed)
+            .unwrap();
+        assert_eq!(result.exit_code, 0, "stderr={}", result.stderr);
+        assert!(obj.is_file(), "the compile must still write the object");
+        assert!(
+            result.artifacts.is_empty(),
+            "an object that embeds a mapped root must not be cached, got {:?}",
+            result
+                .artifacts
+                .outputs()
+                .iter()
+                .map(|a| &a.path)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

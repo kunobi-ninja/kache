@@ -9939,6 +9939,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_depinfo_demand_evicts_and_recompiles() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let (work, nvcc, count, _) = setup_nvcc_case(&dir, None, None, 0, 0);
         let config = test_config(dir.path().join("cache"));
@@ -10048,6 +10049,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_try_remote_hit_skips_daemon_without_remote() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("inc")).unwrap();
@@ -10111,6 +10113,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_try_remote_hit_does_not_restore_on_remote_miss() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("inc")).unwrap();
@@ -10176,6 +10179,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_try_remote_hit_restores_on_found() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("inc")).unwrap();
@@ -10240,6 +10244,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_failed_compile_stores_nothing() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let (_work, _nvcc, count, argv) = setup_nvcc_case(&dir, None, None, 1, 0);
         let config = test_config(dir.path().join("cache"));
@@ -10258,6 +10263,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_key_failure_passes_through_uncached() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let (_work, _nvcc, count, argv) = setup_nvcc_case(&dir, None, None, 0, 1);
         let config = test_config(dir.path().join("cache"));
@@ -10281,6 +10287,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_header_and_flag_edits_bust_the_key() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("inc")).unwrap();
@@ -10379,6 +10386,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_admission_skipped_when_too_cheap() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("inc")).unwrap();
@@ -10422,6 +10430,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_legacy_blob_check_refuses_shared_inode() {
+        let _lock = crate::test_support::process_state_test_lock();
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let dir = tempfile::tempdir().unwrap();
@@ -10488,6 +10497,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_restore_fails_closed_on_missing_blob() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
         std::fs::create_dir_all(work.join("inc")).unwrap();
@@ -10529,6 +10539,7 @@ exit 0
     /// that the `_from_cwd` tests cannot see).
     #[test]
     fn nvcc_depinfo_rewrite_root_uses_current_dir() {
+        let _lock = crate::test_support::process_state_test_lock();
         let parsed = crate::compiler::nvcc::NvccCompiler::with_extra_allowlist_flags(Vec::new())
             .parse(&[
                 "nvcc".to_string(),
@@ -10557,6 +10568,7 @@ exit 0
     /// request needs no anchor at all.
     #[test]
     fn nvcc_depinfo_rewrite_root_anchors() {
+        let _lock = crate::test_support::process_state_test_lock();
         let parsed = crate::compiler::nvcc::NvccCompiler::with_extra_allowlist_flags(Vec::new())
             .parse(&[
                 "nvcc".to_string(),

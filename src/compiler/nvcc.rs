@@ -2061,6 +2061,7 @@ mod tests {
 
     #[test]
     fn prefix_maps_cover_cwd_and_source() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("src").join("k.cu");
         let maps = nvcc_prefix_maps(&source, None, &[]);
@@ -2282,6 +2283,7 @@ mod tests {
 
     #[test]
     fn base_dirs_ordering_is_canonical() {
+        let _lock = crate::test_support::process_state_test_lock();
         // `with_base_dirs` sorts and dedups so flag order on the command
         // line cannot perturb map derivation downstream (configured roots
         // take index-based sentinels).

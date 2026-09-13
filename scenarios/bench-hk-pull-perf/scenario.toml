@@ -1,0 +1,52 @@
+name = "bench-hk-pull-perf"
+tags = ["suite:bench", "project:hk", "backend:kache", "lang:rust", "lang:cc", "scenario:pull"]
+requires = ["cargo", "rustc", "cc"]
+
+build = """
+export KACHE_INPUT_PREDICTIONS=1
+export KACHE_VERIFY_INPUT_PREDICTIONS=0
+
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+export KACHE_BASE_DIR="$repo"
+
+cargo build --locked
+"""
+
+[env]
+HOST_CC = "{kache} cc"
+HOST_CXX = "{kache} c++"
+CC_KNOWN_WRAPPER_CUSTOM = "kache"
+
+[source]
+kind     = "clone"
+repo     = "https://github.com/jdx/hk.git"
+ref      = "27bb615768b85c9ac88e2abf8895219b44462871"
+ref_next = "fc29ead1456ba7c1f62826c284126410a4014b00"
+objdir   = "target"
+
+[[file]]
+path = "rust-toolchain.toml"
+content = """
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+"""
+
+[checks.assert.pull]
+max_errors          = 0
+max_passthrough_pct = 40.0
+min_hits            = 200
+min_restored_bytes  = 67108864 # 64 MiB
+
+[checks.measure.pull]
+known_passthrough = [
+  "unsupported|rustc build-script probe",
+  "unsupported|cc link mode",
+  "uncacheable|cc: the assembler may read a file the cache key cannot see",
+]
+min_hit_rate_pct = 90.0

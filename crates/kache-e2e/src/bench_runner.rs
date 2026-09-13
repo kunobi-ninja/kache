@@ -146,7 +146,7 @@ impl CacheBackend {
         }
     }
 
-    /// A backend other than kache: only cold and warm, no key tracing.
+    /// A backend other than kache: no Kache key tracing.
     fn is_external(self) -> bool {
         !matches!(self, CacheBackend::Kache)
     }
@@ -156,8 +156,8 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     if config.cache_backend.is_external() && config.trace_keys {
         bail!("--trace-keys is only supported with --cache-backend kache");
     }
-    if config.cache_backend.is_external() && config.warm_same_tree {
-        bail!("--warm-same-tree is only supported with --cache-backend kache");
+    if config.cache_backend == CacheBackend::Sccache && config.warm_same_tree {
+        bail!("--warm-same-tree is only supported with --cache-backend kache or mbx");
     }
     let cache_tool_arg = match config.cache_backend {
         CacheBackend::Kache => &config.kache,
@@ -278,14 +278,30 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     }
 
     if profile.is_pull() {
-        if config.cache_backend != CacheBackend::Kache {
-            bail!("pull scenarios (`ref_next`) are only supported with --cache-backend kache");
+        if config.cache_backend == CacheBackend::Sccache {
+            bail!(
+                "pull scenarios (`ref_next`) are only supported with --cache-backend kache or mbx"
+            );
         }
         if config.warm_same_tree {
             // A pull scenario already rebuilds clone-a a second time, at a
             // different ref. Adding the same-tree warm phase would silently
             // change what `pull` measures.
             bail!("--warm-same-tree is not supported for pull scenarios (`ref_next`)");
+        }
+        if config.cache_backend == CacheBackend::Mbx {
+            return run_mbx_pull_bench(
+                &profile,
+                &kache,
+                &cache_dir,
+                &clone_ref,
+                &clone_a,
+                &work_dir,
+                &run_archive_dir,
+                cache_tool_version.as_deref(),
+                config.force_setup,
+                &sh,
+            );
         }
         return run_pull_bench(
             &profile,
@@ -404,6 +420,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
                 &clone_b,
                 &work_dir,
                 config.retry,
+                config.warm_same_tree,
                 &sh,
                 disk_free_before,
                 &objdir,
@@ -1500,6 +1517,10 @@ fn build(
             cmd.env("PATH", prepend_to_path(&shim_dir)?)
                 .env_remove("RUSTC_WRAPPER")
                 .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                // Own the actual target directory. Otherwise mbx can recreate
+                // a symlink to a managed target that survived our wipe, and
+                // the same-tree phase measures a Cargo no-op.
+                .env("CARGO_TARGET_DIR", &objdir)
                 .env("MBX_CACHE_DIR", cache_dir)
                 .env("MBX_STATS_REPORT", mbx_report_path(work_dir, phase))
                 .env("MBX_SUMMARY", "full");
@@ -2952,6 +2973,8 @@ struct MbxBenchResult {
     cache_tool_version: Option<String>,
     cold: MbxPhaseMetrics,
     warm: MbxPhaseMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warm_same_tree: Option<MbxPhaseMetrics>,
     speedup: f64,
     cache_size_mb: f64,
     cache_dir_bytes: u64,
@@ -3114,6 +3137,7 @@ fn run_mbx_bench(
     clone_b: &Path,
     work_dir: &Path,
     retry: bool,
+    warm_same_tree: bool,
     sh: &Path,
     disk_free_before: Option<u64>,
     objdir: &str,
@@ -3130,6 +3154,29 @@ fn run_mbx_bench(
         retry_load_mbx_cold(&profile.name, cache_dir, work_dir)?
     } else {
         run_mbx_cold_phase(profile, mbx, cache_dir, clone_a, work_dir, sh)?
+    };
+
+    let same_tree_metrics = if warm_same_tree {
+        let measured = build(
+            profile,
+            clone_a,
+            Phase::WarmSameTree.name(),
+            cache_dir,
+            &work_dir.join("mbx-config-unused.toml"),
+            mbx,
+            work_dir,
+            CacheBackend::Mbx,
+            false,
+            sh,
+        )?;
+        let metrics = capture_mbx_report(work_dir, Phase::WarmSameTree.name(), measured.wall_ms)?;
+        anyhow::ensure!(
+            metrics.hits > 0,
+            "mbx same-tree warm phase restored nothing"
+        );
+        Some(metrics)
+    } else {
+        None
     };
 
     let warm_ms = build(
@@ -3173,6 +3220,7 @@ fn run_mbx_bench(
         cache_tool_version: cache_tool_version.map(ToString::to_string),
         cold: cold_metrics,
         warm: warm_metrics,
+        warm_same_tree: same_tree_metrics,
         speedup,
         cache_size_mb: bytes_to_mib(cache_dir_bytes),
         cache_dir_bytes,
@@ -3192,6 +3240,23 @@ fn run_mbx_bench(
         .to_vec(),
     };
 
+    let mut result = result;
+    if result.warm_same_tree.is_some() {
+        result.reports.extend([
+            "report-warm-same-tree.mbx.json".into(),
+            "build-warm-same-tree.log".into(),
+        ]);
+    }
+    let mut phases = vec![
+        otlp_mbx_phase("cold", &result.cold, result.cold_objdir_bytes),
+        otlp_mbx_phase("warm", &result.warm, result.warm_objdir_bytes),
+    ];
+    if let Some(same) = &result.warm_same_tree {
+        phases.insert(
+            1,
+            otlp_mbx_phase("warm-same-tree", same, result.cold_objdir_bytes),
+        );
+    }
     let out = work_dir.join(format!("{}.json", profile.name));
     std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
         .with_context(|| format!("writing {}", out.display()))?;
@@ -3212,15 +3277,97 @@ fn run_mbx_bench(
             key_stability_pct: None,
             disk_measured_bytes: result.disk_measured_bytes,
             disk_footprint_bytes: result.disk_footprint_bytes,
-            phases: vec![
-                otlp_mbx_phase("cold", &result.cold, result.cold_objdir_bytes),
-                otlp_mbx_phase("warm", &result.warm, result.warm_objdir_bytes),
-            ],
+            phases,
         },
     );
     archive_run_artifacts(work_dir, run_archive_dir)?;
     print_mbx_summary(&result, run_archive_dir);
     eprintln!("[bench] summary written to {}", out.display());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mbx_pull_bench(
+    profile: &BenchProfile,
+    mbx: &Path,
+    cache: &Path,
+    mirror: &Path,
+    checkout: &Path,
+    work: &Path,
+    archive: &Path,
+    version: Option<&str>,
+    force_setup: bool,
+    sh: &Path,
+) -> Result<()> {
+    anyhow::ensure!(!cfg!(windows), "mbx benchmark requires a POSIX Cargo shim");
+    let child = profile.ref_next.as_deref().context("missing ref_next")?;
+    source::clone_worktrees_pull(&profile.repo, &profile.git_ref, child, mirror, checkout)?;
+    run_setup(profile, checkout, mbx, force_setup, sh)?;
+    profile.apply_files(checkout, mbx)?;
+    prepare_clone(profile, checkout, "cold", mbx, work, sh)?;
+    let cold = run_mbx_cold_phase(profile, mbx, cache, checkout, work, sh)?;
+    let cold_objdir_bytes =
+        crate::disk_usage::measure(cache, &[checkout.join(&profile.objdir)]).objdir_bytes[0];
+    run(Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["checkout", "--detach", child]))?;
+    profile.apply_files(checkout, mbx)?;
+    prepare_clone(profile, checkout, "pull", mbx, work, sh)?;
+    let measured = build(
+        profile,
+        checkout,
+        "pull",
+        cache,
+        &work.join("mbx-config-unused.toml"),
+        mbx,
+        work,
+        CacheBackend::Mbx,
+        false,
+        sh,
+    )?;
+    let pull = capture_mbx_report(work, "pull", measured.wall_ms)?;
+    let disk = crate::disk_usage::measure(cache, &[checkout.join(&profile.objdir)]);
+    let result = serde_json::json!({"project": profile.name, "git_ref": profile.git_ref,
+        "ref_next": child, "cache_backend": "mbx", "cache_tool_version": version,
+        "host": crate::bench_host::HostInfo::collect(work), "cold": cold, "pull": pull,
+        "artifact_dir": archive, "verdict": {"ok": pull.hits > 0}});
+    std::fs::write(
+        work.join(format!("{}.json", profile.name)),
+        serde_json::to_vec_pretty(&result)?,
+    )?;
+    write_otlp_or_warn(
+        work,
+        crate::bench_otlp::OtlpRun {
+            project: profile.name.clone(),
+            git_ref: profile.git_ref.clone(),
+            cache_tool: "mbx",
+            cache_tool_version: crate::bench_otlp::OtlpRun::tool_version_or_unknown("mbx", version),
+            time_unix_nano: crate::bench_otlp::OtlpRun::now_unix_nano(),
+            verdict_ok: pull.hits > 0,
+            speedup: Some(phase_speedup(cold.wall_ms, pull.wall_ms)),
+            cache_size_bytes: disk.cache_bytes,
+            key_stability_pct: None,
+            disk_measured_bytes: None,
+            disk_footprint_bytes: disk.total_bytes,
+            phases: vec![
+                otlp_mbx_phase("cold", &cold, cold_objdir_bytes),
+                otlp_mbx_phase("pull", &pull, disk.objdir_bytes[0]),
+            ],
+        },
+    );
+    archive_run_artifacts(work, archive)?;
+    anyhow::ensure!(
+        pull.hits > 0,
+        "mbx pull restored nothing; see {}",
+        archive.display()
+    );
+    eprintln!(
+        "[bench] mbx pull: {}, {} hits; {}",
+        fmt_wall_clock(pull.wall_ms),
+        pull.hits,
+        archive.display()
+    );
     Ok(())
 }
 
@@ -3241,6 +3388,12 @@ fn print_mbx_summary(r: &MbxBenchResult, archive_dir: &Path) {
         "  warm build : {}   (cache populated by cold)",
         fmt(r.warm.wall_s)
     );
+    if let Some(same) = &r.warm_same_tree {
+        eprintln!(
+            "  same tree  : {} (target wiped)",
+            fmt_wall_clock(same.wall_ms)
+        );
+    }
     eprintln!("  speedup    : {:.2}x", r.speedup);
     eprintln!(
         "  warm cache : {} hits / {} misses / {} unconsulted / {} bypassed   {:.1}% hit rate",
@@ -5775,7 +5928,8 @@ mod tests {
     /// run a phase that backend has no code path for.
     #[test]
     fn warm_same_tree_is_rejected_only_on_the_sccache_backend() {
-        const REJECTION: &str = "--warm-same-tree is only supported with --cache-backend kache";
+        const REJECTION: &str =
+            "--warm-same-tree is only supported with --cache-backend kache or mbx";
         // Non-existent tool paths: the guard under test runs before the binary
         // is resolved, so every case below stops at resolution with a different
         // message and nothing touches a clone, a cache, or a compiler.
@@ -5805,6 +5959,11 @@ mod tests {
         // later, on the missing binary.
         let allowed = run_bench(config(CacheBackend::Kache, true))
             .expect_err("the fake kache binary cannot resolve")
+            .to_string();
+        assert!(!allowed.contains(REJECTION), "{allowed}");
+
+        let allowed = run_bench(config(CacheBackend::Mbx, true))
+            .expect_err("the fake mbx binary cannot resolve")
             .to_string();
         assert!(!allowed.contains(REJECTION), "{allowed}");
 
@@ -6582,6 +6741,39 @@ PREP_MARKER = "{{kache}}"
         .unwrap();
         assert_eq!(got, None);
         assert!(!dir.path().join("prepare-cold.log").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mbx_same_tree_build_owns_and_wipes_the_real_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().canonicalize().unwrap();
+        let mut profile = prepare_fixture(&work, None);
+        profile.build = r#"test -n "$CARGO_TARGET_DIR" || exit 9
+            test ! -e "$CARGO_TARGET_DIR/old" || exit 8
+            mkdir -p "$CARGO_TARGET_DIR"
+            touch "$CARGO_TARGET_DIR/old"
+            printf '%s' "$CARGO_TARGET_DIR" > used-target"#
+            .into();
+        for phase in ["cold", "warm-same-tree"] {
+            build(
+                &profile,
+                &work,
+                phase,
+                &work.join("cache"),
+                &work.join("config"),
+                Path::new("/unused/mbx"),
+                &work,
+                CacheBackend::Mbx,
+                false,
+                &posix_sh().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(work.join("used-target")).unwrap(),
+                work.join(&profile.objdir).display().to_string()
+            );
+        }
     }
 
     #[test]

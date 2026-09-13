@@ -442,7 +442,11 @@ jobs:
             --shard '${{ matrix.index }}/${{ matrix.total }}' \
             --sharding round-robin \
             --in-place \
-            --baseline run \
+            # One baseline for the whole matrix: shard 0 proves the
+            # unmutated tree (~4min build+test) and the rest assume it.
+            # A red tree still fails the aggregate gate through shard 0,
+            # so skipped baselines can never greenwash a broken tree.
+            --baseline "${{ matrix.index == 0 && 'run' || 'skip' }}" \
             --caught \
             --timeout 180 \
             --build-timeout 600 \

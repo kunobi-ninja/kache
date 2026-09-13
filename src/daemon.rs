@@ -5641,8 +5641,7 @@ impl Daemon {
                 );
                 // Under gc.lock like every driver, so the totals cannot race.
                 if let Ok(stats) = store.evict()
-                    && let Err(e) =
-                        crate::report::record_gc_run(&self.config.cache_dir, "daemon", &stats)
+                    && let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats)
                 {
                     tracing::warn!("recording upload-triggered GC run: {e:#}");
                 }
@@ -5847,7 +5846,7 @@ impl Daemon {
 
         // Persist GC stats for reports and machine telemetry. Still under
         // gc.lock, so the running totals cannot race another driver.
-        if let Err(e) = crate::report::record_gc_run(&self.config.cache_dir, "daemon", &stats) {
+        if let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats) {
             tracing::debug!(
                 "gc: could not record {}: {e:#}",
                 crate::report::GC_STATS_FILE

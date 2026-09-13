@@ -2977,7 +2977,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
-    // Still under gc.lock, so the totals update cannot race another driver.
+    // Still under gc.lock, so the record cannot race another driver.
     // The auto-GC worker used to discard this outcome entirely. A failed write
     // must not fail the sweep it describes.
     let source = if mode == GcMode::Background {
@@ -2985,7 +2985,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     } else {
         "manual"
     };
-    if let Err(e) = crate::report::record_gc_run(&config.cache_dir, source, &combined) {
+    if let Err(e) = crate::report::record_gc_run(config, source, &combined) {
         tracing::debug!(
             "gc: could not record {}: {e:#}",
             crate::report::GC_STATS_FILE
@@ -3081,7 +3081,7 @@ fn emit_gc_json(config: &Config, skipped: bool, stats: &crate::store::GcStats) -
 /// Record a GC run `kache gc` made itself. A failed write costs the record,
 /// never the GC.
 fn record_manual_gc_run(config: &Config, stats: &crate::store::GcStats) {
-    if let Err(e) = crate::report::record_gc_run(&config.cache_dir, "manual", stats) {
+    if let Err(e) = crate::report::record_gc_run(config, "manual", stats) {
         tracing::warn!("recording GC run: {e:#}");
     }
 }
@@ -7069,6 +7069,28 @@ mod tests {
         assert_eq!(stats.source, "manual");
     }
 
+    /// Every driver records through record_gc_run; the local one shows the
+    /// history is wired in and stays off until record_sessions asks for it.
+    #[test]
+    fn local_gc_appends_to_the_gc_history_only_when_record_sessions_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().to_path_buf(), None);
+
+        run_gc_local(&config, GcMode::Cli).unwrap();
+        assert!(!config.cache_dir.join("telemetry").exists());
+
+        config.record_sessions = true;
+        run_gc_local(&config, GcMode::Background).unwrap();
+        let log =
+            std::fs::read_to_string(crate::report::gc_runs_log_path(&config.cache_dir)).unwrap();
+        let records: Vec<crate::report::GcRunRecord> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1, "{log}");
+        assert_eq!(records[0].source, "auto");
+    }
+
     #[test]
     fn stale_schema_gc_records_its_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -7111,8 +7133,7 @@ mod tests {
         );
 
         drop(Store::open(&config).unwrap());
-        crate::report::record_gc_run(&config.cache_dir, "auto", &crate::store::GcStats::default())
-            .unwrap();
+        crate::report::record_gc_run(&config, "auto", &crate::store::GcStats::default()).unwrap();
         let snap = machine_snapshot(&config);
         assert!(snap.index_bytes.is_some_and(|bytes| bytes > 0));
         let tables: Vec<_> = snap

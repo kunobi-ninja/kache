@@ -323,8 +323,8 @@ pub struct Config {
     /// `=true` or `[cache] input_predictions`; env wins over the file.
     pub input_predictions: bool,
     /// Make every `kache report` append its session line to
-    /// `<cache dir>/telemetry/sessions.jsonl`, as `--record` does. Off by
-    /// default. Set via `KACHE_RECORD_SESSIONS=1`/`=true` or `[cache]
+    /// `<cache dir>/telemetry/sessions.jsonl`, as `--record` does, and every
+    /// GC run append one line to `telemetry/gc-runs.jsonl`. Off by default. Set via `KACHE_RECORD_SESSIONS=1`/`=true` or `[cache]
     /// record_sessions`; env wins over the file.
     pub record_sessions: bool,
     /// Experimental daemon-assisted local hits (kunobi-ninja/kache#565): when

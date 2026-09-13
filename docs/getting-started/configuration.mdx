@@ -64,6 +64,7 @@ input_predictions = true
 | Environment | TOML key | Default | Purpose |
 | --- | --- | --- | --- |
 | `KACHE_CACHE_DIR` | `cache.local_store` | OS cache directory | Persistent store |
+| `KACHE_TRUST_DOMAIN` | none | unset | Isolate the local store under `$KACHE_CACHE_DIR/<label>/`. One path component (`[A-Za-z0-9._-]`). Invalid labels are ignored. Do not set this on public or fork jobs. |
 | `KACHE_RUNTIME_DIR` | `cache.runtime_dir` | local store | Socket, locks, logs, state, and session markers |
 | none | `cache.volumes` | unset | Volume-local store shards, e.g. `[cache.volumes] "D:" = "D:/kache-store"`. Builds on a mapped volume share inodes there instead of copying across mounts. Unmapped volumes use the main store. |
 | `KACHE_SOCKET_PATH` | none | `<runtime_dir>/daemon.sock` | Absolute daemon endpoint override |

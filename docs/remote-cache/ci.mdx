@@ -79,6 +79,8 @@ This keeps exact remote reads and uploads.
 
 Concurrent jobs may share a persistent local store, but each job should have a distinct `KACHE_RUNTIME_DIR` for sockets, locks, event logs, and session state.
 
+On a trusted builder that keeps a disk across jobs, point `KACHE_CACHE_DIR` at that disk and set `KACHE_TRUST_DOMAIN` to one label for the trust domain (for example `github.kunobi-ninja.kache`). Kache stores under `$KACHE_CACHE_DIR/<label>/`. Keep `KACHE_RUNTIME_DIR` on the job's scratch disk so sockets die with the pod. Do not mount that disk or export `KACHE_TRUST_DOMAIN` on public or fork jobs. An unusable label leaves `KACHE_CACHE_DIR` unchanged.
+
 ## Progress and reports
 
 Kache is quiet in compiler-wrapper mode by default because Cargo can retain wrapper stderr as compiler diagnostics.

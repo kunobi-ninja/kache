@@ -85,7 +85,9 @@ pub struct Config {
     pub cache_dir: PathBuf,
     /// Job/process-lifetime state root. Defaults to [`Self::cache_dir`] for
     /// compatibility, but can be separated from a persistent node-local store
-    /// with `KACHE_RUNTIME_DIR` / `[cache] runtime_dir`.
+    /// with `KACHE_RUNTIME_DIR` / `[cache] runtime_dir`. When
+    /// `KACHE_TRUST_DOMAIN` isolates the store, a defaulted runtime dir
+    /// follows that isolated path; an explicit runtime dir does not.
     pub runtime_dir: PathBuf,
     /// Optional daemon IPC endpoint resolved once by [`Config::load`].
     /// `None` keeps the default `<runtime_dir>/daemon.sock` placement.
@@ -999,7 +1001,8 @@ fn normalize_base_dirs(raw: impl IntoIterator<Item = String>) -> Result<Vec<Stri
 /// setting. Deliberately excludes bootstrap/operational vars that have no file
 /// representation — `KACHE_CONFIG` and `KACHE_HOST_CONFIG` (locate the files
 /// themselves), `KACHE_DISABLED`
-/// (operational kill switch), `KACHE_SOCKET_PATH`,
+/// (operational kill switch), `KACHE_SOCKET_PATH`, `KACHE_TRUST_DOMAIN`
+/// (trusted node-local store isolation; fail-open),
 /// `KACHE_LOG`/`KACHE_LOG_FILE`/`KACHE_PROGRESS`, `KACHE_NAMESPACE`, `KACHE_BASE_DIR` — and S3 credentials
 /// (`KACHE_S3_ACCESS_KEY`/`KACHE_S3_SECRET_KEY`), which are secrets, not config.
 /// Used only to warn which overrides are being ignored; the gating itself is
@@ -1224,6 +1227,18 @@ impl Config {
                     .ok_or(())
             })
             .unwrap_or_else(|_| cache_dir.clone());
+        let runtime_follows_cache = runtime_dir == cache_dir;
+
+        // Trusted node-local L1 (#811): isolate the persistent store under a
+        // single path-safe label. Invalid or unusable labels fail open to the
+        // unscoped cache dir. Do not export this on public/fork jobs.
+        let trust_domain = std::env::var("KACHE_TRUST_DOMAIN").ok();
+        let cache_dir = isolate_cache_dir_for_trust_domain(cache_dir, trust_domain.as_deref());
+        let runtime_dir = if runtime_follows_cache {
+            cache_dir.clone()
+        } else {
+            runtime_dir
+        };
 
         // Operational rather than file-backed, so `ignore_env` deliberately
         // does not gate it. Snapshot once so ambient env cannot redirect a
@@ -3368,6 +3383,58 @@ pub(crate) fn parse_size_checked(value: &str, source: &str) -> Option<u64> {
     parsed
 }
 
+const TRUST_DOMAIN_MAX_LEN: usize = 64;
+
+/// A trust-domain label is one path component: `[A-Za-z0-9._-]`, not `.`/`..`,
+/// at most [`TRUST_DOMAIN_MAX_LEN`] bytes. Anything else is unusable so
+/// callers can fail open.
+pub(crate) fn sanitize_trust_domain(raw: &str) -> Option<&str> {
+    let label = raw.trim();
+    if label.is_empty() || label.len() > TRUST_DOMAIN_MAX_LEN {
+        return None;
+    }
+    if label == "." || label == ".." {
+        return None;
+    }
+    if label
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        Some(label)
+    } else {
+        None
+    }
+}
+
+/// Isolate `base` under `KACHE_TRUST_DOMAIN` when the label is usable and the
+/// directory can be created. Otherwise return `base` unchanged (fail open).
+fn isolate_cache_dir_for_trust_domain(base: PathBuf, domain: Option<&str>) -> PathBuf {
+    let Some(raw) = domain else {
+        return base;
+    };
+    let Some(label) = sanitize_trust_domain(raw) else {
+        if !raw.trim().is_empty() {
+            tracing::warn!(
+                domain = %raw,
+                "KACHE_TRUST_DOMAIN is not a single path-safe label; using the unscoped cache dir"
+            );
+        }
+        return base;
+    };
+    let isolated = base.join(label);
+    match std::fs::create_dir_all(&isolated) {
+        Ok(()) => isolated,
+        Err(error) => {
+            tracing::warn!(
+                path = %isolated.display(),
+                %error,
+                "node-local trust-domain store is unusable; using the unscoped cache dir"
+            );
+            base
+        }
+    }
+}
+
 impl From<&Config> for kache_store::config::Config {
     fn from(config: &Config) -> Self {
         Self {
@@ -3402,6 +3469,62 @@ pub(crate) mod tests {
             default_cache_executables(),
             cfg!(target_os = "linux") || cfg!(target_os = "macos"),
             "executables default on for Linux and macOS, off for Windows (see #319)"
+        );
+    }
+
+    #[test]
+    fn trust_domain_rejects_path_components_and_separators() {
+        assert_eq!(
+            sanitize_trust_domain("github.kunobi-ninja"),
+            Some("github.kunobi-ninja")
+        );
+        assert_eq!(sanitize_trust_domain("  ok_1  "), Some("ok_1"));
+        for bad in [
+            "",
+            " ",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "../x",
+            "x/..",
+            "has space",
+            "unicode-é",
+        ] {
+            assert_eq!(sanitize_trust_domain(bad), None, "{bad:?}");
+        }
+        let too_long = "a".repeat(TRUST_DOMAIN_MAX_LEN + 1);
+        assert_eq!(sanitize_trust_domain(&too_long), None);
+    }
+
+    #[test]
+    fn trust_domain_isolates_stores_and_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let trusted = isolate_cache_dir_for_trust_domain(base.clone(), Some("trusted"));
+        let public = isolate_cache_dir_for_trust_domain(base.clone(), Some("public"));
+        assert_ne!(trusted, public);
+        assert_eq!(trusted, base.join("trusted"));
+        assert_eq!(public, base.join("public"));
+        assert!(trusted.is_dir());
+        assert!(public.is_dir());
+        assert_eq!(
+            isolate_cache_dir_for_trust_domain(base.clone(), None),
+            base,
+            "unset domain must not rewrite the store"
+        );
+        assert_eq!(
+            isolate_cache_dir_for_trust_domain(base.clone(), Some("../escape")),
+            base,
+            "unsafe labels fail open"
+        );
+
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            isolate_cache_dir_for_trust_domain(file.clone(), Some("trusted")),
+            file,
+            "an unusable parent must fail open"
         );
     }
 
@@ -4705,6 +4828,7 @@ remote_key_cache_refresh_secs = 900
             "KACHE_HOST_CONFIG",
             "KACHE_DISABLED",
             "KACHE_SOCKET_PATH",
+            "KACHE_TRUST_DOMAIN",
         ];
         let source = include_str!("config.rs");
         let source = &source[..source

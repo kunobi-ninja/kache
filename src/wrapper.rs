@@ -9584,6 +9584,12 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_miss_then_hit_round_trips_object_and_depinfo() {
+        // Pinned epoch: Nix builders (and reproducibility-minded
+        // developers) export SOURCE_DATE_EPOCH, which the wrapper
+        // honors verbatim — fix both epoch inputs for determinism.
+        let _lock = crate::test_support::process_state_test_lock();
+        let _epoch_env = TestEnvGuard::remove("SOURCE_DATE_EPOCH");
+        let _epoch_knob = TestEnvGuard::remove("KACHE_NVCC_SOURCE_DATE_EPOCH");
         let dir = tempfile::tempdir().unwrap();
         let (work, _nvcc, count, argv) = setup_nvcc_case(&dir, Some("argv"), Some("epoch"), 0, 0);
         let argv_file = dir.path().join("argv");
@@ -9696,10 +9702,20 @@ exit 0
         let mut config = test_config(dir.path().join("cache"));
         config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
 
+        // A reachable fake daemon answers the upload send instantly, so
+        // no real daemon is auto-started (that path costs ~15s and would
+        // leak a daemon onto the machine).
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+        wait_until_reachable(&config.socket_path());
+
         let argv = nvcc_compile_argv(&nvcc, &work, &[]);
         assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
         assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
         assert_eq!(spool_intent_count(&config), 1);
+        assert!(
+            daemon.request_count() >= 1,
+            "the upload send must reach the daemon"
+        );
     }
 
     /// Remote-hit plumbing without a real download: seed the entry
@@ -9821,13 +9837,16 @@ exit 0
 
         let mut config = test_config(dir.path().join("cache"));
         config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        // Up before the seed: the seeding miss uploads, and the send
+        // must reach a daemon instantly instead of auto-starting a real
+        // one (~15s, plus a stray daemon on the machine).
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+        wait_until_reachable(&config.socket_path());
         let argv = nvcc_compile_argv(&nvcc, &work, &[]);
         let (store, parsed, key) = seed_nvcc_entry(&config, &argv);
         std::fs::remove_file(work.join("kernel.o")).unwrap();
         std::fs::remove_file(work.join("kernel.d")).unwrap();
 
-        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
-        wait_until_reachable(&config.socket_path());
         let start = std::time::Instant::now();
 
         assert!(
@@ -9883,13 +9902,15 @@ exit 0
 
         let mut config = test_config(dir.path().join("cache"));
         config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        // Up before the seed (see the miss test): the empty store keeps
+        // the seeding compile a miss even with found=true.
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+        wait_until_reachable(&config.socket_path());
         let argv = nvcc_compile_argv(&nvcc, &work, &[]);
         let (store, parsed, key) = seed_nvcc_entry(&config, &argv);
         std::fs::remove_file(work.join("kernel.o")).unwrap();
         std::fs::remove_file(work.join("kernel.d")).unwrap();
 
-        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
-        wait_until_reachable(&config.socket_path());
         let start = std::time::Instant::now();
 
         assert_eq!(

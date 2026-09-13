@@ -2432,15 +2432,15 @@ pub static CC_FLAGS: &[FlagSpec] = &[
     FlagSpec {
         matcher: Matcher::Regex(concat!(
             r"-f(?:no-)?(?:",
-            "associative-math|asynchronous-unwind-tables|data-sections|fast-math|",
-            "finite-math-only|function-sections|math-errno|merge-all-constants|",
-            "omit-frame-pointer|reciprocal-math|rounding-math|semantic-interposition|",
-            "signaling-nans|signed-zeros|strict-aliasing|trapping-math|",
-            "unsafe-math-optimizations|unroll-loops|unwind-tables|wrapv",
+            "associative-math|asynchronous-unwind-tables|cxx-exceptions|data-sections|",
+            "fast-math|finite-math-only|freestanding|function-sections|math-errno|",
+            "merge-all-constants|omit-frame-pointer|reciprocal-math|rounding-math|",
+            "semantic-interposition|signaling-nans|signed-zeros|strict-aliasing|",
+            "trapping-math|unsafe-math-optimizations|unroll-loops|unwind-tables|wrapv",
             ")",
         )),
         class: FlagClass::CapturedByProbe,
-        source: "#114/#245/#418/#422/#426/#580/#856 + 0.20 nightly — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class). unroll-loops / asynchronous-unwind-tables from lance/Firefox passthroughs.",
+        source: "#114/#245/#418/#422/#426/#580/#856 + 0.20 nightly — codegen knobs, both polarities, resolved into -cc1 tokens. One sorted stem per knob covers -f<stem> AND -fno-<stem> (prevents the missed-polarity passthrough class). unroll-loops / asynchronous-unwind-tables from lance/Firefox passthroughs. cxx-exceptions / freestanding from Firefox Windows nightly.",
         dialect: None,
     },
     FlagSpec {
@@ -3389,6 +3389,60 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         matcher: Matcher::Exact("-Oy-"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #285 — clang-cl frame-pointer omission disabled. Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-Zl"),
+        class: FlagClass::CapturedByProbe,
+        source: "clang-cl omit default library name from the object (.drectve). Firefox Windows nightly. Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/Zl"),
+        class: FlagClass::CapturedByProbe,
+        source: "clang-cl omit default library name from the object (.drectve). Keyed via -### resolved tokens.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-fp:"),
+        class: FlagClass::CapturedByProbe,
+        source: "clang-cl floating-point model (-fp:fast/precise/strict). Firefox Windows nightly. Prefix safe: -### reflects the model into cc1.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/fp:"),
+        class: FlagClass::CapturedByProbe,
+        source: "clang-cl floating-point model (/fp:fast/precise/strict). Prefix safe: -### reflects the model into cc1.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("/clang:"),
+        class: FlagClass::CapturedByProbe,
+        source: "clang-cl /clang:<flag> forwards a clang driver flag. Firefox Windows uses /clang:-fno-finite-math-only. Prefix safe: -### captures the forwarded token.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-clang:"),
+        class: FlagClass::CapturedByProbe,
+        source: "clang-cl -clang:<flag> dash spelling of /clang:. Prefix safe: -### captures the forwarded token.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("/WX"),
+        class: FlagClass::RawKeyed,
+        source: "clang-cl warnings-as-errors (/WX). Outcome gate, same contract as -Werror.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-WX"),
+        class: FlagClass::RawKeyed,
+        source: "clang-cl warnings-as-errors (-WX). Outcome gate, same contract as -Werror.",
+        dialect: Some(Dialect::Cl),
+    },
+    FlagSpec {
+        matcher: Matcher::Regex(r"/W(all|[0-4])"),
+        class: FlagClass::NoObjectEffect,
+        source: "clang-cl warning level (/W0-/W4, /Wall). Diagnostics only. Dash -Wall is already covered by the dialect-agnostic -W* row.",
         dialect: Some(Dialect::Cl),
     },
     FlagSpec {
@@ -6501,6 +6555,9 @@ mod tests {
             "-Oy",
             "/Oy",
             "-Oy-",
+            "-Zl",
+            "/fp:fast",
+            "/clang:-fno-finite-math-only",
             "-fms-compatibility-version=19.50",
             "-MD",
             "-MT",
@@ -6514,7 +6571,7 @@ mod tests {
             );
         }
         // output + ignored → NoObjectEffect (accepted, not keyed)
-        for f in ["-Fofoo.obj", "/Fofoo.obj", "-Zc:inline"] {
+        for f in ["-Fofoo.obj", "/Fofoo.obj", "-Zc:inline", "/Wall", "/W4"] {
             assert_eq!(
                 classify_cc_flag(f, cl),
                 Some(FlagClass::NoObjectEffect),
@@ -8114,6 +8171,8 @@ mod tests {
             "strict-aliasing",
             "function-sections",
             "data-sections",
+            "cxx-exceptions",
+            "freestanding",
             "unwind-tables",
             "asynchronous-unwind-tables",
             "unroll-loops",
@@ -8152,6 +8211,54 @@ mod tests {
         assert!(
             !disable.iter().any(|d| d.contains("unsupported flag")),
             "-Oy- must stay classified, got: {disable:?}"
+        );
+    }
+
+    #[test]
+    fn firefox_windows_remaining_nightly_flags_classify() {
+        // Last firefox-windows scrape after -Oy: -Zl, -fcxx-exceptions,
+        // -ffreestanding, /fp:fast, /clang:-fno-finite-math-only, and the
+        // dash -Wall group (already NoObjectEffect; pin it on clang-cl).
+        for flag in [
+            "-Zl",
+            "/Zl",
+            "-fcxx-exceptions",
+            "-fno-cxx-exceptions",
+            "-ffreestanding",
+            "-fno-freestanding",
+            "/fp:fast",
+            "-fp:fast",
+            "/clang:-fno-finite-math-only",
+            "-Wall",
+            "-Wno-parentheses",
+            "-Wno-unused-function",
+            "/Wall",
+            "/W4",
+        ] {
+            let descs = refuse_descriptions(&["clang-cl", "-c", "foo.c", "-Fofoo.obj", flag]);
+            assert!(
+                !descs.iter().any(|d| d.contains("unsupported flag")),
+                "Firefox Windows {flag} must classify, got: {descs:?}"
+            );
+        }
+        let combo = refuse_descriptions(&[
+            "clang-cl",
+            "-c",
+            "foo.c",
+            "-Fofoo.obj",
+            "-Oy",
+            "-Wall",
+            "-Wno-parentheses",
+            "-Wno-unused-function",
+        ]);
+        assert!(
+            combo.is_empty(),
+            "the 64-TU -Oy + -Wall group must cache, got: {combo:?}"
+        );
+        let stdout = refuse_descriptions(&["clang-cl", "-E", "foo.c"]);
+        assert!(
+            stdout.iter().any(|d| d.contains("to stdout")),
+            "-E to stdout is not a flag row: {stdout:?}"
         );
     }
 

@@ -804,6 +804,11 @@ jobs:
         # Checkout never legitimately runs this long, so fail fast rather than
         # waiting out the whole job timeout.
         timeout-minutes: 10
+      - name: Install cross gcc (riscv64 + armv7)
+        if: env.RUN_E2E == 'true' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu gcc-arm-linux-gnueabihf
       - name: Put hosted Windows tools on PATH
         if: env.RUN_E2E == 'true' && (runner.os == 'Windows')
         run: |

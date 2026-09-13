@@ -1,0 +1,49 @@
+# Opt-in C/C++ link cache (#259). Two objects plus a link; with
+# KACHE_CACHE_CC_LINKS the link is stored and the warm rebuild hits it.
+
+name = "e2e-cc-link"
+tags = ["suite:e2e", "lang:cc"]
+os = ["linux", "macos"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE cc"
+KACHE_CACHE_CC_LINKS = "1"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/prog"
+expected_stdout_contains = ["sum=3"]
+
+[diff]
+artifacts = ["build/a.o", "build/b.o", "build/prog"]
+
+[modify]
+file = "src/a.c"
+find = "return 1;"
+replace = "return 2;"
+
+[assertions.cold]
+min_entries_after = 3
+max_compiler_runs = 3
+
+[assertions.warm]
+min_hits = 3
+max_compiler_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+[assertions.relocate]
+min_hits = 3
+max_compiler_runs = 0
+
+[assertions.relocate-modified]
+min_misses = 2
+max_compiler_runs = 2

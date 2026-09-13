@@ -22,7 +22,8 @@
 //!   deliberately local.
 //!
 //! What passes through (refused, see [`CcArgs::refuse_reasons`]):
-//! - Link mode (whole-program caching is a separate, harder problem)
+//! - Link mode unless `[cache] cache_cc_links` / `KACHE_CACHE_CC_LINKS` is on
+//!   (epic #762 / #259)
 //! - Preprocess (`-E`) / assemble (`-S`) modes
 //! - Multi-source compiles, multi-arch fat binaries
 //! - Response files, coverage instrumentation, split DWARF,
@@ -2866,6 +2867,53 @@ pub static CC_FLAGS: &[FlagSpec] = &[
         dialect: None,
     },
     FlagSpec {
+        // x87 vs SSE math. Closed set; no `native`/`auto`.
+        matcher: Matcher::Regex(r"-mfpmath=(?:sse|387|both)"),
+        class: FlagClass::RawKeyed,
+        source: "Issue #826 — x87/SSE fp math; enumerated so unknown values still refuse.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Regex(r"-mtls-dialect=(?:gnu2?|trad|desc)"),
+        class: FlagClass::RawKeyed,
+        source: "Issue #826 — TLS dialect; closed value set, keyed verbatim.",
+        dialect: None,
+    },
+    FlagSpec {
+        // aarch64 pointer-auth / BTI / GCS. Combinations gcc documents;
+        // `native`/`auto` are not in this set and keep refusing.
+        matcher: Matcher::Regex(
+            r"-mbranch-protection=(?:none|standard|pac-ret(?:\+leaf)?(?:\+b-key)?(?:\+bti)?|bti|gcs)",
+        ),
+        class: FlagClass::RawKeyed,
+        source: "Issue #826 — aarch64 branch protection; enumerated closed set.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Exact("-mgeneral-regs-only"),
+        class: FlagClass::RawKeyed,
+        source: "Issue #826 — restrict to general registers; valueless, keyed verbatim.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Regex(r"-mstack-protector-guard=(?:tls|global|sysreg)"),
+        class: FlagClass::RawKeyed,
+        source: "Issue #826 — stack-protector guard location; enumerated so host-relative values refuse.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-mstack-protector-guard-offset="),
+        class: FlagClass::RawKeyed,
+        source: "Issue #826 — stack-protector guard offset; numeric, keyed verbatim.",
+        dialect: None,
+    },
+    FlagSpec {
+        matcher: Matcher::Prefix("-mstack-protector-guard-reg="),
+        class: FlagClass::RawKeyed,
+        source: "Issue #826 — stack-protector guard register name; keyed verbatim.",
+        dialect: None,
+    },
+    FlagSpec {
         matcher: Matcher::Exact("-msimd128"),
         class: FlagClass::CapturedByProbe,
         source: "Issue #115 — WASM SIMD128 enable.",
@@ -5034,7 +5082,12 @@ fn cc_first_include_dir_providing(dirs: &[PathBuf], name: &Path) -> Result<Optio
         let candidate = dir.join(name);
         match std::fs::symlink_metadata(&candidate) {
             Ok(_) => return Ok(Some(index)),
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            // ENOENT, and ENOTDIR when an intermediate component is a file
+            // (Firefox `system_wrappers/private` is a file, not a directory).
+            // The compiler skips that include dir and continues the search.
+            Err(error)
+                if error.kind() == ErrorKind::NotFound
+                    || error.kind() == ErrorKind::NotADirectory => {}
             Err(error) => anyhow::bail!(
                 "cc include candidate {} is unreadable ({error})",
                 candidate.display()
@@ -5230,6 +5283,8 @@ pub struct CcCompiler {
     /// refusing and is folded verbatim into the cache key. Empty in the
     /// common case (and for every existing `CcCompiler::new()` caller).
     extra_allowlist_flags: Vec<String>,
+    /// Opt-in whole-program link caching (epic #762 / #259).
+    cache_cc_links: bool,
     /// Deterministically ordered `[paths].base_dirs` roots applied to both the
     /// cc key probes and the real compiler invocation.
     base_dirs: Vec<String>,
@@ -5318,11 +5373,79 @@ impl CcCompiler {
     pub fn with_extra_allowlist_flags(extra_allowlist_flags: Vec<String>) -> Self {
         Self {
             extra_allowlist_flags,
+            cache_cc_links: false,
             base_dirs: Vec::new(),
             pending_preprocess_memo: RefCell::new(None),
             pending_include_dir_digest: RefCell::new(None),
             key_path_bound: Cell::new(false),
         }
+    }
+
+    pub fn with_cache_cc_links(mut self, cache_cc_links: bool) -> Self {
+        self.cache_cc_links = cache_cc_links;
+        self
+    }
+
+    fn cache_key_for_link(&self, parsed: &CcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"cc_link_key_version:1\n");
+        let program_name = Path::new(&parsed.program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(parsed.program.as_str());
+        hasher.update(b"compiler:");
+        hasher.update(program_name.as_bytes());
+        hasher.update(b"\n");
+        let config_args = parsed.config_args();
+        let resolved = crate::probe::probe(
+            ctx.cache_dir,
+            &crate::probe::CcProber,
+            &crate::probe::ProbeRequest {
+                compiler: &parsed.program,
+                args: &parsed.rest,
+                key_args: &config_args,
+                per_tu_paths: &[],
+                windows_aware: parsed.family.dialect() != Dialect::Cl,
+            },
+        )?;
+        hasher.update(b"compiler_version:");
+        hasher.update(resolved.version_line.as_bytes());
+        hasher.update(b"\n");
+
+        let expanded = expand_cc_response_files(&parsed.rest)?;
+        hasher.update(b"argv:");
+        for arg in &expanded {
+            hasher.update(ctx.path_normalizer.normalize(arg).as_bytes());
+            hasher.update(b"\x1f");
+        }
+        hasher.update(b"\n");
+
+        let mut inputs = parsed.sources.clone();
+        inputs.extend(cc_link_file_inputs(&expanded));
+        inputs.sort();
+        inputs.dedup();
+        hasher.update(b"inputs:\n");
+        for input in &inputs {
+            let digest = ctx
+                .file_hasher
+                .hash(input)
+                .with_context(|| format!("hashing link input {}", input.display()))?;
+            hasher.update(digest.as_bytes());
+            hasher.update(b" ");
+            hasher.update(
+                ctx.path_normalizer
+                    .normalize(input.to_string_lossy())
+                    .as_bytes(),
+            );
+            hasher.update(b"\n");
+        }
+        let key = hasher.finalize().to_hex().to_string();
+        let key = crate::cache_key::apply_key_env_vars(key, ctx.key_env_vars, "cc-link");
+        Ok(crate::cache_key::apply_key_salt(
+            key,
+            ctx.key_salt,
+            "cc-link",
+        ))
     }
 
     pub fn with_base_dirs(mut self, base_dirs: Vec<String>) -> Self {
@@ -5607,10 +5730,27 @@ impl Compiler for CcCompiler {
         // catch-all is gone — single-source `-c` compiles with no
         // unsafe flags now produce an EMPTY refuse list, which is the
         // signal to the wrapper that this invocation is cacheable.
-        parsed.refuse_reasons(&self.extra_allowlist_flags)
+        let mut reasons = parsed.refuse_reasons(&self.extra_allowlist_flags);
+        if self.cache_cc_links && parsed.mode == CompileMode::Link {
+            reasons.retain(|reason| match reason {
+                RefuseReason::Unsupported(detail) => {
+                    !detail.contains("cc link mode") && !detail.contains("response file")
+                }
+                _ => true,
+            });
+            if parsed.output.is_none() {
+                reasons.push(RefuseReason::Unsupported(
+                    "cc link mode without -o — not cacheable",
+                ));
+            }
+        }
+        reasons
     }
 
     fn cache_key(&self, parsed: &CcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
+        if parsed.mode == CompileMode::Link {
+            return self.cache_key_for_link(parsed, ctx);
+        }
         // Preconditions (guaranteed by the wrapper checking
         // refuse_reasons first): `-c` mode, exactly one source.
         self.pending_preprocess_memo.borrow_mut().take();
@@ -6099,6 +6239,7 @@ impl Compiler for CcCompiler {
         // takes its real destination from the current invocation
         // (kunobi-ninja/kache#655).
         let discovers_outputs = matches!(parsed.mode, CompileMode::Compile)
+            || (parsed.mode == CompileMode::Link && self.cache_cc_links)
             || (parsed.mode == CompileMode::Preprocess && parsed.output.is_some());
         let artifacts = if exit_code == 0 && discovers_outputs {
             discover_cc_output_artifacts(parsed)
@@ -6141,6 +6282,93 @@ impl Compiler for CcCompiler {
     }
 }
 
+fn expand_cc_response_files(args: &[String]) -> Result<Vec<String>> {
+    let mut expanded = Vec::new();
+    for arg in args {
+        let Some(path) = arg.strip_prefix('@') else {
+            expanded.push(arg.clone());
+            continue;
+        };
+        let body =
+            fs::read_to_string(path).with_context(|| format!("reading cc response file {path}"))?;
+        expanded.extend(body.split_whitespace().map(str::to_string));
+    }
+    Ok(expanded)
+}
+
+fn cc_link_file_inputs(args: &[String]) -> Vec<PathBuf> {
+    let mut inputs = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "-o" || arg == "-I" || arg == "-L" || arg == "-include" {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        let path = PathBuf::from(arg);
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        if matches!(
+            ext,
+            "o" | "obj" | "a" | "lib" | "so" | "dylib" | "dll" | "res" | "lo"
+        ) {
+            inputs.push(path);
+        }
+    }
+    inputs
+}
+
+fn discover_cc_link_sidecars(output: &Path) -> Vec<Artifact> {
+    let Some(stem) = output.file_stem().map(|name| name.to_os_string()) else {
+        return Vec::new();
+    };
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let mut sidecars = Vec::new();
+    for (suffix, kind) in [
+        (".map", ArtifactKind::Other("map")),
+        (".pdb", ArtifactKind::DebugSidecar),
+        (".lib", ArtifactKind::Library),
+        (".exp", ArtifactKind::Other("exp")),
+    ] {
+        let mut name = stem.clone();
+        name.push(suffix);
+        let path = parent.join(name);
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file()) {
+            let store_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            sidecars.push(Artifact {
+                path,
+                kind,
+                store_name,
+                required: false,
+            });
+        }
+    }
+    let dsym = parent.join(format!(
+        "{}.dSYM",
+        output
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+    ));
+    if dsym.is_dir() {
+        sidecars.push(Artifact {
+            path: dsym,
+            kind: ArtifactKind::DebugBundle,
+            store_name: "dsym.tar".to_string(),
+            required: false,
+        });
+    }
+    sidecars
+}
+
 /// Discover a successful C/C++ compile's cacheable outputs while preserving
 /// the parsed role of `-MF` instead of trying to recover it from a filename.
 fn discover_cc_output_artifacts(parsed: &CcArgs) -> ArtifactSet {
@@ -6164,11 +6392,14 @@ fn discover_cc_output_artifacts(parsed: &CcArgs) -> ArtifactSet {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut outputs = vec![Artifact {
-        path: object,
+        path: object.clone(),
         kind: classify_by_filename(&object_name),
         store_name: object_name,
         required: true,
     }];
+    if parsed.mode == CompileMode::Link {
+        outputs.extend(discover_cc_link_sidecars(&object));
+    }
 
     if let Some(depinfo) = parsed
         .depinfo_output_path()
@@ -8524,6 +8755,164 @@ mod tests {
         assert_ne!(raw("-mthumb"), raw("-mno-thumb"));
     }
 
+    /// Issue #826: remaining closed-set `-m` flags, keyed verbatim. Host-relative
+    /// values (`native`, `auto`) stay refused, matching `-mfpu=auto`.
+    #[test]
+    fn closed_set_m_flags_are_raw_keyed_issue_826() {
+        for flag in &[
+            "-mfpmath=sse",
+            "-mfpmath=387",
+            "-mfpmath=both",
+            "-mtls-dialect=gnu",
+            "-mtls-dialect=gnu2",
+            "-mtls-dialect=trad",
+            "-mbranch-protection=none",
+            "-mbranch-protection=standard",
+            "-mbranch-protection=pac-ret",
+            "-mbranch-protection=pac-ret+bti",
+            "-mbranch-protection=bti",
+            "-mgeneral-regs-only",
+            "-mstack-protector-guard=tls",
+            "-mstack-protector-guard=global",
+            "-mstack-protector-guard=sysreg",
+            "-mstack-protector-guard-offset=0",
+            "-mstack-protector-guard-reg=sp_el0",
+        ] {
+            assert_eq!(
+                classify_cc_flag(flag, Dialect::Gnu),
+                Some(FlagClass::RawKeyed),
+                "{flag} is a closed-set -m flag and must fold verbatim"
+            );
+            let parsed = CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", flag])).unwrap();
+            assert!(
+                parsed.refuse_reasons(&[]).is_empty(),
+                "{flag} should be cacheable: {:?}",
+                parsed.refuse_reasons(&[])
+            );
+        }
+        let raw = |flag: &str| {
+            cc_raw_flags_for_key(
+                &CcArgs::parse(&s(&["cc", "-c", "foo.c", "-o", "foo.o", flag])).unwrap(),
+                &[],
+            )
+        };
+        assert_ne!(raw("-mfpmath=sse"), raw("-mfpmath=387"));
+        assert_ne!(raw("-mtls-dialect=gnu"), raw("-mtls-dialect=gnu2"));
+        assert_ne!(
+            raw("-mbranch-protection=none"),
+            raw("-mbranch-protection=standard")
+        );
+        assert_ne!(
+            raw("-mstack-protector-guard=tls"),
+            raw("-mstack-protector-guard=global")
+        );
+        for flag in &[
+            "-mfpmath=native",
+            "-mfpmath=auto",
+            "-mtls-dialect=native",
+            "-mbranch-protection=native",
+            "-mbranch-protection=auto",
+            "-mstack-protector-guard=native",
+            "-mtune=native",
+            "-mfpu=auto",
+        ] {
+            let descs = refuse_descriptions(&["cc", "-c", "foo.c", "-o", "foo.o", flag]);
+            assert!(
+                descs.iter().any(|d| d.contains("unsupported flag")),
+                "{flag} is host-relative and must still refuse, got: {descs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_key_for_link_changes_when_an_object_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.o");
+        let b = dir.path().join("b.o");
+        let out = dir.path().join("prog");
+        fs::write(&a, b"obj-a-v1").unwrap();
+        fs::write(&b, b"obj-b").unwrap();
+        let compiler = CcCompiler::new().with_cache_cc_links(true);
+        let argv = s(&[
+            "cc",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+        let parsed = compiler.parse(&argv).unwrap();
+        assert!(
+            compiler.refuse_reasons(&parsed).is_empty(),
+            "opt-in link should be cacheable: {:?}",
+            compiler.refuse_reasons(&parsed)
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let file_hasher = crate::cache_key::FileHasher::new();
+        let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
+        let ctx = KeyCtx {
+            file_hasher: &file_hasher,
+            path_normalizer: &path_normalizer,
+            cache_dir: cache.path(),
+            key_salt: None,
+            key_env_vars: &[],
+            extra_inputs_digest: None,
+        };
+        let first = compiler.cache_key(&parsed, &ctx).unwrap();
+        fs::write(&a, b"obj-a-v2").unwrap();
+        let second = compiler.cache_key(&parsed, &ctx).unwrap();
+        assert_ne!(
+            first, second,
+            "changing an input object must miss the link cache"
+        );
+        fs::write(&a, b"obj-a-v1").unwrap();
+        let restored = compiler.cache_key(&parsed, &ctx).unwrap();
+        assert_eq!(first, restored, "restoring object bytes must hit again");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_opt_in_link_writes_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_a = dir.path().join("a.c");
+        let src_b = dir.path().join("b.c");
+        fs::write(&src_a, "int a(void){return 1;}\n").unwrap();
+        fs::write(&src_b, "int a(void); int main(void){return a();}\n").unwrap();
+        let obj_a = dir.path().join("a.o");
+        let obj_b = dir.path().join("b.o");
+        let bin = dir.path().join("prog");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-c", src_a.to_str().unwrap(), "-o", obj_a.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-c", src_b.to_str().unwrap(), "-o", obj_b.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let compiler = CcCompiler::new().with_cache_cc_links(true);
+        let parsed = compiler
+            .parse(&s(&[
+                "cc",
+                obj_a.to_str().unwrap(),
+                obj_b.to_str().unwrap(),
+                "-o",
+                bin.to_str().unwrap(),
+            ]))
+            .unwrap();
+        let result = compiler.execute(&parsed).unwrap();
+        assert_eq!(result.exit_code, 0, "stderr={}", result.stderr);
+        assert!(bin.is_file(), "link execute must produce the binary");
+        assert!(
+            !result.artifacts.is_empty(),
+            "opt-in link must discover the output artifact"
+        );
+    }
+
     /// The exact `ring` invocation from issue #823. Every flag in it has to
     /// be modeled for the TU to cache at all; `-mabi=lp64d` was the one that
     /// refused, so this pins the whole argv rather than the flag alone.
@@ -9026,8 +9415,7 @@ mod tests {
             // `-m`-shaped flags that are NOT x86 ISA features — value-takers
             // and tuning knobs the SIMD regex must NOT swallow.
             "-mtune=skylake",
-            "-mfpmath=sse",
-            // (`-mcmodel=` moved to the modeled #823 class; `-mfpu=auto`
+            // (`-mfpmath=sse` moved to the modeled #826 class; `-mfpu=auto`
             // resolves inside cc1 so its text is not the object.)
             "-mfpu=auto",
         ] {
@@ -9456,6 +9844,15 @@ mod tests {
         assert!(
             descs.iter().any(|d| d.contains("link mode")),
             "link mode must be reported, got: {descs:?}"
+        );
+        let compiler = CcCompiler::new().with_cache_cc_links(true);
+        let parsed = compiler.parse(&s(&["cc", "foo.o", "-o", "foo"])).unwrap();
+        let opt_in = compiler.refuse_reasons(&parsed);
+        assert!(
+            !opt_in.iter().any(|r| {
+                matches!(r, RefuseReason::Unsupported(d) if d.contains("cc link mode"))
+            }),
+            "opt-in link cache must not refuse link mode, got: {opt_in:?}"
         );
         assert!(
             !descs.iter().any(|d| d.contains("unsupported flag")),
@@ -12391,9 +12788,10 @@ mod tests {
     }
 
     /// A directory we cannot stat into is not the same as one that does not
-    /// have the header. Only ENOENT means absent; anything else leaves the
-    /// resolution unknown, and an unknown shadowing order must refuse rather
-    /// than key as if the search had reached the end.
+    /// have the header. ENOENT and ENOTDIR (an intermediate path component
+    /// is a file) mean absent; anything else leaves the resolution unknown,
+    /// and an unknown shadowing order must refuse rather than key as if the
+    /// search had reached the end.
     #[cfg(unix)]
     #[test]
     fn include_dir_resolution_separates_absent_from_unreadable() {
@@ -12425,6 +12823,29 @@ mod tests {
         fs::set_permissions(&first, fs::Permissions::from_mode(0o755)).unwrap();
         let err = blocked.expect_err("an unreadable include dir must fail closed");
         assert!(err.to_string().contains("unreadable"), "got {err}");
+    }
+
+    #[test]
+    fn include_dir_resolution_skips_when_an_intermediate_component_is_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        // Firefox: dist/system_wrappers/private is a *file*, so looking up
+        // private/pprio.h in that include dir is ENOTDIR, not ENOENT.
+        fs::write(first.join("private"), "not a directory\n").unwrap();
+        let header_dir = second.join("private");
+        fs::create_dir(&header_dir).unwrap();
+        fs::write(header_dir.join("pprio.h"), "int pprio;\n").unwrap();
+        let dirs = vec![first, second];
+        let name = Path::new("private/pprio.h");
+
+        assert_eq!(
+            cc_first_include_dir_providing(&dirs, name).unwrap(),
+            Some(1),
+            "ENOTDIR on an intermediate component must skip to the next dir"
+        );
     }
 
     #[cfg(unix)]

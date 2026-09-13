@@ -248,6 +248,10 @@ pub(crate) struct WindowsMsvcIdentity {
     pub(crate) ucrt: String,
     pub(crate) architecture: String,
     pub(crate) libraries: BTreeMap<String, String>,
+    /// Wrapper script digest and extra flags it injects (Firefox
+    /// `cargo-host-linker.bat` via `MOZ_CARGO_WRAP_*`). Empty when rustc
+    /// invoked `link.exe` / `lld-link.exe` directly.
+    pub(crate) wrapper: Option<(String, Vec<String>)>,
 }
 
 impl WindowsMsvcIdentity {
@@ -261,6 +265,12 @@ impl WindowsMsvcIdentity {
             format!("sdk={}", self.sdk),
             format!("ucrt={}", self.ucrt),
         ];
+        if let Some((digest, extra)) = &self.wrapper {
+            fields.push(format!("wrapper={digest}"));
+            for flag in extra {
+                fields.push(format!("wrapper_flag={flag}"));
+            }
+        }
         fields.extend(
             self.libraries
                 .iter()
@@ -1261,6 +1271,10 @@ where
             linker.display()
         );
     }
+    let (linker, wrapper) = match windows_tool_from_name(&linker) {
+        Some(WindowsTool::Link | WindowsTool::LldLink) => (linker, None),
+        Some(WindowsTool::Cl) | None => unwrap_windows_linker_wrapper(&linker, environment)?,
+    };
     let linker_tool = match windows_tool_from_name(&linker) {
         Some(tool @ (WindowsTool::Link | WindowsTool::LldLink)) => tool,
         Some(WindowsTool::Cl) | None => {
@@ -1315,7 +1329,75 @@ where
         ucrt,
         architecture,
         libraries,
+        wrapper,
     })
+}
+
+/// Firefox's `build/cargo-linker.bat` / `cargo-host-linker.bat` run
+/// `%MOZ_CARGO_WRAP_LD% %* %MOZ_CARGO_WRAP_LDFLAGS%` (or the HOST_ variants).
+/// rustc only sees the `.bat`; the real `link.exe` and extra flags live in
+/// those environment variables. Follow them so identity still pins the tool.
+fn unwrap_windows_linker_wrapper(
+    wrapper: &Path,
+    environment: &WindowsProbeEnvironment,
+) -> Result<(PathBuf, Option<(String, Vec<String>)>)> {
+    let bytes = std::fs::read(wrapper).with_context(|| {
+        format!(
+            "selected Windows linker {} is not readable",
+            wrapper.display()
+        )
+    })?;
+    let digest = blake3::hash(&bytes).to_hex().to_string();
+    let text = String::from_utf8_lossy(&bytes);
+    let pairs = [
+        ("MOZ_CARGO_WRAP_HOST_LD", "MOZ_CARGO_WRAP_HOST_LDFLAGS"),
+        ("MOZ_CARGO_WRAP_LD", "MOZ_CARGO_WRAP_LDFLAGS"),
+    ];
+    for (ld_var, flags_var) in pairs {
+        if !text.to_ascii_uppercase().contains(ld_var) {
+            continue;
+        }
+        let ld = environment.var(ld_var).with_context(|| {
+            format!(
+                "{ld_var} is unset; wrapper {} cannot name the real linker",
+                wrapper.display()
+            )
+        })?;
+        let extra = environment
+            .var(flags_var)
+            .unwrap_or("")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let named = Path::new(ld);
+        let effective = if is_path_like(named) {
+            if named.is_absolute() {
+                named.to_path_buf()
+            } else if let Some(cwd) = &environment.cwd {
+                cwd.join(named)
+            } else {
+                named.to_path_buf()
+            }
+        } else {
+            path_lookup(environment, ld).with_context(|| {
+                format!(
+                    "{ld_var}={ld} is not on PATH (wrapper {})",
+                    wrapper.display()
+                )
+            })?
+        };
+        if windows_tool_from_name(&effective)
+            .is_none_or(|tool| !matches!(tool, WindowsTool::Link | WindowsTool::LldLink))
+        {
+            bail!(
+                "wrapper {} resolved {ld_var} to {}, which is neither link.exe nor lld-link.exe",
+                wrapper.display(),
+                effective.display()
+            );
+        }
+        return Ok((effective, Some((digest, extra))));
+    }
+    bail!("selected Windows linker is neither link.exe nor lld-link.exe")
 }
 
 #[cfg(test)]
@@ -2619,6 +2701,57 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("neither link.exe nor lld-link.exe")
+        );
+
+        let wrapper = directory.path().join("cargo-host-linker.bat");
+        std::fs::write(
+            &wrapper,
+            "%MOZ_CARGO_WRAP_HOST_LD% %* %MOZ_CARGO_WRAP_HOST_LDFLAGS%\r\n",
+        )
+        .unwrap();
+        let mut wrapped = environment.clone();
+        wrapped
+            .variables
+            .insert("MOZ_CARGO_WRAP_HOST_LD".into(), "link.exe".into());
+        wrapped
+            .variables
+            .insert("MOZ_CARGO_WRAP_HOST_LDFLAGS".into(), "/DEBUG".into());
+        let wrapped_identity =
+            probe_windows_msvc_identity_with(Some(&wrapper), "x64", &[], &wrapped, |tool, path| {
+                if tool == WindowsTool::Link {
+                    assert_eq!(path.file_name().unwrap(), "link.exe");
+                }
+                Ok(match tool {
+                    WindowsTool::Link => LINK_BANNER.into(),
+                    WindowsTool::Cl => compiler_banner("x64"),
+                    WindowsTool::LldLink => unreachable!(),
+                })
+            })
+            .unwrap();
+        assert_eq!(wrapped_identity.linker, LINK_BANNER);
+        let (digest, extra) = wrapped_identity.wrapper.as_ref().expect("wrapper identity");
+        assert!(!digest.is_empty());
+        assert_eq!(extra, &["/DEBUG".to_string()]);
+        assert!(wrapped_identity.encode().contains("wrapper="));
+        assert!(wrapped_identity.encode().contains("wrapper_flag=/DEBUG"));
+
+        wrapped.variables.insert(
+            "MOZ_CARGO_WRAP_HOST_LDFLAGS".into(),
+            "/INCREMENTAL:NO".into(),
+        );
+        let changed_flags =
+            probe_windows_msvc_identity_with(Some(&wrapper), "x64", &[], &wrapped, |tool, _| {
+                Ok(match tool {
+                    WindowsTool::Link => LINK_BANNER.into(),
+                    WindowsTool::Cl => compiler_banner("x64"),
+                    WindowsTool::LldLink => unreachable!(),
+                })
+            })
+            .unwrap();
+        assert_ne!(
+            wrapped_identity.encode(),
+            changed_flags.encode(),
+            "wrapper extra flags must change the identity"
         );
         for variable in ["LINK", "_LINK_"] {
             let mut with_options = environment.clone();

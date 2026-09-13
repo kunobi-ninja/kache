@@ -3182,6 +3182,7 @@ mod tests {
             socket_path_override: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,

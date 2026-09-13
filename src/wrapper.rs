@@ -763,6 +763,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
     let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
+        .with_cache_cc_links(config.cache_cc_links)
         .with_base_dirs(config.base_dirs.clone());
     let parsed = compiler
         .parse(wrapper_args)
@@ -1139,7 +1140,10 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             "admission: compile too cheap to store"
         );
     }
-    if store_decision.should_store && !compiler.include_dir_names_still_match(&parsed) {
+    if store_decision.should_store
+        && parsed.mode == crate::compiler::cc::CompileMode::Compile
+        && !compiler.include_dir_names_still_match(&parsed)
+    {
         tracing::debug!(
             crate_name = %crate_name,
             "cc include-dir names changed during compile; skipping store"
@@ -1370,23 +1374,25 @@ fn cc_cache_entry_rejection_reason(
         .iter()
         .any(|file| classify_by_filename(&file.name) == ArtifactKind::DepInfo);
 
-    // A preprocess names its own output and it is not an object, so require
-    // that the entry carries the file this invocation asked for rather than
-    // an object it was never going to produce.
-    let wants_object = parsed.mode != crate::compiler::cc::CompileMode::Preprocess;
     let has_named_output = meta
         .files
         .iter()
         .any(|file| cc_preprocess_restore_target(parsed, &file.name).is_some());
 
-    if wants_object && !has_object {
-        Some("matching entry lacks the object artifact required by this invocation")
-    } else if !wants_object && !has_named_output {
-        Some("matching entry lacks the preprocessed output required by this invocation")
-    } else if parsed.depinfo_output_path().is_some() && !has_depinfo {
-        Some("matching entry lacks dep-info required by this invocation")
-    } else {
-        None
+    match parsed.mode {
+        crate::compiler::cc::CompileMode::Compile if !has_object => {
+            Some("matching entry lacks the object artifact required by this invocation")
+        }
+        crate::compiler::cc::CompileMode::Preprocess if !has_named_output => {
+            Some("matching entry lacks the preprocessed output required by this invocation")
+        }
+        crate::compiler::cc::CompileMode::Link if meta.files.is_empty() => {
+            Some("matching entry lacks the link artifact required by this invocation")
+        }
+        _ if parsed.depinfo_output_path().is_some() && !has_depinfo => {
+            Some("matching entry lacks dep-info required by this invocation")
+        }
+        _ => None,
     }
 }
 
@@ -1637,6 +1643,28 @@ fn restore_cc_from_cache(
                     continue;
                 }
             },
+            ArtifactKind::Executable
+            | ArtifactKind::DynamicLibrary
+            | ArtifactKind::WasmModule
+            | ArtifactKind::Other("extensionless")
+                if parsed.mode == crate::compiler::cc::CompileMode::Link =>
+            {
+                parsed
+                    .object_output_path()
+                    .context("cc restore: cannot determine link output path")?
+            }
+            ArtifactKind::DebugSidecar
+            | ArtifactKind::DebugBundle
+            | ArtifactKind::Library
+            | ArtifactKind::Other(_)
+                if parsed.mode == crate::compiler::cc::CompileMode::Link =>
+            {
+                let parent = parsed
+                    .object_output_path()
+                    .and_then(|path| path.parent().map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("."));
+                parent.join(&cached.name)
+            }
             // Anything else is this invocation's own preprocessor output or
             // nothing we can place. Asking once keeps the answer and the
             // decision to use it from ever disagreeing.
@@ -1674,7 +1702,22 @@ fn restore_cc_from_cache(
             &depinfo_anchor,
         )?);
     }
-    publish_prepared_cc_artifacts(prepared)
+    publish_prepared_cc_artifacts(prepared)?;
+    if parsed.mode == crate::compiler::cc::CompileMode::Link
+        && let Some(output) = parsed.object_output_path()
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&output)
+                .with_context(|| format!("cc restore: stat {}", output.display()))?
+                .permissions();
+            permissions.set_mode(permissions.mode() | 0o111);
+            std::fs::set_permissions(&output, permissions)
+                .with_context(|| format!("cc restore: chmod +x {}", output.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// After a local miss, ask the daemon for an exact remote entry.
@@ -5931,6 +5974,7 @@ mod tests {
             socket_path_override: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,

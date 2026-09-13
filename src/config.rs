@@ -104,6 +104,10 @@ pub struct Config {
     pub remote_error: Option<String>,
     pub disabled: bool,
     pub cache_executables: bool,
+    /// Opt-in C/C++ whole-program link caching (epic #762 / #259). Off by
+    /// default until path/repro gates pass. `KACHE_CACHE_CC_LINKS` or
+    /// `[cache] cache_cc_links`.
+    pub cache_cc_links: bool,
     pub clean_incremental: bool,
     /// Keep rustc incremental compilation for Cargo mutation workloads by
     /// bypassing artifact caching and isolating their incremental state.
@@ -659,6 +663,7 @@ pub(crate) struct CacheFileConfig {
     /// design (env must not re-enable env). See [`Config::ignore_env_enabled`].
     pub(crate) ignore_env: Option<bool>,
     pub(crate) cache_executables: Option<bool>,
+    pub(crate) cache_cc_links: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
     pub(crate) preserve_incremental: Option<bool>,
     pub(crate) adaptive_incremental: Option<bool>,
@@ -753,6 +758,7 @@ pub(crate) struct EnvOverrides {
     pub(crate) cache_dir: bool,
     pub(crate) max_size: bool,
     pub(crate) cache_executables: bool,
+    pub(crate) cache_cc_links: bool,
     pub(crate) clean_incremental: bool,
     pub(crate) preserve_incremental: bool,
     pub(crate) adaptive_incremental: bool,
@@ -783,6 +789,7 @@ impl EnvOverrides {
             cache_dir: env_or_ignored("KACHE_CACHE_DIR", ignore_env).is_ok(),
             max_size: env_or_ignored("KACHE_MAX_SIZE", ignore_env).is_ok(),
             cache_executables: env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env).is_ok(),
+            cache_cc_links: env_or_ignored("KACHE_CACHE_CC_LINKS", ignore_env).is_ok(),
             clean_incremental: env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env).is_ok(),
             preserve_incremental: env_or_ignored("KACHE_PRESERVE_INCREMENTAL", ignore_env).is_ok(),
             adaptive_incremental: env_or_ignored("KACHE_ADAPTIVE_INCREMENTAL", ignore_env).is_ok(),
@@ -1154,6 +1161,17 @@ impl Config {
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.cache_executables)
                     .unwrap_or(default_cache_executables())
+            });
+
+        let cache_cc_links = env_or_ignored("KACHE_CACHE_CC_LINKS", ignore_env)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.cache_cc_links)
+                    .unwrap_or(false)
             });
 
         let clean_incremental = env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env)
@@ -1560,6 +1578,7 @@ impl Config {
             explain_miss,
             scheduler,
             cache_executables,
+            cache_cc_links,
             clean_incremental,
             preserve_incremental,
             adaptive_incremental,
@@ -3857,6 +3876,7 @@ remote_key_cache_refresh_secs = 900
                 local_max_size: Some("50GiB".to_string()),
                 planner: None,
                 cache_executables: Some(true),
+                cache_cc_links: None,
                 clean_incremental: Some(false),
                 preserve_incremental: Some(true),
                 adaptive_incremental: Some(false),
@@ -4326,6 +4346,7 @@ remote_key_cache_refresh_secs = 900
             remote_error: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -4383,6 +4404,7 @@ remote_key_cache_refresh_secs = 900
             remote_error: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -4436,6 +4458,7 @@ remote_key_cache_refresh_secs = 900
             remote_error: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -4508,6 +4531,7 @@ remote_key_cache_refresh_secs = 900
             remote_error: None,
             disabled: false,
             cache_executables: false,
+            cache_cc_links: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -5163,6 +5187,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 local_max_size: Some("10GiB".to_string()),
                 planner: None,
                 cache_executables: Some(true),
+                cache_cc_links: None,
                 clean_incremental: None,
                 preserve_incremental: None,
                 adaptive_incremental: None,

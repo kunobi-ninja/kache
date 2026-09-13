@@ -1,0 +1,48 @@
+# Cross gcc `cc -###` probe on distro riscv64 and armv7 drivers (#825).
+# Skipped when the cross compilers are not on PATH. Linux e2e CI installs them.
+
+name = "e2e-cc-cross-gcc"
+tags = ["suite:e2e", "lang:cc"]
+os = ["linux"]
+requires = ["riscv64-linux-gnu-gcc", "arm-linux-gnueabihf-gcc"]
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+KACHE = "$KACHE"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "sh -c 'test -s build/a-lp64.o && test -s build/a-lp64d.o && test -s build/a-arm.o && cmp -s build/a-lp64.o build/a-lp64d.o; test $? -eq 1'"
+
+[diff]
+artifacts = ["build/a-lp64.o", "build/a-lp64d.o", "build/a-arm.o"]
+
+[modify]
+file = "src/a.c"
+find = "return 1;"
+replace = "return 2;"
+
+[assertions.cold]
+min_entries_after = 3
+max_compiler_runs = 3
+
+[assertions.warm]
+min_hits = 3
+max_compiler_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+[assertions.relocate]
+min_hits = 3
+max_compiler_runs = 0
+
+[assertions.relocate-modified]
+min_misses = 3
+max_compiler_runs = 3

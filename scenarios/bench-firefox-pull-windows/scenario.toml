@@ -54,7 +54,6 @@ max_passthrough_pct = 40.0
 # Any other reason warns; delete an entry once it is fixed.
 known_passthrough = [
   "unsupported|cc preprocessor mode -E to stdout",
-  "uncacheable|determining native Windows MSVC link identity: selected Windows linker is neither",
   "uncacheable|determining native Windows MSVC link identity: explicit Windows linker input files",
   "unsupported|cc link mode",
   "unsupported|cc unsupported flag(s): -Wall -Wno-parentheses -Wno-unused-function — not yet",

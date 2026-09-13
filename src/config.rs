@@ -1104,6 +1104,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_REMOTE_READONLY", "cache.remote_readonly"),
     ("KACHE_MODIFIED_INPUT_GUARD", "cache.modified_input_guard"),
     ("KACHE_INPUT_PREDICTIONS", "cache.input_predictions"),
+    ("KACHE_RECORD_SESSIONS", "cache.record_sessions"),
     ("KACHE_LOCAL_HIT_DAEMON", "cache.local_hit_daemon"),
     ("KACHE_WINDOWS_HARDLINK", "cache.windows_hardlink"),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
@@ -4244,6 +4245,32 @@ remote_key_cache_refresh_secs = 900
         let _env = set_env_for_test("KACHE_INPUT_PREDICTIONS", Some(std::ffi::OsStr::new("0")));
         assert!(
             !Config::input_predictions_enabled(&file),
+            "the environment overrides the host file"
+        );
+    }
+
+    /// A CI host turns session recording on once, in the host layer, under a
+    /// kache-action `KACHE_CONFIG` that only names the remote.
+    #[test]
+    fn record_sessions_comes_from_the_host_layer() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache]\nrecord_sessions = true\n",
+            Some("[cache.remote]\ntype = \"s3\"\nbucket = \"ci\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+        let file = Config::load_file_config();
+
+        {
+            let _env = set_env_for_test("KACHE_RECORD_SESSIONS", None);
+            assert!(Config::record_sessions_enabled(&file), "host value");
+        }
+        let _env = set_env_for_test("KACHE_RECORD_SESSIONS", Some(std::ffi::OsStr::new("0")));
+        assert!(
+            !Config::record_sessions_enabled(&file),
             "the environment overrides the host file"
         );
     }

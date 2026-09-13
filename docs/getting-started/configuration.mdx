@@ -89,6 +89,7 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 | Environment | TOML key | Default | Purpose |
 | --- | --- | --- | --- |
 | `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | Linux/macOS: `true`; Windows: `false` | Cache eligible Rust bins and test executables |
+| `KACHE_CACHE_CC_LINKS` | `cache.cache_cc_links` | `false` | Cache C/C++ whole-program links and their sidecars. Off until path and reproducibility gates pass. |
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Remove tracked incremental directories during cleanup |
 | `KACHE_ADAPTIVE_INCREMENTAL` | `cache.adaptive_incremental` | `true` | Learn rapidly changing Cargo units and give them isolated incremental state |
 | `KACHE_PRESERVE_INCREMENTAL` | `cache.preserve_incremental` | `false` | Force eligible Cargo units onto isolated incremental state |

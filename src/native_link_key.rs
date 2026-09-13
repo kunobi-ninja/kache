@@ -1333,6 +1333,10 @@ where
     })
 }
 
+/// Effective linker path, plus wrapper digest and extra flags when rustc
+/// invoked a script instead of `link.exe` / `lld-link.exe`.
+type UnwrappedWindowsLinker = (PathBuf, Option<(String, Vec<String>)>);
+
 /// Firefox's `build/cargo-linker.bat` / `cargo-host-linker.bat` run
 /// `%MOZ_CARGO_WRAP_LD% %* %MOZ_CARGO_WRAP_LDFLAGS%` (or the HOST_ variants).
 /// rustc only sees the `.bat`; the real `link.exe` and extra flags live in
@@ -1340,7 +1344,7 @@ where
 fn unwrap_windows_linker_wrapper(
     wrapper: &Path,
     environment: &WindowsProbeEnvironment,
-) -> Result<(PathBuf, Option<(String, Vec<String>)>)> {
+) -> Result<UnwrappedWindowsLinker> {
     let bytes = std::fs::read(wrapper).with_context(|| {
         format!(
             "selected Windows linker {} is not readable",

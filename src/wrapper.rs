@@ -1703,19 +1703,17 @@ fn restore_cc_from_cache(
         )?);
     }
     publish_prepared_cc_artifacts(prepared)?;
+    #[cfg(unix)]
     if parsed.mode == crate::compiler::cc::CompileMode::Link
         && let Some(output) = parsed.object_output_path()
     {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&output)
-                .with_context(|| format!("cc restore: stat {}", output.display()))?
-                .permissions();
-            permissions.set_mode(permissions.mode() | 0o111);
-            std::fs::set_permissions(&output, permissions)
-                .with_context(|| format!("cc restore: chmod +x {}", output.display()))?;
-        }
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&output)
+            .with_context(|| format!("cc restore: stat {}", output.display()))?
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        std::fs::set_permissions(&output, permissions)
+            .with_context(|| format!("cc restore: chmod +x {}", output.display()))?;
     }
     Ok(())
 }

@@ -110,7 +110,7 @@ A configured remote publishes GCC and Clang objects the same way it publishes Ru
 
 Kache currently passes through:
 
-- link and whole-program steps
+- link and whole-program steps, unless `KACHE_CACHE_CC_LINKS` or `[cache] cache_cc_links` is on
 - multi-source or multi-architecture invocations
 - response files
 - precompiled headers and modules

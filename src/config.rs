@@ -1031,6 +1031,79 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_PLANNER_ENDPOINT",
     "KACHE_PLANNER_TIMEOUT_MS",
     "KACHE_PLANNER_TOKEN",
+    "KACHE_GC_EVICT_SHARED",
+    "KACHE_PREFETCH_MAX_KEYS",
+    "KACHE_PREFETCH_MAX_BYTES",
+    "KACHE_PREFETCH_DEADLINE_SECS",
+];
+
+/// Every file-backed `KACHE_*` variable and the config key it overrides, as
+/// config resolution reads them. `kache doctor` names overrides from here. A
+/// test fails if this file reads a `KACHE_*` variable that is neither listed
+/// here nor operational, or if a key here is not in the config file schema.
+const ENV_FILE_KEYS: &[(&str, &str)] = &[
+    ("KACHE_CACHE_DIR", "cache.local_store"),
+    ("KACHE_RUNTIME_DIR", "cache.runtime_dir"),
+    ("KACHE_MAX_SIZE", "cache.local_max_size"),
+    ("KACHE_CACHE_EXECUTABLES", "cache.cache_executables"),
+    ("KACHE_CLEAN_INCREMENTAL", "cache.clean_incremental"),
+    ("KACHE_PRESERVE_INCREMENTAL", "cache.preserve_incremental"),
+    ("KACHE_ADAPTIVE_INCREMENTAL", "cache.adaptive_incremental"),
+    ("KACHE_COMPRESSION_LEVEL", "cache.compression_level"),
+    ("KACHE_S3_CONCURRENCY", "cache.s3_concurrency"),
+    ("KACHE_PREFETCH_ENABLED", "cache.prefetch_enabled"),
+    ("KACHE_PREFETCH_MAX_KEYS", "cache.prefetch_max_keys"),
+    ("KACHE_PREFETCH_MAX_BYTES", "cache.prefetch_max_bytes"),
+    (
+        "KACHE_PREFETCH_DEADLINE_SECS",
+        "cache.prefetch_deadline_secs",
+    ),
+    (
+        "KACHE_REMOTE_KEY_CACHE_REFRESH_SECS",
+        "cache.remote_key_cache_refresh_secs",
+    ),
+    (
+        "KACHE_REMOTE_RESTORE_TIMEOUT_SECS",
+        "cache.remote_restore_timeout_secs",
+    ),
+    (
+        "KACHE_REMOTE_NEGATIVE_TTL_SECS",
+        "cache.remote_negative_ttl_secs",
+    ),
+    ("KACHE_MIN_STORE_COMPILE_MS", "cache.min_store_compile_ms"),
+    ("KACHE_GC_MAX_AGE_HOURS", "cache.gc_max_age_hours"),
+    ("KACHE_GC_EVICT_SHARED", "cache.gc_evict_shared"),
+    (
+        "KACHE_DAEMON_IDLE_TIMEOUT",
+        "cache.daemon_idle_timeout_secs",
+    ),
+    ("KACHE_S3_POOL_IDLE_SECS", "cache.s3_pool_idle_secs"),
+    ("KACHE_FALLBACK", "cache.fallback"),
+    ("KACHE_KEY_SALT", "cache.key_salt"),
+    ("KACHE_CC_EXTRA_ALLOWLIST_FLAGS", "cc.extra_allowlist_flags"),
+    ("KACHE_PATH_ONLY_ENV_VARS", "cache.path_only_env_vars"),
+    ("KACHE_INCREMENTAL_CRATES", "cache.incremental_crates"),
+    ("KACHE_KEY_ENV_VARS", "cache.key_env_vars"),
+    ("KACHE_S3_BUCKET", "cache.remote.bucket"),
+    ("KACHE_S3_ENDPOINT", "cache.remote.endpoint"),
+    ("KACHE_S3_REGION", "cache.remote.region"),
+    ("KACHE_S3_PREFIX", "cache.remote.prefix"),
+    ("KACHE_S3_PROFILE", "cache.remote.profile"),
+    ("KACHE_S3_USER_AGENT", "cache.remote.user_agent"),
+    ("KACHE_LOCAL_ONLY", "cache.local_only"),
+    ("KACHE_REMOTE_READONLY", "cache.remote_readonly"),
+    ("KACHE_MODIFIED_INPUT_GUARD", "cache.modified_input_guard"),
+    ("KACHE_INPUT_PREDICTIONS", "cache.input_predictions"),
+    ("KACHE_LOCAL_HIT_DAEMON", "cache.local_hit_daemon"),
+    ("KACHE_WINDOWS_HARDLINK", "cache.windows_hardlink"),
+    ("KACHE_AUTO_GC", "cache.auto_gc"),
+    ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
+    ("KACHE_HEARTBEAT_SECS", "cache.heartbeat_secs"),
+    ("KACHE_EXPLAIN_MISS", "cache.explain_miss"),
+    ("KACHE_SCHEDULER", "cache.scheduler"),
+    ("KACHE_PLANNER_ENDPOINT", "cache.planner.endpoint"),
+    ("KACHE_PLANNER_TIMEOUT_MS", "cache.planner.timeout_ms"),
+    ("KACHE_PLANNER_TOKEN", "cache.planner.token"),
 ];
 
 /// Read a `KACHE_*` env var, unless the pinned config asked to ignore env
@@ -2776,19 +2849,23 @@ fn collect_host_keys(
     }
 }
 
-/// The set `KACHE_*` variable conventionally named after a `[cache]` key
-/// (`cache.input_predictions` is `KACHE_INPUT_PREDICTIONS`), if it is one of
-/// the file-backed variables. Keys whose variable does not follow that
-/// convention are not detected; the environment still wins over both files.
+/// The set `KACHE_*` variable that overrides the key at `path`, looked up in
+/// [`ENV_FILE_KEYS`]. A table replaced whole, such as `cache.remote`, is
+/// overridden by the variable of any key inside it.
 fn env_override_for(path: &[String], ignore_env: bool) -> Option<&'static str> {
-    if ignore_env || path.len() != 2 || path[0] != "cache" {
+    if ignore_env {
         return None;
     }
-    let wanted = format!("KACHE_{}", path[1].to_ascii_uppercase());
-    IGNORE_ENV_GATED_VARS
+    let key = path.join(".");
+    let inside = format!("{key}.");
+    let whole_table = is_host_atomic_table(path);
+    ENV_FILE_KEYS
         .iter()
-        .copied()
-        .find(|name| *name == wanted && std::env::var_os(name).is_some())
+        .find(|(var, file_key)| {
+            (*file_key == key || (whole_table && file_key.starts_with(&inside)))
+                && std::env::var_os(var).is_some()
+        })
+        .map(|(var, _)| *var)
 }
 
 /// Exact config-file snapshot used by one [`Config::load_with_provenance`].
@@ -4280,6 +4357,10 @@ remote_key_cache_refresh_secs = 900
         let _predictions =
             set_env_for_test("KACHE_INPUT_PREDICTIONS", Some(std::ffi::OsStr::new("1")));
         let _local_only = set_env_for_test("KACHE_LOCAL_ONLY", None);
+        let _remote: Vec<_> = REMOTE_ENV_VARS
+            .iter()
+            .map(|name| set_env_for_test(name, None))
+            .collect();
 
         let HostConfigStatus::Present { keys, .. } = host_config_status() else {
             panic!("the host file must be present");
@@ -4302,6 +4383,142 @@ remote_key_cache_refresh_secs = 900
         assert_eq!(source("cache.local_only"), HostKeySource::Host);
         assert_eq!(source("cache.remote"), HostKeySource::Host);
         assert_eq!(keys.len(), 4, "a replaced-whole table is listed once");
+    }
+
+    /// Doctor names the variable config resolution reads, which for many keys
+    /// is not `KACHE_` plus the key's name.
+    #[test]
+    fn host_status_names_the_variable_config_reads() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache]\nlocal_max_size = \"50GiB\"\nlocal_store = \"/srv/kache\"\n\
+             daemon_idle_timeout_secs = 60\n\n\
+             [cc]\nextra_allowlist_flags = [\"-x\"]\n\n\
+             [cache.planner]\nendpoint = \"http://planner\"\n\n\
+             [cache.remote]\ntype = \"s3\"\nbucket = \"host\"\n",
+            Some("[cache]\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+        let expected = [
+            ("cache.local_max_size", "KACHE_MAX_SIZE"),
+            ("cache.local_store", "KACHE_CACHE_DIR"),
+            (
+                "cache.daemon_idle_timeout_secs",
+                "KACHE_DAEMON_IDLE_TIMEOUT",
+            ),
+            ("cc.extra_allowlist_flags", "KACHE_CC_EXTRA_ALLOWLIST_FLAGS"),
+            ("cache.planner", "KACHE_PLANNER_TOKEN"),
+            ("cache.remote", "KACHE_S3_REGION"),
+        ];
+        let _unset: Vec<_> = ENV_FILE_KEYS
+            .iter()
+            .map(|(var, _)| set_env_for_test(var, None))
+            .collect();
+        let _set: Vec<_> = expected
+            .iter()
+            .map(|(_, var)| set_env_for_test(var, Some(std::ffi::OsStr::new("1"))))
+            .collect();
+
+        let HostConfigStatus::Present { keys, .. } = host_config_status() else {
+            panic!("the host file must be present");
+        };
+        for (key, var) in expected {
+            let entry = keys
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("{key} missing from {keys:?}"));
+            assert_eq!(entry.source, HostKeySource::Env(var), "{key}");
+        }
+    }
+
+    /// Every `KACHE_*` variable this file reads outside its tests is either in
+    /// [`ENV_FILE_KEYS`] or one of the operational variables with no config
+    /// key, so a new variable cannot be added without doctor learning its key.
+    #[test]
+    fn every_env_var_config_reads_maps_to_a_config_key() {
+        const OPERATIONAL: &[&str] = &[
+            "KACHE_CONFIG",
+            "KACHE_HOST_CONFIG",
+            "KACHE_DISABLED",
+            "KACHE_SOCKET_PATH",
+        ];
+        let source = include_str!("config.rs");
+        let source = &source[..source
+            .find("\npub(crate) mod tests {")
+            .expect("the tests module")];
+        let read: std::collections::BTreeSet<&str> = source
+            .match_indices("\"KACHE_")
+            .map(|(start, _)| {
+                let name = &source[start + 1..];
+                let end = name
+                    .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                    .unwrap_or(name.len());
+                &name[..end]
+            })
+            .collect();
+        let mapped: std::collections::BTreeSet<&str> =
+            ENV_FILE_KEYS.iter().map(|(var, _)| *var).collect();
+        assert_eq!(
+            mapped.len(),
+            ENV_FILE_KEYS.len(),
+            "a variable is listed twice"
+        );
+        for name in &read {
+            assert!(
+                mapped.contains(name) || OPERATIONAL.contains(name),
+                "{name} is read but has no ENV_FILE_KEYS entry"
+            );
+        }
+        for var in &mapped {
+            assert!(read.contains(var), "{var} is listed but never read");
+        }
+        let gated: std::collections::BTreeSet<&str> =
+            IGNORE_ENV_GATED_VARS.iter().copied().collect();
+        assert_eq!(
+            gated, mapped,
+            "ignore_env gates exactly the file-backed variables"
+        );
+        let remote: Vec<&str> = ENV_FILE_KEYS
+            .iter()
+            .filter(|(_, key)| key.starts_with("cache.remote."))
+            .map(|(var, _)| *var)
+            .collect();
+        assert_eq!(remote, REMOTE_ENV_VARS);
+    }
+
+    /// Each key in [`ENV_FILE_KEYS`] is one the config file has: a value set
+    /// there survives parsing and writing back.
+    #[test]
+    fn every_env_file_key_is_a_config_file_key() {
+        let candidates = [
+            toml::Value::String("1".into()),
+            toml::Value::Integer(1),
+            toml::Value::Boolean(true),
+            toml::Value::Array(vec![toml::Value::String("x".into())]),
+        ];
+        for (var, key) in ENV_FILE_KEYS {
+            let path: Vec<&str> = key.split('.').collect();
+            let survives = candidates.iter().any(|candidate| {
+                let mut value = candidate.clone();
+                for segment in path.iter().rev() {
+                    value =
+                        toml::Value::Table(toml::Table::from_iter([(segment.to_string(), value)]));
+                }
+                let Ok(file) = value.try_into::<FileConfig>() else {
+                    return false;
+                };
+                let Ok(back) = toml::Value::try_from(&file) else {
+                    return false;
+                };
+                path.iter()
+                    .try_fold(&back, |value, segment| value.get(*segment))
+                    .is_some()
+            });
+            assert!(survives, "{var} maps to {key}, which the config file lacks");
+        }
     }
 
     #[test]

@@ -266,6 +266,33 @@ fn profile_hint(name: &str, cache_backend: CacheBackend) -> String {
 mod tests {
     use super::*;
 
+    /// Every kache the runner spawns inherits its environment, so the runner
+    /// turns the host layer off, and leaves a value the caller set alone.
+    #[test]
+    fn the_runner_turns_the_host_layer_off_unless_the_caller_set_it() {
+        let previous = std::env::var_os("KACHE_HOST_CONFIG");
+        // SAFETY: no other test in this crate reads or writes this variable,
+        // and it is restored before any assertion can panic.
+        unsafe { std::env::remove_var("KACHE_HOST_CONFIG") };
+        turn_off_host_config();
+        let unset = std::env::var_os("KACHE_HOST_CONFIG");
+        unsafe { std::env::set_var("KACHE_HOST_CONFIG", "/srv/kache.toml") };
+        turn_off_host_config();
+        let set = std::env::var_os("KACHE_HOST_CONFIG");
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("KACHE_HOST_CONFIG", value),
+                None => std::env::remove_var("KACHE_HOST_CONFIG"),
+            }
+        }
+
+        assert_eq!(unset.as_deref(), Some(std::ffi::OsStr::new("")));
+        assert_eq!(
+            set.as_deref(),
+            Some(std::ffi::OsStr::new("/srv/kache.toml"))
+        );
+    }
+
     /// Every clone-benchmark option, on its own, must be recognised as one.
     /// The check is a long disjunction, and a term that stops contributing
     /// makes its flag silently inert against a fixture selection instead of

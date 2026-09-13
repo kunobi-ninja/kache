@@ -4321,6 +4321,37 @@ remote_key_cache_refresh_secs = 900
         }
     }
 
+    /// A host path that exists but cannot be read is reported, not mistaken
+    /// for a machine without a host file.
+    #[test]
+    fn an_unreadable_host_path_is_reported_not_treated_as_absent() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // Reading a directory fails, and not with NotFound.
+        let host = dir.path().join("host.toml");
+        std::fs::create_dir(&host).unwrap();
+        let chosen = dir.path().join("chosen.toml");
+        std::fs::write(&chosen, "[cache]\nlocal_max_size = \"10GiB\"\n").unwrap();
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+
+        let status = host_config_status();
+        assert!(
+            matches!(&status, HostConfigStatus::Invalid { path, .. } if *path == host),
+            "{status:?}"
+        );
+        assert_eq!(
+            Config::load_file_config()
+                .unwrap()
+                .cache
+                .unwrap()
+                .local_max_size
+                .as_deref(),
+            Some("10GiB"),
+            "the chosen file still loads"
+        );
+    }
+
     #[test]
     fn a_malformed_host_file_is_ignored_and_reported() {
         let _lock = config_path_lock();

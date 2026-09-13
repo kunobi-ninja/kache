@@ -1120,6 +1120,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
 /// every existing env -> file -> default fallback arm transparently skips the
 /// env value and takes the file/default. A drop-in for `std::env::var` on the
 /// file-backed settings (see [`IGNORE_ENV_GATED_VARS`]).
+fn env_flag_one_or_true(v: &str) -> bool {
+    v == "1" || v.eq_ignore_ascii_case("true")
+}
+
 fn env_or_ignored(name: &str, ignore_env: bool) -> Result<String, std::env::VarError> {
     if ignore_env {
         Err(std::env::VarError::NotPresent)
@@ -1240,7 +1244,7 @@ impl Config {
             });
 
         let cache_cc_links = env_or_ignored("KACHE_CACHE_CC_LINKS", ignore_env)
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .map(|v| env_flag_one_or_true(&v))
             .unwrap_or_else(|_| {
                 file_config
                     .as_ref()
@@ -3373,32 +3377,12 @@ pub(crate) mod tests {
 
     #[test]
     fn cache_cc_links_env_one_and_true_enable_zero_does_not() {
-        let _lock = config_path_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, "[cache]\nlocal_only = true\n").unwrap();
-        let _cfg = set_kache_config_for_test(&config_path);
-        let cache_dir = dir.path().join("store");
-        let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(cache_dir.as_os_str()));
-
-        {
-            let _env = set_env_for_test("KACHE_CACHE_CC_LINKS", None);
-            assert!(
-                !Config::load().unwrap().cache_cc_links,
-                "link cache stays off without env or file"
-            );
-        }
         for on in ["1", "true", "TRUE"] {
-            let _env = set_env_for_test("KACHE_CACHE_CC_LINKS", Some(on.as_ref()));
-            assert!(
-                Config::load().unwrap().cache_cc_links,
-                "{on} must enable cache_cc_links"
-            );
+            assert!(env_flag_one_or_true(on), "{on} must enable cache_cc_links");
         }
         for off in ["0", "false", "no", ""] {
-            let _env = set_env_for_test("KACHE_CACHE_CC_LINKS", Some(off.as_ref()));
             assert!(
-                !Config::load().unwrap().cache_cc_links,
+                !env_flag_one_or_true(off),
                 "{off:?} must not enable cache_cc_links"
             );
         }

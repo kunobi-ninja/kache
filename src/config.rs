@@ -3579,6 +3579,7 @@ pub(crate) mod tests {
     /// variable is cleared explicitly rather than assumed absent.
     #[test]
     fn input_predictions_resolve_env_over_file_and_default_off() {
+        let _lock = config_path_lock();
         let file_says = |value: Option<bool>| -> Result<FileConfig> {
             Ok(FileConfig {
                 cache: Some(CacheFileConfig {
@@ -3619,6 +3620,7 @@ pub(crate) mod tests {
     /// over the file, and off with neither.
     #[test]
     fn record_sessions_resolve_env_over_file_and_default_off() {
+        let _lock = config_path_lock();
         let file_says = |value: Option<bool>| -> Result<FileConfig> {
             Ok(FileConfig {
                 cache: Some(CacheFileConfig {

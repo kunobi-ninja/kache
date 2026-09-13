@@ -185,7 +185,7 @@ impl BenchProfile {
         // "matched multiple scenarios" guard to report.
         if profiles.len() > 1 {
             let needles = selectors.name_needles();
-            let exact: Vec<String> = profiles
+            let mut exact: Vec<String> = profiles
                 .iter()
                 .map(|p| p.name.clone())
                 .filter(|name| {
@@ -195,6 +195,23 @@ impl BenchProfile {
                         .any(|&n| name == n || name == format!("bench-{n}").as_str())
                 })
                 .collect();
+            // External variants carry the backend suffix: `bench-mbx hk`
+            // must still select hk when hk-pull-mbx is also present.
+            if exact.is_empty() {
+                exact = profiles
+                    .iter()
+                    .filter(|p| {
+                        p.tags.iter().any(|tag| {
+                            tag.strip_prefix("backend:").is_some_and(|backend| {
+                                needles
+                                    .iter()
+                                    .any(|n| p.name == format!("bench-{n}-{backend}"))
+                            })
+                        })
+                    })
+                    .map(|p| p.name.clone())
+                    .collect();
+            }
             if exact.len() == 1 {
                 profiles.retain(|p| p.name == exact[0]);
             }
@@ -915,6 +932,22 @@ setup_marker = "{}"
             BenchProfile::discover(&root, &Selectors::parse_many(&pull_win_sel).unwrap()).unwrap();
         assert_eq!(pull_win.len(), 1);
         assert_eq!(pull_win[0].name, "bench-firefox-pull-windows");
+    }
+
+    #[test]
+    fn discover_disambiguates_mbx_hk_from_its_pull_variant() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        for (name, expected) in [("hk", "bench-hk-mbx"), ("hk-pull", "bench-hk-pull-mbx")] {
+            let selectors = Selectors::parse_many(&[
+                "suite:bench".into(),
+                "backend:mbx".into(),
+                format!("name:{name}"),
+            ])
+            .unwrap();
+            let profiles = BenchProfile::discover(&root, &selectors).unwrap();
+            assert_eq!(profiles.len(), 1);
+            assert_eq!(profiles[0].name, expected);
+        }
     }
 
     fn repo_profile(name: &str) -> PathBuf {

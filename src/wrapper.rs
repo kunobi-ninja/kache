@@ -7278,6 +7278,25 @@ mod tests {
     }
 
     #[test]
+    fn prepare_cc_store_files_copies_an_already_packed_dsym_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("prog.dsym.tar");
+        std::fs::write(&tar_path, b"already-packed-tar").unwrap();
+        let artifacts = ArtifactSet::new(vec![crate::compiler::Artifact {
+            path: tar_path,
+            kind: ArtifactKind::DebugBundle,
+            store_name: "prog.dsym.tar".to_string(),
+            required: false,
+        }]);
+        let prepared = prepare_cc_store_files(&artifacts, None).unwrap();
+        assert_eq!(
+            std::fs::read(&prepared.files[0].0).unwrap(),
+            b"already-packed-tar",
+            "a DebugBundle that is already a tar file must be copied, not re-tarred as a directory"
+        );
+    }
+
+    #[test]
     fn restore_cc_from_cache_requires_object_output_for_object_blob() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().join("cache"));

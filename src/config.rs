@@ -2510,8 +2510,13 @@ pub(crate) const HOST_CONFIG_PATH: &str = "/etc/kache/config.toml";
 /// Tables a higher layer replaces whole instead of merging key by key. A
 /// remote or a planner is one coherent description: laying a project's
 /// `type = "s3"` over a host's `path = "/mnt/kache"` would name a remote
-/// neither file configured.
-const HOST_ATOMIC_TABLES: &[&[&str]] = &[&["cache", "remote"], &["cache", "planner"]];
+/// neither file configured. A volume set is one too: a project that lists
+/// its volumes means exactly those.
+const HOST_ATOMIC_TABLES: &[&[&str]] = &[
+    &["cache", "remote"],
+    &["cache", "planner"],
+    &["cache", "volumes"],
+];
 
 /// Keys the host layer never contributes, and why. Workspace declarations
 /// describe one Cargo workspace and are only read from its own `.kache.toml`.
@@ -4183,6 +4188,32 @@ remote_key_cache_refresh_secs = 900
         assert_eq!(remote._type.as_deref(), Some("s3"));
         assert_eq!(remote.bucket.as_deref(), Some("ci"));
         assert_eq!(remote.path, None, "no host remote key may leak in");
+    }
+
+    /// A project that lists its volume stores means exactly those; a host
+    /// shard on another volume must not join them.
+    #[test]
+    fn a_chosen_volume_set_replaces_the_host_volumes_whole() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, chosen) = write_host_and_chosen(
+            dir.path(),
+            "[cache.volumes]\n\"/mnt/host\" = \"/mnt/host/kache\"\n",
+            Some("[cache.volumes]\n\"/mnt/project\" = \"/mnt/project/kache\"\n"),
+        );
+        let _host = set_host_config_for_test(&host);
+        let _chosen = set_kache_config_for_test(&chosen);
+
+        let volumes = Config::load_file_config()
+            .unwrap()
+            .cache
+            .unwrap()
+            .volumes
+            .unwrap();
+        assert_eq!(
+            volumes,
+            HashMap::from([("/mnt/project".to_string(), "/mnt/project/kache".to_string())])
+        );
     }
 
     /// A job whose remote lives only in its environment (`KACHE_S3_BUCKET`,

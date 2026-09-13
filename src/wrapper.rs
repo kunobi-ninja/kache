@@ -7099,7 +7099,7 @@ mod tests {
         create_blob(&store, bin_hash, b"ELF");
         create_blob(&store, map_hash, b"MAP");
 
-        let output = dir.path().join("prog");
+        let output = dir.path().join("out");
         let output_str = output.to_string_lossy().into_owned();
         let parsed = CcCompiler::new()
             .parse(&s(&["cc", "a.o", "b.o", "-o", &output_str]))
@@ -7107,18 +7107,37 @@ mod tests {
         let meta = entry_meta(
             "cc-link-key",
             vec![
-                cached_file("prog", bin_hash),
-                cached_file("prog.map", map_hash),
+                cached_file("app", bin_hash),
+                cached_file("app.map", map_hash),
             ],
             &[],
         );
 
         restore_cc_from_cache(&store, &parsed, &meta).unwrap();
-        assert_eq!(std::fs::read(&output).unwrap(), b"ELF");
         assert_eq!(
-            std::fs::read(dir.path().join("prog.map")).unwrap(),
+            std::fs::read(&output).unwrap(),
+            b"ELF",
+            "the primary link artifact must land at -o even when the stored name differs"
+        );
+        assert!(
+            !dir.path().join("app").exists(),
+            "the stored extensionless name is not the restore destination"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("app.map")).unwrap(),
             b"MAP",
-            "link sidecars must land next to the binary"
+            "link sidecars must land next to the binary under their stored name"
+        );
+
+        let object = dir.path().join("unit.o");
+        let object_str = object.to_string_lossy().into_owned();
+        let compile = CcCompiler::new()
+            .parse(&s(&["cc", "-c", "unit.c", "-o", &object_str]))
+            .unwrap();
+        restore_cc_from_cache(&store, &compile, &meta).unwrap();
+        assert!(
+            !object.exists(),
+            "an executable blob must not restore onto a compile -o path"
         );
         #[cfg(unix)]
         {

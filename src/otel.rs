@@ -513,37 +513,26 @@ fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
     metrics
 }
 
-/// This machine's host name, or empty when the OS will not say.
-#[cfg(unix)]
-pub(crate) fn host_name() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: `buf` is valid for `buf.len()` bytes, and gethostname writes at
-    // most that many.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
-    if rc != 0 {
-        return String::new();
+/// Fill `loads` with the 1, 5 and 15 minute load averages and return how
+/// many the OS wrote, or -1 where it keeps none. Only the syscall, so what
+/// counts as a sample is decided in [`one_minute_load`].
+pub(crate) fn sample_load_averages(loads: &mut [f64; 3]) -> i32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `loads` holds the three samples getloadavg may write.
+        unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) }
     }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
+    #[cfg(not(unix))]
+    {
+        let _ = loads;
+        -1
+    }
 }
 
-#[cfg(not(unix))]
-pub(crate) fn host_name() -> String {
-    std::env::var("COMPUTERNAME").unwrap_or_default()
-}
-
-/// The one-minute load average, where the OS reports one.
-#[cfg(unix)]
-pub(crate) fn load_average_1m() -> Option<f64> {
-    let mut loads = [0f64; 3];
-    // SAFETY: `loads` holds the three samples getloadavg may write.
-    let n = unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
-    (n >= 1).then_some(loads[0])
-}
-
-#[cfg(not(unix))]
-pub(crate) fn load_average_1m() -> Option<f64> {
-    None
+/// The one-minute load from a [`sample_load_averages`] result, kept only when
+/// the OS wrote it and it is a real, non-negative number.
+pub(crate) fn one_minute_load(written: i32, one_minute: f64) -> Option<f64> {
+    (written >= 1 && one_minute.is_finite() && one_minute >= 0.0).then_some(one_minute)
 }
 
 #[cfg(test)]
@@ -654,6 +643,29 @@ mod tests {
         assert!(!dumped.contains("run_id"));
         assert!(!dumped.contains("cicd."));
         assert!(!dumped.contains("cache_key"));
+    }
+
+    #[test]
+    fn one_minute_load_keeps_only_a_real_sample() {
+        assert_eq!(one_minute_load(1, 2.5), Some(2.5));
+        assert_eq!(one_minute_load(3, 1.5), Some(1.5));
+        assert_eq!(one_minute_load(1, 0.0), Some(0.0), "an idle host");
+        assert_eq!(one_minute_load(0, 2.5), None, "nothing written");
+        assert_eq!(one_minute_load(-1, 2.5), None, "no load average here");
+        assert_eq!(one_minute_load(1, -0.5), None);
+        assert_eq!(one_minute_load(1, f64::NAN), None);
+        assert_eq!(one_minute_load(1, f64::INFINITY), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_os_writes_all_three_load_samples() {
+        let mut loads = [-1.0; 3];
+        assert_eq!(sample_load_averages(&mut loads), 3);
+        assert!(
+            loads.iter().all(|load| load.is_finite() && *load >= 0.0),
+            "{loads:?}"
+        );
     }
 
     fn machine_snap() -> MachineSnapshot {

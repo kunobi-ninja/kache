@@ -435,16 +435,17 @@ pub(crate) fn session_log_path(config: &Config) -> std::path::PathBuf {
 /// like at that moment. Meant for the end of a CI job, before its runtime dir
 /// and the events in it are deleted.
 pub(crate) fn record_session(config: &Config, report: &crate::report::BuildReport) -> Result<()> {
+    let mut loads = [0.0; 3];
+    let written = crate::otel::sample_load_averages(&mut loads);
     let machine = crate::report::SessionMachine {
-        load_1m: crate::otel::load_average_1m(),
+        load_1m: crate::otel::one_minute_load(written, loads[0]),
         cpus: std::thread::available_parallelism()
             .ok()
             .and_then(|n| u32::try_from(n.get()).ok()),
         index_bytes: index_file_bytes(config),
         store_max: config.max_size,
     };
-    let record =
-        crate::report::SessionRecord::from_report(report, crate::otel::host_name(), machine);
+    let record = crate::report::SessionRecord::from_report(report, machine);
     let path = session_log_path(config);
     crate::events::append_json_line(&path, &record)?;
     crate::events::rotate_if_needed(
@@ -7229,6 +7230,44 @@ mod tests {
             Some(wal_before),
             "the WAL must be left in place"
         );
+    }
+
+    /// The GC line grows a suffix only when there is something to report:
+    /// zero failures and zero write time add nothing, one of each adds both.
+    /// A record without a driver predates `source`, when only the daemon
+    /// wrote one.
+    #[test]
+    fn stats_gc_line_suffixes_start_at_one() {
+        let gc_line = |failed: usize, locked: usize, write_ms: u64, source: &str| {
+            machine_lines(&crate::otel::MachineSnapshot {
+                gc: Some(crate::report::GcStatsPersisted {
+                    last_run: "2026-09-12T12:11:05+00:00".to_string(),
+                    source: source.to_string(),
+                    entries_evicted: 3,
+                    entries_failed: failed,
+                    entries_locked: locked,
+                    evict_write_ms: write_ms,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            gc_line(0, 0, 0, "manual"),
+            vec!["GC:        last run 2026-09-12T12:11:05+00:00 (manual): 3 evicted".to_string()]
+        );
+        assert_eq!(
+            gc_line(1, 1, 1, ""),
+            vec![
+                "GC:        last run 2026-09-12T12:11:05+00:00 (daemon): 3 evicted, 1 failed (1 lost the index write lock), 1 ms in index writes"
+                    .to_string()
+            ]
+        );
+        let index_only = machine_lines(&crate::otel::MachineSnapshot {
+            index_bytes: Some(4096),
+            ..Default::default()
+        });
+        assert_eq!(index_only, vec![format!("Index:     {}", ByteSize(4096))]);
     }
 
     #[test]

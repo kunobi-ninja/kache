@@ -162,7 +162,6 @@ pub struct SessionRecord {
     pub ts: String,
     pub schema: u32,
     pub kache_version: String,
-    pub host: String,
     /// The report window as its heading shows it: `24h`, `build session`.
     pub window: String,
     /// First 16 hex digits of blake3(root), never the path itself: enough to
@@ -191,7 +190,7 @@ pub struct SessionMachine {
 }
 
 impl SessionRecord {
-    pub fn from_report(report: &BuildReport, host: String, machine: SessionMachine) -> Self {
+    pub fn from_report(report: &BuildReport, machine: SessionMachine) -> Self {
         let meta = &report.meta;
         let window = meta.window_label();
         let (root, session_id) = match &meta.session {
@@ -205,7 +204,6 @@ impl SessionRecord {
             ts: Utc::now().to_rfc3339(),
             schema: SESSION_RECORD_SCHEMA,
             kache_version: meta.kache_version.clone(),
-            host,
             window,
             root_hash,
             session_id,

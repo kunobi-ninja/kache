@@ -196,7 +196,7 @@ kache stats --last-build --root "$PWD"
 
 `--last-build` shows the detailed report for the latest recorded activity session. Add `--root` to choose a build tree; without it, the latest event across all roots chooses the session. It cannot be combined with `--since`. With `--json`, the stats envelope contains a `report` object using the build report schema below.
 
-`kache report --record` also appends one JSON line to `telemetry/sessions.jsonl` in the cache dir: the report's summary and timing breakdown, the host, and its load average, CPUs and index size at that moment, with the root stored as a hash. The runtime dir a CI job deletes on exit is where the report reads its events; this line is what survives on the machine. `KACHE_RECORD_SESSIONS=1` or `[cache] record_sessions = true` makes every report record the same way without the flag, and appends each GC run to `telemetry/gc-runs.jsonl`; it is off by default. With neither, the command writes nothing.
+`kache report --record` also appends one JSON line to `telemetry/sessions.jsonl` in the cache dir: the report's summary and timing breakdown, and the machine's load average, CPUs and index size at that moment, with the root stored as a hash. The runtime dir a CI job deletes on exit is where the report reads its events; this line is what survives on the machine. `KACHE_RECORD_SESSIONS=1` or `[cache] record_sessions = true` makes every report record the same way without the flag, and appends each GC run to `telemetry/gc-runs.jsonl`; it is off by default. With neither, the command writes nothing.
 
 ## `kache telemetry`
 

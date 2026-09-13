@@ -10061,12 +10061,8 @@ mod tests {
     fn preprocess_mode_refusal_does_not_report_classified_flags_as_unsupported() {
         let descs = refuse_descriptions(&["cc", "-E", "-xc", "-P", "foo.c"]);
         assert!(
-            descs.iter().any(|d| d.contains("preprocessor mode")),
-            "expected preprocessor-mode refuse, got: {descs:?}"
-        );
-        assert!(
-            !descs.iter().any(|d| d.contains("unsupported flag")),
-            "classified preprocess args should not be reported unsupported: {descs:?}"
+            descs.is_empty(),
+            "-E to stdout with classified flags must cache, got: {descs:?}"
         );
     }
 
@@ -10074,8 +10070,8 @@ mod tests {
     fn refuses_preprocess_and_assemble_modes() {
         let preprocess = refuse_descriptions(&["cc", "-E", "foo.c"]);
         assert!(
-            preprocess.iter().any(|d| d.contains("preprocessor")),
-            "expected preprocessor-mode refuse, got: {preprocess:?}"
+            preprocess.is_empty(),
+            "-E to stdout must cache, got: {preprocess:?}"
         );
 
         let assemble = refuse_descriptions(&["cc", "-S", "foo.c"]);
@@ -10095,27 +10091,16 @@ mod tests {
     fn non_compile_refusal_does_not_carry_unsupported_flag_noise() {
         let compiler = CcCompiler::new();
 
-        // Preprocessor mode. Pre-refactor this returned BOTH
-        // "unsupported flag(s): -xc -P -E" AND "preprocessor mode
-        // (-E)", inflating the "classifier gap" bucket. Post-refactor
-        // only the mode refusal fires.
+        // Preprocessor-to-stdout is cacheable; classified flags must not
+        // invent an "unsupported flag" refusal.
         let parsed = compiler
             .parse(&s(&["cc", "-xc", "-P", "-E", "foo.c"]))
             .unwrap();
         let reasons = compiler.refuse_reasons(&parsed);
         let descs: Vec<_> = reasons.iter().map(|r| r.description()).collect();
         assert!(
-            descs.iter().any(|d| d.contains("preprocessor mode")),
-            "preprocessor mode must be reported, got: {descs:?}"
-        );
-        assert!(
-            !descs.iter().any(|d| d.contains("unsupported flag")),
-            "preprocessor-mode refusal must not carry 'unsupported flag' noise, got: {descs:?}"
-        );
-        // Must read as a deferral, not a permanent limitation.
-        assert!(
-            descs.iter().any(|d| d.contains("— not yet")),
-            "preprocessor mode message must read as deferral ('— not yet'), got: {descs:?}"
+            descs.is_empty(),
+            "-E to stdout must cache, got: {descs:?}"
         );
 
         // Link mode — also `Unsupported` with "— not yet".

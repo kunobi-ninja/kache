@@ -80,6 +80,12 @@ pub(crate) fn cc_expansion_is_stdout(parsed: &CcArgs) -> bool {
     parsed.mode == CompileMode::Preprocess && parsed.output.is_none()
 }
 
+/// The `-E -P` / `/EP` key probe sets this so a kache shim does not cache
+/// the probe as a user-facing stdout preprocess.
+pub(crate) fn cc_is_internal_key_probe() -> bool {
+    std::env::var_os("KACHE_CC_KEY_PROBE").is_some()
+}
+
 impl ToolFamily {
     /// The flag dialect this family speaks (Gnu and Clang share one).
     pub fn dialect(self) -> Dialect {
@@ -2132,6 +2138,10 @@ fn preprocess_hash(
         crate::opcounts::record_preprocessor_run();
         let mut command = Command::new(&parsed.program);
         command.args(args);
+        // If `program` is a kache shim, this probe must not re-enter the
+        // cache (it would try to key another -E to stdout). The wrapper
+        // passthroughs when this is set.
+        command.env("KACHE_CC_KEY_PROBE", "1");
         // Pin the build timestamp so `__DATE__` / `__TIME__` expand
         // deterministically. The real compile uses the same value.
         if let Some(epoch) = effective_source_date_epoch() {
@@ -11941,6 +11951,26 @@ mod tests {
         assert!(cc_expansion_is_stdout(&stdout));
         assert!(!cc_expansion_is_stdout(&named));
         assert!(!cc_expansion_is_stdout(&compile));
+    }
+
+    #[test]
+    fn cc_is_internal_key_probe_reads_the_probe_env() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let previous = std::env::var_os("KACHE_CC_KEY_PROBE");
+        unsafe {
+            std::env::remove_var("KACHE_CC_KEY_PROBE");
+        }
+        assert!(!cc_is_internal_key_probe());
+        unsafe {
+            std::env::set_var("KACHE_CC_KEY_PROBE", "1");
+        }
+        assert!(cc_is_internal_key_probe());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("KACHE_CC_KEY_PROBE", value),
+                None => std::env::remove_var("KACHE_CC_KEY_PROBE"),
+            }
+        }
     }
 
     #[cfg(unix)]

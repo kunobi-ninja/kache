@@ -1379,6 +1379,22 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let parsed = compiler
         .parse(wrapper_args)
         .context("parsing cc-family arguments")?;
+    if crate::compiler::cc::cc_is_internal_key_probe() {
+        let crate_name = parsed
+            .sources
+            .first()
+            .and_then(|s| s.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        return cc_direct_passthrough_with_event(
+            config,
+            &parsed,
+            &crate_name,
+            &cc_event_root(&parsed),
+            start,
+            "cc key probe".to_string(),
+        );
+    }
     let event_root = cc_event_root(&parsed);
 
     // The crate-name slot in events / metadata is the source file

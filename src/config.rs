@@ -3413,12 +3413,10 @@ fn isolate_cache_dir_for_trust_domain(base: PathBuf, domain: Option<&str>) -> Pa
         return base;
     };
     let Some(label) = sanitize_trust_domain(raw) else {
-        if !raw.trim().is_empty() {
-            tracing::warn!(
-                domain = %raw,
-                "KACHE_TRUST_DOMAIN is not a single path-safe label; using the unscoped cache dir"
-            );
-        }
+        tracing::warn!(
+            domain = %raw,
+            "KACHE_TRUST_DOMAIN is not a single path-safe label; using the unscoped cache dir"
+        );
         return base;
     };
     let isolated = base.join(label);
@@ -3493,6 +3491,8 @@ pub(crate) mod tests {
         ] {
             assert_eq!(sanitize_trust_domain(bad), None, "{bad:?}");
         }
+        let at_max = "a".repeat(TRUST_DOMAIN_MAX_LEN);
+        assert_eq!(sanitize_trust_domain(&at_max), Some(at_max.as_str()));
         let too_long = "a".repeat(TRUST_DOMAIN_MAX_LEN + 1);
         assert_eq!(sanitize_trust_domain(&too_long), None);
     }
@@ -3517,6 +3517,11 @@ pub(crate) mod tests {
             isolate_cache_dir_for_trust_domain(base.clone(), Some("../escape")),
             base,
             "unsafe labels fail open"
+        );
+        assert_eq!(
+            isolate_cache_dir_for_trust_domain(base.clone(), Some("   ")),
+            base,
+            "whitespace-only labels fail open"
         );
 
         let file = dir.path().join("not-a-dir");

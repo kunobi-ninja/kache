@@ -9173,6 +9173,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn execute_opt_in_link_writes_the_output() {
+        let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let src_a = dir.path().join("a.c");
         let src_b = dir.path().join("b.c");

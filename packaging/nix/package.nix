@@ -62,6 +62,10 @@ buildRustPackage {
   # The tmutil xattr test shells out to /usr/bin/tmutil which isn't in the sandbox.
   checkFlags = lib.optionals stdenv.hostPlatform.isDarwin [
     "--skip=store::tests::test_exclude_from_indexing_sets_tmutil_xattr"
+    # Nix's sandbox rejects sandbox_apply for these nested sandbox fixtures.
+    # The regular macOS CI job runs both against real allowed/denied processes.
+    "--skip=fallback::macos::tests::policy_distinguishes_denied_and_allowed_output"
+    "--skip=sandbox_preflight_bypasses_denied_server_but_keeps_allowed_server"
   ];
 
   # planner_client / remote_backend tests bind 127.0.0.1. Darwin's Nix sandbox

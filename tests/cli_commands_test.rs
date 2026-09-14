@@ -1632,6 +1632,16 @@ fn why_miss_reports_key_mismatch_after_source_edit() {
         "first build failed"
     );
 
+    let first_diagnosis = e
+        .cmd()
+        .args(["--json", "why-miss", "kachediff"])
+        .output()
+        .unwrap();
+    assert!(first_diagnosis.status.success());
+    let first_diagnosis: serde_json::Value =
+        serde_json::from_slice(&first_diagnosis.stdout).unwrap();
+    let first_key = first_diagnosis["cache_key"].as_str().unwrap();
+
     // Edit the source -> different key -> a second miss + second stored entry.
     std::fs::remove_dir_all(&target_dir).ok();
     std::fs::write(
@@ -1653,7 +1663,11 @@ fn why_miss_reports_key_mismatch_after_source_edit() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Why `kachediff` missed"))
-        .stdout(predicates::str::contains("Diagnosis: key mismatch"));
+        .stdout(predicates::str::contains("Diagnosis: key mismatch"))
+        .stdout(predicates::str::contains(format!(
+            "same config as {} -- likely source code, dependency, or rustc version change",
+            &first_key[..12],
+        )));
 
     // Two distinct stored entries are listed for the crate.
     e.cmd()

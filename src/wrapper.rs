@@ -9284,7 +9284,8 @@ exit 0
 
     /// Answers `RemoteCheck` with a fixed `found` flag. `send_remote_check`
     /// probes reachability before the real request, so the accept loop must
-    /// survive empty connections.
+    /// survive empty connections. Local-only tests also use this listener to
+    /// intercept accidental uploads without starting a real daemon.
     struct RemoteCheckReplyDaemon {
         stop: Arc<AtomicBool>,
         requests: Arc<AtomicUsize>,
@@ -9647,6 +9648,7 @@ exit 0
         let key = blake3::hash(b"cc-cl-debug-no-upload").to_hex().to_string();
         seed_cc_object_entry(&store, &key, dir.path());
 
+        let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
         let _lock = crate::config::config_path_lock();
         let _isolated = isolate_daemon_autostart(dir.path());
         maybe_enqueue_upload(&config, &store, &key, "foo.c", false);
@@ -9669,6 +9671,8 @@ exit 0
         let local_store = Store::open(&local).unwrap();
         seed_cc_object_entry(&local_store, &key, dir.path());
 
+        let _readonly_daemon = RemoteCheckReplyDaemon::spawn(readonly.socket_path(), false);
+        let _local_daemon = RemoteCheckReplyDaemon::spawn(local.socket_path(), false);
         let _lock = crate::config::config_path_lock();
         let _isolated = isolate_daemon_autostart(dir.path());
         maybe_enqueue_upload(&readonly, &readonly_store, &key, "foo.c", true);
@@ -9976,8 +9980,14 @@ exit 0
         let argv_file = dir.path().join("argv");
         let epoch_file = dir.path().join("epoch");
         let config = test_config(dir.path().join("cache"));
+        let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
 
         assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(
+            spool_intent_count(&config),
+            0,
+            "local-only compile queued an upload"
+        );
         assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
         assert_eq!(
             std::fs::read_to_string(work.join("kernel.o")).unwrap(),
@@ -10027,6 +10037,7 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let (work, nvcc, count, _) = setup_nvcc_case(&dir, None, None, 0, 0);
         let config = test_config(dir.path().join("cache"));
+        let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
 
         // Without -MF: object-only entry.
         let bare = vec![
@@ -10037,6 +10048,11 @@ exit 0
             work.join("kernel.o").to_string_lossy().into_owned(),
         ];
         assert_eq!(run_nvcc(&config, &bare).unwrap(), 0);
+        assert_eq!(
+            spool_intent_count(&config),
+            0,
+            "local-only compile queued an upload"
+        );
         // With -MF: the object-only entry cannot satisfy it — evict,
         // recompile, store both artifacts…
         let with_dep = nvcc_compile_argv(&nvcc, &work, &[]);
@@ -10157,12 +10173,17 @@ exit 0
 
         let config = test_config(dir.path().join("cache"));
         let argv = nvcc_compile_argv(&nvcc, &work, &[]);
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+        wait_until_reachable(&config.socket_path());
         let (store, parsed, key) = seed_nvcc_entry(&config, &argv);
+        assert_eq!(
+            spool_intent_count(&config),
+            0,
+            "seeding must remain local-only"
+        );
         std::fs::remove_file(work.join("kernel.o")).unwrap();
         std::fs::remove_file(work.join("kernel.d")).unwrap();
 
-        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
-        wait_until_reachable(&config.socket_path());
         let requests_before = daemon.request_count();
         let start = std::time::Instant::now();
 
@@ -10393,9 +10414,15 @@ exit 0
         );
 
         let config = test_config(dir.path().join("cache"));
+        let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
 
         let argv = nvcc_compile_argv(&nvcc, &work, &[]);
         assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(
+            spool_intent_count(&config),
+            0,
+            "local-only compile queued an upload"
+        );
         assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
         assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
 
@@ -10427,8 +10454,14 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let (_work, _nvcc, count, argv) = setup_nvcc_case(&dir, None, None, 0, 0);
         let config = test_config(dir.path().join("cache"));
+        let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
 
         assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
+        assert_eq!(
+            spool_intent_count(&config),
+            0,
+            "local-only compile queued an upload"
+        );
         assert_eq!(run_nvcc(&config, &argv).unwrap(), 0);
         assert_eq!(std::fs::read_to_string(&count).unwrap(), "run\n");
 
@@ -10604,8 +10637,15 @@ exit 0
         );
 
         let config = test_config(dir.path().join("cache"));
+        let _daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), false);
+
         let argv = nvcc_compile_argv(&nvcc, &work, &[]);
         let (store, parsed, key) = seed_nvcc_entry(&config, &argv);
+        assert_eq!(
+            spool_intent_count(&config),
+            0,
+            "local-only compile queued an upload"
+        );
 
         let meta = store.get(&key).unwrap().unwrap();
         for file in &meta.files {

@@ -815,6 +815,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p kache --test custom_harness_test
+          cargo test -p kache --test integration_test test_rust_restored_outputs_allow_build_without_wrapper
           cargo test -p kache-fs --all-features
           cargo test -p kache-store --lib
           cargo test -p kache --bins -- store:: wrapper::tests::materialize_cached_artifact

@@ -276,10 +276,8 @@ pub fn link_to_target(store_path: &Path, target_path: &Path, strategy: LinkStrat
         let reflink_err = match try_reflink(store_path, target_path) {
             Ok(()) => {
                 match strategy {
-                    LinkStrategy::Hardlink => {}
-                    // Reflink preserves source mode (read-only for stored
-                    // blobs). Independent restores need consumer-facing
-                    // permissions without discarding umask-shaped read bits.
+                    LinkStrategy::Hardlink => set_owner_write_permission(target_path)?,
+                    // Executables and loadable libraries also need execute bits.
                     LinkStrategy::Copy => set_executable_permissions(target_path)?,
                 }
                 tracing::debug!(
@@ -856,6 +854,21 @@ fn windows_volume_root(path: &Path) -> Option<String> {
     }
     let len = root.iter().position(|&c| c == 0).unwrap_or(root.len());
     Some(String::from_utf16_lossy(&root[..len]))
+}
+
+/// Grant owner write access on an independent restore, retaining other bits.
+/// Call only after the target is known to have its own inode.
+fn set_owner_write_permission(path: &Path) -> Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("setting owner write permission on {}", path.display()))
 }
 
 /// Set 0o755 after an executable/dylib reflink. Reflink preserves the store
@@ -1953,6 +1966,106 @@ mod tests {
         // independent inode) on APFS/btrfs/XFS-with-reflink, or hardlink
         // (shared inode) as fallback. We don't assert which mechanism was
         // used — either satisfies the contract.
+    }
+
+    #[test]
+    fn owner_write_permission_preserves_other_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("restored");
+        fs::write(&target, b"artifact").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for (before, after) in [
+                (0o400, 0o600),
+                (0o440, 0o640),
+                (0o444, 0o644),
+                (0o555, 0o755),
+                (0o600, 0o600),
+            ] {
+                fs::set_permissions(&target, fs::Permissions::from_mode(before)).unwrap();
+                set_owner_write_permission(&target).unwrap();
+                assert_eq!(
+                    fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    after
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(&target).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&target, permissions).unwrap();
+            set_owner_write_permission(&target).unwrap();
+            assert!(!fs::metadata(&target).unwrap().permissions().readonly());
+        }
+        fs::write(&target, b"rebuilt artifact").unwrap();
+        assert!(set_owner_write_permission(&dir.path().join("missing")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reflink_restore_adds_owner_write_without_changing_blob_or_other_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        let probe = dir.path().join("probe");
+        let target = dir.path().join("output.rlib");
+        fs::write(&blob, b"cached artifact").unwrap();
+        for mode in [0o400, 0o440, 0o444, 0o555] {
+            fs::set_permissions(&blob, fs::Permissions::from_mode(mode)).unwrap();
+            if let Err(error) = try_reflink(&blob, &probe) {
+                eprintln!("reflink unavailable on test filesystem: {error}");
+                return;
+            }
+            let clone_mode = fs::metadata(&probe).unwrap().permissions().mode() & 0o777;
+            fs::remove_file(&probe).unwrap();
+
+            link_to_target(&blob, &target, LinkStrategy::Hardlink).unwrap();
+            let restored = fs::metadata(&target).unwrap();
+            assert_ne!(restored.ino(), fs::metadata(&blob).unwrap().ino());
+            assert_eq!(restored.permissions().mode() & 0o777, clone_mode | 0o200);
+            fs::write(&target, b"rebuilt artifact").unwrap();
+            assert_eq!(fs::read(&blob).unwrap(), b"cached artifact");
+            assert_eq!(
+                fs::metadata(&blob).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_restore_keeps_shared_inode_readonly_and_copy_writable() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        let linked = dir.path().join("linked.rlib");
+        let copied = dir.path().join("copied.rlib");
+        fs::write(&blob, b"cached artifact").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+
+        hardlink_or_copy(&blob, &linked, bytes).unwrap();
+        assert_eq!(
+            fs::metadata(&linked).unwrap().ino(),
+            fs::metadata(&blob).unwrap().ino()
+        );
+        assert!(fs::metadata(&linked).unwrap().permissions().readonly());
+        hardlink_or_copy(&blob, &copied, bytes).unwrap();
+        assert_ne!(
+            fs::metadata(&copied).unwrap().ino(),
+            fs::metadata(&blob).unwrap().ino()
+        );
+        fs::write(&copied, b"rebuilt artifact").unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"cached artifact");
+        assert_eq!(fs::read(&linked).unwrap(), b"cached artifact");
+        assert_eq!(
+            fs::metadata(&blob).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
     }
 
     /// kunobi-ninja/kache#794: restoring the same blob into another target

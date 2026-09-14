@@ -67,6 +67,97 @@ fn run_cargo_test_with_kache(project: &Path, cache_dir: &Path, target_dir: &Path
     );
 }
 
+/// #971: a CoW restore must allow rustc to reuse the output paths after the
+/// user removes the wrapper. Real hardlinks retain their read-only contract.
+#[cfg(unix)]
+#[test]
+fn test_rust_restored_outputs_allow_build_without_wrapper() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempDir::new_in(common::scratch_dir()).unwrap();
+    let cache = TempDir::new_in(common::scratch_dir()).unwrap();
+    let target = project.path().join("target");
+    let source = project.path().join("lib.rs");
+    fs::write(&source, "pub fn value() -> u32 { 42 }\n").unwrap();
+    let probe = project.path().join("clone-probe");
+    if let Err(error) = kache_store::link::try_reflink(&source, &probe) {
+        eprintln!("reflink unavailable on test filesystem: {error}");
+        return;
+    }
+    fs::remove_file(&probe).unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"permission_probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+         [lib]\npath = \"lib.rs\"\n[workspace]\n",
+    )
+    .unwrap();
+
+    run_cargo_build_with_kache(project.path(), cache.path(), &target);
+    fs::remove_dir_all(&target).unwrap();
+    run_cargo_build_with_kache(project.path(), cache.path(), &target);
+    let report = kache_report(cache.path());
+    let event = report["all_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|event| event["crate_name"] == "permission_probe")
+        .unwrap();
+    assert_eq!(event["result"], "local_hit");
+    assert_eq!(event["compiler_runs"], 0);
+
+    let mut blobs = Vec::new();
+    for shard in fs::read_dir(cache.path().join("store/blobs")).unwrap() {
+        for entry in fs::read_dir(shard.unwrap().path()).unwrap() {
+            let path = entry.unwrap().path();
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o222, 0, "cached blob must be read-only");
+            blobs.push((path.clone(), fs::read(&path).unwrap(), mode));
+        }
+    }
+    assert!(!blobs.is_empty());
+
+    // Keep the restored artifacts while forcing Cargo to invoke rustc again.
+    fs::remove_dir_all(target.join("debug/.fingerprint")).unwrap();
+    let unwrapped = hermetic_command(
+        "cargo",
+        cache.path(),
+        Some(&isolated_config_path(cache.path())),
+    )
+    .args([
+        "build",
+        "--lib",
+        "--offline",
+        "--config",
+        "build.rustc-wrapper=\"\"",
+    ])
+    .current_dir(project.path())
+    .env("RUSTC_WRAPPER", "")
+    .env("CARGO_TARGET_DIR", &target)
+    .env("CARGO_INCREMENTAL", "0")
+    .output()
+    .unwrap();
+    assert!(
+        unwrapped.status.success(),
+        "unwrapped rebuild failed: {}",
+        String::from_utf8_lossy(&unwrapped.stderr)
+    );
+    assert!(String::from_utf8_lossy(&unwrapped.stderr).contains("Compiling permission_probe"));
+    for (path, bytes, mode) in blobs {
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "unwrapped build changed cache bytes"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode(),
+            mode,
+            "unwrapped build changed cache permissions"
+        );
+    }
+}
+
 fn kache_report(cache_dir: &Path) -> serde_json::Value {
     let output = hermetic_command(
         kache_binary(),

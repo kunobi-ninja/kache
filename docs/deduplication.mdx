@@ -25,6 +25,8 @@ Kache chooses the safest available method per artifact:
 
 Executable and loadable outputs use clone or copy, never the hardlink fallback, because signing, stripping, or another consumer may modify them. Windows copies on non-CoW volumes unless the unsafe `windows_hardlink` option is enabled.
 
+Restored reflinks and copies are writable by their owner, so a later compiler invocation can overwrite them after you remove the Kache wrapper. Adding owner write access to a reflink preserves its other permissions and leaves the cache blob read-only. A real hardlink shares permissions with the blob and stays read-only; rebuilding those outputs without Kache can require removing them first.
+
 Reflinks have independent inodes. A later write copies changed blocks instead of modifying the store blob.
 
 ## Monitor metrics

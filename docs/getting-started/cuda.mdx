@@ -55,7 +55,7 @@ Anything Kache does not model runs the real `nvcc` uncached, including:
 - relocatable and separable device code (`-rdc`, `-dc`);
 - device debug (`-G`);
 - machine-resolved values (`-march=native`, `-arch=native`, …) — one key must never cover different objects, so these refuse even when allow-listed;
-- dep-info without an explicit path (bare `-M` / `-MD` / `-MMD`) — request `-MF <file>` instead;
+- dependency generation without an explicit output (`-M`, `-MM`) or without `-MF` (`-MD`, `-MMD` alone) — combine `-MD`/`-MMD` with `-MF <file>` instead;
 - compiles without `-o`;
 - `-keep` / `--save-temps`, profiling (`--time`), response files (`@file`);
 - any flag outside the built-in table (see below).

@@ -70,13 +70,19 @@ pub struct NvccArgs {
     pub sources: Vec<PathBuf>,
     /// `-o <file>`.
     pub output: Option<PathBuf>,
-    /// `-MF <file>` / `-MF<file>`: explicit dep-info sidecar. The only
-    /// dep-info shape v1 caches — bare `-M`/`-MD`/`-MMD` name the sidecar
-    /// implicitly (derived from the output), and an unvalidated guess at
-    /// nvcc's derivation is a misplaced-restore waiting to happen.
+    /// `-MF <file>` / `-MF<file>`: explicit dep-info sidecar. Cached
+    /// together with `-MD` / `-MMD`, which are the only generation modes
+    /// v1 accepts: per the driver docs the `-MF` path is only honored
+    /// with a generate-dependencies mode, and a bare `-MD` would leave
+    /// the sidecar name to an unvalidated derivation rule.
     pub depfile: Option<PathBuf>,
-    /// Bare `-M`/`-MM`/`-MD`/`-MMD`/`-MG`/`-MP`/`--generate-dependencies`:
-    /// refused (see `depfile`).
+    /// `-MD` / `-MMD`: generate dependencies *and* compile. Allowed only
+    /// together with an explicit `-MF` path (see `depfile`); on its own
+    /// the sidecar name is derived and v1 refuses to guess it.
+    pub depgen_with_compile: bool,
+    /// Bare `-M`/`-MM`/`-MG`/`-MP`/`--generate-dependencies`: always
+    /// refused (see `depfile`). `-M`/`-MM` also skip the compile, so
+    /// there is no object to cache.
     pub implicit_depfile: bool,
     /// `-dc` or `-rdc=true`: relocatable / separable device code.
     pub separate_device_code: bool,
@@ -203,6 +209,7 @@ impl NvccArgs {
             sources: Vec::new(),
             output: None,
             depfile: None,
+            depgen_with_compile: false,
             implicit_depfile: false,
             separate_device_code: false,
             device_debug: false,
@@ -320,10 +327,19 @@ impl NvccArgs {
                     parsed.xcompiler_values.push(value.to_string());
                     parsed.deferred_flags.push(arg.to_string());
                 }
-                // Bare `-M` family: nvcc derives the sidecar name from the
-                // output, and v1 does not guess at that derivation.
-                "-M" | "-MM" | "-MD" | "-MMD" | "-MG" | "-MP" | "--generate-dependencies" => {
+                // Bare `-M` family without compile: nvcc emits no object
+                // (and the sidecar name would be derived), so v1 refuses.
+                // `-MD`/`-MMD` are handled below: they compile, and are
+                // fine with an explicit `-MF` path.
+                "-M" | "-MM" | "-MG" | "-MP" | "--generate-dependencies" => {
                     parsed.implicit_depfile = true;
+                }
+                // `-MD`/`-MMD` generate dependencies *and* compile. Keyed
+                // verbatim (a different dep mode is a different build);
+                // the refuse check below requires an explicit `-MF` path.
+                "-MD" | "-MMD" => {
+                    parsed.depgen_with_compile = true;
+                    parsed.deferred_flags.push(arg.to_string());
                 }
                 _ if arg == "-rdc" => parsed.separate_device_code = true,
                 _ if arg.starts_with("-rdc=") || arg.starts_with("--relocatable-device-code=") => {
@@ -441,7 +457,12 @@ impl NvccArgs {
         }
         if self.implicit_depfile {
             reasons.push(RefuseReason::Unsupported(
-                "nvcc implicit depfile (-M/-MD/-MMD) — pass -MF <file> (not yet supported)",
+                "nvcc dependency-only mode (-M/-MM) — not yet supported",
+            ));
+        }
+        if self.depgen_with_compile && self.depfile.is_none() {
+            reasons.push(RefuseReason::Unsupported(
+                "nvcc implicit depfile (-MD/-MMD without -MF) — pass -MF <file> (not yet supported)",
             ));
         }
         if nvcc_xcompiler_smuggles_pp(&self.xcompiler_values) {
@@ -1517,22 +1538,49 @@ mod tests {
 
     #[test]
     fn bare_depinfo_flags_set_implicit_depfile() {
-        for flag in [
-            "-M",
-            "-MM",
-            "-MD",
-            "-MMD",
-            "-MG",
-            "-MP",
-            "--generate-dependencies",
-        ] {
+        for flag in ["-M", "-MM", "-MG", "-MP", "--generate-dependencies"] {
             let parsed = parse_ok(&["nvcc", "-c", "k.cu", "-o", "k.o", flag]);
             assert!(parsed.implicit_depfile, "{flag} must set implicit_depfile");
             assert!(
                 parsed.refuse_reasons(&[]).iter().any(|r| {
-                    matches!(r, RefuseReason::Unsupported(d) if d.contains("implicit depfile"))
+                    matches!(r, RefuseReason::Unsupported(d) if d.contains("dependency-only"))
                 }),
                 "{flag} must refuse with the depfile reason"
+            );
+        }
+    }
+
+    #[test]
+    fn depgen_with_compile_needs_explicit_mf() {
+        // `-MD -MF k.d` / `-MMD -MF k.d` is the supported depinfo shape:
+        // generation mode keyed verbatim, sidecar path explicit.
+        for flag in ["-MD", "-MMD"] {
+            let parsed = parse_ok(&["nvcc", "-c", "k.cu", "-o", "k.o", flag, "-MF", "k.d"]);
+            assert!(
+                parsed.depgen_with_compile,
+                "{flag} must set depgen_with_compile"
+            );
+            assert!(!parsed.implicit_depfile);
+            assert_eq!(parsed.depinfo_output_path(), Some(PathBuf::from("k.d")));
+            assert!(
+                parsed.deferred_flags.iter().any(|f| f == flag),
+                "{flag} must be keyed, got {:?}",
+                parsed.deferred_flags
+            );
+            assert!(
+                parsed.refuse_reasons(&[]).is_empty(),
+                "{flag} with -MF must be cacheable, got {:?}",
+                parsed.refuse_reasons(&[])
+            );
+        }
+        // Without `-MF` the sidecar name would be derived: refuse.
+        for flag in ["-MD", "-MMD"] {
+            let parsed = parse_ok(&["nvcc", "-c", "k.cu", "-o", "k.o", flag]);
+            assert!(
+                parsed.refuse_reasons(&[]).iter().any(|r| {
+                    matches!(r, RefuseReason::Unsupported(d) if d.contains("-MF <file>"))
+                }),
+                "{flag} without -MF must refuse with the -MF reason"
             );
         }
     }

@@ -432,16 +432,18 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-${{ matrix.name }}
-          # Reports, per-phase JSON/MD, key-diff, ALL top-level logs
-          # (build-cold/build-warm/wrapper-* — the build logs hold the actual
-          # compile error on a failed run), and sccache's *.sccache-adv.txt stats
-          # for the sccache arm. These are flat globs in the scratch dir, so they
-          # exclude the multi-GB clone worktrees / objdirs / cache.
+          # Reports, per-phase JSON/MD, Chrome traces, key-diff, ALL top-level
+          # logs (build-cold/build-warm/wrapper-* — the build logs hold the
+          # actual compile error on a failed run), and sccache's
+          # *.sccache-adv.txt stats for the sccache arm. These are flat globs
+          # in the scratch dir, so they exclude the multi-GB clone worktrees /
+          # objdirs / cache.
           path: |
             tmp/bench/${{ matrix.dir }}/*.json
             tmp/bench/${{ matrix.dir }}/*.md
             tmp/bench/${{ matrix.dir }}/report-*.json
             tmp/bench/${{ matrix.dir }}/report-*.md
+            tmp/bench/${{ matrix.dir }}/trace-*.json
             tmp/bench/${{ matrix.dir }}/key-diff.*
             tmp/bench/${{ matrix.dir }}/*.log
             tmp/bench/${{ matrix.dir }}/*.txt
@@ -711,6 +713,7 @@ jobs:
             ${{ runner.temp }}/f/*.md
             ${{ runner.temp }}/f/report-*.json
             ${{ runner.temp }}/f/report-*.md
+            ${{ runner.temp }}/f/trace-*.json
             ${{ runner.temp }}/f/key-diff.*
             ${{ runner.temp }}/f/*.log
             ${{ runner.temp }}/f/*.txt
@@ -976,6 +979,7 @@ jobs:
             ${{ runner.temp }}/b/*.md
             ${{ runner.temp }}/b/report-*.json
             ${{ runner.temp }}/b/report-*.md
+            ${{ runner.temp }}/b/trace-*.json
             ${{ runner.temp }}/b/key-diff.*
             ${{ runner.temp }}/b/*.log
             ${{ runner.temp }}/b/*.txt

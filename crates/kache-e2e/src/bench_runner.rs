@@ -60,8 +60,9 @@
 //! # Reading the output
 //!
 //! Each run prints a summary block and writes `tmp/bench/<scenario>/<scenario>.json`
-//! plus per-phase reports (`report-<phase>.*`), build logs
-//! (`build-<phase>.log`), wrapper logs (`wrapper-<phase>.log`), OTLP
+//! plus per-phase reports (`report-<phase>.*`), Chrome traces
+//! (`trace-<phase>.json`), build logs (`build-<phase>.log`), wrapper logs
+//! (`wrapper-<phase>.log`), OTLP
 //! gauges (`metrics.otlp.json`, `kache.bench.*`), and cache counters
 //! (`cache-otlp-<phase>/metrics.otlp.json`, `kache.cache.*`) for kartero.
 //! By default each scenario writes under its own `./tmp/bench/<scenario>` (so
@@ -2888,6 +2889,142 @@ fn mbx_report_path(work_dir: &Path, phase: &str) -> PathBuf {
     work_dir.join(format!("report-{phase}.mbx.json"))
 }
 
+/// Session JSONL lives under the store at `sessions/v1/<id>.jsonl`.
+fn mbx_sessions_dir(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("sessions").join("v1")
+}
+
+fn mbx_trace_path(work_dir: &Path, phase: &str) -> PathBuf {
+    work_dir.join(format!("trace-{phase}.json"))
+}
+
+/// Session files present under the store. Missing `sessions/v1` is empty, not
+/// an error: a fixture or a command that compiled nothing leaves nothing.
+fn list_mbx_session_files(cache_dir: &Path) -> Result<BTreeSet<PathBuf>> {
+    let dir = mbx_sessions_dir(cache_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading {}", dir.display()));
+        }
+    };
+    let mut files = BTreeSet::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading {}", dir.display()))?
+            .path();
+        if path.extension().is_some_and(|ext| ext == "jsonl") && path.is_file() {
+            files.insert(path);
+        }
+    }
+    Ok(files)
+}
+
+/// mbx names sessions `{unix-ms}-{pid}-{rand}.jsonl`. The leading integer is
+/// the start time; a larger value is a later session.
+fn mbx_session_order(path: &Path) -> (u64, String) {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_string();
+    let stem = name.strip_suffix(".jsonl").unwrap_or(name.as_str());
+    let head = stem.split_once('-').map(|(head, _)| head).unwrap_or(stem);
+    let ts = head.parse::<u64>().unwrap_or(0);
+    (ts, name)
+}
+
+fn write_mbx_trace(dest: &Path, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    std::fs::write(dest, bytes).with_context(|| format!("writing {}", dest.display()))
+}
+
+fn export_mbx_session_trace(mbx: &Path, session: &Path, dest: &Path) -> Result<()> {
+    let output = Command::new(mbx)
+        .args(["cache", "trace"])
+        .arg(session)
+        .output()
+        .with_context(|| {
+            format!(
+                "running `{} cache trace {}`",
+                mbx.display(),
+                session.display()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`{} cache trace {}` failed ({}): {}",
+            mbx.display(),
+            session.display(),
+            output.status,
+            stderr.trim()
+        );
+    }
+    write_mbx_trace(dest, &output.stdout)
+}
+
+/// Export the session this phase created. None new (fixtures, or a command
+/// that compiled nothing) is a no-op, not a failed run.
+fn export_new_mbx_session_trace(
+    mbx: &Path,
+    cache_dir: &Path,
+    work_dir: &Path,
+    phase: &str,
+    before: &BTreeSet<PathBuf>,
+) -> Result<()> {
+    let after = list_mbx_session_files(cache_dir)?;
+    let Some(session) = after
+        .difference(before)
+        .max_by_key(|path| mbx_session_order(path))
+    else {
+        return Ok(());
+    };
+    export_mbx_session_trace(mbx, session, &mbx_trace_path(work_dir, phase))
+}
+
+fn mbx_trace_artifacts(work_dir: &Path, phases: &[&str]) -> Vec<String> {
+    let mut names = Vec::new();
+    for phase in phases {
+        let name = format!("trace-{phase}.json");
+        if work_dir.join(&name).is_file() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn measure_mbx_phase(
+    profile: &BenchProfile,
+    clone: &Path,
+    phase: &str,
+    cache_dir: &Path,
+    mbx: &Path,
+    work_dir: &Path,
+    sh: &Path,
+) -> Result<MbxPhaseMetrics> {
+    let before = list_mbx_session_files(cache_dir)?;
+    let wall_ms = build(
+        profile,
+        clone,
+        phase,
+        cache_dir,
+        &work_dir.join("mbx-config-unused.toml"),
+        mbx,
+        work_dir,
+        CacheBackend::Mbx,
+        false,
+        sh,
+    )?
+    .wall_ms;
+    let metrics = capture_mbx_report(work_dir, phase, wall_ms)?;
+    export_new_mbx_session_trace(mbx, cache_dir, work_dir, phase, &before)?;
+    Ok(metrics)
+}
+
 /// One phase of the mbx arm, reduced from its stats report (version 4).
 /// Field names follow the report; durations are converted to seconds.
 #[derive(Debug, Serialize, Deserialize)]
@@ -3081,20 +3218,15 @@ fn run_mbx_cold_phase(
         std::fs::remove_dir_all(cache_dir).context("clearing mbx cache dir")?;
     }
     std::fs::create_dir_all(cache_dir)?;
-    let cold_ms = build(
+    let cold_metrics = measure_mbx_phase(
         profile,
         clone_a,
         Phase::Cold.name(),
         cache_dir,
-        &work_dir.join("mbx-config-unused.toml"),
         mbx,
         work_dir,
-        CacheBackend::Mbx,
-        false,
         sh,
-    )?
-    .wall_ms;
-    let cold_metrics = capture_mbx_report(work_dir, Phase::Cold.name(), cold_ms)?;
+    )?;
     source::snapshot_dir(cache_dir, &work_dir.join("cache-after-cold"))?;
     Ok(cold_metrics)
 }
@@ -3157,19 +3289,15 @@ fn run_mbx_bench(
     };
 
     let same_tree_metrics = if warm_same_tree {
-        let measured = build(
+        let metrics = measure_mbx_phase(
             profile,
             clone_a,
             Phase::WarmSameTree.name(),
             cache_dir,
-            &work_dir.join("mbx-config-unused.toml"),
             mbx,
             work_dir,
-            CacheBackend::Mbx,
-            false,
             sh,
         )?;
-        let metrics = capture_mbx_report(work_dir, Phase::WarmSameTree.name(), measured.wall_ms)?;
         anyhow::ensure!(
             metrics.hits > 0,
             "mbx same-tree warm phase restored nothing"
@@ -3179,20 +3307,15 @@ fn run_mbx_bench(
         None
     };
 
-    let warm_ms = build(
+    let warm_metrics = measure_mbx_phase(
         profile,
         clone_b,
         Phase::Warm.name(),
         cache_dir,
-        &work_dir.join("mbx-config-unused.toml"),
         mbx,
         work_dir,
-        CacheBackend::Mbx,
-        false,
         sh,
-    )?
-    .wall_ms;
-    let warm_metrics = capture_mbx_report(work_dir, Phase::Warm.name(), warm_ms)?;
+    )?;
 
     let disk_measured_bytes = disk_delta(disk_free_before, available_bytes(work_dir));
     let speedup = phase_speedup(cold_metrics.wall_ms, warm_metrics.wall_ms);
@@ -3247,6 +3370,10 @@ fn run_mbx_bench(
             "build-warm-same-tree.log".into(),
         ]);
     }
+    result.reports.extend(mbx_trace_artifacts(
+        work_dir,
+        &["cold", "warm-same-tree", "warm"],
+    ));
     let mut phases = vec![
         otlp_mbx_phase("cold", &result.cold, result.cold_objdir_bytes),
         otlp_mbx_phase("warm", &result.warm, result.warm_objdir_bytes),
@@ -3314,19 +3441,7 @@ fn run_mbx_pull_bench(
         .args(["checkout", "--detach", child]))?;
     profile.apply_files(checkout, mbx)?;
     prepare_clone(profile, checkout, "pull", mbx, work, sh)?;
-    let measured = build(
-        profile,
-        checkout,
-        "pull",
-        cache,
-        &work.join("mbx-config-unused.toml"),
-        mbx,
-        work,
-        CacheBackend::Mbx,
-        false,
-        sh,
-    )?;
-    let pull = capture_mbx_report(work, "pull", measured.wall_ms)?;
+    let pull = measure_mbx_phase(profile, checkout, "pull", cache, mbx, work, sh)?;
     let disk = crate::disk_usage::measure(cache, &[checkout.join(&profile.objdir)]);
     let result = serde_json::json!({"project": profile.name, "git_ref": profile.git_ref,
         "ref_next": child, "cache_backend": "mbx", "cache_tool_version": version,
@@ -6374,6 +6489,217 @@ mod tests {
             mbx_report_path(Path::new("/w"), "warm"),
             Path::new("/w/report-warm.mbx.json")
         );
+        assert_eq!(
+            mbx_trace_path(Path::new("/w"), "warm"),
+            Path::new("/w/trace-warm.json")
+        );
+        assert_eq!(
+            mbx_sessions_dir(Path::new("/cache")),
+            Path::new("/cache/sessions/v1")
+        );
+    }
+
+    #[test]
+    fn list_mbx_session_files_skips_locks_and_missing_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        assert!(list_mbx_session_files(&cache).unwrap().is_empty());
+
+        let sessions = mbx_sessions_dir(&cache);
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("1-1-aaaa.lock"), b"lock").unwrap();
+        std::fs::create_dir(sessions.join("2-1-bbbb.jsonl")).unwrap();
+        std::fs::write(sessions.join("3-1-cccc.jsonl"), b"session\n").unwrap();
+        let files = list_mbx_session_files(&cache).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files.iter().next().unwrap().file_name().unwrap(),
+            "3-1-cccc.jsonl"
+        );
+    }
+
+    #[test]
+    fn mbx_session_order_uses_the_leading_timestamp_not_the_name() {
+        // Unpadded names: string order would pick `20.jsonl` over `100.jsonl`.
+        assert!(
+            mbx_session_order(Path::new("100.jsonl")) > mbx_session_order(Path::new("20.jsonl"))
+        );
+        assert!(
+            mbx_session_order(Path::new("100-1-bbbb.jsonl"))
+                > mbx_session_order(Path::new("99-9-aaaa.jsonl"))
+        );
+    }
+
+    #[test]
+    fn write_mbx_trace_skips_empty_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("trace-warm.json");
+        write_mbx_trace(&dest, b"").unwrap();
+        assert!(!dest.exists(), "empty stdout must not create a trace file");
+        write_mbx_trace(&dest, b"{\"traceEvents\":[]}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "{\"traceEvents\":[]}"
+        );
+    }
+
+    #[test]
+    fn mbx_trace_artifacts_lists_only_files_that_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(mbx_trace_artifacts(dir.path(), &["cold", "warm"]).is_empty());
+        std::fs::write(dir.path().join("trace-warm.json"), b"{}").unwrap();
+        assert_eq!(
+            mbx_trace_artifacts(dir.path(), &["cold", "warm"]),
+            vec!["trace-warm.json"]
+        );
+    }
+
+    #[cfg(unix)]
+    fn unix_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn fake_mbx_trace(dir: &Path) -> PathBuf {
+        unix_script(
+            dir,
+            "fake-mbx",
+            r#"#!/bin/sh
+if [ "$1" = cache ] && [ "$2" = trace ]; then
+  session=$3
+  if [ ! -f "$session" ]; then
+    echo "missing session" >&2
+    exit 2
+  fi
+  printf '{"traceEvents":[{"name":"%s"}],"displayTimeUnit":"ms"}\n' "$(basename "$session")"
+  exit 0
+fi
+exit 0
+"#,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_mbx_session_trace_writes_stdout_and_rejects_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("1-1-aaaa.jsonl");
+        std::fs::write(&session, b"{}\n").unwrap();
+        let dest = dir.path().join("trace-cold.json");
+        export_mbx_session_trace(&fake_mbx_trace(dir.path()), &session, &dest).unwrap();
+        let body = std::fs::read_to_string(&dest).unwrap();
+        assert!(body.contains("1-1-aaaa.jsonl"), "{body}");
+
+        let empty = dir.path().join("trace-empty.json");
+        export_mbx_session_trace(Path::new("/usr/bin/true"), &session, &empty).unwrap();
+        assert!(
+            !empty.exists(),
+            "a successful trace with empty stdout must not write a file"
+        );
+
+        let failing = unix_script(dir.path(), "fail-mbx", "#!/bin/sh\necho boom >&2\nexit 7\n");
+        let err = export_mbx_session_trace(&failing, &session, &dir.path().join("nope.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exit 7") || err.contains("7"), "{err}");
+        assert!(err.contains("boom"), "{err}");
+        assert!(!dir.path().join("nope.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_new_mbx_session_trace_picks_the_session_this_phase_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let sessions = mbx_sessions_dir(&cache);
+        std::fs::create_dir_all(&sessions).unwrap();
+        let old = sessions.join("900-1-old.jsonl");
+        let new = sessions.join("100-1-new.jsonl");
+        std::fs::write(&old, b"old\n").unwrap();
+        std::fs::write(&new, b"new\n").unwrap();
+        let mut before = BTreeSet::new();
+        before.insert(old);
+        export_new_mbx_session_trace(
+            &fake_mbx_trace(dir.path()),
+            &cache,
+            dir.path(),
+            "warm",
+            &before,
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(dir.path().join("trace-warm.json")).unwrap();
+        assert!(body.contains("100-1-new.jsonl"), "{body}");
+        assert!(!body.contains("900-1-old.jsonl"), "{body}");
+
+        // Two new sessions: BTreeSet path order would pick `100-` first;
+        // the later timestamp must win.
+        std::fs::write(sessions.join("200-1-later.jsonl"), b"later\n").unwrap();
+        export_new_mbx_session_trace(
+            &fake_mbx_trace(dir.path()),
+            &cache,
+            dir.path(),
+            "warm",
+            &before,
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(dir.path().join("trace-warm.json")).unwrap();
+        assert!(body.contains("200-1-later.jsonl"), "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_new_mbx_session_trace_is_a_noop_without_a_new_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let sessions = mbx_sessions_dir(&cache);
+        std::fs::create_dir_all(&sessions).unwrap();
+        let old = sessions.join("1-1-old.jsonl");
+        std::fs::write(&old, b"old\n").unwrap();
+        let mut before = BTreeSet::new();
+        before.insert(old);
+        export_new_mbx_session_trace(
+            &fake_mbx_trace(dir.path()),
+            &cache,
+            dir.path(),
+            "warm",
+            &before,
+        )
+        .unwrap();
+        assert!(!dir.path().join("trace-warm.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mbx_cold_phase_exports_the_session_as_a_chrome_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut profile = prepare_fixture(&work, None);
+        profile.build = r#"
+            mkdir -p "$MBX_CACHE_DIR/sessions/v1"
+            printf '%s\n' '{"hits":1}' > "$MBX_STATS_REPORT"
+            printf '%s\n' '{}' > "$MBX_CACHE_DIR/sessions/v1/100-1-cold.jsonl"
+        "#
+        .into();
+        let clone = work.join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        let cache = work.join("cache");
+        run_mbx_cold_phase(
+            &profile,
+            &fake_mbx_trace(&work),
+            &cache,
+            &clone,
+            &work,
+            &posix_sh().unwrap(),
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(work.join("trace-cold.json")).unwrap();
+        assert!(body.contains("100-1-cold.jsonl"), "{body}");
+        assert!(work.join("report-cold.mbx.json").is_file());
     }
 
     /// Each threshold fires alone, and the message carries the number.
@@ -6921,6 +7247,8 @@ objdir = "target"
         assert!(is_run_artifact("prepare-cold.log"));
         assert!(is_run_artifact("prepare-warm.log"));
         assert!(is_run_artifact("key-diff.json"));
+        assert!(is_run_artifact("trace-cold.json"));
+        assert!(is_run_artifact("trace-warm.json"));
         assert!(!is_run_artifact("prepared.txt"));
     }
 

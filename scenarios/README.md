@@ -137,7 +137,9 @@ Every benchmark keeps root-level `report-*`, `build-*`, `wrapper-*`, and result
 JSON files as the latest run for `--retry`, and also archives those artifacts to
 `runs/<YYYYMMDDTHHMMSSZ>-<backend>-<pid>/` so repeated runs are preserved.
 Kache benchmark runs also write `trace-cold.json` and `trace-warm.json` in
-Perfetto/Chrome trace format; sccache benchmark runs write
+Perfetto/Chrome trace format. mbx runs write the same filenames by pointing
+the store at the scratch cache dir and running `mbx cache trace` on the
+session JSONL that phase created. sccache benchmark runs write
 `report-*.sccache.json` plus `report-*.sccache-adv.txt` from sccache's own
 stats commands. `--trace-keys` is kache-only and adds `key-diff.{json,md}` for
 cache-key divergence analysis.

@@ -25,6 +25,9 @@ use crate::store::{BuildClaim, EntryMeta, Store, StorePutResult};
 mod remote;
 use remote::{NegativeReply, acquire_entry, compiler_remote_enabled, maybe_enqueue_upload};
 
+mod hit;
+use hit::HitCompletion;
+
 mod rustc_hit;
 use rustc_hit::RustcHitContext;
 
@@ -839,28 +842,22 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 );
             }
             let restore_ms = restore_start.elapsed().as_millis() as u64;
-            let elapsed = start.elapsed().as_millis() as u64;
-            let size: u64 = meta.files.iter().map(|f| f.size).sum();
             tracing::debug!(
                 "nvcc local cache hit for {crate_name} ({})",
                 &cache_key[..16]
             );
-            log_event(
-                config,
-                &event_root,
-                &crate_name,
-                EventResult::LocalHit,
-                elapsed,
-                meta.compile_time_ms,
-                size,
-                &cache_key,
+            HitCompletion {
+                event_root: &event_root,
+                crate_name: &crate_name,
+                result: EventResult::LocalHit,
+                cache_key: &cache_key,
+                start,
                 key_ms,
+                key_hash_stats: FileHashStats::default(),
                 lookup_ms,
                 restore_ms,
-                0,
-            );
-            print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
-            replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+            }
+            .report(config, &meta);
             return Ok(0);
         }
     }
@@ -922,24 +919,18 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             );
         }
         let restore_ms = restore_start.elapsed().as_millis() as u64;
-        let elapsed = start.elapsed().as_millis() as u64;
-        let size: u64 = meta.files.iter().map(|f| f.size).sum();
-        log_event(
-            config,
-            &event_root,
-            &crate_name,
-            EventResult::LocalHit,
-            elapsed,
-            meta.compile_time_ms,
-            size,
-            &cache_key,
+        HitCompletion {
+            event_root: &event_root,
+            crate_name: &crate_name,
+            result: EventResult::LocalHit,
+            cache_key: &cache_key,
+            start,
             key_ms,
+            key_hash_stats: FileHashStats::default(),
             lookup_ms,
             restore_ms,
-            0,
-        );
-        print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
-        replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+        }
+        .report(config, &meta);
         return Ok(0);
     }
 
@@ -1281,24 +1272,18 @@ fn nvcc_try_remote_hit(
         )?));
     }
     let restore_ms = restore_start.elapsed().as_millis() as u64;
-    let elapsed = start.elapsed().as_millis() as u64;
-    let size: u64 = meta.files.iter().map(|f| f.size).sum();
-    log_event(
-        config,
+    HitCompletion {
         event_root,
         crate_name,
-        event_result,
-        elapsed,
-        meta.compile_time_ms,
-        size,
+        result: event_result,
         cache_key,
+        start,
         key_ms,
+        key_hash_stats: FileHashStats::default(),
         lookup_ms,
         restore_ms,
-        0,
-    );
-    print_progress(crate_name, event_result, elapsed, size);
-    replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+    }
+    .report(config, &meta);
     Ok(Some(0))
 }
 
@@ -1521,36 +1506,23 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 );
             }
             let restore_ms = restore_start.elapsed().as_millis() as u64;
-            let elapsed = start.elapsed().as_millis() as u64;
-            let size: u64 = meta.files.iter().map(|f| f.size).sum();
             tracing::debug!(
                 "cc local cache hit for {} ({})",
                 crate_name,
                 &cache_key[..16]
             );
-            log_event(
-                config,
-                &event_root,
-                &crate_name,
-                EventResult::LocalHit,
-                elapsed,
-                meta.compile_time_ms,
-                size,
-                &cache_key,
+            HitCompletion {
+                event_root: &event_root,
+                crate_name: &crate_name,
+                result: EventResult::LocalHit,
+                cache_key: &cache_key,
+                start,
                 key_ms,
+                key_hash_stats: FileHashStats::default(),
                 lookup_ms,
                 restore_ms,
-                0,
-            );
-            print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
-            // Replay the cached compiler diagnostics so warnings still
-            // surface on a cache hit.
-            replay_diagnostics(
-                &meta.stdout,
-                &meta.stderr,
-                std::io::stdout(),
-                std::io::stderr(),
-            );
+            }
+            .report(config, &meta);
 
             compiler.commit_preprocess_memo(&file_hasher);
 
@@ -1644,24 +1616,18 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             );
         }
         let restore_ms = restore_start.elapsed().as_millis() as u64;
-        let elapsed = start.elapsed().as_millis() as u64;
-        let size: u64 = meta.files.iter().map(|f| f.size).sum();
-        log_event(
-            config,
-            &event_root,
-            &crate_name,
-            EventResult::LocalHit,
-            elapsed,
-            meta.compile_time_ms,
-            size,
-            &cache_key,
+        HitCompletion {
+            event_root: &event_root,
+            crate_name: &crate_name,
+            result: EventResult::LocalHit,
+            cache_key: &cache_key,
+            start,
             key_ms,
+            key_hash_stats: FileHashStats::default(),
             lookup_ms,
             restore_ms,
-            0,
-        );
-        print_progress(&crate_name, EventResult::LocalHit, elapsed, size);
-        replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+        }
+        .report(config, &meta);
         compiler.commit_preprocess_memo(&file_hasher);
         return Ok(0);
     }
@@ -2401,24 +2367,18 @@ fn cc_try_remote_hit(
         )?));
     }
     let restore_ms = restore_start.elapsed().as_millis() as u64;
-    let elapsed = start.elapsed().as_millis() as u64;
-    let size: u64 = meta.files.iter().map(|f| f.size).sum();
-    log_event(
-        config,
+    HitCompletion {
         event_root,
         crate_name,
-        event_result,
-        elapsed,
-        meta.compile_time_ms,
-        size,
+        result: event_result,
         cache_key,
+        start,
         key_ms,
+        key_hash_stats: FileHashStats::default(),
         lookup_ms,
         restore_ms,
-        0,
-    );
-    print_progress(crate_name, event_result, elapsed, size);
-    replay_cached_diagnostics(&meta, std::io::stdout(), std::io::stderr());
+    }
+    .report(config, &meta);
     compiler.commit_preprocess_memo(file_hasher);
     Ok(Some(0))
 }
@@ -5267,38 +5227,6 @@ fn cc_direct_passthrough_with_event<R: Into<String>>(
     Ok(output.exit_code)
 }
 
-/// Log a build event.
-fn log_event(
-    config: &Config,
-    root: &str,
-    crate_name: &str,
-    result: EventResult,
-    elapsed_ms: u64,
-    compile_time_ms: u64,
-    size: u64,
-    cache_key: &str,
-    key_ms: u64,
-    lookup_ms: u64,
-    restore_ms: u64,
-    store_ms: u64,
-) {
-    log_event_with_hash_stats(
-        config,
-        root,
-        crate_name,
-        result,
-        elapsed_ms,
-        compile_time_ms,
-        size,
-        cache_key,
-        key_ms,
-        FileHashStats::default(),
-        lookup_ms,
-        restore_ms,
-        store_ms,
-    );
-}
-
 #[allow(clippy::too_many_arguments)]
 fn log_event_with_hash_stats(
     config: &Config,
@@ -5976,6 +5904,7 @@ fn clean_incremental_dir(config: &Config, args: &RustcArgs) {
 
 #[cfg(test)]
 mod tests {
+    mod hit;
     mod rustc_hit;
 
     use super::*;
@@ -10965,7 +10894,7 @@ exit 0
         crate::opcounts::record_flight_wait(std::time::Duration::from_millis(FLIGHT_MS));
         crate::opcounts::record_permit_wait(std::time::Duration::from_millis(PERMIT_MS));
 
-        log_event(
+        log_event_with_hash_stats(
             &config,
             "/repo",
             "foo",
@@ -10975,6 +10904,7 @@ exit 0
             30,
             "cache-key",
             40,
+            FileHashStats::default(),
             50,
             0,
             60,
@@ -11141,7 +11071,7 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().join("cache"));
 
-        log_event(
+        log_event_with_hash_stats(
             &config,
             "/repo",
             "foo",
@@ -11151,6 +11081,7 @@ exit 0
             30,
             "hit-key",
             0,
+            FileHashStats::default(),
             0,
             0,
             0,
@@ -11164,7 +11095,7 @@ exit 0
         );
 
         crate::verify_compare::record_report("content: libfoo.rlib (byte mismatch)".to_string());
-        log_event(
+        log_event_with_hash_stats(
             &config,
             "/repo",
             "foo",
@@ -11174,6 +11105,7 @@ exit 0
             30,
             "hit-key",
             0,
+            FileHashStats::default(),
             0,
             1,
             0,

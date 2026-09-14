@@ -1,7 +1,6 @@
 use super::{
-    BlobSource, Config, EntryMeta, EventResult, FileHashStats, RustcArgs, RustcCompiler, Store,
-    clean_incremental_dir, log_event_with_hash_stats, print_progress, record_input_prediction,
-    replay_cached_diagnostics, restore_from_cache,
+    BlobSource, Config, EntryMeta, EventResult, FileHashStats, HitCompletion, RustcArgs,
+    RustcCompiler, Store, clean_incremental_dir, record_input_prediction, restore_from_cache,
 };
 use anyhow::Result;
 use std::time::Instant;
@@ -43,26 +42,19 @@ impl RustcHitContext<'_> {
             self.extra_inputs,
         )?;
         let restore_ms = restore_start.elapsed().as_millis() as u64;
-        let elapsed = self.start.elapsed().as_millis() as u64;
-        let size = meta.files.iter().map(|file| file.size).sum();
-        log_event_with_hash_stats(
-            self.config,
-            self.event_root,
-            self.crate_name,
+        HitCompletion {
+            event_root: self.event_root,
+            crate_name: self.crate_name,
             result,
-            elapsed,
-            meta.compile_time_ms,
-            size,
             cache_key,
+            start: self.start,
             key_ms,
             key_hash_stats,
             lookup_ms,
             restore_ms,
-            0,
-        );
+        }
+        .report(self.config, meta);
         record_input_prediction(self.config, prediction_store, self.args, true);
-        print_progress(self.crate_name, result, elapsed, size);
-        replay_cached_diagnostics(meta, std::io::stdout(), std::io::stderr());
         clean_incremental_dir(self.config, self.args);
         Ok(())
     }

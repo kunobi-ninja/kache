@@ -136,6 +136,7 @@ fn test_rust_restored_outputs_allow_build_without_wrapper() {
     .env("RUSTC_WRAPPER", "")
     .env("CARGO_TARGET_DIR", &target)
     .env("CARGO_INCREMENTAL", "0")
+    .env("CARGO_TERM_COLOR", "never")
     .output()
     .unwrap();
     assert!(

@@ -703,11 +703,62 @@ fn nvcc_dep_forward_args(deferred: &[String]) -> Vec<String> {
 /// Parse `nvcc -M` (make-style) output into dependency paths.
 ///
 /// Fail-closed: any construct this parser does not confidently model
-/// (unhandled escapes, missing colon, Windows drive-letter targets are
-/// handled; anything else) bails to passthrough. A dropped header
-/// would under-key the entry — the fatal direction — so doubt means
-/// refusal, never a guess.
+/// bails to passthrough. A dropped header would under-key the entry —
+/// the fatal direction — so doubt means refusal, never a guess.
+/// Conversely, unknown tokens never silently vanish: every parsed token
+/// becomes a hashed input, so trailing garbage fails the hash (missing
+/// file) instead of corrupting the key.
+/// Byte offset where the make rule starts: skip leading lines that
+/// cannot start one. Driver prologues (`nvcc warning : ...` on
+/// stdout) contain a colon but are not rules; without this skip the
+/// separator below would land inside the prologue and every word of
+/// it would become a (missing, bailing) dependency — correct but
+/// permanently uncached on toolkits that warn. A skipped-too-much
+/// mistake is equally safe: no rule found means bail, never a guess.
+fn leading_rule_offset(text: &str) -> usize {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line_has_rule_target(line) {
+            break;
+        }
+        offset += line.len();
+    }
+    offset
+}
+
+/// Could `line` start a make rule? The text before the first colon
+/// must be whitespace-free once backslash escapes are removed, so
+/// `kernel.o :`, `C:\x:` and `my\ dir/f.o:` qualify while `nvcc
+/// warning : ...` does not. Over-accepting is safe (unknown tokens
+/// fail the hash); under-accepting just bails.
+fn line_has_rule_target(line: &str) -> bool {
+    let mut unescaped = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            unescaped.push(c);
+        } else {
+            chars.next();
+        }
+    }
+    match unescaped.find(':') {
+        Some(colon) => {
+            let target = unescaped[..colon].trim();
+            !target.is_empty() && !target.contains([' ', '\t'])
+        }
+        None => false,
+    }
+}
+
 fn parse_nvcc_make_deps(text: &str) -> Result<Vec<PathBuf>> {
+    // Skip leading non-rule lines. Driver prologues (`nvcc warning :
+    // ...` on stdout) contain a colon but cannot start a make rule: a
+    // rule target has no unescaped whitespace before its colon (see
+    // `rule_separator_colon`). Without this, the separator below would
+    // land inside the prologue and every word of it would become a
+    // (missing, bailing) dependency — correct but permanently uncached
+    // on toolkits that warn.
+    let text = &text[leading_rule_offset(text)..];
     // Escaped spaces must survive the whitespace split below, so they
     // become a private-use placeholder first (restored after splitting).
     // Only two backslash sequences are escapes: a line continuation
@@ -2002,6 +2053,52 @@ mod tests {
                 "must not forward {excluded:?}: {forwarded:?}"
             );
         }
+    }
+
+    #[test]
+    fn line_rule_target_shapes() {
+        // Real rule lines qualify in every spelling.
+        for rule in [
+            "kernel.o: kernel.cu\n",
+            "kernel.o : kernel.cu\n",
+            "C:\\b\\k.obj: C:\\s\\k.cu\n",
+            "C:/b/k.obj: C:/s/k.cu\n",
+            "my\\ dir/k.o: k.cu\n",
+            "   spaced.o: k.cu\n",
+        ] {
+            assert!(line_has_rule_target(rule), "{rule:?} must qualify");
+        }
+        // Prose, blanks, and colon-less lines never do — notably the
+        // `nvcc warning : ...` prologue some toolkits print on stdout.
+        // (A `word: ...` line WOULD qualify as a degenerate rule; that
+        // is safe — its tokens fail the hash and bail.)
+        for prose in [
+            "nvcc warning : Support for offline compilation\n",
+            "\n",
+            "no colon here\n",
+            ": leading colon\n",
+        ] {
+            assert!(!line_has_rule_target(prose), "{prose:?} must not qualify");
+        }
+    }
+
+    #[test]
+    fn make_deps_skips_driver_prologue() {
+        // Real CUDA 12.8 shape: a warning prologue on stdout, then the
+        // rule. Without the skip, the separator would land inside the
+        // prologue and every word of it would fail the hash.
+        let parsed = parse_nvcc_make_deps(
+            "nvcc warning : Support for offline compilation for architectures prior to '<compute/sm/lto>_75' will be removed\nkernel.o : kernel.cu \\\n inc/k.h \\\n /usr/include/stdc-predef.h\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                PathBuf::from("kernel.cu"),
+                PathBuf::from("inc/k.h"),
+                PathBuf::from("/usr/include/stdc-predef.h"),
+            ]
+        );
     }
 
     #[test]

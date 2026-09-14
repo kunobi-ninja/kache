@@ -217,22 +217,25 @@ impl Prober for NvccProber {
         if !dryrun.status.success() {
             anyhow::bail!("`{} --dryrun` exited {}", req.compiler, dryrun.status);
         }
-        let dryrun_text = String::from_utf8_lossy(&dryrun.stdout).into_owned();
+        // The plan goes to stderr on real toolkits (stdout carries only
+        // the banner); scan both, stdout first. Only the host binary
+        // path is read out — nothing here is hashed (see above).
+        let dryrun_text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&dryrun.stdout),
+            String::from_utf8_lossy(&dryrun.stderr)
+        );
         let host = find_nvcc_host_compiler(&dryrun_text).with_context(|| {
             // Include the raw output (truncated): host discovery runs
             // against real driver text exactly once per toolchain, and a
             // format drift is otherwise undebuggable from the reason alone.
             let mut shown: String =
-                dryrun_text.chars().take(800).collect();
+                dryrun_text.chars().take(1200).collect();
             if dryrun_text.len() > shown.len() {
                 shown.push_str("…[truncated]");
             }
-            let stderr: String = String::from_utf8_lossy(&dryrun.stderr)
-                .chars()
-                .take(400)
-                .collect();
             format!(
-                "`{} --dryrun` names no recognizable host compiler\n--- stdout ---\n{shown}\n--- stderr ---\n{stderr}",
+                "`{} --dryrun` names no recognizable host compiler\n--- combined output ---\n{shown}",
                 req.compiler
             )
         })?;

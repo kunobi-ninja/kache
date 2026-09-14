@@ -6519,6 +6519,19 @@ mod tests {
     }
 
     #[test]
+    fn list_mbx_session_files_errors_when_sessions_is_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(cache.join("sessions")).unwrap();
+        std::fs::write(mbx_sessions_dir(&cache), b"not a directory").unwrap();
+        let err = list_mbx_session_files(&cache).unwrap_err().to_string();
+        assert!(
+            err.contains("sessions"),
+            "a non-directory sessions path must fail, got {err}"
+        );
+    }
+
+    #[test]
     fn mbx_session_order_uses_the_leading_timestamp_not_the_name() {
         // Unpadded names: string order would pick `20.jsonl` over `100.jsonl`.
         assert!(

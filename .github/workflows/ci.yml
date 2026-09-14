@@ -697,6 +697,23 @@ jobs:
           echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
           nvcc --version
           gcc --version
+      # Ground truth for the adapter: dump the exact driver outputs the
+      # prober and the dependency closure parse (host discovery reads
+      # --dryrun, the closure reads -M stdout). Kept permanently —
+      # driver output formats drift across toolkit releases, and this
+      # log is where that drift first shows up.
+      - name: Dump nvcc probe inputs
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/nvcc-probe-sample
+          cd /tmp/nvcc-probe-sample
+          printf '__global__ void kernel(void) {}\n' > kernel.cu
+          echo '--- nvcc --dryrun (stdout) ---'
+          nvcc --dryrun -c kernel.cu -o kernel.o || echo "dryrun exit: $?"
+          echo '--- nvcc --dryrun (stderr) ---'
+          nvcc --dryrun -c kernel.cu -o kernel.o 2>&1 1>/dev/null || echo "dryrun exit: $?"
+          echo '--- nvcc -M ---'
+          nvcc -M kernel.cu || echo "-M exit: $?"
       - name: Run nvcc integration tests
         run: cargo test --test nvcc_cuda_toolchain_test
 

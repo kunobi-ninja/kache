@@ -1530,6 +1530,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn retry_nvcc_probe_spawn(req: &ProbeRequest<'_>) -> Result<ResolvedConfig> {
+        let mut result = NvccProber.probe(req);
+        for _ in 0..10 {
+            match &result {
+                Err(error) if is_nvcc_spawn_busy(error) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    result = NvccProber.probe(req);
+                }
+                _ => break,
+            }
+        }
+        result
+    }
+
+    #[cfg(unix)]
     #[test]
     fn nvcc_probe_captures_both_versions() {
         let temp = TempDir::new().unwrap();
@@ -1554,17 +1569,7 @@ mod tests {
             per_tu_paths: &["k.cu".to_string()],
             windows_aware: false,
         };
-        let mut config = NvccProber.probe(&req);
-        for _ in 0..10 {
-            match &config {
-                Err(e) if is_nvcc_spawn_busy(e) => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    config = NvccProber.probe(&req);
-                }
-                _ => break,
-            }
-        }
-        let config = config.expect("probe succeeds");
+        let config = retry_nvcc_probe_spawn(&req).expect("probe succeeds");
         assert_eq!(config.prober, "nvcc");
         assert_eq!(config.version_line, "nvcc: NVIDIA (R) Cuda compiler driver");
         assert_eq!(
@@ -1655,10 +1660,10 @@ mod tests {
             per_tu_paths: &[],
             windows_aware: false,
         };
-        let err = NvccProber.probe(&req).expect_err("must fail the probe");
+        let err = retry_nvcc_probe_spawn(&req).expect_err("must fail the probe");
         assert!(
             format!("{err:#}").contains("[truncated]"),
-            "long output must be marked"
+            "long output must be marked: {err:#}"
         );
         // Short output: no marker.
         let short_nvcc = write_nvcc_fixture(
@@ -1673,10 +1678,14 @@ mod tests {
             per_tu_paths: &[],
             windows_aware: false,
         };
-        let err = NvccProber.probe(&req).expect_err("must fail the probe");
+        let err = retry_nvcc_probe_spawn(&req).expect_err("must fail the probe");
+        assert!(
+            format!("{err:#}").contains("names no recognizable host compiler"),
+            "expected host discovery failure: {err:#}"
+        );
         assert!(
             !format!("{err:#}").contains("[truncated]"),
-            "short output must not be marked"
+            "short output must not be marked: {err:#}"
         );
     }
 }

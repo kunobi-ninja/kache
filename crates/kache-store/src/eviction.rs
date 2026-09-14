@@ -77,6 +77,9 @@ pub struct EntryFeatures {
     /// `None` means unknown (entry not yet backfilled into `entry_blobs`);
     /// policies fall back to the logical `size`.
     pub reclaimable_bytes: Option<i64>,
+    /// Recent at candidate selection time. GC skips their metadata read and
+    /// transaction setup; removal checks the grace again for other entries.
+    pub recently_accessed: bool,
 }
 
 /// Ranks or filters eviction candidates. Pure: no I/O, no store mutation.
@@ -341,6 +344,7 @@ mod tests {
             committed: true,
             compile_time_ms: 0,
             reclaimable_bytes: None,
+            recently_accessed: false,
         }
     }
 

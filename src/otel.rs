@@ -428,6 +428,8 @@ fn cum_sum(name: &str, unit: &str, data_points: Vec<Value>) -> Value {
 /// wait.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MachineSnapshot {
+    /// Registered blob bytes, the physical size GC compares with max_size.
+    pub store_physical_bytes: Option<u64>,
     /// `index.db` plus its `-wal`, in bytes.
     pub index_bytes: Option<u64>,
     /// The `-wal` file alone, also inside `index_bytes`.
@@ -444,6 +446,13 @@ pub(crate) struct MachineSnapshot {
 
 fn machine_metrics(snap: &MachineSnapshot, now: &str) -> Vec<Value> {
     let mut metrics = Vec::new();
+    if let Some(bytes) = snap.store_physical_bytes {
+        metrics.push(gauge(
+            "kache.cache.store.physical_size",
+            "By",
+            vec![as_int(bytes, now, &[])],
+        ));
+    }
     if let Some(bytes) = snap.index_bytes {
         metrics.push(gauge(
             "kache.cache.index.size",
@@ -491,6 +500,16 @@ fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
         ),
         ("kache.cache.gc.last_run.bytes_freed", "By", gc.bytes_freed),
         (
+            "kache.cache.gc.last_run.entries_pinned",
+            "{entry}",
+            gc.entries_pinned as u64,
+        ),
+        (
+            "kache.cache.gc.last_run.entries_unreclaimable",
+            "{entry}",
+            gc.entries_unreclaimable as u64,
+        ),
+        (
             "kache.cache.gc.last_run.entries_failed",
             "{entry}",
             gc.entries_failed as u64,
@@ -499,6 +518,16 @@ fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
             "kache.cache.gc.last_run.entries_locked",
             "{entry}",
             gc.entries_locked as u64,
+        ),
+        (
+            "kache.cache.gc.last_run.entries_busy_snapshot",
+            "{entry}",
+            gc.entries_busy_snapshot as u64,
+        ),
+        (
+            "kache.cache.gc.last_run.entries_recent_prefiltered",
+            "{entry}",
+            gc.entries_recent_prefiltered as u64,
         ),
         ("kache.cache.gc.last_run.duration", "ms", gc.duration_ms),
         (
@@ -670,6 +699,7 @@ mod tests {
 
     fn machine_snap() -> MachineSnapshot {
         MachineSnapshot {
+            store_physical_bytes: Some(107_000_000_000),
             index_bytes: Some(29_074_419_712),
             wal_bytes: Some(1_073_741_824),
             rowid_high_water: vec![("entries", 2_085_333), ("cc_preprocess_memos", 874_517)],
@@ -679,6 +709,10 @@ mod tests {
                 bytes_freed: 8_373_732_071,
                 entries_failed: 3,
                 entries_locked: 2,
+                entries_busy_snapshot: 1,
+                entries_recent_prefiltered: 20,
+                entries_pinned: 25,
+                entries_unreclaimable: 42,
                 duration_ms: 5801,
                 evict_write_ms: 4200,
                 ..Default::default()
@@ -742,6 +776,10 @@ mod tests {
             metric(&body, "kache.cache.index.size")["gauge"]["dataPoints"][0]["asInt"],
             "29074419712"
         );
+        assert_eq!(
+            metric(&body, "kache.cache.store.physical_size")["gauge"]["dataPoints"][0]["asInt"],
+            "107000000000"
+        );
         let wal = metric(&body, "kache.cache.index.wal.size");
         assert_eq!(wal["unit"], "By");
         assert_eq!(wal["gauge"]["dataPoints"][0]["asInt"], "1073741824");
@@ -791,8 +829,12 @@ mod tests {
             ("kache.cache.gc.last_run.time", last_run.as_str()),
             ("kache.cache.gc.last_run.entries_evicted", "560"),
             ("kache.cache.gc.last_run.bytes_freed", "8373732071"),
+            ("kache.cache.gc.last_run.entries_pinned", "25"),
+            ("kache.cache.gc.last_run.entries_unreclaimable", "42"),
             ("kache.cache.gc.last_run.entries_failed", "3"),
             ("kache.cache.gc.last_run.entries_locked", "2"),
+            ("kache.cache.gc.last_run.entries_busy_snapshot", "1"),
+            ("kache.cache.gc.last_run.entries_recent_prefiltered", "20"),
             ("kache.cache.gc.last_run.duration", "5801"),
             ("kache.cache.gc.last_run.evict_write", "4200"),
         ]

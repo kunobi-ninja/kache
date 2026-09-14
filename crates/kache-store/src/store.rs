@@ -801,6 +801,14 @@ pub struct GcStats {
     /// builds, as opposed to finding a damaged entry.
     #[serde(default)]
     pub entries_locked: usize,
+    /// Failed evictions caused by upgrading a stale WAL read snapshot to a
+    /// writer. These fail immediately and cannot be cured by busy_timeout.
+    #[serde(default)]
+    pub entries_busy_snapshot: usize,
+    /// Recently accessed candidates skipped before loading metadata or
+    /// starting a SQLite transaction. Included in entries_pinned.
+    #[serde(default)]
+    pub entries_recent_prefiltered: usize,
     /// Time spent in the eviction writes themselves, each entry's removal
     /// with its busy waits, summed over the run. Next to `entries_locked` it
     /// shows how much of a sweep went to waiting on builds for the index
@@ -820,6 +828,26 @@ pub fn is_sqlite_contention(err: &anyhow::Error) -> bool {
                 if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
         )
     })
+}
+
+pub fn is_sqlite_busy_snapshot(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<SqlError>(),
+            Some(SqlError::SqliteFailure(code, _))
+                if code.extended_code == rusqlite::ffi::SQLITE_BUSY_SNAPSHOT
+        )
+    })
+}
+
+fn record_eviction_failure(stats: &mut GcStats, error: &anyhow::Error) {
+    stats.entries_failed += 1;
+    if is_sqlite_contention(error) {
+        stats.entries_locked += 1;
+        if is_sqlite_busy_snapshot(error) {
+            stats.entries_busy_snapshot += 1;
+        }
+    }
 }
 
 /// Registered blob bytes and blob rows an entry removal released — blobs
@@ -3484,35 +3512,40 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                       WHERE eb.cache_key = entries.cache_key
                         AND eb.refs = b.refcount),
                     EXISTS(SELECT 1 FROM entry_blobs eb2
-                            WHERE eb2.cache_key = entries.cache_key)
+                            WHERE eb2.cache_key = entries.cache_key),
+                    last_accessed >= datetime('now', ?1)
              FROM entries",
         )?;
         let rows = stmt
-            .query_map([], |row| {
-                // Bytes this entry would actually free: blobs where it holds
-                // every remaining reference (#608). Entries not yet backfilled
-                // into entry_blobs report None and rank on logical size as
-                // before.
-                let has_blob_rows: bool = row.get(8)?;
-                let reclaimable_bytes = if has_blob_rows {
-                    Some(row.get::<_, i64>(7)?)
-                } else {
-                    None
-                };
-                Ok(crate::eviction::EntryFeatures {
-                    key: row.get(0)?,
-                    size: row.get(1)?,
-                    hit_count: row.get(2)?,
-                    content_hash: row.get(3)?,
-                    committed: row.get(4)?,
-                    // NULL/unparseable timestamps yield NULL from julianday();
-                    // treat those as "just accessed" so a malformed row is
-                    // never evicted ahead of a genuinely stale one.
-                    idle_hours: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                    compile_time_ms: row.get(6)?,
-                    reclaimable_bytes,
-                })
-            })?
+            .query_map(
+                params![format!("-{} seconds", EVICTION_IDLE_GRACE.as_secs())],
+                |row| {
+                    // Bytes this entry would actually free: blobs where it holds
+                    // every remaining reference (#608). Entries not yet backfilled
+                    // into entry_blobs report None and rank on logical size as
+                    // before.
+                    let has_blob_rows: bool = row.get(8)?;
+                    let reclaimable_bytes = if has_blob_rows {
+                        Some(row.get::<_, i64>(7)?)
+                    } else {
+                        None
+                    };
+                    Ok(crate::eviction::EntryFeatures {
+                        key: row.get(0)?,
+                        size: row.get(1)?,
+                        hit_count: row.get(2)?,
+                        content_hash: row.get(3)?,
+                        committed: row.get(4)?,
+                        // NULL/unparseable timestamps yield NULL from julianday();
+                        // treat those as "just accessed" so a malformed row is
+                        // never evicted ahead of a genuinely stale one.
+                        idle_hours: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                        compile_time_ms: row.get(6)?,
+                        reclaimable_bytes,
+                        recently_accessed: row.get(9)?,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -3604,6 +3637,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 continue;
             }
             let features = by_key.get(key.as_str()).copied();
+            if features.is_some_and(|f| f.recently_accessed) {
+                stats.entries_pinned += 1;
+                stats.entries_recent_prefiltered += 1;
+                continue;
+            }
             let write_started = std::time::Instant::now();
             let removal = self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE));
             eviction_writes += write_started.elapsed();
@@ -3646,10 +3684,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     // A corrupt entry (unloadable meta.json) refuses removal to
                     // avoid leaking blob refcounts (#276); skip it and keep
                     // evicting the rest rather than aborting the whole sweep.
-                    stats.entries_failed += 1;
-                    if is_sqlite_contention(&e) {
-                        stats.entries_locked += 1;
-                    }
+                    record_eviction_failure(&mut stats, &e);
                     tracing::warn!("gc: skipping eviction of {key}: {e:#}");
                     continue;
                 }
@@ -7160,6 +7195,11 @@ mod tests {
             .unwrap();
         let _ = std::fs::remove_file(&output_file);
 
+        let recent = store.evict().unwrap();
+        assert_eq!(recent.entries_recent_prefiltered, 1);
+        assert_eq!(recent.entries_pinned, 1);
+        assert_eq!(recent.entries_evicted, 0);
+
         // Age the entry past the active-pin grace so size-pressure eviction can
         // claim it (a just-put entry is "recently accessed" and is now pinned
         // against eviction for EVICTION_IDLE_GRACE — kunobi-ninja/kache#326).
@@ -7259,12 +7299,29 @@ mod tests {
         };
         assert!(is_sqlite_contention(&sqlite(rusqlite::ffi::SQLITE_BUSY)));
         assert!(is_sqlite_contention(&sqlite(rusqlite::ffi::SQLITE_LOCKED)));
+        assert!(is_sqlite_busy_snapshot(&sqlite(
+            rusqlite::ffi::SQLITE_BUSY_SNAPSHOT
+        )));
+        assert!(!is_sqlite_busy_snapshot(&sqlite(
+            rusqlite::ffi::SQLITE_BUSY
+        )));
+        assert!(!is_sqlite_busy_snapshot(&sqlite(
+            rusqlite::ffi::SQLITE_LOCKED
+        )));
         assert!(!is_sqlite_contention(&sqlite(
             rusqlite::ffi::SQLITE_CORRUPT
         )));
         assert!(!is_sqlite_contention(&anyhow::anyhow!(
             "meta.json unparseable"
         )));
+
+        let mut stats = GcStats::default();
+        record_eviction_failure(&mut stats, &sqlite(rusqlite::ffi::SQLITE_BUSY_SNAPSHOT));
+        record_eviction_failure(&mut stats, &sqlite(rusqlite::ffi::SQLITE_BUSY));
+        record_eviction_failure(&mut stats, &anyhow::anyhow!("meta.json unparseable"));
+        assert_eq!(stats.entries_failed, 3);
+        assert_eq!(stats.entries_locked, 2);
+        assert_eq!(stats.entries_busy_snapshot, 1);
     }
 
     #[cfg(unix)]
@@ -7660,6 +7717,7 @@ mod tests {
             committed: true,
             compile_time_ms: 10,
             reclaimable_bytes: None,
+            recently_accessed: false,
         };
         store.record_tombstone(&features, "size-pressure", Some(("value-density", false)));
         assert_eq!(

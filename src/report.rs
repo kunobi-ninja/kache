@@ -31,9 +31,15 @@ pub struct GcStatsPersisted {
     #[serde(default)]
     pub entries_pinned: usize,
     #[serde(default)]
+    pub entries_unreclaimable: usize,
+    #[serde(default)]
     pub entries_failed: usize,
     #[serde(default)]
     pub entries_locked: usize,
+    #[serde(default)]
+    pub entries_busy_snapshot: usize,
+    #[serde(default)]
+    pub entries_recent_prefiltered: usize,
     /// Time the run spent in its eviction writes, busy waits included.
     #[serde(default)]
     pub evict_write_ms: u64,
@@ -60,7 +66,7 @@ pub(crate) fn read_gc_stats(cache_dir: &Path) -> Option<GcStatsPersisted> {
 }
 
 /// Schema of one line in `cache_dir/telemetry/gc-runs.jsonl`.
-pub const GC_RUN_RECORD_SCHEMA: u32 = 1;
+pub const GC_RUN_RECORD_SCHEMA: u32 = 2;
 
 /// One GC run in `telemetry/gc-runs.jsonl`, written only with session
 /// recording on. `gc_stats.json` keeps the latest run; this history is what
@@ -78,6 +84,12 @@ pub struct GcRunRecord {
     pub entries_failed: usize,
     /// The failed evictions that lost the index write lock.
     pub entries_locked: usize,
+    /// Failed read-to-write upgrades on stale WAL snapshots.
+    #[serde(default)]
+    pub entries_busy_snapshot: usize,
+    /// Recent candidates skipped before reading metadata or opening a txn.
+    #[serde(default)]
+    pub entries_recent_prefiltered: usize,
     pub entries_pinned: usize,
     pub entries_unreclaimable: usize,
     pub duration_ms: u64,
@@ -98,6 +110,8 @@ impl GcRunRecord {
             blobs_removed: stats.blobs_removed,
             entries_failed: stats.entries_failed,
             entries_locked: stats.entries_locked,
+            entries_busy_snapshot: stats.entries_busy_snapshot,
+            entries_recent_prefiltered: stats.entries_recent_prefiltered,
             entries_pinned: stats.entries_pinned,
             entries_unreclaimable: stats.entries_unreclaimable,
             duration_ms: stats.duration_ms,
@@ -143,8 +157,11 @@ pub(crate) fn write_last_gc_run(
         duration_ms: stats.duration_ms,
         source: source.to_string(),
         entries_pinned: stats.entries_pinned,
+        entries_unreclaimable: stats.entries_unreclaimable,
         entries_failed: stats.entries_failed,
         entries_locked: stats.entries_locked,
+        entries_busy_snapshot: stats.entries_busy_snapshot,
+        entries_recent_prefiltered: stats.entries_recent_prefiltered,
         evict_write_ms: stats.evict_write_ms,
     };
     let json = serde_json::to_string_pretty(&persisted)?;
@@ -3896,6 +3913,8 @@ mod tests {
             entries_unreclaimable: 1,
             entries_failed: 5,
             entries_locked: 3,
+            entries_busy_snapshot: 2,
+            entries_recent_prefiltered: 4,
             evict_write_ms: 11,
             ..Default::default()
         };
@@ -3922,7 +3941,7 @@ mod tests {
             records[0],
             GcRunRecord {
                 ts: records[0].ts.clone(),
-                schema: 1,
+                schema: GC_RUN_RECORD_SCHEMA,
                 source: "auto".to_string(),
                 entries_evicted: 3,
                 bytes_freed: 100,
@@ -3930,6 +3949,8 @@ mod tests {
                 blobs_removed: 2,
                 entries_failed: 5,
                 entries_locked: 3,
+                entries_busy_snapshot: 2,
+                entries_recent_prefiltered: 4,
                 entries_pinned: 4,
                 entries_unreclaimable: 1,
                 duration_ms: 9,

@@ -5624,18 +5624,19 @@ impl Daemon {
 
     /// After a successful upload, check if store exceeds max_size → LRU eviction.
     fn maybe_evict_after_upload(&self) {
-        let _ = self.with_store(|store| {
-            let _gc_lock = match store.try_gc_lock()? {
-                Some(lock) => lock,
-                None => {
-                    tracing::debug!(
-                        "gc.lock held by another GC; skipping upload-triggered eviction"
-                    );
-                    return Ok(());
-                }
+        let _ = (|| -> Result<()> {
+            let Some((_gc_lock, size)) = self.with_store(|store| {
+                let Some(lock) = store.try_gc_lock()? else {
+                    return Ok(None);
+                };
+                // The size check is cheap; release the daemon's Store mutex
+                // before the long eviction scan and per-entry removals.
+                Ok(Some((lock, store.physical_size()?)))
+            })?
+            else {
+                tracing::debug!("gc.lock held by another GC; skipping upload-triggered eviction");
+                return Ok(());
             };
-            // Physical bytes, matching `evict()`'s own trigger (#608).
-            let size = store.physical_size()?;
             if size > self.config.max_size {
                 tracing::info!(
                     "store size {} > max {}, running LRU eviction",
@@ -5643,14 +5644,17 @@ impl Daemon {
                     self.config.max_size
                 );
                 // Under gc.lock like every driver, so the totals cannot race.
-                if let Ok(stats) = store.evict()
-                    && let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats)
-                {
-                    tracing::warn!("recording upload-triggered GC run: {e:#}");
+                let store = Store::open(&self.config)?;
+                let started = Instant::now();
+                if let Ok(mut stats) = store.evict() {
+                    stats.duration_ms = started.elapsed().as_millis() as u64;
+                    if let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats) {
+                        tracing::warn!("recording upload-triggered GC run: {e:#}");
+                    }
                 }
             }
             Ok(())
-        });
+        })();
     }
 
     /// Core GC logic with an explicit policy and per-policy result accounting.
@@ -5660,7 +5664,11 @@ impl Daemon {
         // Cross-process GC mutual exclusion (kunobi-ninja/kache#326): if another
         // GC driver (a manual `kache gc`, a second daemon) holds gc.lock, skip
         // this run rather than double-scan and contend. Held until run_gc returns.
-        let _gc_lock = match self.with_store(|store| store.try_gc_lock())? {
+        // GC may scan and remove thousands of entries. Use its own connection
+        // so daemon lookups and uploads can still reach the main Store mutex.
+        // SQLite and gc.lock continue to serialize the actual writes.
+        let gc_store = Store::open(&self.config)?;
+        let _gc_lock = match gc_store.try_gc_lock()? {
             Some(lock) => lock,
             None => {
                 tracing::info!("gc.lock held by another GC; skipping this run");
@@ -5668,7 +5676,8 @@ impl Daemon {
             }
         };
         let (dedup_stats, evict_stats, age_evict_stats, incremental_cleaned, orphan_stats) =
-            self.with_store(|store| {
+            (|| -> Result<_> {
+                let store = &gc_store;
                 // Backfill content_hash for legacy entries
                 let backfilled = store.backfill_content_hashes().unwrap_or(0);
                 if backfilled > 0 {
@@ -5794,7 +5803,7 @@ impl Daemon {
                     incremental_cleaned,
                     orphan_stats,
                 ))
-            })?;
+            })()?;
 
         // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
         // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
@@ -5837,6 +5846,12 @@ impl Daemon {
             entries_locked: dedup_stats.entries_locked
                 + evict_stats.entries_locked
                 + age_evict_stats.entries_locked,
+            entries_busy_snapshot: dedup_stats.entries_busy_snapshot
+                + evict_stats.entries_busy_snapshot
+                + age_evict_stats.entries_busy_snapshot,
+            entries_recent_prefiltered: dedup_stats.entries_recent_prefiltered
+                + evict_stats.entries_recent_prefiltered
+                + age_evict_stats.entries_recent_prefiltered,
             evict_write_ms: dedup_stats.evict_write_ms
                 + evict_stats.evict_write_ms
                 + age_evict_stats.evict_write_ms,
@@ -11481,6 +11496,30 @@ mod tests {
         assert!(resp.ok);
         assert_eq!(resp.evicted, Some(0));
         assert_eq!(resp.gc.as_ref().unwrap().mode, GcRequestMode::Automatic);
+    }
+
+    #[test]
+    fn gc_does_not_hold_the_daemon_store_mutex() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon.with_store(|_| Ok(())).unwrap();
+        let main_store = daemon.store.get().unwrap().lock().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_daemon = Arc::clone(&daemon);
+        let worker = std::thread::spawn(move || {
+            done_tx
+                .send(worker_daemon.run_gc(GcPolicy::Automatic { max_age_hours: 0 }))
+                .unwrap();
+        });
+
+        let finished = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(main_store);
+        worker.join().unwrap();
+        assert!(
+            finished
+                .expect("GC must finish while the daemon store is in use")
+                .is_ok()
+        );
     }
 
     #[test]

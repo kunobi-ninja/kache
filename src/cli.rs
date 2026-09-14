@@ -389,6 +389,12 @@ pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot 
     let Ok(db) = crate::store::open_index_db_readonly(&db_path) else {
         return snap;
     };
+    snap.store_physical_bytes = db
+        .query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .ok()
+        .map(|bytes| bytes.max(0) as u64);
     for table in MACHINE_INDEX_TABLES {
         let top: rusqlite::Result<Option<i64>> =
             db.query_row(&rowid_high_water_sql(table), [], |row| row.get(0));
@@ -2863,6 +2869,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         }
     };
     let mut combined = crate::store::GcStats::default();
+    let started = std::time::Instant::now();
 
     if verbose {
         print!("Backfilling content hashes...");
@@ -2956,6 +2963,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
+    combined.duration_ms = started.elapsed().as_millis() as u64;
     // Still under gc.lock, so the record cannot race another driver.
     // The auto-GC worker used to discard this outcome entirely. A failed write
     // must not fail the sweep it describes.
@@ -2995,6 +3003,12 @@ fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats)
         .saturating_add(part.disk_bytes_reclaimed);
     total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
     total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
+    total.entries_busy_snapshot = total
+        .entries_busy_snapshot
+        .saturating_add(part.entries_busy_snapshot);
+    total.entries_recent_prefiltered = total
+        .entries_recent_prefiltered
+        .saturating_add(part.entries_recent_prefiltered);
     total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
     total.skipped |= part.skipped;
 }
@@ -3074,7 +3088,9 @@ fn evict_older_than_recorded(
     config: &Config,
     hours: u64,
 ) -> Result<crate::store::GcStats> {
-    let stats = store.evict_older_than(hours)?;
+    let started = std::time::Instant::now();
+    let mut stats = store.evict_older_than(hours)?;
+    stats.duration_ms = started.elapsed().as_millis() as u64;
     record_manual_gc_run(config, &stats);
     Ok(stats)
 }
@@ -3098,7 +3114,9 @@ pub fn gc(
                 return Ok(());
             }
         };
-        let stats = store.evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)?;
+        let started = std::time::Instant::now();
+        let mut stats = store.evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)?;
+        stats.duration_ms = started.elapsed().as_millis() as u64;
         record_manual_gc_run(config, &stats);
         if json {
             return emit_gc_json(config, false, &stats);
@@ -6990,6 +7008,8 @@ mod tests {
             skipped: false,
             entries_failed: 8,
             entries_locked: 9,
+            entries_busy_snapshot: 0,
+            entries_recent_prefiltered: 0,
             evict_write_ms: 11,
         };
         let part = crate::store::GcStats {
@@ -7003,6 +7023,8 @@ mod tests {
             skipped: true,
             entries_failed: 80,
             entries_locked: 90,
+            entries_busy_snapshot: 0,
+            entries_recent_prefiltered: 0,
             evict_write_ms: 110,
         };
         add_gc_stats(&mut accumulated, &part);
@@ -7099,7 +7121,23 @@ mod tests {
             "a snapshot must never create the index"
         );
 
-        drop(Store::open(&config).unwrap());
+        let store = Store::open(&config).unwrap();
+        let artifact = dir.path().join("physical-size.rlib");
+        std::fs::write(&artifact, b"payload").unwrap();
+        store
+            .put(
+                "physical-size",
+                "physical_size",
+                &["lib".to_string()],
+                &[],
+                "",
+                "dev",
+                &[(artifact, "libphysical_size.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        drop(store);
         crate::report::record_gc_run(&config, "auto", &crate::store::GcStats::default()).unwrap();
         let snap = machine_snapshot(&config);
         let db_len = std::fs::metadata(config.index_db_path()).unwrap().len();
@@ -7108,6 +7146,7 @@ mod tests {
         let wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
         assert_eq!(snap.wal_bytes, Some(wal_len));
         assert_eq!(snap.index_bytes, Some(db_len + wal_len));
+        assert_eq!(snap.store_physical_bytes, Some(7));
         let tables: Vec<_> = snap
             .rowid_high_water
             .iter()
@@ -7208,6 +7247,7 @@ mod tests {
     #[test]
     fn stats_lines_show_the_index_and_a_gc_that_keeps_losing_the_lock() {
         let machine = crate::otel::MachineSnapshot {
+            store_physical_bytes: None,
             index_bytes: Some(29_074_419_712),
             wal_bytes: Some(1_073_741_824),
             rowid_high_water: vec![

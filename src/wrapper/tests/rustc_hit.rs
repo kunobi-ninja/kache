@@ -290,13 +290,14 @@ fn predictions_belong_to_the_key_store_and_are_not_rewritten_when_declined() {
 }
 
 #[test]
-fn remote_hits_preserve_labels_and_record_fresh_predictions() {
+fn remote_hits_report_provenance_and_record_fresh_predictions() {
     let _lock = crate::test_support::process_state_test_lock();
     let _manifest = TestEnvGuard::remove("CARGO_MANIFEST_DIR");
     for (prefetched, found, record_closure) in [
         (false, true, true),
         (true, true, true),
         (false, false, true),
+        (true, false, true),
         (false, true, false),
     ] {
         let mut fixture = Fixture::new();
@@ -323,7 +324,9 @@ fn remote_hits_preserve_labels_and_record_fresh_predictions() {
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].result,
-            if prefetched {
+            if !found {
+                EventResult::LocalHit
+            } else if prefetched {
                 EventResult::PrefetchHit
             } else {
                 EventResult::RemoteHit

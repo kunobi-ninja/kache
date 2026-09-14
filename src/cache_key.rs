@@ -3351,9 +3351,9 @@ impl<'db> FileHasher<'db> {
 
     /// The closure recorded for `identity`, if this build can still read it.
     ///
-    /// Nothing derives a key from this yet. Any uncertainty — no row, a schema
-    /// this build does not know, bytes that will not decode — is `None`, which
-    /// the caller reads as "run the pre-pass".
+    /// The Rust prediction path validates this closure before deriving a key.
+    /// Missing rows, unknown schemas, and undecodable records return `None`,
+    /// so the caller runs the pre-pass.
     ///
     pub(crate) fn input_prediction(&self, identity: &str) -> Option<InputPrediction> {
         let cache = self.cache.as_ref()?;

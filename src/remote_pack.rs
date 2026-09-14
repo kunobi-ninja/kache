@@ -9,7 +9,7 @@
 //! Offsets are relative to the payload section, avoiding a circular dependency
 //! between JSON length and encoded offsets.
 
-#![allow(dead_code)] // foundations consumed by publisher/discovery slices
+#![allow(dead_code)] // Publisher helpers are pending; daemon prefetch consumes the reader.
 
 use std::collections::HashSet;
 

@@ -70,7 +70,7 @@ const MAX_NODES: usize = 64;
 
 /// A dependency whose artifact digest differs between a crate's compile and the
 /// previous recorded state of that crate.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ChangedDep {
     /// The name the CONSUMER used, which Cargo's `package = "..."` renaming can
     /// make different from the producing crate's own name.
@@ -86,7 +86,7 @@ pub struct ChangedDep {
 }
 
 /// One step down a branch: `crate_name` diverged because `via` moved.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Hop {
     pub crate_name: String,
     /// Unit id of the crate at this hop, when its event recorded one. Carried
@@ -108,7 +108,8 @@ fn node_key(name: &str, unit: Option<&str>) -> String {
 }
 
 /// Why the crate at the end of a branch diverged.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", content = "groups", rename_all = "snake_case")]
 pub enum RootKind {
     /// Key input groups that moved, `externs` excluded. The only variant that
     /// asserts a cause; everything else is an explicit dead end.
@@ -139,13 +140,13 @@ impl RootKind {
 /// Passthrough (uncached) compiles attributed to a root crate, grouped by
 /// reason. This is the actionable half: a passthrough there means the crate's
 /// artifact varies per checkout, and the reason names the flag to model.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PassthroughGroup {
     pub reason: String,
     pub count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Root {
     pub crate_name: String,
     /// Unit id of the event this endpoint resolved to, when that event recorded
@@ -165,7 +166,7 @@ pub struct Root {
     pub path: Vec<Hop>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Chain {
     /// Endpoints, most-converged first, then shallowest.
     pub roots: Vec<Root>,

@@ -22,6 +22,9 @@ use crate::link;
 use crate::scheduler::{self, FlightIdentity, MissGuard};
 use crate::store::{BuildClaim, EntryMeta, Store, StorePutResult};
 
+mod remote;
+use remote::{NegativeReply, acquire_entry, compiler_remote_enabled, maybe_enqueue_upload};
+
 mod rustc_hit;
 use rustc_hit::RustcHitContext;
 
@@ -446,26 +449,6 @@ fn store_admits_compile(config: &Config, compile_time_ms: u64, publishes_to_remo
 /// remote pipeline. clang-cl debug objects embed un-remapped paths.
 fn cc_publishes_to_remote(parsed: &crate::compiler::cc::CcArgs) -> bool {
     !parsed.embeds_codeview_debug()
-}
-
-fn cc_should_enqueue_upload(config: &Config, publishes_to_remote: bool) -> bool {
-    publishes_to_remote && config.remote.is_some()
-}
-
-fn maybe_enqueue_cc_upload(
-    config: &Config,
-    store: &Store,
-    cache_key: &str,
-    crate_name: &str,
-    publishes_to_remote: bool,
-) {
-    if !cc_should_enqueue_upload(config, publishes_to_remote) {
-        return;
-    }
-    let entry_dir = store.entry_dir(cache_key);
-    if let Err(e) = crate::daemon::send_upload_job(config, cache_key, &entry_dir, crate_name) {
-        tracing::warn!("failed to send upload job to daemon: {e}");
-    }
 }
 
 fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
@@ -1026,7 +1009,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     // Store grew — throttled size check + detached background GC if over
                     // budget (kunobi-ninja/kache#497). Never blocks the compile path.
                     maybe_spawn_auto_gc(config, &store);
-                    maybe_enqueue_nvcc_upload(config, &store, &cache_key, &crate_name);
+                    maybe_enqueue_upload(config, &store, &cache_key, &crate_name, true);
                 }
                 Err(e) => {
                     store_error = store_error_for_event(&e);
@@ -1274,38 +1257,14 @@ fn nvcc_try_remote_hit(
     key_ms: u64,
     lookup_ms: u64,
 ) -> Result<Option<i32>> {
-    if config.remote.is_none() {
-        return Ok(None);
-    }
-    let entry_dir = store.entry_dir(cache_key);
-    let shard_dir = crate::daemon::remote_check_shard_dir_arg(&config.cache_dir, store.cache_dir());
-    let Some(result) = crate::daemon::send_remote_check(
+    let Some((meta, event_result)) = acquire_entry(
         config,
+        store,
         cache_key,
-        &entry_dir,
         crate_name,
-        shard_dir.as_deref().map(Path::new),
+        NegativeReply::ContinueCompile,
     ) else {
         return Ok(None);
-    };
-    if !result.found {
-        return Ok(None);
-    }
-    let Ok(Some(meta)) = store.get(cache_key) else {
-        return Ok(None);
-    };
-    let event_result = if result.prefetched {
-        tracing::debug!(
-            "nvcc prefetch cache hit for {crate_name} ({})",
-            &cache_key[..16]
-        );
-        EventResult::PrefetchHit
-    } else {
-        tracing::debug!(
-            "nvcc remote cache hit for {crate_name} ({})",
-            &cache_key[..16]
-        );
-        EventResult::RemoteHit
     };
     let restore_start = std::time::Instant::now();
     if let Err(e) = restore_nvcc_from_cache(store, parsed, &meta) {
@@ -1343,16 +1302,6 @@ fn nvcc_try_remote_hit(
     Ok(Some(0))
 }
 
-fn maybe_enqueue_nvcc_upload(config: &Config, store: &Store, cache_key: &str, crate_name: &str) {
-    if config.remote.is_none() {
-        return;
-    }
-    let entry_dir = store.entry_dir(cache_key);
-    if let Err(e) = crate::daemon::send_upload_job(config, cache_key, &entry_dir, crate_name) {
-        tracing::warn!("failed to send upload job to daemon: {e}");
-    }
-}
-
 /// Run kache as a C-family compiler wrapper (`CC=kache cc`,
 /// `CXX=kache c++`, etc.).
 ///
@@ -1361,8 +1310,8 @@ fn maybe_enqueue_nvcc_upload(config: &Config, store: &Store, cache_key: &str, cr
 /// `.o` on hit, or compile + store on dup/miss. Everything else (link
 /// mode, multi-source, unsafe flags) routes through [`cc_passthrough`].
 ///
-/// This is the local-cache path. Remote cache is a separate follow-up;
-/// miss-path flights, permits, and per-key build locks match rustc.
+/// Local and remote hits share compiler-specific restoration. Miss-path
+/// flights, permits, and per-key build locks match rustc.
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let start = wrapper_entry();
     let invocation_start_ns = std::time::SystemTime::now()
@@ -1800,7 +1749,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     // Store grew — throttled size check + detached background GC if over
                     // budget (kunobi-ninja/kache#497). Never blocks the compile path.
                     maybe_spawn_auto_gc(config, &store);
-                    maybe_enqueue_cc_upload(
+                    maybe_enqueue_upload(
                         config,
                         &store,
                         &cache_key,
@@ -2420,40 +2369,17 @@ fn cc_try_remote_hit(
     key_ms: u64,
     lookup_ms: u64,
 ) -> Result<Option<i32>> {
-    if !cc_should_enqueue_upload(config, cc_publishes_to_remote(parsed)) {
+    if !compiler_remote_enabled(config, cc_publishes_to_remote(parsed)) {
         return Ok(None);
     }
-    let entry_dir = store.entry_dir(cache_key);
-    let shard_dir = crate::daemon::remote_check_shard_dir_arg(&config.cache_dir, store.cache_dir());
-    let Some(result) = crate::daemon::send_remote_check(
+    let Some((meta, event_result)) = acquire_entry(
         config,
+        store,
         cache_key,
-        &entry_dir,
         crate_name,
-        shard_dir.as_deref().map(Path::new),
+        NegativeReply::ContinueCompile,
     ) else {
         return Ok(None);
-    };
-    if !result.found {
-        return Ok(None);
-    }
-    let Ok(Some(meta)) = store.get(cache_key) else {
-        return Ok(None);
-    };
-    let event_result = if result.prefetched {
-        tracing::debug!(
-            "cc prefetch cache hit for {} ({})",
-            crate_name,
-            &cache_key[..16]
-        );
-        EventResult::PrefetchHit
-    } else {
-        tracing::debug!(
-            "cc remote cache hit for {} ({})",
-            crate_name,
-            &cache_key[..16]
-        );
-        EventResult::RemoteHit
     };
     let restore_start = std::time::Instant::now();
     if let Err(e) = restore_cc_from_cache(store, parsed, &meta) {
@@ -3600,13 +3526,8 @@ fn run_parsed_rustc(
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
 
-    // 6. Async upload to remote (if configured) — sends job to the daemon
-    if config.remote.is_some() {
-        let entry_dir = store.entry_dir(&cache_key);
-        if let Err(e) = crate::daemon::send_upload_job(config, &cache_key, &entry_dir, crate_name) {
-            tracing::warn!("failed to send upload job to daemon: {}", e);
-        }
-    }
+    // 6. Queue remote publication through the shared durable upload path.
+    maybe_enqueue_upload(config, &store, &cache_key, crate_name, true);
 
     record_input_prediction(config, Some(&store), args, record_closure);
 
@@ -4340,35 +4261,13 @@ fn try_rustc_remote_hit(
     lookup_ms: u64,
     record_closure: bool,
 ) -> Option<Result<()>> {
-    hit.config.remote.as_ref()?;
-    let entry_dir = store.entry_dir(cache_key);
-    let shard_dir =
-        crate::daemon::remote_check_shard_dir_arg(&hit.config.cache_dir, store.cache_dir());
-    let reply = crate::daemon::send_remote_check(
+    let (meta, result) = acquire_entry(
         hit.config,
+        store,
         cache_key,
-        &entry_dir,
         hit.crate_name,
-        shard_dir.as_deref().map(Path::new),
+        NegativeReply::CheckConcurrentEntry,
     )?;
-    // A concurrent writer can also supply the entry. Read the store even when
-    // the reply says `found: false`; only `prefetched` affects the hit label.
-    let meta = store.get(cache_key).ok()??;
-    let result = if reply.prefetched {
-        tracing::debug!(
-            "prefetch cache hit for {} ({})",
-            hit.crate_name,
-            &cache_key[..16]
-        );
-        EventResult::PrefetchHit
-    } else {
-        tracing::debug!(
-            "remote cache hit for {} ({})",
-            hit.crate_name,
-            &cache_key[..16]
-        );
-        EventResult::RemoteHit
-    };
     Some(hit.restore_and_finish(
         BlobSource::Store(store),
         &meta,
@@ -9504,6 +9403,112 @@ exit 0
     }
 
     #[test]
+    fn remote_acquisition_preserves_negative_reply_policy_and_provenance() {
+        for (found, prefetched, policy, expected) in [
+            (false, false, NegativeReply::ContinueCompile, None),
+            (false, true, NegativeReply::ContinueCompile, None),
+            (
+                false,
+                false,
+                NegativeReply::CheckConcurrentEntry,
+                Some(EventResult::LocalHit),
+            ),
+            (
+                false,
+                true,
+                NegativeReply::CheckConcurrentEntry,
+                Some(EventResult::LocalHit),
+            ),
+            (
+                true,
+                false,
+                NegativeReply::ContinueCompile,
+                Some(EventResult::RemoteHit),
+            ),
+            (
+                true,
+                true,
+                NegativeReply::ContinueCompile,
+                Some(EventResult::PrefetchHit),
+            ),
+            (
+                true,
+                false,
+                NegativeReply::CheckConcurrentEntry,
+                Some(EventResult::RemoteHit),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(dir.path().join("cache"));
+            config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+            let store = Store::open(&config).unwrap();
+            let key = blake3::hash(b"remote-entry-provenance")
+                .to_hex()
+                .to_string();
+            seed_cc_object_entry(&store, &key, dir.path());
+            let daemon = RemoteCheckReplyDaemon::with_reply(
+                config.socket_path(),
+                serde_json::json!({ "ok": true, "found": found, "prefetched": prefetched }),
+            );
+            wait_until_reachable(&config.socket_path());
+            let result = acquire_entry(&config, &store, &key, "foo.c", policy);
+            assert_eq!(result.as_ref().map(|(_, origin)| *origin), expected);
+            if let Some((meta, _)) = result {
+                assert_eq!(meta.cache_key, key);
+                assert_eq!(meta.crate_name, "foo.c");
+            }
+            assert!(daemon.request_count() >= 1);
+        }
+    }
+
+    #[test]
+    fn remote_acquisition_requires_a_reply_and_readable_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"remote-entry-validation")
+            .to_hex()
+            .to_string();
+        seed_cc_object_entry(&store, &key, dir.path());
+        assert!(
+            acquire_entry(
+                &config,
+                &store,
+                &key,
+                "foo.c",
+                NegativeReply::CheckConcurrentEntry
+            )
+            .is_none()
+        );
+        let daemon = RemoteCheckReplyDaemon::spawn(config.socket_path(), true);
+        wait_until_reachable(&config.socket_path());
+        let missing = blake3::hash(b"missing-entry").to_hex().to_string();
+        assert!(
+            acquire_entry(
+                &config,
+                &store,
+                &missing,
+                "foo.c",
+                NegativeReply::ContinueCompile
+            )
+            .is_none()
+        );
+        std::fs::write(store.entry_dir(&key).join("meta.json"), b"invalid json").unwrap();
+        assert!(
+            acquire_entry(
+                &config,
+                &store,
+                &key,
+                "foo.c",
+                NegativeReply::ContinueCompile
+            )
+            .is_none()
+        );
+        assert!(daemon.request_count() >= 2);
+    }
+
+    #[test]
     fn clang_cl_debug_does_not_bypass_local_admission() {
         let mut config = test_config(PathBuf::from("cache"));
         config.min_store_compile_ms = 1_000;
@@ -9540,16 +9545,16 @@ exit 0
     #[test]
     fn cc_upload_enqueue_requires_a_configured_remote_and_publication() {
         let mut config = test_config(PathBuf::from("cache"));
-        assert!(!cc_should_enqueue_upload(&config, true));
-        assert!(!cc_should_enqueue_upload(&config, false));
+        assert!(!compiler_remote_enabled(&config, true));
+        assert!(!compiler_remote_enabled(&config, false));
 
         config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
-        assert!(cc_should_enqueue_upload(&config, true));
-        assert!(!cc_should_enqueue_upload(&config, false));
+        assert!(compiler_remote_enabled(&config, true));
+        assert!(!compiler_remote_enabled(&config, false));
 
         config.remote_readonly = true;
         assert!(
-            cc_should_enqueue_upload(&config, true),
+            compiler_remote_enabled(&config, true),
             "readonly is enforced inside send_upload_job, matching rustc"
         );
     }
@@ -9622,7 +9627,7 @@ exit 0
 
         let _lock = crate::config::config_path_lock();
         let _isolated = isolate_daemon_autostart(dir.path());
-        maybe_enqueue_cc_upload(&config, &store, &key, "foo.c", true);
+        maybe_enqueue_upload(&config, &store, &key, "foo.c", true);
 
         assert_eq!(spool_intent_count(&config), 1);
         assert!(
@@ -9644,7 +9649,7 @@ exit 0
 
         let _lock = crate::config::config_path_lock();
         let _isolated = isolate_daemon_autostart(dir.path());
-        maybe_enqueue_cc_upload(&config, &store, &key, "foo.c", false);
+        maybe_enqueue_upload(&config, &store, &key, "foo.c", false);
 
         assert_eq!(spool_intent_count(&config), 0);
     }
@@ -9666,8 +9671,8 @@ exit 0
 
         let _lock = crate::config::config_path_lock();
         let _isolated = isolate_daemon_autostart(dir.path());
-        maybe_enqueue_cc_upload(&readonly, &readonly_store, &key, "foo.c", true);
-        maybe_enqueue_cc_upload(&local, &local_store, &key, "foo.c", true);
+        maybe_enqueue_upload(&readonly, &readonly_store, &key, "foo.c", true);
+        maybe_enqueue_upload(&local, &local_store, &key, "foo.c", true);
 
         assert_eq!(spool_intent_count(&readonly), 0);
         assert_eq!(spool_intent_count(&local), 0);

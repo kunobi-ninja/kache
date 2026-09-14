@@ -13,8 +13,8 @@
 //! pattern matching). Storage metadata (crate types, features,
 //! target/profile) and the restore loop's path resolution still touch
 //! [`crate::args::RustcArgs`] fields directly in [`crate::wrapper`]; those
-//! move behind the trait when adding a second compiler forces the
-//! abstraction.
+//! remain compiler-specific. Rust, C-family, and CUDA adapters share the
+//! contract while the wrapper coordinates their cache operations.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};

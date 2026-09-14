@@ -2150,3 +2150,94 @@ fn sync_help_includes_allow_partial() {
         .success()
         .stdout(predicates::str::contains("--allow-partial"));
 }
+
+#[test]
+fn why_miss_json_preserves_legacy_repeat_uncertainty() {
+    let e = env();
+    write_legacy_miss_events(&e, "legacy-cc", &["same-key", "same-key"]);
+    let output = e
+        .cmd()
+        .args(["--json", "why-miss", "legacy-cc"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["diagnosis"], "repeated_same_key");
+    assert_eq!(value["dependency_recording_missing"], true);
+    assert!(value["dependency_chain"].is_null());
+}
+
+#[test]
+fn why_miss_both_formats_prioritize_store_failure_over_lookup_and_cold_history() {
+    let e = env();
+    let event = serde_json::json!({
+        "ts": "2026-01-01T00:00:00Z", "crate_name": "example",
+        "result": "miss", "elapsed_ms": 1, "size": 1,
+        "cache_key": "same-key", "schema": 15,
+        "store_error": "disk full", "lookup_rejection": "invalid metadata"
+    });
+    std::fs::write(e.cache.join("events.jsonl"), format!("{event}\n")).unwrap();
+    e.cmd()
+        .args(["why-miss", "example"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("NOT CACHED"))
+        .stdout(predicates::str::contains("disk full"))
+        .stdout(predicates::str::contains("Diagnosis: never cached").not())
+        .stdout(predicates::str::contains("Diagnosis: matching key").not());
+    let output = e
+        .cmd()
+        .args(["--json", "why-miss", "example"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["diagnosis"], "not_cached");
+    assert_eq!(value["store_error"], "disk full");
+    assert_eq!(value["lookup_rejection"], "invalid metadata");
+}
+
+#[test]
+fn why_miss_both_formats_include_unresolved_dependency_cascade() {
+    let e = env();
+    let events: Vec<_> = ["before", "after"]
+        .iter()
+        .enumerate()
+        .map(|(index, digest)| {
+            serde_json::json!({
+                "ts": format!("2026-01-01T00:00:0{index}Z"), "crate_name": "example",
+                "result": "miss", "elapsed_ms": 1, "size": 1,
+                "cache_key": digest, "schema": 15, "root": "/project",
+                "key_externs_recorded": true, "key_externs": {"dep": digest}
+            })
+            .to_string()
+        })
+        .collect();
+    std::fs::write(
+        e.cache.join("events.jsonl"),
+        format!("{}\n", events.join("\n")),
+    )
+    .unwrap();
+    e.cmd()
+        .args(["why-miss", "example"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Dependency cascade:"))
+        .stdout(predicates::str::contains("unresolved: dep"));
+    let output = e
+        .cmd()
+        .args(["--json", "why-miss", "example"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["dependency_recording_missing"], false);
+    assert_eq!(value["dependency_chain"]["direct"][0]["name"], "dep");
+    assert_eq!(value["dependency_chain"]["direct"][0]["from"], "before");
+    assert_eq!(value["dependency_chain"]["direct"][0]["to"], "after");
+    assert_eq!(value["dependency_chain"]["roots"][0]["crate_name"], "dep");
+    assert_eq!(
+        value["dependency_chain"]["roots"][0]["kind"]["kind"],
+        "no_miss_recorded"
+    );
+}

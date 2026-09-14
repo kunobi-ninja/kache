@@ -12,6 +12,9 @@ use crate::events;
 use crate::since::SinceWindow;
 use crate::store::{STAGING_SWEEP_GRACE, Store};
 
+mod miss_diagnosis;
+use miss_diagnosis::{Cause, MissDiagnosis};
+
 // ── Stats snapshot (daemon-first, fallback to direct) ──────────────────────
 
 /// Cached store + event stats, refreshed periodically.
@@ -1272,10 +1275,8 @@ fn format_relative_time(sqlite_dt: &str) -> String {
 /// stored normally (kunobi-ninja/kache#629).
 ///
 /// A compile that ran and could not be stored answers the question outright, and
-/// it outranks the key analysis `why_miss` prints below it: the key never got
-/// the chance to matter, because nothing was written for a later build to match
-/// against. Deliberately not labelled `Diagnosis:` — that heading belongs to the
-/// stored-entry analysis, and two of them read as contradictory findings.
+/// it outranks key comparisons: nothing was written for a later build to match.
+/// The terminal keeps the established `NOT CACHED` heading for this failure.
 fn store_failure_banner(miss: &crate::events::BuildEvent) -> Option<String> {
     if miss.store_error.is_empty() {
         return None;
@@ -1283,8 +1284,7 @@ fn store_failure_banner(miss: &crate::events::BuildEvent) -> Option<String> {
     Some(format!(
         "  NOT CACHED: this compile ran and its outputs failed to store,\n  \
          so the crate misses on every build until the cause is fixed.\n    \
-         reason: {}\n  \
-         (the key analysis below is secondary: nothing was stored to match)",
+         reason: {}",
         miss.store_error
     ))
 }
@@ -1421,8 +1421,27 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 events::EventResult::Dup | events::EventResult::Miss
             )
     };
+    let store = Store::open(config)?;
+    let all_entries = store.list_entries("name")?;
+    let stored: Vec<_> = all_entries
+        .iter()
+        .filter(|e| e.crate_name == crate_name)
+        .collect();
+    let same_key_present = stored.iter().any(|e| e.cache_key == miss.cache_key);
+    let chain = all_events
+        .iter()
+        .position(|event| std::ptr::eq(event, *miss))
+        .and_then(|index| crate::miss_chain::analyze(&all_events, index));
+    let diagnosis = MissDiagnosis::new(
+        miss,
+        prior_same_key_miss,
+        stored.len(),
+        same_key_present,
+        chain,
+        config.explain_miss,
+    );
     if json {
-        return why_miss_json(config, crate_name, miss, prior_same_key_miss);
+        return why_miss_json(crate_name, miss, stored.len(), &diagnosis);
     }
 
     // ── Header ─────────────────────────────────────────────────────────
@@ -1462,26 +1481,11 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         }
     }
 
-    // ── Stored entries for this crate ──────────────────────────────────
-    let store = Store::open(config)?;
-    let all_entries = store.list_entries("name")?;
-    let stored: Vec<_> = all_entries
-        .iter()
-        .filter(|e| e.crate_name == crate_name)
-        .collect();
-
     println!();
 
     if stored.is_empty() {
         println!("  Stored entries for `{crate_name}`: (none)");
         println!();
-        if let Some(banner) = lookup_rejection_banner(miss, false) {
-            println!("{banner}");
-        } else if let Some(banner) = legacy_repeated_same_key_banner(miss, prior_same_key_miss) {
-            println!("{banner}");
-        } else {
-            println!("  Diagnosis: never cached -- first build of this crate");
-        }
     } else {
         // Show stored entries (cap at 10 most recent)
         println!(
@@ -1533,53 +1537,11 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         if hidden > 0 {
             println!("    ... and {hidden} older entries");
         }
-
-        // ── Diagnosis ──────────────────────────────────────────────────
-        println!();
-
-        let miss_key_stored = stored.iter().any(|e| e.cache_key == miss.cache_key);
-        let other_entries: Vec<_> = stored
-            .iter()
-            .filter(|e| e.cache_key != miss.cache_key)
-            .collect();
-
-        if let Some(banner) = lookup_rejection_banner(miss, miss_key_stored) {
-            println!("{banner}");
-        } else if let Some(banner) = legacy_repeated_same_key_banner(miss, prior_same_key_miss) {
-            println!("{banner}");
-        } else if miss_key_stored && !other_entries.is_empty() {
-            println!(
-                "  Diagnosis: key mismatch -- {} other entr{} exist but {} matched the current build inputs",
-                other_entries.len(),
-                if other_entries.len() == 1 { "y" } else { "ies" },
-                if other_entries.len() == 1 {
-                    "it"
-                } else {
-                    "none"
-                },
-            );
-            why_miss_diff_entries(config, &store, miss, &other_entries);
-        } else if miss_key_stored {
-            println!("  Diagnosis: first build with these inputs -- entry is now cached");
-        } else if !other_entries.is_empty() {
-            println!(
-                "  Diagnosis: key mismatch -- {} entr{} exist but none match key {}",
-                other_entries.len(),
-                if other_entries.len() == 1 { "y" } else { "ies" },
-                miss_key_display,
-            );
-            why_miss_diff_entries(config, &store, miss, &other_entries);
-        } else {
-            println!("  Diagnosis: no matching entries found");
-        }
     }
+    print_miss_diagnosis(config, &store, miss, &stored, &diagnosis);
 
-    // ── Dependency cascade ────────────────────────────────────────────
-    // The diagnosis above compares this crate's stored entries against each
-    // other, which in a cascade says the same undifferentiated thing for every
-    // crate downstream of the one that actually moved. Walk the recorded
-    // dependency digests instead and name the crate at the bottom (#609).
-    print_extern_chain(&all_events, miss, config.explain_miss);
+    // Render the dependency analysis shared with JSON output.
+    print_extern_chain(&diagnosis);
 
     // ── Recent event history ──────────────────────────────────────────
     println!("\n  Recent events:");
@@ -1649,19 +1611,9 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
 /// the ordinary single-crate case reads exactly as before. When the digests
 /// were never recorded, says how to turn them on rather than staying silent
 /// about a diagnosis it could have given.
-fn print_extern_chain(
-    all_events: &[events::BuildEvent],
-    miss: &events::BuildEvent,
-    explain_miss: bool,
-) {
-    // The walk is driven by position in the oldest-first slice, so the exact
-    // event has to be located rather than re-found by name and timestamp
-    // (which can collide).
-    let Some(miss_index) = all_events.iter().position(|e| std::ptr::eq(e, miss)) else {
-        return;
-    };
-    let Some(chain) = crate::miss_chain::analyze(all_events, miss_index) else {
-        if !explain_miss && miss.key_externs.is_empty() {
+fn print_extern_chain(diagnosis: &MissDiagnosis) {
+    let Some(chain) = &diagnosis.dependency_chain else {
+        if diagnosis.dependency_recording_missing {
             println!(
                 "\n  Dependency cascade: not analyzed (no per-dependency digests recorded).\n    \
                  Enable [cache] explain_miss to record them, then rebuild."
@@ -1749,75 +1701,78 @@ fn print_extern_chain(
     }
 }
 
-fn why_miss_json(
+fn print_miss_diagnosis(
     config: &Config,
+    store: &Store,
+    miss: &events::BuildEvent,
+    stored: &[&crate::store::EntryInfo],
+    diagnosis: &MissDiagnosis,
+) {
+    match diagnosis.cause {
+        Cause::NotCached => {} // The store-failure banner already leads the report.
+        Cause::LookupRejected => {
+            if let Some(banner) = lookup_rejection_banner(miss, diagnosis.same_key_present) {
+                println!("{banner}");
+            }
+        }
+        Cause::RepeatedSameKey => {
+            if let Some(banner) = legacy_repeated_same_key_banner(miss, true) {
+                println!("{banner}");
+            }
+        }
+        Cause::NeverCached => println!("  Diagnosis: never cached -- first build of this crate"),
+        Cause::FirstBuildNowCached => {
+            println!("  Diagnosis: first build with these inputs -- entry is now cached");
+        }
+        Cause::KeyMismatch => {
+            println!(
+                "  Diagnosis: key mismatch -- {} other stored entries differ from key {}",
+                diagnosis.other_entries,
+                key_short(&miss.cache_key),
+            );
+            let other_entries: Vec<_> = stored
+                .iter()
+                .filter(|e| e.cache_key != miss.cache_key)
+                .collect();
+            why_miss_diff_entries(config, store, miss, &other_entries);
+        }
+    }
+}
+
+fn why_miss_json(
     crate_name: &str,
     miss: &events::BuildEvent,
-    prior_same_key_miss: bool,
+    stored_entries: usize,
+    diagnosis: &MissDiagnosis,
 ) -> Result<()> {
     #[derive(serde::Serialize)]
     struct Body<'a> {
         crate_name: &'a str,
-        diagnosis: &'a str,
+        diagnosis: Cause,
         last_result: String,
         cache_key: &'a str,
         store_error: &'a str,
         lookup_rejection: &'a str,
         stored_entries: usize,
+        dependency_chain: &'a Option<crate::miss_chain::Chain>,
+        dependency_recording_missing: bool,
     }
 
-    let store = Store::open(config)?;
-    let stored: Vec<_> = store
-        .list_entries("name")?
-        .into_iter()
-        .filter(|e| crate_name_matches(crate_name, &e.crate_name))
-        .collect();
-    let miss_key_stored = stored
-        .iter()
-        .any(|e| cache_key_matches(&e.cache_key, &miss.cache_key));
-    let diagnosis = why_miss_diagnosis(
-        &miss.store_error,
-        &miss.lookup_rejection,
-        stored.len(),
-        miss_key_stored,
-    );
-    let _ = prior_same_key_miss;
     crate::machine::emit(
         "why-miss",
         Body {
             crate_name,
-            diagnosis,
+            diagnosis: diagnosis.cause,
             last_result: miss.result.to_string(),
             cache_key: &miss.cache_key,
             store_error: &miss.store_error,
             lookup_rejection: &miss.lookup_rejection,
-            stored_entries: stored.len(),
+            stored_entries,
+            dependency_chain: &diagnosis.dependency_chain,
+            dependency_recording_missing: diagnosis.dependency_recording_missing,
         },
         Vec::new(),
     )
-}
-
-fn why_miss_diagnosis(
-    store_error: &str,
-    lookup_rejection: &str,
-    stored_entries: usize,
-    miss_key_stored: bool,
-) -> &'static str {
-    if !store_error.is_empty() {
-        "not_cached"
-    } else if !lookup_rejection.is_empty() {
-        "lookup_rejected"
-    } else if stored_entries == 0 {
-        "never_cached"
-    } else if miss_key_stored {
-        "first_build_now_cached"
-    } else {
-        "key_mismatch"
-    }
-}
-
-fn cache_key_matches(stored: &str, missed: &str) -> bool {
-    stored == missed
 }
 
 /// Compare the miss event's stored metadata against other stored entries
@@ -6986,26 +6941,6 @@ mod tests {
         assert!(!human_clean_output(true));
         assert!(!doctor_has_issues(0));
         assert!(doctor_has_issues(1));
-    }
-
-    #[test]
-    fn why_miss_json_diagnosis_has_distinct_precedence() {
-        assert_eq!(
-            why_miss_diagnosis("write failed", "", 0, false),
-            "not_cached"
-        );
-        assert_eq!(
-            why_miss_diagnosis("", "metadata mismatch", 0, false),
-            "lookup_rejected"
-        );
-        assert_eq!(why_miss_diagnosis("", "", 0, false), "never_cached");
-        assert_eq!(
-            why_miss_diagnosis("", "", 1, true),
-            "first_build_now_cached"
-        );
-        assert_eq!(why_miss_diagnosis("", "", 1, false), "key_mismatch");
-        assert!(cache_key_matches("same", "same"));
-        assert!(!cache_key_matches("stored", "missed"));
     }
 
     #[test]

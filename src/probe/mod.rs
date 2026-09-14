@@ -968,6 +968,16 @@ mod tests {
     fn live_doctor_probe_skips_a_kache_cc_shim() {
         use std::os::unix::fs::symlink;
 
+        if let Some(expected) = std::env::var_os("KACHE_DOCTOR_SHIM_TEST_CHILD") {
+            match live_probe_diagnostic() {
+                LiveProbeDiagnostic::Resolved { version_line } => {
+                    assert_eq!(version_line, expected.to_string_lossy())
+                }
+                other => panic!("doctor must probe the compiler behind the shim: {other:?}"),
+            }
+            return;
+        }
+
         let _lock = crate::config::config_path_lock();
         let Some(real_cc) = crate::compiler::shim::resolve_real_compiler_from_env("cc") else {
             eprintln!("skipping: no real `cc` on PATH");
@@ -981,25 +991,26 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        symlink(std::env::current_exe().unwrap(), dir.path().join("cc")).unwrap();
-        struct RestorePath(std::ffi::OsString);
-        impl Drop for RestorePath {
-            fn drop(&mut self) {
-                unsafe { std::env::set_var("PATH", &self.0) };
-            }
-        }
+        let exe = std::env::current_exe().unwrap();
+        symlink(&exe, dir.path().join("cc")).unwrap();
         let original_path = std::env::var_os("PATH").unwrap();
-        let _restore = RestorePath(original_path.clone());
         let mut dirs = vec![dir.path().to_path_buf()];
         dirs.extend(std::env::split_paths(&original_path));
-        unsafe { std::env::set_var("PATH", std::env::join_paths(dirs).unwrap()) };
-
-        match live_probe_diagnostic() {
-            LiveProbeDiagnostic::Resolved {
-                version_line: actual,
-            } => assert_eq!(actual, version_line),
-            other => panic!("doctor must probe the compiler behind the shim: {other:?}"),
-        }
+        let output = Command::new(exe)
+            .args([
+                "--exact",
+                "probe::tests::live_doctor_probe_skips_a_kache_cc_shim",
+            ])
+            .env("PATH", std::env::join_paths(dirs).unwrap())
+            .env("KACHE_DOCTOR_SHIM_TEST_CHILD", version_line)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child probe failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

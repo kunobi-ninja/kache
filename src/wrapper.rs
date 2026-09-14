@@ -1059,6 +1059,7 @@ fn nvcc_passthrough(parsed: &crate::compiler::nvcc::NvccArgs) -> Result<Passthro
     Ok(PassthroughOutput {
         exit_code: status.code().unwrap_or(1),
         fallback: false,
+        fallback_attempt: None,
     })
 }
 
@@ -1815,10 +1816,11 @@ fn cc_passthrough_impl(
     parsed: &crate::compiler::cc::CcArgs,
     force_direct: bool,
 ) -> Result<PassthroughOutput> {
+    let mut fallback_attempt = None;
     // Configured fallback wrapper: `<fallback> <cc> <args>`.
     // kache's C/C++ coverage is narrower than its rustc support, so
     // the fallback is most valuable on this path. Falls through to a
-    // plain passthrough if the fallback is not on PATH.
+    // direct compilation if the fallback fails.
     if let Some(fb) = config.fallback.as_deref()
         && !force_direct
         && !parsed.requires_compiler_output_semantics()
@@ -1826,9 +1828,21 @@ fn cc_passthrough_impl(
         let mut cmd = std::process::Command::new(fb);
         cmd.arg(&parsed.program);
         cmd.args(&parsed.rest);
-        if let Some(output) = run_fallback(cmd, fb)? {
-            return Ok(output);
+        let outputs: Vec<&Path> = parsed
+            .output
+            .as_deref()
+            .map(Path::new)
+            .into_iter()
+            .collect();
+        let attempt = crate::fallback::run(cmd, fb, &outputs, &parsed.rest);
+        if let Some(exit_code) = attempt.terminal_code() {
+            return Ok(PassthroughOutput {
+                exit_code,
+                fallback: true,
+                fallback_attempt: Some(attempt),
+            });
         }
+        fallback_attempt = Some(attempt);
     }
 
     // A refusal means Kache has promised to preserve the selected compiler's
@@ -1845,6 +1859,7 @@ fn cc_passthrough_impl(
     Ok(PassthroughOutput {
         exit_code: status.code().unwrap_or(1),
         fallback: false,
+        fallback_attempt,
     })
 }
 
@@ -4826,35 +4841,11 @@ fn read_cached_dep_info_blob(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PassthroughOutput {
     exit_code: i32,
     fallback: bool,
-}
-
-/// Run a configured fallback compiler-wrapper.
-///
-/// `cmd` is the fully-built `<fallback> <compiler> <args...>` command.
-/// Returns `Some(output)` if the fallback ran; returns `None` — so
-/// the caller does a plain passthrough — when the fallback binary is
-/// not found on `PATH`. A misconfigured fallback must never fail a
-/// build, so `NotFound` degrades gracefully; any other spawn error
-/// propagates.
-fn run_fallback(mut cmd: std::process::Command, name: &str) -> Result<Option<PassthroughOutput>> {
-    match cmd.status() {
-        Ok(status) => Ok(Some(PassthroughOutput {
-            exit_code: status.code().unwrap_or(1),
-            fallback: true,
-        })),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::warn!(
-                "[kache] fallback wrapper `{}` not found on PATH — plain passthrough",
-                name
-            );
-            Ok(None)
-        }
-        Err(e) => Err(e).with_context(|| format!("executing fallback wrapper `{name}`")),
-    }
+    fallback_attempt: Option<crate::fallback::Attempt>,
 }
 
 /// Pass through to rustc without caching.
@@ -4979,9 +4970,9 @@ fn passthrough_args(
         &args.emit,
     );
 
+    let mut fallback_attempt = None;
     // Configured fallback wrapper: `<fallback> <rustc> [<inner-rustc>]
-    // <args>`. Falls through to a plain passthrough if the fallback
-    // binary is not on PATH.
+    // <args>`. Failures fall through to direct compilation.
     if let Some(fb) = fallback {
         let mut cmd = std::process::Command::new(fb);
         if disable_incremental_env(incremental_preserved) {
@@ -4996,9 +4987,22 @@ fn passthrough_args(
         } else if let Some(direct) = &direct_args {
             cmd.args(direct);
         }
-        if let Some(output) = run_fallback(cmd, fb)? {
-            return Ok(output);
+        let outputs: Vec<&Path> = args
+            .output
+            .as_deref()
+            .map(Path::new)
+            .into_iter()
+            .chain(args.out_dir.as_deref().map(Path::new))
+            .collect();
+        let attempt = crate::fallback::run(cmd, fb, &outputs, compiler_args);
+        if let Some(exit_code) = attempt.terminal_code() {
+            return Ok(PassthroughOutput {
+                exit_code,
+                fallback: true,
+                fallback_attempt: Some(attempt),
+            });
         }
+        fallback_attempt = Some(attempt);
     }
 
     let mut cmd = std::process::Command::new(&args.rustc);
@@ -5020,6 +5024,7 @@ fn passthrough_args(
     Ok(PassthroughOutput {
         exit_code: status.code().unwrap_or(1),
         fallback: false,
+        fallback_attempt,
     })
 }
 
@@ -5137,6 +5142,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         String::new(),
         false,
         Some(result.exit_code),
+        None,
     );
     Ok(result.exit_code)
 }
@@ -5409,6 +5415,7 @@ fn log_event_with_store_and_lookup_outcome(
         lookup_rejection,
         false,
         None,
+        None,
     );
 }
 
@@ -5440,6 +5447,7 @@ fn log_passthrough_event(
         String::new(),
         output.fallback,
         Some(output.exit_code),
+        output.fallback_attempt.clone(),
     );
 }
 
@@ -5464,6 +5472,7 @@ fn log_event_details(
     lookup_rejection: String,
     fallback: bool,
     exit_code: Option<i32>,
+    fallback_attempt: Option<crate::fallback::Attempt>,
 ) {
     // Session attribution (#583 P0.5): read the root-scoped session id and
     // refresh the marker so the 5-minute window measures inactivity. Both are
@@ -5516,7 +5525,7 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 18,
+        schema: 19,
         session_id,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
@@ -5561,6 +5570,7 @@ fn log_event_details(
         lookup_rejection,
         verify_compare: crate::verify_compare::take_last_report(),
         fallback,
+        fallback_attempt,
         exit_code,
         key_fields,
         key_diff,
@@ -8721,31 +8731,6 @@ mod tests {
 
     // ── fallback wrapper ─────────────────────────────────────────────
 
-    #[test]
-    fn run_fallback_missing_binary_degrades_to_none() {
-        // A configured-but-absent fallback wrapper must never fail a
-        // build — `NotFound` degrades to `None` so the caller does a
-        // plain passthrough.
-        let name = "kache-no-such-fallback-binary-zzz";
-        let cmd = std::process::Command::new(name);
-        assert!(matches!(run_fallback(cmd, name), Ok(None)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn run_fallback_runs_an_existing_command() {
-        // `true` exists on every unix and exits 0 — the fallback ran,
-        // so its exit code is returned.
-        let cmd = std::process::Command::new("true");
-        assert!(matches!(
-            run_fallback(cmd, "true"),
-            Ok(Some(PassthroughOutput {
-                exit_code: 0,
-                fallback: true
-            }))
-        ));
-    }
-
     #[cfg(unix)]
     #[test]
     fn stripped_fallback_receives_incremental_disabled_env() {
@@ -10846,7 +10831,7 @@ exit 0
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 18);
+        assert_eq!(event.schema, 19);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);
@@ -10912,7 +10897,7 @@ exit 0
 
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         let event = &events[0];
-        assert_eq!(event.schema, 18);
+        assert_eq!(event.schema, 19);
         // Whatever other tests add is real time, far under the next band.
         for (name, value, floor, fed) in [
             ("startup_ms", event.startup_ms, before[0], STARTUP_MS),
@@ -11051,7 +11036,7 @@ exit 0
         let event = &events[0];
         assert_eq!(event.result, EventResult::Miss);
         assert_eq!(event.cache_key, "same-key");
-        assert_eq!(event.schema, 18);
+        assert_eq!(event.schema, 19);
         assert_eq!(
             event.lookup_rejection,
             "matching entry lacks dep-info required by this invocation"
@@ -11087,7 +11072,7 @@ exit 0
             0,
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
-        assert_eq!(events[0].schema, 18);
+        assert_eq!(events[0].schema, 19);
         assert_eq!(events[0].result, EventResult::LocalHit);
         assert!(
             events[0].verify_compare.is_empty(),
@@ -11112,7 +11097,7 @@ exit 0
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[1].schema, 18);
+        assert_eq!(events[1].schema, 19);
         assert_eq!(
             events[1].verify_compare,
             "content: libfoo.rlib (byte mismatch)"
@@ -11129,6 +11114,7 @@ exit 0
         let output = PassthroughOutput {
             exit_code: 42,
             fallback: true,
+            fallback_attempt: None,
         };
 
         log_passthrough_event(

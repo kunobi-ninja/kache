@@ -15,6 +15,7 @@ mod daemon;
 mod daemon_local;
 mod events;
 mod extra_inputs;
+mod fallback;
 mod fallback_planner;
 mod heartbeat;
 mod identity;

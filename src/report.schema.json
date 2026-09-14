@@ -480,6 +480,16 @@
         "start_unix_ms": { "type": "integer" },
         "end_unix_ms": { "type": "integer" },
         "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "fallback_attempt": {
+          "type": "object",
+          "required": ["wrapper", "outcome", "exit_code", "detail"],
+          "properties": {
+            "wrapper": { "type": "string" },
+            "outcome": { "enum": ["success", "failed", "spawn_failed", "cancelled", "sandbox_denied", "direct_required"] },
+            "exit_code": { "type": ["integer", "null"] },
+            "detail": { "type": "string" }
+          }
+        },
         "exit_code": { "type": ["integer", "null"] },
         "timestamp": { "type": "string" }
       }

@@ -4390,6 +4390,7 @@ mod tests {
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,
+            fallback_attempt: None,
             exit_code: Some(0),
             key_fields: Default::default(),
             key_diff: Vec::new(),

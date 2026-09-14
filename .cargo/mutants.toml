@@ -229,7 +229,10 @@ gitignore = true
 # ubuntu lane never compiles. Their parsers and the procfs readers are
 # platform-neutral and stay in scope; the macOS Test lane runs the real
 # wrappers through the host smoke test.
-exclude_globs = ["crates/kache-fs/src/apfs.rs"]
+# The sccache preflight adapter calls Darwin-only process and sandbox APIs.
+# Its decision logic lives in src/fallback/sandbox.rs and stays in this Linux
+# lane. Test (macOS) covers the native adapter with allowed/denied subprocesses.
+exclude_globs = ["crates/kache-fs/src/apfs.rs", "src/fallback/macos.rs"]
 exclude_re = [
     "crates/kache-fs/src/copy.rs:.*(native_reflink_macos|native_reflink_windows|native_reflink_unsupported|windows_cluster_size)",
     "crates/kache-fs/src/identity.rs:.*windows_metadata_identity",

@@ -737,6 +737,8 @@ pub struct BypassDetail {
     pub elapsed_ms: u64,
     pub exit_code: Option<i32>,
     pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_attempt: Option<crate::fallback::Attempt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1736,6 +1738,7 @@ fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
         result: e.result.to_string(),
         route: bypass_route(e).to_string(),
         reason: bypass_reason(e),
+        fallback_attempt: e.fallback_attempt.clone(),
         start_time,
         end_time,
         start_unix_ms,
@@ -1743,6 +1746,16 @@ fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
         elapsed_ms: e.elapsed_ms,
         exit_code: e.exit_code,
         timestamp: e.ts.to_rfc3339(),
+    }
+}
+
+fn bypass_detail_reason(detail: &BypassDetail) -> String {
+    match &detail.fallback_attempt {
+        Some(attempt) => format!(
+            "{}; fallback `{}`: {}",
+            detail.reason, attempt.wrapper, attempt.detail
+        ),
+        None => detail.reason.clone(),
     }
 }
 
@@ -2477,7 +2490,7 @@ fn push_bypass_tables(lines: &mut Vec<String>, bypass: &BypassAnalysis) {
                 detail.route,
                 format_duration_ms(detail.elapsed_ms),
                 format_exit_code(detail.exit_code),
-                markdown_cell(&detail.reason),
+                markdown_cell(&bypass_detail_reason(detail)),
             ));
         }
     }
@@ -3719,7 +3732,7 @@ pub fn format_text(report: &BuildReport) -> String {
                     detail.route,
                     format_duration_ms(detail.elapsed_ms),
                     format_exit_code(detail.exit_code),
-                    detail.reason
+                    bypass_detail_reason(detail)
                 ));
             }
         }
@@ -4166,6 +4179,7 @@ mod tests {
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,
+            fallback_attempt: None,
             exit_code: None,
             key_fields: Default::default(),
             key_diff: Vec::new(),
@@ -6363,6 +6377,44 @@ mod tests {
     }
 
     #[test]
+    fn fallback_recovery_survives_report_conversion_and_formatting() {
+        let mut event = test_event("fixture", EventResult::Passthrough, 5, 0, 0, "");
+        event.passthrough_reason = "unsupported|assembly".into();
+        event.exit_code = Some(0);
+        let plain = to_bypass_detail(&event);
+        assert_eq!(bypass_detail_reason(&plain), "unsupported|assembly");
+        event.fallback_attempt = Some(crate::fallback::Attempt {
+            wrapper: "sccache".into(),
+            outcome: crate::fallback::Outcome::Failed,
+            exit_code: Some(42),
+            detail: "exit status: 42".into(),
+        });
+        let detail = to_bypass_detail(&event);
+        assert_eq!(detail.fallback_attempt, event.fallback_attempt);
+        assert_eq!(detail.route, "direct");
+        assert_eq!(detail.exit_code, Some(0));
+        assert_eq!(
+            bypass_detail_reason(&detail),
+            "unsupported|assembly; fallback `sccache`: exit status: 42"
+        );
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["fallback_attempt"]["exit_code"], 42);
+        let mut lines = Vec::new();
+        push_bypass_tables(
+            &mut lines,
+            &BypassAnalysis {
+                slowest: vec![detail],
+                ..Default::default()
+            },
+        );
+        assert!(
+            lines
+                .join("\n")
+                .contains("fallback `sccache`: exit status: 42")
+        );
+    }
+
+    #[test]
     fn test_bypass_route_reflects_result_and_fallback() {
         let mut e = test_event("c", EventResult::Passthrough, 1, 0, 0, "k");
         assert_eq!(bypass_route(&e), "direct");
@@ -7017,6 +7069,7 @@ mod tests {
                 max_elapsed_ms: 1500,
             }],
             slowest: vec![BypassDetail {
+                fallback_attempt: None,
                 crate_name: "foo".to_string(),
                 root: String::new(),
                 result: "passthrough".to_string(),

@@ -20,7 +20,7 @@ enum PreserveMode<'a> {
     Global,
     /// `KACHE_INCREMENTAL_CRATES=<list>`: only the listed crates preserved.
     /// `failing_fallback` also exports a fallback wrapper that exits 77 —
-    /// proof that the exercised lane runs the compiler itself. Leave it off
+    /// its marker proves that the exercised lane runs the compiler itself. Leave it off
     /// when the test expects the ordinary cache path, whose key pre-pass
     /// falls back on the fake compiler's missing dep-info output.
     ForceList {
@@ -99,13 +99,18 @@ fn run_fake_compiler(
     let env_dump = dir.path().join("incremental-env.txt");
     let fake_rustc = dir.path().join(compiler_name);
     let failing_fallback = dir.path().join("fallback");
+    let fallback_marker = dir.path().join("fallback-used");
     fs::write(
         &fake_rustc,
         "#!/bin/sh\n: > \"$ARGV_DUMP\"\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    @*) while IFS= read -r line || [ -n \"$line\" ]; do printf '%s\\n' \"$line\" >> \"$ARGV_DUMP\"; done < \"${arg#@}\";;\n    *) printf '%s\\n' \"$arg\" >> \"$ARGV_DUMP\";;\n  esac\ndone\nprintf '%s' \"${CARGO_INCREMENTAL-unset}\" > \"$INCREMENTAL_ENV_DUMP\"\nexit 0\n",
     )
     .unwrap();
     fs::set_permissions(&fake_rustc, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::write(&failing_fallback, "#!/bin/sh\nexit 77\n").unwrap();
+    fs::write(
+        &failing_fallback,
+        "#!/bin/sh\necho used > \"$FALLBACK_MARKER\"\nexit 77\n",
+    )
+    .unwrap();
     fs::set_permissions(&failing_fallback, fs::Permissions::from_mode(0o755)).unwrap();
 
     let source = dir.path().join("lib.rs");
@@ -159,10 +164,11 @@ fn run_fake_compiler(
             command
                 .env("KACHE_PRESERVE_INCREMENTAL", "1")
                 .env_remove("KACHE_INCREMENTAL_CRATES")
+                .env("FALLBACK_MARKER", &fallback_marker)
                 .env("KACHE_FALLBACK", &failing_fallback);
         }
         // The failing fallback doubles as proof the force-list lane runs the
-        // compiler itself: routing through the fallback would exit 77.
+        // compiler itself: routing through the fallback would write its marker.
         PreserveMode::ForceList {
             list,
             failing_fallback: with_fallback,
@@ -171,7 +177,9 @@ fn run_fake_compiler(
                 .env_remove("KACHE_PRESERVE_INCREMENTAL")
                 .env("KACHE_INCREMENTAL_CRATES", list);
             if with_fallback {
-                command.env("KACHE_FALLBACK", &failing_fallback);
+                command
+                    .env("FALLBACK_MARKER", &fallback_marker)
+                    .env("KACHE_FALLBACK", &failing_fallback);
             } else {
                 command.env_remove("KACHE_FALLBACK");
             }
@@ -197,6 +205,11 @@ fn run_fake_compiler(
         output.status.success(),
         "kache wrapper failed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !fallback_marker.exists(),
+        "incremental preservation must bypass the fallback, not recover after running it"
     );
 
     let argv = fs::read_to_string(&argv_dump)

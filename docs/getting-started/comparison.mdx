@@ -62,3 +62,25 @@ cargo build
 ```
 
 The fallback only receives passthrough work. Kache still owns the invocations it decides to cache or isolate. Remove the fallback when Kache covers the remaining workload.
+
+If the fallback fails to start or exits unsuccessfully, Kache warns and retries once
+with the direct compiler. The direct compiler's result determines the build result.
+Interrupts and termination requests (including shell statuses 130 and 143) do not trigger a retry.
+Both attempts keep their diagnostics; the warning marks the transition to the direct
+compiler. A genuine source error can therefore be reported twice.
+
+On macOS, Kache also checks the output access of an identifiable local sccache TCP
+server. A confirmed sandbox denial skips the fallback before compilation. This
+optional check respects `SCCACHE_SERVER_PORT`; Unix sockets, unidentified servers,
+and unavailable sandbox queries use normal fallback execution and failure recovery.
+Kache does not start, stop, or change the server during this check. A server that
+starts after the check can still inherit its launcher's sandbox, so recovery remains
+necessary. Use `KACHE_FALLBACK=off` to disable the fallback for a build.
+
+Build events and JSON report bypass details include `fallback_attempt` with the
+wrapper, outcome, status, and diagnostic reason. The final `route` and `exit_code`
+show whether direct compilation followed and whether it succeeded.
+
+Invocations using standard input/output, preprocessor stdout, or an unexpanded
+response file go directly to the compiler. This prevents a failed fallback from
+consuming input or leaving partial stdout that cannot be replayed safely.

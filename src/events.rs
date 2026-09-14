@@ -45,6 +45,7 @@ pub struct BuildEvent {
     /// 15 = same-key lookup rejection reason (#655),
     /// 16 = compile-and-compare verify on hits (`verify_compare`),
     /// 17 = wrapper phase timings: startup, dep-info pre-pass, scheduler wait.
+    /// 19 = fallback attempt and recovery details.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -231,6 +232,9 @@ pub struct BuildEvent {
     /// Whether a configured fallback wrapper handled the passthrough.
     #[serde(default, skip_serializing_if = "is_false")]
     pub fallback: bool,
+    /// Optional wrapper attempt, including failure or sandbox bypass before a direct compile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_attempt: Option<crate::fallback::Attempt>,
     /// Exit code from the passthrough command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -1464,6 +1468,7 @@ impl BuildEvent {
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,
+            fallback_attempt: None,
             exit_code: None,
             key_fields: Default::default(),
             key_diff: Vec::new(),
@@ -1552,6 +1557,7 @@ mod tests {
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,
+            fallback_attempt: None,
             exit_code: None,
             key_fields: Default::default(),
             key_diff: Vec::new(),

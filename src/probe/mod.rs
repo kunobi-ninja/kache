@@ -219,8 +219,20 @@ impl Prober for NvccProber {
         }
         let dryrun_text = String::from_utf8_lossy(&dryrun.stdout).into_owned();
         let host = find_nvcc_host_compiler(&dryrun_text).with_context(|| {
+            // Include the raw output (truncated): host discovery runs
+            // against real driver text exactly once per toolchain, and a
+            // format drift is otherwise undebuggable from the reason alone.
+            let mut shown: String =
+                dryrun_text.chars().take(800).collect();
+            if dryrun_text.len() > shown.len() {
+                shown.push_str("…[truncated]");
+            }
+            let stderr: String = String::from_utf8_lossy(&dryrun.stderr)
+                .chars()
+                .take(400)
+                .collect();
             format!(
-                "`{} --dryrun` names no recognizable host compiler",
+                "`{} --dryrun` names no recognizable host compiler\n--- stdout ---\n{shown}\n--- stderr ---\n{stderr}",
                 req.compiler
             )
         })?;

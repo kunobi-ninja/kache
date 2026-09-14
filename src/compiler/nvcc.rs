@@ -1,9 +1,7 @@
 //! CUDA `nvcc` compiler adapter.
 //!
-//! Phase 1 (kunobi-ninja/kache#1024): argv recognition, argument parsing,
-//! and refuse-to-cache classification. There is deliberately no caching
-//! yet — [`run_nvcc`](crate::wrapper::run_nvcc) parses every invocation,
-//! reports *why* it is not cached, and passes through to the real `nvcc`.
+//! Caches single-source object compiles, including relocatable device code.
+//! Other invocation modes pass through to the real `nvcc`.
 //!
 //! ## Why the parser is strict (fail-closed)
 //!
@@ -19,7 +17,7 @@
 //!
 //! `nvcc -E` always defines `__CUDA_ARCH__`, so host-only code guarded by
 //! `#ifndef __CUDA_ARCH__` is invisible in preprocessed output — two
-//! different sources could preprocess identically. Phase 2 therefore keys
+//! different sources could preprocess identically. The adapter keys
 //! raw source + header *contents* via the `nvcc -M` dependency closure,
 //! never preprocessed output.
 
@@ -32,8 +30,8 @@ pub const NVCC_ID: CompilerId = CompilerId::new("nvcc");
 pub const ADAPTER: CompilerAdapter =
     CompilerAdapter::new(NVCC_ID, "nvcc", NvccCompiler::recognizes);
 
-/// What an `nvcc` invocation does. Only [`NvccMode::Compile`] is a future
-/// cache candidate; every other mode refuses in [`NvccArgs::refuse_reasons`].
+/// What an `nvcc` invocation does. Only [`NvccMode::Compile`] is cacheable;
+/// every other mode refuses in [`NvccArgs::refuse_reasons`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvccMode {
     /// `nvcc -c a.cu -o a.o`: single whole-invocation device compile.
@@ -92,10 +90,7 @@ pub struct NvccArgs {
     pub keep_temps: bool,
     /// `@file`: response file (never expanded — refuse).
     pub response_file: bool,
-    /// Flags the phase-1 table knows, keyed verbatim into the cache key
-    /// (see `cache_key`). The table exists so phase 3 promotes entries to
-    /// resolved/probed classification instead of discovering flags from
-    /// scratch.
+    /// Modeled flags keyed verbatim into the cache key (see `cache_key`).
     pub deferred_flags: Vec<String>,
     /// Flags matching nothing in the table. Always refuse; the
     /// user-declared allow-list ([`NvccCompiler::extra_allowlist_flags`])
@@ -110,8 +105,7 @@ pub struct NvccArgs {
 
 /// Flags taking a separate value (`-D FOO`, `-gencode arch=..,code=..`).
 /// Checked before [`JOINED_PREFIXES`], so `-MF` takes a value while
-/// `-MFout.d` matches the joined form. Every entry is deferred (known but
-/// unkeyed) until phase 2 promotes it into the cache key.
+/// `-MFout.d` matches the joined form.
 const VALUE_FLAGS: &[&str] = &[
     "-D",
     "-U",
@@ -196,6 +190,14 @@ fn is_nvcc_source(name: &str) -> bool {
     )
 }
 
+fn parse_rdc_value(value: &str) -> Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => anyhow::bail!("nvcc: invalid relocatable device code value {value:?}"),
+    }
+}
+
 impl NvccArgs {
     pub fn parse(args: &[String]) -> Result<Self> {
         let Some(program) = args.first().cloned() else {
@@ -261,6 +263,7 @@ impl NvccArgs {
                 "-c" | "--compile" => set_vote(Vote::Compile, NvccMode::Compile, &mut parsed),
                 "-dc" | "--device-c" => {
                     parsed.separate_device_code = true;
+                    parsed.deferred_flags.push(arg.to_string());
                     set_vote(Vote::Compile, NvccMode::Compile, &mut parsed);
                 }
                 "-dlink" | "--device-link" => {
@@ -341,10 +344,15 @@ impl NvccArgs {
                     parsed.depgen_with_compile = true;
                     parsed.deferred_flags.push(arg.to_string());
                 }
-                _ if arg == "-rdc" => parsed.separate_device_code = true,
+                "-rdc" | "--relocatable-device-code" => {
+                    let value = take_value(&mut argv, arg)?;
+                    parsed.separate_device_code = parse_rdc_value(&value)?;
+                    parsed.deferred_flags.push(format!("{arg} {value}"));
+                }
                 _ if arg.starts_with("-rdc=") || arg.starts_with("--relocatable-device-code=") => {
                     let value = arg.rsplit('=').next().unwrap_or("");
-                    parsed.separate_device_code = matches!(value, "true" | "1");
+                    parsed.separate_device_code = parse_rdc_value(value)?;
+                    parsed.deferred_flags.push(arg.to_string());
                 }
                 // Known-but-unmodeled flags (see the tables): recorded so
                 // phase 2 promotes entries instead of discovering flags
@@ -428,11 +436,6 @@ impl NvccArgs {
         if self.sources.len() != 1 {
             reasons.push(RefuseReason::Unsupported(
                 "nvcc multi-source or source-less compile — not yet supported",
-            ));
-        }
-        if self.separate_device_code {
-            reasons.push(RefuseReason::Unsupported(
-                "nvcc separable device code (-dc/-rdc) — not yet supported (kunobi-ninja/kache#1024)",
             ));
         }
         if self.device_debug {
@@ -1426,26 +1429,43 @@ mod tests {
     }
 
     #[test]
-    fn separable_and_debug_refuse_with_named_reasons() {
+    fn separable_modes_are_cacheable_and_keyed() {
         let parsed = parse_ok(&["nvcc", "-c", "-dc", "k.cu", "-o", "k.o"]);
         assert!(parsed.separate_device_code);
-        let reasons = parsed.refuse_reasons(&[]);
-        assert!(
-            reasons
-                .iter()
-                .any(|r| { matches!(r, RefuseReason::Unsupported(d) if d.contains("-dc")) })
-        );
+        assert!(parsed.refuse_reasons(&[]).is_empty());
+        assert_eq!(parsed.deferred_flags, ["-dc"]);
 
         let parsed = parse_ok(&["nvcc", "-c", "-rdc=true", "k.cu", "-o", "k.o"]);
         assert!(parsed.separate_device_code);
+        assert!(parsed.refuse_reasons(&[]).is_empty());
+        assert_eq!(parsed.deferred_flags, ["-rdc=true"]);
 
         let parsed = parse_ok(&["nvcc", "-c", "-rdc=false", "k.cu", "-o", "k.o"]);
         assert!(!parsed.separate_device_code);
+        assert!(parsed.refuse_reasons(&[]).is_empty());
+        assert_eq!(parsed.deferred_flags, ["-rdc=false"]);
 
         // The long spelling feeds the same flag.
-        let parsed = parse_ok(&["nvcc", "-c", "--relocatable-device-code=true", "k.cu"]);
+        let parsed = parse_ok(&[
+            "nvcc",
+            "-c",
+            "--relocatable-device-code=true",
+            "k.cu",
+            "-o",
+            "k.o",
+        ]);
         assert!(parsed.separate_device_code);
+        assert!(parsed.refuse_reasons(&[]).is_empty());
+        assert_eq!(parsed.deferred_flags, ["--relocatable-device-code=true"]);
 
+        let parsed = parse_ok(&["nvcc", "--device-c", "k.cu", "-o", "k.o"]);
+        assert!(parsed.separate_device_code);
+        assert!(parsed.refuse_reasons(&[]).is_empty());
+        assert_eq!(parsed.deferred_flags, ["--device-c"]);
+    }
+
+    #[test]
+    fn device_debug_still_refuses() {
         let parsed = parse_ok(&["nvcc", "-c", "-G", "k.cu", "-o", "k.o"]);
         assert!(parsed.device_debug);
         let reasons = parsed.refuse_reasons(&[]);
@@ -1723,9 +1743,26 @@ mod tests {
     }
 
     #[test]
-    fn bare_rdc_sets_separable() {
-        let parsed = parse_ok(&["nvcc", "-c", "-rdc", "k.cu", "-o", "k.o"]);
+    fn separate_rdc_value_is_keyed() {
+        let parsed = parse_ok(&["nvcc", "-c", "-rdc", "true", "k.cu", "-o", "k.o"]);
         assert!(parsed.separate_device_code);
+        assert!(parsed.refuse_reasons(&[]).is_empty());
+        assert_eq!(parsed.deferred_flags, ["-rdc true"]);
+
+        let parsed = parse_ok(&[
+            "nvcc",
+            "-c",
+            "--relocatable-device-code",
+            "false",
+            "k.cu",
+            "-o",
+            "k.o",
+        ]);
+        assert!(!parsed.separate_device_code);
+        assert_eq!(parsed.deferred_flags, ["--relocatable-device-code false"]);
+
+        assert!(NvccArgs::parse(&s(&["nvcc", "-c", "-rdc=maybe", "k.cu"])).is_err());
+        assert!(NvccArgs::parse(&s(&["nvcc", "-c", "-rdc"])).is_err());
     }
 
     /// Linker inputs are positional unknowns, never sources: a `-c` line

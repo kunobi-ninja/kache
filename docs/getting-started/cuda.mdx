@@ -3,7 +3,7 @@ title: CUDA (nvcc) caching
 description: Cache single-source nvcc object compilations, locally and over the remote
 ---
 
-Kache caches conservative, single-source `nvcc -c` object compilations. If it cannot prove that an invocation is safe to cache, it runs the real compiler unchanged.
+Kache caches single-source `nvcc -c` and `nvcc -dc` object compilations. If it cannot prove that an invocation is safe to cache, it runs the real compiler unchanged.
 
 ## Setup
 
@@ -31,6 +31,13 @@ Kache caches the single-source `-c` device compile as a whole:
 nvcc -c src/kernel.cu -o build/kernel.o -arch=sm_80
 ```
 
+For separate compilation, `-dc` and `-c -rdc=true` also cache the object. Device linking and final linking run through `nvcc` uncached:
+
+```sh
+nvcc -dc src/kernel.cu -o build/kernel.o
+nvcc -dlink build/kernel.o build/helper.o -o build/device-link.o
+```
+
 `nvcc` is a driver: one `-c` invocation fans out to the device frontend, one compiler pair per GPU architecture, the fatbinary bundler, and the host C++ compiler. Kache caches the whole invocation as one entry. On a miss it runs `nvcc` end to end and stores the final object; on a hit it restores the object (and the `-MF` dep-info sidecar, when requested) and skips the toolchain.
 
 ### Why the key is sound
@@ -38,7 +45,7 @@ nvcc -c src/kernel.cu -o build/kernel.o -arch=sm_80
 `nvcc -E` is not a safe cache key: it always defines `__CUDA_ARCH__`, so host-only code guarded by `#ifndef __CUDA_ARCH__` is invisible in its output. Kache does not hash preprocessed output. The key is built from:
 
 - `nvcc`'s version and the host compiler's version (a host upgrade changes the object, probed via `nvcc --dryrun`);
-- the modeled flags verbatim — compile mode, GPU `-arch` / `-gencode` / `-code`, `-std`, `-O`, defines, and the `-Xcompiler` / `-Xptxas` forwarding flags;
+- the modeled flags verbatim — `-dc` / `-rdc` mode, GPU `-arch` / `-gencode` / `-code`, `-std`, `-O`, defines, and the `-Xcompiler` / `-Xptxas` forwarding flags;
 - the dependency closure: the raw content of the source plus every header `nvcc -M` reports. Hashing raw contents (not preprocessed output) captures host-only code, so any source or header edit invalidates the entry.
 - the driver environment: `NVCC_PREPEND_FLAGS` / `NVCC_APPEND_FLAGS` are folded in verbatim, so the same checkout with different driver flags keys apart.
 
@@ -52,7 +59,6 @@ Anything Kache does not model runs the real `nvcc` uncached, including:
 
 - link and device-link (`-dlink`) modes, `--lib`, multi-source compiles;
 - standalone `-ptx` / `-cubin` / `-fatbin` / `--optix-ir` emission;
-- relocatable and separable device code (`-rdc`, `-dc`);
 - device debug (`-G`);
 - machine-resolved values (`-march=native`, `-arch=native`, …) — one key must never cover different objects, so these refuse even when allow-listed;
 - dependency generation without an explicit output (`-M`, `-MM`) or without `-MF` (`-MD`, `-MMD` alone) — combine `-MD`/`-MMD` with `-MF <file>` instead;

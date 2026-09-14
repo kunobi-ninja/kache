@@ -288,6 +288,93 @@ fn nvcc_depinfo_roundtrips() {
 }
 
 #[test]
+fn nvcc_separable_objects_restore_and_link() {
+    if !require_toolkit("nvcc_separable_objects_restore_and_link") {
+        return;
+    }
+    let e = env();
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("kernel.cu"),
+        "extern __device__ int helper(int);\n__global__ void kernel(int *out) { *out = helper(41); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("helper.cu"),
+        "__device__ int helper(int x) { return x + 1; }\nint main() { return 0; }\n",
+    )
+    .unwrap();
+
+    e.kache_nvcc(project.path(), &["-dc", "kernel.cu", "-o", "kernel.o"]);
+    e.kache_nvcc(
+        project.path(),
+        &["-c", "-rdc=true", "helper.cu", "-o", "helper.o"],
+    );
+    std::fs::remove_file(project.path().join("kernel.o")).unwrap();
+    std::fs::remove_file(project.path().join("helper.o")).unwrap();
+    e.kache_nvcc(project.path(), &["-dc", "kernel.cu", "-o", "kernel.o"]);
+    e.kache_nvcc(
+        project.path(),
+        &["-c", "-rdc=true", "helper.cu", "-o", "helper.o"],
+    );
+
+    let v = e.report();
+    assert_eq!(v["summary"]["misses"].as_u64(), Some(2), "{v}");
+    assert_eq!(v["summary"]["local_hits"].as_u64(), Some(2), "{v}");
+    assert_eq!(v["summary"]["passthroughs"].as_u64(), Some(0), "{v}");
+
+    // Device linking and final host linking remain passthroughs. No GPU
+    // is needed to check that the restored objects carry relocatable code.
+    e.kache_nvcc(
+        project.path(),
+        &["-dlink", "kernel.o", "helper.o", "-o", "device-link.o"],
+    );
+    assert!(project.path().join("device-link.o").exists());
+    e.kache_nvcc(project.path(), &["kernel.o", "helper.o", "-o", "app"]);
+    assert!(project.path().join("app").exists());
+}
+
+#[test]
+fn nvcc_separable_mode_has_a_distinct_key() {
+    if !require_toolkit("nvcc_separable_mode_has_a_distinct_key") {
+        return;
+    }
+    let e = env();
+    let project = TempDir::new().unwrap();
+    write_project(project.path());
+
+    e.kache_nvcc(project.path(), &standard_args());
+    e.kache_nvcc(
+        project.path(),
+        &[
+            "-dc",
+            "kernel.cu",
+            "-o",
+            "kernel.o",
+            "-Iinclude",
+            "-DUSE_CUDA",
+        ],
+    );
+    std::fs::remove_file(project.path().join("kernel.o")).unwrap();
+    e.kache_nvcc(
+        project.path(),
+        &[
+            "-dc",
+            "kernel.cu",
+            "-o",
+            "kernel.o",
+            "-Iinclude",
+            "-DUSE_CUDA",
+        ],
+    );
+
+    let v = e.report();
+    assert_eq!(v["summary"]["misses"].as_u64(), Some(2), "{v}");
+    assert_eq!(v["summary"]["local_hits"].as_u64(), Some(1), "{v}");
+    assert_eq!(v["summary"]["passthroughs"].as_u64(), Some(0), "{v}");
+}
+
+#[test]
 fn nvcc_device_debug_passthrough() {
     // `-G` (device debug) is refused: it still compiles fine, uncached.
     if !require_toolkit("nvcc_device_debug_passthrough") {

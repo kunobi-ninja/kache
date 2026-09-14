@@ -1576,4 +1576,51 @@ mod tests {
             );
         }
     }
+
+    /// The host-discovery failure carries the raw output for debugging:
+    /// long output gets a truncation marker, short output does not.
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_probe_failure_marks_truncation() {
+        let temp = TempDir::new().unwrap();
+        // 2000 chars of host-less output: marker expected.
+        let long_garbage = "x".repeat(2000);
+        let long_nvcc = write_nvcc_fixture(
+            temp.path(),
+            "nvcc-long",
+            &format!(
+                "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'nvcc mock'; else printf '%s' '{long_garbage}'; fi"
+            ),
+        );
+        let req = ProbeRequest {
+            compiler: long_nvcc.to_str().unwrap(),
+            args: &[],
+            key_args: &[],
+            per_tu_paths: &[],
+            windows_aware: false,
+        };
+        let err = NvccProber.probe(&req).expect_err("must fail the probe");
+        assert!(
+            format!("{err:#}").contains("[truncated]"),
+            "long output must be marked"
+        );
+        // Short output: no marker.
+        let short_nvcc = write_nvcc_fixture(
+            temp.path(),
+            "nvcc-short",
+            "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'nvcc mock'; else printf '%s\\n' '#$ nothing here'; fi",
+        );
+        let req = ProbeRequest {
+            compiler: short_nvcc.to_str().unwrap(),
+            args: &[],
+            key_args: &[],
+            per_tu_paths: &[],
+            windows_aware: false,
+        };
+        let err = NvccProber.probe(&req).expect_err("must fail the probe");
+        assert!(
+            !format!("{err:#}").contains("[truncated]"),
+            "short output must not be marked"
+        );
+    }
 }

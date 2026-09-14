@@ -11815,6 +11815,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn upload_triggered_eviction_skips_at_exact_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 200;
+
+        let src_file = dir.path().join("exact.rlib");
+        std::fs::write(&src_file, vec![0u8; 200]).unwrap();
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                "exact_limit_key",
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(src_file.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        std::fs::remove_file(src_file).unwrap();
+        store.set_last_accessed_for_test("exact_limit_key", "-1 hour");
+        assert_eq!(store.physical_size().unwrap(), config.max_size);
+
+        Daemon::new(config).maybe_evict_after_upload();
+
+        assert!(store.contains("exact_limit_key"));
+        assert!(crate::report::read_gc_stats(dir.path()).is_none());
+    }
+
     /// Upload-triggered eviction is a GC driver too: without a record, the
     /// evictions it makes (and the ones it fails) never reach gc_stats.json.
     #[test]

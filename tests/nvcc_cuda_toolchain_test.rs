@@ -375,6 +375,40 @@ fn nvcc_separable_mode_has_a_distinct_key() {
 }
 
 #[test]
+fn nvcc_rdc_conditional_header_busts_key() {
+    if !require_toolkit("nvcc_rdc_conditional_header_busts_key") {
+        return;
+    }
+    let e = env();
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("kernel.cu"),
+        "#ifdef __CUDACC_RDC__\n#include \"rdc.h\"\n#endif\n__global__ void kernel(int *out) { *out = rdc_value(41); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("rdc.h"),
+        "__device__ inline int rdc_value(int x) { return x + 1; }\n",
+    )
+    .unwrap();
+    let args = ["-dc", "kernel.cu", "-o", "kernel.o"];
+
+    e.kache_nvcc(project.path(), &args);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(
+        project.path().join("rdc.h"),
+        "__device__ inline int rdc_value(int x) { return x + 2; }\n",
+    )
+    .unwrap();
+    e.kache_nvcc(project.path(), &args);
+
+    let v = e.report();
+    assert_eq!(v["summary"]["misses"].as_u64(), Some(2), "{v}");
+    assert_eq!(v["summary"]["local_hits"].as_u64(), Some(0), "{v}");
+    assert_eq!(v["summary"]["passthroughs"].as_u64(), Some(0), "{v}");
+}
+
+#[test]
 fn nvcc_device_debug_passthrough() {
     // `-G` (device debug) is refused: it still compiles fine, uncached.
     if !require_toolkit("nvcc_device_debug_passthrough") {

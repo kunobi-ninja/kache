@@ -814,12 +814,7 @@ fn parse_nvcc_make_deps(text: &str) -> Result<Vec<PathBuf>> {
 /// source itself). Any failure (missing binary, bad exit, unparseable
 /// output) bails: the compile then runs uncached via passthrough.
 pub(crate) fn nvcc_dependency_closure(parsed: &NvccArgs) -> Result<Vec<PathBuf>> {
-    let source = parsed
-        .sources
-        .first()
-        .context("nvcc -M with no source file")?;
-    let mut cmd_args = vec!["-M".to_string(), source.to_string_lossy().into_owned()];
-    cmd_args.extend(nvcc_dep_forward_args(&parsed.deferred_flags));
+    let cmd_args = nvcc_dependency_query_args(parsed)?;
     let output = std::process::Command::new(&parsed.program)
         .env("LC_ALL", "C")
         .args(&cmd_args)
@@ -843,6 +838,21 @@ pub(crate) fn nvcc_dependency_closure(parsed: &NvccArgs) -> Result<Vec<PathBuf>>
     deps.sort();
     deps.dedup();
     Ok(deps)
+}
+
+fn nvcc_dependency_query_args(parsed: &NvccArgs) -> Result<Vec<String>> {
+    let source = parsed
+        .sources
+        .first()
+        .context("nvcc -M with no source file")?;
+    let mut args = vec!["-M".to_string(), source.to_string_lossy().into_owned()];
+    args.extend(nvcc_dep_forward_args(&parsed.deferred_flags));
+    // nvcc defines __CUDACC_RDC__ only in relocatable mode. A header
+    // included under that macro must appear in the -M dependency closure.
+    if parsed.separate_device_code {
+        args.push("-rdc=true".to_string());
+    }
+    Ok(args)
 }
 
 /// A machine-local path prefix and the portable sentinel it maps to.
@@ -1763,6 +1773,24 @@ mod tests {
 
         assert!(NvccArgs::parse(&s(&["nvcc", "-c", "-rdc=maybe", "k.cu"])).is_err());
         assert!(NvccArgs::parse(&s(&["nvcc", "-c", "-rdc"])).is_err());
+    }
+
+    #[test]
+    fn dependency_query_uses_effective_rdc_mode() {
+        let parsed = parse_ok(&["nvcc", "-dc", "k.cu", "-o", "k.o"]);
+        assert_eq!(
+            nvcc_dependency_query_args(&parsed).unwrap(),
+            ["-M", "k.cu", "-rdc=true"]
+        );
+
+        let parsed = parse_ok(&["nvcc", "-c", "-rdc=true", "k.cu", "-o", "k.o"]);
+        assert_eq!(
+            nvcc_dependency_query_args(&parsed).unwrap(),
+            ["-M", "k.cu", "-rdc=true"]
+        );
+
+        let parsed = parse_ok(&["nvcc", "-dc", "-rdc=false", "k.cu", "-o", "k.o"]);
+        assert_eq!(nvcc_dependency_query_args(&parsed).unwrap(), ["-M", "k.cu"]);
     }
 
     /// Linker inputs are positional unknowns, never sources: a `-c` line

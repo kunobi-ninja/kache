@@ -63,6 +63,24 @@ packaging validation do not require upstream release credentials.
 To publish a separately maintained distribution, configure its destinations
 and credentials and review the publication guards for that repository.
 
+## Which jobs a pull request runs
+
+`Detect changes` classifies the files a pull request touches with
+`scripts/ci-changes.py` and turns on only the job groups that cover them.
+Pushes to `main` and tags always run everything.
+
+| Files | Jobs |
+| --- | --- |
+| Markdown, `docs/`, `notes/`, `assets/`, `LICENSE`, issue templates | none |
+| `scripts/bench-short.py` and its test, `install-bench-mbx.sh`, the bench and perf-gate workflows | Check (Linux) |
+| `scenarios/` | Check (Linux), E2E smoke on every platform |
+| `packaging/`, `flake.nix`, `flake.lock`, apt/AUR/release scripts, publication workflows | Check (Linux), Nix package |
+| anything else, including `ci.yml` and the classifier itself | every job |
+
+A mixed pull request runs the union. Required checks that a group skips
+still count as passed. Run the mapping's tests with
+`python3 scripts/test-ci-changes.py`.
+
 ## Checking workflow changes
 
 The Repository consistency job evaluates runner and publication expressions

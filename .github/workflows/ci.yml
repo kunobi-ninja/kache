@@ -31,9 +31,23 @@ jobs:
     name: Detect changes
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 5
+    # Which job groups a pull request needs, from the files it touches. The
+    # mapping lives in scripts/ci-changes.py (tested by
+    # scripts/test-ci-changes.py in Repository consistency): docs run
+    # nothing, bench scripts only Check (Linux), scenarios add the E2E arms,
+    # packaging adds the Nix builds, and any other file runs everything.
+    # Pushes and tags always run everything, as does a failed file listing.
+    # A skipped required job still satisfies branch protection.
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      check: ${{ steps.filter.outputs.check }}
+      tests: ${{ steps.filter.outputs.tests }}
+      e2e: ${{ steps.filter.outputs.e2e }}
+      nix: ${{ steps.filter.outputs.nix }}
     steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          sparse-checkout: scripts/ci-changes.py
+          sparse-checkout-cone-mode: false
       - id: filter
         env:
           GH_TOKEN: ${{ github.token }}
@@ -41,23 +55,18 @@ jobs:
         run: |
           set -o pipefail
           if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+            python3 scripts/ci-changes.py --all >> "$GITHUB_OUTPUT"; exit 0
           fi
           files=$(gh api --paginate "repos/${{ github.repository }}/pulls/$PR/files" \
-            --jq '.[].filename') || { echo "code=true" >> "$GITHUB_OUTPUT"; exit 0; }
-          printf '%s\n' "$files"
-          if printf '%s\n' "$files" | grep -qvE '(\.mdx?$|^docs/)'; then
-            echo "code=true"  >> "$GITHUB_OUTPUT"   # a non-docs file changed
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"   # docs only -> skip the matrix
-          fi
+            --jq '.[].filename') || { python3 scripts/ci-changes.py --all >> "$GITHUB_OUTPUT"; exit 0; }
+          printf '%s\n' "$files" | python3 scripts/ci-changes.py | tee -a "$GITHUB_OUTPUT"
 
   check:
     # A single Linux job keeps its required name even when it is skipped.
     name: Check (Linux)
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.check == 'true'
     # Job-level cap so a hang in checkout/mise/build is killed in minutes, not
     # the 6h GitHub default — the step-level timeouts below only guard their own
     # steps. (`just ci` itself is additionally capped at 30m.)
@@ -182,24 +191,24 @@ jobs:
       count: ${{ steps.plan.outputs.count }}
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+      - if: github.event_name == 'pull_request' && needs.changes.outputs.tests == 'true'
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
-      - if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+      - if: github.event_name == 'pull_request' && needs.changes.outputs.tests == 'true'
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.6.9
           install_args: rust
           cache: false
-      - if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+      - if: github.event_name == 'pull_request' && needs.changes.outputs.tests == 'true'
         uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
         with:
           tool: cargo-mutants@27.1.0
           fallback: none
       - id: plan
         env:
-          MUTATE_DIFF: ${{ github.event_name == 'pull_request' && needs.changes.outputs.code == 'true' }}
+          MUTATE_DIFF: ${{ github.event_name == 'pull_request' && needs.changes.outputs.tests == 'true' }}
         run: |
           if [ "$MUTATE_DIFF" != "true" ]; then
             echo 'count=0' >> "$GITHUB_OUTPUT"
@@ -255,7 +264,7 @@ jobs:
     name: Mutation testing (core)
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: [changes, check]
-    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true')
     timeout-minutes: 20
     env:
       RUSTC_WRAPPER: ""
@@ -323,7 +332,7 @@ jobs:
     name: Mutation testing (service)
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: [changes, check]
-    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true')
     timeout-minutes: 35
     env:
       RUSTC_WRAPPER: ""
@@ -470,7 +479,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           CHANGES_RESULT: ${{ needs.changes.result }}
-          CODE_CHANGED: ${{ needs.changes.outputs.code }}
+          CODE_CHANGED: ${{ needs.changes.outputs.tests }}
           PLAN_RESULT: ${{ needs.mutation-plan.result }}
           CORE_RESULT: ${{ needs.mutation-core.result }}
           SERVICE_RESULT: ${{ needs.mutation-service.result }}
@@ -516,7 +525,7 @@ jobs:
     name: Kani proofs
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-24.04"' || vars.CI_RUNNER_LINUX) }}
     needs: [changes, check]
-    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true')
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: ""
@@ -614,6 +623,10 @@ jobs:
       - name: Perf gate comparison tests
         run: python3 scripts/test-bench-short.py
 
+      # The path-to-job-group mapping Detect changes applies to pull requests.
+      - name: Change detection tests
+        run: python3 scripts/test-ci-changes.py
+
   # --- Dependency policy audit ---
   # Runs `cargo deny check` (via `just audit`) on every push and non-docs PR:
   # RustSec advisories PLUS license / bans / sources policy, matching the
@@ -632,7 +645,7 @@ jobs:
     name: Dependency audit
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true'
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -663,7 +676,7 @@ jobs:
     name: CUDA toolkit (nvcc)
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true'
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -726,7 +739,7 @@ jobs:
     name: Nix package (${{ matrix.os }})
     runs-on: ${{ matrix.runner }}
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.nix == 'true'
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -766,7 +779,7 @@ jobs:
     name: CoW filesystem (btrfs)
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -832,7 +845,7 @@ jobs:
     needs: changes
     # Expand every platform name even when docs-only changes skip the work.
     env:
-      RUN_E2E: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
+      RUN_E2E: ${{ github.event_name != 'pull_request' || needs.changes.outputs.e2e == 'true' }}
     # Per-arm cap. A hosted image or dependency download can still stall;
     # without a job timeout the default is 6h. Normal runs are <10m.
     timeout-minutes: 30
@@ -1130,7 +1143,7 @@ jobs:
     name: cargo test (macOS)
     runs-on: ${{ fromJSON(!github.event.repository.private && '"macos-latest"' || vars.CI_RUNNER_MACOS) }}
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true'
     # Cargo test is additionally capped at 30m; the job cap catches setup hangs.
     timeout-minutes: 40
     steps:
@@ -1223,7 +1236,7 @@ jobs:
     name: cargo test (Windows)
     runs-on: ${{ fromJSON(!github.event.repository.private && '"windows-latest"' || vars.CI_RUNNER_WINDOWS) }}
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.code == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.tests == 'true'
     # A from-scratch workspace test compile has exceeded the previous 30m step
     # cap. Job cap covers filesystem tests (5m), workspace tests (45m),
     # doctests (15m), clippy (30m), and setup.

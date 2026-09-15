@@ -4319,7 +4319,10 @@ fn read_tool_version_cache(binary: &Path, prefix: &str) -> Option<String> {
 /// silently ignored because the fallback (running the tool) is always available.
 fn write_tool_version_cache(binary: &Path, prefix: &str, version: &str) {
     if let Some(cache_file) = tool_version_cache_path(binary, prefix) {
-        let _ = std::fs::write(cache_file, version);
+        // The cache directory may not exist yet (a fresh machine, or a CI
+        // runner whose store lives elsewhere); without it nothing was ever
+        // persisted and every process re-ran the probe.
+        crate::probe_memo::write_atomic(&cache_file, version);
     }
 }
 

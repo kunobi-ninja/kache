@@ -1,0 +1,16 @@
+# cargo-nextest settings. CI runs the workspace suite through nextest on
+# Windows: one process per test, and test binaries run concurrently instead of
+# one after another, which is where `cargo test` lost most of its time there.
+# `cargo test` stays the local default; these settings only apply under
+# `cargo nextest run`.
+
+[profile.default]
+# Report any test past a minute so the slow ones are visible in the log.
+slow-timeout = { period = "60s" }
+
+[profile.ci]
+fail-fast = false
+# Keep reporting every two minutes; give up on a test after ten.
+slow-timeout = { period = "120s", terminate-after = 5 }
+# List the slow tests again at the end, after the pass/fail summary.
+final-status-level = "slow"

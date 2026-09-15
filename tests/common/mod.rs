@@ -33,6 +33,14 @@ fn bootstrap_target_dir() -> PathBuf {
     dir.join("kache-test-bootstrap")
 }
 
+/// `KACHE_TEST_USE_CARGO_BIN_EXE=1` skips the bootstrap build and uses the
+/// `kache` binary the outer cargo already built for these tests. Only a caller
+/// that knows the outer build ran with no `rustc-wrapper` may set it (CI does,
+/// with `RUSTC_WRAPPER=""`); the second build is otherwise the guarantee.
+fn reuse_outer_build() -> bool {
+    std::env::var_os("KACHE_TEST_USE_CARGO_BIN_EXE").is_some_and(|value| value == "1")
+}
+
 /// The bootstrap result, shared by every test in this binary.
 ///
 /// Holds `Err(message)` rather than panicking inside the initializer: a panic
@@ -56,6 +64,9 @@ pub fn kache_binary() -> PathBuf {
 }
 
 fn bootstrap_kache() -> Result<PathBuf, String> {
+    if reuse_outer_build() {
+        return Ok(PathBuf::from(env!("CARGO_BIN_EXE_kache")));
+    }
     let target_dir = bootstrap_target_dir();
     let output = std::process::Command::new("cargo")
         .args([

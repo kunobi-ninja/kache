@@ -35,6 +35,7 @@ mod planner_client;
 mod platform;
 mod policy;
 mod probe;
+mod probe_memo;
 mod remote;
 mod remote_backend;
 mod remote_layout;

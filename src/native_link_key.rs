@@ -31,6 +31,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::probe_memo::{self, Material};
+
 /// What the driver is asked to place, and which of it a key cannot do without.
 ///
 /// Chosen with `cfg!` rather than `#[cfg]` so both tables compile everywhere;
@@ -383,6 +385,10 @@ impl WindowsProbeEnvironment {
         }
     }
 
+    /// Installed-toolchain discovery. Not memoised: which toolset and SDK
+    /// discovery selects depends on state only `find-msvc-tools` reads (the
+    /// toolset default file, SDK registry roots, per-version eligibility),
+    /// so a memo keyed on anything less would serve a stale selection.
     #[cfg(windows)]
     fn augment_from_installed_msvc(&mut self, architecture: &str) -> Result<()> {
         self.validate_discovery_probe()?;
@@ -729,11 +735,40 @@ fn windows_tool_command(
     command
 }
 
+/// Run a tool for its banner, served from the on-disk memo when the same
+/// bytes were already probed under the same command environment.
+///
+/// The memo identifies the tool by a digest of its contents, not by path or
+/// timestamps, so a binary replaced in place, even with its length and mtime
+/// preserved, is a different key. The digest is taken again after the probe
+/// and the banner is only published when the two agree, so a toolchain
+/// swapped mid-probe can not file its banner under the other binary. Only a
+/// validated banner is memoised; a tool that fails validation runs again.
+///
+/// The contract is "the banner is a function of the bytes and the command
+/// environment". That holds for Microsoft's `link.exe` and `cl.exe`, which
+/// the Visual Studio installer places as plain binaries. It does not hold
+/// for a launcher whose target lives in a sidecar file: package managers
+/// install `lld-link.exe` exactly that way (a scoop shim keeps its bytes
+/// across `scoop update llvm`), so `lld-link` is always probed fresh.
 fn run_windows_tool(
     tool: WindowsTool,
     path: &Path,
     environment: &[(OsString, OsString)],
 ) -> Result<String> {
+    let before = memoises_banner(tool)
+        .then(|| probe_memo::file_digest(path))
+        .flatten();
+    let memo = before
+        .as_deref()
+        .map(|digest| banner_memo(tool, path, digest, environment));
+    if let Some(banner) = memo
+        .as_ref()
+        .and_then(|(memo_path, key)| probe_memo::read_verified(memo_path, key))
+        .and_then(|text| validate_tool_banner(tool, &text).ok())
+    {
+        return Ok(banner);
+    }
     let output = windows_tool_command(tool, path, environment)
         .output()
         .with_context(|| format!("running {} at {}", tool.name(), path.display()))?;
@@ -742,7 +777,69 @@ fn run_windows_tool(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    validate_tool_banner(tool, &text)
+    let banner = validate_tool_banner(tool, &text)?;
+    if let Some((memo_path, key)) = &memo
+        && probe_memo::file_digest(path) == before
+    {
+        probe_memo::write_verified(memo_path, key, &text);
+    }
+    Ok(banner)
+}
+
+/// Whether a tool's banner may be served from the memo; see
+/// [`run_windows_tool`].
+fn memoises_banner(tool: WindowsTool) -> bool {
+    matches!(tool, WindowsTool::Link | WindowsTool::Cl)
+}
+
+/// `<cache_dir>/msvc-banner-<digest>.txt` plus the full key digest for one
+/// tool's bytes under one command environment.
+fn banner_memo(
+    tool: WindowsTool,
+    path: &Path,
+    file_digest: &str,
+    environment: &[(OsString, OsString)],
+) -> (PathBuf, String) {
+    let key = banner_memo_key(tool, path, file_digest, environment);
+    (
+        probe_memo::memo_path(
+            &crate::config::default_cache_dir(),
+            "msvc-banner",
+            "txt",
+            &key,
+        ),
+        key,
+    )
+}
+
+/// The banner's inputs: which tool, the exact bytes it runs, where they
+/// live, the environment the tool runs under, and the two inherited
+/// variables that change a banner: `PATH` (which DLLs load) and `VSLANG`
+/// (which language the banner prints in).
+fn banner_memo_key(
+    tool: WindowsTool,
+    path: &Path,
+    file_digest: &str,
+    environment: &[(OsString, OsString)],
+) -> String {
+    let mut material = Material::new("msvc-banner.v1");
+    material
+        .push(tool.name().as_bytes())
+        .push(file_digest.as_bytes())
+        .push(path.as_os_str().as_encoded_bytes());
+    for (name, value) in environment {
+        material
+            .push(name.as_encoded_bytes())
+            .push(value.as_encoded_bytes());
+    }
+    for inherited in ["PATH", "VSLANG"] {
+        material.push(
+            std::env::var_os(inherited)
+                .unwrap_or_default()
+                .as_encoded_bytes(),
+        );
+    }
+    material.digest()
 }
 
 fn version_from_environment(
@@ -3140,5 +3237,165 @@ mod tests {
             hashed.get("link:0").map(String::as_str),
             Some(hash_placed(&root.path().join("foo.lib")).unwrap().as_str())
         );
+    }
+
+    #[test]
+    fn banner_memo_key_folds_tool_bytes_path_and_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = placed(dir.path(), "link.exe");
+        let digest = probe_memo::file_digest(&link).unwrap();
+        let environment: Vec<(OsString, OsString)> = vec![("LIB".into(), "C:\\libs".into())];
+
+        let base = banner_memo_key(WindowsTool::Link, &link, &digest, &environment);
+        assert_eq!(
+            base,
+            banner_memo_key(WindowsTool::Link, &link, &digest, &environment)
+        );
+        assert_ne!(
+            base,
+            banner_memo_key(WindowsTool::LldLink, &link, &digest, &environment)
+        );
+        assert_ne!(
+            base,
+            banner_memo_key(WindowsTool::Link, &link, "other-bytes", &environment)
+        );
+        assert_ne!(
+            base,
+            banner_memo_key(
+                WindowsTool::Link,
+                &dir.path().join("x.exe"),
+                &digest,
+                &environment
+            )
+        );
+        assert_ne!(
+            base,
+            banner_memo_key(WindowsTool::Link, &link, &digest, &[])
+        );
+        let split: Vec<(OsString, OsString)> = vec![("LI".into(), "BC:\\libs".into())];
+        assert_ne!(
+            base,
+            banner_memo_key(WindowsTool::Link, &link, &digest, &split),
+            "field boundaries are part of the key"
+        );
+
+        let (path, key) = banner_memo(WindowsTool::Cl, &link, &digest, &[]);
+        assert_eq!(key, banner_memo_key(WindowsTool::Cl, &link, &digest, &[]));
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, format!("msvc-banner-{}.txt", &key[..16]));
+        assert_eq!(
+            path.parent(),
+            Some(crate::config::default_cache_dir().as_path())
+        );
+    }
+
+    /// A memoised banner is served without running the tool; only a
+    /// validated banner is written; the memo follows the tool's bytes.
+    #[cfg(unix)]
+    #[test]
+    fn run_windows_tool_serves_and_fills_the_banner_memo() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let write_tool = |name: &str, banner: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho '{banner}'\n")).unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            path
+        };
+        let environment: Vec<(OsString, OsString)> = vec![("KACHE_TEST_MEMO".into(), "1".into())];
+        let memo_for = |path: &Path| {
+            banner_memo(
+                WindowsTool::Link,
+                path,
+                &probe_memo::file_digest(path).unwrap(),
+                &environment,
+            )
+        };
+
+        // A tool whose banner never validates runs every time and leaves no memo.
+        let broken = write_tool("broken-link.exe", "not a linker");
+        let (broken_memo, _) = memo_for(&broken);
+        let _ = std::fs::remove_file(&broken_memo);
+        assert!(run_windows_tool(WindowsTool::Link, &broken, &environment).is_err());
+        assert!(!broken_memo.exists(), "a failed probe must not be memoised");
+
+        // A valid banner is memoised, and the memo answers while the bytes match.
+        let link = write_tool("link.exe", LINK_BANNER);
+        let (memo, key) = memo_for(&link);
+        let _ = std::fs::remove_file(&memo);
+        assert_eq!(
+            run_windows_tool(WindowsTool::Link, &link, &environment).unwrap(),
+            LINK_BANNER
+        );
+        assert!(
+            memo.exists(),
+            "a validated banner is written to {}",
+            memo.display()
+        );
+
+        let served = "Microsoft (R) Incremental Linker Version 99.0.0.0";
+        probe_memo::write_verified(&memo, &key, &format!("{served}\n"));
+        assert_eq!(
+            run_windows_tool(WindowsTool::Link, &link, &environment).unwrap(),
+            served,
+            "the memo answers instead of the tool"
+        );
+
+        // Replacing the tool's bytes (same length) is a different key: the
+        // tool runs, and the old memo is left alone.
+        let replaced = "Microsoft (R) Incremental Linker Version 14.44.35208.0";
+        assert_eq!(replaced.len(), LINK_BANNER.len());
+        write_tool("link.exe", replaced);
+        let (memo_after, _) = memo_for(&link);
+        assert_ne!(memo_after, memo);
+        let _ = std::fs::remove_file(&memo_after);
+        assert_eq!(
+            run_windows_tool(WindowsTool::Link, &link, &environment).unwrap(),
+            replaced
+        );
+        assert!(memo_after.exists());
+        assert_eq!(
+            probe_memo::read_verified(&memo, &key).unwrap().trim(),
+            served,
+            "the previous binary's memo is untouched"
+        );
+
+        // lld-link is probed fresh every time: a launcher's bytes do not
+        // determine its banner.
+        let lld = write_tool("lld-link.exe", LLD_LINK_BANNER);
+        let (lld_memo, _) = banner_memo(
+            WindowsTool::LldLink,
+            &lld,
+            &probe_memo::file_digest(&lld).unwrap(),
+            &environment,
+        );
+        let _ = std::fs::remove_file(&lld_memo);
+        assert_eq!(
+            run_windows_tool(WindowsTool::LldLink, &lld, &environment).unwrap(),
+            LLD_LINK_BANNER
+        );
+        assert!(!lld_memo.exists(), "lld-link banners are never memoised");
+        assert!(memoises_banner(WindowsTool::Link));
+        assert!(memoises_banner(WindowsTool::Cl));
+        assert!(!memoises_banner(WindowsTool::LldLink));
+
+        // A memo that no longer validates is ignored and refilled from the tool.
+        let (memo, key) = memo_for(&link);
+        probe_memo::write_verified(&memo, &key, "garbage\n");
+        assert_eq!(
+            run_windows_tool(WindowsTool::Link, &link, &environment).unwrap(),
+            replaced
+        );
+        assert_eq!(
+            probe_memo::read_verified(&memo, &key).unwrap().trim(),
+            replaced
+        );
+        for path in [memo, memo_after] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

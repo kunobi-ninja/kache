@@ -756,12 +756,28 @@ fn run_windows_tool(
     path: &Path,
     environment: &[(OsString, OsString)],
 ) -> Result<String> {
-    let before = memoises_banner(tool)
+    run_windows_tool_in(
+        Some(&crate::config::default_cache_dir()),
+        tool,
+        path,
+        environment,
+    )
+}
+
+/// [`run_windows_tool`] with the memo directory chosen by the caller;
+/// `None` never memoises.
+fn run_windows_tool_in(
+    memo_dir: Option<&Path>,
+    tool: WindowsTool,
+    path: &Path,
+    environment: &[(OsString, OsString)],
+) -> Result<String> {
+    let before = (memo_dir.is_some() && memoises_banner(tool))
         .then(|| probe_memo::file_digest(path))
         .flatten();
-    let memo = before
-        .as_deref()
-        .map(|digest| banner_memo(tool, path, digest, environment));
+    let memo = memo_dir
+        .zip(before.as_deref())
+        .map(|(dir, digest)| banner_memo(dir, tool, path, digest, environment));
     if let Some(banner) = memo
         .as_ref()
         .and_then(|(memo_path, key)| probe_memo::read_verified(memo_path, key))
@@ -792,9 +808,10 @@ fn memoises_banner(tool: WindowsTool) -> bool {
     matches!(tool, WindowsTool::Link | WindowsTool::Cl)
 }
 
-/// `<cache_dir>/msvc-banner-<digest>.txt` plus the full key digest for one
+/// `<memo_dir>/msvc-banner-<digest>.txt` plus the full key digest for one
 /// tool's bytes under one command environment.
 fn banner_memo(
+    memo_dir: &Path,
     tool: WindowsTool,
     path: &Path,
     file_digest: &str,
@@ -802,12 +819,7 @@ fn banner_memo(
 ) -> (PathBuf, String) {
     let key = banner_memo_key(tool, path, file_digest, environment);
     (
-        probe_memo::memo_path(
-            &crate::config::default_cache_dir(),
-            "msvc-banner",
-            "txt",
-            &key,
-        ),
+        probe_memo::memo_path(memo_dir, "msvc-banner", "txt", &key),
         key,
     )
 }
@@ -3279,14 +3291,12 @@ mod tests {
             "field boundaries are part of the key"
         );
 
-        let (path, key) = banner_memo(WindowsTool::Cl, &link, &digest, &[]);
+        let memo_dir = dir.path().join("memo");
+        let (path, key) = banner_memo(&memo_dir, WindowsTool::Cl, &link, &digest, &[]);
         assert_eq!(key, banner_memo_key(WindowsTool::Cl, &link, &digest, &[]));
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(name, format!("msvc-banner-{}.txt", &key[..16]));
-        assert_eq!(
-            path.parent(),
-            Some(crate::config::default_cache_dir().as_path())
-        );
+        assert_eq!(path.parent(), Some(memo_dir.as_path()));
     }
 
     /// A memoised banner is served without running the tool; only a
@@ -3298,6 +3308,10 @@ mod tests {
 
         let _lock = process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
+        let memo_dir = dir.path().join("memo");
+        let run = |tool: WindowsTool, path: &Path, environment: &[(OsString, OsString)]| {
+            run_windows_tool_in(Some(&memo_dir), tool, path, environment)
+        };
         let write_tool = |name: &str, banner: &str| {
             let path = dir.path().join(name);
             std::fs::write(&path, format!("#!/bin/sh\necho '{banner}'\n")).unwrap();
@@ -3309,6 +3323,7 @@ mod tests {
         let environment: Vec<(OsString, OsString)> = vec![("KACHE_TEST_MEMO".into(), "1".into())];
         let memo_for = |path: &Path| {
             banner_memo(
+                &memo_dir,
                 WindowsTool::Link,
                 path,
                 &probe_memo::file_digest(path).unwrap(),
@@ -3320,7 +3335,7 @@ mod tests {
         let broken = write_tool("broken-link.exe", "not a linker");
         let (broken_memo, _) = memo_for(&broken);
         let _ = std::fs::remove_file(&broken_memo);
-        assert!(run_windows_tool(WindowsTool::Link, &broken, &environment).is_err());
+        assert!(run(WindowsTool::Link, &broken, &environment).is_err());
         assert!(!broken_memo.exists(), "a failed probe must not be memoised");
 
         // A valid banner is memoised, and the memo answers while the bytes match.
@@ -3328,7 +3343,7 @@ mod tests {
         let (memo, key) = memo_for(&link);
         let _ = std::fs::remove_file(&memo);
         assert_eq!(
-            run_windows_tool(WindowsTool::Link, &link, &environment).unwrap(),
+            run(WindowsTool::Link, &link, &environment).unwrap(),
             LINK_BANNER
         );
         assert!(
@@ -3340,7 +3355,7 @@ mod tests {
         let served = "Microsoft (R) Incremental Linker Version 99.0.0.0";
         probe_memo::write_verified(&memo, &key, &format!("{served}\n"));
         assert_eq!(
-            run_windows_tool(WindowsTool::Link, &link, &environment).unwrap(),
+            run(WindowsTool::Link, &link, &environment).unwrap(),
             served,
             "the memo answers instead of the tool"
         );
@@ -3354,7 +3369,7 @@ mod tests {
         assert_ne!(memo_after, memo);
         let _ = std::fs::remove_file(&memo_after);
         assert_eq!(
-            run_windows_tool(WindowsTool::Link, &link, &environment).unwrap(),
+            run(WindowsTool::Link, &link, &environment).unwrap(),
             replaced
         );
         assert!(memo_after.exists());
@@ -3368,6 +3383,7 @@ mod tests {
         // determine its banner.
         let lld = write_tool("lld-link.exe", LLD_LINK_BANNER);
         let (lld_memo, _) = banner_memo(
+            &memo_dir,
             WindowsTool::LldLink,
             &lld,
             &probe_memo::file_digest(&lld).unwrap(),
@@ -3375,7 +3391,7 @@ mod tests {
         );
         let _ = std::fs::remove_file(&lld_memo);
         assert_eq!(
-            run_windows_tool(WindowsTool::LldLink, &lld, &environment).unwrap(),
+            run(WindowsTool::LldLink, &lld, &environment).unwrap(),
             LLD_LINK_BANNER
         );
         assert!(!lld_memo.exists(), "lld-link banners are never memoised");
@@ -3387,15 +3403,21 @@ mod tests {
         let (memo, key) = memo_for(&link);
         probe_memo::write_verified(&memo, &key, "garbage\n");
         assert_eq!(
-            run_windows_tool(WindowsTool::Link, &link, &environment).unwrap(),
+            run(WindowsTool::Link, &link, &environment).unwrap(),
             replaced
         );
         assert_eq!(
             probe_memo::read_verified(&memo, &key).unwrap().trim(),
             replaced
         );
-        for path in [memo, memo_after] {
-            let _ = std::fs::remove_file(path);
-        }
+        // Without a memo directory nothing is read or written.
+        let entries = || std::fs::read_dir(&memo_dir).unwrap().count();
+        let before = entries();
+        assert_eq!(
+            run_windows_tool_in(None, WindowsTool::Link, &link, &environment).unwrap(),
+            replaced
+        );
+        assert_eq!(entries(), before);
+        let _ = (memo, memo_after);
     }
 }

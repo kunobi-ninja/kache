@@ -1,4 +1,5 @@
 mod args;
+mod build_script;
 use kache_store::atomic;
 mod build_intent;
 mod cache_fs;
@@ -31,6 +32,7 @@ mod native_link_key;
 mod opcounts;
 mod otel;
 mod path_normalizer;
+mod phase_trace;
 mod planner_client;
 mod platform;
 mod policy;
@@ -580,6 +582,12 @@ fn main() -> Result<()> {
     if std::env::var_os("KACHE_FAMILY_PROBE_ACTIVE").is_some() {
         // Prevent unbounded recursion when a probed wrapper calls back into kache.
         return Ok(());
+    }
+    // Cargo running a build script through the launcher the rustc wrapper
+    // installed. Decided on the environment alone: argv is the script's own.
+    if build_script::is_shim_invocation() {
+        init_logging(LogMode::Wrapper);
+        std::process::exit(build_script::run_shim());
     }
 
     // Keep the original argv byte-preserving for `kache cargo`. Compiler
@@ -1159,7 +1167,9 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         std::process::exit(wrapper::run_cc_probe(args)?);
     }
 
-    if compiler::is_workspace_wrapper_chain(args) {
+    if compiler::is_workspace_wrapper_chain(args)
+        && !compiler::is_cacheable_workspace_wrapper_chain(args)
+    {
         tracing::debug!(
             program = ?args.first(),
             "workspace-wrapper chain is uncached; retaining extra-input Cargo freshness"

@@ -1,4 +1,9 @@
 {
   "title": "How it works",
-  "pages": ["architecture", "cache-key", "limits"]
+  "pages": [
+    "architecture",
+    "cache-key",
+    "build-scripts",
+    "limits"
+  ]
 }

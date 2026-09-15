@@ -1,0 +1,61 @@
+---
+title: Build scripts
+description: How Kache caches a build script's run, and when it does not
+---
+
+Compiling a build script is cached like any other unit. Running it is not, and
+on a fresh target directory Cargo runs every build script again. A script that
+compiles C sources through the `cc` crate pays for that even when every object
+is a cache hit: `cc` polls its compiler children and sleeps between polls, so
+each object costs about 100 ms per parallel lane regardless of how fast the
+wrapper answers.
+
+Kache therefore caches the run itself. After the rustc wrapper produces a
+`build_script_*` binary, it preserves the binary as `<name>.kache-real` beside
+the path Cargo expects and installs a launcher there. Cargo runs the launcher,
+which hands the invocation to Kache.
+
+## What a run is keyed on
+
+Kache reuses Cargo's own rule for when a build script must rerun. A recorded run
+is restored only when all of these match:
+
+- the script binary's content hash;
+- the environment Cargo provides (`CARGO_*`, `DEP_*`, `TARGET`, `HOST`,
+  `PROFILE`, `OPT_LEVEL`, `DEBUG`, `RUSTC`, `PKG_CONFIG_*`), with the
+  checkout, target and Cargo home roots replaced by placeholders, and the
+  content behind every `DEP_*` path;
+- the values of every variable the script declared with
+  `cargo:rerun-if-env-changed`;
+- the content of every path the script declared with `cargo:rerun-if-changed`
+  (a directory is digested recursively; the digest of a directory whose
+  entries' sizes and timestamps are unchanged is reused from a memo, so a
+  vendored C library costs one stat walk per run). A script that declares
+  nothing depends on its whole package directory, as in Cargo;
+- the `OUT_DIR` path, when anything the script wrote spells a machine-local
+  root;
+- the operating system and architecture, and the configured key salt.
+
+A hit empties `OUT_DIR`, restores the recorded files, directories and modes,
+and replays the recorded stdout and stderr with the current paths substituted.
+Entries stay in the local store: `kache sync` never uploads them.
+
+## What is not cached
+
+- A script that prints an empty `cargo:rerun-if-changed=` (always rerun) or
+  declares an input under `OUT_DIR`.
+- A run that started with a non-empty `OUT_DIR`, or during which a declared
+  input changed.
+- An `OUT_DIR` containing symlinks, more than 50,000 files, or over 1 GiB.
+- Any platform without `/bin/sh` launchers (Windows).
+
+## Limits
+
+The key covers what Cargo compares. It does not cover state a script probes
+without declaring it: system libraries, `pkg-config` results, or tools found on
+`PATH`. Cargo has the same blind spot with a warm target directory; with Kache
+it also survives `cargo clean`. Side effects outside `OUT_DIR` and the package
+directory are not replayed either.
+
+Set `KACHE_BUILD_SCRIPT_CACHE=0` to run every build script. Existing launchers
+then run the preserved binary directly.

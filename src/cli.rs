@@ -5406,6 +5406,8 @@ async fn sync_with_client(
     let to_push: Vec<(String, String)> = if !pull_only && !config.remote_readonly {
         local_entries
             .iter()
+            // Build-script runs describe one host's probes; they never leave it.
+            .filter(|e| e.crate_name != crate::build_script::CRATE_NAME)
             .filter(|e| {
                 if let Some(ws) = workspace_crates {
                     ws.contains(&e.crate_name)
@@ -6421,6 +6423,23 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
             swept_staging.removed,
             ByteSize(swept_staging.bytes_reclaimed)
         );
+        let memos = store.file_hash_cache();
+        match memos.prune_cc_preprocess_memos() {
+            Ok((removed, inputs)) if removed + inputs > 0 => println!(
+                "Repairing: removed {removed} stale C/C++ memos and {inputs} unreferenced inputs"
+            ),
+            Ok(_) => {}
+            Err(error) => println!("Warning: could not prune C/C++ memos: {error}"),
+        }
+        match memos.compact_sparse_index() {
+            Ok(Some((before, after))) => println!(
+                "Repairing: compacted index file from {} to {}",
+                ByteSize(before),
+                ByteSize(after)
+            ),
+            Ok(None) => {}
+            Err(error) => println!("Warning: index compaction deferred: {error:#}"),
+        }
     }
 
     // Compute store size
@@ -8774,6 +8793,8 @@ mod tests {
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
+            shared_hardlink_restores: false,
+            deferred_discovery: true,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,

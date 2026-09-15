@@ -5,14 +5,15 @@ import argparse
 import json
 import math
 import os
-from pathlib import Path
 import platform
 import random
 import shutil
 import signal
 import statistics
 import subprocess
+import sys
 import time
+from pathlib import Path
 
 PHASES = ("cold", "warm_same_tree", "warm")
 LABELS = (
@@ -158,7 +159,7 @@ def report(summary, project, path):
     lines = [
         f"## Perf gate: {'FAIL' if failed else 'pass'} — {project}",
         "",
-        "Times exclude setup. Each warm phase starts from the cold cache snapshot and an empty build directory.",
+        "Isolated build times exclude setup. Each isolated warm phase starts from the cold cache snapshot and an empty build directory.",
         "",
         "| Tool | Phase | Samples | Mean | Median | Min–max |",
         "| --- | --- | ---: | ---: | ---: | ---: |",
@@ -208,6 +209,96 @@ def run_measurement(command, **kwargs):
         raise subprocess.CalledProcessError(status, command)
 
 
+def contention_comparison(records):
+    pairs = {
+        arm: {(r["sample"], r["phase"]): r for r in records if r["arm"] == arm}
+        for arm in ("base", "head")
+    }
+    base, head = pairs["base"], pairs["head"]
+    if not base and not head:
+        return [], []
+    if not base or base.keys() != head.keys():
+        raise ValueError("incomplete contention head/base sample pairs")
+    failures, comparisons = [], []
+    for phase in ("cold", "warm"):
+        keys = sorted(key for key in base if key[1] == phase)
+        change = paired_change(
+            [base[key]["wall_ms"] for key in keys],
+            [head[key]["wall_ms"] for key in keys],
+        )
+        comparisons.append({"phase": "contention_" + phase, "n": len(keys), **change})
+        if change["outcome"] == "regression":
+            failures.append(f"contention {phase}: paired timing regression")
+        for key in keys:
+            b, h = base[key]["events"], head[key]["events"]
+            # Cold hit/miss counts vary with overlap. Duplicate compilation of
+            # the same key is the useful cold correctness signal.
+            if h["duplicate_key_compiles"] > b["duplicate_key_compiles"]:
+                failures.append(
+                    f"contention {phase} sample {key[0]}: duplicate key compiles increased"
+                )
+            if phase == "warm":
+                for result in ("miss", "passthrough"):
+                    if h["results"].get(result, 0) > b["results"].get(result, 0):
+                        failures.append(
+                            f"contention warm sample {key[0]}: {result} count increased"
+                        )
+    return comparisons, failures
+
+
+def run_contention(args, arms):
+    output = args.output.resolve() / "contention"
+    samples = getattr(args, "contention_samples", None) or args.samples
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("bench-contention.py")),
+        "--project",
+        args.project,
+        "--scenarios",
+        str(args.scenarios.resolve()),
+        "--samples",
+        str(samples),
+        "--cold-every",
+        "3",
+        "--order-seed",
+        str(args.order_seed),
+        "--output",
+        str(output),
+    ]
+    for arm, backend, binary in arms:
+        command += (
+            ["--arm", f"{arm}={binary},1"]
+            if backend == "kache"
+            else ["--" + backend, binary]
+        )
+    # The child enforces a timeout per Cargo job and stops its process groups.
+    # Workflow timeouts bound the whole suite; setup and all samples can exceed
+    # the isolated engine's 20-minute timeout.
+    print(
+        f"{args.project}: contention, {samples} warm batches and {math.ceil(samples / 3)} cold seeds per arm; see contention.log",
+        flush=True,
+    )
+    with (args.output / "contention.log").open("w") as stream:
+        subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, check=True)
+    data = json.loads((output / "samples.json").read_text())
+    expected = {
+        (sample, arm, phase)
+        for sample in range(samples)
+        for arm, _, _ in arms
+        for phase in ("cold", "warm")
+        if phase == "warm" or sample % 3 == 0
+    }
+    actual = [(r["sample"], r["arm"], r["phase"]) for r in data["records"]]
+    if data.get("error") or set(actual) != expected or len(actual) != len(expected):
+        raise ValueError("incomplete contention measurements")
+    comparisons, failures = contention_comparison(data["records"])
+    return {
+        "statistics": json.loads((output / "summary.json").read_text()),
+        "comparisons": comparisons,
+        "failures": failures,
+    }
+
+
 def tool_path(binary):
     """Absolute path of a tool, real binary rather than a mise shim.
 
@@ -249,15 +340,15 @@ def run(args):
         "platform": f"{platform.system()} {platform.release()} {platform.machine()}",
         "samples_requested": args.samples,
         "cold_every": 3,
-        "identity": dict(
-            (key, os.environ.get(key, ""))
+        "identity": {
+            key: os.environ.get(key, "")
             for key in (
                 "BENCH_HEAD_SHA",
                 "BENCH_BASE_SHA",
                 "BENCH_INSTRUMENT_SHA",
                 "GITHUB_RUN_ID",
             )
-        ),
+        },
         "records": records,
     }
     try:
@@ -335,10 +426,35 @@ def run(args):
                 payload["elapsed_s"] = time.monotonic() - started
                 (root / "samples.json").write_text(json.dumps(payload, indent=2) + "\n")
         summary = summarize(records)
+        # Release isolated-build scratch before allocating six contention targets.
+        shutil.rmtree(root / "scratch", ignore_errors=True)
+        if not getattr(args, "skip_contention", False):
+            summary["contention"] = run_contention(args, arms)
+            summary["comparisons"].extend(summary["contention"]["comparisons"])
+            summary["failures"].extend(summary["contention"]["failures"])
+            contention_data = json.loads(
+                (root / "contention" / "samples.json").read_text()
+            )
+            if contention_data["revision"] != records[0]["result"]["git_ref"]:
+                raise ValueError(
+                    "contention and isolated builds used different source revisions"
+                )
+            payload["contention_samples"] = "contention/samples.json"
+            payload["elapsed_s"] = time.monotonic() - started
+            (root / "samples.json").write_text(json.dumps(payload, indent=2) + "\n")
         (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         report(summary, args.project, root / "perf-gate.md")
+        if "contention" in summary:
+            with (root / "perf-gate.md").open("a") as stream:
+                stream.write("\n" + (root / "contention" / "report.md").read_text())
         # Every sample has its own timestamp. Reused cold observations are not new samples.
         resources = []
+        if "contention" in summary:
+            resources.extend(
+                json.loads((root / "contention" / "metrics.otlp.json").read_text())[
+                    "resourceMetrics"
+                ]
+            )
         for record in records:
             logs = root / "logs" / f"{record['sample']:02d}-{record['arm']}"
             otlp = json.loads((logs / "metrics.otlp.json").read_text())
@@ -409,8 +525,24 @@ def main():
     parser.add_argument("--mbx", default="mbx")
     parser.add_argument("--samples", type=int, choices=range(1, 21), default=1)
     parser.add_argument("--order-seed", type=int, default=0)
+    parser.add_argument(
+        "--contention-samples",
+        type=int,
+        choices=range(1, 21),
+        help="warm batches per arm; defaults to --samples, with a fresh cold seed every third sample",
+    )
+    parser.add_argument(
+        "--skip-contention",
+        action="store_true",
+        help="run only isolated builds for a focused local experiment",
+    )
     parser.add_argument("--output", type=Path, required=True)
-    return run(parser.parse_args())
+    args = parser.parse_args()
+    if platform.system() != "Linux" and not args.skip_contention:
+        parser.error(
+            "contention requires Linux; use a Linux runner or --skip-contention for isolated local builds"
+        )
+    return run(args)
 
 
 if __name__ == "__main__":

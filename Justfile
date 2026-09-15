@@ -281,7 +281,17 @@ bench-trace PROFILE="" *ARGS:
     ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --select backend:kache --profile "{{PROFILE}}" --trace-keys {{ARGS}}; \
   fi
 
-# Run the hk or eza three-tool suite locally (six warm samples, two cold seeds).
+# Run six overlapping Cargo jobs on Linux; pass --output with a fresh directory.
+[group('bench')]
+bench-contention *ARGS:
+  cargo build --release -p kache
+  python3 scripts/bench-contention.py --arm kache=./target/release/kache,1 {{ARGS}}
+
+[group('test')]
+test-bench-contention:
+  python3 scripts/test-bench-contention.py
+
+# Run isolated builds (2 cold / 6 warm) and contention (2 cold / 6 warm), three tools.
 [group('bench')]
 bench-short PROJECT SAMPLES="6" *ARGS:
   cargo build --release -p kache -p kache-e2e --bin kache --bin kache-scenario

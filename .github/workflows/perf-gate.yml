@@ -316,7 +316,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/instrument"
           cp target/release/kache-scenario "$RUNNER_TEMP/instrument/kache-scenario"
           cp -R scenarios "$RUNNER_TEMP/instrument/scenarios"
-          cp scripts/bench-short.py "$RUNNER_TEMP/instrument/bench-short.py"
+          cp scripts/bench-short.py scripts/bench-contention.py "$RUNNER_TEMP/instrument/"
 
       - name: Build kache from the merge base
         env:

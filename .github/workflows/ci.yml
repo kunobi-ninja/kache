@@ -616,12 +616,12 @@ jobs:
       - name: AUR -git pkgver tests
         run: ./scripts/aur/test-vcs-pkgver.sh
 
-      # The perf gate's comparison script sets a commit status on every pull
-      # request from two JSON files. Same fixture-driven shape as the pkgver
-      # tests above: run it on results the engine could have written and check
-      # the exit code and the headline the workflow parses.
+      # Validate benchmark admission, aggregation, and event capture using
+      # fixtures. Real contention timings run separately on a quiet host.
       - name: Perf gate comparison tests
-        run: python3 scripts/test-bench-short.py
+        run: |
+          python3 scripts/test-bench-short.py
+          python3 scripts/test-bench-contention.py
 
       # The path-to-job-group mapping Detect changes applies to pull requests.
       - name: Change detection tests

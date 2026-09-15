@@ -6,10 +6,10 @@ import copy
 import importlib.util
 import json
 import os
-from pathlib import Path
-import tempfile
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 spec = importlib.util.spec_from_file_location(
@@ -151,7 +151,8 @@ class BenchTests(unittest.TestCase):
             link.symlink_to(real)
 
             with patch.dict(
-                "os.environ", {"PATH": os.pathsep.join(map(str, (shims, plain, bin_dir)))}
+                "os.environ",
+                {"PATH": os.pathsep.join(map(str, (shims, plain, bin_dir)))},
             ):
                 self.assertEqual(bench.tool_path("sccache"), str(real))
                 self.assertEqual(
@@ -184,6 +185,7 @@ class BenchTests(unittest.TestCase):
                 mbx="/mbx",
                 samples=6,
                 order_seed=0,
+                skip_contention=False,
             )
             calls = []
 
@@ -227,7 +229,26 @@ class BenchTests(unittest.TestCase):
                             (work / "metrics.otlp.json").read_text()
                         )
 
-            with patch.object(bench, "run_measurement", invoke):
+            def contention(args, arms):
+                self.assertFalse((args.output / "scratch").exists())
+                self.assertEqual(
+                    [arm[0] for arm in arms], ["base", "head", "sccache", "mbx"]
+                )
+                output = args.output / "contention"
+                output.mkdir()
+                (output / "samples.json").write_text(
+                    json.dumps({"revision": "subject-sha"})
+                )
+                (output / "report.md").write_text("## Contention: hk\n")
+                (output / "metrics.otlp.json").write_text(
+                    json.dumps({"resourceMetrics": []})
+                )
+                return {"statistics": [], "comparisons": [], "failures": []}
+
+            with (
+                patch.object(bench, "run_measurement", invoke),
+                patch.object(bench, "run_contention", contention),
+            ):
                 self.assertEqual(bench.run(args), 0)
             self.assertEqual(len(calls), 24)
             self.assertTrue(calls[0][calls[0].index("--kache") + 1].endswith("/base"))
@@ -238,6 +259,10 @@ class BenchTests(unittest.TestCase):
             self.assertIn("--skip-clone", calls[12])
             payload = json.loads((args.output / "samples.json").read_text())
             self.assertEqual(len(payload["records"]), 24)
+            self.assertEqual(payload["contention_samples"], "contention/samples.json")
+            self.assertIn(
+                "## Contention: hk", (args.output / "perf-gate.md").read_text()
+            )
             self.assertFalse((args.output / "scratch").exists())
             metrics = json.loads((args.output / "metrics.otlp.json").read_text())
             points = [
@@ -262,6 +287,76 @@ class BenchTests(unittest.TestCase):
                 )
                 self.assertEqual(len(cached["resourceMetrics"]), expected)
 
+    def test_contention_compares_paired_work_and_rejects_incomplete_pairs(self):
+        records = []
+        for sample in range(6):
+            for arm, ms in (("base", 10000), ("head", 12000)):
+                for phase in ("cold", "warm"):
+                    records.append(
+                        {
+                            "sample": sample,
+                            "arm": arm,
+                            "phase": phase,
+                            "wall_ms": ms,
+                            "events": {
+                                "duplicate_key_compiles": 0,
+                                "results": {"miss": int(phase == "cold")},
+                            },
+                        }
+                    )
+        comparisons, failures = bench.contention_comparison(records)
+        self.assertEqual(len(comparisons), 2)
+        self.assertEqual(len(failures), 2)
+        for row in records:
+            row["wall_ms"] = 10000
+        records[-1]["events"]["results"]["miss"] = 1
+        self.assertIn(
+            "miss count increased", bench.contention_comparison(records)[1][0]
+        )
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            bench.contention_comparison(records[:-1])
+
+    def test_contention_driver_requires_all_tool_phase_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(
+                output=root,
+                project="eza",
+                scenarios=root / "scenarios",
+                samples=6,
+                order_seed=1,
+            )
+            arms = [
+                ("kache", "kache", "/kache"),
+                ("sccache", "sccache", "/sccache"),
+                ("mbx", "mbx", "/mbx"),
+            ]
+            records = [
+                {"sample": sample, "arm": arm, "phase": phase}
+                for sample in range(6)
+                for arm, _, _ in arms
+                for phase in ("cold", "warm")
+                if phase == "warm" or sample % 3 == 0
+            ]
+            calls = []
+
+            def run(command, **kwargs):
+                calls.append(command)
+                output = root / "contention"
+                output.mkdir(exist_ok=True)
+                (output / "samples.json").write_text(json.dumps({"records": records}))
+                (output / "summary.json").write_text("[]")
+
+            with patch.object(bench.subprocess, "run", run):
+                self.assertEqual(bench.run_contention(args, arms)["failures"], [])
+                self.assertIn("kache=/kache,1", calls[0])
+                self.assertIn("--sccache", calls[0])
+                self.assertIn("--mbx", calls[0])
+                self.assertEqual(calls[0][calls[0].index("--samples") + 1], "6")
+                records[-1] = records[0]
+                with self.assertRaisesRegex(ValueError, "incomplete contention"):
+                    bench.run_contention(args, arms)
+
     def test_subprocess_failure_keeps_logs_and_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -276,6 +371,7 @@ class BenchTests(unittest.TestCase):
                 mbx="/mbx",
                 samples=1,
                 order_seed=0,
+                skip_contention=True,
             )
             with patch.object(
                 bench,

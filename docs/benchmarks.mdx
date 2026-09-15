@@ -1,6 +1,6 @@
 ---
 title: Benchmarks
-description: Measure cold, same-checkout, and cross-checkout cache behavior
+description: Measure isolated and concurrent builds with cold and warm caches
 ---
 
 ## CI coverage
@@ -9,12 +9,12 @@ The [Perf gate](https://github.com/kunobi-ninja/kache/actions/workflows/perf-gat
 measures **hk and eza** on pull requests. Each subject runs Kache from the PR
 and its merge base, sccache, and mbx sequentially on one runner.
 
-| Trigger | Subjects | Samples per tool and subject |
-| --- | --- | --- |
-| Same-repository PR, ready for review | hk, eza | 1 cold, 1 same-checkout warm, 1 cross-checkout warm |
-| PR with the `bench` label **or** `[bench]` in its title | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm |
-| Nightly, 03:37 Europe/Zurich | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm |
-| Nightly | Firefox Linux/Windows, LLVM, SurrealDB, Lance, OpenDAL | One measurement per configured phase |
+| Trigger | Subjects | Isolated samples per tool | Contention samples per tool |
+| --- | --- | --- | --- |
+| Same-repository PR, ready for review | hk, eza | 1 cold, 1 same-checkout warm, 1 cross-checkout warm | 1 cold + 1 warm batch |
+| PR with the `bench` label **or** `[bench]` in its title | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
+| Nightly, 03:37 Europe/Zurich | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
+| Nightly | Firefox Linux/Windows, LLVM, SurrealDB, Lance, OpenDAL | One measurement per configured phase | — |
 
 The opt-in also runs on same-repository draft PRs. Adding either trigger or
 pushing a new commit starts a measurement; a newer run cancels the older one.
@@ -103,7 +103,8 @@ just bench-mbx eza --warm-same-tree
 just bench-mbx hk-pull
 ```
 
-The short suite needs sccache and mbx on PATH. It refuses to overwrite its
+The complete short suite runs on Linux and needs sccache and mbx on PATH.
+On macOS, pass `--skip-contention` to run its isolated builds. It refuses to overwrite its
 output directory; pass `--output <fresh-path>` after the sample count for another
 run. Run builds on an otherwise quiet host. Two minutes for a single build
 phase is not a two-minute CI budget: tool installation, compiling Kache,
@@ -115,3 +116,106 @@ completed runs in `runs/`. The short suite keeps `samples.json`, `summary.json`,
 
 See the [scenario format](https://github.com/kunobi-ninja/kache/tree/main/scenarios#readme)
 when adding a subject. For choosing a cache, see [Kache or sccache?](/docs/getting-started/comparison).
+
+## Contention on one runner
+
+`bench-contention.py` runs six Cargo commands for hk or eza: check, Clippy,
+and test compilation, each with default features and a second feature set.
+hk uses all features/targets; eza uses no default features and all targets.
+Every command owns a separate checkout and target directory. Commands share
+one store of the selected tool within an arm; arms and cold seeds have separate stores. Cold
+starts empty. Warm clears all six targets and restores the completed cold store.
+Both phases use the debug profile without Cargo incremental state. These are
+batch measurements; eza's isolated release build remains a separate case.
+
+```bash
+just bench-contention --project hk --samples 3 --jobs-per-build 4 \
+  --output /tmp/hk-contention
+
+# Compare two release binaries with identical settings and alternating order.
+python3 scripts/bench-contention.py --project hk --samples 3 \
+  --arm base=/path/to/base/kache,1 --arm head=/path/to/head/kache,1 \
+  --jobs-per-build 4 --output /tmp/hk-contention-comparison
+```
+
+eza's `--all-features` graph enables vendored OpenSSL and exceeds the short
+case's budget. `--full-features` retains that stress workload for standalone
+runs and exports it as `bench-eza-contention-full-features`. On the validation
+runner, sccache 0.15.0 failed OpenSSL's assembler generation in that variant;
+those results are invalid and excluded from the normal comparison.
+
+The final number in each arm enables (`1`) or disables (`0`) Kache's scheduler.
+Use `--parallelism 1`, `3`, or `6` to vary overlap while retaining the same six
+commands and independent targets. `--jobs-per-build` sets Cargo's parallelism
+inside each command; it does not change the scheduler's permit pool.
+
+Run this Linux-only benchmark on a quiet runner. The report retains CPU
+affinity, cgroup CPU/memory limits, CPU throttling, sampled real compiler counts,
+and cgroup memory usage, including filesystem page cache. Compiler peaks exclude wrapper processes and include
+native compiler/preprocessor frontends. Sampling can miss short-lived processes.
+Cgroup measurements include other work inside that container, so compiling
+Kache or running tests alongside the measurement invalidates comparisons.
+
+The export includes `samples.json`, `summary.json`, `report.md`,
+`metrics.otlp.json`, and each phase's
+Cargo logs, raw Kache events, mbx session streams and Perfetto traces, and
+process samples in `result.json`. It records
+binary hashes, toolchain, source revision, and instrument hash. It reports
+compiler invocations, duplicate compilations of a cache key, and time spent
+computing keys, waiting for peers, and waiting for permits. Summed wait times
+overlap; they are not elapsed-time savings. Event logs use a larger retention
+budget for the six-job batch, and detected rotation invalidates the measurement.
+
+After each cold and warm batch, the runner measures storage outside the timer.
+`samples.json` and OTLP include logical bytes, bytes counted once per inode,
+and allocated blocks for the cache, targets, and their combined footprint.
+Cache components distinguish blobs, the SQLite index, mbx session logs, and
+other metadata. The report shows mean allocated GiB. Hardlinks count once;
+shared reflink extents are unresolved, so allocated blocks are not exclusive
+physical disk usage. Sources, Cargo home, runtime logs, and cold snapshots
+are excluded. Cache-resident session logs remain included.
+
+`bench-short` includes contention for hk and eza in PRs and nightly. The same
+three tools run identical commands; Kache head and base also run on PRs.
+Contention appears as its own report section and as `bench-hk-contention` or
+`bench-eza-contention` in the existing OTLP metrics. The suite archives raw
+results under `contention/` and includes the statistics in `summary.json`.
+Missing backend reports or failed builds invalidate the suite.
+
+Normal PRs use one cold/warm pair per arm. Expanded PRs and nightly use two
+cold seeds and six warm batches, matching the isolated-build sample counts.
+Every warm batch restores its cold snapshot and clears all targets. A new
+cold seed is measured every third sample, and arm order alternates.
+The six warm pairs use the same timing gate as isolated builds; two cold
+samples remain inconclusive. More duplicate Kache key compilations, or more
+warm misses or passthroughs than the base, fail independently of elapsed time.
+
+Use `--contention-samples 12` with `bench-short` for a longer local comparison,
+or `--skip-contention` to focus on isolated builds. To run only contention
+with all three tools, add `--sccache /path/to/sccache --mbx /path/to/mbx` to the
+standalone command. Compiler invocation and internal wait counters come from
+Kache events; other tools report their own cache statistics, with unavailable
+fields shown as unknown. mbx's `wrapper_phases_ns` contains exclusive phase
+durations; Kache's key timer includes dependency discovery, so those two
+timers must not be compared as though they described identical work.
+
+### Detailed phase tracing
+
+For a diagnostic run, add `--trace-phases` to `bench-contention.py`. Kache
+then records real monotonic intervals under each phase's `kache-phases/`
+directory and merges them into `kache.trace.json`, which Perfetto can open.
+The trace marks prediction decisions and measures prediction reads and
+validation, dependency discovery, file hashing, scheduler waits, compiler
+execution, local lookups, and Rust artifact restoration. Nested spans include
+their children; summing them double-counts that work.
+
+Outside the benchmark, set `KACHE_PHASE_TRACE_DIR=/tmp/kache-phases` when
+running Cargo through Kache. Each wrapper writes its own trace on return.
+This captures the wrapper's calling thread, excluding CLI startup and work
+inside child processes or other threads. Trace writing adds overhead, so use
+ordinary runs for performance comparisons. The benchmark marks traced runs
+as diagnostic and rejects missing or truncated traces.
+
+`kache report --format perfetto` remains the compact event-based view: its
+phase offsets are reconstructed from millisecond totals. The opt-in files
+above record actual interval placement and retain sub-millisecond work.

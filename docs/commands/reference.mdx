@@ -113,7 +113,7 @@ kache doctor --repair
 - `--purge-sccache` also removes sccache data and requires `--fix`.
 - `--verify` checks entries, blobs, and metadata.
 - `--checksums` also hashes blob contents and implies `--verify`.
-- `--repair` removes corrupted entries and implies `--verify`.
+- `--repair` removes corrupted entries, prunes stale C/C++ memos, and compacts a large, sparse index when disk space allows. It implies `--verify`.
 
 Review destructive options before running them.
 

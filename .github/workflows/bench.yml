@@ -404,6 +404,8 @@ jobs:
             tmp/bench/${{ matrix.dir }}/*.log
             tmp/bench/${{ matrix.dir }}/*.txt
             tmp/bench/${{ matrix.dir }}/logs/
+            tmp/bench/${{ matrix.dir }}/contention/
+            tmp/bench/${{ matrix.dir }}/contention.log
           retention-days: 30
           if-no-files-found: warn
 

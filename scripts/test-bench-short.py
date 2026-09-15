@@ -5,6 +5,7 @@ import argparse
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import sys
@@ -123,6 +124,51 @@ class BenchTests(unittest.TestCase):
         records = [record("base", 0), record("head", 0, 5000)]
         records[1]["result"]["warm"]["misses"] = 1
         self.assertIn("misses rose", bench.summarize(records)["failures"][0])
+
+    def test_tool_path_sees_through_mise_shims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "installs" / "sccache-1.0"
+            install.mkdir(parents=True)
+            real = install / "sccache"
+            real.write_text("#!/bin/sh\necho real\n")
+            real.chmod(0o755)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            mise = bin_dir / "mise"
+            mise.write_text(
+                '#!/bin/sh\ncase "$1 $2" in "which sccache") echo "%s" ;; *) exit 1 ;; esac\n'
+                % real
+            )
+            mise.chmod(0o755)
+            shims = root / "shims"
+            shims.mkdir()
+            (shims / "sccache").symlink_to(mise)
+            (shims / "unknown").symlink_to(mise)
+            plain = root / "plain"
+            plain.mkdir()
+            link = plain / "kache"
+            link.symlink_to(real)
+
+            with patch.dict(
+                "os.environ", {"PATH": os.pathsep.join(map(str, (shims, plain, bin_dir)))}
+            ):
+                self.assertEqual(bench.tool_path("sccache"), str(real))
+                self.assertEqual(
+                    bench.tool_path("unknown"),
+                    str(shims / "unknown"),
+                    "a shim mise cannot locate is kept as the shim itself",
+                )
+                self.assertEqual(
+                    bench.tool_path("kache"),
+                    os.path.realpath(real),
+                    "an ordinary symlink is followed as before",
+                )
+                self.assertEqual(
+                    bench.tool_path(str(root / "absent")),
+                    os.path.realpath(root / "absent"),
+                    "a missing tool keeps its name so the failure names it",
+                )
 
     def test_driver_alternates_arms_and_saves_samples(self):
         with tempfile.TemporaryDirectory() as tmp:

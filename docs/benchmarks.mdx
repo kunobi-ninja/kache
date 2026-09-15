@@ -1,111 +1,117 @@
 ---
-title: Benchmarks and reports
-description: Measure cold, local-hit, remote-hit, and cross-checkout behavior
+title: Benchmarks
+description: Measure cold, same-checkout, and cross-checkout cache behavior
 ---
 
-The repository benchmark harness builds real projects in separate checkouts. This tests wall time and whether path normalization produces portable keys.
+## CI coverage
 
-## Nightly benchmark matrix
+The [Perf gate](https://github.com/kunobi-ninja/kache/actions/workflows/perf-gate.yml)
+measures **hk and eza** on pull requests. Each subject runs Kache from the PR
+and its merge base, sccache, and mbx sequentially on one runner.
 
-The [Bench workflow](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml) is scheduled every night at 03:37 Zurich time (01:37 UTC in summer, 02:37 UTC in winter). It runs:
-
-- Firefox cold/warm builds on Linux and Windows
-- LLVM, Substrate, SurrealDB, Lance, and OpenDAL cold/warm builds
-- Firefox through sccache for comparison
-- Firefox source-update builds on Linux and Windows
-- hk cold, warm and next-commit builds on Linux: a mid-size Rust CLI whose build scripts compile C and assembly through cc-rs, wired the way `kache init` configures a machine
-- hk with input predictions on and off for warm and next-commit timings; `hk-pull` separately checks every prediction
-- The hk, Lance, OpenDAL, Substrate and SurrealDB builds through mbx at its latest release; hk includes same-checkout and next-commit rebuilds
-- eza cold, warm and cross-worktree builds on Linux: the smallest subject in the matrix and the only one built through a fat-LTO release profile, with its bundled libgit2 and zlib compiled through the same cc-rs wiring
-
-Jobs upload their reports, Perfetto traces, and logs even when a benchmark fails. GitHub retains those artifacts for 30 days.
-
-A scheduled run is not automatically a valid result. Check that the individual job succeeded and that its benchmark verdict is `ok` before using its timing or hit-rate numbers.
-
-To run these six comparisons in CI, dispatch **Bench** with `hk-comparison`.
-Individual scenarios can also be selected. They use the same
-pinned hk commits and Rust toolchain. Each job exports the existing benchmark
-reports and OTLP metrics. Jobs run on separate runners, so compare several runs
-before attributing small timing differences to a cache setting.
-
-## Per-pull-request perf gate
-
-The nightly matrix reports absolute numbers hours after a change lands. The [Perf gate workflow](https://github.com/kunobi-ninja/kache/actions/workflows/perf-gate.yml) answers a narrower question at review time: is this pull request slower than the commit it is a delta against?
-
-It measures one mid-size subject — `bench-pr-cargo`, the `rust-lang/cargo` tree pinned by commit — in three phases per side:
-
-| phase | store | build tree |
+| Trigger | Subjects | Samples per tool and subject |
 | --- | --- | --- |
-| cold | empty | fresh |
-| warm | populated by cold | fresh, same path |
-| cross-worktree | populated by cold | fresh, different path |
+| Same-repository PR, ready for review | hk, eza | 1 cold, 1 same-checkout warm, 1 cross-checkout warm |
+| PR with the `bench` label **or** `[bench]` in its title | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm |
+| Nightly, 03:37 Europe/Zurich | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm |
+| Nightly | Firefox Linux/Windows, LLVM, SurrealDB, Lance, OpenDAL | One measurement per configured phase |
 
-The pull request head and its merge base are both measured, back to back on the same runner, so the report is a delta rather than a comparison against a stored figure from another machine. A warm build more than 5% slower than the merge base fails the gate. Cold and cross-worktree deltas are reported without failing while their noise floor is still being established. The numbers land as a comment on the pull request.
+The opt-in also runs on same-repository draft PRs. Adding either trigger or
+pushing a new commit starts a measurement; a newer run cancels the older one.
+Fork PRs cannot use the self-hosted benchmark runner.
 
-The engine times every phase in milliseconds (`wall_ms` in the result JSON) and the gate takes its delta on that field. The subject's warm build runs about 15 seconds on the gate's runner, where a whole-second tick would already be 7% of the build, more than the threshold. The whole-second `wall_s` next to it is derived from `wall_ms` and stays in the result JSON for older readers. Speedups and the nightly telemetry are computed from `wall_ms`.
+Firefox Linux/Windows, including the next-commit variants, run only on the
+nightly schedule. Manual `all` excludes Firefox. Substrate is no longer a
+benchmark subject.
 
-The gate refuses to compare a warm build shorter than 5 seconds. Below that, 5% of the build is within the fixed cost of spawning the shell, cargo, and its dependency resolution on a shared runner, so a delta would measure the runner rather than kache. The refusal is reported as `INVALID MEASUREMENT`, distinct from a failing delta.
+| Subject | Kache | sccache | mbx |
+| --- | --- | --- | --- |
+| hk, eza | yes | yes | yes |
+| Firefox Linux | yes | yes | — |
+| Firefox Windows, LLVM | yes | — | — |
+| SurrealDB, Lance, OpenDAL | yes | — | yes |
 
-Only the two `kache` binaries come from the pull request. The benchmark engine, the pinned subject, and the threshold all come from the default branch, so both sides are measured with the same instrument. One consequence to expect: a pull request that changes the engine or the scenario is not measured by its own version of them, and those changes take effect for the pull requests that follow.
+hk retains its prediction-disabled and next-commit scenarios. The next-commit
+Kache variants separate exhaustive prediction verification from timing.
 
-The gate runs only for branches in this repository: the benchmark needs a self-hosted runner, and fork code never touches one. It is not a required check.
+## Phases
 
-## Run a scenario
+| Phase in JSON | Cache before the build | Build directory |
+| --- | --- | --- |
+| `cold` | Empty | Empty |
+| `warm_same_tree` | Snapshot populated by cold | Empty, original checkout |
+| `warm` | Same cold snapshot | Empty, different checkout at the same revision |
+| `pull` | Populated at commit A | Empty, original checkout moved to commit B |
+
+hk and eza run the first three phases through all three tools. Other clone
+scenarios run cold and cross-checkout warm. The separate `pull` scenarios
+measure cold followed by the next-commit rebuild; they do not measure an
+incremental build with existing artifacts.
+
+Cold uses the cache tool with an empty store. It is not an uncached build
+without a wrapper. The operating system's page cache is not flushed.
+
+The short suite fetches dependencies before timing. It alternates arm order,
+keeps each arm's store and paths separate, and measures a new cold seed every
+third sample. Other samples use `--retry`: their saved cold value is excluded
+from the cold sample count and duration telemetry. Each warm phase restores
+that seed and clears its build artifacts before starting.
+
+## Reading a PR result
+
+The report lists mean, median, range, and sample count for each tool and phase.
+`summary.json` carries the statistics; `samples.json` retains raw measurements,
+source/tool versions, arm order, and the head/base/instrument identities.
+Build logs and engine reports are retained for each sample.
+
+Only Kache head versus base decides the PR verdict. Increased misses or
+passthroughs fail independently of elapsed time. A timing regression needs at
+least five paired samples, a paired-median bootstrap 95% interval entirely
+above +5%, and a median increase above 250 ms. A corresponding reduction is
+reported as an improvement. Other timing results are **inconclusive**, including
+the single-sample default run. The short suite applies these rules to both warm
+phases; its two cold samples are reported without a timing verdict.
+
+Intervals describe these samples on this runner. Shared-host load and samples
+reusing a cold seed can remain correlated. Confirm a candidate improvement in
+another run before treating a small difference as repeatable. The nightly
+checks whether improvements carry over to larger subjects.
+
+Missing phases, zero restores, cache errors, or invalid Kache verdicts produce
+**INVALID MEASUREMENT**. A fast build that did not exercise the cache is not a
+performance result. Competitor timings provide context and never fail a PR
+because another tool is faster.
+
+The engine, scenarios, installer, and comparison policy come from the default
+branch. Only the two Kache binaries vary with the PR. Changes to the measuring
+instrument therefore take effect after they merge. `perf-gate/warm` remains an
+optional status; this workflow does not change branch protection.
+
+## Local commands
 
 ```bash
 just bench                 # list Kache scenarios
-just bench firefox
-just bench substrate
-just bench lance
-just bench opendal
-just bench eza
-just bench llvm
-just bench-retry firefox   # reuse the saved cold state
-just bench-trace firefox   # include key-diff artifacts
-
-just bench-pr              # one side of the per-PR perf gate
-
-just bench-sccache
-just bench-sccache firefox
-
+just bench hk --warm-same-tree
+just bench eza --warm-same-tree
+just bench-pr              # one Kache side of hk and eza
+just bench-short hk        # three tools, six warm samples each
+just bench-short eza
+just bench-sccache hk --warm-same-tree
+just bench-sccache eza --warm-same-tree
 just bench-mbx hk --warm-same-tree
+just bench-mbx eza --warm-same-tree
 just bench-mbx hk-pull
 ```
 
-Firefox is a large mixed Rust/C++ workload and needs about 50 GB of scratch space. Run benchmark builds sequentially on an otherwise quiet host.
+The short suite needs sccache and mbx on PATH. It refuses to overwrite its
+output directory; pass `--output <fresh-path>` after the sample count for another
+run. Run builds on an otherwise quiet host. Two minutes for a single build
+phase is not a two-minute CI budget: tool installation, compiling Kache,
+preparing the subject, and repetitions add to the job's elapsed time.
 
-## Trust the verdict first
+Individual benchmark runs keep reports under `tmp/bench/<scenario>/` and archive
+completed runs in `runs/`. The short suite keeps `samples.json`, `summary.json`,
+`perf-gate.md`, `metrics.otlp.json`, and per-sample `logs/` in its output directory.
 
-Each summary has a `verdict`. Use timing and hit-rate results only when it is `ok`. A degraded verdict can mean checkout-path leakage, an unexpected miss, or inconsistent cache placement.
-
-Compare medians from several runs. Keep repository revision, toolchain, machine, target, profile, and remote location fixed.
-
-## Output
-
-Latest artifacts are under `tmp/bench/<scenario>/`:
-
-- cold and warm JSON/Markdown reports
-- Perfetto-compatible trace files
-- build and wrapper logs
-- scenario summary with tool version
-- optional key-diff JSON and Markdown
-- sccache reports for comparison runs
-
-Completed runs are archived below `tmp/bench/<scenario>/runs/` so later runs do not erase the evidence.
-
-## Reports outside the harness
-
-```bash
-kache report --format text --since 24h
-kache report --format json --output report.json
-kache report --format trace --output trace.json
-kache report --format markdown --root "$PWD"
-```
-
-`trace`, `perfetto`, and `chrome-trace` produce the same trace format. Open it in Perfetto or Chrome's trace viewer.
-
-## Add a workload
-
-Benchmark definitions live under `scenarios/bench-*`. A scenario declares its repository, revision, setup, wrapper wiring, build command, and optional patches. Start from `bench-firefox`, `bench-substrate`, or `bench-llvm` and read the [scenario format](https://github.com/kunobi-ninja/kache/tree/main/scenarios#readme).
-
-For choosing a cache before benchmarking, see [Kache or sccache?](/docs/getting-started/comparison).
+See the [scenario format](https://github.com/kunobi-ninja/kache/tree/main/scenarios#readme)
+when adding a subject. For choosing a cache, see [Kache or sccache?](/docs/getting-started/comparison).

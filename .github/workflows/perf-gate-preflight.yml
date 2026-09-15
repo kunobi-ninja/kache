@@ -23,7 +23,7 @@ name: Perf gate (preflight)
 # protection the way it would for `ci.yml`.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited]
     paths-ignore:
       - "**.md"
       - "**.mdx"
@@ -60,6 +60,8 @@ jobs:
         env:
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           THIS_REPO: ${{ github.repository }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          HAS_BENCH_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'bench') }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
         run: |
           set -euo pipefail
@@ -72,10 +74,10 @@ jobs:
               echo "runner, and fork code must not execute on one. A maintainer can"
               echo "get numbers by pushing the same commits to a branch in"
               echo "\`$THIS_REPO\`."
-            elif [ "$IS_DRAFT" = "true" ]; then
+            elif [ "$IS_DRAFT" = "true" ] && [ "$HAS_BENCH_LABEL" != "true" ] && [[ "$PR_TITLE" != *"[bench]"* ]]; then
               echo
               echo "This pull request is a draft, so the performance gate is skipped."
-              echo "Mark it ready for review to get numbers."
+              echo "Add the bench label or [bench] to the title to measure a draft."
             else
               echo
               echo "Eligible. The measurement runs in the \`Perf gate\` workflow and"

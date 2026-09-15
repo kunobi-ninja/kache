@@ -281,32 +281,24 @@ bench-trace PROFILE="" *ARGS:
     ./target/release/kache-scenario --kache ./target/release/kache --select suite:bench --select backend:kache --profile "{{PROFILE}}" --trace-keys {{ARGS}}; \
   fi
 
-# Run ONE side of the per-PR perf gate locally: the mid-size `bench-pr-cargo`
-# scenario with the extra same-worktree warm phase enabled, so the run reports
-# all three numbers the gate compares (cold, warm same-tree, cross-worktree).
-# Minutes, not hours — unlike the nightly giants above.
-#
-# This is one side only. The gate measures the PR head AND its merge base on the
-# same machine and compares them; see .github/workflows/perf-gate.yml. To
-# reproduce that locally, run this once per commit with a different
-# `--work-dir`, then diff the two result JSONs with
-# `scripts/perf-gate-compare.sh`.
+# Run the hk or eza three-tool suite locally (six warm samples, two cold seeds).
 [group('bench')]
-bench-pr *ARGS:
-  cargo build --release -p kache
-  cargo build --release -p kache-e2e --bin kache-scenario
-  ./target/release/kache-scenario --kache ./target/release/kache \
-    --select suite:bench --select backend:kache --profile pr-cargo \
-    --warm-same-tree {{ARGS}}
+bench-short PROJECT SAMPLES="6" *ARGS:
+  cargo build --release -p kache -p kache-e2e --bin kache --bin kache-scenario
+  python3 scripts/bench-short.py --project "{{PROJECT}}" --samples "{{SAMPLES}}" \
+    --engine target/release/kache-scenario --kache target/release/kache \
+    --output "tmp/bench/bench-{{PROJECT}}" {{ARGS}}
 
-# The comparison script decides the `perf-gate/warm` commit status on every
-# pull request, and the workflow parses its first line into that status. The
-# tests run it on fixture JSON in the engine's shape: threshold, floor, and
-# the validity rejections, each by exit code and headline. Seconds to run.
-# Test scripts/perf-gate-compare.sh on fixture results
+# One Kache side of both PR subjects; use a separate checkout for each version.
 [group('bench')]
-test-perf-gate-compare:
-  @./scripts/test-perf-gate-compare.sh
+bench-pr:
+  just bench hk --warm-same-tree
+  just bench eza --warm-same-tree
+
+# Validate sample isolation, result admission and paired comparisons.
+[group('bench')]
+test-bench-short:
+  @python3 scripts/test-bench-short.py
 
 # Same cold/warm clone benchmark, but with sccache as the compiler cache.
 # Omit PROFILE to list sccache-backed profiles.

@@ -88,7 +88,7 @@ struct Args {
 
     /// Add a same-worktree warm rebuild between the cold and cross-clone
     /// phases (clone-a again, objdir wiped, store left warm). Off by default:
-    /// it costs a third full build, which only the PR perf gate wants.
+    /// hk and eza enable it in both PR and nightly comparisons.
     #[arg(long)]
     warm_same_tree: bool,
 }
@@ -331,10 +331,7 @@ mod tests {
             profile_hint("bench-firefox", CacheBackend::Kache),
             "firefox"
         );
-        assert_eq!(
-            profile_hint("bench-substrate", CacheBackend::Kache),
-            "substrate"
-        );
+        assert_eq!(profile_hint("bench-eza", CacheBackend::Kache), "eza");
         assert_eq!(
             profile_hint("bench-firefox-sccache", CacheBackend::Sccache),
             "firefox"

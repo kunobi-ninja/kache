@@ -17,6 +17,8 @@ setup = [
 
 # Same portability knobs as bench-hk so the two arms build identical
 # inputs; the store location comes from the harness.
+prepare = "cargo fetch --locked"
+
 build = """
 repo="$(pwd -P)"
 prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."

@@ -129,9 +129,9 @@ held constant — the everyday "I cleaned my `target/`" case. Its own gate is
 `[checks.assert.warm-same-tree]`, evaluated separately from `[checks.assert.warm]`
 and folded into the same exit code.
 
-Off by default: it costs a third full build the nightly scenarios do not read.
-`bench-pr-cargo` is the scenario built for it — see the per-PR perf gate in
-`.github/workflows/perf-gate.yml`, and `just bench-pr` to run one side locally.
+hk and eza run all three phases through Kache, sccache, and mbx. See the
+per-PR perf gate in `.github/workflows/perf-gate.yml`, and `just bench-pr`
+to run one Kache side locally. Both warm phases start from the cold snapshot.
 
 Every benchmark keeps root-level `report-*`, `build-*`, `wrapper-*`, and result
 JSON files as the latest run for `--retry`, and also archives those artifacts to

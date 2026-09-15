@@ -1,23 +1,10 @@
 name: Perf gate
 
-# Per-pull-request performance regression gate — the review-time counterpart to
-# the nightly `bench.yml`. Where the nightly measures the giants (Firefox, LLVM,
-# Substrate, SurrealDB, Lance, OpenDAL) for hours and reports absolute numbers,
-# this measures ONE mid-size subject twice — the PR head and its merge base,
-# back to back on the same machine — and reports the delta between them. Nothing
-# is compared against a stored historical figure: numbers from two different
-# runner generations are not comparable, and this repo has no way to pin one.
-#
-# NOT A REQUIRED CHECK. The repo's required contexts are managed outside this
-# file, and nothing here adds itself to them. This workflow reports a
-# `perf-gate/warm` commit status and a PR comment; promoting that status to a
-# blocking context is a separate, deliberate decision for the maintainer once
-# the first few runs have shown what its noise floor actually is.
-#
-# Only the two `kache` binaries vary with the pull request. The measuring
-# instrument — the benchmark engine, the scenario, the threshold — comes from
-# the DEFAULT BRANCH, the same place this file does. See the "Build the
-# measuring instrument" step for why, and for what that costs.
+# hk and eza, Kache head/base plus sccache and mbx on each subject's runner.
+# One full sample normally; the bench label or [bench] title requests six warm
+# samples and two independent cold seeds per arm, including same-repo drafts.
+# The instrument and policy come from the default branch. Only the two Kache
+# binaries vary with the PR. The published perf-gate/warm status remains optional.
 #
 # ── Runner topology ─────────────────────────────────────────────────────────
 # The measurement runs on the kunobi self-hosted Linux ARC runner — the
@@ -78,10 +65,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Selects scenarios/bench-pr-cargo. Kept here so the scenario name appears
-  # once, not in every step that references it.
-  BENCH_PROFILE: pr-cargo
-  BENCH_SCENARIO: bench-pr-cargo
 
 jobs:
   # ── Trusted validation ──────────────────────────────────────────────────────
@@ -107,6 +90,7 @@ jobs:
       pr: ${{ steps.pr.outputs.number }}
       head_sha: ${{ steps.check.outputs.head_sha }}
       base_ref: ${{ steps.check.outputs.base_ref }}
+      samples: ${{ steps.check.outputs.samples }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -151,6 +135,9 @@ jobs:
           head_sha="$(jq -r '.head.sha // empty' <<<"$pr_json")"
           base_ref="$(jq -r '.base.ref // empty' <<<"$pr_json")"
           state="$(jq -r '.state // empty' <<<"$pr_json")"
+          expanded="$(jq -r '((.title | contains("[bench]")) or any(.labels[]; .name == "bench"))' <<<"$pr_json")"
+          samples=1
+          [ "$expanded" != "true" ] || samples=6
           draft="$(jq -r '.draft' <<<"$pr_json")"
 
           skip() {
@@ -165,18 +152,23 @@ jobs:
           [ "$head_sha" = "$TRIGGER_SHA" ] || skip \
             "PR #$PR is now at $head_sha but this run was triggered for $TRIGGER_SHA — a newer push supersedes it."
           [ "$state" = "open" ] || skip "PR #$PR is $state."
-          [ "$draft" != "true" ] || skip "PR #$PR is a draft."
+          [ "$draft" != "true" ] || [ "$expanded" = "true" ] || skip "PR #$PR is a draft."
           [ -n "$base_ref" ] || skip "PR #$PR has no base branch."
 
           {
             echo "eligible=true"
             echo "head_sha=$head_sha"
             echo "base_ref=$base_ref"
+            echo "samples=$samples"
           } >> "$GITHUB_OUTPUT"
 
   # ── The measurement ─────────────────────────────────────────────────────────
   measure:
-    name: Measure head vs merge base
+    name: Measure ${{ matrix.project }}
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [hk, eza]
     needs: authorize
     if: needs.authorize.outputs.eligible == 'true'
     # gha-runner-scale-set: match by the scale-set's installation name (single
@@ -209,18 +201,17 @@ jobs:
           persist-credentials: false
 
       # The ARC image is minimal. This is bench.yml's prerequisite list trimmed
-      # to what `bench-pr-cargo` actually needs: a C toolchain and pkg-config
+      # to what hk and eza need: a C toolchain and pkg-config
       # for the cc-rs build scripts (libgit2-sys, libssh2-sys, libz-sys,
       # curl-sys), OpenSSL headers for openssl-sys/libgit2, git + curl for the
-      # clone and for mise, and jq for the comparison script. No protoc, no
-      # ninja, no python — nothing in this subject needs them.
+      # clone and for mise, and Python for the repeated-sample coordinator.
       - name: Install build prerequisites (apt)
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev \
+            build-essential pkg-config libssl-dev python3 \
             git curl ca-certificates jq
 
       # mise installs rust (per rust-toolchain.toml) and just. The SUBJECT pins
@@ -231,14 +222,22 @@ jobs:
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
-          install_args: --force rust github:casey/just
+          install_args: --force rust github:casey/just github:mozilla/sccache
           cache: false
           reshim: false
 
+      - name: Install mbx
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git show "origin/$DEFAULT_BRANCH:scripts/install-bench-mbx.sh" > "$RUNNER_TEMP/install-bench-mbx.sh"
+          bash "$RUNNER_TEMP/install-bench-mbx.sh"
+
       # Disk-full mid-build is the worst failure mode on the emptyDir-backed
-      # work volume. Each side needs two debug objdirs plus a store; the first
-      # side's scratch is deleted before the second side starts (see below), so
-      # the floor covers one side plus kache's own target tree with headroom.
+      # work volume. Four arms retain isolated cold snapshots and build trees
+      # between repetitions. The
+      # floor includes their build trees and Kache build output.
       - name: Free-disk precheck
         run: |
           set -euo pipefail
@@ -317,8 +316,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/instrument"
           cp target/release/kache-scenario "$RUNNER_TEMP/instrument/kache-scenario"
           cp -R scenarios "$RUNNER_TEMP/instrument/scenarios"
-          cp scripts/perf-gate-compare.sh "$RUNNER_TEMP/instrument/perf-gate-compare.sh"
-          cp scripts/perf-gate-side.sh "$RUNNER_TEMP/instrument/perf-gate-side.sh"
+          cp scripts/bench-short.py "$RUNNER_TEMP/instrument/bench-short.py"
 
       - name: Build kache from the merge base
         env:
@@ -357,78 +355,28 @@ jobs:
           git config --global --replace-all \
             "http.https://github.com/.extraheader" "AUTHORIZATION: basic $header"
 
-      # Which side runs first alternates with the run number. The first side
-      # on a fresh pod pays for a cold page cache and any runner warm-up, and a
-      # fixed order handed that cost to the merge base on every pull request,
-      # so the head always read a little faster. The scenario's untimed
-      # `prepare` step keeps crate downloads and the toolchain install out of
-      # both sides' timings; alternating spreads what remains across runs
-      # instead of tilting every run the same way. A re-run keeps its run
-      # number, so it keeps its order.
-      - name: Choose which side runs first
-        id: order
+      - name: Measure repeated samples
+        timeout-minutes: 60
         env:
-          RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          set -euo pipefail
-          if [ $((RUN_NUMBER % 2)) -eq 0 ]; then
-            first="base"
-            second="head"
-          else
-            first="head"
-            second="base"
-          fi
-          echo "Side order for run $RUN_NUMBER: $first first, then $second"
-          {
-            echo "first=$first"
-            echo "second=$second"
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo "Perf gate side order for run $RUN_NUMBER: \`$first\` first, then \`$second\`."
-            echo
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Each side deletes its scratch when it finishes, so peak disk is one
-      # side, not two.
-      - name: Benchmark the first side (${{ steps.order.outputs.first }})
-        timeout-minutes: 40
-        env:
-          SIDE: ${{ steps.order.outputs.first }}
-          RUSTC_WRAPPER: ""
-          # The subject pins its own toolchain via the rust-toolchain.toml the
-          # scenario injects; a forced RUSTUP_TOOLCHAIN would override it.
-          RUSTUP_TOOLCHAIN: ""
-        run: '"$RUNNER_TEMP/instrument/perf-gate-side.sh" "$SIDE"'
-
-      - name: Benchmark the second side (${{ steps.order.outputs.second }})
-        timeout-minutes: 40
-        env:
-          SIDE: ${{ steps.order.outputs.second }}
+          BENCH_PROJECT: ${{ matrix.project }}
+          BENCH_SAMPLES: ${{ needs.authorize.outputs.samples }}
+          BENCH_HEAD_SHA: ${{ needs.authorize.outputs.head_sha }}
+          BENCH_BASE_SHA: ${{ steps.commits.outputs.merge_base }}
+          BENCH_INSTRUMENT_SHA: ${{ steps.commits.outputs.instrument }}
+          ORDER_SEED: ${{ github.run_number }}
           RUSTC_WRAPPER: ""
           RUSTUP_TOOLCHAIN: ""
-        run: '"$RUNNER_TEMP/instrument/perf-gate-side.sh" "$SIDE"'
-
-      # The threshold and the validity gates live in the script, so `just`
-      # users and CI apply exactly the same rules. Non-zero exit = regression or
-      # invalid measurement; either way the markdown is written first so the
-      # reviewer sees why.
-      - name: Compare and gate
-        id: compare
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/report"
           status=0
-          "$RUNNER_TEMP/instrument/perf-gate-compare.sh" \
-            "$RUNNER_TEMP/base.json" \
-            "$RUNNER_TEMP/head.json" \
-            "$RUNNER_TEMP/report/perf-gate.md" || status=$?
-          # The script writes the markdown before it decides the exit code, so
-          # the summary is there for both outcomes. Guard anyway: an argument or
-          # environment failure exits before writing anything, and losing the
-          # real exit code to a missing file would be the wrong failure to show.
-          if [ -f "$RUNNER_TEMP/report/perf-gate.md" ]; then
-            cat "$RUNNER_TEMP/report/perf-gate.md" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          python3 "$RUNNER_TEMP/instrument/bench-short.py" \
+            --project "$BENCH_PROJECT" --samples "$BENCH_SAMPLES" --order-seed "$ORDER_SEED" \
+            --engine "$RUNNER_TEMP/instrument/kache-scenario" \
+            --scenarios "$RUNNER_TEMP/instrument/scenarios" \
+            --kache "$RUNNER_TEMP/kache-head" --base "$RUNNER_TEMP/kache-base" \
+            --output "$RUNNER_TEMP/perf-gate/$BENCH_PROJECT" || status=$?
+          report="$RUNNER_TEMP/perf-gate/$BENCH_PROJECT/perf-gate.md"
+          if [ -f "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; fi
           exit "$status"
 
       # always(): a failed comparison is exactly when the per-phase reports and
@@ -437,12 +385,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: perf-gate
-          path: |
-            ${{ runner.temp }}/base.json
-            ${{ runner.temp }}/head.json
-            ${{ runner.temp }}/report/perf-gate.md
-            ${{ runner.temp }}/logs/
+          name: perf-gate-${{ matrix.project }}
+          path: ${{ runner.temp }}/perf-gate/
           retention-days: 14
           if-no-files-found: warn
 
@@ -467,7 +411,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: perf-gate
+          pattern: perf-gate-*
+          merge-multiple: true
           path: perf-gate
         continue-on-error: true
 
@@ -481,6 +426,22 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+
+          if [ -f perf-gate/hk/perf-gate.md ] && [ -f perf-gate/eza/perf-gate.md ]; then
+            mkdir -p perf-gate/report
+            if grep -q '^## Perf gate: INVALID MEASUREMENT' perf-gate/hk/perf-gate.md perf-gate/eza/perf-gate.md; then
+              verdict='INVALID MEASUREMENT'
+            elif [ "$MEASURE_RESULT" = "success" ]; then
+              verdict=pass
+            else
+              verdict=FAIL
+            fi
+            {
+              echo "## Perf gate: $verdict — hk and eza"
+              echo
+              cat perf-gate/hk/perf-gate.md perf-gate/eza/perf-gate.md
+            } > perf-gate/report/perf-gate.md
+          fi
 
           # Three outcomes, not two. "The gate could not run" and "the gate ran
           # and the numbers are bad" are different facts, and a reviewer who
@@ -498,6 +459,8 @@ jobs:
             description="$(printf '%.140s' "$headline")"
             if [ "$MEASURE_RESULT" = "success" ]; then
               state=success
+            elif [ "$verdict" = 'INVALID MEASUREMENT' ]; then
+              state=error
             else
               state=failure
             fi

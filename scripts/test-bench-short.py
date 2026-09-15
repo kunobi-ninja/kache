@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Exercise validity, paired regressions, independent cold counts and run isolation."""
+
+import argparse
+import copy
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import sys
+import unittest
+from unittest.mock import MagicMock, patch
+
+spec = importlib.util.spec_from_file_location(
+    "bench_short", Path(__file__).with_name("bench-short.py")
+)
+bench = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bench)
+
+
+def result(backend="kache", ms=10000):
+    phase = {
+        "wall_ms": ms,
+        "hits": 10,
+        "cache_hits": 10,
+        "misses": 0,
+        "storage": {"restored_bytes": 1000},
+        "event_log": {"passed_through": 0},
+    }
+    return {
+        "git_ref": "subject-sha",
+        "cache_tool_version": backend + " 1.0",
+        "verdict": {"ok": True},
+        "warm_same_tree_verdict": {"ok": True},
+        **{p: copy.deepcopy(phase) for p in bench.PHASES},
+    }
+
+
+def record(arm, sample, ms=10000):
+    return {
+        "arm": arm,
+        "sample": sample,
+        "cold_reused": sample % 3 != 0,
+        "result": result(ms=ms),
+    }
+
+
+class BenchTests(unittest.TestCase):
+    def test_process_exit_and_timeout_cleanup(self):
+        bench.run_measurement([sys.executable, "-c", "pass"])
+        with self.assertRaises(bench.subprocess.CalledProcessError):
+            bench.run_measurement([sys.executable, "-c", "raise SystemExit(4)"])
+        process = MagicMock()
+        process.pid = 1234
+        process.wait.side_effect = [bench.subprocess.TimeoutExpired("engine", 1200), 0]
+        with (
+            patch.object(bench.subprocess, "Popen") as spawn,
+            patch.object(bench.os, "killpg") as kill,
+        ):
+            spawn.return_value.__enter__.return_value = process
+            with self.assertRaises(bench.subprocess.TimeoutExpired):
+                bench.run_measurement(["engine"])
+            kill.assert_called_once_with(1234, bench.signal.SIGKILL)
+
+    def test_refuses_invalid_measurements(self):
+        for backend in ("kache", "sccache", "mbx"):
+            bench.validate(result(backend), backend)
+            for phase in bench.PHASES:
+                for value in (None, 0, -1, float("nan"), True):
+                    r = result(backend)
+                    r[phase]["wall_ms"] = value
+                    with self.assertRaises(ValueError):
+                        bench.validate(r, backend)
+            for phase in bench.PHASES[1:]:
+                r = result(backend)
+                r[phase]["hits"] = r[phase]["cache_hits"] = 0
+                with self.assertRaises(ValueError):
+                    bench.validate(r, backend)
+        r = result()
+        r["warm_same_tree_verdict"]["ok"] = False
+        with self.assertRaises(ValueError):
+            bench.validate(r, "kache")
+        r = result()
+        r["warm"]["invalid_reasons"] = ["store error"]
+        with self.assertRaises(ValueError):
+            bench.validate(r, "kache")
+
+    def test_cold_reuse_does_not_inflate_samples(self):
+        summary = bench.summarize([record("kache", i) for i in range(6)])
+        self.assertEqual([s["n"] for s in summary["statistics"]], [2, 6, 6])
+
+    def test_paired_regression_and_noise(self):
+        self.assertEqual(
+            bench.paired_change([10000] * 6, [12000] * 6)["outcome"], "regression"
+        )
+        self.assertEqual(
+            bench.paired_change([10000] * 6, [8000] * 6)["outcome"], "improvement"
+        )
+        self.assertEqual(
+            bench.paired_change([10000] * 6, [9000, 12000] * 3)["outcome"],
+            "inconclusive",
+        )
+        self.assertEqual(
+            bench.paired_change([10000], [15000])["outcome"], "inconclusive"
+        )
+        self.assertEqual(
+            bench.paired_change([1000] * 6, [1100] * 6)["outcome"], "inconclusive"
+        )
+
+    def test_pair_and_identity_validation(self):
+        with self.assertRaises(ValueError):
+            bench.summarize([record("base", 0)])
+        records = [record("base", 0), record("head", 0)]
+        records[1]["result"]["git_ref"] = "different"
+        with self.assertRaises(ValueError):
+            bench.summarize(records)
+        records = [record("kache", 0), record("kache", 1)]
+        records[1]["result"]["cache_tool_version"] = "changed"
+        with self.assertRaises(ValueError):
+            bench.summarize(records)
+
+    def test_count_regression_cannot_hide_in_faster_timing(self):
+        records = [record("base", 0), record("head", 0, 5000)]
+        records[1]["result"]["warm"]["misses"] = 1
+        self.assertIn("misses rose", bench.summarize(records)["failures"][0])
+
+    def test_driver_alternates_arms_and_saves_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(
+                output=root / "output",
+                project="hk",
+                engine=root / "engine",
+                scenarios=root / "scenarios",
+                kache="/kache",
+                base="/base",
+                sccache="/sccache",
+                mbx="/mbx",
+                samples=6,
+                order_seed=0,
+            )
+            calls = []
+
+            def invoke(command, **kwargs):
+                calls.append(command)
+                work = Path(command[command.index("--work-dir") + 1])
+                work.mkdir(parents=True, exist_ok=True)
+                scenario = command[command.index("--profile") + 1]
+                backend = command[command.index("--cache-backend") + 1]
+                (work / f"{scenario}.json").write_text(json.dumps(result(backend)))
+                points = [
+                    {
+                        "attributes": [
+                            {
+                                "key": "kache.bench.phase",
+                                "value": {"stringValue": phase},
+                            }
+                        ]
+                    }
+                    for phase in ("cold", "warm")
+                ]
+                (work / "metrics.otlp.json").write_text(
+                    json.dumps(
+                        {
+                            "resourceMetrics": [
+                                {
+                                    "scopeMetrics": [
+                                        {"metrics": [{"gauge": {"dataPoints": points}}]}
+                                    ]
+                                }
+                            ]
+                        }
+                    )
+                )
+
+                if backend == "kache":
+                    for phase in ("cold", "warm-same-tree", "warm"):
+                        dest = work / f"cache-otlp-{phase}"
+                        dest.mkdir(exist_ok=True)
+                        (dest / "metrics.otlp.json").write_text(
+                            (work / "metrics.otlp.json").read_text()
+                        )
+
+            with patch.object(bench, "run_measurement", invoke):
+                self.assertEqual(bench.run(args), 0)
+            self.assertEqual(len(calls), 24)
+            self.assertTrue(calls[0][calls[0].index("--kache") + 1].endswith("/base"))
+            self.assertEqual(calls[4][calls[4].index("--cache-backend") + 1], "mbx")
+            self.assertNotIn("--retry", calls[0])
+            self.assertIn("--retry", calls[4])
+            self.assertNotIn("--retry", calls[12])
+            self.assertIn("--skip-clone", calls[12])
+            payload = json.loads((args.output / "samples.json").read_text())
+            self.assertEqual(len(payload["records"]), 24)
+            self.assertFalse((args.output / "scratch").exists())
+            metrics = json.loads((args.output / "metrics.otlp.json").read_text())
+            points = [
+                point
+                for resource in metrics["resourceMetrics"]
+                for scope in resource["scopeMetrics"]
+                for metric in scope["metrics"]
+                for point in metric["gauge"]["dataPoints"]
+            ]
+            cold = [
+                point
+                for point in points
+                if point["attributes"][0]["value"]["stringValue"] == "cold"
+            ]
+            self.assertEqual(len(cold), 8)
+            self.assertIn("inconclusive", (args.output / "perf-gate.md").read_text())
+            for phase, expected in (("cold", 4), ("warm", 12)):
+                cached = json.loads(
+                    (
+                        args.output / f"cache-otlp-{phase}" / "metrics.otlp.json"
+                    ).read_text()
+                )
+                self.assertEqual(len(cached["resourceMetrics"]), expected)
+
+    def test_subprocess_failure_keeps_logs_and_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = argparse.Namespace(
+                output=root / "output",
+                project="eza",
+                engine=root / "engine",
+                scenarios=root / "scenarios",
+                kache="/kache",
+                base=None,
+                sccache="/sccache",
+                mbx="/mbx",
+                samples=1,
+                order_seed=0,
+            )
+            with patch.object(
+                bench,
+                "run_measurement",
+                side_effect=bench.subprocess.CalledProcessError(1, ["engine"]),
+            ):
+                self.assertEqual(bench.run(args), 1)
+            self.assertIn(
+                "INVALID MEASUREMENT", (args.output / "perf-gate.md").read_text()
+            )
+            self.assertTrue((args.output / "logs/00-kache/engine.log").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

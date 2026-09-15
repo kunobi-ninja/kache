@@ -780,12 +780,27 @@ prepare = "{kache} fetch --into {objdir}"
     /// whichever side runs first pays for the downloads and the other does
     /// not.
     #[test]
-    fn shipped_pr_cargo_profile_fetches_before_timing() {
-        let p = BenchProfile::load(&repo_profile("pr-cargo")).expect("pr-cargo loads");
-        assert_eq!(
-            p.prepare_command(Path::new("/k")).as_deref(),
-            Some("cargo fetch --locked")
-        );
+    fn short_profiles_share_sources_and_fetch_before_timing() {
+        for project in ["hk", "eza"] {
+            let baseline = BenchProfile::load(&repo_profile(project)).unwrap();
+            for suffix in ["", "-sccache", "-mbx"] {
+                let profile =
+                    BenchProfile::load(&repo_profile(&format!("{project}{suffix}"))).unwrap();
+                assert_eq!(profile.repo, baseline.repo);
+                assert_eq!(profile.git_ref, baseline.git_ref);
+                assert_eq!(profile.objdir, baseline.objdir);
+                assert_eq!(
+                    profile.prepare_command(Path::new("/cache")).as_deref(),
+                    Some("cargo fetch --locked")
+                );
+                if suffix == "-sccache" {
+                    let env: std::collections::HashMap<_, _> =
+                        profile.build_env(Path::new("/cache")).into_iter().collect();
+                    assert_eq!(env.get("HOST_CC").map(String::as_str), Some("/cache cc"));
+                    assert_eq!(env.get("HOST_CXX").map(String::as_str), Some("/cache c++"));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1146,28 +1161,6 @@ diff --git a/hello.txt b/hello.txt
                 .as_deref()
                 .expect("inline mozconfig")
                 .contains("KACHE_PATH_ONLY_ENV_VARS")
-        );
-    }
-
-    /// The shipped Substrate scenario wires kache via `RUSTC_WRAPPER` only
-    /// (no file injection, no CC/CXX — native C deps stay outside kache),
-    /// installs the wasm targets + rust-src in setup, and builds the
-    /// polkadot node.
-    #[test]
-    fn shipped_substrate_profile_is_rustc_wrapper_only() {
-        let p = BenchProfile::load(&repo_profile("substrate")).expect("substrate.toml loads");
-        assert_eq!(p.name, "bench-substrate");
-        assert_eq!(p.objdir, "target");
-        assert!(p.files.is_empty(), "substrate uses RUSTC_WRAPPER only");
-        assert!(
-            p.env.is_empty(),
-            "no extra env — CARGO_INCREMENTAL is an engine baseline, not a profile var"
-        );
-        assert!(p.setup.iter().any(|s| s.contains("wasm32-unknown-unknown")));
-        assert!(p.setup.iter().any(|s| s.contains("rust-src")));
-        assert!(
-            p.build_command(Path::new("/k"))
-                .contains("cargo build --release -p polkadot")
         );
     }
 

@@ -612,7 +612,7 @@ jobs:
       # tests above: run it on results the engine could have written and check
       # the exit code and the headline the workflow parses.
       - name: Perf gate comparison tests
-        run: ./scripts/test-perf-gate-compare.sh
+        run: python3 scripts/test-bench-short.py
 
   # --- Dependency policy audit ---
   # Runs `cargo deny check` (via `just audit`) on every push and non-docs PR:

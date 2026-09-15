@@ -25,7 +25,9 @@ setup = [
 # Dev profile with --locked, the command a developer runs. hk's [profile.dev]
 # keeps DWARF embedded, so the final binaries restore self-contained. The
 # prefix maps, SOURCE_DATE_EPOCH and KACHE_BASE_DIR are the cross-worktree
-# portability knobs the other cargo scenarios use (see bench-pr-cargo).
+# portability settings shared by the Cargo scenarios.
+prepare = "cargo fetch --locked"
+
 build = """
 # Input-set predictions, with a sampled cross-check (kunobi-ninja/kache#945).
 # Predictions replace the rustc dep-info pre-pass with a recorded closure, so

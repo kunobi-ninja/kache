@@ -1,0 +1,37 @@
+# Same source, toolchain and build profile as bench-eza.
+name = "bench-eza-sccache"
+tags = ["suite:bench", "project:eza", "backend:sccache", "lang:rust", "lang:cc"]
+
+requires = ["cargo", "rustc", "cc"]
+
+setup = [
+  "echo '[bench] bench-eza-sccache needs a C compiler (bundled libgit2 and zlib through cc-rs). No OpenSSL: eza takes git2 with default-features off.'",
+]
+
+prepare = "cargo fetch --locked"
+
+build = """
+
+repo="$(pwd -P)"
+prefix_map="-ffile-prefix-map=$repo=. -fdebug-prefix-map=$repo=. -fmacro-prefix-map=$repo=."
+export CFLAGS="${CFLAGS:-} $prefix_map"
+export CXXFLAGS="${CXXFLAGS:-} $prefix_map"
+export SOURCE_DATE_EPOCH=1735689600
+export ZERO_AR_DATE=1
+
+cargo build --release --locked
+"""
+
+[env]
+HOST_CC = "{cache} cc"
+HOST_CXX = "{cache} c++"
+CC_KNOWN_WRAPPER_CUSTOM = "sccache"
+
+[source]
+kind   = "clone"
+repo   = "https://github.com/eza-community/eza.git"
+ref    = "98442ab17c2c3738701b62a7e060b1431ae2d6ea"
+objdir = "target"
+
+[checks.measure.warm]
+min_hit_rate_pct = 50.0

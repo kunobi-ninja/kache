@@ -1,6 +1,6 @@
 //! Clone benchmark scenario engine.
 //!
-//! Builds a real project (Firefox, Substrate, …) twice against one
+//! Builds a real project (Firefox, hk, …) twice against one
 //! shared compiler cache:
 //!
 //! - **cold**: a fresh clone with an empty cache → every compile is a
@@ -28,9 +28,8 @@
 //! this binary is the project-agnostic measurement engine. See
 //! `scenarios/README.md` for the scenario format.
 //!
-//! Reports cold/warm wall-clock, speedup, and hit rate. This is a manual
-//! tool: a full run takes tens of minutes to a few hours and needs tens
-//! of GB of disk. It is intentionally NOT wired into CI.
+//! Reports cold/warm wall-clock, speedup, and hit rate. CI uses hk and eza
+//! for short comparisons; the larger subjects run on the nightly schedule.
 //!
 //! The kache benchmark path is **self-diagnosing** when a scenario declares
 //! `checks.assert`: it captures kache's own leak detector, measures
@@ -48,7 +47,7 @@
 //!
 //! ```text
 //! just bench firefox               # full cold + warm
-//! just bench substrate
+//! just bench hk
 //! kache-scenario --select suite:bench --profile firefox --retry
 //! kache-scenario --select suite:bench --profile firefox --skip-clone
 //! kache-scenario --select suite:bench --profile firefox --ref FIREFOX_152_0_RELEASE
@@ -156,9 +155,6 @@ impl CacheBackend {
 pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     if config.cache_backend.is_external() && config.trace_keys {
         bail!("--trace-keys is only supported with --cache-backend kache");
-    }
-    if config.cache_backend == CacheBackend::Sccache && config.warm_same_tree {
-        bail!("--warm-same-tree is only supported with --cache-backend kache or mbx");
     }
     let cache_tool_arg = match config.cache_backend {
         CacheBackend::Kache => &config.kache,
@@ -391,7 +387,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         None
     };
 
-    // Every backend other than kache has its own two-phase arm; matching
+    // Every backend other than kache has its own phase implementation; matching
     // exhaustively keeps the dispatch from depending on a comparison that
     // could quietly select the wrong one.
     match config.cache_backend {
@@ -404,6 +400,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
                 &clone_b,
                 &work_dir,
                 config.retry,
+                config.warm_same_tree,
                 &sh,
                 disk_free_before,
                 &objdir,
@@ -460,9 +457,8 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
     // cold's cache snapshot (`cache-after-cold`, used by `--retry`) is already
     // on disk, and because clone-b must stay untouched until it is built once.
     //
-    // Anything this rebuild stores (a passthrough that cold did not reach) also
-    // benefits the cross-clone warm phase below; that is the same direction the
-    // cache already works in and is noted in the summary.
+    // Restore the cold snapshot afterwards so this phase cannot seed the
+    // cross-checkout measurement.
     let warm_same_tree_metrics = if config.warm_same_tree {
         reset_event_log(&event_log)?;
         let daemon_started = daemon::start(&kache, &cache_dir, &kache_config);
@@ -506,6 +502,9 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         None
     };
 
+    if config.warm_same_tree {
+        source::snapshot_dir(&work_dir.join("cache-after-cold"), &cache_dir)?;
+    }
     // Reset the event log so warm's report covers only the warm build.
     // Only the observability log is removed — the cache store (`store/`,
     // `index.db`) stays, so warm still hits everything cold populated.
@@ -1920,6 +1919,7 @@ fn run_sccache_bench(
     clone_b: &Path,
     work_dir: &Path,
     retry: bool,
+    warm_same_tree: bool,
     sh: &Path,
     disk_free_before: Option<u64>,
     objdir: &str,
@@ -1935,32 +1935,33 @@ fn run_sccache_bench(
     ensure_sccache_cache_location(&cold_metrics, cache_dir, Phase::Cold.name())?;
     ensure_sccache_base_dirs(&cold_metrics, clone_a, Phase::Cold.name())?;
 
-    sccache_start(sccache, cache_dir, clone_b)?;
-    sccache_zero_stats(sccache, cache_dir, clone_b)?;
-    let warm_ms = build(
+    let same_tree_metrics = if warm_same_tree {
+        Some(measure_sccache_phase(
+            profile,
+            sccache,
+            cache_dir,
+            clone_a,
+            work_dir,
+            Phase::WarmSameTree.name(),
+            sh,
+        )?)
+    } else {
+        None
+    };
+    // Each warm phase starts from the same cold snapshot.
+    if warm_same_tree {
+        source::snapshot_dir(&work_dir.join("cache-after-cold"), cache_dir)?;
+    }
+    let warm_metrics = measure_sccache_phase(
         profile,
-        clone_b,
-        Phase::Warm.name(),
-        cache_dir,
-        &work_dir.join("sccache-config-unused.toml"),
         sccache,
+        cache_dir,
+        clone_b,
         work_dir,
-        CacheBackend::Sccache,
-        false,
+        Phase::Warm.name(),
         sh,
-    )?
-    .wall_ms;
-    let warm_metrics = capture_sccache_report(
-        sccache,
-        cache_dir,
-        clone_b,
-        work_dir,
-        Phase::Warm.name(),
-        warm_ms,
     )?;
-    sccache_stop(sccache, cache_dir);
-    ensure_sccache_cache_location(&warm_metrics, cache_dir, Phase::Warm.name())?;
-    ensure_sccache_base_dirs(&warm_metrics, clone_b, Phase::Warm.name())?;
+    let warm_ms = warm_metrics.wall_ms;
 
     let disk_measured_bytes = disk_delta(disk_free_before, available_bytes(work_dir));
     // Milliseconds, as for the kache path; see `phase_speedup`.
@@ -1978,7 +1979,7 @@ fn run_sccache_bench(
         .saturating_add(warm_objdir_bytes)
         .saturating_add(cache_dir_bytes);
 
-    let result = SccacheBenchResult {
+    let mut result = SccacheBenchResult {
         project: profile.name.clone(),
         git_ref: profile.git_ref.clone(),
         platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -1995,6 +1996,7 @@ fn run_sccache_bench(
             .clone()
             .or_else(|| cold_metrics.cache_location.clone()),
         cold: cold_metrics,
+        warm_same_tree: same_tree_metrics,
         warm: warm_metrics,
         speedup,
         cache_size_mb: round1(cache_dir_bytes as f64 / 1024.0 / 1024.0),
@@ -2019,6 +2021,33 @@ fn run_sccache_bench(
         .to_vec(),
     };
 
+    if result.warm_same_tree.is_some() {
+        for name in [
+            "report-warm-same-tree.sccache.json",
+            "report-warm-same-tree.sccache-adv.txt",
+            "build-warm-same-tree.log",
+            "wrapper-warm-same-tree.log",
+        ] {
+            result.reports.push(name.to_string());
+        }
+    }
+    let mut phases = vec![otlp_sccache_phase(
+        "cold",
+        &result.cold,
+        result.cold_objdir_bytes,
+    )];
+    if let Some(same) = &result.warm_same_tree {
+        phases.push(otlp_sccache_phase(
+            "warm-same-tree",
+            same,
+            result.cold_objdir_bytes,
+        ));
+    }
+    phases.push(otlp_sccache_phase(
+        "warm",
+        &result.warm,
+        result.warm_objdir_bytes,
+    ));
     let out = work_dir.join(format!("{}.json", profile.name));
     std::fs::write(&out, serde_json::to_string_pretty(&result)? + "\n")
         .with_context(|| format!("writing {}", out.display()))?;
@@ -2039,10 +2068,7 @@ fn run_sccache_bench(
             key_stability_pct: None,
             disk_measured_bytes: result.disk_measured_bytes,
             disk_footprint_bytes: result.disk_footprint_bytes,
-            phases: vec![
-                otlp_sccache_phase("cold", &result.cold, result.cold_objdir_bytes),
-                otlp_sccache_phase("warm", &result.warm, result.warm_objdir_bytes),
-            ],
+            phases,
         },
     );
 
@@ -2050,6 +2076,48 @@ fn run_sccache_bench(
     print_sccache_summary(&result, run_archive_dir);
     eprintln!("[bench] summary written to {}", out.display());
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_sccache_phase(
+    profile: &BenchProfile,
+    sccache: &Path,
+    cache_dir: &Path,
+    clone: &Path,
+    work_dir: &Path,
+    phase: &str,
+    sh: &Path,
+) -> Result<SccachePhaseMetrics> {
+    sccache_start(sccache, cache_dir, clone)?;
+    let measured = (|| {
+        sccache_zero_stats(sccache, cache_dir, clone)?;
+        let ms = build(
+            profile,
+            clone,
+            phase,
+            cache_dir,
+            &work_dir.join("sccache-config-unused.toml"),
+            sccache,
+            work_dir,
+            CacheBackend::Sccache,
+            false,
+            sh,
+        )?
+        .wall_ms;
+        let metrics = capture_sccache_report(sccache, cache_dir, clone, work_dir, phase, ms)?;
+        ensure_sccache_cache_location(&metrics, cache_dir, phase)?;
+        ensure_sccache_base_dirs(&metrics, clone, phase)?;
+        anyhow::ensure!(metrics.cache_hits > 0, "[{phase}] sccache restored nothing");
+        anyhow::ensure!(
+            metrics.cache_errors == 0
+                && metrics.cache_read_errors == 0
+                && metrics.cache_write_errors == 0,
+            "[{phase}] sccache reported cache errors"
+        );
+        Ok(metrics)
+    })();
+    sccache_stop(sccache, cache_dir);
+    measured
 }
 
 fn run_sccache_cold_phase(
@@ -3307,6 +3375,9 @@ fn run_mbx_bench(
         None
     };
 
+    if warm_same_tree {
+        source::snapshot_dir(&work_dir.join("cache-after-cold"), cache_dir)?;
+    }
     let warm_metrics = measure_mbx_phase(
         profile,
         clone_b,
@@ -3561,6 +3632,8 @@ struct SccacheBenchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_location: Option<String>,
     cold: SccachePhaseMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warm_same_tree: Option<SccachePhaseMetrics>,
     warm: SccachePhaseMetrics,
     speedup: f64,
     cache_size_mb: f64,
@@ -3746,6 +3819,12 @@ fn print_sccache_summary(r: &SccacheBenchResult, work_dir: &Path) {
         "  cold build : {}   (empty cache, baseline)",
         fmt(r.cold.wall_s)
     );
+    if let Some(same) = &r.warm_same_tree {
+        eprintln!(
+            "  same tree  : {}   (cold cache snapshot, fresh objdir)",
+            fmt_wall_clock(same.wall_ms)
+        );
+    }
     eprintln!(
         "  warm build : {}   (cache populated by cold)",
         fmt(r.warm.wall_s)
@@ -4202,7 +4281,7 @@ fn print_pull_summary(r: &PullBenchResult, archive_dir: &Path) {
 /// Benchmark result document written to `<work-dir>/<project>.json`.
 #[derive(Debug, Serialize)]
 struct BenchResult {
-    /// Profile name, e.g. `firefox` / `substrate`.
+    /// Profile name, e.g. `firefox` / `hk`.
     project: String,
     /// The pinned ref (tag/branch/commit) that was built.
     git_ref: String,
@@ -4220,8 +4299,7 @@ struct BenchResult {
     host: crate::bench_host::HostInfo,
     cold: PhaseMetrics,
     /// The same-worktree warm rebuild, present only under `--warm-same-tree`.
-    /// Absent from every nightly scenario's JSON, so downstream readers must
-    /// treat it as optional.
+    /// Optional for subjects that do not request the same-checkout phase.
     #[serde(skip_serializing_if = "Option::is_none")]
     warm_same_tree: Option<PhaseMetrics>,
     warm: PhaseMetrics,
@@ -6037,56 +6115,103 @@ mod tests {
         assert!(!event_log.exists());
     }
 
-    /// `--warm-same-tree` is rejected for the sccache backend and accepted for
-    /// kache. Both halves of the guard matter: rejecting the flag on kache
-    /// would disable the perf gate outright, and accepting it on sccache would
-    /// run a phase that backend has no code path for.
+    #[cfg(unix)]
     #[test]
-    fn warm_same_tree_is_rejected_only_on_the_sccache_backend() {
-        const REJECTION: &str =
-            "--warm-same-tree is only supported with --cache-backend kache or mbx";
-        // Non-existent tool paths: the guard under test runs before the binary
-        // is resolved, so every case below stops at resolution with a different
-        // message and nothing touches a clone, a cache, or a compiler.
-        let missing = std::env::temp_dir().join("kache-perf-gate-no-such-binary");
-        let config = |cache_backend, warm_same_tree| BenchRunConfig {
-            kache: missing.clone(),
-            sccache: missing.clone(),
-            mbx: missing.clone(),
-            cache_backend,
-            scenarios: PathBuf::from("./scenarios"),
-            select: vec!["suite:bench".to_string()],
-            git_ref: None,
-            work_dir: None,
-            skip_clone: false,
-            force_setup: false,
-            retry: false,
-            trace_keys: false,
-            warm_same_tree,
-        };
-
-        let rejected = run_bench(config(CacheBackend::Sccache, true))
-            .expect_err("sccache + --warm-same-tree must be rejected")
-            .to_string();
-        assert!(rejected.contains(REJECTION), "{rejected}");
-
-        // The same flag on the kache backend gets past the guard and fails
-        // later, on the missing binary.
-        let allowed = run_bench(config(CacheBackend::Kache, true))
-            .expect_err("the fake kache binary cannot resolve")
-            .to_string();
-        assert!(!allowed.contains(REJECTION), "{allowed}");
-
-        let allowed = run_bench(config(CacheBackend::Mbx, true))
-            .expect_err("the fake mbx binary cannot resolve")
-            .to_string();
-        assert!(!allowed.contains(REJECTION), "{allowed}");
-
-        // ...and so does the sccache backend without the flag.
-        let allowed = run_bench(config(CacheBackend::Sccache, false))
-            .expect_err("the fake sccache binary cannot resolve")
-            .to_string();
-        assert!(!allowed.contains(REJECTION), "{allowed}");
+    fn sccache_same_tree_resets_artifacts_and_does_not_seed_cross_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let work = root.join("work");
+        let a = root.join("a");
+        let b = root.join("b");
+        for path in [&work, &a, &b] {
+            std::fs::create_dir_all(path.join("target")).unwrap();
+            std::fs::write(path.join("target/stale"), "stale").unwrap();
+        }
+        let cache = work.join("cache");
+        let tool = root.join("sccache");
+        std::fs::write(&tool, r#"#!/bin/sh
+case "$1" in
+  --show-stats)
+    hits=$(cat "$SCCACHE_DIR/hits")
+    printf '{"stats":{"cache_hits":{"counts":{"Rust":%s}}},"basedirs":["%s"],"cache_location":"%s"}' "$hits" "$SCCACHE_BASEDIRS" "$SCCACHE_DIR"
+    ;;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let scenario_dir = root.join("bench-fixture");
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let scenario = scenario_dir.join("scenario.toml");
+        std::fs::write(
+            &scenario,
+            r#"
+name = "bench-fixture"
+tags = ["suite:bench", "backend:sccache"]
+build = '''
+set -eu
+test ! -e target/stale
+mkdir -p target
+touch target/stale
+if [ ! -f "$SCCACHE_DIR/seed" ]; then
+    touch "$SCCACHE_DIR/seed"
+    echo 0 > "$SCCACHE_DIR/hits"
+else
+    if [ "$(basename "$PWD")" = a ]; then
+        touch "$SCCACHE_DIR/same-tree-only"
+    else
+        test ! -e "$SCCACHE_DIR/same-tree-only"
+    fi
+    echo 4 > "$SCCACHE_DIR/hits"
+fi
+'''
+[source]
+kind = "clone"
+repo = "unused"
+ref = "fixed"
+objdir = "target"
+"#,
+        )
+        .unwrap();
+        let profile = BenchProfile::load(&scenario).unwrap();
+        for retry in [false, true] {
+            run_sccache_bench(
+                &profile,
+                &tool,
+                &cache,
+                &a,
+                &b,
+                &work,
+                retry,
+                true,
+                Path::new("sh"),
+                None,
+                "target",
+                "test",
+                &work.join("archive"),
+                Some("fixture 1"),
+            )
+            .unwrap();
+            let result: serde_json::Value = read_json(&work.join("bench-fixture.json")).unwrap();
+            assert_eq!(result["cold"]["cache_hits"], 0);
+            assert_eq!(result["warm_same_tree"]["cache_hits"], 4);
+            assert_eq!(result["warm"]["cache_hits"], 4);
+            assert!(work.join("report-warm-same-tree.sccache.json").is_file());
+            let otlp = std::fs::read_to_string(work.join("metrics.otlp.json")).unwrap();
+            assert!(otlp.contains("warm-same-tree"));
+        }
+        // A command that does no restoration cannot publish a successful warm phase.
+        std::fs::write(&tool, "#!/bin/sh\ncase \"$1\" in --show-stats) printf '{\"stats\":{},\"basedirs\":[\"%s\"]}' \"$SCCACHE_BASEDIRS\";; esac\n").unwrap();
+        let error = measure_sccache_phase(
+            &profile,
+            &tool,
+            &cache,
+            &a,
+            &work,
+            "warm-same-tree",
+            Path::new("sh"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("restored nothing"));
     }
 
     fn bench_result_fixture() -> BenchResult {
@@ -6097,7 +6222,7 @@ mod tests {
             ..Default::default()
         };
         BenchResult {
-            project: "bench-pr-cargo".to_string(),
+            project: "bench-hk".to_string(),
             git_ref: "797e8a9".to_string(),
             platform: "linux-x86_64".to_string(),
             run_id: "20260901T000000Z-kache-1".to_string(),

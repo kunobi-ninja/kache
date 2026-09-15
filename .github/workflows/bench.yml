@@ -1,16 +1,14 @@
 name: Bench
 
 # Clone benchmark — builds kache from THIS ref and runs the cross-clone
-# cold/warm scenarios (Firefox, Substrate, SurrealDB, Lance, OpenDAL, eza, LLVM)
-# against one shared cache, then
-# uploads the reports. This is the heavy, hours-long, tens-of-GB-disk job, so
+# cold/warm scenarios and the repeated hk/eza suites, then uploads reports. This is the heavy, hours-long, tens-of-GB-disk job, so
 # it lives in its own workflow and never blocks a push or PR. The per-PR perf
-# gate (perf-gate.yml) measures one subject separately.
+# gate (perf-gate.yml) measures hk and eza separately.
 #
 # Triggers:
 #   - schedule  : nightly, runs every arm in the matrix below.
-#   - dispatch  : manual, pick a scenario (default all) and pass extra `just
-#                 bench` flags (e.g. `--skip-clone`, `--retry`).
+#   - dispatch  : manual, pick a scenario (default all, excluding Firefox).
+#                 Extra flags depend on the selected recipe.
 #
 # Runs on the kunobi self-hosted Linux ARC runners in
 # tenant-int-dev/zur1-builder1: `kunobi-runners-large`, runners with a 120Gi
@@ -37,10 +35,10 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, hk-comparison, substrate, surrealdb, lance, opendal, eza, firefox, firefox-sccache, llvm, firefox-windows, firefox-pull, firefox-pull-windows, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, substrate-mbx, surrealdb-mbx]
+        options: [all, hk-comparison, surrealdb, lance, opendal, eza, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx]
         default: all
       extra_args:
-        description: "Extra args appended to `just bench <profile>` (e.g. --skip-clone, --retry)"
+        description: "Extra recipe arguments (hk/eza: sample count; other scenarios: --skip-clone, --retry)"
         type: string
         default: ""
 
@@ -71,23 +69,22 @@ jobs:
   # job-level `if` (it is evaluated before the matrix is expanded, so it reads
   # empty) — a dispatch picking a single scenario would otherwise run zero arms.
   # This tiny job uses the validation runner so a skipped scenario never
-  # claims a benchmark runner. schedule + `all` -> both; otherwise the
-  # one picked scenario. Per-arm timeout/min_free_gb travel with each entry.
+  # claims a benchmark runner. The schedule includes Firefox; manual all
+  # excludes it. Per-arm timeout/min_free_gb travel with each entry.
   plan:
     if: (github.repository == 'kunobi-ninja/kache' || vars.ENABLE_BENCHMARKS == 'true')
     name: Plan scenarios
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
-      # Whether the Linux matrix has any arm. Windows-only scenarios produce an
-      # EMPTY matrix, which GitHub treats as an invalid job and fails the whole
-      # run — so the `bench` job is gated on this to skip cleanly instead.
+      # Avoid starting a matrix job if no Linux scenarios were selected.
       has_linux: ${{ steps.pick.outputs.has_linux }}
     steps:
       - id: pick
         shell: bash
         env:
           # schedule has no inputs -> treat as `all`; dispatch honours the input.
+          EVENT_NAME: ${{ github.event_name }}
           SCENARIO: ${{ github.event_name == 'schedule' && 'all' || github.event.inputs.scenario }}
         run: |
           # Each arm carries: name (display + artifact label), cmd (the `just`
@@ -98,12 +95,10 @@ jobs:
           # since disk-full mid-build is the worst failure mode; emptyDir is
           # node-backed, so the precheck also catches a too-small node).
           #
-          # Smaller than Firefox but still tens of minutes cold.
-          substrate='{"name":"substrate","cmd":"bench substrate","dir":"bench-substrate","timeout":180,"job_timeout":225,"min_free_gb":60,"runner":"kunobi-runners-large"}'
           # SurrealDB's `surreal` server binary at default features — a large
           # pure-Rust workspace whose default features also drag in native C/C++
           # deps (rocksdb, grpcio, quickjs) that build outside kache. Comparable
-          # weight to substrate; same native-prereq set (already installed below).
+          # native-prerequisite set (already installed below).
           surrealdb='{"name":"surrealdb","cmd":"bench surrealdb","dir":"bench-surrealdb","timeout":180,"job_timeout":225,"min_free_gb":80,"runner":"kunobi-runners-large"}'
           # Lance's `lance` crate at default features — a large pure-Rust
           # workspace (Arrow, DataFusion, object-store backends, prost codegen).
@@ -140,28 +135,28 @@ jobs:
           # the way `kache init` does it so both compiler families are measured.
           # `--warm-same-tree` adds the same-path warm phase between cold and the
           # cross-clone warm. Minutes, not hours; a C compiler is all it needs.
-          hk='{"name":"hk","cmd":"bench hk --warm-same-tree","dir":"bench-hk","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          hk='{"name":"hk","cmd":"bench-short hk","dir":"bench-hk","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # hk with input predictions off: the control for the arm above, so
           # the same nightly shows what predictions are worth (#1000).
-          hk_nopred='{"name":"hk-nopred","cmd":"bench hk-nopred --warm-same-tree","dir":"bench-hk-nopred","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          hk_nopred='{"name":"hk-nopred","cmd":"bench hk-nopred --warm-same-tree","dir":"bench-hk-nopred","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # Same subject on the temporal axis: cold at the parent commit, then
           # rebuild the child in the same worktree with the store warm.
-          hk_pull='{"name":"hk-pull","cmd":"bench hk-pull","dir":"bench-hk-pull","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          hk_pull='{"name":"hk-pull","cmd":"bench hk-pull","dir":"bench-hk-pull","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # The same hk shape through mbx, for a side-by-side comparison
           # (as firefox-sccache is for firefox). The workflow installs the
           # latest mbx release; the run records the version it measured.
-          hk_mbx='{"name":"hk-mbx","cmd":"bench-mbx hk --warm-same-tree","dir":"bench-hk-mbx","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          hk_mbx='{"name":"hk-mbx","cmd":"bench-mbx hk --warm-same-tree","dir":"bench-hk-mbx","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # Timing arms; hk-pull keeps exhaustive prediction verification.
-          hk_pull_perf='{"name":"hk-pull-perf","cmd":"bench hk-pull-perf","dir":"bench-hk-pull-perf","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
-          hk_pull_nopred='{"name":"hk-pull-nopred","cmd":"bench hk-pull-nopred","dir":"bench-hk-pull-nopred","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
-          hk_pull_mbx='{"name":"hk-pull-mbx","cmd":"bench-mbx hk-pull","dir":"bench-hk-pull-mbx","timeout":60,"job_timeout":90,"min_free_gb":30,"runner":"kunobi-runners"}'
+          hk_pull_perf='{"name":"hk-pull-perf","cmd":"bench hk-pull-perf","dir":"bench-hk-pull-perf","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
+          hk_pull_nopred='{"name":"hk-pull-nopred","cmd":"bench hk-pull-nopred","dir":"bench-hk-pull-nopred","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
+          hk_pull_mbx='{"name":"hk-pull-mbx","cmd":"bench-mbx hk-pull","dir":"bench-hk-pull-mbx","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # eza: the smallest subject and the only one built through a fat-LTO
           # release profile, so the final unit is one whole-program codegen
           # instead of many small ones. Its bundled libgit2 and zlib put the
           # majority of its cacheable units on the C side (199 of 319 in a local
           # run). The cheapest arm in the sweep: minutes, and under a gigabyte
           # of build output.
-          eza='{"name":"eza","cmd":"bench eza --warm-same-tree","dir":"bench-eza","timeout":60,"job_timeout":90,"min_free_gb":20,"runner":"kunobi-runners"}'
+          eza='{"name":"eza","cmd":"bench-short eza","dir":"bench-eza","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
           # Two more subjects on the same side-by-side axis. mbx fronts Cargo,
           # so the arms it can serve at all are exactly the cargo-driven ones:
           # firefox (mach/gn/ninja) and llvm (cmake) are out of reach, which is
@@ -170,23 +165,13 @@ jobs:
           # already carrying the multi-hour arms.
           opendal_mbx='{"name":"opendal-mbx","cmd":"bench-mbx opendal","dir":"bench-opendal-mbx","timeout":120,"job_timeout":165,"min_free_gb":40,"runner":"kunobi-runners"}'
           lance_mbx='{"name":"lance-mbx","cmd":"bench-mbx lance","dir":"bench-lance-mbx","timeout":180,"job_timeout":225,"min_free_gb":60,"runner":"kunobi-runners"}'
-          # The two heavyweights complete the set: these five are every subject
-          # mbx can serve at all. They keep their kache arms' disk floors, and
-          # 80Gi is exactly the general pool's per-runner ceiling with no
-          # headroom, so they run on the reserved runner as their kache
-          # counterparts do.
-          substrate_mbx='{"name":"substrate-mbx","cmd":"bench-mbx substrate","dir":"bench-substrate-mbx","timeout":180,"job_timeout":225,"min_free_gb":60,"runner":"kunobi-runners-large"}'
           surrealdb_mbx='{"name":"surrealdb-mbx","cmd":"bench-mbx surrealdb","dir":"bench-surrealdb-mbx","timeout":180,"job_timeout":225,"min_free_gb":80,"runner":"kunobi-runners-large"}'
           case "$SCENARIO" in
-            substrate)            inc="[$substrate]" ;;
             surrealdb)            inc="[$surrealdb]" ;;
             lance)                inc="[$lance]" ;;
             opendal)              inc="[$opendal]" ;;
-            firefox)              inc="[$firefox]" ;;
-            firefox-sccache)      inc="[$firefox_sccache]" ;;
             llvm)                 inc="[$llvm]" ;;
-            firefox-pull)         inc="[$firefox_pull]" ;;
-            hk-comparison)       inc="[$hk,$hk_nopred,$hk_mbx,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx]" ;;
+            hk-comparison)       inc="[$hk,$hk_nopred,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx]" ;;
             hk)                   inc="[$hk]" ;;
             hk-nopred)            inc="[$hk_nopred]" ;;
             hk-pull)              inc="[$hk_pull]" ;;
@@ -197,16 +182,16 @@ jobs:
             eza)                  inc="[$eza]" ;;
             opendal-mbx)          inc="[$opendal_mbx]" ;;
             lance-mbx)            inc="[$lance_mbx]" ;;
-            substrate-mbx)        inc="[$substrate_mbx]" ;;
             surrealdb-mbx)        inc="[$surrealdb_mbx]" ;;
             # Windows-only scenarios are served by their own self-hosted jobs
             # below, so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`
             # and wastefully run the whole Linux `all` matrix alongside.
-            firefox-windows)      inc="[]" ;;
-            firefox-pull-windows) inc="[]" ;;
-            *)                    inc="[$substrate,$surrealdb,$lance,$opendal,$firefox,$firefox_sccache,$llvm,$firefox_pull,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_mbx,$hk_pull_mbx,$eza,$opendal_mbx,$lance_mbx,$substrate_mbx,$surrealdb_mbx]" ;;
+            *)                    inc="[$surrealdb,$lance,$opendal,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
           esac
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            inc="$(jq -c --argjson extra "[$firefox,$firefox_sccache,$firefox_pull]" '. + $extra' <<<"$inc")"
+          fi
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
           if [ "$inc" = "[]" ]; then
             echo "has_linux=false" >> "$GITHUB_OUTPUT"
@@ -285,7 +270,7 @@ jobs:
           NPM_CONFIG_CACHE: ${{ runner.temp }}/kartero-npm-cache
 
       # The ARC runner image is minimal. Install the base toolchain the bench
-      # needs around the build: substrate links rocksdb/secp256k1 and needs
+      # needs around the build: SurrealDB links native dependencies and needs
       # protoc + clang + cmake + openssl headers (SurrealDB's default features
       # need the same set — rocksdb bindgen wants libclang, storage-tikv/grpcio
       # wants protoc; Lance's prost-build wants protoc and a few default-feature
@@ -323,7 +308,7 @@ jobs:
         with:
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
-          install_args: --force rust github:casey/just${{ endsWith(matrix.name, '-sccache') && ' github:mozilla/sccache' || '' }}
+          install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || matrix.name == 'hk' || matrix.name == 'eza') && ' github:mozilla/sccache' || '' }}
           cache: false
           reshim: false
 
@@ -332,7 +317,7 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.6.9
-          install_args: --force rust github:casey/just${{ endsWith(matrix.name, '-sccache') && ' github:mozilla/sccache' || '' }}
+          install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || matrix.name == 'hk' || matrix.name == 'eza') && ' github:mozilla/sccache' || '' }}
           cache: false
           reshim: false
 
@@ -343,36 +328,11 @@ jobs:
       # on purpose — the arm tracks the tool as it ships — with the checksum
       # verified and the version recorded in the log.
       - name: Install mbx (comparison arms only)
-        if: endsWith(matrix.name, '-mbx')
+        if: endsWith(matrix.name, '-mbx') || matrix.name == 'hk' || matrix.name == 'eza'
         timeout-minutes: 10
         run: |
-          set -euo pipefail
-          # curl, not `gh`: the ARC runner image ships no GitHub CLI.
-          # /releases/latest redirects to the tag, so the newest release is
-          # one HEAD request and needs no token or JSON parsing.
-          repo=https://github.com/jdx/mr-boxington
-          archive=mbx-x86_64-unknown-linux-gnu.tar.gz
-          dir="$RUNNER_TEMP/mbx"
-          mkdir -p "$dir"
-          tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$repo/releases/latest" | sed 's#.*/tag/##')"
-          case "$tag" in
-            v[0-9]*) ;;
-            *) echo "::error::could not resolve the latest release tag (got '$tag')"; exit 1 ;;
-          esac
-          curl -fsSL -o "$dir/$archive" "$repo/releases/download/$tag/$archive"
-          curl -fsSL -o "$dir/SHA256SUMS" "$repo/releases/download/$tag/SHA256SUMS"
-          (cd "$dir" && grep "  $archive$" SHA256SUMS | sha256sum --check --strict -)
-          tar -xzf "$dir/$archive" -C "$dir"
-          echo "$dir" >> "$GITHUB_PATH"
-          echo "mbx release $tag"
-          "$dir/mbx" --version
+          bash scripts/install-bench-mbx.sh
 
-      # The harness clones third-party subjects over https. Anonymous
-      # requests share this cluster's egress quota, and when it is exhausted
-      # GitHub answers 401, which git reports as "could not read Username"
-      # and the bench dies before it builds anything. Authenticating with the
-      # job's own read-only token moves those fetches onto the much larger
-      # per-token limit. Ephemeral pod, so the config dies with the job.
       - name: Authenticate git for third-party clones
         env:
           GH_JOB_TOKEN: ${{ github.token }}
@@ -414,11 +374,7 @@ jobs:
           EXTRA_ARGS: ${{ github.event.inputs.extra_args }}
           # The bench measures kache itself; it must not run under a wrapper.
           RUSTC_WRAPPER: ""
-          # Unset the toolchain pin mise exports. The cloned projects pin their
-          # OWN Rust via rust-toolchain.toml (polkadot-sdk -> 1.93.0); a forced
-          # RUSTUP_TOOLCHAIN overrides that and breaks substrate's wasm-runtime
-          # build. With it cleared, rustup honours each tree's rust-toolchain.toml
-          # (kache builds with its pin, substrate with 1.93.0).
+          # The subject uses its own pinned Rust toolchain.
           RUSTUP_TOOLCHAIN: ""
 
       - name: Upload bench reports
@@ -447,6 +403,7 @@ jobs:
             tmp/bench/${{ matrix.dir }}/key-diff.*
             tmp/bench/${{ matrix.dir }}/*.log
             tmp/bench/${{ matrix.dir }}/*.txt
+            tmp/bench/${{ matrix.dir }}/logs/
           retention-days: 30
           if-no-files-found: warn
 
@@ -501,7 +458,7 @@ jobs:
       # Only the arms that pass `--warm-same-tree` write this directory; the
       # step is skipped elsewhere so a missing phase never reads as a warning.
       - name: Upload cache telemetry (warm-same-tree)
-        if: always() && contains(matrix.cmd, '--warm-same-tree') && !endsWith(matrix.name, '-mbx')
+        if: always() && (contains(matrix.cmd, '--warm-same-tree') || matrix.name == 'hk' || matrix.name == 'eza') && !endsWith(matrix.name, '-mbx')
         timeout-minutes: 10
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -517,8 +474,7 @@ jobs:
   # MozillaBuild + VS Build Tools), and `bash` via
   # Git/MozillaBuild `sh.exe`.
   #
-  # Runs nightly (schedule) like the other bench arms, plus on a dispatch that
-  # selects firefox-windows or all. Until the runner is provisioned with
+  # Runs only on the nightly schedule. Until the runner is provisioned with
   # MozillaBuild the nightly arm fails at the prereq precheck — the same
   # self-diagnosing "this bench could not validly run" signal the other arms
   # give, not a silent green.
@@ -526,9 +482,7 @@ jobs:
     name: Bench Firefox (Windows)
     if: >-
       (github.repository == 'kunobi-ninja/kache' || vars.ENABLE_BENCHMARKS == 'true') &&
-      (github.event_name == 'schedule' ||
-       (github.event_name == 'workflow_dispatch' &&
-        (github.event.inputs.scenario == 'firefox-windows' || github.event.inputs.scenario == 'all')))
+      github.event_name == 'schedule'
     runs-on: ${{ fromJSON(vars.BENCH_RUNNER_WINDOWS || (github.repository == 'kunobi-ninja/kache' && '["self-hosted","Windows","X64","kunobi-windows"]')) }}
     timeout-minutes: 420
     defaults:
@@ -766,15 +720,12 @@ jobs:
   # `bench-firefox-windows` step-for-step; the only differences are the scenario
   # profile (`firefox-pull-windows`), a longer timeout (two full sequential
   # Firefox builds — cold at ref A, then a from-scratch rebuild at ref B — vs
-  # the cross-clone job's cold+warm), and the artifact name. Runs nightly and on
-  # a dispatch selecting firefox-pull-windows or all.
+  # the cross-clone job's cold+warm), and the artifact name. Runs nightly only.
   bench-firefox-pull-windows:
     name: Bench Firefox Pull (Windows)
     if: >-
       (github.repository == 'kunobi-ninja/kache' || vars.ENABLE_BENCHMARKS == 'true') &&
-      (github.event_name == 'schedule' ||
-       (github.event_name == 'workflow_dispatch' &&
-        (github.event.inputs.scenario == 'firefox-pull-windows' || github.event.inputs.scenario == 'all')))
+      github.event_name == 'schedule'
     runs-on: ${{ fromJSON(vars.BENCH_RUNNER_WINDOWS || (github.repository == 'kunobi-ninja/kache' && '["self-hosted","Windows","X64","kunobi-windows"]')) }}
     timeout-minutes: 540
     defaults:

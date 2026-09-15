@@ -30,9 +30,11 @@ setup = [
 
 # Release with --locked: eza's release profile is the point of this subject.
 # The prefix maps, SOURCE_DATE_EPOCH and KACHE_BASE_DIR are the cross-worktree
-# portability knobs the other cargo scenarios use (see bench-pr-cargo).
+# portability settings shared by the Cargo scenarios.
 # KACHE_BASE_DIR also covers eza's build script, which writes the version
 # string into OUT_DIR under the checkout for the crate to `include!`.
+prepare = "cargo fetch --locked"
+
 build = """
 # Input-set predictions, with a sampled cross-check (kunobi-ninja/kache#945).
 # Predictions replace the rustc dep-info pre-pass with a recorded closure, so

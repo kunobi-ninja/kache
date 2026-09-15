@@ -2,6 +2,7 @@
 
 pub mod atomic;
 mod blob_validation;
+mod cc_memo;
 pub mod config;
 pub mod eviction;
 pub mod file_hash;

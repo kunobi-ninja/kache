@@ -98,6 +98,14 @@ The key includes preprocessor output, compiler identity, modeled code-generation
 
 Kache recognizes GCC, Clang, Apple Clang, clang-cl, versioned names such as `gcc-13`, and target-prefixed compiler names. It can probe other wrapper names to identify the underlying compiler family.
 
+## Preprocessor memos
+
+Kache remembers each unit's source and header inputs so an unchanged build can reuse its preprocessor result. Identical inputs share one database row, including the local file stamp and the raw and prefix-mapped content hashes. A hit checks the stamp first, then raw content, then mapped content.
+
+GC removes memos unused for 30 days and then removes inputs with no references. Successful hits refresh usage at most once a day per memo.
+
+Upgrading from the JSON memo format discards those memos once; units rediscover their inputs on the next build. Compiled artifact entries remain available. SQLite reuses the freed pages. `kache doctor --repair` also compacts a large, sparse index when enough disk space is available; run it after builds finish to avoid lock contention.
+
 ## Portability
 
 GCC and Clang entries can be reused across worktrees when source and build paths normalize cleanly. Set `KACHE_BASE_DIR` when the automatic roots do not cover a container mount or out-of-tree layout:

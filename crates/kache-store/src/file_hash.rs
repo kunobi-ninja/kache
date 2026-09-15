@@ -1,5 +1,6 @@
 //! Persistent file fingerprints and opaque compiler memo records.
 
+pub use crate::cc_memo::{CcPreprocessMemo, CcPreprocessMemoInput};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
@@ -121,20 +122,6 @@ impl<'db> FileHashCache<'db> {
         Ok(())
     }
 
-    pub fn get_cc_preprocess_memo(
-        &self,
-        memo_key: &str,
-    ) -> rusqlite::Result<Option<(String, String)>> {
-        self.db()
-            .query_row(
-                "SELECT preprocessed_hash, inputs_json FROM cc_preprocess_memos
-                 WHERE memo_key = ?1",
-                params![memo_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-    }
-
     /// Return the stored schema and payload for `identity`, or `None` when absent.
     /// The caller validates the schema before interpreting the payload.
     pub fn get_input_prediction(&self, identity: &str) -> rusqlite::Result<Option<(u32, String)>> {
@@ -162,24 +149,10 @@ impl<'db> FileHashCache<'db> {
         )?;
         Ok(())
     }
-
-    pub fn put_cc_preprocess_memo(
-        &self,
-        memo_key: &str,
-        preprocessed_hash: &str,
-        inputs_json: &str,
-    ) -> rusqlite::Result<()> {
-        self.db().execute(
-            "INSERT OR REPLACE INTO cc_preprocess_memos
-             (memo_key, preprocessed_hash, inputs_json, updated_at)
-             VALUES (?1, ?2, ?3, datetime('now'))",
-            params![memo_key, preprocessed_hash, inputs_json],
-        )?;
-        Ok(())
-    }
 }
 
 pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
+    crate::cc_memo::ensure_schema(db)?;
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS file_hashes (
             path       TEXT PRIMARY KEY,
@@ -189,12 +162,6 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
             inode      INTEGER NOT NULL DEFAULT 0,
             hash       TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS cc_preprocess_memos (
-            memo_key          TEXT PRIMARY KEY,
-            preprocessed_hash TEXT NOT NULL,
-            inputs_json       TEXT NOT NULL,
-            updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS input_predictions (
             identity        TEXT PRIMARY KEY,
@@ -527,39 +494,6 @@ mod tests {
         assert_eq!(
             cache.get_runtime_env_use("source-a", "OUT_DIR").unwrap(),
             Some(false)
-        );
-    }
-
-    #[test]
-    fn cc_memo_persists_and_replaces_only_the_requested_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("index.db");
-        let cache = FileHashCache::open(&db_path).unwrap();
-        assert_eq!(cache.get_cc_preprocess_memo("first").unwrap(), None);
-        cache
-            .put_cc_preprocess_memo("first", "digest-a", "inputs-a")
-            .unwrap();
-        cache
-            .put_cc_preprocess_memo("second", "digest-b", "inputs-b")
-            .unwrap();
-        drop(cache);
-
-        let cache = FileHashCache::open(&db_path).unwrap();
-        assert_eq!(
-            cache.get_cc_preprocess_memo("first").unwrap(),
-            Some(("digest-a".into(), "inputs-a".into()))
-        );
-        assert_eq!(cache.get_cc_preprocess_memo("missing").unwrap(), None);
-        cache
-            .put_cc_preprocess_memo("first", "digest-c", "inputs-c")
-            .unwrap();
-        assert_eq!(
-            cache.get_cc_preprocess_memo("first").unwrap(),
-            Some(("digest-c".into(), "inputs-c".into()))
-        );
-        assert_eq!(
-            cache.get_cc_preprocess_memo("second").unwrap(),
-            Some(("digest-b".into(), "inputs-b".into()))
         );
     }
 

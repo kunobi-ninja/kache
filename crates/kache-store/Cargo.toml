@@ -10,6 +10,10 @@ repository = "https://github.com/kunobi-ninja/kache"
 [features]
 test-support = []
 
+[[example]]
+name = "bench-cc-memos"
+required-features = ["test-support"]
+
 [dependencies]
 kache-format = { version = "0.22.0", path = "../kache-format" }
 kache-fs = { version = "0.22.0", path = "../kache-fs", features = ["staging"] }

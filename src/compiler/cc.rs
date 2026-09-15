@@ -4537,23 +4537,18 @@ fn fold_cc_memo_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
     hasher.update(label);
     hasher.update(&(value.len() as u64).to_le_bytes());
     hasher.update(value);
+    // Values are logged as digests only: an environment value may be a secret.
+    tracing::trace!(
+        target: "kache::cc_memo_key",
+        "memo-field {}={}",
+        String::from_utf8_lossy(label),
+        &blake3::hash(value).to_hex()[..12]
+    );
 }
 
 /// Environment variables that cannot change a preprocessor expansion and do
-/// change between two otherwise identical invocations.
-///
-/// The memo key folds the environment wholesale, because compiler-specific
-/// include variables are numerous and an extra miss is safer than overlooking
-/// one. That stays true — this is a deny list, not an allow list, so anything
-/// unrecognised is still keyed and the worst case remains a wasted preprocess.
-///
-/// Without it the memo is unreachable rather than merely conservative. A
-/// shell exports `_`, `PWD` and `OLDPWD` fresh for every command, cargo hands
-/// each build script a jobserver on file descriptors it picked this run, and
-/// kache's own runtime variables move with the cache directory. Any one of
-/// those gives every invocation its own key, so nothing is ever reused.
-/// `cwd` is folded separately and explicitly, so dropping `PWD` here loses
-/// nothing.
+/// change between two otherwise identical invocations. Checked before the
+/// allow list below, so a name matching both stays out.
 const CC_MEMO_VOLATILE_ENV: &[&str] = &[
     // Shell bookkeeping, rewritten per command.
     "_",
@@ -4568,20 +4563,94 @@ const CC_MEMO_VOLATILE_ENV: &[&str] = &[
     "NUM_JOBS",
 ];
 
-/// Is this a variable the memo key deliberately ignores? kache's own
-/// `KACHE_*` settings are included: they steer the wrapper, never the
-/// preprocessor, and they differ between any two cache directories.
-fn cc_memo_env_is_volatile(name: &OsStr) -> bool {
+/// Environment variables the preprocessor reads, by the GCC, Clang and MSVC
+/// documentation. Names are matched exactly; [`cc_memo_env_pattern_is_keyed`]
+/// widens this to families of names.
+const CC_MEMO_KEYED_ENV: &[&str] = &[
+    // GCC "Environment Variables Affecting GCC"; Clang honours the same set.
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "OBJC_INCLUDE_PATH",
+    "OBJCPLUS_INCLUDE_PATH",
+    "GCC_EXEC_PREFIX",
+    "COMPILER_PATH",
+    "LIBRARY_PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "DEPENDENCIES_OUTPUT",
+    "SUNPRO_DEPENDENCIES",
+    "SOURCE_DATE_EPOCH",
+    // Clang driver.
+    "CCC_OVERRIDE_OPTIONS",
+    "CLANG_CONFIG_FILE_SYSTEM_DIR",
+    "CLANG_CONFIG_FILE_USER_DIR",
+    "CLANG_NO_DEFAULT_CONFIG",
+    "SDKROOT",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "IPHONEOS_DEPLOYMENT_TARGET",
+    "TVOS_DEPLOYMENT_TARGET",
+    "WATCHOS_DEPLOYMENT_TARGET",
+    "XROS_DEPLOYMENT_TARGET",
+    "DRIVERKIT_DEPLOYMENT_TARGET",
+    // MSVC.
+    "INCLUDE",
+    "EXTERNAL_INCLUDE",
+    "CL",
+    "_CL_",
+    "VCINSTALLDIR",
+    "VCToolsInstallDir",
+    "VCToolsVersion",
+    "WindowsSdkDir",
+    "WindowsSDKVersion",
+    "UCRTVersion",
+    "Platform",
+];
+
+/// Families of names that can reach a preprocessor without being on the
+/// documented list: toolchain wrappers and vendor drivers read `*_INCLUDE*`,
+/// `*SYSROOT*`, `*SDK*` and `*FLAGS` variables of their own. Keying a whole
+/// family costs at most a spurious miss.
+fn cc_memo_env_pattern_is_keyed(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    [
+        "INCLUDE",
+        "SYSROOT",
+        "SDK",
+        "DEPLOYMENT_TARGET",
+        "CLANG",
+        "GCC",
+        "CCACHE",
+    ]
+    .iter()
+    .any(|needle| upper.contains(needle))
+        || upper.ends_with("FLAGS")
+}
+
+/// Is this a variable the memo key folds?
+///
+/// The memo identifies a preprocessor run, so the environment it keys is the
+/// environment a preprocessor reads: the documented include, locale, SDK and
+/// driver variables, plus families of names that vendor wrappers use. Folding
+/// everything else made the memo unreachable in practice: a CI runner sets
+/// per-run variables (`GITHUB_RUN_ID`, per-job temporary paths, tokens), so
+/// no run could ever match the previous one and every warm build preprocessed
+/// every translation unit again. kache's own `KACHE_*` settings steer the
+/// wrapper, never the preprocessor, and are never keyed.
+fn cc_memo_env_is_keyed(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    name.starts_with("KACHE_") || CC_MEMO_VOLATILE_ENV.contains(&name)
+    if name.starts_with("KACHE_") || CC_MEMO_VOLATILE_ENV.contains(&name) {
+        return false;
+    }
+    CC_MEMO_KEYED_ENV.contains(&name) || cc_memo_env_pattern_is_keyed(name)
 }
 
 /// Local identity for a preprocessor invocation. The environment is included
-/// apart from [`cc_memo_env_is_volatile`]: compiler-specific include
-/// variables are numerous, and an extra miss is safer than overlooking one
-/// that changes expansion.
+/// as selected by [`cc_memo_env_is_keyed`].
 fn cc_preprocess_memo_key(
     parsed: &CcArgs,
     prefix_maps: &[CcPrefixMap],
@@ -4661,7 +4730,7 @@ fn cc_preprocess_memo_key(
     }
 
     let mut environment: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
-        .filter(|(name, _)| !cc_memo_env_is_volatile(name))
+        .filter(|(name, _)| cc_memo_env_is_keyed(name))
         .map(|(name, value)| (cc_memo_os_bytes(&name), cc_memo_os_bytes(&value)))
         .collect();
     environment.sort();
@@ -5134,10 +5203,11 @@ fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Resu
     names.sort();
 
     let mut hasher = blake3::Hasher::new();
+    let mut listings = CcDirectoryListings::default();
     for name in &names {
         hasher.update(name.as_os_str().as_encoded_bytes());
         hasher.update(b"\x1f");
-        match cc_first_include_dir_providing(&dirs, name)? {
+        match cc_first_include_dir_providing_cached(&dirs, name, &mut listings)? {
             Some(index) => {
                 hasher.update(b"@");
                 hasher.update(index.to_string().as_bytes());
@@ -5154,21 +5224,104 @@ fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Resu
 /// Index of the first user include directory that provides `name`, stopping
 /// at the first hit. `None` when no directory does, which is itself a fact
 /// worth keying: a directory later gaining the name changes it.
+#[cfg(test)]
 fn cc_first_include_dir_providing(dirs: &[PathBuf], name: &Path) -> Result<Option<usize>> {
+    cc_first_include_dir_providing_cached(dirs, name, &mut CcDirectoryListings::default())
+}
+
+/// Directory listings read once per invocation. Resolving a few hundred
+/// header names against a dozen include directories one `stat` at a time was
+/// the largest cost of a warm C hit; listing each directory once answers the
+/// same question from memory.
+#[derive(Default)]
+struct CcDirectoryListings {
+    listings: HashMap<PathBuf, Option<CcDirectoryListing>>,
+}
+
+struct CcDirectoryListing {
+    names: HashSet<std::ffi::OsString>,
+    /// Lower-cased names, so a case-insensitive filesystem's answer can be
+    /// confirmed with one `stat` instead of assumed from the exact spelling.
+    folded: HashSet<String>,
+}
+
+impl CcDirectoryListings {
+    /// Whether `directory` contains an entry named `file_name`, of any kind.
+    /// `None` when the directory cannot be listed as a directory: absent, or
+    /// an intermediate component is a file, which the compiler skips too.
+    fn contains(&mut self, directory: &Path, file_name: &OsStr) -> Result<bool> {
+        if !self.listings.contains_key(directory) {
+            let listing = match std::fs::read_dir(directory) {
+                Ok(entries) => {
+                    let mut names = HashSet::new();
+                    let mut folded = HashSet::new();
+                    for entry in entries {
+                        let name = entry?.file_name();
+                        folded.insert(name.to_string_lossy().to_lowercase());
+                        names.insert(name);
+                    }
+                    Some(CcDirectoryListing { names, folded })
+                }
+                Err(error)
+                    if error.kind() == ErrorKind::NotFound
+                        || error.kind() == ErrorKind::NotADirectory =>
+                {
+                    None
+                }
+                Err(error) => anyhow::bail!(
+                    "cc include directory {} is unreadable ({error})",
+                    directory.display()
+                ),
+            };
+            self.listings.insert(directory.to_path_buf(), listing);
+        }
+        let Some(listing) = &self.listings[directory] else {
+            return Ok(false);
+        };
+        if listing.names.contains(file_name) {
+            return Ok(true);
+        }
+        // A case-insensitive filesystem (macOS, Windows, but also a casefold
+        // ext4 or a mounted share on Linux) resolves `foo.h` to `Foo.h`; the
+        // listing does not. When only the case differs, ask the filesystem,
+        // which is what the compiler does.
+        if listing
+            .folded
+            .contains(&file_name.to_string_lossy().to_lowercase())
+        {
+            return match std::fs::symlink_metadata(directory.join(file_name)) {
+                Ok(_) => Ok(true),
+                Err(error)
+                    if error.kind() == ErrorKind::NotFound
+                        || error.kind() == ErrorKind::NotADirectory =>
+                {
+                    Ok(false)
+                }
+                Err(error) => anyhow::bail!(
+                    "cc include candidate {} is unreadable ({error})",
+                    directory.join(file_name).display()
+                ),
+            };
+        }
+        Ok(false)
+    }
+}
+
+fn cc_first_include_dir_providing_cached(
+    dirs: &[PathBuf],
+    name: &Path,
+    listings: &mut CcDirectoryListings,
+) -> Result<Option<usize>> {
+    let Some(file_name) = name.file_name() else {
+        return Ok(None);
+    };
     for (index, dir) in dirs.iter().enumerate() {
-        let candidate = dir.join(name);
-        match std::fs::symlink_metadata(&candidate) {
-            Ok(_) => return Ok(Some(index)),
-            // ENOENT, and ENOTDIR when an intermediate component is a file
-            // (Firefox `system_wrappers/private` is a file, not a directory).
-            // The compiler skips that include dir and continues the search.
-            Err(error)
-                if error.kind() == ErrorKind::NotFound
-                    || error.kind() == ErrorKind::NotADirectory => {}
-            Err(error) => anyhow::bail!(
-                "cc include candidate {} is unreadable ({error})",
-                candidate.display()
-            ),
+        let directory = match name.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => dir.join(parent),
+            _ => dir.clone(),
+        };
+        if listings.contains(&directory, file_name)? {
+            return Ok(Some(index));
         }
     }
     Ok(None)
@@ -5839,9 +5992,13 @@ impl Compiler for CcCompiler {
         // refuse_reasons first): `-c` mode, exactly one source.
         self.pending_preprocess_memo.borrow_mut().take();
         self.key_path_bound.set(false);
+        let _trace = crate::phase_trace::phase("key");
         let mut hasher = blake3::Hasher::new();
         let trace_name = cc_trace_name(parsed);
-        let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
+        let prefix_maps = {
+            let _trace = crate::phase_trace::phase("cc_prefix_maps");
+            cc_prefix_maps(parsed, &self.base_dirs)
+        };
 
         hasher.update(b"cc_key_version:");
         hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
@@ -5916,6 +6073,7 @@ impl Compiler for CcCompiler {
         // tokens, so the record is invariant across the build's TUs and
         // parallel builds don't race on whose paths it holds (#keyrace).
         let per_tu_paths = cc_resolved_per_tu_paths(parsed);
+        let trace_probe = crate::phase_trace::phase("cc_probe");
         let resolved = crate::probe::probe(
             ctx.cache_dir,
             &crate::probe::CcProber,
@@ -5930,6 +6088,7 @@ impl Compiler for CcCompiler {
                 windows_aware: parsed.family.dialect() != Dialect::Cl,
             },
         )?;
+        drop(trace_probe);
         if resolved.resolved_tokens.is_none() && cc_flags_need_resolved_invocation(parsed) {
             anyhow::bail!("cc: resolved invocation unavailable for probe-captured flags");
         }
@@ -6171,16 +6330,19 @@ impl Compiler for CcCompiler {
         // macro expansion. `-E -P` strips line markers so header
         // PATHS don't leak (cross-machine portable); SOURCE_DATE_EPOCH
         // pins __DATE__/__TIME__ (stable across builds).
+        let trace_memo_key = crate::phase_trace::phase("cc_memo_key");
         let memo_key = ctx
             .file_hasher
             .supports_cc_preprocess_memo()
             .then(|| cc_preprocess_memo_key(parsed, &prefix_maps, &resolved.version_line))
             .flatten();
+        drop(trace_memo_key);
         // The read set comes back with the expansion, from the memo when it
         // answers and from the dependency capture otherwise. It is what makes
         // the shadowing resolution below possible.
         let (pp_hash, read_inputs) = if let Some((memo_hash, satisfied)) =
             memo_key.as_ref().and_then(|key| {
+                let _trace = crate::phase_trace::phase("cc_memo_lookup");
                 ctx.file_hasher.cc_preprocess_memo_lookup(
                     key,
                     |name| cc_unmapped_path_candidates(name, &prefix_maps),
@@ -6194,6 +6356,7 @@ impl Compiler for CcCompiler {
             );
             (memo_hash, Some(satisfied))
         } else {
+            let _trace = crate::phase_trace::phase("cc_preprocess");
             let preprocessed =
                 preprocess_hash(parsed, &prefix_maps, ctx.file_hasher, memo_key.is_some())?;
             self.key_path_bound.set(preprocessed.path_bound);
@@ -6237,10 +6400,12 @@ impl Compiler for CcCompiler {
         // shadowed; without it (a compiler whose dependency capture failed)
         // fall back to enumerating the directories, which is what the capped
         // walk has always done.
+        let trace_shadowing = crate::phase_trace::phase("cc_shadowing");
         let (include_dir_digest, include_dir_mode) = match &read_inputs {
             Some(inputs) => (digest_cc_include_shadowing(parsed, inputs)?, "resolved"),
             None => (digest_cc_include_dir_names(parsed)?, "walked"),
         };
+        drop(trace_shadowing);
         self.pending_include_dir_digest
             .borrow_mut()
             .replace((include_dir_digest.clone(), read_inputs));
@@ -10642,6 +10807,14 @@ mod tests {
             ("CARGO_MAKEFLAGS", "-j --jobserver-fds=7,9"),
             ("NUM_JOBS", "13"),
             ("KACHE_CACHE_DIR", "/tmp/some-other-cache"),
+            // CI runners mint these per run; a memo keyed on them never hits.
+            ("GITHUB_RUN_ID", "1234567890"),
+            (
+                "GITHUB_ENV",
+                "/home/runner/work/_temp/_runner_file_commands/set_env_9a2b",
+            ),
+            ("ACTIONS_RUNTIME_TOKEN", "eyJ.secret"),
+            ("INVOCATION_ID", "7f9d3c"),
         ] {
             // SAFETY: the process-state lock serialises environment edits.
             unsafe { std::env::set_var(name, value) };
@@ -10653,14 +10826,23 @@ mod tests {
             unsafe { std::env::remove_var(name) };
         }
 
-        // SAFETY: as above.
-        unsafe { std::env::set_var("CPATH", "/opt/extra/include") };
-        let with_cpath = key();
-        unsafe { std::env::remove_var("CPATH") };
-        assert_ne!(
-            with_cpath, baseline,
-            "an include-path variable changes which headers are found and must be keyed"
-        );
+        for (name, value) in [
+            ("CPATH", "/opt/extra/include"),
+            ("SDKROOT", "/opt/sdk"),
+            ("LC_ALL", "C"),
+            ("VENDOR_INCLUDE_DIR", "/opt/vendor/include"),
+            ("MY_SYSROOT", "/opt/sysroot"),
+            ("CFLAGS", "-DEXTRA"),
+        ] {
+            // SAFETY: as above.
+            unsafe { std::env::set_var(name, value) };
+            let changed = key();
+            unsafe { std::env::remove_var(name) };
+            assert_ne!(
+                changed, baseline,
+                "{name} can change which headers are found or how they expand and must be keyed"
+            );
+        }
     }
 
     #[test]

@@ -367,10 +367,16 @@ fmt-nix:
 fmt-nix-check:
   nix build --no-link ".#checks.$(nix eval --impure --raw --expr builtins.currentSystem).formatting"
 
-# Lint the deployable Helm chart.
+# Lint the deployable Helm chart, then render it with every optional pod
+# metadata value set and parse the result strictly. `helm lint` accepts a
+# manifest with a duplicated key; Kubernetes and Flux reject it.
 [group('deploy')]
 helm-lint:
   helm lint packaging/charts/kache-service
+  helm template kache packaging/charts/kache-service \
+    --set podAnnotations.example/annotation=set \
+    --set podLabels.example/label=set \
+    | kubeconform -strict -ignore-missing-schemas -summary
 
 # Run cargo-llvm-cov and emit JSON + HTML reports under tmp/llvm-cov/.
 # JSON drives the CI threshold check; HTML is uploaded as a CI artifact

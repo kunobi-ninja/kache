@@ -11,6 +11,8 @@ idiomatic_version_file_enable_tools = ["rust"]
 # code change. Bump deliberately. (rust is pinned in rust-toolchain.toml, read
 # via idiomatic_version_file_enable_tools above.)
 helm = "4.2.0"
+# `just helm-lint` parses the rendered chart strictly; `helm lint` does not.
+"aqua:yannh/kubeconform" = "0.7.0"
 # Drives the out-of-tree CMake e2e scenario (e2e-cmake-out-of-tree, #394) so it
 # runs on the Linux/macOS gate instead of skipping. The scenario itself is
 # gnu/clang-only (`os = ["linux", "macos"]`), so cmake here is just the build

@@ -1320,6 +1320,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn declarations_follow_cargo_rerun_rules() {
         let env = environment(Path::new("/t/build/pkg-1/out"), Path::new("/src/pkg"));

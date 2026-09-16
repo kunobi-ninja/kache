@@ -5588,7 +5588,11 @@ fn cc_driver_captures_dependencies(program: &str, memo_dir: &Path) -> bool {
     if let Some(body) = crate::probe_memo::read_verified(&path, &digest) {
         return body.trim() == "ok";
     }
-    let supported = cc_direct_probe(program);
+    let supported = {
+        let _trace = crate::phase_trace::phase("cc_direct_probe");
+        cc_direct_probe(program)
+    };
+    tracing::debug!("cc: probed {program} for compile-first capture: {supported}");
     crate::probe_memo::write_verified(&path, &digest, if supported { "ok" } else { "no" });
     supported
 }
@@ -6812,6 +6816,7 @@ impl CcCompiler {
         // them as flags, then last among the flags so they win over any
         // user-supplied map for the same prefix.
         crate::opcounts::record_compiler_run();
+        let _trace = crate::phase_trace::phase("cc_compile");
         let mut command = Command::new(&parsed.program);
         let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
         let mut appended = file_prefix_map_args(&prefix_maps);

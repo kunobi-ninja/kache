@@ -1466,8 +1466,13 @@ fn run_cc_inner(
     };
     let discovery = match precompiled.as_mut().and_then(|pre| pre.inputs.take()) {
         Some(inputs) => crate::compiler::cc::CcKeyDiscovery::Captured(inputs),
+        // Compiling first forgoes the lookup a key would have allowed, so it
+        // is only for a certain miss: nowhere but this store could hold the
+        // entry, and no fallback wrapper is waiting to be asked.
         None if precompiled.is_none()
             && config.deferred_discovery
+            && config.remote.is_none()
+            && config.fallback.is_none()
             && crate::compiler::cc::cc_direct_key_eligible(&parsed) =>
         {
             crate::compiler::cc::CcKeyDiscovery::Deferrable
@@ -1827,6 +1832,7 @@ fn run_cc_inner(
             "cc include-dir names changed during compile; skipping store"
         );
     } else if store_decision.should_store {
+        let _trace = crate::phase_trace::phase("store");
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         let target = parsed.cache_target_arch();
         match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
@@ -3774,6 +3780,7 @@ fn run_parsed_rustc(
     }
 
     let store_start = std::time::Instant::now();
+    let trace_store = crate::phase_trace::phase("store");
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
     match store.put_with_compile_time(
@@ -3808,6 +3815,7 @@ fn run_parsed_rustc(
             );
         }
     }
+    drop(trace_store);
     let store_ms = store_start.elapsed().as_millis() as u64;
 
     // 6. Queue remote publication through the shared durable upload path.

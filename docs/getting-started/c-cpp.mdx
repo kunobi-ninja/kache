@@ -94,13 +94,15 @@ c++ -c src/foo.cpp -o build/foo.o
 clang-cl /c foo.c /Fofoo.obj
 ```
 
-The key includes preprocessor output, compiler identity, modeled code-generation options, and normalized paths. Header changes therefore invalidate the entry.
+The key includes the content of the source and of every header the compile reads, the compiler identity, modeled code-generation options, and normalized paths. Header changes therefore invalidate the entry.
+
+Kache learns the read set without a separate preprocessor run. The first time it sees an invocation it compiles right away, asking GCC or Clang for a dependency file alongside the object (a caller's own `-MD` file serves when present), then fingerprints the files that compile read and keys from their digest. Peers compiling the same unit in other build directories wait for that record instead of compiling too. When a record exists but a file in it changed, Kache runs the preprocessor to rediscover the read set; the key it derives is the same one a compile would, so an entry left by an earlier state of the tree is still found. A read set that includes a file the assembler opens on its own, or a file modified while the build ran, is compiled and not cached. `KACHE_DEFERRED_DISCOVERY=0` keeps the preprocessor as the discovery on every miss.
 
 Kache recognizes GCC, Clang, Apple Clang, clang-cl, versioned names such as `gcc-13`, and target-prefixed compiler names. It can probe other wrapper names to identify the underlying compiler family.
 
 ## Preprocessor memos
 
-Kache remembers each unit's source and header inputs so an unchanged build can reuse its preprocessor result. Identical inputs share one database row, including the local file stamp and the raw and prefix-mapped content hashes. A hit checks the stamp first, then raw content, then mapped content.
+Kache remembers each unit's source and header inputs so an unchanged build can derive its key without running the compiler. Identical inputs share one database row, including the local file stamp and the raw and prefix-mapped content hashes. A hit checks the stamp first, then raw content, then mapped content.
 
 GC removes memos unused for 30 days and then removes inputs with no references. Successful hits refresh usage at most once a day per memo.
 

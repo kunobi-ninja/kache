@@ -53,6 +53,11 @@ Peers of the same unit in other target directories wait for this compile as
 they would for a pre-pass. `[cache] deferred_discovery = false` restores the
 pre-pass.
 
+A C or C++ compile without a recorded read set does the same: it compiles
+with a dependency file and keys from the digest of the files that compile
+read, instead of preprocessing first. A record whose files changed is
+rediscovered with the preprocessor, which yields the same key.
+
 ## Path normalization
 
 Kache maps known roots to stable sentinels before hashing and asks the compiler to emit matching remapped paths. This allows equivalent worktrees and runners to share entries.

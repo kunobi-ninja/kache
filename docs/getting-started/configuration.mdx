@@ -286,7 +286,7 @@ Session and GC history are opt-in. `kache telemetry write` reads index rows and 
 | `KACHE_RECORD_SESSIONS` | `cache.record_sessions` | `false` | Make every `kache report` append its session line, as `--record` does, and every GC run append to `telemetry/gc-runs.jsonl` |
 | `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Warn when storage layout forces copies |
 | `KACHE_WINDOWS_HARDLINK` | `cache.windows_hardlink` | `false` | Unsafe opt-in hardlink restores on non-CoW Windows volumes |
-| `KACHE_DEFERRED_DISCOVERY` | `cache.deferred_discovery` | `true` | On a certain miss (no closure record, no remote), compile first and key from the dep-info rustc emits instead of running the dep-info pre-pass. Set to `0` to keep the pre-pass on every miss. |
+| `KACHE_DEFERRED_DISCOVERY` | `cache.deferred_discovery` | `true` | On a certain miss (no closure record, no remote), compile first and key from the dep-info rustc emits instead of running the dep-info pre-pass; a C compile with no recorded read set likewise compiles first and keys from the dependency file it writes. Set to `0` to keep the pre-pass and the preprocessor probe on every miss. |
 | `KACHE_SHARED_HARDLINK_RESTORES` | `cache.shared_hardlink_restores` | `false` | Let every target directory hardlink the same store blob on filesystems without reflink. Only for single-use target directories (a CI job's tree): the restore-time mtime stamp on a shared inode re-dates the artifact in every other tree that links it. |
 | `KACHE_PROGRESS` | none | off | `hits` or `verbose` compiler progress |
 | `KACHE_LOG` | none | CLI: `kache=warn`; wrapper: off | Stderr tracing filter |

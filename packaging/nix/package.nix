@@ -36,7 +36,9 @@ buildRustPackage {
       ../../Cargo.toml
       ../../Cargo.lock
       ../../assets
+      ../../build.rs
       ../../crates
+      ../../launcher
       ../../src
       ../../tests/fixtures
     ];

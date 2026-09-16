@@ -3177,9 +3177,11 @@ fn test_cc_direct_key_compiles_once_without_a_preprocess() {
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
     std::fs::write(project.path().join("value.h"), "#define VALUE 7\n").unwrap();
+    // A system header brings the libc's macro-built asm operands into the
+    // read set; they must not read as files the assembler opens.
     std::fs::write(
         project.path().join("foo.c"),
-        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+        "#include <stdio.h>\n#include \"value.h\"\nint value(void) { return VALUE; }\n",
     )
     .unwrap();
     let args = ["cc", "-O0", "-g0", "-c", "foo.c", "-o", "foo.o"];

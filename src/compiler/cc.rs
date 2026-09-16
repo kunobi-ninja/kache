@@ -5705,8 +5705,26 @@ fn cc_direct_probe(program: &str) -> bool {
 fn cc_inputs_hide_assembler_input(paths: &[PathBuf]) -> Option<&'static str> {
     paths.iter().find_map(|path| {
         let bytes = fs::read(path).ok()?;
-        cc_assembler_hidden_input(&bytes)
+        cc_raw_assembler_hidden_input(&bytes)
     })
+}
+
+/// [`cc_assembler_hidden_input`] for unexpanded source text. The directive
+/// and named-escape checks carry over: a directive the expansion would
+/// contain is spelled in some input, macro pieces included, as the escaped
+/// quote a stringised operand leaves. The computed-operand check does not:
+/// in raw text an `asm` whose operand is not a literal is a macro
+/// definition, as in every libc's symbol-aliasing headers, not a hidden
+/// string.
+fn cc_raw_assembler_hidden_input(text: &[u8]) -> Option<&'static str> {
+    if let Some(found) = cc_assembler_text_hidden_input(text) {
+        return Some(found);
+    }
+    let literals = cc_string_literals(text);
+    if literals.named_escape {
+        return Some(r"\N{...}");
+    }
+    cc_assembler_text_hidden_input(&literals.text)
 }
 
 #[derive(Default)]
@@ -14076,11 +14094,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plain = dir.path().join("plain.h");
         let sneaky = dir.path().join("sneaky.h");
+        let libc = dir.path().join("cdefs.h");
         std::fs::write(&plain, "#define X 1\n").unwrap();
         std::fs::write(&sneaky, "__asm__(\".incbin \\\"blob.bin\\\"\");\n").unwrap();
+        // The shape of glibc's `<sys/cdefs.h>`: an asm operand built from
+        // macros is a definition, not a file the assembler reads.
+        std::fs::write(
+            &libc,
+            "#define __ASMNAME(cname) __asm__ (__ASMNAME2 (__USER_LABEL_PREFIX__, cname))\n\
+             #define __ASMNAME2(prefix, cname) __STRING (prefix) cname\n",
+        )
+        .unwrap();
         assert_eq!(
             cc_inputs_hide_assembler_input(std::slice::from_ref(&plain)),
             None
+        );
+        assert_eq!(
+            cc_inputs_hide_assembler_input(std::slice::from_ref(&libc)),
+            None,
+            "macro-built asm operands are the libc norm"
+        );
+        let pasted = dir.path().join("pasted.h");
+        std::fs::write(
+            &pasted,
+            "#define EMBED(name) __asm__(\".incbin \\\"\" #name \"\\\"\")\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cc_inputs_hide_assembler_input(std::slice::from_ref(&pasted)),
+            Some(".incbin"),
+            "a stringised operand still spells the directive"
         );
         assert_eq!(
             cc_inputs_hide_assembler_input(&[plain, sneaky]),

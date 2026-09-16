@@ -87,7 +87,10 @@ objdir = "target"
 [checks.assert.warm-same-tree]
 max_passthrough_pct = 40.0
 max_errors = 0
-min_hits = 150
+# eza has ~105 rustc units plus ~15 build scripts; C objects and
+# build-script runs no longer appear as wrapper hits since build-script
+# execution is cached (the run itself is one hit).
+min_hits = 100
 min_restored_bytes = 67108864 # 64 MiB
 
 # The cross-worktree phase adds the path-portability check: an absolute path
@@ -96,7 +99,10 @@ min_restored_bytes = 67108864 # 64 MiB
 min_key_stability_pct = 50.0
 max_passthrough_pct = 40.0
 max_errors = 0
-min_hits = 150
+# eza has ~105 rustc units plus ~15 build scripts; C objects and
+# build-script runs no longer appear as wrapper hits since build-script
+# execution is cached (the run itself is one hit).
+min_hits = 100
 min_restored_bytes = 67108864 # 64 MiB
 
 [checks.measure.warm]

@@ -3408,6 +3408,28 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let Some(identity) = crate::filesystem::directory_identity(&target) else {
             return Ok(());
         };
+        // The upsert below refuses to touch a fresh, unchanged row, but even
+        // a refused upsert takes the index's write lock; read first so a
+        // warm target directory costs one query per invocation, not a wait
+        // behind whichever miss is storing.
+        let fresh: Option<bool> = self
+            .db
+            .query_row(
+                "SELECT last_seen > unixepoch() - 300
+                    AND workspace_root = ?2 AND device = ?3 AND inode = ?4
+                 FROM target_roots WHERE path = ?1",
+                params![
+                    target.to_string_lossy(),
+                    workspace_root.to_string_lossy(),
+                    identity.device.to_string(),
+                    identity.inode.to_string(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if fresh == Some(true) {
+            return Ok(());
+        }
         let changed = self.db.execute(
             "INSERT INTO target_roots
                 (path, workspace_root, first_seen, last_seen, device, inode)

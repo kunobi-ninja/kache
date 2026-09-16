@@ -5602,7 +5602,14 @@ fn cc_memo_identity_portable(parsed: &CcArgs, cwd: &Path, prefix_maps: &[CcPrefi
     let portable = |path: &Path| {
         let absolute = absolutize_path(cwd, path);
         let raw = absolute.to_string_lossy().into_owned();
-        cc_mapped_path(&absolute, prefix_maps) != raw || cc_system_path(&raw)
+        let mapped = cc_mapped_path(&absolute, prefix_maps);
+        // The build and source sentinels stand for "wherever this invocation
+        // runs": which one a path lands under depends on the checkout's
+        // layout, so a spelling under them is not one other checkouts share.
+        (mapped != raw
+            && !mapped.starts_with(CC_BUILD_SENTINEL)
+            && !mapped.starts_with(CC_SOURCE_SENTINEL))
+            || cc_system_path(&raw)
     };
     portable(cwd)
         && parsed.sources.iter().all(|source| portable(source))
@@ -14501,6 +14508,24 @@ mod tests {
         assert!(
             !cc_memo_identity_portable(&parse(&["cc", "-c", "a.c"]), cwd, &[]),
             "no maps at all"
+        );
+        let catch_all = vec![
+            CcPrefixMap {
+                from: "/tmp/oot-build".to_string(),
+                to: CC_BUILD_SENTINEL.to_string(),
+            },
+            CcPrefixMap {
+                from: "/tmp/checkout".to_string(),
+                to: CC_BASE_SENTINEL.to_string(),
+            },
+        ];
+        assert!(
+            !cc_memo_identity_portable(
+                &parse(&["cc", "-c", "/tmp/checkout/src/a.c"]),
+                Path::new("/tmp/oot-build"),
+                &catch_all
+            ),
+            "a working directory the catch-all sentinel stands for is this checkout's"
         );
     }
 

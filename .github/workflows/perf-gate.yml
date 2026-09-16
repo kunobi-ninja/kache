@@ -397,7 +397,11 @@ jobs:
   report:
     name: Report
     needs: [authorize, measure]
-    if: always() && needs.authorize.outputs.eligible == 'true'
+    # `!cancelled()`, not `always()`: a newer push to the same branch cancels
+    # this run, and the newer run reports. Reporting here would replace the
+    # pull request's comment with "could not run" for a measurement nobody
+    # needs any more. A measurement that fails on its own is still reported.
+    if: ${{ !cancelled() && needs.authorize.outputs.eligible == 'true' }}
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     timeout-minutes: 10
     permissions:
@@ -426,6 +430,14 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+
+          # A pull request merged or closed while it was being measured needs
+          # no comment and no status.
+          pr_state="$(gh api "repos/$REPO/pulls/$PR" --jq .state)"
+          if [ "$pr_state" != "open" ]; then
+            echo "Pull request #$PR is $pr_state; not reporting."
+            exit 0
+          fi
 
           if [ -f perf-gate/hk/perf-gate.md ] && [ -f perf-gate/eza/perf-gate.md ]; then
             mkdir -p perf-gate/report

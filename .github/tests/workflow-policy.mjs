@@ -13,19 +13,31 @@ const files = Object.fromEntries(
       parse(fs.readFileSync(`${root}/.github/workflows/${n}`, "utf8")),
     ]),
 );
-const custom = new Map(
-  ["always", "success"].map((name) => [
-    name,
-    {
+// Job status functions. By default the run is healthy; a check can override
+// one, e.g. `{ cancelled: true }` for a run superseded by a newer push.
+function statusFunctions(overrides) {
+  const values = {
+    always: true,
+    success: true,
+    cancelled: false,
+    failure: false,
+    ...overrides,
+  };
+  return new Map(
+    Object.entries(values).map(([name, value]) => [
       name,
-      minArgs: 0,
-      maxArgs: 0,
-      call: () => new data.BooleanData(true),
-    },
-  ]),
-);
+      {
+        name,
+        minArgs: 0,
+        maxArgs: 0,
+        call: () => new data.BooleanData(value),
+      },
+    ]),
+  );
+}
 let checks = 0;
-function evaluate(source, context) {
+function evaluate(source, context, status = {}) {
+  const custom = statusFunctions(status);
   const expression = source
     .trim()
     .replace(/^\$\{\{\s*/, "")
@@ -336,6 +348,25 @@ eq(
   ["self-hosted", "Windows", "X64", "kunobi-windows"],
   "canonical Windows pool retained",
 );
+// A newer push cancels the in-flight perf-gate run. Its report must not replace
+// the pull request's comment with "could not run"; the newer run reports.
+// A measurement that fails on its own still gets reported.
+{
+  const report = files["perf-gate.yml"].jobs.report.if;
+  const ctx = context("kunobi-ninja/kache", false);
+  ctx.needs = {
+    authorize: { outputs: { eligible: "true" } },
+    measure: { result: "failure" },
+  };
+  eq(evaluate(report, ctx), true, "perf report after a failed measurement");
+  eq(
+    evaluate(report, ctx, { cancelled: true, success: false }),
+    false,
+    "perf report skipped when a newer run cancelled this one",
+  );
+  ctx.needs.authorize.outputs.eligible = "false";
+  eq(evaluate(report, ctx), false, "perf report skipped when ineligible");
+}
 console.log(
   `${checks} workflow policy checks passed across ${routing.length} validation selectors.`,
 );

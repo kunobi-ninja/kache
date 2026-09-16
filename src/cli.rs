@@ -11869,6 +11869,11 @@ pub(crate) fn apply_cargo_wrapper_edit(existing: &str, plan: &CargoWrapperPlan) 
     }
 }
 
+/// Set when a prompt found stdin closed, so `init` can tell "declined" apart
+/// from "nobody was there to answer" (#1080).
+static PROMPT_HAD_NO_INPUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bool> {
     use std::io::{BufRead, Write};
 
@@ -11885,6 +11890,7 @@ fn prompt_yes_no(question: &str, default_yes: bool, auto_yes: bool) -> Result<bo
     let mut line = String::new();
     if stdin.lock().read_line(&mut line)? == 0 {
         println!("skipped (no input; use --yes to accept defaults)");
+        PROMPT_HAD_NO_INPUT.store(true, std::sync::atomic::Ordering::Relaxed);
         return Ok(false);
     }
     let trimmed = line.trim().to_ascii_lowercase();
@@ -12008,6 +12014,10 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
 
     if no_service {
         println!("  \x1b[33m→\x1b[0m Login service: skipped (--no-service)");
+    } else if !crate::service::login_service_available() {
+        // Containers and CI runners have no systemd user manager. Installing
+        // the unit would fail, so start the daemon directly below (#1080).
+        println!("  • Login service: unavailable (no systemd user session)");
     } else if let Some(mismatch) = service_mismatch {
         println!("  \x1b[33m→\x1b[0m Background service: update to this Kache binary");
         println!("    installed: {}", mismatch.installed.display());
@@ -12092,6 +12102,11 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     if daemon_step_failed {
         println!("  Background cache setup failed. Run kache doctor for details.\n");
         anyhow::bail!("init did not complete: daemon not reachable");
+    }
+    if !cargo_ready && PROMPT_HAD_NO_INPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        anyhow::bail!(
+            "init changed nothing because stdin had no answers; rerun with --yes to accept the defaults"
+        );
     }
     if cargo_ready {
         println!("  Ready for Cargo builds. Use cargo as usual.");

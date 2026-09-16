@@ -105,6 +105,28 @@ pub(crate) fn service_exe_mismatch(path: &Path) -> Option<ServiceExeMismatch> {
 
 // ── Install ──────────────────────────────────────────────────────
 
+/// Whether [`install`] can register a login service on this machine.
+///
+/// Linux needs a reachable systemd user manager. Containers and most CI
+/// runners have none, and every `systemctl --user` call there fails with
+/// "Failed to connect to bus" (#1080).
+pub fn login_service_available() -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    systemd_user_manager_reachable()
+}
+
+fn systemd_user_manager_reachable() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 pub fn install() -> Result<()> {
     let exe = std::env::current_exe()
         .context("resolving current executable")?
@@ -273,6 +295,12 @@ WantedBy=default.target
 }
 
 fn install_systemd(exe: &std::path::Path) -> Result<()> {
+    // Check before writing the unit, so a failed install leaves no file behind.
+    anyhow::ensure!(
+        systemd_user_manager_reachable(),
+        "no systemd user session is available (systemctl --user cannot connect); \
+         start the daemon with `kache daemon start` instead"
+    );
     let unit = unit_path();
 
     // If already installed, stop old service first

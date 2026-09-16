@@ -1171,12 +1171,64 @@ fn init_check_is_a_dry_run() {
 
 #[test]
 fn init_eof_does_not_accept_changes() {
+    // With nobody to answer, init must not look like it succeeded (#1080).
     let e = env();
-    e.cmd().args(["init", "--no-service"]).assert().success();
+    e.cmd()
+        .args(["init", "--no-service"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("rerun with --yes"));
     assert!(!e.home.join(".cargo/config.toml").exists());
     assert!(!e.home.join(".bashrc").exists());
     assert!(!e.home.join(".local/lib/kache/shims").exists());
     assert!(!e.cache.join("daemon.sock").exists());
+}
+
+/// PATH with fake `systemctl` (exiting `status`) and `loginctl` first, so
+/// service tests never reach the host's systemd.
+#[cfg(target_os = "linux")]
+fn fake_systemd_path(dir: &Path, status: i32) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    for (name, code) in [("systemctl", status), ("loginctl", 0)] {
+        let tool = dir.join(name);
+        std::fs::write(&tool, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&path)))
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn init_without_user_systemd_skips_the_login_service() {
+    // Containers and CI runners have no systemd user bus (#1080).
+    let e = env();
+    e.cmd()
+        .env("PATH", fake_systemd_path(&e.home.join("fake-bin"), 1))
+        .args(["init", "--no-shell"])
+        .write_stdin("y\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Login service: unavailable"))
+        .stdout(predicates::str::contains("Start Kache automatically at login?").not());
+    assert!(e.home.join(".cargo/config.toml").exists());
+    assert!(!e.home.join(".config/systemd/user/kache.service").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn init_with_user_systemd_installs_the_login_service() {
+    let e = env();
+    e.cmd()
+        .env("PATH", fake_systemd_path(&e.home.join("fake-bin"), 0))
+        .args(["init", "--no-shell"])
+        .write_stdin("y\ny\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Service installed"));
+    assert!(e.home.join(".config/systemd/user/kache.service").exists());
 }
 
 #[cfg(unix)]

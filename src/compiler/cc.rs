@@ -5555,10 +5555,17 @@ fn cc_direct_inputs_digest(fingerprints: &[crate::cache_key::CcPreprocessMemoInp
 const CC_DIRECT_CAPTURE_TARGET: &str = "__kache_direct_capture";
 
 /// Whether the key may come from a compile-first read set instead of the
-/// expansion. Only the GNU dialect adds a private `-MD -MF`; a caller that
-/// asked for `-MMD` gets a depfile without system headers, which is not a
-/// complete read set, so it keeps the classic path.
+/// expansion: the invocation has the right shape and the driver is known
+/// to accept the flags the capture adds.
 pub(crate) fn cc_direct_key_eligible(parsed: &CcArgs) -> bool {
+    cc_direct_key_shape_ok(parsed)
+        && cc_driver_captures_dependencies(&parsed.program, &crate::config::probe_memo_dir())
+}
+
+/// Only the GNU dialect adds a private `-MD -MF`; a caller that asked for
+/// `-MMD` gets a depfile without system headers, which is not a complete
+/// read set, so it keeps the classic path.
+fn cc_direct_key_shape_ok(parsed: &CcArgs) -> bool {
     parsed.family.dialect() == Dialect::Gnu
         && parsed.mode == CompileMode::Compile
         && parsed.sources.len() == 1
@@ -5566,6 +5573,90 @@ pub(crate) fn cc_direct_key_eligible(parsed: &CcArgs) -> bool {
             .depinfo
             .as_ref()
             .is_none_or(|depinfo| !depinfo.emit || depinfo.include_system)
+}
+
+/// Whether `program` compiles an object while writing a usable dependency
+/// file under the flags a compile-first run adds. The `-E` probe used to
+/// vouch for the driver before any flag was injected; without it, this one
+/// compile of an empty unit does, once per driver binary, remembered in
+/// the probe memo directory.
+fn cc_driver_captures_dependencies(program: &str, memo_dir: &Path) -> bool {
+    let Some(digest) = cc_direct_probe_material(program) else {
+        return false;
+    };
+    let path = crate::probe_memo::memo_path(memo_dir, "cc-direct-capture", "txt", &digest);
+    if let Some(body) = crate::probe_memo::read_verified(&path, &digest) {
+        return body.trim() == "ok";
+    }
+    let supported = cc_direct_probe(program);
+    crate::probe_memo::write_verified(&path, &digest, if supported { "ok" } else { "no" });
+    supported
+}
+
+fn cc_direct_probe_material(program: &str) -> Option<String> {
+    let resolved = super::resolve_program_on_path(program)?;
+    let canonical = std::fs::canonicalize(&resolved).ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    let mut material = crate::probe_memo::Material::new("cc-direct-capture-v1");
+    material.push(program.as_bytes());
+    material.push(canonical.as_os_str().as_encoded_bytes());
+    material.push(&metadata.len().to_le_bytes());
+    material.push(&crate::cache_key::metadata_mtime_ns(&metadata).to_le_bytes());
+    Some(material.digest())
+}
+
+fn cc_direct_probe(program: &str) -> bool {
+    let Ok(dir) = tempfile::Builder::new()
+        .prefix("kache-cc-direct-probe-")
+        .tempdir()
+    else {
+        return false;
+    };
+    let root = dir.path();
+    if fs::write(
+        root.join("probe.c"),
+        "int kache_direct_probe(void) { return 0; }\n",
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let Some(prefix_map) = root
+        .to_str()
+        .map(|root| format!("-ffile-prefix-map={root}=/kache/probe"))
+    else {
+        return false;
+    };
+    let output = Command::new(program)
+        .args([
+            "-c",
+            "probe.c",
+            "-o",
+            "probe.o",
+            "-MD",
+            "-MF",
+            "probe.d",
+            "-MT",
+            CC_DIRECT_CAPTURE_TARGET,
+            prefix_map.as_str(),
+        ])
+        .current_dir(root)
+        // A kache shim standing in for the compiler must run it, not key it.
+        .env("KACHE_CC_KEY_PROBE", "1")
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    let depfile = fs::read_to_string(root.join("probe.d")).unwrap_or_default();
+    let ok =
+        output.status.success() && root.join("probe.o").is_file() && depfile.contains("probe.c");
+    if !ok {
+        tracing::debug!(
+            "cc: {program} does not take the compile-first capture flags; keeping the preprocessor: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    ok
 }
 
 /// The first construct in any of `paths` that could make the assembler read
@@ -13840,23 +13931,67 @@ mod tests {
         let parse = |argv: &[&str]| {
             CcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
         };
-        assert!(cc_direct_key_eligible(&parse(&[
+        assert!(cc_direct_key_shape_ok(&parse(&[
             "cc", "-c", "a.c", "-o", "a.o"
         ])));
-        assert!(cc_direct_key_eligible(&parse(&[
+        assert!(cc_direct_key_shape_ok(&parse(&[
             "cc", "-MD", "-MF", "a.d", "-c", "a.c", "-o", "a.o"
         ])));
         assert!(
-            !cc_direct_key_eligible(&parse(&["cc", "-MMD", "-c", "a.c", "-o", "a.o"])),
+            !cc_direct_key_shape_ok(&parse(&["cc", "-MMD", "-c", "a.c", "-o", "a.o"])),
             "a user-header-only depfile is not the read set"
         );
         assert!(
-            !cc_direct_key_eligible(&parse(&["cc", "-E", "a.c", "-o", "a.i"])),
+            !cc_direct_key_shape_ok(&parse(&["cc", "-E", "a.c", "-o", "a.i"])),
             "only object compiles"
         );
         assert!(
-            !cc_direct_key_eligible(&parse(&["clang-cl", "/c", "a.c", "/Foa.obj"])),
+            !cc_direct_key_shape_ok(&parse(&["clang-cl", "/c", "a.c", "/Foa.obj"])),
             "the private capture flags are GNU spellings"
+        );
+    }
+
+    /// The driver probe vouches for the capture flags once per binary: a
+    /// stand-in that ignores them fails it, and the answer is remembered.
+    #[cfg(unix)]
+    #[test]
+    fn the_direct_capture_probe_rejects_a_driver_that_writes_no_object_and_remembers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let memo = dir.path().join("probes");
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_str().unwrap().to_string()
+        };
+        let silent = script("silent-cc", "#!/bin/sh\nexit 0\n");
+        assert!(!cc_driver_captures_dependencies(&silent, &memo));
+        let counting = script(
+            "counting-cc",
+            concat!(
+                "#!/bin/sh\n",
+                "echo run >> \"$(dirname \"$0\")/runs\"\n",
+                "out=; dep=\n",
+                "while [ $# -gt 0 ]; do case \"$1\" in -o) out=$2; shift;; -MF) dep=$2; shift;; esac; shift; done\n",
+                ": > \"$out\"\n",
+                "printf 'x: probe.c\\n' > \"$dep\"\n",
+            ),
+        );
+        assert!(cc_driver_captures_dependencies(&counting, &memo));
+        assert!(cc_driver_captures_dependencies(&counting, &memo));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("runs")).unwrap(),
+            "run\n",
+            "the second answer comes from the memo"
+        );
+        assert!(
+            !cc_driver_captures_dependencies(&silent, &memo),
+            "remembered as well"
+        );
+        assert!(
+            !cc_driver_captures_dependencies(&dir.path().join("absent").to_string_lossy(), &memo),
+            "an unresolvable driver is not probed"
         );
     }
 

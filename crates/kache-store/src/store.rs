@@ -2,7 +2,7 @@ use crate::ArtifactPolicy;
 use crate::blob_validation::validate_blob_metadata;
 use anyhow::{Context, Result};
 pub use kache_format::{CachedFile, EntryMeta};
-use rusqlite::{Connection, Error as SqlError, ErrorCode, params};
+use rusqlite::{Connection, Error as SqlError, ErrorCode, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -965,6 +965,12 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
 /// headroom on a slow disk while staying far below any sensible cache lifetime.
 pub const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
 
+/// A hit re-stamps `last_accessed` only when the previous stamp is at least
+/// this old: well inside [`EVICTION_IDLE_GRACE`], so a restore in flight is
+/// still pinned, and rare enough that concurrent hits stop contending for
+/// the index's write lock.
+pub const HIT_STAMP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Entries backfilled with their rebuild cost per GC sweep
 /// (kunobi-ninja/kache#594).
 ///
@@ -1809,11 +1815,27 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        // Update access time and hit count
-        self.db.execute(
-            "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1 WHERE cache_key = ?1",
-            params![cache_key],
-        )?;
+        // Update access time and hit count. The stamp pins the entry against
+        // eviction for [`EVICTION_IDLE_GRACE`]; one that is already fresh
+        // needs no write, and in a contended cell every hit's write would
+        // queue behind the misses' store transactions. Hit counts therefore
+        // count at most one hit per entry per [`HIT_STAMP_INTERVAL`].
+        let age_seconds: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT strftime('%s', 'now') - strftime('%s', last_accessed) FROM entries \
+                 WHERE cache_key = ?1",
+                params![cache_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64) {
+            self.db.execute(
+                "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1 \
+                 WHERE cache_key = ?1",
+                params![cache_key],
+            )?;
+        }
 
         Ok(Some(meta))
     }
@@ -6141,11 +6163,16 @@ mod tests {
                 "the probe must leave accounting to the pin writer"
             );
 
+            // A hit re-stamps an entry only once per `HIT_STAMP_INTERVAL`;
+            // the put just stamped it, so age it first.
+            store.set_last_accessed_for_test("probe_key", "-1 minutes");
             let local = store.get("probe_key").unwrap().unwrap();
             assert_eq!(local.files, meta.files);
             assert_eq!(local.stdout, meta.stdout);
             assert_eq!(local.stderr, meta.stderr);
             assert_eq!(hit_count(), 1, "get must record the hit");
+            let _ = store.get("probe_key").unwrap().unwrap();
+            assert_eq!(hit_count(), 1, "a fresh stamp is not rewritten");
 
             assert!(matches!(
                 probe_entry_readonly(&ro, &store_dir, "no_such_key"),

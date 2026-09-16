@@ -396,6 +396,7 @@ fn hardlink_or_copy_with_prelink_hook(
     // existing target consumer. Metadata failure is handled conservatively:
     // a copy preserves isolation and lets the ordinary read report any real
     // source failure.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let shared = SHARED_HARDLINK_RESTORES.load(Ordering::Relaxed);
     #[cfg(unix)]
     match fs::metadata(store_path) {

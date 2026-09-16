@@ -1186,7 +1186,6 @@ fn hash_directory(
 /// only, so a tree with a symlink to something outside it is not memoised.
 /// `None` when the tree is larger than the budget or holds a symlink.
 fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
     let mut hasher = blake3::Hasher::new();
     let mut remaining = budget;
     let mut pending = vec![path.to_path_buf()];
@@ -1216,16 +1215,7 @@ fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<String
                     .as_encoded_bytes(),
             );
             hasher.update(if metadata.is_dir() { b"dir" } else { b"fil" });
-            for value in [
-                metadata.len(),
-                metadata.mtime() as u64,
-                metadata.mtime_nsec() as u64,
-                metadata.ctime() as u64,
-                metadata.ctime_nsec() as u64,
-                metadata.ino(),
-            ] {
-                hasher.update(&value.to_le_bytes());
-            }
+            fold_metadata_stamp(&mut hasher, &metadata);
             if metadata.is_dir() {
                 pending.push(child);
             }
@@ -1238,6 +1228,28 @@ fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<String
 /// once a run has loaded its configuration, else the environment's or the
 /// default one.
 static TREE_MEMO_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Size and times of one entry, plus the inode where the platform has one.
+fn fold_metadata_stamp(hasher: &mut blake3::Hasher, metadata: &std::fs::Metadata) {
+    hasher.update(&metadata.len().to_le_bytes());
+    for time in [metadata.modified().ok(), metadata.created().ok()] {
+        let nanos = time
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        hasher.update(&nanos.to_le_bytes());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for value in [
+            metadata.ctime() as u64,
+            metadata.ctime_nsec() as u64,
+            metadata.ino(),
+        ] {
+            hasher.update(&value.to_le_bytes());
+        }
+    }
+}
 
 fn tree_memo_path(path: &Path) -> PathBuf {
     let name = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
@@ -1380,6 +1392,7 @@ mod tests {
         assert!(checked_relative("a/b").is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_tree_digest_is_memoised_by_its_stamp_and_forgets_on_change() {
         let _lock = crate::test_support::process_state_test_lock();

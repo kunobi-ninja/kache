@@ -2988,7 +2988,9 @@ fn run_parsed_rustc(
                 return Ok(result.exit_code);
             }
         };
-        return run_parsed_rustc(
+        let exit_code = result.exit_code;
+        PRECOMPILED_EXIT.with(|cell| cell.set(Some(exit_code)));
+        let stored = run_parsed_rustc(
             config,
             compiler,
             args,
@@ -3005,6 +3007,10 @@ fn run_parsed_rustc(
                 dep_info: Some(dep_info),
             }),
         );
+        PRECOMPILED_EXIT.with(|cell| cell.set(None));
+        // Whatever the store step reported, the compile succeeded and its
+        // outputs are in place.
+        return stored.or(Ok(exit_code));
     }
     // A force-list request that could not obtain its immediate lease must not
     // retry through the post-key adaptive seed path in the same invocation.
@@ -5440,6 +5446,13 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     Ok(result.exit_code)
 }
 
+thread_local! {
+    /// Set while the keyed flow re-enters after a deferred compile: the
+    /// compiler already ran and printed its diagnostics (with the artifact
+    /// notifications Cargo pipelines on), so no branch may run it again.
+    static PRECOMPILED_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
 fn passthrough_with_event<R: Into<String>>(
     config: &Config,
     args: &RustcArgs,
@@ -5448,6 +5461,28 @@ fn passthrough_with_event<R: Into<String>>(
     start: std::time::Instant,
     reason: R,
 ) -> Result<i32> {
+    if let Some(exit_code) = PRECOMPILED_EXIT.with(std::cell::Cell::get) {
+        let reason = reason.into();
+        tracing::debug!("{crate_name}: compiled, not stored: {reason}");
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event_with_hash_stats(
+            config,
+            root,
+            crate_name,
+            EventResult::Skipped,
+            elapsed,
+            0,
+            0,
+            "",
+            0,
+            FileHashStats::default(),
+            0,
+            0,
+            0,
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        return Ok(exit_code);
+    }
     let output = passthrough(
         args,
         config.fallback.as_deref(),
@@ -6770,6 +6805,48 @@ mod tests {
                 &fields_now
             )
             .is_empty()
+        );
+    }
+
+    /// After a deferred compile the keyed flow must never run the compiler
+    /// again: Cargo has already consumed the first run's artifact
+    /// notifications, and a second set makes it finish the unit twice.
+    #[test]
+    fn a_passthrough_after_a_deferred_compile_keeps_the_first_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().to_path_buf());
+        let args = RustcArgs::parse(
+            &[
+                dir.path().join("no-such-rustc").display().to_string(),
+                "--crate-name".into(),
+                "kt".into(),
+                "src/lib.rs".into(),
+            ]
+            .to_vec(),
+        )
+        .unwrap();
+        PRECOMPILED_EXIT.with(|cell| cell.set(Some(0)));
+        let exit = passthrough_with_event(
+            &config,
+            &args,
+            "kt",
+            "root",
+            std::time::Instant::now(),
+            "build lock wait failed",
+        );
+        PRECOMPILED_EXIT.with(|cell| cell.set(None));
+        assert_eq!(exit.unwrap(), 0, "the compiler must not run a second time");
+        assert!(
+            passthrough_with_event(
+                &config,
+                &args,
+                "kt",
+                "root",
+                std::time::Instant::now(),
+                "build lock wait failed",
+            )
+            .is_err(),
+            "without a deferred compile the passthrough runs the (missing) compiler"
         );
     }
 

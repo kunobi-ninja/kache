@@ -546,9 +546,11 @@ fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(haystack.len());
     let mut rest = haystack;
     while let Some(index) = find_bytes(rest, needle) {
-        out.extend_from_slice(&rest[..index]);
+        let (before, found) = rest.split_at(index);
+        let (_, after) = found.split_at(needle.len());
+        out.extend_from_slice(before);
         out.extend_from_slice(replacement);
-        rest = &rest[index + needle.len()..];
+        rest = after;
     }
     out.extend_from_slice(rest);
     out
@@ -1594,7 +1596,13 @@ mod tests {
             parse_declarations("cargo:rerun-if-changed=build.rs\n", &env).unwrap();
         assert!(names.is_empty());
         assert!(!default, "a declared path is a declaration");
-        assert_eq!(inputs, ["${KACHE_MANIFEST_DIR}/build.rs"]);
+        assert_eq!(
+            inputs,
+            [format!(
+                "${{KACHE_MANIFEST_DIR}}{}build.rs",
+                std::path::MAIN_SEPARATOR
+            )]
+        );
     }
 
     #[cfg(unix)]

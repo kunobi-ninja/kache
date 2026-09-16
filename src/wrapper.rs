@@ -6815,15 +6815,12 @@ mod tests {
     fn a_passthrough_after_a_deferred_compile_keeps_the_first_exit_code() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path().to_path_buf());
-        let args = RustcArgs::parse(
-            &[
-                dir.path().join("no-such-rustc").display().to_string(),
-                "--crate-name".into(),
-                "kt".into(),
-                "src/lib.rs".into(),
-            ]
-            .to_vec(),
-        )
+        let args = RustcArgs::parse(&[
+            dir.path().join("no-such-rustc").display().to_string(),
+            "--crate-name".into(),
+            "kt".into(),
+            "src/lib.rs".into(),
+        ])
         .unwrap();
         PRECOMPILED_EXIT.with(|cell| cell.set(Some(0)));
         let exit = passthrough_with_event(

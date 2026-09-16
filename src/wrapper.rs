@@ -594,6 +594,7 @@ fn lookup_local_entry<'a>(
     fallback: Option<&'a Store>,
     cache_key: &str,
 ) -> Result<Option<(&'a Store, crate::store::EntryMeta)>> {
+    let _trace = crate::phase_trace::phase("lookup");
     if let Some(meta) = primary.get(cache_key)? {
         return Ok(Some((primary, meta)));
     }
@@ -667,12 +668,14 @@ fn wrapper_entry() -> std::time::Instant {
 /// restore failure recompiles via passthrough (nvcc always rewrites
 /// `-o` outputs fresh, so no partial-restore abort).
 pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
+    let _trace = crate::phase_trace::start("nvcc", wrapper_args);
     let start = wrapper_entry();
     let invocation_start_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as i64)
         .unwrap_or(0);
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
+    crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
@@ -1299,21 +1302,25 @@ fn nvcc_try_remote_hit(
 /// Local and remote hits share compiler-specific restoration. Miss-path
 /// flights, permits, and per-key build locks match rustc.
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
+    let _trace = crate::phase_trace::start("cc", wrapper_args);
     let start = wrapper_entry();
     let invocation_start_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as i64)
         .unwrap_or(0);
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
+    crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
     let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
         .with_cache_cc_links(config.cache_cc_links)
         .with_base_dirs(config.base_dirs.clone());
+    let trace_parse = crate::phase_trace::phase("cc_parse");
     let parsed = compiler
         .parse(wrapper_args)
         .context("parsing cc-family arguments")?;
+    drop(trace_parse);
     if crate::compiler::cc::cc_is_internal_key_probe() {
         let crate_name = parsed
             .sources
@@ -1391,9 +1398,13 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
     }
 
+    let trace_store_open = crate::phase_trace::phase("store_open");
     let (store, fallback_store) =
         match open_primary_and_fallback(config, &volume_route_path_cc(&parsed)) {
-            Ok(pair) => pair,
+            Ok(pair) => {
+                drop(trace_store_open);
+                pair
+            }
             Err(e) => {
                 warn_store_unavailable_once(config, &e);
                 return cc_passthrough_with_event(
@@ -1453,8 +1464,12 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     // ── Local cache lookup ───────────────────────────────────────
     let lookup_start = std::time::Instant::now();
+    let trace_lookup = crate::phase_trace::phase("lookup");
     let lookup = match lookup_local_entry(&store, fallback_store.as_ref(), &cache_key) {
-        Ok(lookup) => lookup,
+        Ok(lookup) => {
+            drop(trace_lookup);
+            lookup
+        }
         Err(e) => {
             tracing::warn!(
                 "cc local store lookup failed for {}: {} — recompiling",
@@ -1488,7 +1503,10 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             let _ = hit_store.remove_entry(&cache_key);
         } else {
             let restore_start = std::time::Instant::now();
-            if let Err(e) = restore_cc_from_cache(hit_store, &parsed, &meta) {
+            let trace_restore = crate::phase_trace::phase("restore");
+            let restored = restore_cc_from_cache(hit_store, &parsed, &meta);
+            drop(trace_restore);
+            if let Err(e) = restored {
                 if e.downcast_ref::<PartialCcRestore>().is_some() {
                     return Err(e);
                 }
@@ -1512,6 +1530,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 crate_name,
                 &cache_key[..16]
             );
+            let trace_report = crate::phase_trace::phase("event_report");
             HitCompletion {
                 event_root: &event_root,
                 crate_name: &crate_name,
@@ -1524,7 +1543,9 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                 restore_ms,
             }
             .report(config, &meta);
+            drop(trace_report);
 
+            let _trace = crate::phase_trace::phase("memo_commit");
             compiler.commit_preprocess_memo(&file_hasher);
 
             return Ok(0);
@@ -2403,8 +2424,10 @@ fn cc_try_remote_hit(
 /// This is the hot path — called once per crate by cargo.
 /// Flow: parse args → compute cache key → check store → link on hit → compile on miss → store → link
 pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
+    let _trace = crate::phase_trace::start("rustc", wrapper_args);
     let start = wrapper_entry();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
+    crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
@@ -2433,10 +2456,12 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         extra_inputs_hasher.arm_too_new_guard(invocation_start_ns, 0);
     }
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
+    let trace_extra = crate::phase_trace::phase("extra_inputs_resolve");
     let extra_inputs =
         crate::extra_inputs::ExtraInputsSnapshot::resolve_for_rustc(&args, &extra_inputs_hasher)
             .with_context(|| format!("resolving extra_inputs for {crate_name}"))?;
 
+    drop(trace_extra);
     validate_extra_inputs_freshness_mode(&args, extra_inputs.is_some())?;
 
     let extra_inputs_hash_stats = extra_inputs_hasher.stats();
@@ -2473,6 +2498,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         extra_inputs_too_new,
         extra_inputs_key_ms,
         extra_inputs_guard_inputs,
+        None,
     )?;
 
     if exit == 0 {
@@ -2481,8 +2507,47 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
             &args,
             extra_inputs.as_ref(),
         )?;
+        // Cargo hardlinks and runs the binary after this wrapper returns, so
+        // this is the last moment to put the launcher in its place.
+        crate::build_script::install_shim(&args);
     }
     Ok(exit)
+}
+
+/// Event for one build-script run, on the same log as compiler events.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn log_build_script_event(
+    config: &Config,
+    root: &str,
+    crate_name: &str,
+    result: EventResult,
+    elapsed_ms: u64,
+    size: u64,
+    cache_key: &str,
+    key_ms: u64,
+    lookup_ms: u64,
+    restore_ms: u64,
+    store_ms: u64,
+    store_put: StorePutResult,
+) {
+    log_event_with_store_and_lookup_outcome(
+        config,
+        root,
+        crate_name,
+        result,
+        elapsed_ms,
+        0,
+        size,
+        cache_key,
+        key_ms,
+        FileHashStats::default(),
+        lookup_ms,
+        restore_ms,
+        store_ms,
+        store_put,
+        String::new(),
+        String::new(),
+    );
 }
 
 pub(crate) fn resolve_extra_inputs_for_passthrough(
@@ -2591,6 +2656,7 @@ fn run_parsed_rustc(
     extra_inputs_too_new: bool,
     extra_inputs_key_ms: u64,
     extra_inputs_guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    mut precompiled: Option<Precompiled>,
 ) -> Result<i32> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let event_root = rustc_event_root(args);
@@ -2626,12 +2692,14 @@ fn run_parsed_rustc(
     // where Cargo's original incremental argument is stripped.
     let force_incremental = force_incremental_requested(config, args);
     let adaptive_policy_for_invocation = adaptive_seed_allowed(config, args);
+    let trace_adaptive = crate::phase_trace::phase("adaptive_unit");
     let adaptive_unit = managed_incremental_unit(
         config,
         args,
         std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
         || extra_inputs.is_some(),
     );
+    drop(trace_adaptive);
 
     // Evaluate every cheap cache-eligibility gate before the learned fast
     // path. In particular, changing an exclusion or executable-cache policy
@@ -2694,6 +2762,7 @@ fn run_parsed_rustc(
     let daemon_local = config.local_hit_daemon && args.is_primary && args.incremental.is_none();
     let rustc_route = volume_route_path_rustc(args);
     let mut fallback_store = None;
+    let trace_store_open = crate::phase_trace::phase("store_open");
     let store = if daemon_local {
         None
     } else if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
@@ -2806,6 +2875,13 @@ fn run_parsed_rustc(
         extra_inputs_too_new,
         extra_inputs_key_ms,
         extra_inputs_guard_inputs,
+        match precompiled.as_mut().and_then(|pre| pre.dep_info.take()) {
+            Some(dep_info) => KeyDiscovery::Emitted(dep_info),
+            None if deferral_allowed(config, args, adaptive_unit.is_some(), extra_inputs) => {
+                KeyDiscovery::Deferrable
+            }
+            None => KeyDiscovery::Immediate,
+        },
     ) {
         Ok(keyed) => keyed,
         Err(e) => {
@@ -2827,12 +2903,109 @@ fn run_parsed_rustc(
     };
     let ComputedKey {
         mut cache_key,
+        deferred,
+        discovery_flight: _discovery_flight,
         predicted,
         mut key_ms,
         mut key_hash_stats,
         mut key_too_new,
         mut guard_inputs,
     } = keyed;
+    if deferred {
+        // No record and nowhere else the entry could be: compile now, then
+        // key from what rustc emitted. `_discovery_flight` stays held across
+        // the recursion so peers wait for this compile.
+        tracing::debug!("no closure record for {crate_name}; compiling before keying");
+        let compile_start = std::time::Instant::now();
+        let result = match compiler.execute(args) {
+            Ok(result) => result,
+            Err(e) => {
+                return passthrough_with_event(
+                    config,
+                    args,
+                    crate_name,
+                    &event_root,
+                    start,
+                    format!("compiler spawn failed: {e}"),
+                );
+            }
+        };
+        let compile_time_ms = compile_start.elapsed().as_millis() as u64;
+        if !result.stdout.is_empty() {
+            print!("{}", result.stdout);
+        }
+        if !result.stderr.is_empty() {
+            eprint!("{}", result.stderr);
+        }
+        if result.exit_code != 0 {
+            let elapsed = start.elapsed().as_millis() as u64;
+            log_event_with_hash_stats(
+                config,
+                &event_root,
+                crate_name,
+                EventResult::Error,
+                elapsed,
+                compile_time_ms,
+                0,
+                "",
+                key_ms,
+                key_hash_stats,
+                0,
+                0,
+                0,
+            );
+            print_progress(crate_name, EventResult::Error, elapsed, 0);
+            return Ok(result.exit_code);
+        }
+        let emitted = args
+            .dep_info_path()
+            .zip(args.source_file.as_deref())
+            .map(|(path, source)| crate::cache_key::dep_info_from_emitted(&path, source));
+        let dep_info = match emitted {
+            Some(Ok(dep_info)) => dep_info,
+            other => {
+                tracing::debug!(
+                    "not caching {crate_name}: the compile left no readable dep-info ({:?})",
+                    other.map(|r| r.map(|_| ()))
+                );
+                let elapsed = start.elapsed().as_millis() as u64;
+                log_event_with_hash_stats(
+                    config,
+                    &event_root,
+                    crate_name,
+                    EventResult::Skipped,
+                    elapsed,
+                    compile_time_ms,
+                    0,
+                    "",
+                    key_ms,
+                    key_hash_stats,
+                    0,
+                    0,
+                    0,
+                );
+                print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+                return Ok(result.exit_code);
+            }
+        };
+        return run_parsed_rustc(
+            config,
+            compiler,
+            args,
+            start,
+            invocation_start_ns,
+            extra_inputs,
+            extra_inputs_hash_stats,
+            extra_inputs_too_new,
+            extra_inputs_key_ms,
+            guard_inputs,
+            Some(Precompiled {
+                result,
+                compile_time_ms,
+                dep_info: Some(dep_info),
+            }),
+        );
+    }
     // A force-list request that could not obtain its immediate lease must not
     // retry through the post-key adaptive seed path in the same invocation.
     // It stays on the normal cache path with incremental stripped.
@@ -2886,6 +3059,8 @@ fn run_parsed_rustc(
         }
     };
 
+    drop(trace_store_open);
+    let _trace_remember = crate::phase_trace::phase("remember_target_root");
     if args.is_primary
         && let Some(target_dir) = args.target_dir()
         && let Some(workspace_root) = workspace_root.as_deref()
@@ -3181,32 +3356,41 @@ fn run_parsed_rustc(
         &cache_key[..16]
     );
     let compile_start = std::time::Instant::now();
-    let mut result = match compiler.execute(args) {
-        Ok(r) => r,
-        // A spawn-level failure (missing binary, ENOMEM, fork pressure under
-        // load) must not abort the build: fall back to passthrough so the
-        // configured fallback wrapper still gets a chance and the user sees the
-        // real compiler error rather than a kache anyhow chain.
-        Err(e) => {
-            return passthrough_with_event(
-                config,
-                args,
-                crate_name,
-                &event_root,
-                start,
-                format!("compiler spawn failed: {e}"),
-            );
-        }
+    let precompiled_time = precompiled.as_ref().map(|pre| pre.compile_time_ms);
+    let mut result = match precompiled.take() {
+        // Compiled before keying (deferred discovery); its output was
+        // already replayed.
+        Some(pre) => pre.result,
+        None => match compiler.execute(args) {
+            Ok(r) => r,
+            // A spawn-level failure (missing binary, ENOMEM, fork pressure under
+            // load) must not abort the build: fall back to passthrough so the
+            // configured fallback wrapper still gets a chance and the user sees the
+            // real compiler error rather than a kache anyhow chain.
+            Err(e) => {
+                return passthrough_with_event(
+                    config,
+                    args,
+                    crate_name,
+                    &event_root,
+                    start,
+                    format!("compiler spawn failed: {e}"),
+                );
+            }
+        },
     };
     miss_guard.record_compile_rss(crate_name);
-    let compile_time_ms = compile_start.elapsed().as_millis() as u64;
+    let compile_time_ms =
+        precompiled_time.unwrap_or_else(|| compile_start.elapsed().as_millis() as u64);
 
     // Print rustc output
-    if !result.stdout.is_empty() {
-        print!("{}", result.stdout);
-    }
-    if !result.stderr.is_empty() {
-        eprint!("{}", result.stderr);
+    if precompiled_time.is_none() {
+        if !result.stdout.is_empty() {
+            print!("{}", result.stdout);
+        }
+        if !result.stderr.is_empty() {
+            eprint!("{}", result.stderr);
+        }
     }
 
     // Don't cache failures
@@ -4006,6 +4190,12 @@ fn missing_requested_emit(args: &RustcArgs, artifacts: &ArtifactSet) -> Option<S
 
 struct ComputedKey {
     cache_key: String,
+    /// No key yet: the closure has no record and no remote could hold the
+    /// entry, so the wrapper compiles first and keys from the emitted
+    /// dep-info (`cache_key` is empty). `discovery_flight` is still held so
+    /// peers of the same unit wait for this compile instead of repeating it.
+    deferred: bool,
+    discovery_flight: Option<crate::store::StoreLock>,
     /// Did this key come from a recorded closure rather than the pre-pass?
     /// The caller owes it a re-derivation before the key may reach anything
     /// that stores or publishes.
@@ -4017,6 +4207,36 @@ struct ComputedKey {
     /// the too-new guard was armed, carried past the compile for
     /// clock-independent verification.
     guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+}
+
+/// A compile that ran before its key was known (deferred discovery), handed
+/// back into the keyed flow.
+struct Precompiled {
+    result: crate::compile::CompileResult,
+    compile_time_ms: u64,
+    /// Taken by the key computation; `None` afterwards.
+    dep_info: Option<crate::cache_key::DepInfo>,
+}
+
+/// Compile-before-key is only sound where a miss is certain from the absence
+/// of a local record: no remote to consult, predictions on (so records
+/// exist at all), no fallback store, no adaptive incremental unit and no
+/// extra-inputs declaration, the last two keying more than the closure.
+fn deferral_allowed(
+    config: &Config,
+    args: &RustcArgs,
+    adaptive: bool,
+    extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
+) -> bool {
+    // The compile must emit the dep-info the key is derived from afterwards
+    // (Cargo always asks for it; a bare rustc invocation may not).
+    args.dep_info_path().is_some()
+        && config.deferred_discovery
+        && config.input_predictions
+        && config.remote.is_none()
+        && config.fallback.is_none()
+        && !adaptive
+        && extra_inputs.is_none()
 }
 
 /// Remember the input closure this invocation discovered, so a later build of
@@ -4031,6 +4251,7 @@ struct ComputedKey {
 /// store, no closure to record, no identity) costs a future pre-pass and
 /// nothing else, so none of them is worth a warning on a successful build.
 fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcArgs, wanted: bool) {
+    let _trace = crate::phase_trace::phase("prediction_record");
     // Taken before any gate. The closure belongs to this invocation whether or
     // not it gets written, and leaving it in the stash would let whatever key
     // is computed next on this thread record it under a different identity.
@@ -4051,7 +4272,20 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
     let Some(identity) = crate::cache_key::rustc_prediction_identity(args) else {
         return;
     };
-    file_hasher.record_input_prediction(&identity, args.crate_name.as_deref(), &dep_info);
+    // Present exactly when the key was computed under the tree guard; the
+    // record must carry it or the guard will never accept the record.
+    let tree = crate::cache_key::take_last_tree_digest();
+    file_hasher.record_input_prediction(
+        &identity,
+        args.crate_name.as_deref(),
+        &dep_info,
+        tree.clone(),
+    );
+    if crate::cache_key::shared_prediction_can_record(args, &dep_info)
+        && let Some(identity) = crate::cache_key::rustc_shared_prediction_identity(args)
+    {
+        file_hasher.record_input_prediction(&identity, args.crate_name.as_deref(), &dep_info, tree);
+    }
 }
 
 fn should_skip_cache_store_for_input_race(
@@ -4099,6 +4333,19 @@ fn combine_key_measurements(
 /// kunobi-ninja/kache#565) a store-free hasher still batches hashing through
 /// the daemon. The key value is identical either way — the cache only changes
 /// how it's computed.
+/// How the key may learn a closure it has no record of.
+enum KeyDiscovery {
+    /// Run the dep-info pre-pass, as always.
+    Immediate,
+    /// Stop and let the wrapper compile first (local store only).
+    Deferrable,
+    /// The compile already ran; this is its emitted closure. The too-new
+    /// guard is armed regardless of configuration: an input written during
+    /// the compile must not be keyed as if the compiler had read it.
+    Emitted(crate::cache_key::DepInfo),
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compute_rustc_cache_key(
     config: &Config,
     compiler: &RustcCompiler,
@@ -4111,14 +4358,21 @@ fn compute_rustc_cache_key(
     extra_inputs_too_new: bool,
     extra_inputs_key_ms: u64,
     mut extra_inputs_guard_inputs: Vec<crate::cache_key::FileFingerprint>,
+    discovery: KeyDiscovery,
 ) -> Result<ComputedKey> {
     let key_start = std::time::Instant::now();
+    let emitted = matches!(discovery, KeyDiscovery::Emitted(_));
+    crate::cache_key::set_defer_discovery(matches!(discovery, KeyDiscovery::Deferrable));
+    if let KeyDiscovery::Emitted(dep_info) = discovery {
+        crate::cache_key::provide_dep_info(dep_info);
+    }
     let mut file_hasher = match store {
         Some(store) => store.file_hasher_with_daemon(config.socket_path()),
         None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
     }
-    .with_input_predictions(config.input_predictions);
-    if config.modified_input_guard {
+    .with_input_predictions(config.input_predictions)
+    .with_prediction_flights(config.scheduler.then(|| config.cache_dir.clone()));
+    if config.modified_input_guard || emitted {
         // Flag keyed inputs touched at/after this invocation started — their
         // content at hash time may differ from what rustc reads, so we'll look
         // up but refuse to store (kunobi-ninja/kache#324).
@@ -4148,7 +4402,31 @@ fn compute_rustc_cache_key(
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest,
     };
-    let cache_key = compiler.cache_key(args, &key_ctx)?;
+    let cache_key = match compiler.cache_key(args, &key_ctx) {
+        Ok(cache_key) => cache_key,
+        Err(error)
+            if error
+                .downcast_ref::<crate::cache_key::DeferredDiscovery>()
+                .is_some() =>
+        {
+            crate::cache_key::set_defer_discovery(false);
+            return Ok(ComputedKey {
+                cache_key: String::new(),
+                deferred: true,
+                discovery_flight: file_hasher.take_discovery_flight(),
+                predicted: false,
+                key_ms: key_start.elapsed().as_millis() as u64,
+                key_hash_stats: file_hasher.stats(),
+                key_too_new: false,
+                guard_inputs: extra_inputs_guard_inputs,
+            });
+        }
+        Err(error) => {
+            crate::cache_key::set_defer_discovery(false);
+            return Err(error);
+        }
+    };
+    crate::cache_key::set_defer_discovery(false);
     let key_hash_stats = file_hasher.stats();
     extra_inputs_guard_inputs.extend(file_hasher.take_guarded_inputs());
     let (key_ms, key_hash_stats, key_too_new) = combine_key_measurements(
@@ -4161,6 +4439,8 @@ fn compute_rustc_cache_key(
     );
     Ok(ComputedKey {
         cache_key,
+        deferred: false,
+        discovery_flight: file_hasher.take_discovery_flight(),
         predicted: crate::cache_key::take_last_key_used_prediction(),
         key_ms,
         key_hash_stats,
@@ -4222,6 +4502,7 @@ fn recompute_key_without_prediction(
         false,
         0,
         Vec::new(),
+        KeyDiscovery::Immediate,
     )
 }
 
@@ -4265,14 +4546,17 @@ fn try_daemon_local_hit(
     key_ms: u64,
     key_hash_stats: FileHashStats,
 ) -> Option<i32> {
+    let _trace = crate::phase_trace::phase("daemon_hit_path");
     let lookup_start = std::time::Instant::now();
     let target_dir = hit.args.target_dir();
+    let trace_lookup = crate::phase_trace::phase("lookup");
     let reply = crate::daemon::send_local_lookup(
         hit.config,
         cache_key,
         target_dir.as_deref(),
         hit.args.path_normalization_root(),
     )?;
+    drop(trace_lookup);
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
     if reply.outcome != "hit" {
         return None;
@@ -4358,9 +4642,12 @@ impl BlobSource<'_> {
         let BlobSource::Store(store) = self else {
             return;
         };
-        for (fingerprint, hash) in restored {
-            store.record_verified_file_hash(fingerprint, hash);
-        }
+        let _trace = crate::phase_trace::phase("memo_restored");
+        let restored: Vec<_> = restored
+            .iter()
+            .map(|(fingerprint, hash)| (fingerprint.clone(), *hash))
+            .collect();
+        store.record_verified_file_hashes(&restored);
     }
 }
 
@@ -4585,6 +4872,7 @@ fn restore_from_cache(
     meta: &crate::store::EntryMeta,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
 ) -> Result<()> {
+    let _trace = crate::phase_trace::phase("restore");
     let current = resolve_extra_inputs_for_passthrough(config, args)
         .context("revalidating extra_inputs before cache-hit publication")?;
     anyhow::ensure!(
@@ -5314,6 +5602,7 @@ fn log_event_with_store_stats(
     store_ms: u64,
     store_put: StorePutResult,
 ) {
+    let _trace = crate::phase_trace::phase("event_report");
     log_event_with_store_outcome(
         config,
         root,
@@ -6479,6 +6768,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compile_before_key_needs_a_local_store_with_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().to_path_buf());
+        let parse = |argv: &[&str]| {
+            RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let cargo_like = parse(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            "src/lib.rs",
+            "--emit=dep-info,metadata",
+            "--out-dir",
+            "/t/debug/deps",
+        ]);
+        let no_dep_info = parse(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            "src/lib.rs",
+            "--emit=link",
+            "--out-dir",
+            "/t/debug/deps",
+        ]);
+        assert!(
+            !deferral_allowed(&config, &cargo_like, false, None),
+            "predictions off"
+        );
+        config.input_predictions = true;
+        assert!(deferral_allowed(&config, &cargo_like, false, None));
+        assert!(
+            !deferral_allowed(&config, &no_dep_info, false, None),
+            "nothing to key from"
+        );
+        config.deferred_discovery = false;
+        assert!(
+            !deferral_allowed(&config, &cargo_like, false, None),
+            "switched off"
+        );
+        config.deferred_discovery = true;
+        assert!(
+            !deferral_allowed(&config, &cargo_like, true, None),
+            "adaptive unit"
+        );
+        config.fallback = Some("sccache".to_string());
+        assert!(
+            !deferral_allowed(&config, &cargo_like, false, None),
+            "fallback store"
+        );
+        config.fallback = None;
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        assert!(
+            !deferral_allowed(&config, &cargo_like, false, None),
+            "remote configured"
+        );
+    }
+
     fn test_config(cache_dir: PathBuf) -> Config {
         Config {
             fallback: None,
@@ -6492,6 +6839,8 @@ mod tests {
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
+            shared_hardlink_restores: false,
+            deferred_discovery: true,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,

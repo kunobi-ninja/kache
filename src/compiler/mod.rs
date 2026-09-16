@@ -917,6 +917,23 @@ pub(crate) fn is_passthrough_compiler_invocation_with(
     configured_rustc.is_some_and(|rustc| rustc == std::ffi::OsStr::new(program.as_str()))
 }
 
+/// A workspace-wrapper chain Kache knows how to key: Clippy. `clippy-driver`
+/// is rustc plus lints, so its outputs are keyed like rustc's with the Clippy
+/// version, configuration and lint arguments folded in (see
+/// `cache_key::clippy_identity`). Every other driver stays uncached.
+pub fn is_cacheable_workspace_wrapper_chain(args: &[String]) -> bool {
+    is_workspace_wrapper_chain(args)
+        && args
+            .first()
+            .is_some_and(|program| is_clippy_driver(program))
+}
+
+pub(crate) fn is_clippy_driver(program: &str) -> bool {
+    command_basename(program)
+        .map(strip_windows_exe_suffix)
+        .is_some_and(|name| name == "clippy-driver")
+}
+
 pub fn is_workspace_wrapper_chain(args: &[String]) -> bool {
     let workspace_wrapper = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
     is_workspace_wrapper_chain_with(args, workspace_wrapper.as_deref(), is_program_on_path)
@@ -1225,6 +1242,30 @@ mod tests {
             &s(&["gc"]),
             Some(std::ffi::OsStr::new("gc")),
         ));
+    }
+
+    #[test]
+    fn only_the_clippy_chain_is_cacheable() {
+        let clippy = s(&[
+            "/toolchain/bin/clippy-driver",
+            "/toolchain/bin/rustc",
+            "--crate-name",
+            "foo",
+            "src/lib.rs",
+        ]);
+        assert!(is_workspace_wrapper_chain(&clippy));
+        assert!(is_cacheable_workspace_wrapper_chain(&clippy));
+        let dylint = s(&[
+            "/toolchain/bin/dylint-driver",
+            "/toolchain/bin/rustc",
+            "--crate-name",
+            "foo",
+            "src/lib.rs",
+        ]);
+        assert!(is_workspace_wrapper_chain(&dylint));
+        assert!(!is_cacheable_workspace_wrapper_chain(&dylint));
+        assert!(is_clippy_driver(r"C:\toolchain\bin\clippy-driver.exe"));
+        assert!(!is_clippy_driver("rustc"));
     }
 
     #[test]

@@ -8,6 +8,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// instead of the default copy (#429). Set once from `config.windows_hardlink`
 /// at wrapper entry; read on the Windows restore path. Off everywhere else.
 static WINDOWS_HARDLINK_RESTORE: AtomicBool = AtomicBool::new(false);
+/// Unix opt-in: every target directory may share a store blob's inode.
+static SHARED_HARDLINK_RESTORES: AtomicBool = AtomicBool::new(false);
+
+/// Let restores hardlink a blob that another target directory already links
+/// (`[cache] shared_hardlink_restores`). Call once per process before
+/// restoring.
+pub fn set_shared_hardlink_restores(enabled: bool) {
+    SHARED_HARDLINK_RESTORES.store(enabled, Ordering::Relaxed);
+}
 
 /// Process-global: marker file used to dedup storage-layout advisories across
 /// the hundreds of wrapper processes a single build spawns (#508, #835). Set
@@ -387,11 +396,12 @@ fn hardlink_or_copy_with_prelink_hook(
     // existing target consumer. Metadata failure is handled conservatively:
     // a copy preserves isolation and lets the ordinary read report any real
     // source failure.
+    let shared = SHARED_HARDLINK_RESTORES.load(Ordering::Relaxed);
     #[cfg(unix)]
     match fs::metadata(store_path) {
         Ok(meta) => {
             use std::os::unix::fs::MetadataExt;
-            if meta.nlink() != 1 {
+            if !shared && meta.nlink() != 1 {
                 tracing::debug!(
                     links = meta.nlink(),
                     "blob already has a hardlink consumer, restoring by copy: {} -> {}",
@@ -445,7 +455,7 @@ fn hardlink_or_copy_with_prelink_hook(
     // the link. Others unlink before returning, so no contender can reach its
     // mtime stamp while sharing an inode with an existing consumer.
     #[cfg(unix)]
-    {
+    if !shared {
         use std::os::unix::fs::MetadataExt;
         match fs::metadata(store_path) {
             Ok(meta) if meta.nlink() == 2 => {}
@@ -1952,6 +1962,7 @@ mod tests {
 
     #[test]
     fn test_hardlink_strategy_restores_content() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("source.rlib");
         fs::write(&src, b"rlib content").unwrap();
@@ -2038,6 +2049,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hardlink_restore_keeps_shared_inode_readonly_and_copy_writable() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2075,6 +2087,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hardlink_restore_does_not_retimestamp_existing_consumer() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
         use std::fs::File;
         use std::os::unix::fs::MetadataExt;
 
@@ -2115,6 +2128,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn simultaneous_hardlink_restores_retain_at_most_one_consumer() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::MetadataExt;
         use std::sync::{Arc, Barrier};
 
@@ -3793,9 +3807,44 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         assert_eq!(fs::read(&target).unwrap(), b"cached rlib");
     }
 
+    /// The shared-restore flag is process-global; tests that read or set it
+    /// take turns.
+    static SHARED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[cfg(unix)]
+    fn shared_restores_let_every_tree_link_the_blob() {
+        use std::os::unix::fs::MetadataExt;
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        fs::write(&blob, b"cached rlib").unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        set_shared_hardlink_restores(true);
+        let result = (|| {
+            let first = dir.path().join("tree-a.rlib");
+            hardlink_or_copy(&blob, &first, bytes)?;
+            let second = dir.path().join("tree-b.rlib");
+            hardlink_or_copy(&blob, &second, bytes)?;
+            Ok::<_, anyhow::Error>((first, second))
+        })();
+        set_shared_hardlink_restores(false);
+        let (first, second) = result.unwrap();
+        assert_eq!(
+            fs::metadata(&blob).unwrap().nlink(),
+            3,
+            "both trees link the blob"
+        );
+        assert_eq!(
+            fs::metadata(&first).unwrap().ino(),
+            fs::metadata(&second).unwrap().ino()
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn exclusive_precheck_restore_records_exclusive_reason() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();

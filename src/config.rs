@@ -357,6 +357,22 @@ pub struct Config {
     /// Windows. Set via
     /// `KACHE_WINDOWS_HARDLINK=1`/`=true` or `[cache] windows_hardlink`.
     pub windows_hardlink: bool,
+    /// Let every target directory hardlink the same store blob (Unix, no
+    /// reflink). Off, at most one target directory shares a blob's inode and
+    /// later consumers get a private copy, because the restore-time mtime
+    /// stamp on a shared inode re-dates the artifact in the other tree and
+    /// can make that tree's dependents look stale (#794). Turn this on when
+    /// target directories are single-use — a CI job's tree that no later
+    /// `cargo` will examine — and restores of already-cached artifacts cost
+    /// a link instead of a copy. Set via `KACHE_SHARED_HARDLINK_RESTORES=1`
+    /// or `[cache] shared_hardlink_restores`.
+    pub shared_hardlink_restores: bool,
+    /// Compile before keying when a unit has no closure record and no remote
+    /// could hold its entry (a certain miss), then key from the dep-info
+    /// rustc emitted instead of spawning the dep-info pre-pass first. On by
+    /// default; `KACHE_DEFERRED_DISCOVERY=0` or
+    /// `[cache] deferred_discovery = false` keeps the pre-pass on every miss.
+    pub deferred_discovery: bool,
     /// Opportunistic size-pressure GC (kunobi-ninja/kache#497): when on (the
     /// default), the compiler wrapper — after storing a new entry — performs a
     /// cheap, throttled store-size check and, if the store has grown past
@@ -661,6 +677,10 @@ pub(crate) struct CacheFileConfig {
     pub(crate) local_hit_daemon: Option<bool>,
     /// Windows hardlink restore opt-in. See [`Config::windows_hardlink`].
     pub(crate) windows_hardlink: Option<bool>,
+    /// Shared-inode restore opt-in. See [`Config::shared_hardlink_restores`].
+    pub(crate) shared_hardlink_restores: Option<bool>,
+    /// Compile-before-key toggle. See [`Config::deferred_discovery`].
+    pub(crate) deferred_discovery: Option<bool>,
     /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
     pub(crate) auto_gc: Option<bool>,
     /// Namespace-first GC compatibility mode. See [`Config::gc_evict_shared`].
@@ -1045,6 +1065,8 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_RECORD_SESSIONS",
     "KACHE_LOCAL_HIT_DAEMON",
     "KACHE_WINDOWS_HARDLINK",
+    "KACHE_SHARED_HARDLINK_RESTORES",
+    "KACHE_DEFERRED_DISCOVERY",
     "KACHE_AUTO_GC",
     "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_HEARTBEAT_SECS",
@@ -1120,6 +1142,11 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_RECORD_SESSIONS", "cache.record_sessions"),
     ("KACHE_LOCAL_HIT_DAEMON", "cache.local_hit_daemon"),
     ("KACHE_WINDOWS_HARDLINK", "cache.windows_hardlink"),
+    (
+        "KACHE_SHARED_HARDLINK_RESTORES",
+        "cache.shared_hardlink_restores",
+    ),
+    ("KACHE_DEFERRED_DISCOVERY", "cache.deferred_discovery"),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
     ("KACHE_HEARTBEAT_SECS", "cache.heartbeat_secs"),
@@ -1625,6 +1652,8 @@ impl Config {
         let record_sessions = Self::record_sessions_enabled(&file_config);
         let local_hit_daemon = Self::local_hit_daemon_enabled(&file_config);
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
+        let shared_hardlink_restores = Self::shared_hardlink_restores_enabled(&file_config);
+        let deferred_discovery = Self::deferred_discovery_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
@@ -1679,6 +1708,8 @@ impl Config {
             record_sessions,
             local_hit_daemon,
             windows_hardlink,
+            shared_hardlink_restores,
+            deferred_discovery,
             auto_gc,
             gc_evict_shared,
             storage_layout_advice,
@@ -2108,6 +2139,32 @@ impl Config {
 
     /// Windows hardlink-restore opt-in: `KACHE_WINDOWS_HARDLINK=1`/`true`, else
     /// `[cache] windows_hardlink`, else off. See [`Config::windows_hardlink`].
+    fn deferred_discovery_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_DEFERRED_DISCOVERY", ignore_env) {
+            return !(v == "0" || v.eq_ignore_ascii_case("false"));
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.deferred_discovery)
+            .unwrap_or(true)
+    }
+
+    fn shared_hardlink_restores_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_SHARED_HARDLINK_RESTORES", ignore_env) {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.shared_hardlink_restores)
+            .unwrap_or(false)
+    }
+
     fn windows_hardlink_enabled(file_config: &Result<FileConfig>) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
         if let Ok(v) = env_or_ignored("KACHE_WINDOWS_HARDLINK", ignore_env) {
@@ -2561,6 +2618,17 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
 /// `[cache] cache_executables`.
 pub(crate) fn default_cache_executables() -> bool {
     cfg!(target_os = "linux") || cfg!(target_os = "macos")
+}
+
+/// Where probe memos (CRT placements, build-script tree digests) live: under
+/// the cache directory the environment selects, else the default one. Callers
+/// without a loaded configuration use this; the configured `cache_dir` wins
+/// where one is at hand.
+pub(crate) fn probe_memo_dir() -> PathBuf {
+    std::env::var_os("KACHE_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_cache_dir)
+        .join("probes")
 }
 
 pub(crate) fn default_cache_dir() -> PathBuf {
@@ -5216,6 +5284,8 @@ remote_key_cache_refresh_secs = 900
                 record_sessions: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
+                shared_hardlink_restores: None,
+                deferred_discovery: None,
                 auto_gc: None,
                 gc_evict_shared: None,
                 storage_layout_advice: None,
@@ -5685,6 +5755,8 @@ remote_key_cache_refresh_secs = 900
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
+            shared_hardlink_restores: false,
+            deferred_discovery: true,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
@@ -5744,6 +5816,8 @@ remote_key_cache_refresh_secs = 900
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
+            shared_hardlink_restores: false,
+            deferred_discovery: true,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
@@ -5799,6 +5873,8 @@ remote_key_cache_refresh_secs = 900
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
+            shared_hardlink_restores: false,
+            deferred_discovery: true,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
@@ -5873,6 +5949,8 @@ remote_key_cache_refresh_secs = 900
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
+            shared_hardlink_restores: false,
+            deferred_discovery: true,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
@@ -6532,6 +6610,8 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 record_sessions: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
+                shared_hardlink_restores: None,
+                deferred_discovery: None,
                 auto_gc: None,
                 gc_evict_shared: None,
                 storage_layout_advice: None,

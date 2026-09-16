@@ -29,6 +29,30 @@ Incremental directory names and harmless local path spellings are excluded or no
 
 The live implementation is the authority. Use `kache why-miss` and trace logging to see the components for a particular build.
 
+### Clippy
+
+`cargo clippy` runs workspace crates through `clippy-driver`, which Cargo
+composes with Kache as `kache clippy-driver rustc …`. Kache keys those units
+like any rustc unit and adds the Clippy version, the package's `Cargo.toml`
+(the `cargo` lint group reads it), the `.clippy.toml` or `clippy.toml` Clippy
+would load (found from `CLIPPY_CONF_DIR` or the crate's manifest directory
+upwards, keyed by content), and the lint arguments Cargo passes in
+`CLIPPY_ARGS`. A hit restores the outputs and replays the recorded
+diagnostics, so warnings appear exactly as on the first run. Other
+`RUSTC_WORKSPACE_WRAPPER` drivers stay uncached.
+
+### Misses without a record
+
+The first time a unit is built on a machine, Kache has no recorded closure to
+derive a key from. When no remote could hold the entry either, the miss is
+certain, so instead of spawning `rustc --emit=dep-info` to discover the
+closure before compiling, Kache compiles first and keys from the dep-info the
+compile emitted. Every input in that closure is checked against the build's
+start time; an input written during the compile leaves the result unstored.
+Peers of the same unit in other target directories wait for this compile as
+they would for a pre-pass. `[cache] deferred_discovery = false` restores the
+pre-pass.
+
 ## Path normalization
 
 Kache maps known roots to stable sentinels before hashing and asks the compiler to emit matching remapped paths. This allows equivalent worktrees and runners to share entries.

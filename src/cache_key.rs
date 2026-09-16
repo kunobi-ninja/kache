@@ -848,6 +848,123 @@ pub(crate) fn stash_last_dep_info_for_test(dep_info: DepInfo) {
 }
 
 thread_local! {
+    /// The crate tree digest the last guarded key computation on this thread
+    /// used, so the record made from it carries the same digest.
+    static LAST_KEY_TREE_DIGEST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take (consume) the crate tree digest of the last computed rustc key, if it
+/// was a proc-macro-dependent unit.
+pub(crate) fn take_last_tree_digest() -> Option<String> {
+    LAST_KEY_TREE_DIGEST
+        .try_with(|stash| stash.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+/// Cap on entries digested for the tree guard. A crate directory past this is
+/// a build tree or a monorepo root, and the pre-pass stays cheaper than
+/// digesting it.
+const CRATE_TREE_MAX_ENTRIES: usize = 20_000;
+
+/// A content digest of everything under the crate directory and its
+/// `OUT_DIR`, the two places a proc macro reads from by convention
+/// (`CARGO_MANIFEST_DIR`-relative paths and generated files).
+///
+/// Content rather than metadata, so a fresh checkout matches a record made
+/// from another one. Every file hashes through the persistent content cache,
+/// so an unchanged tree costs stats, not reads. `None` when the crate
+/// directory is unknown, unreadable, or too large to digest, which leaves the
+/// unit on the pre-pass.
+pub(crate) fn crate_tree_digest(file_hasher: &FileHasher<'_>) -> Option<String> {
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
+    // Only for published crates, whose package directory is immutable and
+    // self-contained: a macro in one can only read files under the package or
+    // its OUT_DIR. A workspace crate can point a macro at `../assets`, which
+    // no digest of its own directory would notice, so it keeps the pre-pass.
+    if !is_registry_package(&manifest_dir) {
+        return None;
+    }
+    let mut roots = vec![(manifest_dir, &b"manifest_dir"[..])];
+    if let Some(out_dir) = std::env::var_os("OUT_DIR").map(PathBuf::from) {
+        roots.push((out_dir, &b"out_dir"[..]));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache-crate-tree-v1\n");
+    let mut budget = CRATE_TREE_MAX_ENTRIES;
+    // Roots are named by role, not by path: the identity the record is filed
+    // under already knows the path, and the guard is about content.
+    for (root, role) in roots {
+        fold_field(&mut hasher, b"root:", role);
+        // A build directory or a git checkout under the crate is not what a
+        // macro reads, and `target` in particular is rewritten by the build
+        // this key belongs to.
+        let excluded = [root.join("target"), root.join(".git")];
+        crate_tree_fold(
+            &root,
+            &root,
+            &excluded,
+            file_hasher,
+            &mut hasher,
+            &mut budget,
+        )?;
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// Is `manifest_dir` an extracted registry package (`<CARGO_HOME>/registry/src/<index>/<pkg>`)?
+fn is_registry_package(manifest_dir: &Path) -> bool {
+    let mut components = manifest_dir.components().rev();
+    let _package = components.next();
+    let _index = components.next();
+    let src = components.next();
+    let registry = components.next();
+    matches!(
+        (src, registry),
+        (Some(std::path::Component::Normal(src)), Some(std::path::Component::Normal(registry)))
+            if src == "src" && registry == "registry"
+    )
+}
+
+fn crate_tree_fold(
+    root: &Path,
+    directory: &Path,
+    excluded: &[PathBuf],
+    file_hasher: &FileHasher<'_>,
+    hasher: &mut blake3::Hasher,
+    budget: &mut usize,
+) -> Option<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(directory)
+        .ok()?
+        .collect::<std::io::Result<_>>()
+        .ok()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        if excluded.contains(&path) {
+            continue;
+        }
+        *budget = budget.checked_sub(1)?;
+        let relative = path.strip_prefix(root).ok()?;
+        fold_field(hasher, b"path:", relative.as_os_str().as_encoded_bytes());
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(&path).ok()?;
+            fold_field(hasher, b"symlink:", target.as_os_str().as_encoded_bytes());
+        } else if metadata.is_dir() {
+            fold_field(hasher, b"dir:", b"");
+            crate_tree_fold(root, &path, excluded, file_hasher, hasher, budget)?;
+        } else if metadata.is_file() {
+            fold_field(hasher, b"file:", file_hasher.hash(&path).ok()?.as_bytes());
+        } else {
+            fold_field(hasher, b"other:", b"");
+        }
+    }
+    Some(())
+}
+
+thread_local! {
     /// Did the last key computed on this thread derive its input set from a
     /// record rather than from the pre-pass?
     ///
@@ -855,6 +972,54 @@ thread_local! {
     /// derived key that misses locally must be recomputed the slow way before
     /// anything reaches the remote, the scheduler or the store.
     static LAST_KEY_USED_PREDICTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// May the key refuse to discover a closure it has no record of, so the
+    /// wrapper compiles first and keys from the dep-info rustc emits?
+    static DEFER_DISCOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A closure handed in by the wrapper after such a compile: the next key
+    /// computation uses it instead of a record or a pre-pass.
+    static PROVIDED_DEP_INFO: std::cell::RefCell<Option<DepInfo>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The key stopped before discovering the closure: no record, and the wrapper
+/// allowed compiling first (see [`set_defer_discovery`]).
+#[derive(Debug)]
+pub struct DeferredDiscovery;
+
+impl std::fmt::Display for DeferredDiscovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("closure discovery deferred until after the compile")
+    }
+}
+
+impl std::error::Error for DeferredDiscovery {}
+
+/// Allow (or forbid) deferring closure discovery for keys computed on this
+/// thread. With no record and no remote to consult, a miss is certain, so
+/// the dep-info pre-pass would only repeat what the compile is about to
+/// emit; the wrapper compiles, hands the emitted closure to
+/// [`provide_dep_info`] and keys again.
+pub fn set_defer_discovery(allowed: bool) {
+    DEFER_DISCOVERY.with(|cell| cell.set(allowed));
+}
+
+/// Use `dep_info` for the next key computed on this thread.
+pub fn provide_dep_info(dep_info: DepInfo) {
+    PROVIDED_DEP_INFO.with(|cell| *cell.borrow_mut() = Some(dep_info));
+}
+
+/// The closure rustc wrote to `path` during the compile whose crate root is
+/// `source_file`: the same content the pre-pass reads from its own output.
+pub fn dep_info_from_emitted(path: &Path, source_file: &Path) -> Result<DepInfo> {
+    let content = read_dep_info_file(path)?;
+    let mut source_files = parse_dep_info(&content);
+    if source_files.is_empty() {
+        source_files.push(source_file.to_path_buf());
+    }
+    let env_deps = parse_env_dep_info(&content);
+    Ok(DepInfo {
+        source_files,
+        env_deps,
+    })
 }
 
 /// Take (consume) whether the last computed rustc key came from a prediction.
@@ -910,6 +1075,14 @@ fn rustc_prediction_identity_in_env(
     args: &RustcArgs,
     vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 ) -> Option<String> {
+    rustc_prediction_identity_with_args(args, vars, None)
+}
+
+fn rustc_prediction_identity_with_args(
+    args: &RustcArgs,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    closure_args: Option<Vec<String>>,
+) -> Option<String> {
     let source_file = args.source_file.as_ref()?;
     let rustc_version = get_rustc_version(&args.rustc).ok()?;
     Some(prediction_identity_in_env(
@@ -918,11 +1091,78 @@ fn rustc_prediction_identity_in_env(
             inner_rustc: args.inner_rustc.as_deref(),
             current_dir: std::env::current_dir().ok().as_deref(),
             source_file,
-            closure_args: &closure_shaping_args(source_file, &args.all_args),
+            closure_args: &closure_args
+                .unwrap_or_else(|| closure_shaping_args(source_file, &args.all_args)),
             skip_path_remap: args.skip_path_remap(),
         },
         vars,
     ))
+}
+
+/// Share a prediction across Cargo target directories without relocating any
+/// source. Only dependency-search and extern paths are virtualized; cwd,
+/// source paths, cfg values and environment retain their original identity.
+/// A record containing a source under target is never published here.
+pub(crate) fn rustc_shared_prediction_identity(args: &RustcArgs) -> Option<String> {
+    let target = args.target_dir()?;
+    if !target.is_absolute() || !prediction_applies(&args.externs) {
+        return None;
+    }
+    let source = args.source_file.as_ref()?;
+    let closure_args =
+        shared_prediction_args(&closure_shaping_args(source, &args.all_args), &target);
+    let identity = rustc_prediction_identity_with_args(
+        args,
+        std::env::vars_os().collect(),
+        Some(closure_args),
+    )?;
+    Some(format!("shared-target-v1:{identity}"))
+}
+
+fn shared_prediction_args(args: &[String], target: &Path) -> Vec<String> {
+    let mut kind = None;
+    args.iter()
+        .map(|arg| {
+            let path_arg = match kind.take() {
+                Some(flag) => Some((flag, arg.as_str())),
+                None => {
+                    if arg == "--extern" || arg == "-L" {
+                        kind = Some(arg.as_str());
+                    }
+                    arg.strip_prefix("--extern=")
+                        .map(|value| ("--extern=", value))
+                        .or_else(|| {
+                            arg.strip_prefix("-L")
+                                .filter(|s| !s.is_empty())
+                                .map(|value| ("-L", value))
+                        })
+                }
+            };
+            let mapped = path_arg.and_then(|(flag, value)| {
+                let (name, path) = value.split_once('=').unwrap_or(("", value));
+                let relative = Path::new(path).strip_prefix(target).ok()?;
+                if relative
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return None;
+                }
+                Some(("target", flag, name, relative.to_str()?))
+            });
+            // Tag every argument, including literals, so a user-supplied path
+            // or cfg string cannot impersonate an encoded target-relative one.
+            serde_json::to_string(&mapped.unwrap_or(("literal", "", "", arg))).unwrap()
+        })
+        .collect()
+}
+
+pub(crate) fn shared_prediction_can_record(args: &RustcArgs, dep_info: &DepInfo) -> bool {
+    args.target_dir().is_some_and(|target| {
+        !dep_info
+            .source_files
+            .iter()
+            .any(|source| source.starts_with(&target))
+    })
 }
 
 /// How often to check a prediction against the pre-pass it replaced.
@@ -1016,16 +1256,37 @@ fn predicted_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
 ) -> std::result::Result<(DepInfo, String), Rejection> {
+    let _trace = crate::phase_trace::phase("prediction_validate");
     if !file_hasher.uses_input_predictions() {
         return Err(Rejection::Disabled);
     }
-    if !prediction_applies(&args.externs) {
-        return Err(Rejection::NotEligible);
-    }
-    let identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
+    // A unit with a proc-macro dependency is only predictable under the tree
+    // guard: the record must carry the crate tree digest and it must still
+    // match. Computed once here and stashed, because the same digest is what
+    // a record made from this invocation has to carry.
+    let tree = if prediction_applies(&args.externs) {
+        None
+    } else {
+        let _trace = crate::phase_trace::phase("crate_tree");
+        let digest = crate_tree_digest(file_hasher).ok_or(Rejection::NotEligible)?;
+        let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(digest.clone()));
+        Some(digest)
+    };
+    let mut identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
     let record = file_hasher
         .input_prediction(&identity)
+        .or_else(|| {
+            identity = rustc_shared_prediction_identity(args)?;
+            file_hasher.input_prediction(&identity)
+        })
         .ok_or(Rejection::NoRecord)?;
+    if let Some(tree) = &tree {
+        match &record.tree {
+            Some(recorded) if recorded == tree => {}
+            Some(_) => return Err(Rejection::TreeChanged),
+            None => return Err(Rejection::NoRecord),
+        }
+    }
     let dep_info = validate_prediction(
         &record,
         |path| std::fs::metadata(path).ok(),
@@ -1035,6 +1296,16 @@ fn predicted_key_inputs(
     // The identity travels with the closure: the sampled cross-check selects
     // by it, so it must be the one this record actually came from.
     Ok((dep_info, identity))
+}
+
+/// Join only when an eligible unit needs discovery. A peer holds the lock
+/// until it has published a successful prediction and artifacts; this caller
+/// then validates the record and computes its own complete key as usual.
+fn prediction_discovery_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>) -> Option<String> {
+    if !file_hasher.uses_input_predictions() || !prediction_applies(&args.externs) {
+        return None;
+    }
+    rustc_shared_prediction_identity(args).or_else(|| rustc_prediction_identity(args))
 }
 
 /// Discover the source closure that feeds the key.
@@ -1054,9 +1325,25 @@ fn resolve_key_inputs(
     file_hasher: &FileHasher<'_>,
     crate_name: &str,
 ) -> Result<Option<DepInfo>> {
+    if let Some(provided) = PROVIDED_DEP_INFO.with(|cell| cell.borrow_mut().take()) {
+        crate::phase_trace::decision("prediction", "emitted");
+        tracing::trace!("[key:{}] inputs=emitted-dep-info", crate_name);
+        return Ok(Some(provided));
+    }
     if args.source_file.is_some() {
-        match predicted_key_inputs(args, file_hasher) {
+        let mut prediction = predicted_key_inputs(args, file_hasher);
+        if prediction.is_err()
+            && let Some(cache_dir) = &file_hasher.prediction_flight_dir
+            && let Some(identity) = prediction_discovery_identity(args, file_hasher)
+        {
+            *file_hasher.discovery_flight.borrow_mut() =
+                crate::scheduler::join_discovery(cache_dir, &identity);
+            // The previous owner may have published while this process waited.
+            prediction = predicted_key_inputs(args, file_hasher);
+        }
+        match prediction {
             Ok((dep_info, identity)) => {
+                crate::phase_trace::decision("prediction", "validated");
                 let mode = parse_verify_predictions(
                     std::env::var("KACHE_VERIFY_INPUT_PREDICTIONS")
                         .ok()
@@ -1066,6 +1353,7 @@ fn resolve_key_inputs(
                 // anyway and uses ITS answer, so a disagreement is reported
                 // rather than acted on.
                 if should_verify_this_prediction(mode, &identity) {
+                    crate::phase_trace::decision("prediction", "verify-sampled");
                     let discovered = dep_info_pre_pass(args)?;
                     if discovered
                         .as_ref()
@@ -1087,7 +1375,13 @@ fn resolve_key_inputs(
                 let _ = LAST_KEY_USED_PREDICTION.try_with(|stash| stash.set(true));
                 return Ok(Some(dep_info));
             }
+            Err(Rejection::NoRecord) if DEFER_DISCOVERY.with(std::cell::Cell::get) => {
+                crate::phase_trace::decision("prediction", "deferred");
+                tracing::trace!("[key:{}] inputs=deferred", crate_name);
+                return Err(anyhow::Error::new(DeferredDiscovery));
+            }
             Err(reason) => {
+                crate::phase_trace::decision("prediction", reason.as_str());
                 tracing::trace!("[key:{}] inputs=dep-info({})", crate_name, reason.as_str())
             }
         }
@@ -1097,6 +1391,7 @@ fn resolve_key_inputs(
 
 /// Spawn rustc to enumerate the closure. The slow, authoritative answer.
 fn dep_info_pre_pass(args: &RustcArgs) -> Result<Option<DepInfo>> {
+    let _trace = crate::phase_trace::phase("dep-info");
     args.source_file
         .as_ref()
         .map(|source| {
@@ -1136,6 +1431,7 @@ pub fn compute_cache_key(
     file_hasher: &FileHasher<'_>,
     path_normalizer: &PathNormalizer,
 ) -> Result<String> {
+    let _trace = crate::phase_trace::phase("key");
     // Grouped: the main digest is identical to a plain hasher's; the group
     // tee powers `explain_miss` (kunobi-ninja/kache#131).
     let mut hasher = GroupedHasher::new("compiler");
@@ -1156,6 +1452,7 @@ pub fn compute_cache_key(
     // bails before the pre-pass would otherwise leave the previous compile's
     // closure to be recorded against this one's identity.
     let _ = LAST_KEY_DEP_INFO.try_with(|stash| *stash.borrow_mut() = None);
+    let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = None);
     let _ = LAST_KEY_USED_PREDICTION.try_with(|stash| stash.set(false));
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
@@ -1192,6 +1489,19 @@ pub fn compute_cache_key(
         crate_name,
         rustc_version.lines().next().unwrap_or("?")
     );
+
+    // Clippy: the driver's own version, its configuration file and the lint
+    // arguments Cargo hands it through the environment all change what a
+    // successful compile prints, and hits replay diagnostics.
+    if args.is_clippy_chain() {
+        let identity = clippy_identity(&args.rustc)?;
+        fold_field(&mut hasher, b"clippy.v1:", identity.as_bytes());
+        tracing::trace!(
+            "[key:{}] clippy={}",
+            crate_name,
+            identity.lines().next().unwrap_or("?")
+        );
+    }
 
     // target triple
     let target = args
@@ -1792,7 +2102,17 @@ pub fn compute_cache_key(
         &rustc_version,
         cfg!(target_os = "linux"),
         cfg!(target_os = "macos"),
-        crate::native_link_key::probe_linux_crt_objects,
+        |driver| {
+            // Placements come from the memo while the searched directories
+            // are unchanged; content hashes are still reused only with an
+            // unchanged file fingerprint, through the same guards as other
+            // key inputs.
+            crate::native_link_key::probe_linux_crt_objects_memoized(
+                &crate::config::probe_memo_dir(),
+                driver,
+                |path| file_hasher.hash(path),
+            )
+        },
         |sdkroot| match crate::native_link_key::sdk_identity_for(sdkroot)? {
             Some(identity) => Ok(identity),
             None => anyhow::bail!("the macOS SDK could not be identified"),
@@ -2788,14 +3108,23 @@ pub(crate) struct InputPrediction {
     /// (OUT_DIR-like values collapse to a sentinel), so the raw value is the
     /// only signal that an included file moved.
     pub(crate) env_deps: Vec<(String, String)>,
+    /// Digest of the crate's own tree ([`crate_tree_digest`]) when the unit
+    /// depends on a proc macro. Such a macro can read any file under the crate
+    /// without it entering the closure, so the closure alone cannot say
+    /// whether the record still applies; the tree can. Absent on records made
+    /// for units that need no such guard, and on rows written before it
+    /// existed, which the guard then treats as unusable.
+    #[serde(default)]
+    pub(crate) tree: Option<String>,
 }
 
 impl InputPrediction {
-    fn from_dep_info(dep_info: &DepInfo) -> Self {
+    fn from_dep_info(dep_info: &DepInfo, tree: Option<String>) -> Self {
         Self {
             schema: PREDICTION_SCHEMA,
             sources: dep_info.source_files.clone(),
             env_deps: dep_info.env_deps.clone(),
+            tree,
         }
     }
 }
@@ -2826,6 +3155,9 @@ pub(crate) enum Rejection {
     /// exist. rustc rejects that (E0761), and replaying a recorded success
     /// would restore an artifact for a build that should fail.
     Sibling,
+    /// The unit depends on a proc macro and the crate tree is not the one the
+    /// record was made against, so a file the macro reads may have changed.
+    TreeChanged,
 }
 
 impl Rejection {
@@ -2838,6 +3170,7 @@ impl Rejection {
             Rejection::NotRegular => "not-regular",
             Rejection::EnvChanged => "env-changed",
             Rejection::Sibling => "sibling",
+            Rejection::TreeChanged => "tree-changed",
         }
     }
 }
@@ -3081,6 +3414,8 @@ pub struct FileHasher<'db> {
     cache: Option<FileHashCache<'db>>,
     daemon_socket: Option<PathBuf>,
     use_input_predictions: bool,
+    prediction_flight_dir: Option<PathBuf>,
+    discovery_flight: RefCell<Option<crate::store::StoreLock>>,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
     recent_hashes: RefCell<HashMap<PathBuf, RecentHash>>,
     runtime_env_uses: RefCell<HashMap<(String, String), bool>>,
@@ -3091,6 +3426,18 @@ pub struct FileHasher<'db> {
     /// that none of them changed mid-build (see
     /// [`FileHasher::guarded_inputs_unchanged_since_hash`]).
     guard_inputs: RefCell<Vec<FileFingerprint>>,
+    /// Memo rows for files hashed in this process, written in one transaction
+    /// by [`FileHasher::flush_memo`] (and on drop). One autocommit write per
+    /// file made every hit in a six-job cold cell wait for the index's write
+    /// lock behind the misses' store transactions: 6 ms of hashing became
+    /// 380 ms.
+    pending_memo: RefCell<Vec<(FileFingerprint, String)>>,
+}
+
+impl Drop for FileHasher<'_> {
+    fn drop(&mut self) {
+        self.flush_memo();
+    }
 }
 
 /// Optional "too-new input" guard (kunobi-ninja/kache#324). When armed, any
@@ -3119,48 +3466,6 @@ struct FileHashStatsCells {
     bytes_hashed: Cell<u64>,
 }
 
-/// One input of a memoised preprocessor run: its metadata at the time the
-/// expansion was hashed, plus the hash of its contents.
-///
-/// The metadata is a fast path — identical metadata means identical bytes,
-/// with no read. The content hash is what makes the memo survive everything
-/// metadata cannot: a second worktree (new inodes and mtimes for the same
-/// bytes), a fresh CI checkout, and a header a build script regenerated
-/// byte-for-byte. Those are the cases a compile cache exists for, and they
-/// are exactly the ones metadata alone rejects.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct CcPreprocessMemoInput {
-    /// The input's prefix-mapped spelling: what it is called in the form the
-    /// expansion was hashed in, and therefore the same string from any
-    /// checkout the maps cover. The reader turns it back into a local path.
-    name: String,
-    /// Where the file was, and what its metadata said, when recorded. The
-    /// path here is local to the recording checkout and is only a fast path;
-    /// a reader that resolved `name` elsewhere ignores it.
-    #[serde(flatten)]
-    fingerprint: FileFingerprint,
-    /// blake3 of the file's contents when the expansion was hashed.
-    content: String,
-    /// blake3 of those contents with the prefix maps applied, which is how
-    /// the expansion itself is hashed.
-    ///
-    /// A generated header that names its own build directory has different
-    /// bytes in two checkouts and contributes the same expansion to both,
-    /// because the maps rewrite the path either way. Comparing raw bytes
-    /// alone made the memo stricter than the key it feeds, and `-sys` crates
-    /// put such a header in front of nearly every unit.
-    #[serde(default)]
-    mapped: String,
-}
-
-impl CcPreprocessMemoInput {
-    /// Where this input was when it was recorded. Local to the recording
-    /// checkout; a reader that resolved the name elsewhere has its own path.
-    pub(crate) fn local_path(&self) -> &str {
-        &self.fingerprint.path
-    }
-}
-
 #[derive(Debug, Clone)]
 struct PrefetchedHash {
     hash: String,
@@ -3180,12 +3485,15 @@ impl FileHasher<'static> {
             cache: None,
             daemon_socket: None,
             use_input_predictions: false,
+            prediction_flight_dir: None,
+            discovery_flight: RefCell::new(None),
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
             runtime_env_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
+            pending_memo: RefCell::new(Vec::new()),
         }
     }
 
@@ -3196,12 +3504,15 @@ impl FileHasher<'static> {
                 cache: Some(cache),
                 daemon_socket: None,
                 use_input_predictions: false,
+                prediction_flight_dir: None,
+                discovery_flight: RefCell::new(None),
                 prefetched: RefCell::new(HashMap::new()),
                 recent_hashes: RefCell::new(HashMap::new()),
                 runtime_env_uses: RefCell::new(HashMap::new()),
                 stats: FileHashStatsCells::default(),
                 too_new: TooNewGuard::default(),
                 guard_inputs: RefCell::new(Vec::new()),
+                pending_memo: RefCell::new(Vec::new()),
             },
             Err(e) => {
                 tracing::debug!(
@@ -3215,17 +3526,54 @@ impl FileHasher<'static> {
 }
 
 impl<'db> FileHasher<'db> {
+    /// Write every memo row hashed so far in one transaction. The rows are an
+    /// optimisation, so a busy index (another process holds the write lock
+    /// for longer than the short wait here) drops them rather than stalling
+    /// a hit; the next process hashes those files again.
+    pub fn flush_memo(&self) {
+        let pending = std::mem::take(&mut *self.pending_memo.borrow_mut());
+        if pending.is_empty() {
+            return;
+        }
+        let _trace = crate::phase_trace::phase("memo_flush");
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        let db = cache.db();
+        let _ = db.busy_timeout(std::time::Duration::from_millis(100));
+        let written = (|| -> rusqlite::Result<()> {
+            db.execute_batch("BEGIN IMMEDIATE")?;
+            for (fingerprint, hash) in &pending {
+                if let Err(error) = cache.put(fingerprint, hash) {
+                    let _ = db.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            }
+            db.execute_batch("COMMIT")
+        })();
+        let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
+        if let Err(error) = written {
+            tracing::debug!(
+                rows = pending.len(),
+                "file hash memo not written (index busy): {error}"
+            );
+        }
+    }
+
     pub(crate) fn from_cache(cache: FileHashCache<'db>) -> Self {
         FileHasher {
             cache: Some(cache),
             daemon_socket: None,
             use_input_predictions: false,
+            prediction_flight_dir: None,
+            discovery_flight: RefCell::new(None),
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
             runtime_env_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
+            pending_memo: RefCell::new(Vec::new()),
         }
     }
 
@@ -3243,6 +3591,15 @@ impl<'db> FileHasher<'db> {
     pub(crate) fn with_input_predictions(mut self, enabled: bool) -> Self {
         self.use_input_predictions = enabled;
         self
+    }
+
+    pub(crate) fn with_prediction_flights(mut self, cache_dir: Option<PathBuf>) -> Self {
+        self.prediction_flight_dir = cache_dir;
+        self
+    }
+
+    pub(crate) fn take_discovery_flight(&self) -> Option<crate::store::StoreLock> {
+        self.discovery_flight.borrow_mut().take()
     }
 
     /// May key computation derive its inputs from a record? Only when it was
@@ -3332,11 +3689,12 @@ impl<'db> FileHasher<'db> {
         identity: &str,
         crate_name: Option<&str>,
         dep_info: &DepInfo,
+        tree: Option<String>,
     ) {
         let Some(cache) = self.cache.as_ref() else {
             return;
         };
-        let record = InputPrediction::from_dep_info(dep_info);
+        let record = InputPrediction::from_dep_info(dep_info, tree);
         let json = match serde_json::to_string(&record) {
             Ok(json) => json,
             Err(error) => {
@@ -3356,6 +3714,7 @@ impl<'db> FileHasher<'db> {
     /// so the caller runs the pre-pass.
     ///
     pub(crate) fn input_prediction(&self, identity: &str) -> Option<InputPrediction> {
+        let _trace = crate::phase_trace::phase("prediction_read");
         let cache = self.cache.as_ref()?;
         let (schema, json) = match cache.get_input_prediction(identity) {
             Ok(row) => row?,
@@ -3404,22 +3763,16 @@ impl<'db> FileHasher<'db> {
                 return None;
             }
         };
-        if record.0.len() != 64
+        if record.preprocessed_hash.len() != 64
             || !record
-                .0
+                .preprocessed_hash
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             tracing::debug!("cc preprocess memo hash is invalid");
             return None;
         }
-        let inputs: Vec<CcPreprocessMemoInput> = match serde_json::from_str(&record.1) {
-            Ok(inputs) => inputs,
-            Err(error) => {
-                tracing::debug!("cc preprocess memo inputs are invalid: {error}");
-                return None;
-            }
-        };
+        let inputs = record.inputs;
         if inputs.is_empty() {
             return None;
         }
@@ -3430,7 +3783,12 @@ impl<'db> FileHasher<'db> {
         for expected in &inputs {
             satisfied.push(self.memo_input_is_unchanged(expected, &resolve, mapped_content)?);
         }
-        Some((record.0, satisfied))
+        if record.needs_touch
+            && let Err(error) = cache.touch_cc_preprocess_memo(memo_key)
+        {
+            tracing::debug!("cc preprocess memo touch failed: {error}");
+        }
+        Some((record.preprocessed_hash, satisfied))
     }
 
     /// Does this input still hold the bytes the memo was recorded against?
@@ -3572,20 +3930,14 @@ impl<'db> FileHasher<'db> {
                 return;
             }
         }
-        let inputs_json = match serde_json::to_string(inputs) {
-            Ok(inputs_json) => inputs_json,
-            Err(error) => {
-                tracing::debug!("cc preprocess memo inputs could not be encoded: {error}");
-                return;
-            }
-        };
-        if let Err(error) = cache.put_cc_preprocess_memo(memo_key, preprocessed_hash, &inputs_json)
+        if let Err(error) = cache.put_cc_preprocess_memo_inputs(memo_key, preprocessed_hash, inputs)
         {
             tracing::debug!("cc preprocess memo update failed: {error}");
         }
     }
 
     pub fn prefetch(&self, paths: &[&Path]) {
+        let _trace = crate::phase_trace::phase("input_hash_prefetch");
         let Some(socket_path) = &self.daemon_socket else {
             return;
         };
@@ -3642,6 +3994,7 @@ impl<'db> FileHasher<'db> {
 
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
+        let _trace = crate::phase_trace::phase("input_hash");
         let (hash, fingerprint) = self.hash_inner(path)?;
         if self.too_new.invocation_start_ns > 0
             && let Some(fingerprint) = &fingerprint
@@ -3721,9 +4074,9 @@ impl<'db> FileHasher<'db> {
 
         let hash = hash_file(path)?;
         self.record_miss(fingerprint.size);
-        if let Err(e) = cache.put(&fingerprint, &hash) {
-            tracing::debug!("file hash cache update failed for {}: {e}", path.display());
-        }
+        self.pending_memo
+            .borrow_mut()
+            .push((fingerprint.clone(), hash.clone()));
         Ok((hash, Some(fingerprint)))
     }
 
@@ -3879,9 +4232,7 @@ impl<'db> FileHasher<'db> {
         }
         let hash = compute_static_lib_hash(path, usage)?;
         self.record_miss(size);
-        if let Err(e) = cache.put(&key, &hash) {
-            tracing::debug!("static-lib hash cache update failed: {e}");
-        }
+        self.pending_memo.borrow_mut().push((key, hash.clone()));
         Ok(hash)
     }
 
@@ -4243,6 +4594,7 @@ fn unescape_env_dep_value(s: &str) -> String {
 /// 300+ times per parallel build — the first invocation writes the file and the
 /// rest read it back in <1 ms.
 fn get_rustc_version(rustc: &Path) -> Result<String> {
+    let _trace = crate::phase_trace::phase("compiler_identity");
     if let Some(cached) = read_tool_version_cache(rustc, "rustc-ver") {
         return Ok(cached);
     }
@@ -4256,6 +4608,100 @@ fn get_rustc_version(rustc: &Path) -> Result<String> {
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
     write_tool_version_cache(rustc, "rustc-ver", &version);
     Ok(version)
+}
+
+/// `clippy-driver --version` (`clippy 0.1.98 (hash date)`), file-cached like
+/// the rustc version. `-vV` only reports the underlying rustc.
+fn get_clippy_version(driver: &Path) -> Result<String> {
+    if let Some(cached) = read_tool_version_cache(driver, "clippy-ver") {
+        return Ok(cached);
+    }
+    let output = std::process::Command::new(driver)
+        .arg("--version")
+        .output()
+        .context("running clippy-driver --version")?;
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    anyhow::ensure!(
+        !version.is_empty(),
+        "clippy-driver --version printed nothing"
+    );
+    write_tool_version_cache(driver, "clippy-ver", &version);
+    Ok(version)
+}
+
+/// Everything about a Clippy invocation that its argv does not carry: the
+/// driver version, the configuration file Clippy would load (`.clippy.toml`
+/// or `clippy.toml`, searched from `CLIPPY_CONF_DIR`, else the manifest
+/// directory, upwards) and the lint arguments `cargo clippy` passes through
+/// the environment. Content, not location, so two checkouts share keys.
+pub(crate) fn clippy_identity(driver: &Path) -> Result<String> {
+    clippy_identity_in(
+        driver,
+        |name| std::env::var_os(name),
+        std::env::current_dir().ok(),
+    )
+}
+
+fn clippy_identity_in(
+    driver: &Path,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    current_dir: Option<PathBuf>,
+) -> Result<String> {
+    let mut identity = get_clippy_version(driver)?;
+    identity.push('\n');
+    // The `cargo` lint group reads the package manifest, which rustc's
+    // dep-info never lists.
+    if let Some(manifest_dir) = env("CARGO_MANIFEST_DIR") {
+        let manifest = PathBuf::from(manifest_dir).join("Cargo.toml");
+        match std::fs::read(&manifest) {
+            Ok(content) => {
+                identity.push_str(&format!("manifest:{}\n", blake3::hash(&content).to_hex()))
+            }
+            Err(_) => identity.push_str("manifest:none\n"),
+        }
+    }
+    let start = env("CLIPPY_CONF_DIR")
+        .or_else(|| env("CARGO_MANIFEST_DIR"))
+        .map(PathBuf::from)
+        .or(current_dir);
+    match start.and_then(|start| selected_clippy_config(&start)) {
+        Some(path) => {
+            let content = std::fs::read(&path)
+                .with_context(|| format!("reading Clippy configuration {}", path.display()))?;
+            identity.push_str(&format!(
+                "config:{}:{}\n",
+                path.file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default(),
+                blake3::hash(&content).to_hex()
+            ));
+        }
+        None => identity.push_str("config:none\n"),
+    }
+    for name in ["CLIPPY_ARGS", "CLIPPY_DISABLE_DOCS_LINKS"] {
+        match env(name) {
+            Some(value) => identity.push_str(&format!("{name}={}\n", value.to_string_lossy())),
+            None => identity.push_str(&format!("{name} unset\n")),
+        }
+    }
+    Ok(identity)
+}
+
+/// The configuration file Clippy loads: the first `.clippy.toml` or
+/// `clippy.toml` from `start` up to the filesystem root.
+fn selected_clippy_config(start: &Path) -> Option<PathBuf> {
+    let mut directory = std::fs::canonicalize(start).ok()?;
+    loop {
+        for name in [".clippy.toml", "clippy.toml"] {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        if !directory.pop() {
+            return None;
+        }
+    }
 }
 
 /// The toolchain commit hash from `rustc -vV`'s `commit-hash:` line, for the
@@ -4864,6 +5310,7 @@ fn parse_ldd_libc(text: &str) -> Option<(LinuxLibcFamily, String)> {
 /// the primary musl signal. A family mismatch or unparseable result fails
 /// closed; the caller then treats the compile as uncacheable.
 fn probe_linux_libc_signature(expected: LinuxLibcFamily) -> Result<String> {
+    let _trace = crate::phase_trace::phase("native_libc_signature");
     if expected == LinuxLibcFamily::Gnu
         && let Ok(output) = std::process::Command::new("getconf")
             .arg("GNU_LIBC_VERSION")
@@ -4904,6 +5351,7 @@ fn probe_linux_libc_signature(expected: LinuxLibcFamily) -> Result<String> {
 
 /// Get linker identity string for cache key, with file-based caching.
 fn get_linker_identity(args: &RustcArgs) -> Option<String> {
+    let _trace = crate::phase_trace::phase("linker_identity");
     let linker = args.get_codegen_opt("linker").unwrap_or("cc");
     let linker_path = Path::new(linker);
 
@@ -6288,6 +6736,59 @@ mod tests {
         );
     }
 
+    /// With no record and deferral allowed, the key stops instead of running
+    /// the pre-pass; the closure the wrapper hands back afterwards is used as
+    /// is.
+    #[test]
+    fn discovery_defers_to_the_compile_and_takes_the_emitted_closure() {
+        let _lock = key_test_lock();
+        if get_rustc_version(Path::new("rustc")).is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let args = RustcArgs::parse(
+            &["rustc", "src/lib.rs", "--edition", "2021"]
+                .iter()
+                .map(|a| (*a).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let on = FileHasher::persistent(&db).with_input_predictions(true);
+
+        set_defer_discovery(true);
+        let deferred = resolve_key_inputs(&args, &on, "x");
+        set_defer_discovery(false);
+        let error = deferred.expect_err("no record and deferral allowed: no pre-pass");
+        assert!(
+            error.downcast_ref::<DeferredDiscovery>().is_some(),
+            "{error:#}"
+        );
+
+        let emitted = dir.path().join("lib.d");
+        std::fs::write(
+            &emitted,
+            "/w/target/debug/deps/lib.rmeta: /w/src/lib.rs /w/src/inner.rs\n\n\
+             /w/src/lib.rs:\n/w/src/inner.rs:\n# env-dep:CARGO_PKG_NAME=lib\n",
+        )
+        .unwrap();
+        let closure = dep_info_from_emitted(&emitted, Path::new("/w/src/lib.rs")).unwrap();
+        assert_eq!(
+            closure.source_files,
+            vec![
+                PathBuf::from("/w/src/inner.rs"),
+                PathBuf::from("/w/src/lib.rs")
+            ]
+        );
+        assert_eq!(
+            closure.env_deps,
+            vec![("CARGO_PKG_NAME".to_string(), "lib".to_string())]
+        );
+        provide_dep_info(closure.clone());
+        let used = resolve_key_inputs(&args, &on, "x").unwrap();
+        assert_eq!(used, Some(closure));
+    }
+
     /// The two gates in front of a record lookup, each refusing for its own
     /// reason so the trace can say which.
     #[test]
@@ -6318,7 +6819,7 @@ mod tests {
         assert_eq!(
             predicted_key_inputs(&with_macro, &on),
             Err(Rejection::NotEligible),
-            "a proc-macro dependency is refused before any lookup"
+            "a proc-macro dependency outside a registry package is refused before any lookup"
         );
         if get_rustc_version(Path::new("rustc")).is_ok() {
             assert_eq!(
@@ -6524,6 +7025,7 @@ mod tests {
             schema: PREDICTION_SCHEMA,
             sources: vec![lib.clone(), helper.clone()],
             env_deps: vec![("OUT_DIR".to_string(), "/t/build/out".to_string())],
+            tree: None,
         };
         let stat = |path: &Path| std::fs::metadata(path).ok();
         let exists = |path: &Path| path.exists();
@@ -6592,6 +7094,7 @@ mod tests {
             schema: PREDICTION_SCHEMA,
             sources: vec![lib.clone()],
             env_deps: vec![("KACHE_PROBE_UNSET".to_string(), String::new())],
+            tree: None,
         };
         assert!(
             validate_prediction(&empty, stat, exists, |_| None).is_ok(),
@@ -6601,6 +7104,7 @@ mod tests {
             schema: PREDICTION_SCHEMA,
             sources: vec![lib],
             env_deps: vec![("KACHE_PROBE_UNSET".to_string(), "1".to_string())],
+            tree: None,
         };
         assert_eq!(
             validate_prediction(&valued, stat, exists, |_| None),
@@ -6826,6 +7330,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shared_predictions_only_virtualize_dependency_paths() {
+        let map = |target: &str, args: &[&str]| {
+            shared_prediction_args(
+                &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                Path::new(target),
+            )
+        };
+        for (left, right) in [
+            (
+                vec!["--extern", "dep=/a/target/debug/libdep.rlib"],
+                vec!["--extern", "dep=/b/target/debug/libdep.rlib"],
+            ),
+            (
+                vec!["--extern=dep=/a/target/debug/libdep.rmeta"],
+                vec!["--extern=dep=/b/target/debug/libdep.rmeta"],
+            ),
+            (
+                vec!["-L", "dependency=/a/target/debug/deps"],
+                vec!["-L", "dependency=/b/target/debug/deps"],
+            ),
+            (
+                vec!["-Lnative=/a/target/debug/build/out"],
+                vec!["-Lnative=/b/target/debug/build/out"],
+            ),
+            (
+                vec!["-L/a/target/debug/deps"],
+                vec!["-L/b/target/debug/deps"],
+            ),
+        ] {
+            assert_eq!(map("/a/target", &left), map("/b/target", &right));
+        }
+        for (left, right) in [
+            (
+                vec!["--cfg", "path=\"/a/target/value\""],
+                vec!["--cfg", "path=\"/b/target/value\""],
+            ),
+            (
+                vec!["/a/target/generated.rs"],
+                vec!["/b/target/generated.rs"],
+            ),
+            (
+                vec!["--extern", "a=/a/target/lib.rlib"],
+                vec!["--extern", "b=/b/target/lib.rlib"],
+            ),
+            (
+                vec!["--extern", "a=/a/target/lib.rlib"],
+                vec!["--extern", "a=/b/target/other.rlib"],
+            ),
+            (
+                vec!["-Lnative=/a/target/lib"],
+                vec!["-Ldependency=/b/target/lib"],
+            ),
+            (
+                vec!["--extern", "a=/a/target-extra/lib.rlib"],
+                vec!["--extern", "a=/b/target-extra/lib.rlib"],
+            ),
+            (
+                vec!["--extern", "a=/a/target/../lib.rlib"],
+                vec!["--extern", "a=/b/target/../lib.rlib"],
+            ),
+        ] {
+            assert_ne!(map("/a/target", &left), map("/b/target", &right));
+        }
+        let encoded = map("/a/target", &["-L/a/target/lib"]);
+        assert_ne!(encoded, map("/a/target", &[&encoded[0]]));
+    }
+
+    #[test]
+    fn shared_predictions_reject_target_sources() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let args = RustcArgs::parse(&[
+            "rustc".into(),
+            "src/lib.rs".into(),
+            "--out-dir".into(),
+            target.join("debug/deps").to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let mut dep = DepInfo {
+            source_files: vec![root.path().join("src/lib.rs")],
+            env_deps: vec![],
+        };
+        assert!(shared_prediction_can_record(&args, &dep));
+        dep.source_files
+            .push(target.join("debug/build/pkg/out/generated.rs"));
+        assert!(!shared_prediction_can_record(&args, &dep));
+        let no_target = RustcArgs::parse(&["rustc".into(), "src/lib.rs".into()]).unwrap();
+        assert!(!shared_prediction_can_record(&no_target, &dep));
+    }
+
     /// What is written has to be exactly what comes back, or a prediction
     /// would reproduce a different `sources` group than the pre-pass did.
     #[test]
@@ -6847,7 +7443,7 @@ mod tests {
             None,
             "an identity never recorded has no prediction"
         );
-        hasher.record_input_prediction("unit", Some("demo"), &dep_info);
+        hasher.record_input_prediction("unit", Some("demo"), &dep_info, None);
 
         let record = FileHasher::persistent(&db)
             .input_prediction("unit")
@@ -6861,12 +7457,83 @@ mod tests {
             source_files: vec![PathBuf::from("/w/src/lib.rs")],
             env_deps: Vec::new(),
         };
-        FileHasher::persistent(&db).record_input_prediction("unit", Some("demo"), &narrower);
+        FileHasher::persistent(&db).record_input_prediction(
+            "unit",
+            Some("demo"),
+            &narrower,
+            Some("tree-digest".to_string()),
+        );
         let record = FileHasher::persistent(&db)
             .input_prediction("unit")
             .unwrap();
         assert_eq!(record.sources, narrower.source_files);
         assert!(record.env_deps.is_empty());
+        assert_eq!(record.tree.as_deref(), Some("tree-digest"));
+    }
+
+    /// The tree guard: a record for a proc-macro-dependent unit is only usable
+    /// while the crate's files are exactly what they were, wherever the tree
+    /// lives.
+    #[test]
+    fn crate_tree_digest_tracks_content_names_and_exclusions() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("registry/src/index-abc/pkg-1.0.0");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        let hasher = FileHasher::new();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::set_var("CARGO_MANIFEST_DIR", &root) };
+        unsafe { std::env::remove_var("OUT_DIR") };
+        let baseline = crate_tree_digest(&hasher).unwrap();
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn b() {}\n").unwrap();
+        assert_ne!(crate_tree_digest(&hasher).unwrap(), baseline, "content");
+        std::fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        assert_eq!(
+            crate_tree_digest(&hasher).unwrap(),
+            baseline,
+            "restored content"
+        );
+
+        std::fs::write(root.join("src/extra.txt"), "x").unwrap();
+        assert_ne!(crate_tree_digest(&hasher).unwrap(), baseline, "a new file");
+        std::fs::remove_file(root.join("src/extra.txt")).unwrap();
+
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/debug/x"), "x").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref").unwrap();
+        assert_eq!(
+            crate_tree_digest(&hasher).unwrap(),
+            baseline,
+            "build and git dirs"
+        );
+
+        // The same tree elsewhere digests the same: the guard follows content.
+        let copy = dir.path().join("other/registry/src/index-def/pkg-1.0.0");
+        std::fs::create_dir_all(copy.join("src")).unwrap();
+        std::fs::write(copy.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(copy.join("Cargo.toml"), "[package]\n").unwrap();
+        unsafe { std::env::set_var("CARGO_MANIFEST_DIR", &copy) };
+        assert_eq!(
+            crate_tree_digest(&hasher).unwrap(),
+            baseline,
+            "relocated tree"
+        );
+        let workspace = dir.path().join("workspace/member");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        unsafe { std::env::set_var("CARGO_MANIFEST_DIR", &workspace) };
+        assert!(
+            crate_tree_digest(&hasher).is_none(),
+            "a workspace crate keeps the pre-pass"
+        );
+        unsafe { std::env::remove_var("CARGO_MANIFEST_DIR") };
+        assert!(
+            crate_tree_digest(&hasher).is_none(),
+            "no crate directory, no guard"
+        );
     }
 
     /// A row this build cannot vouch for reads as absent. The cost of that is
@@ -6916,6 +7583,7 @@ mod tests {
                 source_files: vec![PathBuf::from("/w/src/lib.rs")],
                 env_deps: Vec::new(),
             },
+            None,
         );
         assert_eq!(hasher.input_prediction("unit"), None);
     }
@@ -7013,6 +7681,75 @@ mod tests {
             "the file is exactly the version string, as before"
         );
         let _ = std::fs::remove_file(&cache_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clippy_identity_follows_version_config_and_lint_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let driver = dir.path().join("clippy-driver");
+        std::fs::write(
+            &driver,
+            "#!/bin/sh\necho 'clippy 0.1.98 (abc 2026-09-01)'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let workspace = dir.path().join("ws");
+        let member = workspace.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        let env = |vars: Vec<(&'static str, String)>| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        let manifest = vec![("CARGO_MANIFEST_DIR", member.display().to_string())];
+
+        let bare = clippy_identity_in(&driver, env(manifest.clone()), None).unwrap();
+        assert!(bare.starts_with("clippy 0.1.98"));
+        assert!(bare.contains("config:none"));
+        assert!(bare.contains("manifest:none"));
+
+        // The package manifest feeds the `cargo` lint group.
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"m\"\n").unwrap();
+        let with_manifest = clippy_identity_in(&driver, env(manifest.clone()), None).unwrap();
+        assert_ne!(with_manifest, bare);
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"m\"\ndescription = \"d\"\n",
+        )
+        .unwrap();
+        assert_ne!(
+            clippy_identity_in(&driver, env(manifest.clone()), None).unwrap(),
+            with_manifest
+        );
+        let bare = clippy_identity_in(&driver, env(manifest.clone()), None).unwrap();
+
+        // A configuration file above the member is found and keyed by content.
+        std::fs::write(workspace.join("clippy.toml"), "msrv = \"1.80\"\n").unwrap();
+        let configured = clippy_identity_in(&driver, env(manifest.clone()), None).unwrap();
+        assert_ne!(configured, bare);
+        assert!(configured.contains("config:clippy.toml:"));
+        std::fs::write(workspace.join("clippy.toml"), "msrv = \"1.85\"\n").unwrap();
+        let edited = clippy_identity_in(&driver, env(manifest.clone()), None).unwrap();
+        assert_ne!(edited, configured);
+
+        // `CLIPPY_CONF_DIR` wins over the manifest directory, and the lint
+        // arguments Cargo passes through the environment are part of it.
+        let elsewhere = dir.path().join("conf");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(".clippy.toml"), "").unwrap();
+        let mut with_conf_dir = manifest.clone();
+        with_conf_dir.push(("CLIPPY_CONF_DIR", elsewhere.display().to_string()));
+        let redirected = clippy_identity_in(&driver, env(with_conf_dir.clone()), None).unwrap();
+        assert!(redirected.contains("config:.clippy.toml:"));
+        with_conf_dir.push(("CLIPPY_ARGS", "-Dclippy::all".to_string()));
+        let with_args = clippy_identity_in(&driver, env(with_conf_dir), None).unwrap();
+        assert_ne!(with_args, redirected);
+        assert!(with_args.contains("CLIPPY_ARGS=-Dclippy::all"));
     }
 
     #[test]
@@ -7752,6 +8489,7 @@ mod tests {
         assert_ne!(computed, "legacy-unguarded-object-sentinel");
         assert_ne!(computed, "legacy-unguarded-macho-sentinel");
         assert_ne!(computed, "legacy-path-bound-dwarf-sentinel");
+        fh.flush_memo();
         assert_eq!(cache.get(&current_key).unwrap(), Some(computed.clone()));
         assert_eq!(fh.hash_static_lib(&lib).unwrap(), computed);
     }
@@ -7879,6 +8617,7 @@ mod tests {
             bundled
         );
 
+        fh.flush_memo();
         let fingerprint = FileFingerprint::from_path(&lib).unwrap();
         let cache = fh.cache.as_ref().expect("persistent cache opens");
         for (namespace, expected) in [
@@ -7908,6 +8647,7 @@ mod tests {
             let lib = dir.path().join(name);
             std::fs::write(&lib, vec![b'x'; len]).unwrap();
             let hash = fh.hash_static_lib(&lib).unwrap();
+            fh.flush_memo();
             let fingerprint = FileFingerprint::from_path(&lib).unwrap();
             let key = FileFingerprint {
                 path: format!("static-ar-v6\0{}", fingerprint.path),
@@ -10015,6 +10755,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         let hasher = FileHasher::persistent(&db_path);
         let first = hasher.hash(&file).unwrap();
+        hasher.flush_memo();
         let first_stats = hasher.stats();
         assert_eq!(first_stats.cache_hits, 0);
         assert_eq!(first_stats.cache_misses, 1);

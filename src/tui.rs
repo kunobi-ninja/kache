@@ -3165,6 +3165,8 @@ mod tests {
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
+            shared_hardlink_restores: false,
+            deferred_discovery: true,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,

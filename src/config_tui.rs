@@ -1933,6 +1933,8 @@ mod tests {
                 record_sessions: None,
                 local_hit_daemon: None,
                 windows_hardlink: None,
+                shared_hardlink_restores: None,
+                deferred_discovery: None,
                 auto_gc: None,
                 gc_evict_shared: Some(true),
                 storage_layout_advice: None,

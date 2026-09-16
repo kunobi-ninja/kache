@@ -332,6 +332,13 @@ fn parse_emit_value(value: &str, kinds: &mut Vec<String>, dep_info_output: &mut 
 }
 
 impl RustcArgs {
+    /// Is this `clippy-driver <rustc> <args>`, Cargo's composition of
+    /// `RUSTC_WRAPPER` with Clippy as `RUSTC_WORKSPACE_WRAPPER`?
+    pub fn is_clippy_chain(&self) -> bool {
+        self.inner_rustc.is_some()
+            && crate::compiler::is_clippy_driver(&self.rustc.to_string_lossy())
+    }
+
     /// Parse RUSTC_WRAPPER-style arguments.
     /// In RUSTC_WRAPPER mode, argv[0] = kache, argv[1] = rustc path, argv[2..] = rustc args.
     pub fn parse(args: &[String]) -> Result<Self> {

@@ -5699,6 +5699,11 @@ impl Daemon {
                     tracing::info!("backfilled {mapped} entry blob maps");
                 }
 
+                match store.file_hash_cache().prune_cc_preprocess_memos() {
+                    Ok((memos, inputs)) => tracing::debug!(memos, inputs, "gc: pruned C/C++ memos"),
+                    Err(error) => tracing::warn!("gc: C/C++ memo pruning failed: {error}"),
+                }
+
                 // Bound the post-eviction demand log, and report what it says
                 // so far: a high demand rate means eviction is discarding
                 // entries the build still wants (#594).
@@ -10206,6 +10211,8 @@ mod tests {
             volume_stores: Vec::new(),
             local_hit_daemon: false,
             windows_hardlink: false,
+            shared_hardlink_restores: false,
+            deferred_discovery: true,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,

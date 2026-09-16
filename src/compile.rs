@@ -172,6 +172,7 @@ pub fn run_rustc(
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    let compiler_trace = crate::phase_trace::phase("compiler");
     let child = cmd
         .spawn()
         .with_context(|| format!("executing {}", rustc.display()))?;
@@ -179,6 +180,7 @@ pub fn run_rustc(
     let output = child
         .wait_with_output()
         .with_context(|| format!("executing {}", rustc.display()))?;
+    drop(compiler_trace);
     drop(response_file);
     if let Some(monitor) = monitor {
         monitor.finish();

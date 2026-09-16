@@ -117,6 +117,7 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 | `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | Force listed rustc crate names onto that incremental path |
 | `KACHE_MODIFIED_INPUT_GUARD` | `cache.modified_input_guard` | `false` | Do not store a result when a keyed input changed at or after build start |
 | `KACHE_INPUT_PREDICTIONS` | `cache.input_predictions` | `false` | Remember each crate's source closure and derive the next key from it, skipping the dep-info pre-pass when every recorded input still checks out |
+| `KACHE_BUILD_SCRIPT_CACHE` | none | `true` (Unix) | Cache build-script runs: restore `OUT_DIR` and the script's output instead of running it when its binary, Cargo environment and declared `rerun-if-*` inputs match a recorded run. See [Build scripts](/how-it-works/build-scripts). |
 | `KACHE_FALLBACK` | `cache.fallback` | none | Wrapper used for ordinary Kache passthroughs |
 | none | `cache.exclude` | `[]` | Source-path globs that bypass Kache |
 | none | `cache.bypass_crates` | `[]` | Exact rustc crate names that bypass Kache |
@@ -258,7 +259,7 @@ That writes `metrics.otlp.json` and `schema_version` in the directory. `--scenar
 
 On a host where several jobs share one cache, the payload reports `kache.cache.store.physical_size`: registered blob bytes, the figure GC compares with `kache.cache.store.max`. `kache.cache.store.size` is the sum of logical entry sizes and may differ. It also reports `kache.cache.index.size` (`index.db` plus `-wal`), `kache.cache.index.wal.size`, and `kache.cache.index.rowid_high_water` per table. Last-run GC gauges include duration, pinned and unreclaimable entries, failed evictions, stale WAL snapshot failures, and recently accessed entries skipped before reading their metadata. The shipper adds host identity. The index probe is read-only with a 25 ms lock timeout and omits unavailable figures. `kache stats --json` carries the index figures and GC summary as `index_bytes`, `index_wal_bytes`, `index_rowid_high_water` and `gc`.
 
-Read `rowid_high_water` as a write counter, not a row count. It is the largest rowid in each table. Several tables (`file_hashes`, `cc_preprocess_memos`, `input_predictions`, `eviction_tombstones`) are written with `INSERT OR REPLACE`, which gives a replaced row a new rowid, so the figure grows with every insert and every replacement and does not fall when rows are deleted. For how big the index is, use `kache.cache.index.size`.
+`rowid_high_water` reports the largest rowid in each table. Tables written with `INSERT OR REPLACE` (`file_hashes`, `input_predictions`, `eviction_tombstones`) allocate new rowids on replacement, so this value can grow without adding rows. C/C++ memos keep their IDs on update; their high-water value does not count refreshes. Use `kache.cache.index.size` to measure index bytes.
 
 To keep per-build numbers at machine level, add `--record` to `kache report`:
 
@@ -285,6 +286,8 @@ Session and GC history are opt-in. `kache telemetry write` reads index rows and 
 | `KACHE_RECORD_SESSIONS` | `cache.record_sessions` | `false` | Make every `kache report` append its session line, as `--record` does, and every GC run append to `telemetry/gc-runs.jsonl` |
 | `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Warn when storage layout forces copies |
 | `KACHE_WINDOWS_HARDLINK` | `cache.windows_hardlink` | `false` | Unsafe opt-in hardlink restores on non-CoW Windows volumes |
+| `KACHE_DEFERRED_DISCOVERY` | `cache.deferred_discovery` | `true` | On a certain miss (no closure record, no remote), compile first and key from the dep-info rustc emits instead of running the dep-info pre-pass. Set to `0` to keep the pre-pass on every miss. |
+| `KACHE_SHARED_HARDLINK_RESTORES` | `cache.shared_hardlink_restores` | `false` | Let every target directory hardlink the same store blob on filesystems without reflink. Only for single-use target directories (a CI job's tree): the restore-time mtime stamp on a shared inode re-dates the artifact in every other tree that links it. |
 | `KACHE_PROGRESS` | none | off | `hits` or `verbose` compiler progress |
 | `KACHE_LOG` | none | CLI: `kache=warn`; wrapper: off | Stderr tracing filter |
 | `KACHE_LOG_FILE` | none | CLI/daemon: `kache=info`; wrapper: off | File tracing filter and wrapper opt-in |

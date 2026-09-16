@@ -1669,6 +1669,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.file_hash_cache().record_verified(fingerprint, hash);
     }
 
+    /// [`Self::record_verified_file_hash`] for every restored file of one
+    /// hit, in one transaction with a short wait: the rows only save a later
+    /// hash, so a busy index (a miss's store transaction elsewhere) drops them
+    /// instead of stalling the hit.
+    pub fn record_verified_file_hashes(
+        &self,
+        restored: &[(crate::file_hash::FileFingerprint, &str)],
+    ) {
+        if restored.is_empty() {
+            return;
+        }
+        let _ = self.db.busy_timeout(std::time::Duration::from_millis(100));
+        let written = (|| -> rusqlite::Result<()> {
+            self.db.execute_batch("BEGIN IMMEDIATE")?;
+            for (fingerprint, hash) in restored {
+                self.file_hash_cache().record_verified(fingerprint, hash);
+            }
+            self.db.execute_batch("COMMIT")
+        })();
+        let _ = self.db.busy_timeout(std::time::Duration::from_millis(5000));
+        if let Err(error) = written {
+            let _ = self.db.execute_batch("ROLLBACK");
+            tracing::debug!("restored file hashes not memoised (index busy): {error}");
+        }
+    }
+
     /// Associate a stable file with its already-known content hash, avoiding a
     /// redundant read when it becomes a compiler input. Call this only after
     /// every store-side operation that may change the file's fingerprint and

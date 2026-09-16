@@ -63,9 +63,178 @@ const LINUX_PROBES: FileProbes = FileProbes {
 };
 
 /// Resolve CRT/startup/libc objects through `cc -print-file-name=` and hash
-/// each file that comes back as an absolute path.
-pub(crate) fn probe_linux_crt_objects(driver: &Path) -> Result<BTreeMap<String, String>> {
-    probe_files(LINUX_PROBES, |name| print_file_name(driver, name))
+/// each file that comes back as an absolute path. The memoised form below is
+/// what the key uses; this is the reference the tests compare it against.
+#[cfg(test)]
+pub(crate) fn probe_linux_crt_objects(
+    driver: &Path,
+    hash: impl Fn(&Path) -> Result<String>,
+) -> Result<BTreeMap<String, String>> {
+    let _trace = crate::phase_trace::phase("native_crt");
+    probe_files_with_hash(LINUX_PROBES, |name| print_file_name(driver, name), hash)
+}
+
+/// [`probe_linux_crt_objects`] with the driver's placements remembered.
+///
+/// Placing thirteen names costs thirteen driver spawns per linked output,
+/// which on a build-script-heavy warm build is most of what a hit spends.
+/// The placements only depend on the driver, the variables that steer its
+/// search, and what the searched directories contain, so they are memoised
+/// under the first two and validated against the third: every directory the
+/// driver searches, and every directory a placement came from, must still
+/// carry the modification stamp it had when the memo was written. A file
+/// added to or removed from any of them changes that stamp, so a name that
+/// would now place differently is probed again. Content is still hashed
+/// through `hash` on every call, as before.
+pub(crate) fn probe_linux_crt_objects_memoized(
+    memo_dir: &Path,
+    driver: &Path,
+    hash: impl Fn(&Path) -> Result<String>,
+) -> Result<BTreeMap<String, String>> {
+    let _trace = crate::phase_trace::phase("native_crt");
+    let placements = match crt_placement_memo(memo_dir, driver) {
+        Some(placed) => placed,
+        None => {
+            let placed = place_linux_crt_objects(driver);
+            record_crt_placement_memo(memo_dir, driver, &placed);
+            placed
+        }
+    };
+    probe_files_with_hash(LINUX_PROBES, |name| placements.get(name).cloned(), hash)
+}
+
+fn place_linux_crt_objects(driver: &Path) -> BTreeMap<String, PathBuf> {
+    LINUX_PROBES
+        .startup
+        .iter()
+        .chain(LINUX_PROBES.libc)
+        .chain(LINUX_PROBES.rest)
+        .filter_map(|name| Some((name.to_string(), print_file_name(driver, name)?)))
+        .collect()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CrtPlacementMemo {
+    /// Name to absolute path, for the names the driver placed.
+    placed: BTreeMap<String, PathBuf>,
+    /// Directory to `mtime_ns:ctime_ns` for every directory that decides a
+    /// placement: the driver's library search directories and the parent of
+    /// each placed file.
+    stamps: BTreeMap<PathBuf, String>,
+}
+
+/// Variables that change where a GCC or Clang driver looks for files.
+const CRT_SEARCH_ENV: &[&str] = &["LIBRARY_PATH", "GCC_EXEC_PREFIX", "COMPILER_PATH"];
+
+fn crt_memo_material(driver: &Path) -> Option<(PathBuf, String)> {
+    let canonical = std::fs::canonicalize(driver).ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    let mut material = Material::new("linux-crt-placements-v1");
+    // Both spellings: a driver that dispatches on its own name (`ccache`,
+    // `clang` via `aarch64-linux-gnu-clang`) canonicalizes to one binary and
+    // places differently under each name.
+    material.push(driver.as_os_str().as_encoded_bytes());
+    material.push(canonical.as_os_str().as_encoded_bytes());
+    material.push(&metadata.len().to_le_bytes());
+    material.push(&crate::cache_key::metadata_mtime_ns(&metadata).to_le_bytes());
+    for name in CRT_SEARCH_ENV {
+        material.push(name.as_bytes());
+        material.push(
+            &std::env::var_os(name)
+                .map(|value| value.as_encoded_bytes().to_vec())
+                .unwrap_or_default(),
+        );
+    }
+    Some((canonical, material.digest()))
+}
+
+fn directory_stamp(directory: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(directory).ok()?;
+    Some(format!(
+        "{}:{}",
+        crate::cache_key::metadata_mtime_ns(&metadata),
+        crate::cache_key::metadata_ctime_ns(&metadata)
+    ))
+}
+
+fn crt_placement_memo(memo_dir: &Path, driver: &Path) -> Option<BTreeMap<String, PathBuf>> {
+    let (_, digest) = crt_memo_material(driver)?;
+    let path = probe_memo::memo_path(memo_dir, "crt-placements", "json", &digest);
+    let body = probe_memo::read_verified(&path, &digest)?;
+    let memo: CrtPlacementMemo = serde_json::from_str(&body).ok()?;
+    if memo.stamps.is_empty() {
+        return None;
+    }
+    for (directory, stamp) in &memo.stamps {
+        if directory_stamp(directory).as_ref() != Some(stamp) {
+            return None;
+        }
+    }
+    memo.placed
+        .values()
+        .all(|path| path.is_file())
+        .then_some(memo.placed)
+}
+
+fn record_crt_placement_memo(memo_dir: &Path, driver: &Path, placed: &BTreeMap<String, PathBuf>) {
+    let Some((canonical, digest)) = crt_memo_material(driver) else {
+        return;
+    };
+    let mut directories: Vec<PathBuf> = driver_library_search_dirs(&canonical);
+    directories.extend(
+        placed
+            .values()
+            .filter_map(|path| path.parent().map(Path::to_path_buf)),
+    );
+    let mut stamps = BTreeMap::new();
+    for directory in directories {
+        let Ok(directory) = std::fs::canonicalize(&directory) else {
+            continue;
+        };
+        if let Some(stamp) = directory_stamp(&directory) {
+            stamps.insert(directory, stamp);
+        }
+    }
+    if stamps.is_empty() {
+        return;
+    }
+    let memo = CrtPlacementMemo {
+        placed: placed.clone(),
+        stamps,
+    };
+    if let Ok(body) = serde_json::to_string(&memo) {
+        probe_memo::write_verified(
+            &probe_memo::memo_path(memo_dir, "crt-placements", "json", &digest),
+            &digest,
+            &body,
+        );
+    }
+}
+
+/// The `libraries:` line of `cc -print-search-dirs`, as directories that exist.
+fn driver_library_search_dirs(driver: &Path) -> Vec<PathBuf> {
+    let Ok(output) = Command::new(driver)
+        .arg("-print-search-dirs")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = text
+        .lines()
+        .find_map(|line| line.strip_prefix("libraries:"))
+    else {
+        return Vec::new();
+    };
+    let line = line.trim().trim_start_matches('=');
+    std::env::split_paths(line)
+        .filter(|dir| dir.is_absolute() && dir.is_dir())
+        .collect()
 }
 
 /// Resolve each probe, hash what came back, and insist on the ones a key
@@ -75,9 +244,18 @@ pub(crate) fn probe_linux_crt_objects(driver: &Path) -> Result<BTreeMap<String, 
 /// different set keys differently. That alone is not enough: two hosts
 /// failing the *same* probe would agree on a key without ever pinning what
 /// that probe stood for. Startup and libc therefore have to resolve.
-pub(crate) fn probe_files(
+#[cfg(test)]
+fn probe_files(
     probes: FileProbes,
     place: impl Fn(&str) -> Option<PathBuf>,
+) -> Result<BTreeMap<String, String>> {
+    probe_files_with_hash(probes, place, hash_placed)
+}
+
+fn probe_files_with_hash(
+    probes: FileProbes,
+    place: impl Fn(&str) -> Option<PathBuf>,
+    hash: impl Fn(&Path) -> Result<String>,
 ) -> Result<BTreeMap<String, String>> {
     let mut resolved = BTreeMap::new();
     for name in probes
@@ -90,7 +268,8 @@ pub(crate) fn probe_files(
         let Some(path) = place(name) else {
             continue;
         };
-        let digest = hash_placed(&path)
+        let _trace = crate::phase_trace::phase("native_crt_hash");
+        let digest = hash(&path)
             .with_context(|| format!("hashing linker-placed {name} at {}", path.display()))?;
         resolved.insert(name.to_string(), digest);
     }
@@ -113,6 +292,7 @@ fn hash_placed(path: &Path) -> Result<String> {
 }
 
 fn print_file_name(driver: &Path, name: &str) -> Option<PathBuf> {
+    let _trace = crate::phase_trace::phase("native_crt_resolve");
     let output = Command::new(driver)
         .arg(format!("-print-file-name={name}"))
         .env("LC_ALL", "C")
@@ -1801,6 +1981,69 @@ mod tests {
         }
     }
 
+    /// The placement memo answers from disk while the searched directories
+    /// are unchanged, and forgets itself when one of them gains or loses a
+    /// file or a placed file disappears.
+    #[cfg(unix)]
+    #[test]
+    fn crt_placement_memo_follows_the_searched_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        for (name, bytes) in [("crt1.o", "start"), ("libc.so", "libc"), ("crti.o", "i")] {
+            std::fs::write(lib.join(name), bytes).unwrap();
+        }
+        let driver = dir.path().join("cc");
+        std::fs::write(
+            &driver,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  -print-search-dirs) echo \"libraries: ={lib}\" ;;\n  -print-file-name=*) n=\"${{1#-print-file-name=}}\"; if [ -f \"{lib}/$n\" ]; then echo \"{lib}/$n\"; else echo \"$n\"; fi ;;\nesac\n",
+                lib = lib.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let memo_dir = dir.path().join("probes");
+        for name in CRT_SEARCH_ENV {
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe { std::env::remove_var(name) };
+        }
+
+        let direct = probe_linux_crt_objects(&driver, hash_placed).unwrap();
+        let memoized = probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_placed).unwrap();
+        assert_eq!(memoized, direct);
+        assert_eq!(
+            memoized.keys().collect::<Vec<_>>(),
+            ["crt1.o", "crti.o", "libc.so"]
+        );
+        let placed = crt_placement_memo(&memo_dir, &driver).expect("memo written and valid");
+        assert_eq!(placed["crt1.o"], lib.join("crt1.o"));
+
+        // A file appearing in a searched directory changes what the driver
+        // would place; the memo must step aside.
+        std::fs::write(lib.join("crtn.o"), "n").unwrap();
+        assert!(crt_placement_memo(&memo_dir, &driver).is_none());
+        let refreshed = probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_placed).unwrap();
+        assert!(refreshed.contains_key("crtn.o"));
+        assert!(crt_placement_memo(&memo_dir, &driver).is_some());
+
+        // A placed file that is gone is a miss, and then a failed probe: the
+        // essentials must resolve.
+        std::fs::remove_file(lib.join("libc.so")).unwrap();
+        assert!(crt_placement_memo(&memo_dir, &driver).is_none());
+        assert!(probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_placed).is_err());
+
+        // The search variables are part of the identity.
+        std::fs::write(lib.join("libc.so"), "libc").unwrap();
+        let _ = probe_linux_crt_objects_memoized(&memo_dir, &driver, hash_placed).unwrap();
+        assert!(crt_placement_memo(&memo_dir, &driver).is_some());
+        unsafe { std::env::set_var("LIBRARY_PATH", "/opt/other") };
+        assert!(crt_placement_memo(&memo_dir, &driver).is_none());
+        unsafe { std::env::remove_var("LIBRARY_PATH") };
+    }
+
     #[test]
     fn a_link_is_only_identified_once_its_essentials_resolve() {
         let directory = tempfile::tempdir().unwrap();
@@ -1847,6 +2090,74 @@ mod tests {
     }
 
     #[test]
+    fn crt_hash_cache_preserves_resolution_and_detects_changed_objects() {
+        use crate::cache_key::FileHasher;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let probes = FileProbes {
+            startup: &["startup"],
+            libc: &["libc"],
+            rest: &["optional"],
+        };
+        for name in ["startup", "libc"] {
+            std::fs::write(root.join(name), vec![1u8; 131072]).unwrap();
+        }
+        let index = root.join("index.db");
+        let run = || {
+            let hasher = FileHasher::persistent(&index);
+            let result = probe_files_with_hash(
+                probes,
+                |name| {
+                    let path = root.join(name);
+                    path.is_file().then_some(path)
+                },
+                |path| hasher.hash(path),
+            );
+            (result, hasher.stats())
+        };
+        let (first, cold) = run();
+        let first = first.unwrap();
+        assert_eq!(cold.bytes_hashed, 262144);
+        let (second, warm) = run();
+        assert_eq!(second.unwrap(), first);
+        assert_eq!(warm.cache_hits, 2);
+        assert_eq!(warm.bytes_hashed, 0);
+
+        // A newly resolvable optional object must enter the identity even
+        // though every existing object still has a cached content hash.
+        std::fs::write(root.join("optional"), b"new CRT object").unwrap();
+        let with_optional = run().0.unwrap();
+        assert!(with_optional.contains_key("optional"));
+        assert_ne!(with_optional, first);
+
+        std::fs::write(root.join("libc"), vec![2u8; 131073]).unwrap();
+        let changed = run().0.unwrap();
+        assert_ne!(changed["libc"], first["libc"]);
+        assert_eq!(changed["libc"], hash_placed(&root.join("libc")).unwrap());
+        std::fs::remove_file(root.join("startup")).unwrap();
+        assert!(
+            run().0.is_err(),
+            "cached hashes cannot replace missing startup objects"
+        );
+    }
+
+    #[test]
+    fn crt_hash_failures_are_not_omitted_from_the_identity() {
+        let probes = FileProbes {
+            startup: &["startup"],
+            libc: &[],
+            rest: &[],
+        };
+        let result = probe_files_with_hash(
+            probes,
+            |_| Some(PathBuf::from("selected-object")),
+            |_| anyhow::bail!("unreadable object"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn a_platform_that_places_nothing_is_still_identified() {
         let probes = FileProbes {
             startup: &[],
@@ -1880,7 +2191,7 @@ mod tests {
         let Ok(driver) = which_cc() else {
             return;
         };
-        let Ok(objects) = probe_linux_crt_objects(&driver) else {
+        let Ok(objects) = probe_linux_crt_objects(&driver, hash_placed) else {
             return;
         };
         assert!(

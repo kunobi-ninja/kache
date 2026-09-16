@@ -1240,6 +1240,31 @@ fn init_with_user_systemd_installs_the_login_service() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn init_updates_a_login_service_that_runs_another_binary() {
+    let e = env();
+    let unit = e.home.join(".config/systemd/user/kache.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(&unit, "[Service]\nExecStart=/old/kache daemon run\n").unwrap();
+    e.cmd()
+        .env(
+            "PATH",
+            fake_systemd_path(&e.home.join("fake-bin"), "exit 0"),
+        )
+        .args(["init", "--no-shell"])
+        .write_stdin("y\ny\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Update service?"))
+        .stdout(predicates::str::contains("Service installed"));
+    let updated = std::fs::read_to_string(&unit).unwrap();
+    assert!(
+        !updated.contains("/old/kache"),
+        "unit was not rewritten: {updated}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn init_continues_when_the_login_service_cannot_be_installed() {
     // The same shape as Task Scheduler refusing a non-admin user on Windows:
     // the service install fails, and init must still finish (#1080).

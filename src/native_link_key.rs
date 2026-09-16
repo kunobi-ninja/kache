@@ -65,7 +65,7 @@ const LINUX_PROBES: FileProbes = FileProbes {
 /// Resolve CRT/startup/libc objects through `cc -print-file-name=` and hash
 /// each file that comes back as an absolute path. The memoised form below is
 /// what the key uses; this is the reference the tests compare it against.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn probe_linux_crt_objects(
     driver: &Path,
     hash: impl Fn(&Path) -> Result<String>,

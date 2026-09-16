@@ -1332,12 +1332,20 @@ fn resolve_key_inputs(
     }
     if args.source_file.is_some() {
         let mut prediction = predicted_key_inputs(args, file_hasher);
+        // Whether "no record" means nobody built this unit here. A unit whose
+        // record is shared across target directories and whose discovery
+        // flight this process owns (or needs no flight) can be sure; a peer
+        // that waited for an owner and still finds nothing, or a unit whose
+        // record is target-directory-local (a proc-macro dependent), may
+        // well find the entry under the key the pre-pass yields.
+        let mut certain_miss = rustc_shared_prediction_identity(args).is_some();
         if prediction.is_err()
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
             && let Some(identity) = prediction_discovery_identity(args, file_hasher)
         {
-            *file_hasher.discovery_flight.borrow_mut() =
-                crate::scheduler::join_discovery(cache_dir, &identity);
+            let flight = crate::scheduler::join_discovery(cache_dir, &identity);
+            certain_miss = certain_miss && flight.is_some();
+            *file_hasher.discovery_flight.borrow_mut() = flight;
             // The previous owner may have published while this process waited.
             prediction = predicted_key_inputs(args, file_hasher);
         }
@@ -1375,7 +1383,9 @@ fn resolve_key_inputs(
                 let _ = LAST_KEY_USED_PREDICTION.try_with(|stash| stash.set(true));
                 return Ok(Some(dep_info));
             }
-            Err(Rejection::NoRecord) if DEFER_DISCOVERY.with(std::cell::Cell::get) => {
+            Err(Rejection::NoRecord)
+                if certain_miss && DEFER_DISCOVERY.with(std::cell::Cell::get) =>
+            {
                 crate::phase_trace::decision("prediction", "deferred");
                 tracing::trace!("[key:{}] inputs=deferred", crate_name);
                 return Err(anyhow::Error::new(DeferredDiscovery));
@@ -6747,13 +6757,28 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("index.db");
+        let out_dir = dir.path().join("target/debug/deps");
         let args = RustcArgs::parse(
-            &["rustc", "src/lib.rs", "--edition", "2021"]
-                .iter()
-                .map(|a| (*a).to_string())
-                .collect::<Vec<_>>(),
+            &[
+                "rustc",
+                "--crate-name",
+                "x",
+                "src/lib.rs",
+                "--edition",
+                "2021",
+                "--emit=dep-info,metadata",
+                "--out-dir",
+                &out_dir.display().to_string(),
+            ]
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect::<Vec<_>>(),
         )
         .unwrap();
+        assert!(
+            rustc_shared_prediction_identity(&args).is_some(),
+            "a target directory gives the unit a shared record identity"
+        );
         let on = FileHasher::persistent(&db).with_input_predictions(true);
 
         set_defer_discovery(true);

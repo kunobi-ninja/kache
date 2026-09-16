@@ -13088,6 +13088,16 @@ exit 0
             !cc_store_candidate(true, false, true),
             "the peer's entry stands"
         );
+        assert!(cc_restore_committed(false, true));
+        assert!(
+            !cc_restore_committed(false, false),
+            "an entry that does not fit is not restored"
+        );
+        assert!(
+            !cc_restore_committed(true, true),
+            "never over a compile's own outputs"
+        );
+        assert!(!cc_restore_committed(true, false));
     }
 
     #[test]

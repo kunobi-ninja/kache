@@ -15,6 +15,12 @@ Kache therefore caches the run itself. After the rustc wrapper produces a
 the path Cargo expects and installs a launcher there. Cargo runs the launcher,
 which hands the invocation to Kache.
 
+The launcher is a small native program that ships inside Kache. It passes
+Cargo's environment on unchanged, including `DEP_*` variables whose names a
+shell would drop: Cargo spells a `links` dependency's metadata keys as the
+script printed them, so Tauri's `cargo:core:window__...` arrives as
+`DEP_TAURI_CORE:WINDOW__...`.
+
 ## What a run is keyed on
 
 Kache reuses Cargo's own rule for when a build script must rerun. A recorded run
@@ -47,7 +53,7 @@ Entries stay in the local store: `kache sync` never uploads them.
 - A run that started with a non-empty `OUT_DIR`, or during which a declared
   input changed.
 - An `OUT_DIR` containing symlinks, more than 50,000 files, or over 1 GiB.
-- Any platform without `/bin/sh` launchers (Windows).
+- Windows, where no launcher is installed.
 
 ## Limits
 

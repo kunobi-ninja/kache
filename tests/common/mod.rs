@@ -146,6 +146,10 @@ pub fn hermetic_command(
         .env_remove("KACHE_ACTIVE")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        // Cargo sets kache's own OUT_DIR on the test process (kache has a
+        // build script). A child compile would inherit it and look like a
+        // unit with an OUT_DIR.
+        .env_remove("OUT_DIR")
         .env("KACHE_HOST_CONFIG", "");
     match config {
         Some(path) => command.env("KACHE_CONFIG", path),

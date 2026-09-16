@@ -10,6 +10,10 @@
 //! The rustc wrapper, after producing a `build_script_*` binary, moves it aside
 //! and installs a launcher at Cargo's expected path. Cargo runs the launcher;
 //! it execs kache in build-script mode with the preserved binary beside it.
+//! The launcher is a native program (`launcher/build_script.rs`, compiled by
+//! kache's build script), not a shell script: a shell drops environment
+//! variables whose names are not shell identifiers, and Cargo's `DEP_*`
+//! metadata variables can be spelled that way.
 //! kache then restores `OUT_DIR` and the script's stdout/stderr from the cache
 //! when the run's inputs match a recorded run, and otherwise runs the real
 //! script and records the result.
@@ -42,8 +46,16 @@ pub const SHIM_PATH_ENV: &str = "KACHE_BUILD_SCRIPT_PATH";
 const ENABLE_ENV: &str = "KACHE_BUILD_SCRIPT_CACHE";
 const REAL_SUFFIX: &str = ".kache-real";
 const ACTION_SUFFIX: &str = ".kache-real.action";
+/// Beside the launcher: the preserved script's file name and the pinned
+/// kache relative to the profile directory, each NUL-terminated. The launcher
+/// reads it instead of listing the directory.
+#[cfg_attr(not(unix), allow(dead_code))]
+const LAUNCH_RECORD: &str = ".kache-launch";
 #[cfg_attr(not(unix), allow(dead_code))]
 const SHIM_DIR: &str = ".kache-build-script-shims";
+/// The launcher binary for this target, built from `launcher/build_script.rs`.
+#[cfg(unix)]
+const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-launcher"));
 const PREDICTION_SCHEMA: u32 = 1;
 const PREDICTION_PREFIX: &str = "build-script:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
@@ -107,12 +119,17 @@ pub fn install_shim(args: &RustcArgs) {
 
 #[cfg(unix)]
 fn install(executable: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
     let metadata = std::fs::metadata(executable)?;
     let modified = metadata.modified()?;
     let real = with_suffix(executable, REAL_SUFFIX);
     let action = with_suffix(executable, ACTION_SUFFIX);
+    let record = executable
+        .parent()
+        .context("build script has no parent directory")?
+        .join(LAUNCH_RECORD);
     let binary_hash = kache_store::file_hash::hash_file(executable)?;
 
     // <profile>/build/<pkg>-<hash>/<exe>: the profile directory is what the
@@ -127,25 +144,23 @@ fn install(executable: &Path) -> Result<()> {
         .strip_prefix(profile)
         .context("pinned kache is outside the profile directory")?;
 
-    // When the pinned kache is gone (a pruned or partially restored target
-    // directory), run the preserved script directly rather than failing the
-    // build: uncached is always acceptable.
-    let launcher = format!(
-        "#!/bin/sh\n\
-         d=\"$(dirname \"$0\")\"\n\
-         k=\"$d/../../{}\"\n\
-         if [ -x \"$k\" ]; then {SHIM_PATH_ENV}=\"$0\" exec \"$k\" \"$@\"; fi\n\
-         for r in \"$d\"/*{REAL_SUFFIX}; do [ -x \"$r\" ] && exec \"$r\" \"$@\"; done\n\
-         echo 'kache: build-script launcher found neither kache nor the preserved script' >&2\n\
-         exit 127\n",
-        relative.display()
-    );
     let _ = std::fs::remove_file(&real);
     std::fs::rename(executable, &real).context("preserving the build script")?;
     let installed = (|| -> Result<()> {
         std::fs::write(&action, &binary_hash)?;
+        let real_name = real.file_name().context("preserved script has no name")?;
+        std::fs::write(
+            &record,
+            [
+                real_name.as_bytes(),
+                b"\0",
+                relative.as_os_str().as_bytes(),
+                b"\0",
+            ]
+            .concat(),
+        )?;
         let temporary = with_suffix(executable, ".kache-launcher");
-        std::fs::write(&temporary, launcher)?;
+        std::fs::write(&temporary, LAUNCHER)?;
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
         // Cargo compares this path's mtime with its inputs when deciding
         // whether the compilation is fresh; keep the binary's.
@@ -158,6 +173,7 @@ fn install(executable: &Path) -> Result<()> {
     })();
     if let Err(error) = installed {
         let _ = std::fs::remove_file(&action);
+        let _ = std::fs::remove_file(&record);
         let _ = std::fs::rename(&real, executable);
         return Err(error);
     }
@@ -2110,14 +2126,11 @@ mod tests {
             std::fs::read_to_string(&real).unwrap(),
             "#!/bin/sh\necho real\n"
         );
-        let launcher = std::fs::read_to_string(&executable).unwrap();
-        assert!(launcher.starts_with("#!/bin/sh\n"));
-        assert!(launcher.contains(SHIM_PATH_ENV));
-        assert!(
-            launcher.contains(REAL_SUFFIX),
-            "falls back to the preserved script"
-        );
-        assert!(dir.path().join("debug").join(SHIM_DIR).is_dir());
+        assert_eq!(std::fs::read(&executable).unwrap(), LAUNCHER);
+        let (real_name, pinned) = launch_record(&unit);
+        assert_eq!(real_name, "build_script_build-1.kache-real");
+        assert!(pinned.starts_with(dir.path().join("debug").join(SHIM_DIR)));
+        assert!(pinned.is_file(), "the record names the pinned kache");
         // The launcher runs the preserved script when the pinned kache is gone.
         std::fs::remove_dir_all(dir.path().join("debug").join(SHIM_DIR)).unwrap();
         let output = std::process::Command::new(&executable).output().unwrap();
@@ -2135,5 +2148,77 @@ mod tests {
             stored_binary_hash(&real).unwrap(),
             kache_store::file_hash::hash_file(&real).unwrap()
         );
+    }
+
+    /// Cargo spells a `links` dependency's metadata keys as the script printed
+    /// them, so `DEP_*` names can hold `:`, `-` or `.`. A shell launcher drops
+    /// those under dash; the launcher must hand every name on, to kache and to
+    /// the preserved script alike.
+    #[cfg(unix)]
+    #[test]
+    fn the_launcher_passes_every_variable_name_on() {
+        const NAME: &str = "DEP_TAURI_CORE:WINDOW__CORE-PLUGIN.PERMISSION_FILES_PATH";
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        // `env` stands in for both the script and kache: it prints exactly the
+        // environment it was started with.
+        // A link, not a copy: macOS kills a copied system binary.
+        let executable = unit.join("build_script_build-1");
+        std::os::unix::fs::symlink("/usr/bin/env", &executable).unwrap();
+        install(&executable).unwrap();
+        let (_, pinned) = launch_record(&unit);
+        std::fs::remove_file(&pinned).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/env", &pinned).unwrap();
+        let hardlink = unit.join("build-script-build");
+        std::fs::hard_link(&executable, &hardlink).unwrap();
+        let environment = |launcher: &Path, stale: Option<&str>| {
+            let mut command = std::process::Command::new(launcher);
+            match stale {
+                Some(value) => command.env(SHIM_PATH_ENV, value),
+                None => command.env_remove(SHIM_PATH_ENV),
+            };
+            let output = command.env(NAME, "kept").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+
+        let to_kache = environment(&hardlink, Some("/stale"));
+        assert!(
+            to_kache.lines().any(|line| line == format!("{NAME}=kept")),
+            "{to_kache}"
+        );
+        assert!(
+            to_kache
+                .lines()
+                .filter(|line| line.starts_with(SHIM_PATH_ENV))
+                .eq([format!("{SHIM_PATH_ENV}={}", hardlink.display()).as_str()]),
+            "kache learns only the path Cargo invoked: {to_kache}"
+        );
+
+        std::fs::remove_file(&pinned).unwrap();
+        let to_script = environment(&hardlink, None);
+        assert!(
+            to_script.lines().any(|line| line == format!("{NAME}=kept")),
+            "{to_script}"
+        );
+        assert!(
+            !to_script.contains(SHIM_PATH_ENV),
+            "the preserved script runs as Cargo started it: {to_script}"
+        );
+    }
+
+    /// The preserved script's name and the pinned kache from `.kache-launch`.
+    #[cfg(unix)]
+    fn launch_record(unit: &Path) -> (String, PathBuf) {
+        let record = std::fs::read_to_string(unit.join(LAUNCH_RECORD)).unwrap();
+        let fields: Vec<&str> = record.split('\0').collect();
+        assert_eq!(fields.len(), 3, "two NUL-terminated fields: {record:?}");
+        let profile = unit.ancestors().nth(2).unwrap();
+        (fields[0].to_string(), profile.join(fields[1]))
     }
 }

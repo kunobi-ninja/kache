@@ -515,6 +515,108 @@ fn build_script_runs_are_restored_and_keyed_on_their_declarations() {
     assert!(results_for(&events_since(&fx.cache, mark), "build_script_run").is_empty());
 }
 
+/// Cargo passes a `links` dependency's metadata to its dependents as
+/// `DEP_<LINKS>_<KEY>`, spelling the key as the script printed it. Tauri prints
+/// `cargo:core:window__CORE_PLUGIN___PERMISSION_FILES_PATH=...`, and under a
+/// `/bin/sh` launcher dash dropped the resulting variable before the dependent
+/// script ever ran. Both runs must see every key, cold and restored.
+#[test]
+fn links_metadata_reaches_dependent_build_scripts_whatever_its_spelling() {
+    let workspace = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    let root = workspace.path();
+    let write = |relative: &str, content: &str| {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"linked\", \"consumer\"]\nresolver = \"2\"\n",
+    );
+    write(
+        "linked/Cargo.toml",
+        "[package]\nname = \"linked\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"linked\"\n",
+    );
+    write("linked/src/lib.rs", "");
+    write(
+        "linked/build.rs",
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let files = out.join("core-window-permission-files");
+    std::fs::write(&files, "[]").unwrap();
+    println!("cargo:core:window__CORE_PLUGIN___PERMISSION_FILES_PATH={}", files.display());
+    println!("cargo:dashed-key.with.dots=yes");
+    println!("cargo:plain=yes");
+}
+"#,
+    );
+    write(
+        "consumer/Cargo.toml",
+        "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nlinked = { path = \"../linked\" }\n",
+    );
+    write("consumer/src/lib.rs", "");
+    write(
+        "consumer/build.rs",
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    for name in [
+        "DEP_LINKED_CORE:WINDOW__CORE_PLUGIN___PERMISSION_FILES_PATH",
+        "DEP_LINKED_DASHED_KEY.WITH.DOTS",
+        "DEP_LINKED_PLAIN",
+    ] {
+        let Some(value) = std::env::var_os(name) else {
+            let seen: Vec<String> = std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .filter(|name| name.starts_with("DEP_"))
+                .collect();
+            panic!("{name} is missing; the script saw {seen:?}");
+        };
+        if name.ends_with("_PATH") {
+            assert!(std::path::Path::new(&value).is_file(), "{value:?}");
+        }
+    }
+    println!("cargo:warning=consumer saw every linked key");
+}
+"#,
+    );
+    let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+    for entry in walkdir(root) {
+        let _ = filetime::set_file_mtime(&entry, old);
+    }
+    std::fs::create_dir_all(home.path().join(".cargo")).unwrap();
+    let fx = Fixture {
+        workspace: root.to_path_buf(),
+        home: home.path().to_path_buf(),
+        cache: cache.path().to_path_buf(),
+        _dirs: vec![workspace, home, cache],
+    };
+
+    for (name, expected) in [("cold", "miss"), ("warm", "local_hit")] {
+        let mark = event_count(&fx.cache);
+        let output = run(&mut cargo(
+            "check",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &target(&fx, name),
+            &[],
+        ));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("consumer saw every linked key"),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            results_for(&events_since(&fx.cache, mark), "build_script_run"),
+            vec![expected, expected],
+            "{name}: both scripts go through the launcher"
+        );
+    }
+}
+
 /// `cargo clippy` units are served from the store with their diagnostics,
 /// and a change to the lint arguments is a different key.
 #[test]

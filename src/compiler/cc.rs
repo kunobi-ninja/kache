@@ -4772,10 +4772,17 @@ fn cc_preprocess_memo_key(
     let mut environment: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
         .filter(|(name, _)| cc_memo_env_is_keyed(name))
         .map(|(name, value)| {
-            (
-                cc_memo_os_bytes(&name),
-                apply_cc_prefix_maps_to_bytes(cc_memo_os_bytes(&value), prefix_maps),
-            )
+            // Mapped as text, then encoded like every other memo field: on
+            // Windows the field encoding is UTF-16 and the maps are UTF-8.
+            let mapped = match value.to_str() {
+                Some(text) => {
+                    let mapped =
+                        apply_cc_prefix_maps_to_bytes(text.as_bytes().to_vec(), prefix_maps);
+                    cc_memo_os_bytes(OsStr::new(String::from_utf8_lossy(&mapped).as_ref()))
+                }
+                None => cc_memo_os_bytes(&value),
+            };
+            (cc_memo_os_bytes(&name), mapped)
         })
         .collect();
     environment.sort();
@@ -6840,15 +6847,14 @@ impl CcCompiler {
                 return None;
             }
         };
+        // The depfile lists the source itself; adding it again is harmless,
+        // the fingerprints are deduplicated by name.
         for source in &parsed.sources {
-            let absolute = if source.is_absolute() {
+            paths.push(if source.is_absolute() {
                 source.clone()
             } else {
                 cwd.join(source)
-            };
-            if !paths.contains(&absolute) {
-                paths.push(absolute);
-            }
+            });
         }
         if let Some(construct) = cc_inputs_hide_assembler_input(&paths) {
             tracing::debug!(

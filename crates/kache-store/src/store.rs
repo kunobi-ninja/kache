@@ -6399,11 +6399,25 @@ mod tests {
         assert!(
             matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "verified")
         );
+        let second = dir.path().join("second.rlib");
+        fs::write(&second, vec![9; 65_536]).unwrap();
+        let second_fingerprint = FileFingerprint::from_path(&second).unwrap();
+        store.record_verified_file_hashes(&[
+            (fingerprint.clone(), "batched"),
+            (second_fingerprint, "batched-second"),
+        ]);
+        assert!(
+            matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "batched")
+        );
+        assert!(
+            matches!(store.file_hash_lookup(&second), FileHashLookup::Hit(hash) if hash == "batched-second")
+        );
+        store.record_verified_file_hashes(&[]);
         drop(store);
 
         let store = Store::open(&config).unwrap();
         assert!(
-            matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "verified")
+            matches!(store.file_hash_lookup(&artifact), FileHashLookup::Hit(hash) if hash == "batched")
         );
         fs::write(&artifact, vec![8; 65_537]).unwrap();
         assert!(matches!(

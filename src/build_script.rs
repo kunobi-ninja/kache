@@ -1320,6 +1320,559 @@ mod tests {
         }
     }
 
+    #[test]
+    fn find_bytes_handles_bounds_and_repeated_first_bytes() {
+        assert_eq!(find_bytes(b"abcabc", b"bc"), Some(1));
+        assert_eq!(find_bytes(b"xxab", b"ab"), Some(2));
+        assert_eq!(
+            find_bytes(b"aab", b"ab"),
+            Some(1),
+            "a false first-byte match moves on"
+        );
+        assert_eq!(
+            find_bytes(b"abc", b"abc"),
+            Some(0),
+            "a needle the size of the haystack"
+        );
+        assert_eq!(find_bytes(b"ab", b"abc"), None);
+        assert_eq!(find_bytes(b"abc", b""), None);
+        assert_eq!(find_bytes(b"", b"a"), None);
+        assert_eq!(
+            replace_all(b"/t/out/x /t/out/y", b"/t/out", b"${O}"),
+            b"${O}/x ${O}/y"
+        );
+        assert_eq!(replace_all(b"keep", b"", b"x"), b"keep");
+    }
+
+    #[test]
+    fn package_exclusions_cover_vcs_target_and_mapped_target_roots_inside_the_package() {
+        let package = Path::new("/src/pkg");
+        let environment = Environment {
+            out_dir: PathBuf::from("/src/pkg/target/debug/build/pkg-1/out"),
+            manifest_dir: package.to_path_buf(),
+            mappings: vec![
+                (
+                    PathBuf::from("/src/pkg/target/debug"),
+                    "${KACHE_TARGET_DIR}",
+                ),
+                (PathBuf::from("/src/pkg"), "${KACHE_MANIFEST_DIR}"),
+                (
+                    PathBuf::from("/elsewhere/target/debug"),
+                    "${KACHE_TARGET_DIR}",
+                ),
+            ],
+        };
+        let excluded = package_exclusions(package, &environment);
+        assert_eq!(
+            excluded,
+            vec![
+                PathBuf::from("/src/pkg/.git"),
+                PathBuf::from("/src/pkg/target"),
+                PathBuf::from("/src/pkg/target/debug"),
+            ],
+            "only target roots under the package are excluded, never the manifest root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_reads_any_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        for (mode, expected) in [
+            (0o644, false),
+            (0o600, false),
+            (0o755, true),
+            (0o700, true),
+            (0o010, true),
+        ] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                is_executable(&std::fs::metadata(&file).unwrap()),
+                expected,
+                "mode {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_dir_strips_the_unit_profile_and_triple() {
+        let _lock = crate::test_support::process_state_test_lock();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::remove_var("TARGET") };
+        assert_eq!(
+            target_dir(Path::new("/t/debug/build/pkg-1/out")),
+            Some(PathBuf::from("/t"))
+        );
+        assert_eq!(
+            target_dir(Path::new(
+                "/t/x86_64-unknown-linux-gnu/debug/build/pkg-1/out"
+            )),
+            Some(PathBuf::from("/t/x86_64-unknown-linux-gnu")),
+            "without TARGET the triple directory is not stripped"
+        );
+        unsafe { std::env::set_var("TARGET", "x86_64-unknown-linux-gnu") };
+        assert_eq!(
+            target_dir(Path::new(
+                "/t/x86_64-unknown-linux-gnu/debug/build/pkg-1/out"
+            )),
+            Some(PathBuf::from("/t"))
+        );
+        assert_eq!(
+            target_dir(Path::new("/t/debug/build/pkg-1/out")),
+            Some(PathBuf::from("/t")),
+            "a profile directory that is not the triple is kept"
+        );
+        unsafe { std::env::remove_var("TARGET") };
+        assert_eq!(target_dir(Path::new("/t/debug/other/pkg-1/out")), None);
+        assert_eq!(target_dir(Path::new("out")), None);
+    }
+
+    #[test]
+    fn cargo_environment_lists_fixed_and_prefixed_variables_with_normalized_values() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let env = environment(Path::new("/t/debug/build/pkg-1/out"), Path::new("/src/pkg"));
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe {
+            std::env::set_var("CARGO_PKG_NAME", "kt");
+            std::env::set_var("DEP_Z_INCLUDE", "/t/debug/build/z-1/out/include");
+            std::env::set_var("CARGO_CFG_UNIX", "");
+            std::env::set_var("KACHE_TEST_UNRELATED_VAR", "no");
+            std::env::remove_var("PKG_CONFIG_PATH");
+        }
+        let vars = cargo_environment(&env);
+        unsafe {
+            std::env::remove_var("CARGO_PKG_NAME");
+            std::env::remove_var("DEP_Z_INCLUDE");
+            std::env::remove_var("CARGO_CFG_UNIX");
+            std::env::remove_var("KACHE_TEST_UNRELATED_VAR");
+        }
+        assert_eq!(vars["CARGO_PKG_NAME"].as_deref(), Some("kt"));
+        assert_eq!(
+            vars["DEP_Z_INCLUDE"].as_deref(),
+            Some("/t/debug/build/z-1/out/include"),
+            "values outside a mapped root stay verbatim"
+        );
+        assert_eq!(vars["CARGO_CFG_UNIX"].as_deref(), Some(""));
+        assert!(
+            vars.contains_key("TARGET"),
+            "fixed names are listed even when unset"
+        );
+        assert_eq!(vars["PKG_CONFIG_PATH"], None);
+        assert!(!vars.contains_key("KACHE_TEST_UNRELATED_VAR"));
+        assert!(vars.len() >= 16);
+    }
+
+    #[test]
+    fn the_switch_only_turns_off_on_zero_or_false() {
+        let _lock = crate::test_support::process_state_test_lock();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::remove_var(ENABLE_ENV) };
+        assert!(enabled());
+        for (value, expected) in [
+            ("0", false),
+            ("false", false),
+            ("1", true),
+            ("yes", true),
+            ("", true),
+        ] {
+            unsafe { std::env::set_var(ENABLE_ENV, value) };
+            assert_eq!(enabled(), expected, "{value:?}");
+        }
+        unsafe { std::env::remove_var(ENABLE_ENV) };
+    }
+
+    #[test]
+    fn only_a_build_script_bin_in_a_build_unit_directory_is_a_compiled_build_script() {
+        let parse = |argv: &[&str]| {
+            RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug").join("build").join("pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        let unit_str = unit.to_str().unwrap();
+        let good = parse(&[
+            "rustc",
+            "--crate-name",
+            "build_script_build",
+            "--crate-type",
+            "bin",
+            "build.rs",
+            "--out-dir",
+            unit_str,
+            "-C",
+            "extra-filename=-1",
+        ]);
+        assert_eq!(
+            compiled_build_script(&good),
+            None,
+            "the binary has to exist before it can be shimmed"
+        );
+        let binary = unit.join(crate::args::format_crate_output_stem(
+            "build_script_build",
+            "-1",
+        ));
+        std::fs::write(&binary, "elf").unwrap();
+        assert_eq!(compiled_build_script(&good), Some(binary));
+        let deps = dir.path().join("debug").join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let deps_str = deps.to_str().unwrap();
+        for (stem, at) in [("pkg-1", &unit), ("build_script_build-1", &deps)] {
+            std::fs::write(at.join(stem), "elf").unwrap();
+        }
+        for (label, argv) in [
+            (
+                "not a build script",
+                vec![
+                    "rustc",
+                    "--crate-name",
+                    "pkg",
+                    "--crate-type",
+                    "bin",
+                    "src/main.rs",
+                    "--out-dir",
+                    unit_str,
+                    "-C",
+                    "extra-filename=-1",
+                ],
+            ),
+            (
+                "not a bin",
+                vec![
+                    "rustc",
+                    "--crate-name",
+                    "build_script_build",
+                    "--crate-type",
+                    "lib",
+                    "build.rs",
+                    "--out-dir",
+                    unit_str,
+                    "-C",
+                    "extra-filename=-1",
+                ],
+            ),
+            (
+                "not under build/",
+                vec![
+                    "rustc",
+                    "--crate-name",
+                    "build_script_build",
+                    "--crate-type",
+                    "bin",
+                    "build.rs",
+                    "--out-dir",
+                    deps_str,
+                    "-C",
+                    "extra-filename=-1",
+                ],
+            ),
+        ] {
+            assert!(compiled_build_script(&parse(&argv)).is_none(), "{label}");
+        }
+    }
+
+    #[test]
+    fn an_empty_rerun_if_env_changed_name_is_not_a_declaration() {
+        let env = environment(Path::new("/t/build/pkg-1/out"), Path::new("/src/pkg"));
+        let (inputs, names, default) =
+            parse_declarations("cargo:rerun-if-env-changed=\n", &env).unwrap();
+        assert!(names.is_empty());
+        assert!(default, "nothing declared means the package is the input");
+        assert_eq!(inputs, ["${KACHE_MANIFEST_DIR}"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_maps_both_spellings_and_a_plain_root_maps_once() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("out")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe {
+            std::env::set_var("OUT_DIR", link.join("out"));
+            std::env::set_var("CARGO_MANIFEST_DIR", &real);
+            std::env::remove_var("CARGO_TARGET_DIR");
+            std::env::remove_var("CARGO_HOME");
+        }
+        let environment = Environment::capture();
+        unsafe {
+            std::env::remove_var("OUT_DIR");
+            std::env::remove_var("CARGO_MANIFEST_DIR");
+        }
+        let environment = environment.unwrap();
+        let canonical_out = std::fs::canonicalize(link.join("out")).unwrap();
+        let out_roots: Vec<_> = environment
+            .mappings
+            .iter()
+            .filter(|(_, placeholder)| *placeholder == "${KACHE_OUT_DIR}")
+            .map(|(root, _)| root.clone())
+            .collect();
+        assert!(out_roots.contains(&link.join("out")), "{out_roots:?}");
+        assert!(out_roots.contains(&canonical_out), "{out_roots:?}");
+        let manifest_roots = environment
+            .mappings
+            .iter()
+            .filter(|(_, placeholder)| *placeholder == "${KACHE_MANIFEST_DIR}")
+            .count();
+        assert_eq!(
+            manifest_roots,
+            usize::from(std::fs::canonicalize(&real).unwrap() != real) + 1,
+            "a root that is already canonical is mapped once"
+        );
+    }
+
+    #[test]
+    fn out_dir_portability_depends_on_spelled_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let env = environment(&out, Path::new("/src/pkg"));
+        let plain = out.join("plain.h");
+        std::fs::write(&plain, "#define X 1").unwrap();
+        assert!(
+            env.out_dir_is_portable(&[(plain.clone(), "plain.h".into())])
+                .unwrap()
+        );
+        let spelled = out.join("paths.txt");
+        std::fs::write(&spelled, format!("root={}", out.display())).unwrap();
+        assert!(
+            !env.out_dir_is_portable(&[(spelled, "paths.txt".into())])
+                .unwrap()
+        );
+        let manifest = out.join("manifest.txt");
+        std::fs::write(&manifest, "at /src/pkg/src").unwrap();
+        assert!(
+            !env.out_dir_is_portable(&[(manifest, "manifest.txt".into())])
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn modified_since_distinguishes_absent_from_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(!modified_since(&dir.path().join("absent"), &[], later).unwrap());
+        assert!(
+            modified_since(&file.join("child"), &[], later).is_err(),
+            "a path through a file is an error, not an absence"
+        );
+        let hasher = crate::cache_key::FileHasher::new();
+        let mut budget = 10;
+        assert!(
+            input_state(&file.join("child"), &[], &hasher, &mut budget, 0).is_err(),
+            "an unreadable declared input is an error, not a missing one"
+        );
+        assert_eq!(
+            input_state(&dir.path().join("absent"), &[], &hasher, &mut budget, 0).unwrap(),
+            "missing"
+        );
+    }
+
+    #[test]
+    fn an_out_dir_past_the_byte_cap_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        // Sparse: the cap is judged on the size the metadata reports.
+        let big = std::fs::File::create(out.join("big.bin")).unwrap();
+        big.set_len(MAX_OUT_DIR_BYTES + 1).unwrap();
+        assert!(collect_out_dir(&out).is_err());
+        big.set_len(MAX_OUT_DIR_BYTES / 2).unwrap();
+        let second = std::fs::File::create(out.join("second.bin")).unwrap();
+        second.set_len(MAX_OUT_DIR_BYTES / 2 + 1).unwrap();
+        assert!(collect_out_dir(&out).is_err(), "sizes add up across files");
+        second.set_len(1).unwrap();
+        assert_eq!(collect_out_dir(&out).unwrap().files.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_real_reports_the_script_status_or_one_when_it_cannot_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        assert_eq!(run_real(&script("three", "#!/bin/sh\nexit 3\n"), &[]), 3);
+        assert_eq!(run_real(&script("zero", "#!/bin/sh\nexit 0\n"), &[]), 0);
+        assert_eq!(
+            run_real(
+                &script("arg", "#!/bin/sh\ntest \"$1\" = arg\n"),
+                &["arg".into()]
+            ),
+            0,
+            "arguments reach the script"
+        );
+        assert_eq!(run_real(&dir.path().join("absent"), &[]), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_executable_sets_and_clears_the_execute_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x").unwrap();
+        set_executable(&file, true).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        set_executable(&file, false).unwrap();
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(set_executable(&dir.path().join("absent"), true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_launcher_is_not_installed_while_the_switch_is_off() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        let executable = unit.join("build_script_build-1");
+        std::fs::write(&executable, "#!/bin/sh\necho real\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = RustcArgs::parse(
+            &[
+                "rustc",
+                "--crate-name",
+                "build_script_build",
+                "--crate-type",
+                "bin",
+                "build.rs",
+                "--out-dir",
+                unit.to_str().unwrap(),
+                "-C",
+                "extra-filename=-1",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::set_var(ENABLE_ENV, "0") };
+        install_shim(&args);
+        unsafe { std::env::remove_var(ENABLE_ENV) };
+        assert_eq!(
+            std::fs::read_to_string(&executable).unwrap(),
+            "#!/bin/sh\necho real\n",
+            "the binary is left alone"
+        );
+        assert!(!with_suffix(&executable, REAL_SUFFIX).exists());
+        install_shim(&args);
+        assert!(
+            with_suffix(&executable, REAL_SUFFIX).is_file(),
+            "the same invocation installs once the switch is back on"
+        );
+    }
+
+    /// The prediction row is addressed by the script binary: two scripts
+    /// never share declarations, and the same binary always finds its own.
+    #[test]
+    fn a_run_identity_names_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let run = |binary_hash: &str| Run {
+            store: Store::open(&config).unwrap(),
+            config: config.clone(),
+            binary_hash: binary_hash.to_string(),
+            environment: environment(&dir.path().join("out"), &dir.path().join("pkg")),
+            start: std::time::Instant::now(),
+        };
+        let a = run("aaaa");
+        let identity = a.identity();
+        assert!(identity.starts_with(PREDICTION_PREFIX), "{identity}");
+        assert!(identity.len() > PREDICTION_PREFIX.len() + 32);
+        assert_eq!(identity, a.identity(), "stable across calls");
+        assert_ne!(identity, run("bbbb").identity());
+    }
+
+    /// A `links` dependency hands its outputs down as `DEP_*` paths. What is
+    /// at an absolute path is part of the key; a relative or missing value
+    /// contributes its spelling only.
+    #[test]
+    fn dep_paths_are_keyed_by_content_only_when_absolute_and_present() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config: config.clone(),
+            binary_hash: "aaaa".to_string(),
+            environment: environment(&dir.path().join("out"), &dir.path().join("pkg")),
+            start: std::time::Instant::now(),
+        };
+        let prediction = Prediction {
+            version: PREDICTION_SCHEMA,
+            inputs: Vec::new(),
+            env: Vec::new(),
+            default_package: false,
+            portable_out_dir: true,
+        };
+        let absolute = dir.path().join("include.h");
+        std::fs::write(&absolute, "one").unwrap();
+        std::fs::write(dir.path().join("relative.h"), "one").unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::set_var("DEP_KT_INCLUDE", &absolute) };
+        let before = run.action_key(&prediction).unwrap();
+        std::fs::write(&absolute, "two").unwrap();
+        let after = run.action_key(&prediction).unwrap();
+        assert_ne!(
+            before, after,
+            "the file behind an absolute DEP_ path is keyed"
+        );
+
+        unsafe { std::env::set_var("DEP_KT_INCLUDE", "relative.h") };
+        let before = run.action_key(&prediction).unwrap();
+        std::fs::write(dir.path().join("relative.h"), "two").unwrap();
+        let after = run.action_key(&prediction).unwrap();
+        assert_eq!(before, after, "a relative value is only a spelling");
+        unsafe { std::env::remove_var("DEP_KT_INCLUDE") };
+    }
+
+    #[test]
+    fn input_digests_are_bounded_and_refuse_symlink_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir(&root).unwrap();
+        for i in 0..5 {
+            std::fs::write(root.join(format!("{i}.c")), "int x;").unwrap();
+        }
+        let hasher = crate::cache_key::FileHasher::new();
+        let mut budget = 3;
+        assert!(
+            input_state(&root, &[], &hasher, &mut budget, 0).is_err(),
+            "six entries exceed a budget of three"
+        );
+        let mut budget = 100;
+        assert!(input_state(&root, &[], &hasher, &mut budget, 0).is_ok());
+        assert_eq!(budget, 94, "every entry costs one");
+        #[cfg(unix)]
+        {
+            let a = dir.path().join("a");
+            let b = dir.path().join("b");
+            std::os::unix::fs::symlink(&b, &a).unwrap();
+            std::os::unix::fs::symlink(&a, &b).unwrap();
+            let mut budget = 1000;
+            assert!(input_state(&a, &[], &hasher, &mut budget, 0).is_err());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn declarations_follow_cargo_rerun_rules() {

@@ -12882,4 +12882,267 @@ pub fn value() -> (&'static str, u8) {
              the key — a change here is over-keying"
         );
     }
+
+    #[test]
+    fn the_stashed_tree_digest_is_taken_once() {
+        let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = None);
+        assert_eq!(take_last_tree_digest(), None);
+        let _ =
+            LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some("tree-1".to_string()));
+        assert_eq!(take_last_tree_digest().as_deref(), Some("tree-1"));
+        assert_eq!(take_last_tree_digest(), None, "taken, not peeked");
+    }
+
+    #[test]
+    fn a_deferred_discovery_says_so_when_displayed() {
+        let text = DeferredDiscovery.to_string();
+        assert!(text.contains("deferred"), "{text}");
+        let error: anyhow::Error = DeferredDiscovery.into();
+        assert!(error.downcast_ref::<DeferredDiscovery>().is_some());
+    }
+
+    #[test]
+    fn a_shared_identity_needs_an_absolute_target_and_a_predictable_unit() {
+        let _lock = key_test_lock();
+        let parse = |argv: &[&str]| {
+            RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("debug").join("deps");
+        std::fs::create_dir_all(&out).unwrap();
+        let out_str = out.to_str().unwrap();
+        let eligible = parse(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            "src/lib.rs",
+            "--out-dir",
+            out_str,
+        ]);
+        assert!(rustc_shared_prediction_identity(&eligible).is_some());
+        let relative = parse(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            "src/lib.rs",
+            "--out-dir",
+            "target/debug/deps",
+        ]);
+        assert!(
+            rustc_shared_prediction_identity(&relative).is_none(),
+            "a relative target directory is not shareable"
+        );
+        let with_macro = parse(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            "src/lib.rs",
+            "--out-dir",
+            out_str,
+            "--extern",
+            "my_macro=/t/debug/deps/libmy_macro-3.so",
+        ]);
+        assert!(
+            rustc_shared_prediction_identity(&with_macro).is_none(),
+            "a proc-macro dependency is not predictable by closure alone"
+        );
+    }
+
+    #[test]
+    fn a_discovery_identity_is_the_shared_one_when_predictions_are_on() {
+        let _lock = key_test_lock();
+        let parse = |argv: &[&str]| {
+            RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("debug").join("deps");
+        std::fs::create_dir_all(&out).unwrap();
+        let out_str = out.to_str().unwrap();
+        let eligible = parse(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            "src/lib.rs",
+            "--out-dir",
+            out_str,
+        ]);
+        let with_macro = parse(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            "src/lib.rs",
+            "--out-dir",
+            out_str,
+            "--extern",
+            "my_macro=/t/debug/deps/libmy_macro-3.so",
+        ]);
+        let db = dir.path().join("index.db");
+        let off = FileHasher::persistent(&db);
+        assert_eq!(prediction_discovery_identity(&eligible, &off), None);
+        let on = FileHasher::persistent(&db).with_input_predictions(true);
+        let identity = prediction_discovery_identity(&eligible, &on).unwrap();
+        assert_eq!(
+            Some(identity.clone()),
+            rustc_shared_prediction_identity(&eligible),
+            "the shared spelling comes first"
+        );
+        assert!(!identity.is_empty());
+        assert_eq!(
+            prediction_discovery_identity(&with_macro, &on),
+            None,
+            "not shareable and not predictable: no flight"
+        );
+    }
+
+    /// A record for a unit under the tree guard is usable only while the
+    /// crate tree it was made from is unchanged; a record without a tree
+    /// digest is not usable at all for such a unit.
+    #[test]
+    fn a_guarded_record_is_refused_when_the_tree_changed() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir
+            .path()
+            .join("registry")
+            .join("src")
+            .join("index-1")
+            .join("kt-1.0.0");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(package.join("src/lib.rs"), "pub fn v() {}\n").unwrap();
+        let parse = |argv: &[&str]| {
+            RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let out = dir.path().join("debug").join("deps");
+        std::fs::create_dir_all(&out).unwrap();
+        let with_macro = parse(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            package.join("src/lib.rs").to_str().unwrap(),
+            "--out-dir",
+            out.to_str().unwrap(),
+            "--extern",
+            "my_macro=/t/debug/deps/libmy_macro-3.so",
+        ]);
+        // SAFETY: the key test lock serialises environment edits.
+        unsafe {
+            std::env::set_var("CARGO_MANIFEST_DIR", &package);
+            std::env::remove_var("OUT_DIR");
+        }
+        let on = FileHasher::persistent(&dir.path().join("index.db")).with_input_predictions(true);
+        let tree = crate_tree_digest(&on).expect("a registry package has a tree digest");
+        let identity = rustc_prediction_identity(&with_macro).unwrap();
+        let closure = DepInfo {
+            source_files: vec![package.join("src/lib.rs")],
+            env_deps: Vec::new(),
+        };
+
+        on.record_input_prediction(&identity, Some("kt"), &closure, None);
+        assert_eq!(
+            predicted_key_inputs(&with_macro, &on),
+            Err(Rejection::NoRecord),
+            "a record without a tree digest cannot guard a proc-macro unit"
+        );
+
+        on.record_input_prediction(&identity, Some("kt"), &closure, Some("stale".to_string()));
+        assert_eq!(
+            predicted_key_inputs(&with_macro, &on),
+            Err(Rejection::TreeChanged)
+        );
+
+        on.record_input_prediction(&identity, Some("kt"), &closure, Some(tree.clone()));
+        let current = predicted_key_inputs(&with_macro, &on);
+        assert_ne!(current, Err(Rejection::TreeChanged), "{current:?}");
+        assert_ne!(current, Err(Rejection::NoRecord), "{current:?}");
+        assert_eq!(take_last_tree_digest(), Some(tree));
+
+        std::fs::write(package.join("extra.txt"), "read by the macro").unwrap();
+        assert_eq!(
+            predicted_key_inputs(&with_macro, &on),
+            Err(Rejection::TreeChanged),
+            "a file added under the package changes the tree"
+        );
+        unsafe { std::env::remove_var("CARGO_MANIFEST_DIR") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clippy_identity_reads_the_process_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let driver = dir.path().join("clippy-driver");
+        std::fs::write(
+            &driver,
+            "#!/bin/sh\necho 'clippy 0.1.98 (abc 2026-09-01)'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let member = dir.path().join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        // SAFETY: the key test lock serialises environment edits.
+        unsafe {
+            std::env::set_var("CARGO_MANIFEST_DIR", &member);
+            std::env::remove_var("CLIPPY_CONF_DIR");
+            std::env::remove_var("CLIPPY_ARGS");
+        }
+        let identity = clippy_identity(&driver).unwrap();
+        let expected = clippy_identity_in(
+            &driver,
+            |name| std::env::var_os(name),
+            std::env::current_dir().ok(),
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("CARGO_MANIFEST_DIR") };
+        assert_eq!(identity, expected);
+        assert!(identity.starts_with("clippy 0.1.98"), "{identity}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_libc_signature_names_the_running_libc() {
+        let family = if cfg!(target_env = "musl") {
+            LinuxLibcFamily::Musl
+        } else {
+            LinuxLibcFamily::Gnu
+        };
+        let signature = probe_linux_libc_signature(family).unwrap();
+        assert!(!signature.is_empty());
+        assert!(
+            signature.chars().any(|c| c.is_ascii_digit()),
+            "a version, not a label: {signature}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linker_identity_is_the_first_version_line_of_the_configured_linker() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: the key test lock serialises environment edits.
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", dir.path()) };
+        let linker = dir.path().join("my-ld");
+        std::fs::write(&linker, "#!/bin/sh\necho 'my-ld 9.9'\necho 'second line'\n").unwrap();
+        std::fs::set_permissions(&linker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let parse = |argv: &[&str]| {
+            RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let args = parse(&[
+            "rustc",
+            "src/lib.rs",
+            "-C",
+            &format!("linker={}", linker.display()),
+        ]);
+        let identity = get_linker_identity(&args);
+        let missing = get_linker_identity(&parse(&[
+            "rustc",
+            "src/lib.rs",
+            "-C",
+            &format!("linker={}", dir.path().join("absent").display()),
+        ]));
+        unsafe { std::env::remove_var("KACHE_CACHE_DIR") };
+        assert_eq!(identity.as_deref(), Some("my-ld 9.9"));
+        assert_eq!(missing, None, "a linker that cannot run has no identity");
+    }
 }

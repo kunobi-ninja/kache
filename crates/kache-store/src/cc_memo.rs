@@ -598,4 +598,35 @@ mod tests {
         );
         assert_eq!(cache.compact_sparse_index().unwrap(), None);
     }
+
+    #[test]
+    fn a_memo_input_names_its_local_path() {
+        let first = input("shared.h", "one");
+        assert_eq!(first.local_path(), "/checkout/shared.h");
+    }
+
+    #[test]
+    fn a_memo_without_inputs_is_not_a_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        cache
+            .put_cc_preprocess_memo_inputs("empty", "hash-e", &[])
+            .unwrap();
+        assert!(
+            cache.get_cc_preprocess_memo("empty").unwrap().is_none(),
+            "a preprocess always reads at least the source"
+        );
+        let json = serde_json::to_string(&[input("a.h", "one")]).unwrap();
+        cache
+            .put_cc_preprocess_memo("json", "hash-j", &json)
+            .unwrap();
+        let memo = cache.get_cc_preprocess_memo("json").unwrap().unwrap();
+        assert_eq!(memo.preprocessed_hash, "hash-j");
+        assert_eq!(memo.inputs, vec![input("a.h", "one")]);
+        assert!(
+            cache
+                .put_cc_preprocess_memo("bad", "hash-b", "not json")
+                .is_err()
+        );
+    }
 }

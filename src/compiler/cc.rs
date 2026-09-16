@@ -13513,4 +13513,69 @@ mod tests {
         );
         assert!(compiler.include_dir_names_still_match(&parse()));
     }
+
+    /// The case-folded fallback asks the filesystem only about a name whose
+    /// spelling differs from the listing, and treats "not there" as absence.
+    #[test]
+    fn directory_listings_confirm_a_case_folded_match_with_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let include = dir.path().join("include");
+        std::fs::create_dir(&include).unwrap();
+        std::fs::write(include.join("Foo.h"), "").unwrap();
+        let mut listings = CcDirectoryListings::default();
+        assert!(listings.contains(&include, OsStr::new("Foo.h")).unwrap());
+        assert!(!listings.contains(&include, OsStr::new("bar.h")).unwrap());
+        let folded = listings.contains(&include, OsStr::new("foo.h")).unwrap();
+        assert_eq!(
+            folded,
+            include.join("foo.h").symlink_metadata().is_ok(),
+            "only a case-insensitive filesystem provides foo.h"
+        );
+        assert!(
+            !listings
+                .contains(&dir.path().join("absent"), OsStr::new("Foo.h"))
+                .unwrap(),
+            "an absent directory provides nothing"
+        );
+        assert_eq!(
+            cc_first_include_dir_providing_cached(
+                &[dir.path().join("absent"), include.clone()],
+                Path::new("Foo.h"),
+                &mut listings
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            cc_first_include_dir_providing_cached(
+                std::slice::from_ref(&include),
+                Path::new("sub/Foo.h"),
+                &mut listings
+            )
+            .unwrap(),
+            None,
+            "the parent joins the directory before the listing is taken"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_case_folded_candidate_is_an_error_not_an_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root ignores directory modes");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let include = dir.path().join("include");
+        std::fs::create_dir(&include).unwrap();
+        std::fs::write(include.join("Foo.h"), "").unwrap();
+        let mut listings = CcDirectoryListings::default();
+        assert!(listings.contains(&include, OsStr::new("Foo.h")).unwrap());
+        std::fs::set_permissions(&include, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = listings.contains(&include, OsStr::new("foo.h"));
+        std::fs::set_permissions(&include, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = result.expect_err("permission denied is not an answer");
+        assert!(error.to_string().contains("unreadable"), "{error:#}");
+    }
 }

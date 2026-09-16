@@ -6906,58 +6906,7 @@ mod tests {
     }
 
     fn test_config(cache_dir: PathBuf) -> Config {
-        Config {
-            fallback: None,
-            key_salt: None,
-            cc_extra_allowlist_flags: Vec::new(),
-            local_only: false,
-            remote_readonly: false,
-            modified_input_guard: false,
-            input_predictions: false,
-            record_sessions: false,
-            volume_stores: Vec::new(),
-            local_hit_daemon: false,
-            windows_hardlink: false,
-            shared_hardlink_restores: false,
-            deferred_discovery: true,
-            auto_gc: true,
-            gc_evict_shared: false,
-            storage_layout_advice: true,
-            heartbeat_secs: 30,
-            explain_miss: false,
-            scheduler: true,
-            path_only_env_vars: Vec::new(),
-            incremental_crates: Vec::new(),
-            key_env_vars: Vec::new(),
-            base_dirs: Vec::new(),
-            runtime_dir: cache_dir.clone(),
-            cache_dir,
-            max_size: 1024 * 1024,
-            remote: None,
-            remote_error: None,
-            socket_path_override: None,
-            disabled: false,
-            cache_executables: false,
-            cache_cc_links: false,
-            clean_incremental: true,
-            preserve_incremental: false,
-            adaptive_incremental: true,
-            event_log_max_size: 10 * 1024 * 1024,
-            event_log_keep_lines: 1000,
-            compression_level: 3,
-            s3_concurrency: 16,
-            prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
-            remote_key_cache_refresh_secs: crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
-            prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
-            prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
-            prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
-            min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
-            gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
-            daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
-            s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
-            remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
-            remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
-        }
+        crate::test_support::test_config(cache_dir)
     }
 
     #[test]
@@ -13019,5 +12968,76 @@ exit 0
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         drop(guard);
+    }
+
+    /// A key derived from the emitted dep-info arms the too-new guard even
+    /// with the modified-input guard off: the compile already ran, so an input
+    /// written since it started may not match what rustc read.
+    #[test]
+    fn a_key_from_emitted_dep_info_always_arms_the_too_new_guard() {
+        if std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: no rustc");
+            return;
+        }
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.modified_input_guard = false;
+        config.input_predictions = true;
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let lib = src.join("lib.rs");
+        let out = dir.path().join("debug").join("deps");
+        std::fs::create_dir_all(&out).unwrap();
+        let args = RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "--crate-name",
+                "kt",
+                lib.to_str().unwrap(),
+                "--emit=dep-info,metadata",
+                "--out-dir",
+                out.to_str().unwrap(),
+            ]))
+            .unwrap();
+        let invocation_start_ns = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&lib, "pub fn v() {}\n").unwrap();
+        let closure = crate::cache_key::DepInfo {
+            source_files: vec![lib.clone()],
+            env_deps: Vec::new(),
+        };
+        let compiler = RustcCompiler::new();
+        let keyed = compute_rustc_cache_key(
+            &config,
+            &compiler,
+            &args,
+            None,
+            invocation_start_ns,
+            None,
+            None,
+            FileHashStats::default(),
+            false,
+            0,
+            Vec::new(),
+            KeyDiscovery::Emitted(closure),
+        )
+        .unwrap();
+        assert!(!keyed.cache_key.is_empty());
+        assert!(!keyed.deferred);
+        assert!(
+            keyed.key_too_new,
+            "a source written after the invocation started is too new"
+        );
     }
 }

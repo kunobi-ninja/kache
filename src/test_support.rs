@@ -44,6 +44,63 @@ pub(crate) fn process_state_test_lock() -> ProcessStateTestGuard {
     }
 }
 
+/// A `Config` rooted in `cache_dir` with every optional feature off, for
+/// tests that need a store without reading the developer's configuration.
+pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
+    crate::config::Config {
+        fallback: None,
+        key_salt: None,
+        cc_extra_allowlist_flags: Vec::new(),
+        local_only: false,
+        remote_readonly: false,
+        modified_input_guard: false,
+        input_predictions: false,
+        record_sessions: false,
+        volume_stores: Vec::new(),
+        local_hit_daemon: false,
+        windows_hardlink: false,
+        shared_hardlink_restores: false,
+        deferred_discovery: true,
+        auto_gc: true,
+        gc_evict_shared: false,
+        storage_layout_advice: true,
+        heartbeat_secs: 30,
+        explain_miss: false,
+        scheduler: true,
+        path_only_env_vars: Vec::new(),
+        incremental_crates: Vec::new(),
+        key_env_vars: Vec::new(),
+        base_dirs: Vec::new(),
+        runtime_dir: cache_dir.clone(),
+        cache_dir,
+        max_size: 1024 * 1024,
+        remote: None,
+        remote_error: None,
+        socket_path_override: None,
+        disabled: false,
+        cache_executables: false,
+        cache_cc_links: false,
+        clean_incremental: true,
+        preserve_incremental: false,
+        adaptive_incremental: true,
+        event_log_max_size: 10 * 1024 * 1024,
+        event_log_keep_lines: 1000,
+        compression_level: 3,
+        s3_concurrency: 16,
+        prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
+        remote_key_cache_refresh_secs: crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
+        prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
+        prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
+        prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
+        min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
+        gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
+        daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
+        s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
+        remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::process_state_test_lock;

@@ -5267,6 +5267,94 @@ remote_key_cache_refresh_secs = 900
     }
 
     #[test]
+    fn deferred_discovery_is_on_unless_switched_off() {
+        let _lock = config_path_lock();
+        let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
+        let off: Result<FileConfig> =
+            Ok(toml::from_str("[cache]\ndeferred_discovery = false\n").unwrap());
+        let on: Result<FileConfig> =
+            Ok(toml::from_str("[cache]\ndeferred_discovery = true\n").unwrap());
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::remove_var("KACHE_DEFERRED_DISCOVERY") };
+        assert!(Config::deferred_discovery_enabled(&none));
+        assert!(!Config::deferred_discovery_enabled(&off));
+        assert!(Config::deferred_discovery_enabled(&on));
+        for (value, expected) in [
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("", true),
+        ] {
+            unsafe { std::env::set_var("KACHE_DEFERRED_DISCOVERY", value) };
+            assert_eq!(
+                Config::deferred_discovery_enabled(&on),
+                expected,
+                "{value:?}"
+            );
+            assert_eq!(
+                Config::deferred_discovery_enabled(&off),
+                expected,
+                "{value:?} overrides the file"
+            );
+        }
+        unsafe { std::env::remove_var("KACHE_DEFERRED_DISCOVERY") };
+    }
+
+    #[test]
+    fn shared_hardlink_restores_are_off_unless_switched_on() {
+        let _lock = config_path_lock();
+        let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
+        let off: Result<FileConfig> =
+            Ok(toml::from_str("[cache]\nshared_hardlink_restores = false\n").unwrap());
+        let on: Result<FileConfig> =
+            Ok(toml::from_str("[cache]\nshared_hardlink_restores = true\n").unwrap());
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::remove_var("KACHE_SHARED_HARDLINK_RESTORES") };
+        assert!(!Config::shared_hardlink_restores_enabled(&none));
+        assert!(!Config::shared_hardlink_restores_enabled(&off));
+        assert!(Config::shared_hardlink_restores_enabled(&on));
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("0", false),
+            ("false", false),
+            ("yes", false),
+            ("", false),
+        ] {
+            unsafe { std::env::set_var("KACHE_SHARED_HARDLINK_RESTORES", value) };
+            assert_eq!(
+                Config::shared_hardlink_restores_enabled(&off),
+                expected,
+                "{value:?}"
+            );
+            assert_eq!(
+                Config::shared_hardlink_restores_enabled(&on),
+                expected,
+                "{value:?} overrides the file"
+            );
+        }
+        unsafe { std::env::remove_var("KACHE_SHARED_HARDLINK_RESTORES") };
+    }
+
+    #[test]
+    fn probe_memos_live_under_the_configured_cache_dir() {
+        let _lock = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", dir.path()) };
+        let probes = probe_memo_dir();
+        unsafe { std::env::remove_var("KACHE_CACHE_DIR") };
+        assert_eq!(probes, dir.path().join("probes"));
+        let default = probe_memo_dir();
+        assert_eq!(default, default_cache_dir().join("probes"));
+        assert!(default.is_absolute());
+    }
+
+    #[test]
     fn test_file_config_roundtrip() {
         let config = FileConfig {
             cc: None,

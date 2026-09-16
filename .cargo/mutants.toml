@@ -299,4 +299,50 @@ exclude_re = [
     "src/native_link_key.rs:.*replace WindowsProbeEnvironment::augment_from_installed_msvc .* with Ok",
     "SqlitePlannerRepository>::identity_candidates .* with Ok\\(vec!\\[\\]\\)",
     "crates/kache-store/src/link.rs:.*replace warn_no_cow_restore_once with \\(\\)",
+    # Build-script execution cache. The non-Unix `install` is a stub that
+    # refuses (`run_cargo_non_unix` shape: the ubuntu lane compiles only the
+    # Unix body, whose launcher tests stay in scope). `pin_kache` copies the
+    # binary only after `hard_link` fails, which one filesystem cannot
+    # arrange, so the guard on its race fallback is unreachable here.
+    # `tree_stamp`'s `>` keeps the newest mtime: replacing it with `>=`
+    # reassigns an equal value, the same result. `Run::restore` sums sizes
+    # for the event's `size` field only; every restored byte is asserted by
+    # the round-trip tests, the sum is not a decision.
+    "src/build_script.rs:.*replace install -> Result<\\(\\)> with Ok\\(\\(\\)\\)$",
+    "replace match guard pinned.is_file\\(\\) with (true|false) in pin_kache",
+    "replace > with >= in tree_stamp",
+    "replace \\+= with \\*= in Run::restore",
+    # Lock-poll back-off. `attempt` only paces the sleep between polls
+    # (`lock_poll_interval(attempt)`, capped at 100 ms); `*=` leaves it at
+    # the first interval, which changes how often a waiter polls and nothing
+    # a test can observe. The interval function itself is tested directly.
+    "replace \\+= with \\*= in StoreLock::wait_until_available",
+    "replace \\+= with \\*= in Scheduler::wait_for_permit",
+    "replace \\+= with \\*= in wait_for_lock",
+    "replace \\+= with \\*= in acquire_discovery",
+    # Printing rustc's captured stdout/stderr is gated on `!is_empty()`, so
+    # dropping the gate prints an empty string: a no-op.
+    "delete ! in run_parsed_rustc",
+    # `daemon_local && precompiled.is_none()`: without a daemon socket
+    # `try_daemon_local_hit` returns None, so the flip is observable only
+    # with a live local-hit daemon, which the e2e lanes run. The precompiled
+    # half is covered by the passthrough exit-code test.
+    "src/wrapper.rs:.*replace && with \\|\\| in run_parsed_rustc",
+    # `verify` gates one "Repairing:" line on `removed + inputs > 0`, the
+    # `run_gc_local` shape above; `prune_cc_preprocess_memos` is tested
+    # directly.
+    "replace match guard removed \\+ inputs > 0 with (true|false) in verify",
+    "replace \\+ with . in verify",
+    "replace > with (<|==|>=) in verify",
+    # `cc_first_include_dir_providing_cached` joins a non-empty parent onto
+    # the include directory; an empty parent joined is the same directory.
+    "replace match guard !parent.as_os_str\\(\\).is_empty\\(\\) with true in cc_first_include_dir_providing_cached",
+    # `FileHasher::prefetch` warms the daemon's hash cache and returns before
+    # doing anything without a socket; the keys it later serves are the same
+    # either way, only their latency differs.
+    "replace FileHasher<'db>::prefetch with \\(\\)",
+    # `Run::action_key` folds a `DEP_*` path's content only when the value is
+    # absolute and present. The value itself is always folded, so an absent
+    # or relative value keys the same with or without the extra fold.
+    "replace && with \\|\\| in Run::action_key",
 ]

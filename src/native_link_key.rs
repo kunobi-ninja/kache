@@ -3731,4 +3731,37 @@ mod tests {
         assert_eq!(entries(), before);
         let _ = (memo, memo_after);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn driver_library_search_dirs_keeps_absolute_directories_that_exist() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "").unwrap();
+        let driver = dir.path().join("cc");
+        std::fs::write(
+            &driver,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  -print-search-dirs) echo \"install: /x\"; echo \"libraries: ={lib}:.:{file}:{absent}\" ;;\nesac\n",
+                lib = lib.display(),
+                file = file.display(),
+                absent = dir.path().join("absent").display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(driver_library_search_dirs(&driver), vec![lib]);
+        let silent = dir.path().join("silent");
+        std::fs::write(&silent, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(driver_library_search_dirs(&silent).is_empty());
+        let failing = dir.path().join("failing");
+        std::fs::write(&failing, "#!/bin/sh\necho 'libraries: =/'; exit 1\n").unwrap();
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(driver_library_search_dirs(&failing).is_empty());
+        assert!(driver_library_search_dirs(&dir.path().join("absent")).is_empty());
+    }
 }

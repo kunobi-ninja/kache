@@ -4765,9 +4765,18 @@ fn cc_preprocess_memo_key(
         fold_cc_memo_field(&mut hasher, b"prefix-to", map.to.as_bytes());
     }
 
+    // Values through the same maps as the argv: a `cc`-crate build hands a
+    // dependency's include directory down as `DEP_<links>_INCLUDE`, a path
+    // under this build directory's target, and it must not give every build
+    // directory its own memo any more than `-I` does.
     let mut environment: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
         .filter(|(name, _)| cc_memo_env_is_keyed(name))
-        .map(|(name, value)| (cc_memo_os_bytes(&name), cc_memo_os_bytes(&value)))
+        .map(|(name, value)| {
+            (
+                cc_memo_os_bytes(&name),
+                apply_cc_prefix_maps_to_bytes(cc_memo_os_bytes(&value), prefix_maps),
+            )
+        })
         .collect();
     environment.sort();
     for (name, value) in environment {
@@ -14179,6 +14188,50 @@ mod tests {
                 "/work/job-b/target/debug/build/libfoo-sys-abc123/out/include/x.h"
             )],
             "a recorded name resolves to this build directory's file"
+        );
+    }
+
+    /// `DEP_<links>_INCLUDE` names a sibling build script's OUT_DIR; mapped,
+    /// two build directories share the memo, unmapped they do not.
+    #[test]
+    fn memo_key_maps_environment_values_like_arguments() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let compiler = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let parsed =
+            CcArgs::parse(&[compiler, "-c".to_string(), "memo-source.c".to_string()]).unwrap();
+        let maps_for = |job: &str| {
+            vec![CcPrefixMap {
+                from: format!("/work/{job}/target"),
+                to: CC_TARGET_SENTINEL.to_string(),
+            }]
+        };
+        let key = |job: &str| {
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe {
+                std::env::set_var(
+                    "DEP_KT_INCLUDE",
+                    format!("/work/{job}/target/debug/build/kt-sys-1/out/include"),
+                )
+            };
+            cc_preprocess_memo_key(&parsed, &maps_for(job), "test compiler version").unwrap()
+        };
+        let a = key("job-a");
+        let b = key("job-b");
+        assert_eq!(
+            a, b,
+            "the mapped value is the same in both build directories"
+        );
+        // SAFETY: as above.
+        unsafe { std::env::set_var("DEP_KT_INCLUDE", "/elsewhere/include") };
+        let elsewhere =
+            cc_preprocess_memo_key(&parsed, &maps_for("job-a"), "test compiler version").unwrap();
+        unsafe { std::env::remove_var("DEP_KT_INCLUDE") };
+        assert_ne!(
+            elsewhere, a,
+            "an include directory outside the maps still keys"
         );
     }
 }

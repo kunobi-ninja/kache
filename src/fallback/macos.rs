@@ -158,32 +158,50 @@ mod tests {
             "(version 1)(allow default)(deny file-write* (subpath \"{}\"))",
             denied.display()
         );
-        let mut child = Command::new("/usr/bin/sandbox-exec")
-            .args(["-p", &profile, "/bin/sleep", "10"])
+        // The child must outlive the readiness wait below, or a slow start
+        // leaves nothing to query.
+        let child = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "/bin/sleep", "600"])
             .spawn()
             .unwrap();
+        let mut child = KillOnDrop(child);
+        let pid = child.0.id() as i32;
         let policy = Policy::load().unwrap();
-        // spawn returns before sandbox-exec applies the profile.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if policy.sandboxed(child.id() as i32)
-                && process_path(child.id() as i32)
+        // spawn returns before sandbox-exec applies the profile and execs
+        // sleep. A loaded machine (a full workspace test run next to a build)
+        // can take seconds for that, so wait generously and fail on the wait
+        // itself rather than letting a late start look like a wrong policy.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let sandboxed = policy.sandboxed(pid);
+            let identity = process_path(pid);
+            if sandboxed
+                && identity
+                    .as_deref()
                     .is_some_and(|path| path.file_name() == Some(std::ffi::OsStr::new("sleep")))
             {
                 break;
             }
+            if Instant::now() >= deadline {
+                panic!(
+                    "sandboxed sleep never became ready: sandboxed={sandboxed}, \
+                     path={identity:?}, exit={:?}",
+                    child.0.try_wait()
+                );
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
-        let pid = child.id() as i32;
-        let denied_result = policy.denies_write(pid, &denied);
-        let allowed_result = policy.denies_write(pid, &allowed.canonicalize().unwrap());
-        let sandboxed = policy.sandboxed(pid);
-        let identity = process_path(pid);
-        let _ = child.kill();
-        child.wait().unwrap();
-        assert!(sandboxed);
-        assert!(denied_result);
-        assert!(!allowed_result);
-        assert_eq!(identity.unwrap().file_name().unwrap(), "sleep");
+        assert!(policy.denies_write(pid, &denied));
+        assert!(!policy.denies_write(pid, &allowed.canonicalize().unwrap()));
+    }
+
+    /// Kills the sandboxed child even when an assertion panics.
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 }

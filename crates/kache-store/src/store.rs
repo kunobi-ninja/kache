@@ -995,6 +995,14 @@ pub const TOMBSTONE_RETENTION_DAYS: u64 = 14;
 const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long a waiter sleeps before its next `try_lock`: 1 ms, doubling up to
+/// [`BUILD_LOCK_POLL_INTERVAL`]. A fixed 100 ms poll cost every waiter half
+/// of that on each hand-off; in a six-job cold cell that was 350 s of sleep
+/// per cell, more than the compiles being waited for.
+pub fn lock_poll_interval(attempt: u32) -> Duration {
+    Duration::from_millis(1u64 << attempt.min(7)).min(BUILD_LOCK_POLL_INTERVAL)
+}
+
 /// Cross-process advisory lock held through an open file handle.
 ///
 /// Lock files deliberately persist after release. Unlinking an advisory lock
@@ -1051,6 +1059,7 @@ impl StoreLock {
 
     fn wait_until_available(path: &Path, timeout: Duration) -> Result<bool> {
         let start = std::time::Instant::now();
+        let mut attempt = 0;
         loop {
             if let Some(lock) = Self::try_acquire(path)? {
                 drop(lock);
@@ -1060,8 +1069,9 @@ impl StoreLock {
                 return Ok(false);
             }
             std::thread::sleep(
-                BUILD_LOCK_POLL_INTERVAL.min(timeout.saturating_sub(start.elapsed())),
+                lock_poll_interval(attempt).min(timeout.saturating_sub(start.elapsed())),
             );
+            attempt += 1;
         }
     }
 }
@@ -5041,6 +5051,14 @@ pub struct EntryInfo {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn lock_polls_back_off_from_a_millisecond_to_the_interval() {
+        let naps: Vec<u64> = (0..10)
+            .map(|attempt| lock_poll_interval(attempt).as_millis() as u64)
+            .collect();
+        assert_eq!(naps, vec![1, 2, 4, 8, 16, 32, 64, 100, 100, 100]);
+    }
 
     /// Opening an index runs its DDL once: the second open finds the schema
     /// generation current and skips every statement (each would otherwise

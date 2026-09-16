@@ -56,6 +56,7 @@ pub(crate) fn join_discovery(cache_dir: &Path, identity: &str) -> Option<StoreLo
 
 fn acquire_discovery(path: &Path, timeout: Duration, poll: Duration) -> Result<Option<StoreLock>> {
     let start = std::time::Instant::now();
+    let mut attempt = 0;
     loop {
         if let Some(lock) = StoreLock::try_acquire(path)? {
             return Ok(Some(lock));
@@ -63,7 +64,11 @@ fn acquire_discovery(path: &Path, timeout: Duration, poll: Duration) -> Result<O
         if start.elapsed() >= timeout {
             return Ok(None);
         }
-        std::thread::sleep(poll.min(timeout.saturating_sub(start.elapsed())));
+        // Back off from 1 ms up to `poll`: a waiter learns of the owner's
+        // release within milliseconds instead of half a poll interval.
+        let nap = crate::store::lock_poll_interval(attempt).min(poll);
+        std::thread::sleep(nap.min(timeout.saturating_sub(start.elapsed())));
+        attempt += 1;
     }
 }
 
@@ -338,6 +343,7 @@ impl Scheduler {
     fn wait_for_permit(&self, weight: u32) -> Option<Permit> {
         let need = weight.clamp(1, self.pool_size) as usize;
         let start = std::time::Instant::now();
+        let mut attempt = 0;
         loop {
             match try_collect_slots(self, need) {
                 Ok(Some(slots)) => return Some(Permit { _slots: slots }),
@@ -353,10 +359,9 @@ impl Scheduler {
                 tracing::debug!("scheduler permit wait timed out; compiling without a permit");
                 return None;
             }
-            std::thread::sleep(
-                self.poll_interval
-                    .min(self.wait_timeout.saturating_sub(start.elapsed())),
-            );
+            let nap = crate::store::lock_poll_interval(attempt).min(self.poll_interval);
+            std::thread::sleep(nap.min(self.wait_timeout.saturating_sub(start.elapsed())));
+            attempt += 1;
         }
     }
 }
@@ -380,6 +385,7 @@ fn try_collect_slots(scheduler: &Scheduler, need: usize) -> Result<Option<Vec<St
 
 fn wait_for_lock(path: &Path, timeout: Duration, poll: Duration) -> Result<bool> {
     let start = std::time::Instant::now();
+    let mut attempt = 0;
     loop {
         if let Some(lock) = StoreLock::try_acquire(path)? {
             drop(lock);
@@ -388,7 +394,9 @@ fn wait_for_lock(path: &Path, timeout: Duration, poll: Duration) -> Result<bool>
         if start.elapsed() >= timeout {
             return Ok(false);
         }
-        std::thread::sleep(poll.min(timeout.saturating_sub(start.elapsed())));
+        let nap = crate::store::lock_poll_interval(attempt).min(poll);
+        std::thread::sleep(nap.min(timeout.saturating_sub(start.elapsed())));
+        attempt += 1;
     }
 }
 

@@ -14056,9 +14056,17 @@ mod tests {
             "a non-cross-device ingest failure must not advise"
         );
 
-        // EXDEV advises exactly once per session window.
+        // EXDEV advises exactly once per session window, through the log
+        // sink when the wrapper selected it (#1067).
+        let _ = crate::markers::take_emitted();
+        crate::link::set_layout_advice_to_log(true);
         let _inject = InjectStoreHardlinkError::enable(std::io::ErrorKind::CrossesDevices);
         let (_, ingest) = store.stage_blob_from_source(&source, true).unwrap();
+        crate::link::set_layout_advice_to_log(false);
+        let emitted = crate::markers::take_emitted();
+        assert_eq!(emitted.len(), 1, "expected one advisory, got {emitted:?}");
+        assert_eq!(emitted[0].0, crate::markers::WarnSink::Log);
+        assert!(emitted[0].1.contains("EXDEV"), "{emitted:?}");
         assert!(
             matches!(ingest, StoreIngest::Copy(StoreCopyReason::CrossDevice)),
             "expected Copy(CrossDevice), got {ingest:?}"

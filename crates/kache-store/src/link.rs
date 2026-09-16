@@ -68,6 +68,29 @@ fn storage_layout_advice_enabled() -> bool {
     STORAGE_LAYOUT_ADVICE.load(Ordering::Relaxed)
 }
 
+/// Process-global: send storage-layout advice to stderr (the default, for CLI
+/// commands) or to the tracing log. Wrapper entries pick the log: a
+/// `RUSTC_WRAPPER`'s stderr is rustc's stderr to cargo and to every tool that
+/// reads it, so advice there looks like compiler output and can fail builds
+/// that reject unexpected stderr (kunobi-ninja/kache#1067). Faults
+/// (`UnexpectedOnCowVolume`) always use stderr.
+static LAYOUT_ADVICE_TO_LOG: AtomicBool = AtomicBool::new(false);
+
+/// Route storage-layout advice to the tracing log instead of stderr. Call once
+/// per process before restoring or storing.
+pub fn set_layout_advice_to_log(enabled: bool) {
+    LAYOUT_ADVICE_TO_LOG.store(enabled, Ordering::Relaxed);
+}
+
+/// Where storage-layout advice goes in this process.
+fn layout_advice_sink() -> crate::markers::WarnSink {
+    if LAYOUT_ADVICE_TO_LOG.load(Ordering::Relaxed) {
+        crate::markers::WarnSink::Log
+    } else {
+        crate::markers::WarnSink::Stderr
+    }
+}
+
 // ── Hardlink-fallback reason classification (#835) ───────────────────────────
 //
 // `link(2)` failures are not one condition: EXDEV across two bind mounts of
@@ -228,19 +251,21 @@ pub(crate) fn warn_hardlink_fallback_once(
             return;
         }
     };
+    let sink = layout_advice_sink();
     match COW_WARN_MARKER.get() {
         Some(base) => {
             let marker = bucket_marker(base, bucket);
-            let _warned = crate::markers::warn_once_per_session(
+            let _warned = crate::markers::warn_once_per_session_to(
                 &marker,
                 crate::markers::WARN_SESSION_SECS,
                 &message,
+                sink,
             );
         }
         None => {
             use std::sync::Once;
             static WARNED: Once = Once::new();
-            WARNED.call_once(|| eprintln!("{message}"));
+            WARNED.call_once(|| sink.emit(&message));
         }
     }
 }
@@ -596,6 +621,17 @@ impl CopyRestoreCause {
         }
     }
 
+    /// Where this cause's message goes. Advice follows the process's
+    /// layout-advice sink; a fault always reaches stderr, even in wrapper mode.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn warn_sink(self) -> crate::markers::WarnSink {
+        if self.is_layout_advisory() {
+            layout_advice_sink()
+        } else {
+            crate::markers::WarnSink::Stderr
+        }
+    }
+
     /// Is this cause storage-layout *advice* (mutable via the `Copy` strategy
     /// or `[cache] storage_layout_advice = false`, #551) rather than a fault
     /// report? Exhaustive on purpose: a future variant must decide explicitly
@@ -781,15 +817,17 @@ fn warn_no_cow_restore_once(
         return;
     }
 
+    let sink = cause.warn_sink();
     match COW_WARN_MARKER.get() {
         Some(base) => {
             // Separate bucket per severity: a layout advisory must never mute a
             // fault report (and vice versa).
             let marker = bucket_marker(base, cause.warn_bucket());
-            let _warned = crate::markers::warn_once_per_session(
+            let _warned = crate::markers::warn_once_per_session_to(
                 &marker,
                 crate::markers::WARN_SESSION_SECS,
                 &message,
+                sink,
             );
         }
         // No marker configured (unit tests, non-wrapper entrypoints): fall back
@@ -797,7 +835,7 @@ fn warn_no_cow_restore_once(
         None => {
             use std::sync::Once;
             static WARNED: Once = Once::new();
-            WARNED.call_once(|| eprintln!("{message}"));
+            WARNED.call_once(|| sink.emit(&message));
         }
     }
 }
@@ -1959,6 +1997,31 @@ mod tests {
                 "{non_advisory:?} must not be muteable by the advice knob",
             );
         }
+    }
+
+    /// #1067: wrapper mode sends layout advice to the log, never faults.
+    #[test]
+    fn layout_advice_sink_follows_the_process_setting_but_faults_keep_stderr() {
+        use crate::markers::WarnSink;
+        let _lock = crate::test_support::process_state_test_lock();
+        for (to_log, advice_sink) in [(false, WarnSink::Stderr), (true, WarnSink::Log)] {
+            set_layout_advice_to_log(to_log);
+            assert_eq!(layout_advice_sink(), advice_sink);
+            for advisory in [
+                CopyRestoreCause::CrossVolume,
+                CopyRestoreCause::NoCow,
+                CopyRestoreCause::UnknownCow,
+            ] {
+                assert_eq!(advisory.warn_sink(), advice_sink, "{advisory:?}");
+            }
+            for fault in [
+                CopyRestoreCause::SubClusterOnCowVolume,
+                CopyRestoreCause::UnexpectedOnCowVolume,
+            ] {
+                assert_eq!(fault.warn_sink(), WarnSink::Stderr, "{fault:?}");
+            }
+        }
+        set_layout_advice_to_log(false);
     }
 
     #[test]

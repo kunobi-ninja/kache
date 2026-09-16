@@ -677,6 +677,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
+    crate::link::set_layout_advice_to_log(true);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
     // Shared with the cc knob for now; a dedicated `[nvcc]` knob is a
@@ -1311,6 +1312,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
+    crate::link::set_layout_advice_to_log(true);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
     let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
@@ -2429,6 +2431,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
+    crate::link::set_layout_advice_to_log(true);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
     // Wall-clock build-start (ns since epoch) for the optional too-new-input

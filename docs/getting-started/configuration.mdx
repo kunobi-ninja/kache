@@ -284,7 +284,7 @@ Session and GC history are opt-in. `kache telemetry write` reads index rows and 
 | `KACHE_HEARTBEAT_SECS` | `cache.heartbeat_secs` | `30` | Event heartbeat cadence for long miss compiles; `0` disables it |
 | `KACHE_EXPLAIN_MISS` | `cache.explain_miss` | `false` | Record changed key groups on repeat misses |
 | `KACHE_RECORD_SESSIONS` | `cache.record_sessions` | `false` | Make every `kache report` append its session line, as `--record` does, and every GC run append to `telemetry/gc-runs.jsonl` |
-| `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Warn when storage layout forces copies |
+| `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Warn when storage layout forces copies. CLI commands print the advice; compiler wrappers log it at `warn` (see `KACHE_LOG`) so it never lands in compiler output |
 | `KACHE_WINDOWS_HARDLINK` | `cache.windows_hardlink` | `false` | Unsafe opt-in hardlink restores on non-CoW Windows volumes |
 | `KACHE_DEFERRED_DISCOVERY` | `cache.deferred_discovery` | `true` | On a certain miss (no closure record, no remote), compile first and key from the dep-info rustc emits instead of running the dep-info pre-pass. Set to `0` to keep the pre-pass on every miss. |
 | `KACHE_SHARED_HARDLINK_RESTORES` | `cache.shared_hardlink_restores` | `false` | Let every target directory hardlink the same store blob on filesystems without reflink. Only for single-use target directories (a CI job's tree): the restore-time mtime stamp on a shared inode re-dates the artifact in every other tree that links it. |

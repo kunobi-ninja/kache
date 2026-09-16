@@ -390,7 +390,10 @@ pub struct Config {
     /// default), a cache hit restored by COPY because the storage *layout*
     /// prevents zero-copy dedup — no copy-on-write on the volume, cache and
     /// build tree on different volumes, or an inconclusive capability probe —
-    /// is surfaced as a deduplicated advisory with fix suggestions. Set
+    /// is surfaced as a deduplicated advisory with fix suggestions. CLI
+    /// commands print it on stderr; compiler wrappers send it to the tracing
+    /// log (`KACHE_LOG=warn`) so it never mixes with compiler output (#1067),
+    /// and `kache doctor` and `kache report` show the copy reasons. Set
     /// `= false` when the layout is intentional and unfixable (e.g. an
     /// NTFS-only laptop that can never host a ReFS Dev Drive): the advisories
     /// drop to debug logging. Genuine clone *faults* (a large file failing to

@@ -18,17 +18,62 @@ pub const WARN_SESSION_SECS: u64 = 300;
 ///
 /// Returns whether this call actually emitted the message (for tests).
 pub fn warn_once_per_session(marker: &Path, session_secs: u64, message: &str) -> bool {
+    warn_once_per_session_to(marker, session_secs, message, WarnSink::Stderr)
+}
+
+/// Where a deduplicated advisory goes once the marker lets it through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarnSink {
+    /// The process's stderr. In wrapper mode that stream is the compiler's
+    /// stderr to cargo and every tool reading it, so reserve it for faults.
+    Stderr,
+    /// The tracing log at `warn` level (visible under `KACHE_LOG`), for advice
+    /// that a build's consumer cannot act on (kunobi-ninja/kache#1067).
+    Log,
+}
+
+impl WarnSink {
+    pub fn emit(self, message: &str) {
+        #[cfg(test)]
+        EMITTED.with(|emitted| emitted.borrow_mut().push((self, message.to_string())));
+        match self {
+            WarnSink::Stderr => eprintln!("{message}"),
+            WarnSink::Log => tracing::warn!("{message}"),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static EMITTED: std::cell::RefCell<Vec<(WarnSink, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the advisories this test thread emitted, with the sink each went to.
+#[cfg(test)]
+pub(crate) fn take_emitted() -> Vec<(WarnSink, String)> {
+    EMITTED.with(|emitted| std::mem::take(&mut *emitted.borrow_mut()))
+}
+
+/// [`warn_once_per_session`] with an explicit [`WarnSink`]. The marker dedups
+/// the same way whichever sink receives the message.
+pub fn warn_once_per_session_to(
+    marker: &Path,
+    session_secs: u64,
+    message: &str,
+    sink: WarnSink,
+) -> bool {
     if let Ok(metadata) = std::fs::symlink_metadata(marker)
         && metadata.file_type().is_symlink()
     {
-        eprintln!("{message}");
+        sink.emit(message);
         return true;
     }
     if marker_is_fresh(marker, session_secs) {
         return false; // already warned this session
     }
     let Some(lock_file) = open_marker_for_lock(marker) else {
-        eprintln!("{message}");
+        sink.emit(message);
         return true;
     };
     match lock_file.try_lock() {
@@ -40,7 +85,7 @@ pub fn warn_once_per_session(marker: &Path, session_secs: u64, message: &str) ->
         // silence the advisory forever, so warn best-effort instead.
         Err(std::fs::TryLockError::Error(e)) => {
             tracing::debug!("warn-once marker lock failed ({e}); warning anyway");
-            eprintln!("{message}");
+            sink.emit(message);
             return true;
         }
     }
@@ -51,7 +96,7 @@ pub fn warn_once_per_session(marker: &Path, session_secs: u64, message: &str) ->
     // would always read "stale" here and let a second wrapper warn again — on
     // the very platform this advisory targets. Same reason
     // `write_marker_timestamp` writes through the locked handle (#348).
-    finish_warn_once_per_session(&lock_file, session_secs, message)
+    finish_warn_once_per_session(&lock_file, session_secs, message, sink)
 }
 
 /// Re-check and update a warn-once marker while its lock is held, then release
@@ -62,11 +107,12 @@ pub fn finish_warn_once_per_session(
     lock_file: &std::fs::File,
     session_secs: u64,
     message: &str,
+    sink: WarnSink,
 ) -> bool {
     let emitted = if marker_file_is_fresh(lock_file, session_secs) {
         false
     } else {
-        eprintln!("{message}");
+        sink.emit(message);
         write_marker_timestamp(lock_file);
         true
     };
@@ -274,6 +320,39 @@ mod tests {
         );
     }
 
+    /// The log sink receives the advisory instead of stderr and dedups through
+    /// the same marker (#1067).
+    #[test]
+    fn warn_once_per_session_to_log_dedups_via_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("cow-warn");
+        let _ = take_emitted();
+
+        assert!(warn_once_per_session_to(
+            &marker,
+            300,
+            "advisory",
+            WarnSink::Log
+        ));
+        assert!(!warn_once_per_session_to(
+            &marker,
+            300,
+            "advisory",
+            WarnSink::Log
+        ));
+        assert_eq!(
+            take_emitted(),
+            vec![(WarnSink::Log, "advisory".to_string())],
+            "the advisory must reach the log sink exactly once"
+        );
+
+        assert!(warn_once_per_session(&marker, 0, "again"));
+        assert_eq!(
+            take_emitted(),
+            vec![(WarnSink::Stderr, "again".to_string())]
+        );
+    }
+
     #[test]
     fn warn_once_per_session_unlocks_even_with_a_duplicated_descriptor() {
         let dir = tempfile::tempdir().unwrap();
@@ -282,7 +361,12 @@ mod tests {
         lock_file.try_lock().unwrap();
         let inherited = lock_file.try_clone().unwrap();
 
-        assert!(finish_warn_once_per_session(&lock_file, 0, "advisory"));
+        assert!(finish_warn_once_per_session(
+            &lock_file,
+            0,
+            "advisory",
+            WarnSink::Stderr
+        ));
         drop(lock_file);
 
         let contender = open_marker_for_lock(&marker).unwrap();

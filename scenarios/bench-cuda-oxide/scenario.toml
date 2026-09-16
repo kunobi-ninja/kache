@@ -62,6 +62,10 @@ sysroot="$(rustc --print sysroot)"
 export LIBRARY_PATH="$sysroot/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
 export LD_LIBRARY_PATH="$sysroot/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# Per-example logs go where the bench workflow uploads them (logs/ in the work
+# dir), one directory per clone.
+export SMOKETEST_LOG_DIR="$repo/../logs/smoketest-$(basename "$repo")"
+
 bash scripts/smoketest.sh --compile-only --no-color
 """
 

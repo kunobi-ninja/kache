@@ -1261,6 +1261,10 @@ diff --git a/hello.txt b/hello.txt
             .expect("prepare installs cargo-oxide");
         assert!(prepare.contains("--path crates/cargo-oxide"), "{prepare}");
         assert!(
+            prepare.starts_with("unset RUSTUP_TOOLCHAIN"),
+            "an inherited toolchain override breaks the rustc-dev backend: {prepare}"
+        );
+        assert!(
             !prepare.contains("--target-dir target"),
             "installing into the objdir would be wiped before the build"
         );
@@ -1274,6 +1278,7 @@ diff --git a/hello.txt b/hello.txt
             "{build}"
         );
         assert!(build.contains("KACHE_BASE_DIR"), "{build}");
+        assert!(build.contains("unset RUSTUP_TOOLCHAIN"), "{build}");
     }
 
     /// The shipped eza scenario measures both compiler families: rustc through

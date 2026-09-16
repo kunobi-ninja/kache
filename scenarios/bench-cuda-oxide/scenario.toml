@@ -18,9 +18,14 @@ setup = [
 
 # `cargo oxide` drives every example build. Install it from the same checkout,
 # untimed and outside kache, into a directory the objdir wipe does not touch.
-# The tree's rust-toolchain.toml pins the nightly and its rustc-dev component,
-# and rustup installs both here on first use.
-prepare = "cargo install --locked --path crates/cargo-oxide --root .bench-tools --target-dir .bench-tools/target"
+#
+# The tree's rust-toolchain.toml pins a nightly with rustc-dev, which the
+# codegen backend links against. A RUSTUP_TOOLCHAIN inherited from the bench
+# host (mise exports kache's own pin) would override that file and the backend
+# would fail with "can't find crate for rustc_driver", so it is unset here and
+# in the build. `rustup toolchain install` with no argument installs the
+# toolchain and components the file names.
+prepare = "unset RUSTUP_TOOLCHAIN && rustup toolchain install && cargo install --locked --path crates/cargo-oxide --root .bench-tools --target-dir .bench-tools/target"
 
 # The upstream examples-compile step, run as upstream runs it: one shared
 # target dir for every example workspace, compile only.
@@ -33,6 +38,9 @@ build = """
 # Input-set predictions, with a sampled cross-check (kunobi-ninja/kache#945).
 export KACHE_INPUT_PREDICTIONS=1
 export KACHE_VERIFY_INPUT_PREDICTIONS=sampled
+
+# See prepare: the subject's rust-toolchain.toml must pick the compiler.
+unset RUSTUP_TOOLCHAIN
 
 repo="$(pwd -P)"
 export KACHE_BASE_DIR="$repo"

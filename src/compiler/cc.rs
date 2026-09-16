@@ -5699,12 +5699,13 @@ fn cc_direct_probe(program: &str) -> bool {
     let depfile = fs::read_to_string(root.join("probe.d")).unwrap_or_default();
     let ok =
         output.status.success() && root.join("probe.o").is_file() && depfile.contains("probe.c");
-    if !ok {
-        tracing::debug!(
-            "cc: {program} does not take the compile-first capture flags; keeping the preprocessor: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    tracing::debug!(
+        "cc: {program} compile-first capture probe: exit {} object {} depfile {}: {}",
+        output.status,
+        root.join("probe.o").is_file(),
+        depfile.contains("probe.c"),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     ok
 }
 
@@ -14035,6 +14036,24 @@ mod tests {
         };
         let silent = script("silent-cc", "#!/bin/sh\nexit 0\n");
         assert!(!cc_driver_captures_dependencies(&silent, &memo));
+        // Each half of the answer on its own is no answer: an object without
+        // a usable depfile, a depfile without an object, or both with a
+        // failing exit.
+        let object_only = script(
+            "object-only-cc",
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) : > \"$2\"; shift;; esac; shift; done\n",
+        );
+        assert!(!cc_driver_captures_dependencies(&object_only, &memo));
+        let depfile_only = script(
+            "depfile-only-cc",
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -MF) printf 'x: probe.c\\n' > \"$2\"; shift;; esac; shift; done\n",
+        );
+        assert!(!cc_driver_captures_dependencies(&depfile_only, &memo));
+        let failing = script(
+            "failing-cc",
+            "#!/bin/sh\nout=; dep=\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=$2; shift;; -MF) dep=$2; shift;; esac; shift; done\n: > \"$out\"\nprintf 'x: probe.c\\n' > \"$dep\"\nexit 1\n",
+        );
+        assert!(!cc_driver_captures_dependencies(&failing, &memo));
         let counting = script(
             "counting-cc",
             concat!(

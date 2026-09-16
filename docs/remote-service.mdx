@@ -35,7 +35,7 @@ Set `--token` or `KACHE_PLANNER_TOKEN` to require bearer authentication.
 ## Helm
 
 ```bash
-helm upgrade --install kache-service ./charts/kache-service
+helm upgrade --install kache-service ./packaging/charts/kache-service
 ```
 
 The chart supplies a Deployment, Service, probes, optional persistent volume, optional existing-secret authentication, and optional Lease-based leader election. It does not create ingress.

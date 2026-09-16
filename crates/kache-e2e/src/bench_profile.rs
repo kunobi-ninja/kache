@@ -1238,6 +1238,44 @@ diff --git a/hello.txt b/hello.txt
         );
     }
 
+    /// The shipped cuda-oxide scenario runs upstream's GPU-less examples
+    /// compile: `cargo oxide` installed untimed per clone, every example
+    /// workspace sharing the objdir as CARGO_TARGET_DIR, pinned by commit.
+    #[test]
+    fn shipped_cuda_oxide_profile_runs_upstream_examples_compile() {
+        let p = BenchProfile::load(&repo_profile("cuda-oxide")).expect("cuda-oxide.toml loads");
+        assert_eq!(p.name, "bench-cuda-oxide");
+        assert_eq!(p.objdir, "target");
+        assert_eq!(p.repo, "https://github.com/NVlabs/cuda-oxide.git");
+        assert_eq!(p.git_ref.len(), 40, "pin by commit SHA, not a tag");
+        assert!(
+            p.files.is_empty(),
+            "cuda-oxide owns its rust-toolchain.toml"
+        );
+        assert!(
+            p.env.is_empty(),
+            "no extra env — CARGO_INCREMENTAL is an engine baseline, not a profile var"
+        );
+        let prepare = p
+            .prepare_command(Path::new("/k"))
+            .expect("prepare installs cargo-oxide");
+        assert!(prepare.contains("--path crates/cargo-oxide"), "{prepare}");
+        assert!(
+            !prepare.contains("--target-dir target"),
+            "installing into the objdir would be wiped before the build"
+        );
+        let build = p.build_command(Path::new("/k"));
+        assert!(
+            build.contains("scripts/smoketest.sh --compile-only"),
+            "{build}"
+        );
+        assert!(
+            build.contains("export CARGO_TARGET_DIR=\"$repo/target\""),
+            "{build}"
+        );
+        assert!(build.contains("KACHE_BASE_DIR"), "{build}");
+    }
+
     /// The shipped eza scenario measures both compiler families: rustc through
     /// the engine's wrapper, and the bundled libgit2/zlib objects through the
     /// host-only cc-rs wrappers `kache init` writes. It builds release, which

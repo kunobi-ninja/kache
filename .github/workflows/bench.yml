@@ -35,7 +35,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, hk-comparison, surrealdb, lance, opendal, eza, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx]
+        options: [all, hk-comparison, surrealdb, lance, opendal, cuda-oxide, eza, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx]
         default: all
       extra_args:
         description: "Extra recipe arguments (hk/eza: sample count; other scenarios: --skip-clone, --retry)"
@@ -110,6 +110,11 @@ jobs:
           # aws-lc-sys (rustls) compiles outside kache; cmake + a C compiler
           # are already in the apt step below.
           opendal='{"name":"opendal","cmd":"bench opendal","dir":"bench-opendal","timeout":120,"job_timeout":165,"min_free_gb":40,"runner":"kunobi-runners"}'
+          # NVlabs/cuda-oxide's examples-compile job: its rustc codegen backend,
+          # the shared host dependency tree, and 200+ example workspaces built
+          # into one target dir. Needs the CUDA toolkit headers and LLVM 22,
+          # installed only for this arm below.
+          cuda_oxide='{"name":"cuda-oxide","cmd":"bench cuda-oxide","dir":"bench-cuda-oxide","timeout":120,"job_timeout":180,"min_free_gb":40,"runner":"kunobi-runners"}'
           # Full cold Firefox build is the long pole — hours. `bench firefox`
           # resolves to the exact `bench-firefox` scenario: `--profile firefox`
           # is a name SUBSTRING match that also catches `bench-firefox-windows`,
@@ -170,6 +175,7 @@ jobs:
             surrealdb)            inc="[$surrealdb]" ;;
             lance)                inc="[$lance]" ;;
             opendal)              inc="[$opendal]" ;;
+            cuda-oxide)           inc="[$cuda_oxide]" ;;
             llvm)                 inc="[$llvm]" ;;
             hk-comparison)       inc="[$hk,$hk_nopred,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx]" ;;
             hk)                   inc="[$hk]" ;;
@@ -187,7 +193,7 @@ jobs:
             # below, so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`
             # and wastefully run the whole Linux `all` matrix alongside.
-            *)                    inc="[$surrealdb,$lance,$opendal,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
+            *)                    inc="[$surrealdb,$lance,$opendal,$cuda_oxide,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
           esac
           if [ "$EVENT_NAME" = "schedule" ]; then
             inc="$(jq -c --argjson extra "[$firefox,$firefox_sccache,$firefox_pull]" '. + $extra' <<<"$inc")"
@@ -291,6 +297,37 @@ jobs:
             libssl-dev \
             git curl wget ca-certificates file unzip bzip2 xz-utils \
             python3 python3-dev python3-pip
+
+      # cuda-oxide only. Its bindgen step needs cuda.h and curand.h, and its
+      # device pipeline shells out to llc-22 for PTX. Same packages as the
+      # upstream examples-compile job: CUDA 13.1 nvcc, cudart-dev, curand-dev
+      # and nvjitlink-dev, plus LLVM 22 from apt.llvm.org.
+      - name: Install CUDA toolkit and LLVM 22 (cuda-oxide only)
+        if: matrix.name == 'cuda-oxide'
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          source /etc/os-release
+          export DEBIAN_FRONTEND=noninteractive
+          distro="ubuntu${VERSION_ID//./}"
+          wget -q -O "$RUNNER_TEMP/cuda-keyring.deb" \
+            "https://developer.download.nvidia.com/compute/cuda/repos/${distro}/x86_64/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
+          sudo install -d -m 0755 /etc/apt/keyrings
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/keyrings/apt-llvm-org.asc >/dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/apt-llvm-org.asc] https://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-13-1 cuda-cudart-dev-13-1 libcurand-dev-13-1 libnvjitlink-dev-13-1 \
+            llvm-22
+          test -f /usr/local/cuda-13.1/include/cuda.h
+          llc-22 --version | head -2
+          {
+            echo "CUDA_TOOLKIT_PATH=/usr/local/cuda-13.1"
+            echo "CUDA_OXIDE_LLC=/usr/bin/llc-22"
+          } >> "$GITHUB_ENV"
 
       # mise installs rust (per rust-toolchain.toml) and just (the bench recipe
       # is `just bench`) for every arm, and sccache only for the sccache arm,

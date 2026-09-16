@@ -14,7 +14,7 @@ and its merge base, sccache, and mbx sequentially on one runner.
 | Same-repository PR, ready for review | hk, eza | 1 cold, 1 same-checkout warm, 1 cross-checkout warm | 1 cold + 1 warm batch |
 | PR with the `bench` label **or** `[bench]` in its title | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
 | Nightly, 03:37 Europe/Zurich | hk, eza | 2 cold, 6 same-checkout warm, 6 cross-checkout warm | 2 cold + 6 warm batches |
-| Nightly | Firefox Linux/Windows, LLVM, SurrealDB, Lance, OpenDAL | One measurement per configured phase | — |
+| Nightly | Firefox Linux/Windows, LLVM, SurrealDB, Lance, OpenDAL, cuda-oxide | One measurement per configured phase | — |
 
 The opt-in also runs on same-repository draft PRs. Adding either trigger or
 pushing a new commit starts a measurement; a newer run cancels the older one.
@@ -28,7 +28,7 @@ benchmark subject.
 | --- | --- | --- | --- |
 | hk, eza | yes | yes | yes |
 | Firefox Linux | yes | yes | — |
-| Firefox Windows, LLVM | yes | — | — |
+| Firefox Windows, LLVM, cuda-oxide | yes | — | — |
 | SurrealDB, Lance, OpenDAL | yes | — | yes |
 
 hk retains its prediction-disabled and next-commit scenarios. The next-commit

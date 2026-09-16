@@ -577,6 +577,13 @@ mod tests {
         assert!(opendal.tags.contains(&"suite:bench".to_string()));
         assert!(opendal.tags.contains(&"project:opendal".to_string()));
 
+        let cuda_oxide = scenarios
+            .iter()
+            .find(|scenario| scenario.name == "bench-cuda-oxide")
+            .unwrap();
+        assert_eq!(cuda_oxide.source_kind, SourceKind::Clone);
+        assert!(cuda_oxide.tags.contains(&"project:cuda-oxide".to_string()));
+
         let c_hello = scenarios
             .iter()
             .find(|scenario| scenario.name == "e2e-c-hello")

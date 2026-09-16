@@ -1,0 +1,68 @@
+# cuda-oxide compile-cache benchmark scenario for kache-scenario.
+# cuda-oxide compiles Rust GPU kernels through its own rustc codegen backend
+# (`-Zcodegen-backend=librustc_codegen_cuda.so`). Its CI compiles every example
+# as a separate Cargo workspace (200+ of them) on a GPU-less runner, sharing
+# one CARGO_TARGET_DIR. This scenario runs that same job, so the numbers read
+# directly against upstream's examples-compile workflow.
+#
+# kache wires in via RUSTC_WRAPPER only (set by the engine). That covers the
+# backend build, the shared host dependency tree and every example crate.
+name = "bench-cuda-oxide"
+tags = ["suite:bench", "project:cuda-oxide", "backend:kache", "lang:rust"]
+
+requires = ["cargo", "rustc", "clang"]
+
+setup = [
+  "echo '[bench] cuda-oxide needs the CUDA toolkit headers (cuda-nvcc, cuda-cudart-dev, libcurand-dev, libnvjitlink-dev) for bindgen, LLVM 22 llc for PTX, and clang/libclang. Set CUDA_TOOLKIT_PATH and CUDA_OXIDE_LLC if they are not at /usr/local/cuda and on PATH.'",
+]
+
+# `cargo oxide` drives every example build. Install it from the same checkout,
+# untimed and outside kache, into a directory the objdir wipe does not touch.
+# The tree's rust-toolchain.toml pins the nightly and its rustc-dev component,
+# and rustup installs both here on first use.
+prepare = "cargo install --locked --path crates/cargo-oxide --root .bench-tools --target-dir .bench-tools/target"
+
+# The upstream examples-compile step, run as upstream runs it: one shared
+# target dir for every example workspace, compile only.
+#
+# The codegen backend is built on the first `cargo oxide build` at
+# crates/rustc-codegen-cuda/target, outside the objdir. Both phases start from
+# a fresh clone, so each phase builds it once and the timing includes it, as it
+# does upstream.
+build = """
+# Input-set predictions, with a sampled cross-check (kunobi-ninja/kache#945).
+export KACHE_INPUT_PREDICTIONS=1
+export KACHE_VERIFY_INPUT_PREDICTIONS=sampled
+
+repo="$(pwd -P)"
+export KACHE_BASE_DIR="$repo"
+export CARGO_TARGET_DIR="$repo/target"
+export PATH="$repo/.bench-tools/bin:$PATH"
+
+export CUDA_TOOLKIT_PATH="${CUDA_TOOLKIT_PATH:-/usr/local/cuda}"
+if [ -z "${CUDA_OXIDE_LLC:-}" ]; then
+  CUDA_OXIDE_LLC="$(command -v llc-22 || command -v llc || true)"
+fi
+if [ -z "$CUDA_OXIDE_LLC" ]; then
+  echo '[bench] no llc found; install LLVM 22 or set CUDA_OXIDE_LLC' >&2
+  exit 1
+fi
+export CUDA_OXIDE_LLC
+
+# The backend links rustc's private dylibs from the pinned sysroot.
+sysroot="$(rustc --print sysroot)"
+export LIBRARY_PATH="$sysroot/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$sysroot/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+bash scripts/smoketest.sh --compile-only --no-color
+"""
+
+[source]
+kind = "clone"
+repo = "https://github.com/NVlabs/cuda-oxide.git"
+# main as of 2026-09-15. Upstream's examples-compile job passed on this commit
+# in 9m16s (NVlabs/cuda-oxide actions run 34943345905). The last tag, v0.2.1,
+# predates that job and most of the examples. rust-toolchain.toml pins
+# nightly-2026-08-28.
+ref    = "7ce30ec798c490e6ed772dfcbad193b3733fe55a"
+objdir = "target"

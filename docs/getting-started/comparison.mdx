@@ -12,14 +12,14 @@ This page describes the current projects; it does not claim that one cache is un
 | Question | Kache | sccache |
 | --- | --- | --- |
 | Primary workflow | Local-first cache with optional explicit remote synchronization | Client-server compiler cache with local and remote storage |
-| Rust setup | `RUSTC_WRAPPER=kache`, `kache init`, or `kache cargo` | `RUSTC_WRAPPER=sccache` |
+| Rust setup | `kache init` | `RUSTC_WRAPPER=sccache` |
 | C/C++ setup | PATH compiler-name shims (`kache install-shims`) or `CC="kache cc"` | Prefix wrapper (`sccache gcc`); no ccache-style PATH farm |
 | Remote backends | S3-compatible storage and filesystem paths | S3, Redis, Memcached, GCS, Azure, GitHub Actions, WebDAV, and others listed by sccache |
 | Inspection | `monitor`, `stats`, `why-miss`, `report`, `list`, and `doctor` | `--show-stats`, logs, and server commands |
 | Remote transfer | On-demand restore plus `sync`, manifests, and prefetch | Remote access is part of normal server operation |
 | Rust executables | Cacheable by default on Linux and macOS | Rust crates that invoke the system linker are not cached, according to the sccache README |
 | Incremental Rust builds | Kache disables or isolates incremental state according to its configured policy | Incrementally compiled Rust crates are not cached, according to the sccache README |
-| Fallback | Can hand Kache passthroughs to another wrapper with `KACHE_FALLBACK` | No Kache-specific handoff needed |
+| Fallback | Hands work it does not cache to another wrapper, such as sccache | No Kache-specific handoff needed |
 
 ## Choose Kache when
 
@@ -29,13 +29,11 @@ This page describes the current projects; it does not claim that one cache is un
 - Caching eligible Rust executable and linker outputs matters to your workload.
 - You want one `PATH` change to cache Make/CMake/PKGBUILD object compiles without wrapping `CC` in a shell.
 
-## Where Kache may not fit yet
+## Gaps sccache can fill
 
-- You need one of its additional remote backends.
-- You need a compiler Kache does not support yet, such as CUDA or HIP.
-- You must keep an existing sccache deployment unchanged during a migration.
+If you need a compiler Kache does not cache yet, [use sccache as a fallback](#use-sccache-as-a-fallback). Kache caches what it supports and passes the rest to sccache, so you do not have to choose one.
 
-If a missing compiler, backend, or workflow blocks your use of Kache, [open a feature request](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md). Include the build command, compiler or backend, and why the fallback described below does not fit. Concrete workloads help us prioritize support.
+If a missing compiler, backend, or workflow still blocks you, [open a feature request](https://github.com/kunobi-ninja/kache/issues/new?template=feature_request.md). Include the build command and the compiler or backend. Concrete workloads help us prioritize support.
 
 ## Measure your own build
 
@@ -51,17 +49,16 @@ Run several samples after one warm-up and compare medians. A count-based hit rat
 
 Kache can generate benchmark artifacts with `kache report` and the repository benchmark harness. See [Benchmarks](/docs/benchmarks).
 
-## Keep sccache during migration
+## Use sccache as a fallback
 
-You can put Kache in front of an existing sccache setup. Kache passes compiler invocations it declines to cache to sccache:
+Put Kache in front of sccache. After `kache init`, add the fallback to your Kache config:
 
-```bash
-export KACHE_FALLBACK=sccache
-export RUSTC_WRAPPER=kache
-cargo build
+```toml title="~/.config/kache/config.toml"
+[cache]
+fallback = "sccache"
 ```
 
-The fallback only receives passthrough work. Kache still owns the invocations it decides to cache or isolate. Remove the fallback when Kache covers the remaining workload.
+Kache still caches everything it supports. Compiler invocations it passes through go to sccache instead of the bare compiler. `KACHE_FALLBACK=sccache` sets the same option for a single build.
 
 If the fallback fails to start or exits unsuccessfully, Kache warns and retries once
 with the direct compiler. The direct compiler's result determines the build result.

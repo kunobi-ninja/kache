@@ -35,8 +35,6 @@ After `kache init`, [build the same revision in two temporary worktrees][first-r
 
 ![A second worktree of the same commit building from cache hits, then the build report showing 42 of 42 crates cached.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/demo.gif)
 
-To try this without touching Cargo's config, skip `kache init` and prefix both builds with `RUSTC_WRAPPER=kache`. That enables the Rust wrapper only; C and C++ build scripts need the [C/C++ setup](https://kunobi.ninja/docs/kache/getting-started/c-cpp).
-
 ## How it works
 
 Kache has three parts: a compiler wrapper, a local store, and an optional daemon.
@@ -52,7 +50,7 @@ Hits, misses, and passthroughs are reported per unit, and `kache why-miss` expla
 
 | Workload | Status | Notes |
 | --- | --- | --- |
-| Rust libraries and build scripts | Supported | Use `RUSTC_WRAPPER=kache` or `kache init` |
+| Rust libraries and build scripts | Supported | Run `kache init` |
 | Rust executables | Supported on Linux and macOS | Disabled by default on Windows |
 | C and C++ object files | Supported | GCC, Clang, Apple Clang, and clang-cl. Build scripts via `kache init`; other builds via shims or `CC`/`CXX` |
 | CUDA object files | Supported | Single-source `nvcc -c` and `-dc` via `CUDACXX="kache nvcc"` or a CMake launcher |

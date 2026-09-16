@@ -101,18 +101,6 @@ kache init --yes         # accept defaults without prompts
 
 Init asks before editing Cargo or shell configuration and backs up existing files. If you enable C/C++ caching, open a new terminal afterward or run the activation command it prints. `--check` shows the planned changes without prompts or modifications.
 
-To try the worktree example without persistent setup, skip `kache init` and prefix both `cargo build` commands with `RUSTC_WRAPPER=kache`. For example:
-
-```bash
-(
-  set -e
-  cd "$kache_trial/first"
-  RUSTC_WRAPPER=kache cargo build --locked --target-dir "$PWD/target"
-)
-```
-
-This enables the Rust wrapper for that command. C and C++ builds need their [own wrapper configuration](/docs/getting-started/c-cpp).
-
 After setup, keep using ordinary Cargo commands. Give concurrent worktrees separate target directories. Tools that build in temporary copies, such as cargo-mutants, need no extra setup; see [Mutation testing](/docs/getting-started/mutation-testing).
 
 ## Executables and incremental builds

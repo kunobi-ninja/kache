@@ -97,7 +97,9 @@ kache init --no-service
 kache init --yes
 ```
 
-`--check` reports proposed changes without writing. `--no-service` skips login-service installation. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. It never sets `CC` or `CXX`.
+`--check` reports proposed changes without writing. `--no-service` skips login-service installation. When the service cannot be installed, such as on a Linux host without a systemd user session or a Windows account that Task Scheduler refuses, init reports why and starts the daemon directly.
+
+Without a terminal, pass `--yes`. If stdin has no answers and Cargo is left unconfigured, init exits with an error. Besides `rustc-wrapper`, init adds `HOST_CC` / `HOST_CXX` / `CC_KNOWN_WRAPPER_CUSTOM` under Cargo `[env]` when those keys are absent. It never sets `CC` or `CXX`.
 
 ## `kache doctor`
 

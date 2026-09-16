@@ -52,10 +52,10 @@ C and C++ objects publish through the same remote as Rust. A daemon-backed compi
 
 ## Other CI systems
 
-Install Kache, then provide wrapper and remote configuration:
+Install Kache, then enable it and set the remote. CI has no terminal to answer prompts, so pass `--yes`:
 
 ```bash
-export RUSTC_WRAPPER=kache
+kache init --yes
 export KACHE_S3_BUCKET=my-build-cache
 export KACHE_S3_REGION=eu-west-1
 

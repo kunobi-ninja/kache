@@ -5635,9 +5635,19 @@ fn cc_system_path(path: &str) -> bool {
 /// the same tree agree even under an unmappable root. The source is one of
 /// the files, so include order and every textual choice are in it.
 fn cc_direct_inputs_digest(fingerprints: &[crate::cache_key::CcPreprocessMemoInput]) -> String {
+    // A toolchain file is the same bytes on every checkout and can spell a
+    // directory a checkout happens to be under (glibc's `P_tmpdir`); its raw
+    // hash is the portable one. A project file may spell its own checkout
+    // root, which the maps make portable.
     let mut contents: Vec<&str> = fingerprints
         .iter()
-        .map(|input| input.mapped.as_str())
+        .map(|input| {
+            if cc_system_path(input.local_path()) {
+                input.content.as_str()
+            } else {
+                input.mapped.as_str()
+            }
+        })
         .collect();
     contents.sort_unstable();
     contents.dedup();
@@ -14251,6 +14261,17 @@ mod tests {
             base
         );
         assert_ne!(cc_direct_inputs_digest(&[input("a.c", "1")]), base);
+        // A toolchain header counts by its raw bytes: a checkout root that
+        // happens to appear in its text is not this checkout's business.
+        let mut system = input("/usr/include/stdio.h", "mapped-under-tmp-root");
+        system.fingerprint.path = "/usr/include/stdio.h".to_string();
+        system.content = "raw".to_string();
+        let mut elsewhere = system.clone();
+        elsewhere.mapped = "mapped-without-that-root".to_string();
+        assert_eq!(
+            cc_direct_inputs_digest(std::slice::from_ref(&system)),
+            cc_direct_inputs_digest(std::slice::from_ref(&elsewhere))
+        );
     }
 
     #[test]

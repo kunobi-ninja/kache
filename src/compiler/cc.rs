@@ -1357,6 +1357,12 @@ const CC_BASE_SENTINEL: &str = "/kache/base-dir";
 /// merges keys that would otherwise miss, never miscaches. A distinct
 /// sentinel so the SDK can't collide with a project root.
 const CC_SDKROOT_SENTINEL: &str = "/kache/sdkroot";
+/// A build script's `OUT_DIR` and the Cargo target directory above it. Every
+/// build directory spells these differently, and a `cc`-crate compile names
+/// them in `-I` for generated headers, so without the map the read-set memo
+/// is private to one build directory and peers cannot coalesce.
+const CC_OUT_DIR_SENTINEL: &str = "/kache/cc-out-dir";
+const CC_TARGET_SENTINEL: &str = "/kache/cc-target";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CcPrefixMap {
@@ -4332,13 +4338,43 @@ fn cc_prefix_maps(parsed: &CcArgs, configured_base_dirs: &[String]) -> Vec<CcPre
     // `-isysroot` is on the command line; read here (the only env access)
     // and threaded into the deterministic core for testability.
     let sdkroot = std::env::var_os("SDKROOT").filter(|v| !v.is_empty());
-    cc_prefix_maps_cfg(
+    let mut maps = cc_prefix_maps_cfg(
         parsed,
         &cwd,
         base.as_deref().map(Path::new),
         sdkroot.as_deref().map(Path::new),
         configured_base_dirs,
-    )
+    );
+    if !maps.is_empty()
+        && let Some(out_dir) = std::env::var_os("OUT_DIR").filter(|v| !v.is_empty())
+    {
+        push_cargo_out_dir_maps(&mut maps, &cwd, Path::new(&out_dir));
+        maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
+    }
+    maps
+}
+
+/// Map a build script's `OUT_DIR`, and the target directory it sits in, to
+/// sentinels shared by every build directory. Appended after the derived
+/// roots; the caller re-sorts so the longest prefix still wins.
+fn push_cargo_out_dir_maps(maps: &mut Vec<CcPrefixMap>, cwd: &Path, out_dir: &Path) {
+    let out_abs = absolutize_path(cwd, out_dir);
+    let mut roots: Vec<(PathBuf, &'static str)> = Vec::new();
+    if let Some(target) = crate::build_script::target_dir(&out_abs) {
+        roots.push((canonicalize_or_self(&target), CC_TARGET_SENTINEL));
+        roots.push((target, CC_TARGET_SENTINEL));
+    }
+    roots.push((canonicalize_or_self(&out_abs), CC_OUT_DIR_SENTINEL));
+    roots.push((out_abs, CC_OUT_DIR_SENTINEL));
+    for (root, to) in roots {
+        let from = root.to_string_lossy().to_string();
+        if !from.is_empty() && !maps.iter().any(|m| m.from == from) {
+            maps.push(CcPrefixMap {
+                from,
+                to: to.to_string(),
+            });
+        }
+    }
 }
 
 /// The Apple SDK path this invocation pins, for the `<SDKROOT>` map.
@@ -14054,6 +14090,52 @@ mod tests {
             cc_inputs_hide_assembler_input(&[dir.path().join("absent.h")]),
             None,
             "an unreadable input is the fingerprinting step's problem"
+        );
+    }
+
+    /// Two build directories spell `OUT_DIR` differently; after the map they
+    /// agree on the generated-header include, so their read-set memos meet.
+    #[test]
+    fn out_dir_maps_make_generated_includes_portable_across_build_directories() {
+        let cwd = Path::new("/registry/src/index/libfoo-sys-1.0.0");
+        let maps_for = |target: &str| {
+            let mut maps = vec![CcPrefixMap {
+                from: cwd.to_string_lossy().to_string(),
+                to: CC_ROOT_SENTINEL.to_string(),
+            }];
+            let out = format!("{target}/debug/build/libfoo-sys-abc123/out");
+            push_cargo_out_dir_maps(&mut maps, cwd, Path::new(&out));
+            maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
+            maps
+        };
+        let a = maps_for("/work/job-a/target");
+        let b = maps_for("/work/job-b/target");
+        let include_a = "-I/work/job-a/target/debug/build/libfoo-sys-abc123/out/include";
+        let include_b = "-I/work/job-b/target/debug/build/libfoo-sys-abc123/out/include";
+        let mapped_a = apply_cc_prefix_maps_to_bytes(include_a.as_bytes().to_vec(), &a);
+        let mapped_b = apply_cc_prefix_maps_to_bytes(include_b.as_bytes().to_vec(), &b);
+        assert_eq!(mapped_a, mapped_b);
+        assert_eq!(
+            String::from_utf8(mapped_a).unwrap(),
+            format!("-I{CC_OUT_DIR_SENTINEL}/include"),
+            "OUT_DIR wins over the target directory it sits in"
+        );
+        let sibling = "-I/work/job-a/target/debug/build/libz-sys-def456/out/include";
+        assert_eq!(
+            String::from_utf8(apply_cc_prefix_maps_to_bytes(
+                sibling.as_bytes().to_vec(),
+                &a
+            ))
+            .unwrap(),
+            format!("-I{CC_TARGET_SENTINEL}/debug/build/libz-sys-def456/out/include"),
+            "a dependency's OUT_DIR under the same target directory maps too"
+        );
+        assert_eq!(
+            cc_unmapped_path_candidates(&format!("{CC_OUT_DIR_SENTINEL}/include/x.h"), &b),
+            vec![PathBuf::from(
+                "/work/job-b/target/debug/build/libfoo-sys-abc123/out/include/x.h"
+            )],
+            "a recorded name resolves to this build directory's file"
         );
     }
 }

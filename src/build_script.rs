@@ -513,7 +513,7 @@ impl Environment {
 }
 
 /// `<target>/[<triple>/]<profile>/build/<pkg>-<hash>/out` back to `<target>`.
-fn target_dir(out_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn target_dir(out_dir: &Path) -> Option<PathBuf> {
     let unit = out_dir.parent()?;
     let build = unit.parent()?;
     if build.file_name()? != "build" {

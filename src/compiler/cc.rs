@@ -4760,8 +4760,13 @@ fn cc_preprocess_memo_key(
     // Targets only. The sources are the per-checkout roots this whole change
     // exists to keep out; the targets are the sentinels both trees share, and
     // they are what decides whether two mappings mean the same thing.
-    for map in prefix_maps {
-        fold_cc_memo_field(&mut hasher, b"prefix-to", map.to.as_bytes());
+    // Sorted: the maps come ordered by source length, which is a property
+    // of one checkout's paths, not of what the mapping means.
+    let mut targets: Vec<&str> = prefix_maps.iter().map(|map| map.to.as_str()).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    for target in targets {
+        fold_cc_memo_field(&mut hasher, b"prefix-to", target.as_bytes());
     }
 
     // Values through the same maps as the argv: a `cc`-crate build hands a
@@ -6329,6 +6334,15 @@ impl CcCompiler {
             let _trace = crate::phase_trace::phase("cc_prefix_maps");
             cc_prefix_maps(parsed, &self.base_dirs)
         };
+        for map in &prefix_maps {
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] prefix_map {} => {}",
+                trace_name,
+                map.from,
+                map.to
+            );
+        }
 
         hasher.update(b"cc_key_version:");
         hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
@@ -14538,6 +14552,41 @@ mod tests {
         assert_eq!(
             cc_memo_hash_parts(&format!("pb:{digest}")),
             (digest.as_str(), true)
+        );
+    }
+
+    /// The memo identity folds the mapping targets as a set: two checkouts
+    /// whose roots sort differently by length still agree.
+    #[test]
+    fn memo_key_ignores_the_order_of_the_prefix_maps() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let compiler = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let parsed =
+            CcArgs::parse(&[compiler, "-c".to_string(), "memo-source.c".to_string()]).unwrap();
+        let map = |from: &str, to: &str| CcPrefixMap {
+            from: from.to_string(),
+            to: to.to_string(),
+        };
+        let short_base = vec![
+            map("/work/a/oot-build", CC_BUILD_SENTINEL),
+            map("/work/a/src", CC_BASE_SENTINEL),
+        ];
+        let long_base = vec![
+            map("/tmp/.tmpEQwlo9-long", CC_BASE_SENTINEL),
+            map("/tmp/oot-build", CC_BUILD_SENTINEL),
+        ];
+        assert_eq!(
+            cc_preprocess_memo_key(&parsed, &short_base, "v").unwrap(),
+            cc_preprocess_memo_key(&parsed, &long_base, "v").unwrap()
+        );
+        let other_targets = vec![map("/work/a/oot-build", CC_BUILD_SENTINEL)];
+        assert_ne!(
+            cc_preprocess_memo_key(&parsed, &short_base, "v").unwrap(),
+            cc_preprocess_memo_key(&parsed, &other_targets, "v").unwrap(),
+            "a different set of targets is a different mapping"
         );
     }
 }

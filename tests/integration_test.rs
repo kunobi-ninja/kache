@@ -3310,13 +3310,12 @@ fn test_cc_direct_key_binds_a_root_spelling_object_to_its_checkout() {
     // The canonical spelling: that is the root the wrapper derives from its
     // working directory, and the one the object must be seen to embed.
     let root = std::fs::canonicalize(project.path()).unwrap();
+    // Spelled as a C string: a Windows path's backslashes are escapes.
+    let literal = format!("{}/data", root.display()).replace('\\', "\\\\");
     let write = |dir: &Path| {
         std::fs::write(
             dir.join("foo.c"),
-            format!(
-                "const char *where(void) {{ return \"{}/data\"; }}\n",
-                root.display()
-            ),
+            format!("const char *where(void) {{ return \"{literal}\"; }}\n"),
         )
         .unwrap();
     };

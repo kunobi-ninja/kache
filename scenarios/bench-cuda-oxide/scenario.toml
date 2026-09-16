@@ -16,16 +16,17 @@ setup = [
   "echo '[bench] cuda-oxide needs the CUDA toolkit headers (cuda-nvcc, cuda-cudart-dev, libcurand-dev, libnvjitlink-dev) for bindgen, LLVM 22 llc for PTX, and clang/libclang. Set CUDA_TOOLKIT_PATH and CUDA_OXIDE_LLC if they are not at /usr/local/cuda and on PATH.'",
 ]
 
-# `cargo oxide` drives every example build. Install it from the same checkout,
-# untimed and outside kache, into a directory the objdir wipe does not touch.
+# `cargo oxide` is a Cargo alias in the tree (`run --package cargo-oxide`), so
+# the build compiles cargo-oxide itself inside the timed phase, as upstream CI
+# does.
 #
 # The tree's rust-toolchain.toml pins a nightly with rustc-dev, which the
 # codegen backend links against. A RUSTUP_TOOLCHAIN inherited from the bench
 # host (mise exports kache's own pin) would override that file and the backend
 # would fail with "can't find crate for rustc_driver", so it is unset here and
 # in the build. `rustup toolchain install` with no argument installs the
-# toolchain and components the file names.
-prepare = "unset RUSTUP_TOOLCHAIN && rustup toolchain install && cargo install --locked --path crates/cargo-oxide --root .bench-tools --target-dir .bench-tools/target"
+# toolchain and components the file names, untimed.
+prepare = "unset RUSTUP_TOOLCHAIN && rustup toolchain install"
 
 # The upstream examples-compile step, run as upstream runs it: one shared
 # target dir for every example workspace, compile only.
@@ -45,7 +46,10 @@ unset RUSTUP_TOOLCHAIN
 repo="$(pwd -P)"
 export KACHE_BASE_DIR="$repo"
 export CARGO_TARGET_DIR="$repo/target"
-export PATH="$repo/.bench-tools/bin:$PATH"
+# The smoketest greps Cargo's output for `error: could not compile` in its
+# expected-failure examples. The bench workflow exports CARGO_TERM_COLOR=always,
+# and the colour codes would hide that text.
+export CARGO_TERM_COLOR=never
 
 export CUDA_TOOLKIT_PATH="${CUDA_TOOLKIT_PATH:-/usr/local/cuda}"
 if [ -z "${CUDA_OXIDE_LLC:-}" ]; then

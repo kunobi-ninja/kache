@@ -1239,7 +1239,7 @@ diff --git a/hello.txt b/hello.txt
     }
 
     /// The shipped cuda-oxide scenario runs upstream's GPU-less examples
-    /// compile: `cargo oxide` installed untimed per clone, every example
+    /// compile: the pinned nightly installed untimed per clone, every example
     /// workspace sharing the objdir as CARGO_TARGET_DIR, pinned by commit.
     #[test]
     fn shipped_cuda_oxide_profile_runs_upstream_examples_compile() {
@@ -1258,15 +1258,10 @@ diff --git a/hello.txt b/hello.txt
         );
         let prepare = p
             .prepare_command(Path::new("/k"))
-            .expect("prepare installs cargo-oxide");
-        assert!(prepare.contains("--path crates/cargo-oxide"), "{prepare}");
+            .expect("prepare installs the pinned toolchain");
         assert!(
             prepare.starts_with("unset RUSTUP_TOOLCHAIN"),
             "an inherited toolchain override breaks the rustc-dev backend: {prepare}"
-        );
-        assert!(
-            !prepare.contains("--target-dir target"),
-            "installing into the objdir would be wiped before the build"
         );
         let build = p.build_command(Path::new("/k"));
         assert!(
@@ -1279,6 +1274,10 @@ diff --git a/hello.txt b/hello.txt
         );
         assert!(build.contains("KACHE_BASE_DIR"), "{build}");
         assert!(build.contains("unset RUSTUP_TOOLCHAIN"), "{build}");
+        assert!(
+            build.contains("export CARGO_TERM_COLOR=never"),
+            "colour codes hide the smoketest's compile-error markers"
+        );
     }
 
     /// The shipped eza scenario measures both compiler families: rustc through

@@ -6820,6 +6820,7 @@ mod tests {
     /// reason so the trace can say which.
     #[test]
     fn a_record_is_only_consulted_for_an_eligible_invocation() {
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("index.db");
         let parse = |args: &[&str]| {
@@ -13024,6 +13025,7 @@ pub fn value() -> (&'static str, u8) {
             "--extern",
             "my_macro=/t/debug/deps/libmy_macro-3.so",
         ]);
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
         // SAFETY: the key test lock serialises environment edits.
         unsafe {
             std::env::set_var("CARGO_MANIFEST_DIR", &package);
@@ -13062,7 +13064,12 @@ pub fn value() -> (&'static str, u8) {
             Err(Rejection::TreeChanged),
             "a file added under the package changes the tree"
         );
-        unsafe { std::env::remove_var("CARGO_MANIFEST_DIR") };
+        unsafe {
+            match manifest_dir {
+                Some(value) => std::env::set_var("CARGO_MANIFEST_DIR", value),
+                None => std::env::remove_var("CARGO_MANIFEST_DIR"),
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -13080,6 +13087,7 @@ pub fn value() -> (&'static str, u8) {
         std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
         let member = dir.path().join("member");
         std::fs::create_dir_all(&member).unwrap();
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
         // SAFETY: the key test lock serialises environment edits.
         unsafe {
             std::env::set_var("CARGO_MANIFEST_DIR", &member);
@@ -13093,7 +13101,12 @@ pub fn value() -> (&'static str, u8) {
             std::env::current_dir().ok(),
         )
         .unwrap();
-        unsafe { std::env::remove_var("CARGO_MANIFEST_DIR") };
+        unsafe {
+            match manifest_dir {
+                Some(value) => std::env::set_var("CARGO_MANIFEST_DIR", value),
+                None => std::env::remove_var("CARGO_MANIFEST_DIR"),
+            }
+        }
         assert_eq!(identity, expected);
         assert!(identity.starts_with("clippy 0.1.98"), "{identity}");
     }

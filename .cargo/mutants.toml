@@ -345,4 +345,10 @@ exclude_re = [
     # absolute and present. The value itself is always folded, so an absent
     # or relative value keys the same with or without the extra fold.
     "replace && with \\|\\| in Run::action_key",
+    # `get_cc_preprocess_memo` accepts a memo only when its recorded input
+    # count equals the inputs joined in. The check runs only once a joined
+    # input row exists, so the count it compares against is at least one and
+    # `> 0` is the same test as `>= 0` there; an empty reference set returns
+    # before the comparison and is covered directly.
+    "replace > with >= in FileHashCache<'_>::get_cc_preprocess_memo",
 ]

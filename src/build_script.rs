@@ -531,19 +531,12 @@ fn target_dir(out_dir: &Path) -> Option<PathBuf> {
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
+    if needle.is_empty() {
         return None;
     }
-    let first = needle[0];
-    let mut offset = 0;
-    while let Some(index) = haystack[offset..].iter().position(|byte| *byte == first) {
-        let start = offset + index;
-        if haystack[start..].starts_with(needle) {
-            return Some(start);
-        }
-        offset = start + 1;
-    }
-    None
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn replace_all(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
@@ -1434,6 +1427,10 @@ mod tests {
     fn cargo_environment_lists_fixed_and_prefixed_variables_with_normalized_values() {
         let _lock = crate::test_support::process_state_test_lock();
         let env = environment(Path::new("/t/debug/build/pkg-1/out"), Path::new("/src/pkg"));
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = ["CARGO_PKG_NAME", "PKG_CONFIG_PATH"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect();
         // SAFETY: the process-state lock serialises environment edits.
         unsafe {
             std::env::set_var("CARGO_PKG_NAME", "kt");
@@ -1444,10 +1441,15 @@ mod tests {
         }
         let vars = cargo_environment(&env);
         unsafe {
-            std::env::remove_var("CARGO_PKG_NAME");
             std::env::remove_var("DEP_Z_INCLUDE");
             std::env::remove_var("CARGO_CFG_UNIX");
             std::env::remove_var("KACHE_TEST_UNRELATED_VAR");
+            for (name, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
         }
         assert_eq!(vars["CARGO_PKG_NAME"].as_deref(), Some("kt"));
         assert_eq!(
@@ -1581,6 +1583,18 @@ mod tests {
         assert!(names.is_empty());
         assert!(default, "nothing declared means the package is the input");
         assert_eq!(inputs, ["${KACHE_MANIFEST_DIR}"]);
+
+        let (inputs, names, default) =
+            parse_declarations("cargo:rerun-if-env-changed=FOO\n", &env).unwrap();
+        assert_eq!(names, ["FOO"]);
+        assert!(!default, "a declared variable is a declaration");
+        assert!(inputs.is_empty());
+
+        let (inputs, names, default) =
+            parse_declarations("cargo:rerun-if-changed=build.rs\n", &env).unwrap();
+        assert!(names.is_empty());
+        assert!(!default, "a declared path is a declaration");
+        assert_eq!(inputs, ["${KACHE_MANIFEST_DIR}/build.rs"]);
     }
 
     #[cfg(unix)]
@@ -1659,12 +1673,15 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         assert!(!modified_since(&dir.path().join("absent"), &[], later).unwrap());
+        // Windows reports a path through a file as not found; Unix as ENOTDIR.
+        #[cfg(unix)]
         assert!(
             modified_since(&file.join("child"), &[], later).is_err(),
             "a path through a file is an error, not an absence"
         );
         let hasher = crate::cache_key::FileHasher::new();
         let mut budget = 10;
+        #[cfg(unix)]
         assert!(
             input_state(&file.join("child"), &[], &hasher, &mut budget, 0).is_err(),
             "an unreadable declared input is an error, not a missing one"
@@ -1869,7 +1886,11 @@ mod tests {
             std::os::unix::fs::symlink(&b, &a).unwrap();
             std::os::unix::fs::symlink(&a, &b).unwrap();
             let mut budget = 1000;
-            assert!(input_state(&a, &[], &hasher, &mut budget, 0).is_err());
+            let error = input_state(&a, &[], &hasher, &mut budget, 0).unwrap_err();
+            assert!(
+                error.to_string().contains("symlink cycle"),
+                "the cycle is named before the budget runs out: {error:#}"
+            );
         }
     }
 

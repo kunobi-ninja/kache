@@ -3166,3 +3166,133 @@ fn workspace_wrapper_passthrough_executes_every_time() {
         "wrapper must execute on every build (uncached passthrough)"
     );
 }
+
+/// Without a memo the key comes from what the compile read, so a cold
+/// object costs one compiler run and no preprocess; the memo it leaves
+/// makes the next build a hit, and a changed header a miss.
+#[test]
+fn test_cc_direct_key_compiles_once_without_a_preprocess() {
+    build_kache();
+
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::write(project.path().join("value.h"), "#define VALUE 7\n").unwrap();
+    std::fs::write(
+        project.path().join("foo.c"),
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    let args = ["cc", "-O0", "-g0", "-c", "foo.c", "-o", "foo.o"];
+
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    assert!(project.path().join("foo.o").exists());
+    assert!(
+        !project.path().join("foo.d").exists(),
+        "the private dependency capture leaves nothing beside the object"
+    );
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "miss", 1);
+    assert_last_cc_preprocessor_runs(&report, 0);
+
+    std::fs::remove_file(project.path().join("foo.o")).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    assert!(project.path().join("foo.o").exists());
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "local_hit", 0);
+    assert_last_cc_preprocessor_runs(&report, 0);
+
+    // A memo that no longer matches is rediscovered with the preprocessor,
+    // not by compiling first: the key it finds is the same one a compile
+    // would have derived, so an entry an earlier tree state left is a hit.
+    std::fs::write(project.path().join("value.h"), "#define VALUE 7777\n").unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "miss", 1);
+    assert_last_cc_preprocessor_runs(&report, 1);
+
+    std::fs::write(project.path().join("value.h"), "#define VALUE 7\n").unwrap();
+    std::fs::remove_file(project.path().join("foo.o")).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "local_hit", 0);
+    assert_last_cc_preprocessor_runs(&report, 1);
+    assert_cc_report_counts(&report, 2, 2);
+}
+
+/// A caller that asks for a complete depfile gets it from the same compile
+/// the key is derived from, and a hit writes it back.
+#[test]
+fn test_cc_direct_key_uses_the_callers_depfile() {
+    build_kache();
+
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::write(project.path().join("value.h"), "#define VALUE 7\n").unwrap();
+    std::fs::write(
+        project.path().join("foo.c"),
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    let args = [
+        "cc", "-O0", "-g0", "-MD", "-MF", "foo.d", "-c", "foo.c", "-o", "foo.o",
+    ];
+
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let cold = std::fs::read_to_string(project.path().join("foo.d")).unwrap();
+    assert!(cold.contains("value.h"), "{cold}");
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "miss", 1);
+    assert_last_cc_preprocessor_runs(&report, 0);
+
+    std::fs::remove_file(project.path().join("foo.o")).unwrap();
+    std::fs::remove_file(project.path().join("foo.d")).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    assert!(project.path().join("foo.o").exists());
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("foo.d")).unwrap(),
+        cold
+    );
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "local_hit", 0);
+}
+
+/// A translation unit whose assembler reads a file the compiler never
+/// opens cannot be keyed from the read set: it compiles and is not cached.
+#[test]
+fn test_cc_direct_key_refuses_an_assembler_read_file() {
+    build_kache();
+
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    std::fs::write(project.path().join("blob.bin"), b"payload").unwrap();
+    std::fs::write(
+        project.path().join("foo.c"),
+        "__asm__(\".incbin \\\"blob.bin\\\"\");\nint value(void) { return 1; }\n",
+    )
+    .unwrap();
+    let args = ["cc", "-O0", "-g0", "-c", "foo.c", "-o", "foo.o"];
+
+    // Skipped compiles are kept out of the report's hit/miss summary, so
+    // read the event log itself.
+    let last_event = |cache: &Path| -> serde_json::Value {
+        let text = std::fs::read_to_string(cache.join("events.jsonl")).unwrap();
+        let line = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap();
+        serde_json::from_str(line).unwrap()
+    };
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    assert!(project.path().join("foo.o").exists());
+    let event = last_event(cache_dir.path());
+    assert_eq!(event["crate_name"].as_str(), Some("foo.c"));
+    assert_eq!(event["result"].as_str(), Some("skipped"), "{event}");
+    assert_eq!(event["compiler_runs"].as_u64(), Some(1));
+    assert_eq!(event["preprocessor_runs"].as_u64(), Some(0));
+
+    std::fs::remove_file(project.path().join("foo.o")).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    assert!(project.path().join("foo.o").exists());
+    let event = last_event(cache_dir.path());
+    assert_eq!(event["result"].as_str(), Some("skipped"), "{event}");
+    assert_eq!(event["compiler_runs"].as_u64(), Some(1));
+    let report = kache_report(cache_dir.path());
+    assert_cc_report_counts(&report, 0, 0);
+}

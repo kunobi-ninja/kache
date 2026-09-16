@@ -5506,6 +5506,78 @@ struct PendingCcPreprocessMemo {
     prefix_maps: Vec<CcPrefixMap>,
 }
 
+/// How the key learns what the translation unit reads.
+///
+/// The memo answers first in every mode. Without a memo the classic path
+/// preprocesses (`-E`) to learn the read set and hash the expansion. The
+/// deferrable path instead hands the decision back to the wrapper, which
+/// compiles once with dependency capture and keys from what that compile
+/// read; the captured read set then comes back through `Captured`.
+pub(crate) enum CcKeyDiscovery {
+    Expansion,
+    Deferrable,
+    Captured(CcCapturedInputs),
+}
+
+pub(crate) enum CcKeyOutcome {
+    Key(String),
+    /// No memo for this invocation: compile first, then key from the read
+    /// set. Carries the memo identity so peers of the same unit coalesce.
+    Deferred(CcDeferredKey),
+}
+
+pub(crate) struct CcDeferredKey {
+    pub(crate) memo_key: String,
+}
+
+/// The files a compile with dependency capture read, fingerprinted the way
+/// the memo records them (mapped name, content hash under the prefix maps).
+pub(crate) struct CcCapturedInputs {
+    fingerprints: Vec<crate::cache_key::CcPreprocessMemoInput>,
+}
+
+/// One digest standing for the read set: what the memo would otherwise hold
+/// as the expansion hash. Hashed over mapped names and mapped content so two
+/// checkouts of the same tree agree.
+fn cc_direct_inputs_digest(fingerprints: &[crate::cache_key::CcPreprocessMemoInput]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache.cc.direct-inputs.v1\0");
+    for input in fingerprints {
+        hasher.update(input.name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(input.content.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Make target the compile-first dependency capture writes; never a real file.
+const CC_DIRECT_CAPTURE_TARGET: &str = "__kache_direct_capture";
+
+/// Whether the key may come from a compile-first read set instead of the
+/// expansion. Only the GNU dialect adds a private `-MD -MF`; a caller that
+/// asked for `-MMD` gets a depfile without system headers, which is not a
+/// complete read set, so it keeps the classic path.
+pub(crate) fn cc_direct_key_eligible(parsed: &CcArgs) -> bool {
+    parsed.family.dialect() == Dialect::Gnu
+        && parsed.mode == CompileMode::Compile
+        && parsed.sources.len() == 1
+        && parsed
+            .depinfo
+            .as_ref()
+            .is_none_or(|depinfo| !depinfo.emit || depinfo.include_system)
+}
+
+/// The first construct in any of `paths` that could make the assembler read
+/// a file no fingerprint covers. The classic path scans the expansion; a
+/// compile-first key never sees one, so it scans what the compile read.
+fn cc_inputs_hide_assembler_input(paths: &[PathBuf]) -> Option<&'static str> {
+    paths.iter().find_map(|path| {
+        let bytes = fs::read(path).ok()?;
+        cc_assembler_hidden_input(&bytes)
+    })
+}
+
 #[derive(Default)]
 pub struct CcCompiler {
     /// User-declared flags (issue #95) that kache's built-in allow-list
@@ -5985,8 +6057,39 @@ impl Compiler for CcCompiler {
     }
 
     fn cache_key(&self, parsed: &CcArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
+        match self.cache_key_with(parsed, ctx, CcKeyDiscovery::Expansion)? {
+            CcKeyOutcome::Key(key) => Ok(key),
+            CcKeyOutcome::Deferred(_) => {
+                anyhow::bail!("cc key deferred without a compile-first caller")
+            }
+        }
+    }
+
+    fn execute(&self, parsed: &CcArgs) -> Result<CompileResult> {
+        self.execute_with_extra_args(parsed, Vec::new())
+    }
+
+    fn classify_output(&self, _parsed: &CcArgs, name: &str) -> ArtifactKind {
+        // Caching is not active; classification only matters once outputs
+        // get stored. Delegate to the shared filename-based classifier so
+        // when the cc store path lands, the kinds it produces are already
+        // consistent with the rustc table for shared extensions (.o, .a,
+        // .dylib, etc.).
+        classify_by_filename(name)
+    }
+}
+
+impl CcCompiler {
+    /// The key, or the request to compile first when `discovery` allows it
+    /// and no memo describes this invocation's read set.
+    pub(crate) fn cache_key_with(
+        &self,
+        parsed: &CcArgs,
+        ctx: &KeyCtx<'_, '_>,
+        discovery: CcKeyDiscovery,
+    ) -> Result<CcKeyOutcome> {
         if parsed.mode == CompileMode::Link {
-            return self.cache_key_for_link(parsed, ctx);
+            return self.cache_key_for_link(parsed, ctx).map(CcKeyOutcome::Key);
         }
         // Preconditions (guaranteed by the wrapper checking
         // refuse_reasons first): `-c` mode, exactly one source.
@@ -6340,21 +6443,62 @@ impl Compiler for CcCompiler {
         // The read set comes back with the expansion, from the memo when it
         // answers and from the dependency capture otherwise. It is what makes
         // the shadowing resolution below possible.
-        let (pp_hash, read_inputs) = if let Some((memo_hash, satisfied)) =
-            memo_key.as_ref().and_then(|key| {
-                let _trace = crate::phase_trace::phase("cc_memo_lookup");
-                ctx.file_hasher.cc_preprocess_memo_lookup(
-                    key,
-                    |name| cc_unmapped_path_candidates(name, &prefix_maps),
-                    &|path| cc_mapped_content_hash(path, &prefix_maps),
-                )
-            }) {
+        let (pp_hash, read_inputs) = if let CcKeyDiscovery::Captured(captured) = discovery {
+            // The compile already ran and this is what it read: the digest
+            // of that read set stands where the expansion hash would, and
+            // the memo records it under the same identity.
+            let digest = cc_direct_inputs_digest(&captured.fingerprints);
+            let read_inputs = captured
+                .fingerprints
+                .iter()
+                .map(|input| PathBuf::from(input.local_path()))
+                .collect::<Vec<_>>();
+            if let Some(memo_key) = memo_key {
+                self.pending_preprocess_memo
+                    .borrow_mut()
+                    .replace(PendingCcPreprocessMemo {
+                        memo_key,
+                        preprocessed_hash: digest.clone(),
+                        fingerprints: captured.fingerprints,
+                        prefix_maps: prefix_maps.clone(),
+                    });
+            }
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] preprocessed_memo=captured",
+                trace_name
+            );
+            (digest, Some(read_inputs))
+        } else if let Some((memo_hash, satisfied)) = memo_key.as_ref().and_then(|key| {
+            let _trace = crate::phase_trace::phase("cc_memo_lookup");
+            ctx.file_hasher.cc_preprocess_memo_lookup(
+                key,
+                |name| cc_unmapped_path_candidates(name, &prefix_maps),
+                &|path| cc_mapped_content_hash(path, &prefix_maps),
+            )
+        }) {
             tracing::trace!(
                 target: "kache::cache_key",
                 "[key:{}] preprocessed_memo=hit",
                 trace_name
             );
             (memo_hash, Some(satisfied))
+        } else if let (CcKeyDiscovery::Deferrable, Some(memo_key)) = (&discovery, &memo_key)
+            && cc_direct_key_eligible(parsed)
+            && !ctx.file_hasher.cc_preprocess_memo_recorded(memo_key)
+        {
+            // Nothing recorded for this invocation: the compile has to run,
+            // so let it run first and key from what it read. A memo that
+            // exists but no longer matches keeps the preprocess below, which
+            // can still find the entry an earlier state of the tree left.
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] preprocessed_memo=none deferred",
+                trace_name
+            );
+            return Ok(CcKeyOutcome::Deferred(CcDeferredKey {
+                memo_key: memo_key.clone(),
+            }));
         } else {
             let _trace = crate::phase_trace::phase("cc_preprocess");
             let preprocessed =
@@ -6366,12 +6510,20 @@ impl Compiler for CcCompiler {
                     .map(|input| PathBuf::from(input.local_path()))
                     .collect::<Vec<_>>()
             });
+            // With the read set in hand the key is its digest, the same key a
+            // compile-first run derives, so the two paths find each other's
+            // entries. The expansion hash stands in only when the dependency
+            // capture gave nothing to fingerprint.
+            let hash = match &preprocessed.fingerprints {
+                Some(fingerprints) => cc_direct_inputs_digest(fingerprints),
+                None => preprocessed.hash.clone(),
+            };
             if let (Some(memo_key), Some(fingerprints)) = (memo_key, preprocessed.fingerprints) {
                 self.pending_preprocess_memo
                     .borrow_mut()
                     .replace(PendingCcPreprocessMemo {
                         memo_key,
-                        preprocessed_hash: preprocessed.hash.clone(),
+                        preprocessed_hash: hash.clone(),
                         fingerprints,
                         prefix_maps: prefix_maps.clone(),
                     });
@@ -6381,7 +6533,7 @@ impl Compiler for CcCompiler {
                 "[key:{}] preprocessed_memo=miss",
                 trace_name
             );
-            (preprocessed.hash, read_inputs)
+            (hash, read_inputs)
         };
         hasher.update(b"preprocessed:");
         hasher.update(pp_hash.as_bytes());
@@ -6449,10 +6601,119 @@ impl Compiler for CcCompiler {
             trace_name,
             &key[..16]
         );
-        Ok(key)
+        Ok(CcKeyOutcome::Key(key))
     }
 
-    fn execute(&self, parsed: &CcArgs) -> Result<CompileResult> {
+    /// Compile first, capturing what the compiler read, for a unit whose key
+    /// was deferred. The read set comes from the caller's own `-MD` depfile
+    /// when there is one, else from a private one the compile is asked to
+    /// write. `None` inputs mean the compile ran but cannot be keyed: the
+    /// capture failed, an input is unreadable, or a file the assembler reads
+    /// hides from every fingerprint.
+    pub(crate) fn execute_capturing_inputs(
+        &self,
+        parsed: &CcArgs,
+        file_hasher: &crate::cache_key::FileHasher<'_>,
+    ) -> Result<(CompileResult, Option<CcCapturedInputs>)> {
+        let caller_depfile = parsed.depinfo_output_path();
+        let private = if caller_depfile.is_none() {
+            match tempfile::Builder::new()
+                .prefix("kache-cc-capture-")
+                .tempdir()
+            {
+                Ok(dir) => Some(dir),
+                Err(error) => {
+                    tracing::debug!("cc capture tempdir unavailable: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let private_path = private
+            .as_ref()
+            .map(|dir| dir.path().join("inputs.d"))
+            .filter(|path| path.to_str().is_some());
+        let extra = match &private_path {
+            Some(path) => vec![
+                "-MD".to_string(),
+                "-MF".to_string(),
+                path.to_str().expect("checked UTF-8").to_string(),
+                "-MT".to_string(),
+                CC_DIRECT_CAPTURE_TARGET.to_string(),
+            ],
+            None => Vec::new(),
+        };
+        let result = self.execute_with_extra_args(parsed, extra)?;
+        if result.exit_code != 0 {
+            return Ok((result, None));
+        }
+        let depfile = match (caller_depfile, private_path) {
+            (Some(path), _) => path,
+            (None, Some(path)) => path,
+            (None, None) => return Ok((result, None)),
+        };
+        let inputs = {
+            let _trace = crate::phase_trace::phase("cc_capture");
+            self.captured_inputs(parsed, &depfile, file_hasher)
+        };
+        Ok((result, inputs))
+    }
+
+    fn captured_inputs(
+        &self,
+        parsed: &CcArgs,
+        depfile: &Path,
+        file_hasher: &crate::cache_key::FileHasher<'_>,
+    ) -> Option<CcCapturedInputs> {
+        let raw = match fs::read_to_string(depfile) {
+            Ok(raw) => raw,
+            Err(error) => {
+                tracing::debug!("cc capture depfile unreadable: {error}");
+                return None;
+            }
+        };
+        let cwd = std::env::current_dir().ok()?;
+        let mut paths = match parse_preprocess_dependencies(&raw, &cwd) {
+            Ok(paths) => paths,
+            Err(error) => {
+                tracing::debug!("cc capture depfile unusable: {error:#}");
+                return None;
+            }
+        };
+        for source in &parsed.sources {
+            let absolute = if source.is_absolute() {
+                source.clone()
+            } else {
+                cwd.join(source)
+            };
+            if !paths.contains(&absolute) {
+                paths.push(absolute);
+            }
+        }
+        if let Some(construct) = cc_inputs_hide_assembler_input(&paths) {
+            tracing::debug!(
+                "cc: {} not keyed from its read set: the assembler may read a file the key cannot see (`{construct}`)",
+                cc_trace_name(parsed)
+            );
+            return None;
+        }
+        let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
+        let mapped: Vec<(String, PathBuf)> = paths
+            .into_iter()
+            .map(|path| (cc_mapped_path(&path, &prefix_maps), path))
+            .collect();
+        let fingerprints = file_hasher.cc_preprocess_fingerprints(&mapped, &|path| {
+            cc_mapped_content_hash(path, &prefix_maps)
+        })?;
+        Some(CcCapturedInputs { fingerprints })
+    }
+
+    fn execute_with_extra_args(
+        &self,
+        parsed: &CcArgs,
+        extra: Vec<String>,
+    ) -> Result<CompileResult> {
         // Invoke the underlying compiler with the original argv, plus a
         // set of `-ffile-prefix-map` rules so the object doesn't embed
         // clone-local build/source roots. Spliced in before any `--`
@@ -6462,7 +6723,9 @@ impl Compiler for CcCompiler {
         crate::opcounts::record_compiler_run();
         let mut command = Command::new(&parsed.program);
         let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
-        let args = compose_cc_args(&parsed.rest, file_prefix_map_args(&prefix_maps));
+        let mut appended = file_prefix_map_args(&prefix_maps);
+        appended.extend(extra);
+        let args = compose_cc_args(&parsed.rest, appended);
         command.args(&args);
         // Pin the same effective SOURCE_DATE_EPOCH the `-E` key probe used, so a
         // TU baking __DATE__/__TIME__/__TIMESTAMP__ produces an object whose date
@@ -6533,15 +6796,6 @@ impl Compiler for CcCompiler {
             artifacts,
             keepalive,
         })
-    }
-
-    fn classify_output(&self, _parsed: &CcArgs, name: &str) -> ArtifactKind {
-        // Caching is not active; classification only matters once outputs
-        // get stored. Delegate to the shared filename-based classifier so
-        // when the cc store path lands, the kinds it produces are already
-        // consistent with the rustc table for shared extensions (.o, .a,
-        // .dylib, etc.).
-        classify_by_filename(name)
     }
 }
 
@@ -13577,5 +13831,89 @@ mod tests {
         std::fs::set_permissions(&include, std::fs::Permissions::from_mode(0o755)).unwrap();
         let error = result.expect_err("permission denied is not an answer");
         assert!(error.to_string().contains("unreadable"), "{error:#}");
+    }
+
+    /// Only a GNU-dialect object compile whose depfile, if it asked for
+    /// one, lists every header may key from its read set.
+    #[test]
+    fn direct_keying_applies_to_gnu_object_compiles_with_complete_depfiles() {
+        let parse = |argv: &[&str]| {
+            CcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        assert!(cc_direct_key_eligible(&parse(&[
+            "cc", "-c", "a.c", "-o", "a.o"
+        ])));
+        assert!(cc_direct_key_eligible(&parse(&[
+            "cc", "-MD", "-MF", "a.d", "-c", "a.c", "-o", "a.o"
+        ])));
+        assert!(
+            !cc_direct_key_eligible(&parse(&["cc", "-MMD", "-c", "a.c", "-o", "a.o"])),
+            "a user-header-only depfile is not the read set"
+        );
+        assert!(
+            !cc_direct_key_eligible(&parse(&["cc", "-E", "a.c", "-o", "a.i"])),
+            "only object compiles"
+        );
+        assert!(
+            !cc_direct_key_eligible(&parse(&["clang-cl", "/c", "a.c", "/Foa.obj"])),
+            "the private capture flags are GNU spellings"
+        );
+    }
+
+    #[test]
+    fn direct_inputs_digest_follows_names_and_content_only() {
+        let input = |name: &str, content: &str| crate::cache_key::CcPreprocessMemoInput {
+            name: name.to_string(),
+            content: content.to_string(),
+            mapped: String::new(),
+            fingerprint: crate::cache_key::FileFingerprint {
+                path: format!("/x/{name}"),
+                size: 1,
+                mtime_ns: 2,
+                ctime_ns: 3,
+                inode: 4,
+            },
+        };
+        let base = cc_direct_inputs_digest(&[input("a.c", "1"), input("b.h", "2")]);
+        assert_eq!(base.len(), 64);
+        let mut moved = input("a.c", "1");
+        moved.fingerprint.mtime_ns = 99;
+        moved.mapped = "elsewhere".to_string();
+        assert_eq!(
+            cc_direct_inputs_digest(&[moved, input("b.h", "2")]),
+            base,
+            "where and when a file sits does not change the digest"
+        );
+        assert_ne!(
+            cc_direct_inputs_digest(&[input("a.c", "1"), input("b.h", "3")]),
+            base
+        );
+        assert_ne!(cc_direct_inputs_digest(&[input("a.c", "1")]), base);
+        assert_ne!(
+            cc_direct_inputs_digest(&[input("b.h", "2"), input("a.c", "1")]),
+            base
+        );
+    }
+
+    #[test]
+    fn a_read_set_with_an_assembler_include_is_not_keyable() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.h");
+        let sneaky = dir.path().join("sneaky.h");
+        std::fs::write(&plain, "#define X 1\n").unwrap();
+        std::fs::write(&sneaky, "__asm__(\".incbin \\\"blob.bin\\\"\");\n").unwrap();
+        assert_eq!(
+            cc_inputs_hide_assembler_input(std::slice::from_ref(&plain)),
+            None
+        );
+        assert_eq!(
+            cc_inputs_hide_assembler_input(&[plain, sneaky]),
+            Some(".incbin")
+        );
+        assert_eq!(
+            cc_inputs_hide_assembler_input(&[dir.path().join("absent.h")]),
+            None,
+            "an unreadable input is the fingerprinting step's problem"
+        );
     }
 }

@@ -1308,6 +1308,34 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as i64)
         .unwrap_or(0);
+    run_cc_inner(config, wrapper_args, start, invocation_start_ns, None)
+}
+
+/// A C compile that already ran because its key was deferred: the key is
+/// derived from what the compile read, and the outputs are in place.
+struct CcPrecompiled {
+    result: crate::compile::CompileResult,
+    compile_time_ms: u64,
+    inputs: Option<crate::compiler::cc::CcCapturedInputs>,
+    /// The discovery flight held through the store, so peers of the same
+    /// unit wait for the memo instead of compiling too.
+    flight: Option<crate::store::StoreLock>,
+}
+
+thread_local! {
+    /// Set while a deferred C compile is being keyed and stored, so a
+    /// passthrough taken on that path returns the compile's exit code
+    /// instead of running the compiler a second time.
+    static CC_PRECOMPILED_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+fn run_cc_inner(
+    config: &Config,
+    wrapper_args: &[String],
+    start: std::time::Instant,
+    invocation_start_ns: i64,
+    mut precompiled: Option<CcPrecompiled>,
+) -> Result<i32> {
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
@@ -1436,8 +1464,55 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
     };
-    let cache_key = match compiler.cache_key(&parsed, &key_ctx) {
-        Ok(k) => k,
+    let discovery = match precompiled.as_mut().and_then(|pre| pre.inputs.take()) {
+        Some(inputs) => crate::compiler::cc::CcKeyDiscovery::Captured(inputs),
+        None if precompiled.is_none()
+            && config.deferred_discovery
+            && crate::compiler::cc::cc_direct_key_eligible(&parsed) =>
+        {
+            crate::compiler::cc::CcKeyDiscovery::Deferrable
+        }
+        None => crate::compiler::cc::CcKeyDiscovery::Expansion,
+    };
+    let keyed = compiler.cache_key_with(&parsed, &key_ctx, discovery);
+    let keyed = match keyed {
+        Ok(crate::compiler::cc::CcKeyOutcome::Deferred(deferred)) => {
+            // No memo describes this unit's read set. Hold the discovery
+            // flight so peers wait for the memo this compile leaves, then
+            // ask once more: the previous owner may have published it.
+            let flight = crate::scheduler::join_discovery(
+                &config.cache_dir,
+                &format!("cc:{}", deferred.memo_key),
+            );
+            match compiler.cache_key_with(
+                &parsed,
+                &key_ctx,
+                crate::compiler::cc::CcKeyDiscovery::Deferrable,
+            ) {
+                Ok(crate::compiler::cc::CcKeyOutcome::Deferred(_)) => {
+                    return cc_compile_before_key(
+                        config,
+                        wrapper_args,
+                        &compiler,
+                        &parsed,
+                        &file_hasher,
+                        &crate_name,
+                        &event_root,
+                        start,
+                        invocation_start_ns,
+                        flight,
+                    );
+                }
+                other => other,
+            }
+        }
+        other => other,
+    };
+    let cache_key = match keyed {
+        Ok(crate::compiler::cc::CcKeyOutcome::Key(k)) => k,
+        Ok(crate::compiler::cc::CcKeyOutcome::Deferred(_)) => {
+            unreachable!("a deferred cc key is resolved above")
+        }
         Err(e) => {
             tracing::debug!(
                 "cc cache key failed for {}: {} — passthrough",
@@ -1465,25 +1540,31 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // ── Local cache lookup ───────────────────────────────────────
     let lookup_start = std::time::Instant::now();
     let trace_lookup = crate::phase_trace::phase("lookup");
-    let lookup = match lookup_local_entry(&store, fallback_store.as_ref(), &cache_key) {
-        Ok(lookup) => {
-            drop(trace_lookup);
-            lookup
-        }
-        Err(e) => {
-            tracing::warn!(
-                "cc local store lookup failed for {}: {} — recompiling",
-                crate_name,
-                e
-            );
-            return cc_passthrough_with_event(
-                config,
-                &parsed,
-                &crate_name,
-                &event_root,
-                start,
-                format!("store lookup failed: {e}"),
-            );
+    // A compile that already ran is keyed for storing, not for a hit: its
+    // outputs are in place and its diagnostics were shown.
+    let lookup = if precompiled.is_some() {
+        None
+    } else {
+        match lookup_local_entry(&store, fallback_store.as_ref(), &cache_key) {
+            Ok(lookup) => {
+                drop(trace_lookup);
+                lookup
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "cc local store lookup failed for {}: {} — recompiling",
+                    crate_name,
+                    e
+                );
+                return cc_passthrough_with_event(
+                    config,
+                    &parsed,
+                    &crate_name,
+                    &event_root,
+                    start,
+                    format!("store lookup failed: {e}"),
+                );
+            }
         }
     };
     let lookup_ms = lookup_start.elapsed().as_millis() as u64;
@@ -1552,19 +1633,21 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         }
     }
 
-    if let Some(exit) = cc_try_remote_hit(
-        config,
-        &store,
-        &compiler,
-        &parsed,
-        &file_hasher,
-        &cache_key,
-        &crate_name,
-        &event_root,
-        start,
-        key_ms,
-        lookup_ms,
-    )? {
+    if precompiled.is_none()
+        && let Some(exit) = cc_try_remote_hit(
+            config,
+            &store,
+            &compiler,
+            &parsed,
+            &file_hasher,
+            &cache_key,
+            &crate_name,
+            &event_root,
+            start,
+            key_ms,
+            lookup_ms,
+        )?
+    {
         return Ok(exit);
     }
 
@@ -1572,7 +1655,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Key generation and lookup can take long enough for another process to
     // create an output. Recheck at the last possible wrapper boundary and run
     // the selected compiler directly if its pathname semantics are now needed.
-    if parsed.requires_compiler_output_semantics() {
+    if precompiled.is_none() && parsed.requires_compiler_output_semantics() {
         return cc_direct_passthrough_with_event(
             config,
             &parsed,
@@ -1583,15 +1666,19 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
     }
 
-    let (miss_guard, scheduled_hit) = admit_scheduler_miss(
-        config,
-        &store,
-        &cache_key,
-        FlightIdentity::cc(&crate_name),
-        &crate_name,
-        false,
-        |meta| cc_scheduled_hit_ok(&parsed, meta),
-    );
+    let (miss_guard, scheduled_hit) = if precompiled.is_none() {
+        admit_scheduler_miss(
+            config,
+            &store,
+            &cache_key,
+            FlightIdentity::cc(&crate_name),
+            &crate_name,
+            false,
+            |meta| cc_scheduled_hit_ok(&parsed, meta),
+        )
+    } else {
+        (MissGuard::empty(), None)
+    };
 
     let mut committed = scheduled_hit;
     let mut _build_lock = None;
@@ -1617,7 +1704,13 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         }
     }
 
-    if let Some(meta) = committed.filter(|meta| cc_scheduled_hit_ok(&parsed, meta)) {
+    // A peer published this key while a deferred compile ran: the outputs
+    // here are this compile's own, so nothing is restored and nothing more
+    // is stored.
+    let peer_committed = precompiled.is_some() && committed.is_some();
+    if let Some(meta) =
+        committed.filter(|meta| precompiled.is_none() && cc_scheduled_hit_ok(&parsed, meta))
+    {
         let restore_start = std::time::Instant::now();
         if let Err(e) = restore_cc_from_cache(&store, &parsed, &meta) {
             if e.downcast_ref::<PartialCcRestore>().is_some() {
@@ -1654,33 +1747,52 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         return Ok(0);
     }
 
-    let compile_start = std::time::Instant::now();
-    let result = match compiler.execute(&parsed) {
-        Ok(r) => r,
-        // A spawn-level failure (missing binary, ENOMEM, fork pressure under
-        // load) must not abort the build: fall back to passthrough so the
-        // configured fallback wrapper still gets a chance and the user sees the
-        // real compiler error rather than a kache anyhow chain.
-        Err(e) => {
-            return cc_passthrough_with_event(
-                config,
-                &parsed,
-                &crate_name,
-                &event_root,
-                start,
-                format!("compiler spawn failed: {e}"),
+    let _flight = precompiled.as_mut().and_then(|pre| pre.flight.take());
+    let (result, compile_time_ms, inputs_changed) = match precompiled.take() {
+        Some(pre) => {
+            // Inputs are fingerprinted after a deferred compile; one written
+            // since this invocation started may not be what the compiler
+            // read, so neither the entry nor the memo may describe it.
+            let changed = file_hasher.too_new();
+            if changed {
+                tracing::debug!(
+                    "cc: {} read an input modified during the build; not storing it",
+                    crate_name
+                );
+            }
+            (pre.result, pre.compile_time_ms, changed)
+        }
+        None => {
+            let compile_start = std::time::Instant::now();
+            let result = match compiler.execute(&parsed) {
+                Ok(r) => r,
+                // A spawn-level failure (missing binary, ENOMEM, fork pressure
+                // under load) must not abort the build: fall back to
+                // passthrough so the configured fallback wrapper still gets a
+                // chance and the user sees the real compiler error rather
+                // than a kache anyhow chain.
+                Err(e) => {
+                    return cc_passthrough_with_event(
+                        config,
+                        &parsed,
+                        &crate_name,
+                        &event_root,
+                        start,
+                        format!("compiler spawn failed: {e}"),
+                    );
+                }
+            };
+            miss_guard.record_compile_rss(&crate_name);
+            let compile_time_ms = compile_start.elapsed().as_millis() as u64;
+            replay_diagnostics(
+                &result.stdout,
+                &result.stderr,
+                std::io::stdout(),
+                std::io::stderr(),
             );
+            (result, compile_time_ms, false)
         }
     };
-    miss_guard.record_compile_rss(&crate_name);
-    let compile_time_ms = compile_start.elapsed().as_millis() as u64;
-
-    replay_diagnostics(
-        &result.stdout,
-        &result.stderr,
-        std::io::stdout(),
-        std::io::stderr(),
-    );
 
     // Only store on a clean compile that actually produced its
     // object file. A failed compile (exit != 0) or one whose output
@@ -1689,7 +1801,9 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    let store_candidate = should_store_cc_result(result.exit_code, !result.artifacts.is_empty());
+    let store_candidate = should_store_cc_result(result.exit_code, !result.artifacts.is_empty())
+        && !inputs_changed
+        && !peer_committed;
     if store_candidate {
         compiler.commit_preprocess_memo(&file_hasher);
     }
@@ -5521,6 +5635,121 @@ fn preserved_incremental_with_event(
     Ok(output.exit_code)
 }
 
+/// A deferred C compile: run the compiler with dependency capture, then key
+/// and store through the ordinary path with the result in hand.
+#[allow(clippy::too_many_arguments)]
+fn cc_compile_before_key(
+    config: &Config,
+    wrapper_args: &[String],
+    compiler: &CcCompiler,
+    parsed: &crate::compiler::cc::CcArgs,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    crate_name: &str,
+    event_root: &str,
+    start: std::time::Instant,
+    invocation_start_ns: i64,
+    flight: Option<crate::store::StoreLock>,
+) -> Result<i32> {
+    tracing::debug!("no read-set memo for {crate_name}; compiling before keying");
+    let compile_start = std::time::Instant::now();
+    let (result, inputs) = match compiler.execute_capturing_inputs(parsed, file_hasher) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return cc_passthrough_with_event(
+                config,
+                parsed,
+                crate_name,
+                event_root,
+                start,
+                format!("compiler spawn failed: {e}"),
+            );
+        }
+    };
+    let compile_time_ms = compile_start.elapsed().as_millis() as u64;
+    replay_diagnostics(
+        &result.stdout,
+        &result.stderr,
+        std::io::stdout(),
+        std::io::stderr(),
+    );
+    if result.exit_code != 0 {
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event_with_hash_stats(
+            config,
+            event_root,
+            crate_name,
+            EventResult::Error,
+            elapsed,
+            compile_time_ms,
+            0,
+            "",
+            0,
+            FileHashStats::default(),
+            0,
+            0,
+            0,
+        );
+        print_progress(crate_name, EventResult::Error, elapsed, 0);
+        return Ok(result.exit_code);
+    }
+    let exit_code = result.exit_code;
+    if inputs.is_none() {
+        return cc_precompiled_skipped(
+            config,
+            crate_name,
+            event_root,
+            start,
+            "the compile left no usable read set".to_string(),
+            exit_code,
+        );
+    }
+    CC_PRECOMPILED_EXIT.with(|cell| cell.set(Some(exit_code)));
+    let stored = run_cc_inner(
+        config,
+        wrapper_args,
+        start,
+        invocation_start_ns,
+        Some(CcPrecompiled {
+            result,
+            compile_time_ms,
+            inputs,
+            flight,
+        }),
+    );
+    CC_PRECOMPILED_EXIT.with(|cell| cell.set(None));
+    stored.or(Ok(exit_code))
+}
+
+/// The compile ran; whatever stopped the store, its exit code stands.
+fn cc_precompiled_skipped(
+    config: &Config,
+    crate_name: &str,
+    root: &str,
+    start: std::time::Instant,
+    reason: String,
+    exit_code: i32,
+) -> Result<i32> {
+    tracing::debug!("{crate_name}: compiled, not stored: {reason}");
+    let elapsed = start.elapsed().as_millis() as u64;
+    log_event_with_hash_stats(
+        config,
+        root,
+        crate_name,
+        EventResult::Skipped,
+        elapsed,
+        0,
+        0,
+        "",
+        0,
+        FileHashStats::default(),
+        0,
+        0,
+        0,
+    );
+    print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+    Ok(exit_code)
+}
+
 fn cc_passthrough_with_event<R: Into<String>>(
     config: &Config,
     parsed: &crate::compiler::cc::CcArgs,
@@ -5529,6 +5758,9 @@ fn cc_passthrough_with_event<R: Into<String>>(
     start: std::time::Instant,
     reason: R,
 ) -> Result<i32> {
+    if let Some(exit_code) = CC_PRECOMPILED_EXIT.with(std::cell::Cell::get) {
+        return cc_precompiled_skipped(config, crate_name, root, start, reason.into(), exit_code);
+    }
     let output = cc_passthrough(config, parsed)?;
     log_passthrough_event(
         config,
@@ -5549,6 +5781,9 @@ fn cc_direct_passthrough_with_event<R: Into<String>>(
     start: std::time::Instant,
     reason: R,
 ) -> Result<i32> {
+    if let Some(exit_code) = CC_PRECOMPILED_EXIT.with(std::cell::Cell::get) {
+        return cc_precompiled_skipped(config, crate_name, root, start, reason.into(), exit_code);
+    }
     let output = cc_direct_passthrough(config, parsed)?;
     log_passthrough_event(
         config,

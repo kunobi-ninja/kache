@@ -3761,6 +3761,15 @@ impl<'db> FileHasher<'db> {
     /// written; a content hash can, because a file that changes afterwards
     /// simply fails the next comparison. Any database, decoding, or metadata
     /// uncertainty is still a miss.
+    /// Whether any memo is recorded under `memo_key`, whatever its inputs
+    /// say now. Decides between compiling first (nothing recorded) and
+    /// rediscovering the read set with the preprocessor (a stale record).
+    pub(crate) fn cc_preprocess_memo_recorded(&self, memo_key: &str) -> bool {
+        self.cache
+            .as_ref()
+            .is_some_and(|cache| matches!(cache.get_cc_preprocess_memo(memo_key), Ok(Some(_))))
+    }
+
     pub(crate) fn cc_preprocess_memo_lookup(
         &self,
         memo_key: &str,

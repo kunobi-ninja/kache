@@ -4681,6 +4681,13 @@ fn cc_memo_env_is_keyed(name: &OsStr) -> bool {
     if name.starts_with("KACHE_") || CC_MEMO_VOLATILE_ENV.contains(&name) {
         return false;
     }
+    // `DEP_<links>_<KEY>` is Cargo's `links` metadata for build scripts. No
+    // compiler reads it; the build script turns it into argv, which is
+    // keyed. Folding it split the memo between jobs whose dependency graphs
+    // differ only in crates the C compile never sees.
+    if name.starts_with("DEP_") {
+        return false;
+    }
     CC_MEMO_KEYED_ENV.contains(&name) || cc_memo_env_pattern_is_keyed(name)
 }
 
@@ -11365,6 +11372,10 @@ mod tests {
             ),
             ("ACTIONS_RUNTIME_TOKEN", "eyJ.secret"),
             ("INVOCATION_ID", "7f9d3c"),
+            // Cargo `links` metadata for build scripts, spelled like an
+            // include variable; the compile sees it only as argv.
+            ("DEP_OPENSSL_INCLUDE", "/usr/include"),
+            ("DEP_Z_INCLUDE", "/t/debug/build/libz-sys-1/out/include"),
         ] {
             // SAFETY: the process-state lock serialises environment edits.
             unsafe { std::env::set_var(name, value) };
@@ -14367,7 +14378,7 @@ mod tests {
         );
     }
 
-    /// `DEP_<links>_INCLUDE` names a sibling build script's OUT_DIR; mapped,
+    /// A keyed variable can name a directory under this build's target; mapped,
     /// two build directories share the memo, unmapped they do not.
     #[test]
     fn memo_key_maps_environment_values_like_arguments() {
@@ -14388,7 +14399,7 @@ mod tests {
             // SAFETY: the process-state lock serialises environment edits.
             unsafe {
                 std::env::set_var(
-                    "DEP_KT_INCLUDE",
+                    "CPATH",
                     format!("/work/{job}/target/debug/build/kt-sys-1/out/include"),
                 )
             };
@@ -14401,10 +14412,10 @@ mod tests {
             "the mapped value is the same in both build directories"
         );
         // SAFETY: as above.
-        unsafe { std::env::set_var("DEP_KT_INCLUDE", "/elsewhere/include") };
+        unsafe { std::env::set_var("CPATH", "/elsewhere/include") };
         let elsewhere =
             cc_preprocess_memo_key(&parsed, &maps_for("job-a"), "test compiler version").unwrap();
-        unsafe { std::env::remove_var("DEP_KT_INCLUDE") };
+        unsafe { std::env::remove_var("CPATH") };
         assert_ne!(
             elsewhere, a,
             "an include directory outside the maps still keys"

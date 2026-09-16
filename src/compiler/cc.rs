@@ -14234,4 +14234,84 @@ mod tests {
             "an include directory outside the maps still keys"
         );
     }
+
+    /// The env-reading wrapper: an empty OUT_DIR or SDKROOT is unset, the
+    /// OUT_DIR maps ride only on an enabled normalizer, and pushing the same
+    /// roots twice leaves one map per root.
+    #[test]
+    fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("target/debug/build/pkg-1/out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(dir.path().join("a.c"), "int a;\n").unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "a.c", "-o", "a.o"])).unwrap();
+        let has = |maps: &[CcPrefixMap], to: &str| maps.iter().any(|m| m.to == to);
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "OUT_DIR",
+            "SDKROOT",
+            "KACHE_CC_PATH_NORMALIZE",
+            "KACHE_BASE_DIR",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe {
+            std::env::remove_var("KACHE_CC_PATH_NORMALIZE");
+            std::env::remove_var("KACHE_BASE_DIR");
+            std::env::set_var("OUT_DIR", &out);
+            std::env::set_var("SDKROOT", "");
+        }
+        let maps = cc_prefix_maps(&parsed, &[]);
+        assert!(has(&maps, CC_OUT_DIR_SENTINEL), "{maps:?}");
+        assert!(has(&maps, CC_TARGET_SENTINEL), "{maps:?}");
+        assert!(
+            !has(&maps, CC_SDKROOT_SENTINEL),
+            "an empty SDKROOT is unset"
+        );
+        let froms: std::collections::HashSet<&str> = maps.iter().map(|m| m.from.as_str()).collect();
+        assert_eq!(froms.len(), maps.len(), "one map per root: {maps:?}");
+
+        unsafe { std::env::set_var("SDKROOT", dir.path().join("sdk")) };
+        assert!(has(&cc_prefix_maps(&parsed, &[]), CC_SDKROOT_SENTINEL));
+
+        unsafe { std::env::set_var("OUT_DIR", "") };
+        let maps = cc_prefix_maps(&parsed, &[]);
+        assert!(
+            !has(&maps, CC_OUT_DIR_SENTINEL),
+            "an empty OUT_DIR is unset"
+        );
+        assert!(!has(&maps, CC_TARGET_SENTINEL));
+
+        unsafe {
+            std::env::set_var("OUT_DIR", &out);
+            std::env::set_var("KACHE_CC_PATH_NORMALIZE", "0");
+        }
+        assert!(
+            cc_prefix_maps(&parsed, &[]).is_empty(),
+            "no maps at all when normalization is off, OUT_DIR included"
+        );
+
+        let mut twice = Vec::new();
+        push_cargo_out_dir_maps(&mut twice, dir.path(), &out);
+        let once = twice.len();
+        push_cargo_out_dir_maps(&mut twice, dir.path(), &out);
+        assert_eq!(
+            twice.len(),
+            once,
+            "roots already mapped are not pushed again"
+        );
+        assert_eq!(once, 2, "one map per existing root: {twice:?}");
+
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 }

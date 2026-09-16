@@ -14303,7 +14303,17 @@ mod tests {
             once,
             "roots already mapped are not pushed again"
         );
-        assert_eq!(once, 2, "one map per existing root: {twice:?}");
+        let twice_froms: std::collections::HashSet<&str> =
+            twice.iter().map(|m| m.from.as_str()).collect();
+        assert_eq!(
+            twice_froms.len(),
+            once,
+            "no root is mapped twice: {twice:?}"
+        );
+        assert!(
+            (2..=4).contains(&once),
+            "each root once per spelling, canonical or not: {twice:?}"
+        );
 
         unsafe {
             for (name, value) in saved {

@@ -5583,14 +5583,14 @@ pub(crate) struct CcCapturedInputs {
 
 /// One digest standing for the read set: what the memo would otherwise hold
 /// as the expansion hash. Hashed over mapped names and mapped content so two
-/// checkouts of the same tree agree.
+/// checkouts of the same tree agree, as the expansion did with `-P`.
 fn cc_direct_inputs_digest(fingerprints: &[crate::cache_key::CcPreprocessMemoInput]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"kache.cc.direct-inputs.v1\0");
     for input in fingerprints {
         hasher.update(input.name.as_bytes());
         hasher.update(b"\0");
-        hasher.update(input.content.as_bytes());
+        hasher.update(input.mapped.as_bytes());
         hasher.update(b"\n");
     }
     hasher.finalize().to_hex().to_string()
@@ -14065,10 +14065,10 @@ mod tests {
 
     #[test]
     fn direct_inputs_digest_follows_names_and_content_only() {
-        let input = |name: &str, content: &str| crate::cache_key::CcPreprocessMemoInput {
+        let input = |name: &str, mapped: &str| crate::cache_key::CcPreprocessMemoInput {
             name: name.to_string(),
-            content: content.to_string(),
-            mapped: String::new(),
+            mapped: mapped.to_string(),
+            content: String::new(),
             fingerprint: crate::cache_key::FileFingerprint {
                 path: format!("/x/{name}"),
                 size: 1,
@@ -14081,11 +14081,11 @@ mod tests {
         assert_eq!(base.len(), 64);
         let mut moved = input("a.c", "1");
         moved.fingerprint.mtime_ns = 99;
-        moved.mapped = "elsewhere".to_string();
+        moved.content = "raw bytes that spell this checkout's root".to_string();
         assert_eq!(
             cc_direct_inputs_digest(&[moved, input("b.h", "2")]),
             base,
-            "where and when a file sits does not change the digest"
+            "where and when a file sits, and its unmapped bytes, do not change the digest"
         );
         assert_ne!(
             cc_direct_inputs_digest(&[input("a.c", "1"), input("b.h", "3")]),

@@ -38,7 +38,9 @@ pub const UNMEASURED_LINK_WEIGHT: u32 = 2;
 pub const RSS_BYTES_PER_SLOT: u64 = 512 * 1024 * 1024;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// A waiter learns of the owner's publish within this; at 10 ms a hundred
+/// polls a second is nothing, and a cargo slot is not held 100 ms for nothing.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Coalesce dependency discovery before taking a compile flight, a permit or
 /// a cache-key lock. The holder keeps this guard through prediction publish.

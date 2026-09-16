@@ -458,6 +458,18 @@ fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
     exit_code == 0 && has_artifacts
 }
 
+/// A deferred compile whose key a peer committed meanwhile: its own outputs
+/// stand, the entry is theirs.
+fn cc_peer_committed_precompile(precompiled: bool, committed: bool) -> bool {
+    precompiled && committed
+}
+
+/// Whether a clean compile may be stored: not when an input moved under it,
+/// and not when a peer already published the key.
+fn cc_store_candidate(clean: bool, inputs_changed: bool, peer_committed: bool) -> bool {
+    clean && !inputs_changed && !peer_committed
+}
+
 fn cc_output_path_requires_passthrough(path: &Path) -> bool {
     crate::compiler::cc::output_path_requires_compiler_semantics(path)
 }
@@ -1712,7 +1724,7 @@ fn run_cc_inner(
     // A peer published this key while a deferred compile ran: the outputs
     // here are this compile's own, so nothing is restored and nothing more
     // is stored.
-    let peer_committed = precompiled.is_some() && committed.is_some();
+    let peer_committed = cc_peer_committed_precompile(precompiled.is_some(), committed.is_some());
     if let Some(meta) =
         committed.filter(|meta| precompiled.is_none() && cc_scheduled_hit_ok(&parsed, meta))
     {
@@ -1806,9 +1818,11 @@ fn run_cc_inner(
     let store_start = std::time::Instant::now();
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    let store_candidate = should_store_cc_result(result.exit_code, !result.artifacts.is_empty())
-        && !inputs_changed
-        && !peer_committed;
+    let store_candidate = cc_store_candidate(
+        should_store_cc_result(result.exit_code, !result.artifacts.is_empty()),
+        inputs_changed,
+        peer_committed,
+    );
     if store_candidate {
         compiler.commit_preprocess_memo(&file_hasher);
     }
@@ -13045,6 +13059,29 @@ exit 0
             "a rejecting predicate must not return the stored meta"
         );
         assert!(take_recheck_hit(&store, "missing", &|_| true).is_none());
+    }
+
+    #[test]
+    fn a_deferred_cc_compile_is_stored_unless_a_peer_beat_it_or_an_input_moved() {
+        assert!(
+            !cc_peer_committed_precompile(false, true),
+            "an ordinary miss restores instead"
+        );
+        assert!(!cc_peer_committed_precompile(true, false));
+        assert!(cc_peer_committed_precompile(true, true));
+        assert!(cc_store_candidate(true, false, false));
+        assert!(
+            !cc_store_candidate(false, false, false),
+            "a failed or output-less compile"
+        );
+        assert!(
+            !cc_store_candidate(true, true, false),
+            "an input written during the build"
+        );
+        assert!(
+            !cc_store_candidate(true, false, true),
+            "the peer's entry stands"
+        );
     }
 
     #[test]

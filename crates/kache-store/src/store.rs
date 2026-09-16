@@ -1258,6 +1258,17 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     // with SQLITE_BUSY -- critical when 300+ wrapper processes hit the DB in parallel.
     db.pragma_update(None, "busy_timeout", "5000")?;
 
+    // Every statement below is a no-op on a current index, yet each one still
+    // opens a write transaction, so every wrapper process queued behind
+    // whichever miss was storing (hundreds of milliseconds per hit in a
+    // contended cell). The generation stamped after the DDL says the schema
+    // is current; bump [`INDEX_SCHEMA_GENERATION`] whenever a statement is
+    // added or changed below.
+    let generation: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if generation == INDEX_SCHEMA_GENERATION {
+        return Ok(());
+    }
+
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS entries (
             cache_key TEXT PRIMARY KEY,
@@ -1370,9 +1381,14 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     )?;
 
     crate::file_hash::ensure_file_hash_cache_schema(db)?;
+    db.pragma_update(None, "user_version", INDEX_SCHEMA_GENERATION)?;
 
     Ok(())
 }
+
+/// The `user_version` an index carries once every statement of
+/// [`initialize_db`] has run. Bump it with any schema change.
+const INDEX_SCHEMA_GENERATION: i64 = 1;
 
 /// Replace `cache_key`'s rows in `entry_blobs` with one row per unique hash
 /// in `files`, `refs` counting per-file references (kunobi-ninja/kache#608).
@@ -5025,6 +5041,41 @@ pub struct EntryInfo {
 
 #[cfg(test)]
 mod tests {
+
+    /// Opening an index runs its DDL once: the second open finds the schema
+    /// generation current and skips every statement (each would otherwise
+    /// take the write lock), while an index from before the stamp still
+    /// migrates.
+    #[test]
+    fn index_ddl_runs_once_per_schema_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = open_index_db(&path).unwrap();
+        let generation: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+        // A pre-stamp index (generation 0) migrates and gets stamped.
+        db.pragma_update(None, "user_version", 0_i64).unwrap();
+        db.execute_batch("DROP TABLE target_roots").unwrap();
+        drop(db);
+        let db = open_index_db(&path).unwrap();
+        let generation: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+        let tables: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'target_roots'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tables, 1,
+            "the dropped table was recreated by the migration"
+        );
+    }
     type Store = ArtifactStore<TestPolicy>;
     struct TestPolicy;
     impl ArtifactPolicy for TestPolicy {

@@ -224,13 +224,12 @@ fn fixture() -> Fixture {
     let cache = TempDir::new().unwrap();
     write_workspace(workspace.path());
     std::fs::create_dir_all(home.path().join(".cargo")).unwrap();
-    let fixture = Fixture {
+    Fixture {
         workspace: workspace.path().to_path_buf(),
         home: home.path().to_path_buf(),
         cache: cache.path().to_path_buf(),
         _dirs: vec![workspace, home, cache],
-    };
-    fixture
+    }
 }
 
 fn target(fixture: &Fixture, name: &str) -> PathBuf {

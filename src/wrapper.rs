@@ -3032,7 +3032,12 @@ fn run_parsed_rustc(
     // (miss, fallback, no daemon, restore failure) opens the store and runs
     // the fully local path below with the already-computed key.
     let mut store = store;
-    if daemon_local {
+    // A compile that already ran (deferred discovery) has printed rustc's
+    // diagnostics, including the artifact notifications Cargo pipelines on.
+    // Restoring a peer's entry now would replay them a second time and Cargo
+    // would see the unit finish twice; the outputs are in place, so only the
+    // store step below is left.
+    if daemon_local && precompiled.is_none() {
         if let Some(exit) = try_daemon_local_hit(&hit_context, &cache_key, key_ms, key_hash_stats) {
             reset_adaptive_unit(adaptive_unit.as_ref());
             return Ok(exit);
@@ -3095,7 +3100,7 @@ fn run_parsed_rustc(
     let mut lookup_ms = 0_u64;
     let mut record_closure = should_record_closure(predicted, false);
     let mut rederived = false;
-    loop {
+    while precompiled.is_none() {
         // 1. Check local store (volume shard, then main)
         let lookup_start = std::time::Instant::now();
         let lookup_result = match lookup_local_entry(&store, fallback_store.as_ref(), &cache_key) {
@@ -3308,7 +3313,7 @@ fn run_parsed_rustc(
         }
     };
 
-    if let Some(meta) = committed {
+    if let Some(meta) = committed.filter(|_| precompiled.is_none()) {
         if let Err(e) = hit_context.restore_and_finish(
             BlobSource::Store(&store),
             &meta,

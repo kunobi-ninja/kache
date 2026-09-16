@@ -42,6 +42,7 @@ pub const SHIM_PATH_ENV: &str = "KACHE_BUILD_SCRIPT_PATH";
 const ENABLE_ENV: &str = "KACHE_BUILD_SCRIPT_CACHE";
 const REAL_SUFFIX: &str = ".kache-real";
 const ACTION_SUFFIX: &str = ".kache-real.action";
+#[cfg_attr(not(unix), allow(dead_code))]
 const SHIM_DIR: &str = ".kache-build-script-shims";
 const PREDICTION_SCHEMA: u32 = 1;
 const PREDICTION_PREFIX: &str = "build-script:";
@@ -1140,13 +1141,19 @@ fn input_state(
             None
         };
         if let Some(stamp) = &stamp
-            && let Some(digest) = tree_digest_memo(path, stamp)
+            && let Some(digest) = tree_digest_memo(path, &stamp.digest)
         {
             return Ok(digest);
         }
         let digest = hash_directory(path, excluded, file_hasher, budget, symlink_depth)?;
-        if let Some(stamp) = &stamp {
-            record_tree_digest_memo(path, stamp, &digest);
+        // Filesystem timestamps are coarse (a kernel tick on Linux), so a
+        // same-size rewrite within the tick of the last write would keep the
+        // stamp. A tree touched in the last seconds is hashed again next time
+        // rather than memoised; the following run finds it settled.
+        if let Some(stamp) = &stamp
+            && stamp.settled_at(std::time::SystemTime::now())
+        {
+            record_tree_digest_memo(path, &stamp.digest, &digest);
         }
         return Ok(digest);
     }
@@ -1185,8 +1192,26 @@ fn hash_directory(
 /// and change time, from one stat walk. Symlinks contribute their link text
 /// only, so a tree with a symlink to something outside it is not memoised.
 /// `None` when the tree is larger than the budget or holds a symlink.
-fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<String> {
+struct TreeStamp {
+    digest: String,
+    /// The newest modification time seen in the walk.
+    newest: std::time::SystemTime,
+}
+
+impl TreeStamp {
+    /// Coarse filesystem clocks make a stamp taken within this window of its
+    /// newest write ambiguous.
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn settled_at(&self, now: std::time::SystemTime) -> bool {
+        now.duration_since(self.newest)
+            .is_ok_and(|age| age >= Self::SETTLE)
+    }
+}
+
+fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<TreeStamp> {
     let mut hasher = blake3::Hasher::new();
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
     let mut remaining = budget;
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -1216,12 +1241,20 @@ fn tree_stamp(path: &Path, excluded: &[PathBuf], budget: usize) -> Option<String
             );
             hasher.update(if metadata.is_dir() { b"dir" } else { b"fil" });
             fold_metadata_stamp(&mut hasher, &metadata);
+            if let Ok(modified) = metadata.modified()
+                && modified > newest
+            {
+                newest = modified;
+            }
             if metadata.is_dir() {
                 pending.push(child);
             }
         }
     }
-    Some(hasher.finalize().to_hex().to_string())
+    Some(TreeStamp {
+        digest: hasher.finalize().to_hex().to_string(),
+        newest,
+    })
 }
 
 /// Where tree digests are memoised: under the configured cache directory
@@ -1403,23 +1436,38 @@ mod tests {
         let root = dir.path().join("lib");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/a.c"), "int a;").unwrap();
-        let stamp = tree_stamp(&root, &[], 100).unwrap();
-        assert!(tree_digest_memo(&root, &stamp).is_none());
         let hasher = crate::cache_key::FileHasher::new();
         let mut budget = 100;
+
+        // Just written: the tree has not settled, so nothing is memoised.
+        let stamp = tree_stamp(&root, &[], 100).unwrap();
         let digest = input_state(&root, &[], &hasher, &mut budget, 0).unwrap();
+        assert!(tree_digest_memo(&root, &stamp.digest).is_none());
+        assert!(!stamp.settled_at(std::time::SystemTime::now()));
+        assert!(stamp.settled_at(std::time::SystemTime::now() + TreeStamp::SETTLE));
+
+        // Age the tree past the settle window, then the memo takes.
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        for entry in [root.join("src/a.c"), root.join("src"), root.clone()] {
+            filetime::set_file_mtime(&entry, old).unwrap();
+        }
+        let settled = tree_stamp(&root, &[], 100).unwrap();
+        assert!(settled.settled_at(std::time::SystemTime::now()));
         assert_eq!(
-            tree_digest_memo(&root, &stamp).as_deref(),
+            input_state(&root, &[], &hasher, &mut budget, 0).unwrap(),
+            digest
+        );
+        assert_eq!(
+            tree_digest_memo(&root, &settled.digest).as_deref(),
             Some(digest.as_str())
         );
-        // Same content, same stamp: the memo answers. A rewrite with the same
-        // bytes changes the stamp (mtime), so the tree is hashed again and
-        // the digest is unchanged.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // A rewrite with the same bytes changes the stamp (mtime), so the
+        // tree is hashed again and the digest is unchanged.
         std::fs::write(root.join("src/a.c"), "int a;").unwrap();
         let restamped = tree_stamp(&root, &[], 100).unwrap();
-        assert_ne!(restamped, stamp);
-        assert!(tree_digest_memo(&root, &restamped).is_none());
+        assert_ne!(restamped.digest, settled.digest);
+        assert!(tree_digest_memo(&root, &restamped.digest).is_none());
         assert_eq!(
             input_state(&root, &[], &hasher, &mut budget, 0).unwrap(),
             digest

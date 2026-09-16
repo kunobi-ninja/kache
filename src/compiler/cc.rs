@@ -1363,6 +1363,13 @@ const CC_SDKROOT_SENTINEL: &str = "/kache/sdkroot";
 /// is private to one build directory and peers cannot coalesce.
 const CC_OUT_DIR_SENTINEL: &str = "/kache/cc-out-dir";
 const CC_TARGET_SENTINEL: &str = "/kache/cc-target";
+/// Another crate's build-script output directory, named by crate rather
+/// than by unit: `-I<target>/debug/build/libz-sys-<hash>/out/include`
+/// reaches the memo as `/kache/cc-dep-out/libz-sys/include`. Cargo's
+/// metadata hash follows the feature set of the whole build, so `cargo
+/// test` and `cargo check` give the same dependency different hashes; with
+/// the hash in the name, the two jobs could never share a memo.
+const CC_DEP_OUT_DIR_SENTINEL: &str = "/kache/cc-dep-out";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CcPrefixMap {
@@ -4348,9 +4355,88 @@ fn cc_prefix_maps(parsed: &CcArgs, configured_base_dirs: &[String]) -> Vec<CcPre
         && let Some(out_dir) = std::env::var_os("OUT_DIR").filter(|v| !v.is_empty())
     {
         push_cargo_out_dir_maps(&mut maps, &cwd, Path::new(&out_dir));
+        let mut include_dirs = cc_user_include_dirs(parsed, &cwd);
+        include_dirs.extend(
+            cc_flag_dir_values(&parsed.rest, "-isystem")
+                .into_iter()
+                .map(|dir| absolutize_path(&cwd, Path::new(dir))),
+        );
+        push_cargo_dep_out_dir_maps(&mut maps, &cwd, Path::new(&out_dir), &include_dirs);
         maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
     }
     maps
+}
+
+/// Map the build-script output directories of the other crates this compile
+/// includes from (`-I<target>/debug/build/libz-sys-<hash>/out/include`) to
+/// [`CC_DEP_OUT_DIR_SENTINEL`] plus the crate name, dropping Cargo's
+/// metadata hash. The compile's own `OUT_DIR` keeps its map. A crate name
+/// that resolves to two units in one compile keeps the hash: the sentinel
+/// would no longer name one directory.
+fn push_cargo_dep_out_dir_maps(
+    maps: &mut Vec<CcPrefixMap>,
+    cwd: &Path,
+    out_dir: &Path,
+    include_dirs: &[PathBuf],
+) {
+    let own = absolutize_path(cwd, out_dir);
+    let Some(target) = crate::build_script::target_dir(&own) else {
+        return;
+    };
+    let mut units: std::collections::BTreeMap<String, Vec<PathBuf>> =
+        std::collections::BTreeMap::new();
+    for dir in include_dirs {
+        let Some((unit_out, name)) = cargo_unit_out_dir(&target, dir) else {
+            continue;
+        };
+        if unit_out == own {
+            continue;
+        }
+        let dirs = units.entry(name).or_default();
+        if !dirs.contains(&unit_out) {
+            dirs.push(unit_out);
+        }
+    }
+    for (name, dirs) in units {
+        let [unit_out] = dirs.as_slice() else {
+            continue;
+        };
+        let to = format!("{CC_DEP_OUT_DIR_SENTINEL}/{name}");
+        for root in [canonicalize_or_self(unit_out), unit_out.clone()] {
+            let from = root.to_string_lossy().to_string();
+            if !from.is_empty() && !maps.iter().any(|m| m.from == from) {
+                maps.push(CcPrefixMap {
+                    from,
+                    to: to.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// The `<target>/[<triple>/]<profile>/build/<name>-<hash>/out` directory an
+/// include directory sits in, with the crate name, when it has that shape.
+fn cargo_unit_out_dir(target: &Path, dir: &Path) -> Option<(PathBuf, String)> {
+    let rel = dir.strip_prefix(target).ok()?;
+    let components: Vec<&OsStr> = rel.iter().collect();
+    // `<profile>/build/<unit>/out` or `<triple>/<profile>/build/<unit>/out`.
+    let build = components
+        .iter()
+        .position(|component| *component == "build")
+        .filter(|index| (1..=2).contains(index))?;
+    let unit = components.get(build + 1)?.to_str()?;
+    if *components.get(build + 2)? != "out" {
+        return None;
+    }
+    let (name, hash) = unit.rsplit_once('-')?;
+    if name.is_empty() || hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // The directory as spelled, not rejoined: separators must match the
+    // argv this map is applied to.
+    let below_out = components.len() - (build + 3);
+    let unit_out = dir.ancestors().nth(below_out)?.to_path_buf();
+    Some((unit_out, name.to_string()))
 }
 
 /// Map a build script's `OUT_DIR`, and the target directory it sits in, to
@@ -14376,6 +14462,185 @@ mod tests {
             )],
             "a recorded name resolves to this build directory's file"
         );
+    }
+
+    /// `cargo check` and `cargo test` give a dependency's OUT_DIR different
+    /// metadata hashes. Named by crate, the include maps the same in both
+    /// jobs and resolves back to each job's own directory, so the two share
+    /// one memo; the compile's own OUT_DIR keeps its map; anything that is
+    /// not a `build/<name>-<hash>/out` directory, and two units of one crate
+    /// name, keep the target-directory map with the hash in it.
+    #[test]
+    fn dependency_out_dir_maps_drop_the_metadata_hash() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let cwd = Path::new("/registry/src/index/libfoo-sys-1.0.0");
+        let maps_for = |target: &str, includes: &[&str]| {
+            let mut maps = vec![CcPrefixMap {
+                from: cwd.to_string_lossy().to_string(),
+                to: CC_ROOT_SENTINEL.to_string(),
+            }];
+            let out = PathBuf::from(format!("{target}/debug/build/libfoo-sys-abc123/out"));
+            let includes: Vec<PathBuf> = includes.iter().map(PathBuf::from).collect();
+            push_cargo_out_dir_maps(&mut maps, cwd, &out);
+            push_cargo_dep_out_dir_maps(&mut maps, cwd, &out, &includes);
+            maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
+            maps
+        };
+        let mapped = |maps: &[CcPrefixMap], arg: &str| {
+            String::from_utf8(apply_cc_prefix_maps_to_bytes(arg.as_bytes().to_vec(), maps)).unwrap()
+        };
+        let no_dep_map = |maps: &[CcPrefixMap]| {
+            maps.iter()
+                .all(|m| !m.to.starts_with(CC_DEP_OUT_DIR_SENTINEL))
+        };
+        let check_z = "/work/check/target/debug/build/libz-sys-0123456789abcdef/out/include";
+        let test_z = "/work/test/target/debug/build/libz-sys-fedcba9876543210/out/include";
+        let own = "/work/check/target/debug/build/libfoo-sys-abc123/out/include";
+        let check = maps_for("/work/check/target", &[check_z, own]);
+        let test = maps_for("/work/test/target", &[test_z]);
+        let shared = format!("-I{CC_DEP_OUT_DIR_SENTINEL}/libz-sys/include");
+        assert_eq!(mapped(&check, &format!("-I{check_z}")), shared);
+        assert_eq!(mapped(&test, &format!("-I{test_z}")), shared);
+        assert_eq!(
+            mapped(&check, &format!("-I{own}")),
+            format!("-I{CC_OUT_DIR_SENTINEL}/include"),
+            "the compile's own OUT_DIR keeps its map"
+        );
+        assert_eq!(
+            cc_unmapped_path_candidates(
+                &format!("{CC_DEP_OUT_DIR_SENTINEL}/libz-sys/include/zlib.h"),
+                &test
+            ),
+            vec![PathBuf::from(format!("{test_z}/zlib.h"))],
+            "a recorded name resolves to this job's copy"
+        );
+        assert!(
+            mapped(
+                &check,
+                "/work/check/target/debug/build/libz-sys-0123456789abcdef/out/zconf.h"
+            )
+            .starts_with(CC_DEP_OUT_DIR_SENTINEL),
+            "the whole unit `out` directory maps, not only the include directory"
+        );
+
+        // The same memo, then: `-I` differs only by the hash.
+        let compiler = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let memo = |maps: &[CcPrefixMap], include: &str| {
+            let parsed = CcArgs::parse(&[
+                compiler.clone(),
+                "-c".to_string(),
+                "memo-source.c".to_string(),
+                format!("-I{include}"),
+            ])
+            .unwrap();
+            cc_preprocess_memo_key(&parsed, maps, "test compiler version").unwrap()
+        };
+        assert_eq!(memo(&check, check_z), memo(&test, test_z));
+        assert_ne!(
+            memo(&check, check_z),
+            memo(&check, "/elsewhere/include"),
+            "an include directory outside the maps still keys"
+        );
+
+        for (why, includes) in [
+            (
+                "a directory beside `build`",
+                vec!["/work/check/target/debug/deps/include"],
+            ),
+            (
+                "a unit without `out`",
+                vec!["/work/check/target/debug/build/libz-sys-0123456789abcdef/include"],
+            ),
+            (
+                "a short hash",
+                vec!["/work/check/target/debug/build/libz-sys-1/out/include"],
+            ),
+            (
+                "a non-hex hash",
+                vec!["/work/check/target/debug/build/libz-sys-0123456789abcdeg/out/include"],
+            ),
+            (
+                "no crate name",
+                vec!["/work/check/target/debug/build/-0123456789abcdef/out/include"],
+            ),
+            (
+                "`build` directly under the target",
+                vec!["/work/check/target/build/libz-sys-0123456789abcdef/out/include"],
+            ),
+            (
+                "`build` too deep",
+                vec!["/work/check/target/a/b/c/build/libz-sys-0123456789abcdef/out/include"],
+            ),
+            (
+                "a directory outside the target",
+                vec!["/work/other/target/debug/build/libz-sys-0123456789abcdef/out/include"],
+            ),
+            (
+                "two units of one crate",
+                vec![
+                    check_z,
+                    "/work/check/target/debug/build/libz-sys-fedcba9876543210/out/include",
+                ],
+            ),
+        ] {
+            let maps = maps_for("/work/check/target", &includes);
+            assert!(no_dep_map(&maps), "{why}: {maps:?}");
+        }
+        let two = maps_for(
+            "/work/check/target",
+            &[
+                check_z,
+                "/work/check/target/debug/build/libz-sys-fedcba9876543210/out/include",
+            ],
+        );
+        assert_eq!(
+            mapped(&two, &format!("-I{check_z}")),
+            format!("-I{CC_TARGET_SENTINEL}/debug/build/libz-sys-0123456789abcdef/out/include"),
+            "two units of one crate keep the hash"
+        );
+        // A target triple between the target directory and the profile.
+        let cross = maps_for(
+            "/work/check/target/aarch64-unknown-linux-gnu",
+            &[
+                "/work/check/target/aarch64-unknown-linux-gnu/debug/build/libz-sys-0123456789abcdef/out/include",
+            ],
+        );
+        assert_eq!(
+            mapped(
+                &cross,
+                "-I/work/check/target/aarch64-unknown-linux-gnu/debug/build/libz-sys-0123456789abcdef/out/include"
+            ),
+            shared
+        );
+        // One map per root: pushing the same include twice adds nothing.
+        let twice = maps_for("/work/check/target", &[check_z, check_z]);
+        assert_eq!(
+            twice
+                .iter()
+                .filter(|m| m.to.starts_with(CC_DEP_OUT_DIR_SENTINEL))
+                .count(),
+            1
+        );
+        // The map ends at `out` however deep the include directory sits
+        // below it, and when the include directory is `out` itself.
+        let deep = "/work/check/target/debug/build/libz-sys-0123456789abcdef/out/include/git2";
+        let at_out = "/work/check/target/debug/build/libz-sys-0123456789abcdef/out";
+        for dir in [deep, at_out] {
+            let maps = maps_for("/work/check/target", &[dir]);
+            assert_eq!(
+                mapped(&maps, &format!("-I{deep}")),
+                format!("-I{CC_DEP_OUT_DIR_SENTINEL}/libz-sys/include/git2"),
+                "include directory {dir}"
+            );
+            assert_eq!(
+                mapped(&maps, &format!("-I{at_out}")),
+                format!("-I{CC_DEP_OUT_DIR_SENTINEL}/libz-sys"),
+                "include directory {dir}"
+            );
+        }
     }
 
     /// A keyed variable can name a directory under this build's target; mapped,

@@ -104,6 +104,8 @@ Kache recognizes GCC, Clang, Apple Clang, clang-cl, versioned names such as `gcc
 
 Kache remembers each unit's source and header inputs so an unchanged build can derive its key without running the compiler. Identical inputs share one database row, including the local file stamp and the raw and prefix-mapped content hashes. A hit checks the stamp first, then raw content, then mapped content.
 
+A memo names Cargo build directories by role rather than by path: the build script's `OUT_DIR`, the target directory, and the `OUT_DIR` of each crate the unit includes from. Build directories and Cargo commands that give a dependency a different metadata hash, such as `cargo check` and `cargo test`, share one memo per unit.
+
 GC removes memos unused for 30 days and then removes inputs with no references. Successful hits refresh usage at most once a day per memo.
 
 Upgrading from the JSON memo format discards those memos once; units rediscover their inputs on the next build. Compiled artifact entries remain available. SQLite reuses the freed pages. `kache doctor --repair` also compacts a large, sparse index when enough disk space is available; run it after builds finish to avoid lock contention.

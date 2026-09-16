@@ -14,7 +14,7 @@ use 0.11.0.
 cargo build --release
 assets/demo/prepare.sh target/release/kache
 cd assets/demo
-vhs demo.tape && vhs why-miss.tape && vhs monitor.tape && vhs clean.tape
+vhs init.tape && vhs demo.tape && vhs why-miss.tape && vhs monitor.tape && vhs clean.tape
 ```
 
 `env.sh` picks the root (`/Users/Shared/kache-demo` on macOS, where `kache clean`
@@ -29,6 +29,7 @@ tapes build on each other's state: run them in the order above, and re-run
 
 | Tape | Shows |
 | --- | --- |
+| `init.tape` | `kache init --check`, then `kache init` answering its prompts, then `kache doctor`. HOME and CARGO_HOME point into the demo root, so nothing on the recording machine changes. |
 | `demo.tape` | The crate is built cold off screen. On screen: the same commit in a second worktree with an empty target directory, every crate a hit, then `kache report --last-build`. |
 | `why-miss.tape` | One source edit, one recompile, and `kache why-miss` naming the key that changed. |
 | `monitor.tape` | `kache monitor` following a build in a third worktree, then the Why, Projects, and Store tabs. |

@@ -27,6 +27,8 @@ That's it. Your Cargo commands do not change.
 
 `kache init` sets `rustc-wrapper` in Cargo's config. On Unix it also adds the `[env]` keys for build-script C and C++. Run `kache init --check` to preview the changes, or `kache init --no-service` to skip the OS service.
 
+![kache init previewing its changes, applying them, and kache doctor passing every check.](https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/init.gif)
+
 `cargo install` needs Rust 1.95 or newer. Prebuilt packages exist for Homebrew, APT, AUR, winget, Scoop, Chocolatey, mise, and Nix; release builds cover x86_64 and ARM on all three platforms. See [Install Kache](https://kunobi.ninja/docs/kache/getting-started/installation) for each channel.
 
 ## See your first cache hit

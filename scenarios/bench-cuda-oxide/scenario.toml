@@ -32,9 +32,16 @@ prepare = "unset RUSTUP_TOOLCHAIN && rustup toolchain install"
 # target dir for every example workspace, compile only.
 #
 # The codegen backend is built on the first `cargo oxide build` at
-# crates/rustc-codegen-cuda/target, outside the objdir. Both phases start from
-# a fresh clone, so each phase builds it once and the timing includes it, as it
-# does upstream.
+# crates/rustc-codegen-cuda/target, outside the objdir the engine wipes. The
+# build removes that directory first, so every phase, including the same-tree
+# warm phase, builds the backend once as upstream CI does.
+#
+# Cross-clone hits are limited by Cargo, not kache: the backend is its own
+# workspace and its dialect/lowering crates are path dependencies outside it,
+# so Cargo hashes their absolute path into -C metadata. Each clone therefore
+# links a different backend, cargo-oxide's backend identity cfg changes, and
+# every downstream key follows. The same-tree phase is the one that matches CI
+# checking out at a fixed path.
 build = """
 # Input-set predictions, with a sampled cross-check (kunobi-ninja/kache#945).
 export KACHE_INPUT_PREDICTIONS=1
@@ -44,6 +51,7 @@ export KACHE_VERIFY_INPUT_PREDICTIONS=sampled
 unset RUSTUP_TOOLCHAIN
 
 repo="$(pwd -P)"
+rm -rf "$repo/crates/rustc-codegen-cuda/target"
 export KACHE_BASE_DIR="$repo"
 export CARGO_TARGET_DIR="$repo/target"
 # The smoketest greps Cargo's output for `error: could not compile` in its

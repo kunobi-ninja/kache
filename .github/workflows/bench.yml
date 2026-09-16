@@ -114,7 +114,7 @@ jobs:
           # the shared host dependency tree, and 200+ example workspaces built
           # into one target dir. Needs the CUDA toolkit headers and LLVM 22,
           # installed only for this arm below.
-          cuda_oxide='{"name":"cuda-oxide","cmd":"bench cuda-oxide","dir":"bench-cuda-oxide","timeout":120,"job_timeout":180,"min_free_gb":40,"runner":"kunobi-runners"}'
+          cuda_oxide='{"name":"cuda-oxide","cmd":"bench cuda-oxide --warm-same-tree","dir":"bench-cuda-oxide","timeout":120,"job_timeout":180,"min_free_gb":40,"runner":"kunobi-runners"}'
           # Full cold Firefox build is the long pole — hours. `bench firefox`
           # resolves to the exact `bench-firefox` scenario: `--profile firefox`
           # is a name SUBSTRING match that also catches `bench-firefox-windows`,

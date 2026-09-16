@@ -1275,6 +1275,10 @@ diff --git a/hello.txt b/hello.txt
         assert!(build.contains("KACHE_BASE_DIR"), "{build}");
         assert!(build.contains("unset RUSTUP_TOOLCHAIN"), "{build}");
         assert!(
+            build.contains("rm -rf \"$repo/crates/rustc-codegen-cuda/target\""),
+            "the backend target dir sits outside the objdir and must be rebuilt per phase"
+        );
+        assert!(
             build.contains("export CARGO_TERM_COLOR=never"),
             "colour codes hide the smoketest's compile-error markers"
         );

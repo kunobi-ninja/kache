@@ -1336,9 +1336,11 @@ fn resolve_key_inputs(
         // record is shared across target directories and whose discovery
         // flight this process owns (or needs no flight) can be sure; a peer
         // that waited for an owner and still finds nothing, or a unit whose
-        // record is target-directory-local (a proc-macro dependent), may
-        // well find the entry under the key the pre-pass yields.
-        let mut certain_miss = rustc_shared_prediction_identity(args).is_some();
+        // record is target-directory-local (a proc-macro dependent, or a
+        // unit with an OUT_DIR, which the record identity keeps verbatim),
+        // may well find the entry under the key the pre-pass yields.
+        let mut certain_miss = rustc_shared_prediction_identity(args).is_some()
+            && std::env::var_os("OUT_DIR").is_none();
         if prediction.is_err()
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
             && let Some(identity) = prediction_discovery_identity(args, file_hasher)

@@ -11869,6 +11869,20 @@ pub(crate) fn apply_cargo_wrapper_edit(existing: &str, plan: &CargoWrapperPlan) 
     }
 }
 
+/// Install the login service without failing init. A machine that cannot
+/// register one (Task Scheduler without admin rights on Windows, a Linux host
+/// whose systemd refuses the unit) still gets the daemon started by the next
+/// init step (#1080).
+fn install_login_service() -> bool {
+    match crate::service::install() {
+        Ok(()) => true,
+        Err(error) => {
+            println!("  • Login service: not installed ({error:#})");
+            false
+        }
+    }
+}
+
 /// Set when a prompt found stdin closed, so `init` can tell "declined" apart
 /// from "nobody was there to answer" (#1080).
 static PROMPT_HAD_NO_INPUT: std::sync::atomic::AtomicBool =
@@ -12023,8 +12037,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         println!("    installed: {}", mismatch.installed.display());
         println!("    current:   {}", mismatch.current.display());
         if !check && prompt_yes_no("Update service?", true, yes)? {
-            crate::service::install()?;
-            service_action_taken = true;
+            service_action_taken = install_login_service();
         }
     } else if service_installed {
         println!(
@@ -12034,8 +12047,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     } else {
         println!("  \x1b[33m→\x1b[0m Background service: start Kache when you log in");
         if !check && prompt_yes_no("Start Kache automatically at login?", true, yes)? {
-            crate::service::install()?;
-            service_action_taken = true;
+            service_action_taken = install_login_service();
         }
     }
 

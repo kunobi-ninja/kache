@@ -1184,15 +1184,15 @@ fn init_eof_does_not_accept_changes() {
     assert!(!e.cache.join("daemon.sock").exists());
 }
 
-/// PATH with fake `systemctl` (exiting `status`) and `loginctl` first, so
-/// service tests never reach the host's systemd.
+/// PATH with a fake `systemctl` running `script` and a no-op `loginctl`
+/// first, so service tests never reach the host's systemd.
 #[cfg(target_os = "linux")]
-fn fake_systemd_path(dir: &Path, status: i32) -> std::ffi::OsString {
+fn fake_systemd_path(dir: &Path, script: &str) -> std::ffi::OsString {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).unwrap();
-    for (name, code) in [("systemctl", status), ("loginctl", 0)] {
+    for (name, body) in [("systemctl", script), ("loginctl", "exit 0")] {
         let tool = dir.join(name);
-        std::fs::write(&tool, format!("#!/bin/sh\nexit {code}\n")).unwrap();
+        std::fs::write(&tool, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
@@ -1206,7 +1206,10 @@ fn init_without_user_systemd_skips_the_login_service() {
     // Containers and CI runners have no systemd user bus (#1080).
     let e = env();
     e.cmd()
-        .env("PATH", fake_systemd_path(&e.home.join("fake-bin"), 1))
+        .env(
+            "PATH",
+            fake_systemd_path(&e.home.join("fake-bin"), "exit 1"),
+        )
         .args(["init", "--no-shell"])
         .write_stdin("y\nn\n")
         .assert()
@@ -1222,13 +1225,41 @@ fn init_without_user_systemd_skips_the_login_service() {
 fn init_with_user_systemd_installs_the_login_service() {
     let e = env();
     e.cmd()
-        .env("PATH", fake_systemd_path(&e.home.join("fake-bin"), 0))
+        .env(
+            "PATH",
+            fake_systemd_path(&e.home.join("fake-bin"), "exit 0"),
+        )
         .args(["init", "--no-shell"])
         .write_stdin("y\ny\nn\n")
         .assert()
         .success()
-        .stdout(predicates::str::contains("Service installed"));
+        .stdout(predicates::str::contains("Service installed"))
+        .stdout(predicates::str::contains("still starting"));
     assert!(e.home.join(".config/systemd/user/kache.service").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn init_continues_when_the_login_service_cannot_be_installed() {
+    // The same shape as Task Scheduler refusing a non-admin user on Windows:
+    // the service install fails, and init must still finish (#1080).
+    let e = env();
+    let refuse_unit = r#"[ "$2" = show-environment ] && exit 0; echo refused >&2; exit 1"#;
+    e.cmd()
+        .env(
+            "PATH",
+            fake_systemd_path(&e.home.join("fake-bin"), refuse_unit),
+        )
+        .args(["init", "--no-shell"])
+        .write_stdin("y\ny\nn\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Login service: not installed (systemctl --user daemon-reload failed: refused)",
+        ))
+        .stdout(predicates::str::contains("Start daemon now?"));
+    assert!(e.home.join(".cargo/config.toml").exists());
+    assert!(!e.home.join(".config/systemd/user/kache.service").exists());
 }
 
 #[cfg(unix)]

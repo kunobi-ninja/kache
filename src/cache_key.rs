@@ -3784,9 +3784,13 @@ impl<'db> FileHasher<'db> {
                 return None;
             }
         };
-        if record.preprocessed_hash.len() != 64
-            || !record
-                .preprocessed_hash
+        // A `pb:` prefix marks a path-bound read set; the digest follows.
+        let digest = record
+            .preprocessed_hash
+            .strip_prefix("pb:")
+            .unwrap_or(&record.preprocessed_hash);
+        if digest.len() != 64
+            || !digest
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {

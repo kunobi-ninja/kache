@@ -464,6 +464,12 @@ fn cc_peer_committed_precompile(precompiled: bool, committed: bool) -> bool {
     precompiled && committed
 }
 
+/// Whether a committed entry is restored over this invocation's outputs:
+/// never over a compile that already ran, and only when it fits.
+fn cc_restore_committed(precompiled: bool, entry_ok: bool) -> bool {
+    !precompiled && entry_ok
+}
+
 /// Whether a clean compile may be stored: not when an input moved under it,
 /// and not when a peer already published the key.
 fn cc_store_candidate(clean: bool, inputs_changed: bool, peer_committed: bool) -> bool {
@@ -1725,9 +1731,9 @@ fn run_cc_inner(
     // here are this compile's own, so nothing is restored and nothing more
     // is stored.
     let peer_committed = cc_peer_committed_precompile(precompiled.is_some(), committed.is_some());
-    if let Some(meta) =
-        committed.filter(|meta| precompiled.is_none() && cc_scheduled_hit_ok(&parsed, meta))
-    {
+    if let Some(meta) = committed.filter(|meta| {
+        cc_restore_committed(precompiled.is_some(), cc_scheduled_hit_ok(&parsed, meta))
+    }) {
         let restore_start = std::time::Instant::now();
         if let Err(e) = restore_cc_from_cache(&store, &parsed, &meta) {
             if e.downcast_ref::<PartialCcRestore>().is_some() {

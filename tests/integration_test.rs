@@ -3298,3 +3298,69 @@ fn test_cc_direct_key_refuses_an_assembler_read_file() {
     let report = kache_report(cache_dir.path());
     assert_cc_report_counts(&report, 0, 0);
 }
+
+/// A unit whose object spells its own checkout root is keyed to that
+/// checkout: cached and hit there, compiled again from another checkout.
+#[test]
+fn test_cc_direct_key_binds_a_root_spelling_object_to_its_checkout() {
+    build_kache();
+
+    let project = TempDir::new().unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    // The canonical spelling: that is the root the wrapper derives from its
+    // working directory, and the one the object must be seen to embed.
+    let root = std::fs::canonicalize(project.path()).unwrap();
+    let write = |dir: &Path| {
+        std::fs::write(
+            dir.join("foo.c"),
+            format!(
+                "const char *where(void) {{ return \"{}/data\"; }}\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+    };
+    write(project.path());
+    let args = ["cc", "-O0", "-g0", "-c", "foo.c", "-o", "foo.o"];
+
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "miss", 1);
+    assert_last_cc_preprocessor_runs(&report, 0);
+    assert_eq!(
+        report["summary"]["misses"].as_u64(),
+        Some(1),
+        "the bound entry is stored: {report}"
+    );
+
+    std::fs::remove_file(project.path().join("foo.o")).unwrap();
+    run_kache_cc(project.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "local_hit", 0);
+    assert_last_cc_preprocessor_runs(&report, 0);
+
+    // The same source text elsewhere still spells the first checkout, which
+    // is not a root of this one: a miss, then its own entry.
+    let elsewhere = TempDir::new().unwrap();
+    write(elsewhere.path());
+    run_kache_cc(elsewhere.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    // Its object is byte-identical to the first checkout's (the literal is
+    // the same text), so the store already holds every blob: a compile
+    // reported as a duplicate, never a hit.
+    let last = report["all_events"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert!(
+        matches!(last["result"].as_str(), Some("miss") | Some("dup")),
+        "{last}"
+    );
+    assert_eq!(last["compiler_runs"].as_u64(), Some(1));
+    std::fs::remove_file(elsewhere.path().join("foo.o")).unwrap();
+    run_kache_cc(elsewhere.path(), cache_dir.path(), &args);
+    let report = kache_report(cache_dir.path());
+    assert_last_cc_event(&report, "local_hit", 0);
+}

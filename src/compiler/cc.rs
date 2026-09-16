@@ -2195,36 +2195,35 @@ fn preprocess_hash(
     // A path-bound expansion is never memoized. The memo is read from other
     // checkouts through mapped names, and a hit skips the probe that would
     // have noticed the root.
-    let fingerprints = dep_path
-        .as_deref()
-        .filter(|_| !path_bound)
-        .and_then(|path| {
-            let dependencies = std::fs::read_to_string(path)
-                .context("reading cc preprocess dependency file")
-                .and_then(|raw| {
-                    let cwd = std::env::current_dir().context("reading cc compiler directory")?;
-                    parse_preprocess_dependencies(&raw, &cwd)
-                });
-            match dependencies {
-                Ok(paths) => {
-                    // Record each input under its prefix-mapped spelling, the form
-                    // the expansion above was hashed in. That is what lets another
-                    // checkout read the memo: the path a second worktree resolves
-                    // an input to differs, the mapped name does not.
-                    let mapped: Vec<(String, PathBuf)> = paths
-                        .into_iter()
-                        .map(|path| (cc_mapped_path(&path, prefix_maps), path))
-                        .collect();
-                    file_hasher.cc_preprocess_fingerprints(&mapped, &|path| {
-                        cc_mapped_content_hash(path, prefix_maps)
-                    })
-                }
-                Err(error) => {
-                    tracing::debug!("cc preprocess dependency capture unavailable: {error:#}");
-                    None
-                }
+    // Fingerprinted for a path-bound expansion too: the memo carries the
+    // binding, and the key folds the reading checkout's roots.
+    let fingerprints = dep_path.as_deref().and_then(|path| {
+        let dependencies = std::fs::read_to_string(path)
+            .context("reading cc preprocess dependency file")
+            .and_then(|raw| {
+                let cwd = std::env::current_dir().context("reading cc compiler directory")?;
+                parse_preprocess_dependencies(&raw, &cwd)
+            });
+        match dependencies {
+            Ok(paths) => {
+                // Record each input under its prefix-mapped spelling, the form
+                // the expansion above was hashed in. That is what lets another
+                // checkout read the memo: the path a second worktree resolves
+                // an input to differs, the mapped name does not.
+                let mapped: Vec<(String, PathBuf)> = paths
+                    .into_iter()
+                    .map(|path| (cc_mapped_path(&path, prefix_maps), path))
+                    .collect();
+                file_hasher.cc_preprocess_fingerprints(&mapped, &|path| {
+                    cc_mapped_content_hash(path, prefix_maps)
+                })
             }
-        });
+            Err(error) => {
+                tracing::debug!("cc preprocess dependency capture unavailable: {error:#}");
+                None
+            }
+        }
+    });
     Ok(PreprocessHash {
         hash,
         fingerprints,
@@ -5586,21 +5585,75 @@ pub(crate) struct CcDeferredKey {
 /// the memo records them (mapped name, content hash under the prefix maps).
 pub(crate) struct CcCapturedInputs {
     fingerprints: Vec<crate::cache_key::CcPreprocessMemoInput>,
+    /// The object spells a checkout root the prefix maps did not rewrite,
+    /// so its key is bound to this checkout (see `hash_cc_expansion`).
+    path_bound: bool,
+}
+
+/// Memo hash prefix for a path-bound read set: the digest is portable, the
+/// key that uses it folds the reading checkout's roots as well.
+const CC_MEMO_PATH_BOUND_PREFIX: &str = "pb:";
+
+/// Whether the memo identity of this invocation is spelled entirely in
+/// mapped or system paths. If a checkout root reaches the identity raw, a
+/// record for the same unit may exist under another checkout's spelling, and
+/// the miss is not certain enough to compile first.
+fn cc_memo_identity_portable(parsed: &CcArgs, cwd: &Path, prefix_maps: &[CcPrefixMap]) -> bool {
+    let portable = |path: &Path| {
+        let absolute = absolutize_path(cwd, path);
+        let raw = absolute.to_string_lossy().into_owned();
+        cc_mapped_path(&absolute, prefix_maps) != raw || cc_system_path(&raw)
+    };
+    portable(cwd)
+        && parsed.sources.iter().all(|source| portable(source))
+        && parsed.includes.iter().all(|include| portable(include))
+}
+
+/// A path the toolchain owns, the same on every checkout of one machine.
+fn cc_system_path(path: &str) -> bool {
+    ["/usr/", "/opt/", "/Library/", "/Applications/", "/nix/"]
+        .iter()
+        .any(|root| path.starts_with(root))
 }
 
 /// One digest standing for the read set: what the memo would otherwise hold
-/// as the expansion hash. Hashed over mapped names and mapped content so two
-/// checkouts of the same tree agree, as the expansion did with `-P`.
+/// as the expansion hash. Hashed over the mapped content of every file read
+/// and nothing else, as the expansion was with `-P`: where a file sits, and
+/// whether its directory could be mapped, does not enter, so two checkouts of
+/// the same tree agree even under an unmappable root. The source is one of
+/// the files, so include order and every textual choice are in it.
 fn cc_direct_inputs_digest(fingerprints: &[crate::cache_key::CcPreprocessMemoInput]) -> String {
+    let mut contents: Vec<&str> = fingerprints
+        .iter()
+        .map(|input| input.mapped.as_str())
+        .collect();
+    contents.sort_unstable();
+    contents.dedup();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"kache.cc.direct-inputs.v1\0");
-    for input in fingerprints {
-        hasher.update(input.name.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(input.mapped.as_bytes());
+    hasher.update(b"kache.cc.direct-inputs.v2\0");
+    hasher.update(&(contents.len() as u64).to_le_bytes());
+    for content in contents {
+        hasher.update(content.as_bytes());
         hasher.update(b"\n");
     }
     hasher.finalize().to_hex().to_string()
+}
+
+/// The memo's hash column for a read-set digest, flagged when path-bound.
+fn cc_memo_hash(digest: &str, path_bound: bool) -> String {
+    if path_bound {
+        format!("{CC_MEMO_PATH_BOUND_PREFIX}{digest}")
+    } else {
+        digest.to_string()
+    }
+}
+
+/// The digest and the path-bound flag a memo hash column carries.
+fn cc_memo_hash_parts(hash: &str) -> (&str, bool) {
+    match hash.strip_prefix(CC_MEMO_PATH_BOUND_PREFIX) {
+        Some(digest) => (digest, true),
+        None => (hash, false),
+    }
 }
 
 /// Make target the compile-first dependency capture writes; never a real file.
@@ -6232,7 +6285,8 @@ impl Compiler for CcCompiler {
     }
 
     fn execute(&self, parsed: &CcArgs) -> Result<CompileResult> {
-        self.execute_with_extra_args(parsed, Vec::new())
+        self.execute_with_extra_args(parsed, Vec::new(), false)
+            .map(|(result, _)| result)
     }
 
     fn classify_output(&self, _parsed: &CcArgs, name: &str) -> ArtifactKind {
@@ -6614,6 +6668,7 @@ impl CcCompiler {
             // of that read set stands where the expansion hash would, and
             // the memo records it under the same identity.
             let digest = cc_direct_inputs_digest(&captured.fingerprints);
+            self.key_path_bound.set(captured.path_bound);
             let read_inputs = captured
                 .fingerprints
                 .iter()
@@ -6624,7 +6679,7 @@ impl CcCompiler {
                     .borrow_mut()
                     .replace(PendingCcPreprocessMemo {
                         memo_key,
-                        preprocessed_hash: digest.clone(),
+                        preprocessed_hash: cc_memo_hash(&digest, captured.path_bound),
                         fingerprints: captured.fingerprints,
                         prefix_maps: prefix_maps.clone(),
                     });
@@ -6643,14 +6698,18 @@ impl CcCompiler {
                 &|path| cc_mapped_content_hash(path, &prefix_maps),
             )
         }) {
+            let (memo_hash, path_bound) = cc_memo_hash_parts(&memo_hash);
+            self.key_path_bound.set(path_bound);
             tracing::trace!(
                 target: "kache::cache_key",
-                "[key:{}] preprocessed_memo=hit",
+                "[key:{}] preprocessed_memo=hit path_bound={path_bound}",
                 trace_name
             );
-            (memo_hash, Some(satisfied))
+            (memo_hash.to_string(), Some(satisfied))
         } else if let (CcKeyDiscovery::Deferrable, Some(memo_key)) = (&discovery, &memo_key)
             && cc_direct_key_eligible(parsed)
+            && std::env::current_dir()
+                .is_ok_and(|cwd| cc_memo_identity_portable(parsed, &cwd, &prefix_maps))
             && !ctx.file_hasher.cc_preprocess_memo_recorded(memo_key)
         {
             // Nothing recorded for this invocation: the compile has to run,
@@ -6689,7 +6748,7 @@ impl CcCompiler {
                     .borrow_mut()
                     .replace(PendingCcPreprocessMemo {
                         memo_key,
-                        preprocessed_hash: hash.clone(),
+                        preprocessed_hash: cc_memo_hash(&hash, preprocessed.path_bound),
                         fingerprints,
                         prefix_maps: prefix_maps.clone(),
                     });
@@ -6710,6 +6769,31 @@ impl CcCompiler {
             trace_name,
             pp_hash
         );
+        // A read set whose object spells a checkout root is keyed to that
+        // checkout: the digest is portable, the roots folded here are not,
+        // which is the point. Another checkout reading the same memo folds
+        // its own roots and misses.
+        if self.key_path_bound.get() {
+            let mut roots: Vec<&str> = prefix_maps
+                .iter()
+                .map(|map| map.from.as_str())
+                .filter(|from| !from.is_empty())
+                .collect();
+            roots.sort_unstable();
+            roots.dedup();
+            hasher.update(b"path_bound_roots:");
+            for root in &roots {
+                hasher.update(root.as_bytes());
+                hasher.update(b"\0");
+            }
+            hasher.update(b"\n");
+            tracing::trace!(
+                target: "kache::cache_key",
+                "[key:{}] path_bound_roots={}",
+                trace_name,
+                roots.len()
+            );
+        }
 
         // Shadowing. A header appearing in an earlier `-I`/`-iquote` dir (or
         // next to the source) can take the place of one that was read without
@@ -6810,7 +6894,7 @@ impl CcCompiler {
             ],
             None => Vec::new(),
         };
-        let result = self.execute_with_extra_args(parsed, extra)?;
+        let (result, path_bound) = self.execute_with_extra_args(parsed, extra, true)?;
         if result.exit_code != 0 {
             return Ok((result, None));
         }
@@ -6823,7 +6907,13 @@ impl CcCompiler {
             let _trace = crate::phase_trace::phase("cc_capture");
             self.captured_inputs(parsed, &depfile, file_hasher)
         };
-        Ok((result, inputs))
+        Ok((
+            result,
+            inputs.map(|fingerprints| CcCapturedInputs {
+                fingerprints,
+                path_bound,
+            }),
+        ))
     }
 
     fn captured_inputs(
@@ -6831,7 +6921,7 @@ impl CcCompiler {
         parsed: &CcArgs,
         depfile: &Path,
         file_hasher: &crate::cache_key::FileHasher<'_>,
-    ) -> Option<CcCapturedInputs> {
+    ) -> Option<Vec<crate::cache_key::CcPreprocessMemoInput>> {
         let raw = match fs::read_to_string(depfile) {
             Ok(raw) => raw,
             Err(error) => {
@@ -6868,17 +6958,20 @@ impl CcCompiler {
             .into_iter()
             .map(|path| (cc_mapped_path(&path, &prefix_maps), path))
             .collect();
-        let fingerprints = file_hasher.cc_preprocess_fingerprints(&mapped, &|path| {
-            cc_mapped_content_hash(path, &prefix_maps)
-        })?;
-        Some(CcCapturedInputs { fingerprints })
+        file_hasher
+            .cc_preprocess_fingerprints(&mapped, &|path| cc_mapped_content_hash(path, &prefix_maps))
     }
 
+    /// Run the compiler. With `bind_on_embedded_root`, an object that spells
+    /// a checkout root is kept and reported as path-bound instead of being
+    /// dropped: the caller keys it to this checkout.
     fn execute_with_extra_args(
         &self,
         parsed: &CcArgs,
         extra: Vec<String>,
-    ) -> Result<CompileResult> {
+        bind_on_embedded_root: bool,
+    ) -> Result<(CompileResult, bool)> {
+        let mut path_bound = false;
         // Invoke the underlying compiler with the original argv, plus a
         // set of `-ffile-prefix-map` rules so the object doesn't embed
         // clone-local build/source roots. Spliced in before any `--`
@@ -6940,28 +7033,34 @@ impl CcCompiler {
             // A root that reaches the object some other way would still be stored
             // under a key every checkout shares, so keep the object for this build
             // and store nothing. It only sees roots spelled out as plain bytes.
-            let unsafe_to_store =
-                cc_unsafe_to_store(artifacts.is_empty(), self.key_path_bound.get(), || {
-                    parsed
-                        .object_output_path()
-                        .map(|path| cc_object_embeds_mapped_root(&path, &prefix_maps))
-                });
-            artifacts = match unsafe_to_store {
-                None => artifacts,
-                Some(reason) => {
-                    tracing::warn!("cc: {} {reason}; not caching it", cc_trace_name(parsed));
-                    ArtifactSet::empty()
-                }
-            };
+            let embeds = parsed
+                .object_output_path()
+                .map(|path| cc_object_embeds_mapped_root(&path, &prefix_maps));
+            if bind_on_embedded_root && !artifacts.is_empty() && matches!(embeds, Some(Ok(true))) {
+                path_bound = true;
+            } else {
+                let unsafe_to_store =
+                    cc_unsafe_to_store(artifacts.is_empty(), self.key_path_bound.get(), || embeds);
+                artifacts = match unsafe_to_store {
+                    None => artifacts,
+                    Some(reason) => {
+                        tracing::warn!("cc: {} {reason}; not caching it", cc_trace_name(parsed));
+                        ArtifactSet::empty()
+                    }
+                };
+            }
         }
 
-        Ok(CompileResult {
-            exit_code,
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            artifacts,
-            keepalive,
-        })
+        Ok((
+            CompileResult {
+                exit_code,
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                artifacts,
+                keepalive,
+            },
+            path_bound,
+        ))
     }
 }
 
@@ -11458,7 +11557,16 @@ mod tests {
         let (_d, literal_b) = probe(true);
         assert!(literal_a.path_bound && literal_b.path_bound);
         assert_ne!(literal_a.hash, literal_b.hash);
-        assert!(literal_a.fingerprints.is_none(), "never memoized");
+        // Memoised with the path-bound flag: the read-set digest is portable
+        // and the key folds the reading checkout's roots, so another checkout
+        // taking this memo misses rather than sharing the object.
+        assert!(
+            literal_a
+                .fingerprints
+                .as_ref()
+                .is_some_and(|inputs| !inputs.is_empty()),
+            "the read set is recorded, flagged path-bound"
+        );
     }
 
     #[test]
@@ -14104,23 +14212,24 @@ mod tests {
         };
         let base = cc_direct_inputs_digest(&[input("a.c", "1"), input("b.h", "2")]);
         assert_eq!(base.len(), 64);
-        let mut moved = input("a.c", "1");
+        let mut moved = input("/elsewhere/a.c", "1");
         moved.fingerprint.mtime_ns = 99;
         moved.content = "raw bytes that spell this checkout's root".to_string();
         assert_eq!(
             cc_direct_inputs_digest(&[moved, input("b.h", "2")]),
             base,
-            "where and when a file sits, and its unmapped bytes, do not change the digest"
+            "where and when a file sits, its name, and its unmapped bytes do not change the digest"
+        );
+        assert_eq!(
+            cc_direct_inputs_digest(&[input("b.h", "2"), input("a.c", "1")]),
+            base,
+            "listing order does not either; the source text carries include order"
         );
         assert_ne!(
             cc_direct_inputs_digest(&[input("a.c", "1"), input("b.h", "3")]),
             base
         );
         assert_ne!(cc_direct_inputs_digest(&[input("a.c", "1")]), base);
-        assert_ne!(
-            cc_direct_inputs_digest(&[input("b.h", "2"), input("a.c", "1")]),
-            base
-        );
     }
 
     #[test]
@@ -14348,5 +14457,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A memo identity spelled in mapped or toolchain paths is shared by
+    /// every checkout; one that spells a raw checkout root is not.
+    #[test]
+    fn a_memo_identity_is_portable_only_when_every_root_is_mapped() {
+        let parse = |argv: &[&str]| {
+            CcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let maps = vec![CcPrefixMap {
+            from: "/work/checkout".to_string(),
+            to: CC_ROOT_SENTINEL.to_string(),
+        }];
+        let cwd = Path::new("/work/checkout/build");
+        assert!(cc_memo_identity_portable(
+            &parse(&[
+                "cc",
+                "-I/work/checkout/include",
+                "-I/usr/include/foo",
+                "-c",
+                "../src/a.c"
+            ]),
+            cwd,
+            &maps
+        ));
+        assert!(
+            !cc_memo_identity_portable(
+                &parse(&["cc", "-c", "a.c"]),
+                Path::new("/tmp/build"),
+                &maps
+            ),
+            "an unmapped working directory"
+        );
+        assert!(
+            !cc_memo_identity_portable(&parse(&["cc", "-c", "/tmp/elsewhere/a.c"]), cwd, &maps),
+            "an unmapped source"
+        );
+        assert!(
+            !cc_memo_identity_portable(&parse(&["cc", "-I/tmp/gen", "-c", "a.c"]), cwd, &maps),
+            "an unmapped include directory"
+        );
+        assert!(
+            !cc_memo_identity_portable(&parse(&["cc", "-c", "a.c"]), cwd, &[]),
+            "no maps at all"
+        );
+    }
+
+    #[test]
+    fn a_memo_hash_carries_the_path_bound_flag() {
+        let digest = "a".repeat(64);
+        assert_eq!(cc_memo_hash(&digest, false), digest);
+        assert_eq!(cc_memo_hash(&digest, true), format!("pb:{digest}"));
+        assert_eq!(cc_memo_hash_parts(&digest), (digest.as_str(), false));
+        assert_eq!(
+            cc_memo_hash_parts(&format!("pb:{digest}")),
+            (digest.as_str(), true)
+        );
     }
 }

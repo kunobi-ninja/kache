@@ -7214,6 +7214,7 @@ impl CcCompiler {
                 exit_code,
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                pending_stderr: None,
                 artifacts,
                 keepalive,
             },

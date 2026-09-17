@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
-use std::io::Write;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
 
 use crate::compiler::{ArtifactSet, classify_by_filename};
 
@@ -18,13 +18,24 @@ pub enum IncrementalMode {
 pub struct CompileResult {
     pub exit_code: i32,
     pub stdout: String,
+    /// Complete compiler stderr, retained for cache storage.
     pub stderr: String,
+    /// Replay override after live metadata forwarding was attempted.
+    /// `None` replays full stderr; `Some("")` means nothing remains to replay.
+    pub pending_stderr: Option<String>,
     /// Full artifact set produced by this compilation.
     pub artifacts: ArtifactSet,
     /// Temp files backing `artifacts`. Held so Drop does not delete them
     /// before the store put copies the bytes.
     #[allow(dead_code)]
     pub keepalive: Vec<tempfile::TempPath>,
+}
+
+impl CompileResult {
+    /// Compiler stderr selected for deferred replay.
+    pub fn pending_stderr(&self) -> &str {
+        self.pending_stderr.as_deref().unwrap_or(&self.stderr)
+    }
 }
 
 /// A securely-created standard rustc response file that owns its lifetime.
@@ -67,6 +78,9 @@ impl RustcResponseFile {
 
 /// Run rustc with the given arguments, capturing all outputs.
 ///
+/// A supplied `metadata_sink` receives metadata readiness messages immediately.
+/// Hidden verification compiles must leave it unset.
+///
 /// `path_normalizer` provides the rule set for `--remap-path-prefix`
 /// injection — same rules used to normalize the cache key, applied
 /// at the rustc invocation layer so the resulting binary's debug
@@ -87,6 +101,7 @@ pub fn run_rustc(
     skip_remap: bool,
     path_normalizer: &crate::path_normalizer::PathNormalizer,
     incremental_mode: IncrementalMode,
+    metadata_sink: Option<&mut dyn Write>,
 ) -> Result<CompileResult> {
     // Pre-clean output paths: remove any read-only hardlinks left by a previous
     // kache cache hit. Without this, rustc cannot overwrite the 0444 hardlinked
@@ -162,33 +177,34 @@ pub fn run_rustc(
         );
     }
 
-    // Spawn + `wait_with_output()` rather than `Command::output()` so the
-    // child PID is known while the compile runs — the heartbeat monitor
-    // (kunobi-ninja/kache#131) ticks against it for elapsed/ETA lines and
-    // stuck detection. `wait_with_output` reproduces `output()`'s capture
-    // semantics exactly (std drains both pipes concurrently without an extra
-    // user thread, and a capture failure surfaces instead of yielding partial
-    // buffers); `output()` also nulls stdin, matched explicitly here.
+    // Spawn exposes the PID to the heartbeat monitor. Drain both pipes in
+    // parallel so neither can block rustc; stderr metadata can unblock Cargo
+    // before codegen finishes. Reap the child and join the reader even if a
+    // pipe read fails, keeping their lifetimes inside this invocation.
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let compiler_trace = crate::phase_trace::phase("compiler");
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("executing {}", rustc.display()))?;
     let monitor = crate::heartbeat::start_monitor(crate_name.unwrap_or("unknown"), child.id());
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("executing {}", rustc.display()))?;
+    let child_stdout = child.stdout.take().context("capturing rustc stdout")?;
+    let child_stderr = child.stderr.take().context("capturing rustc stderr")?;
+    let forwarding_metadata = metadata_sink.is_some();
+    let captured = capture_rustc_output(&mut child, child_stdout, child_stderr, metadata_sink);
     drop(compiler_trace);
     drop(response_file);
     if let Some(monitor) = monitor {
         monitor.finish();
     }
 
-    let exit_code = output.status.code().unwrap_or(1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let (status, stdout, captured_stderr) =
+        captured.with_context(|| format!("executing {}", rustc.display()))?;
+
+    let exit_code = status.code().unwrap_or(1);
+    let stdout = String::from_utf8_lossy(&stdout).to_string();
+    let stderr = String::from_utf8_lossy(&captured_stderr.verbatim);
 
     // Detect incremental-related failures and log diagnostics
     if exit_code != 0
@@ -212,7 +228,7 @@ pub fn run_rustc(
     // without `--json=artifacts`), where filename guessing is the best
     // available signal.
     let artifacts = if exit_code == 0 {
-        let from_json = resolve_artifacts(&parse_rustc_artifacts(&stderr));
+        let from_json = resolve_artifacts(&captured_stderr.artifacts);
         if from_json.is_empty() {
             tracing::debug!(
                 "[kache] no rustc artifact notifications for {}; falling back to candidate path discovery",
@@ -237,10 +253,92 @@ pub fn run_rustc(
     Ok(CompileResult {
         exit_code,
         stdout,
-        stderr,
+        stderr: stderr.into_owned(),
+        pending_stderr: forwarding_metadata
+            .then(|| String::from_utf8_lossy(&captured_stderr.undelivered).into_owned()),
         artifacts,
         keepalive: Vec::new(),
     })
+}
+
+fn capture_rustc_output(
+    child: &mut Child,
+    mut stdout: impl Read + Send,
+    stderr: impl Read,
+    metadata_sink: Option<&mut dyn Write>,
+) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
+    let child = std::sync::Mutex::new(child);
+    std::thread::scope(|scope| {
+        let stdout = scope.spawn(|| {
+            let mut bytes = Vec::new();
+            let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+            if result.is_err() {
+                // Either reader must be able to unblock the other immediately.
+                // The child may already have exited, so still reap it below.
+                let _ = child.lock().unwrap().kill();
+            }
+            result
+        });
+        let stderr = capture_rustc_stderr(stderr, metadata_sink);
+        if stderr.is_err() {
+            let _ = child.lock().unwrap().kill();
+        }
+        let stdout = stdout.join();
+        // Neither reader needs the child lock after joining. Holding it during
+        // wait before this point could block a reader that needs to kill rustc.
+        let status = child.lock().unwrap().wait();
+        let stdout = stdout.map_err(|_| anyhow::anyhow!("rustc stdout reader panicked"))?;
+        Ok((
+            status?,
+            stdout.context("reading rustc stdout")?,
+            stderr.context("reading rustc stderr")?,
+        ))
+    })
+}
+
+struct CapturedStderr {
+    verbatim: Vec<u8>,
+    undelivered: Vec<u8>,
+    artifacts: Vec<PathBuf>,
+}
+
+fn capture_rustc_stderr(
+    reader: impl Read,
+    mut metadata_sink: Option<&mut dyn Write>,
+) -> io::Result<CapturedStderr> {
+    let mut reader = BufReader::new(reader);
+    let mut captured = CapturedStderr {
+        verbatim: Vec::new(),
+        undelivered: Vec::new(),
+        artifacts: Vec::new(),
+    };
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? != 0 {
+        captured.verbatim.extend_from_slice(&line);
+        let artifact = parse_rustc_artifact(&line);
+        if let Some(path) = artifact
+            .as_ref()
+            .and_then(|message| message.get("artifact"))
+            .and_then(|path| path.as_str())
+        {
+            captured.artifacts.push(PathBuf::from(path));
+        }
+        let metadata = artifact
+            .as_ref()
+            .and_then(|message| message.get("emit"))
+            .and_then(|emit| emit.as_str())
+            == Some("metadata");
+        if metadata && let Some(sink) = metadata_sink.as_deref_mut() {
+            // A write/flush error may follow partial or complete delivery.
+            // Replaying the line could corrupt JSON or duplicate notification;
+            // treat sink errors as best-effort, like ordinary diagnostic replay.
+            let _ = sink.write_all(&line).and_then(|()| sink.flush());
+        } else {
+            captured.undelivered.extend_from_slice(&line);
+        }
+        line.clear();
+    }
+    Ok(captured)
 }
 
 /// Strip `-C incremental=...` flags from rustc arguments.
@@ -322,43 +420,18 @@ pub fn isolate_incremental_flags(args: &[String]) -> Option<Vec<String>> {
     Some(rewritten)
 }
 
-/// Parse rustc's `artifact` JSON notifications out of a captured stderr
-/// stream.
-///
-/// When cargo invokes rustc it passes `--error-format=json
-/// --json=artifacts`; rustc then prints one line per file it writes:
-///
-/// ```json
-/// {"$message_type":"artifact","artifact":"target/debug/deps/libfoo-9a.rlib","emit":"link"}
-/// ```
-///
-/// That is rustc's own authoritative statement of the produced file
-/// set — no filename guessing, no directory globbing that can over- or
-/// under-capture. Lines that are not artifact messages (diagnostics,
-/// non-JSON text) are skipped. Returns the paths exactly as rustc
-/// reported them (relative to rustc's cwd, or absolute); an empty Vec
-/// means the stream carried no artifact messages, and the caller falls
-/// back to [`discover_output_files`].
-fn parse_rustc_artifacts(stderr: &str) -> Vec<PathBuf> {
-    let mut artifacts = Vec::new();
-    for line in stderr.lines() {
-        let line = line.trim();
-        // Cheap reject before the JSON parse: every artifact message is
-        // a JSON object, and most stderr lines are not.
-        if !line.starts_with('{') {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("$message_type").and_then(|v| v.as_str()) != Some("artifact") {
-            continue;
-        }
-        if let Some(path) = value.get("artifact").and_then(|v| v.as_str()) {
-            artifacts.push(PathBuf::from(path));
-        }
+/// Parse one artifact notification, ignoring diagnostics and non-JSON output.
+fn parse_rustc_artifact(line: &[u8]) -> Option<serde_json::Value> {
+    let line = line.trim_ascii_start();
+    if !line.starts_with(b"{") {
+        return None;
     }
-    artifacts
+    let message: serde_json::Value = serde_json::from_slice(line).ok()?;
+    (message
+        .get("$message_type")
+        .and_then(|value| value.as_str())
+        == Some("artifact"))
+    .then_some(message)
 }
 
 /// Resolve rustc-reported artifact paths into the `(absolute_path,
@@ -667,11 +740,187 @@ fn remove_if_readonly(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fs;
+    use std::io::Cursor;
+    use std::rc::Rc;
     // Used only by the `#[cfg(unix)]` hardlink test below, which relies on
     // Unix mode bits; the portable read-only tests use `make_readonly`.
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    struct FailingPipe<R>(R);
+
+    #[cfg(unix)]
+    impl<R: Read> Read for FailingPipe<R> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            // Wait for the child to be running before injecting the read error.
+            self.0.read(output)?;
+            Err(io::Error::other("injected pipe read failure"))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn either_pipe_read_failure_kills_and_reaps_the_child() {
+        for fail_stdout in [false, true] {
+            let mut child = Command::new("sh")
+                // exec avoids descendants retaining the pipes after the kill.
+                // The timeout also bounds the test if killing regresses.
+                .args([
+                    "-c",
+                    "printf 'ready\\n'; printf 'ready\\n' >&2; exec sleep 10",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let started = std::time::Instant::now();
+            let result = if fail_stdout {
+                capture_rustc_output(&mut child, FailingPipe(stdout), stderr, None)
+            } else {
+                capture_rustc_output(&mut child, stdout, FailingPipe(stderr), None)
+            };
+            let error = result.err().expect("a pipe read error must be returned");
+            assert!(format!("{error:#}").contains("injected pipe read failure"));
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            assert!(child.try_wait().unwrap().is_some());
+        }
+    }
+
+    struct MetadataReader {
+        input: Cursor<Vec<u8>>,
+        flushed: Rc<Cell<bool>>,
+    }
+
+    impl Read for MetadataReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.input.position() == self.input.get_ref().len() as u64 {
+                assert!(self.flushed.get(), "metadata must be forwarded before EOF");
+            }
+            self.input.read(output)
+        }
+    }
+
+    struct MetadataWriter {
+        output: Vec<u8>,
+        flushed: Rc<Cell<bool>>,
+    }
+
+    impl Write for MetadataWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed.set(true);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn metadata_is_forwarded_before_eof_without_duplicate_replay() {
+        let metadata = b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rmeta\",\"emit\":\"metadata\"}\n";
+        let diagnostic = b"diagnostic\n";
+        let link =
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"libfoo.rlib\",\"emit\":\"link\"}\n";
+        let input = [diagnostic.as_slice(), metadata.as_slice(), link.as_slice()].concat();
+        let flushed = Rc::new(Cell::new(false));
+        let reader = MetadataReader {
+            input: Cursor::new(input.clone()),
+            flushed: flushed.clone(),
+        };
+        let mut writer = MetadataWriter {
+            output: Vec::new(),
+            flushed,
+        };
+        let captured = capture_rustc_stderr(reader, Some(&mut writer)).unwrap();
+        assert_eq!(writer.output, metadata);
+        assert_eq!(captured.verbatim, input);
+        assert_eq!(
+            captured.undelivered,
+            [diagnostic.as_slice(), link.as_slice()].concat()
+        );
+        assert_eq!(captured.artifacts.len(), 2);
+    }
+
+    struct FailingMetadataWriter {
+        output: Vec<u8>,
+        capacity: usize,
+    }
+
+    impl Write for FailingMetadataWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let remaining = self.capacity - self.output.len();
+            if remaining == 0 {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            let count = remaining.min(bytes.len());
+            self.output.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn metadata_sink_failure_drains_stderr_without_retrying_delivery() {
+        let metadata = b"{\"$message_type\":\"artifact\",\"emit\":\"metadata\"}\n";
+        let diagnostics = b"remaining diagnostics\n";
+        let bytes = [metadata.as_slice(), metadata.as_slice(), diagnostics].concat();
+        // No bytes written, a partial write, and complete writes with failed flushes.
+        for capacity in [0, metadata.len() / 2, 2 * metadata.len()] {
+            let mut input = Cursor::new(&bytes);
+            let mut sink = FailingMetadataWriter {
+                output: Vec::new(),
+                capacity,
+            };
+            let captured = capture_rustc_stderr(&mut input, Some(&mut sink)).unwrap();
+            assert_eq!(sink.output, bytes[..capacity]);
+            assert_eq!(captured.verbatim, bytes);
+            assert_eq!(captured.undelivered, diagnostics);
+            assert_eq!(input.position(), bytes.len() as u64);
+        }
+    }
+
+    #[test]
+    fn pending_stderr_selects_the_override_including_an_empty_override() {
+        for (pending, expected) in [
+            (None, "complete stderr"),
+            (Some("remaining"), "remaining"),
+            (Some(""), ""),
+        ] {
+            let result = CompileResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: "complete stderr".to_owned(),
+                pending_stderr: pending.map(str::to_owned),
+                artifacts: ArtifactSet::empty(),
+                keepalive: Vec::new(),
+            };
+            assert_eq!(result.pending_stderr(), expected);
+            assert_eq!(result.stderr, "complete stderr");
+        }
+    }
+
+    #[test]
+    fn capture_without_forwarding_preserves_metadata_for_replay() {
+        let input = b"{\"$message_type\":\"artifact\",\"artifact\":\"staging/libfoo.rmeta\",\"emit\":\"metadata\"}\nwarning\n";
+        let captured = capture_rustc_stderr(input.as_slice(), None).unwrap();
+        assert_eq!(captured.verbatim, input);
+        assert_eq!(captured.undelivered, input);
+        assert_eq!(
+            captured.artifacts,
+            vec![PathBuf::from("staging/libfoo.rmeta")]
+        );
+    }
 
     /// Mark a file read-only on any platform. Unix mode bits (`from_mode`)
     /// aren't available on Windows, and `remove_if_readonly` keys off the
@@ -1030,7 +1279,9 @@ mod tests {
             "not json at all\n",
         );
         assert_eq!(
-            parse_rustc_artifacts(stream),
+            capture_rustc_stderr(stream.as_bytes(), None)
+                .unwrap()
+                .artifacts,
             vec![
                 PathBuf::from("target/debug/deps/libfoo-9a.rmeta"),
                 PathBuf::from("target/debug/deps/libfoo-9a.rlib"),
@@ -1044,12 +1295,22 @@ mod tests {
         // human-readable diagnostics only, no artifact notifications.
         // The caller must then fall back to candidate path discovery.
         let stream = "warning: unused variable: `x`\nerror: aborting due to 1 error\n";
-        assert!(parse_rustc_artifacts(stream).is_empty());
+        assert!(
+            capture_rustc_stderr(stream.as_bytes(), None)
+                .unwrap()
+                .artifacts
+                .is_empty()
+        );
     }
 
     #[test]
     fn parse_rustc_artifacts_empty_input() {
-        assert!(parse_rustc_artifacts("").is_empty());
+        assert!(
+            capture_rustc_stderr(&b""[..], None)
+                .unwrap()
+                .artifacts
+                .is_empty()
+        );
     }
 
     #[test]

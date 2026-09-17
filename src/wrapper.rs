@@ -1008,7 +1008,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 
     replay_diagnostics(
         &result.stdout,
-        &result.stderr,
+        result.pending_stderr(),
         std::io::stdout(),
         std::io::stderr(),
     );
@@ -1851,7 +1851,7 @@ fn run_cc_inner(
             let compile_time_ms = compile_start.elapsed().as_millis() as u64;
             replay_diagnostics(
                 &result.stdout,
-                &result.stderr,
+                result.pending_stderr(),
                 std::io::stdout(),
                 std::io::stderr(),
             );
@@ -3178,7 +3178,7 @@ fn run_parsed_rustc(
         // the recursion so peers wait for this compile.
         tracing::debug!("no closure record for {crate_name}; compiling before keying");
         let compile_start = std::time::Instant::now();
-        let result = match compiler.execute(args) {
+        let result = match compiler.execute_streaming(args) {
             Ok(result) => result,
             Err(e) => {
                 return passthrough_with_event(
@@ -3192,12 +3192,12 @@ fn run_parsed_rustc(
             }
         };
         let compile_time_ms = compile_start.elapsed().as_millis() as u64;
-        if !result.stdout.is_empty() {
-            print!("{}", result.stdout);
-        }
-        if !result.stderr.is_empty() {
-            eprint!("{}", result.stderr);
-        }
+        replay_diagnostics(
+            &result.stdout,
+            result.pending_stderr(),
+            std::io::stdout(),
+            std::io::stderr(),
+        );
         if result.exit_code != 0 {
             let elapsed = start.elapsed().as_millis() as u64;
             log_event_with_hash_stats(
@@ -3633,7 +3633,7 @@ fn run_parsed_rustc(
         // Compiled before keying (deferred discovery); its output was
         // already replayed.
         Some(pre) => pre.result,
-        None => match compiler.execute(args) {
+        None => match compiler.execute_streaming(args) {
             Ok(r) => r,
             // A spawn-level failure (missing binary, ENOMEM, fork pressure under
             // load) must not abort the build: fall back to passthrough so the
@@ -3657,12 +3657,12 @@ fn run_parsed_rustc(
 
     // Print rustc output
     if precompiled_time.is_none() {
-        if !result.stdout.is_empty() {
-            print!("{}", result.stdout);
-        }
-        if !result.stderr.is_empty() {
-            eprint!("{}", result.stderr);
-        }
+        replay_diagnostics(
+            &result.stdout,
+            result.pending_stderr(),
+            std::io::stdout(),
+            std::io::stderr(),
+        );
     }
 
     // Don't cache failures
@@ -5672,7 +5672,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
     replay_diagnostics(
         &result.stdout,
-        &result.stderr,
+        result.pending_stderr(),
         std::io::stdout(),
         std::io::stderr(),
     );
@@ -5853,7 +5853,7 @@ fn cc_compile_before_key(
     let compile_time_ms = compile_start.elapsed().as_millis() as u64;
     replay_diagnostics(
         &result.stdout,
-        &result.stderr,
+        result.pending_stderr(),
         std::io::stdout(),
         std::io::stderr(),
     );

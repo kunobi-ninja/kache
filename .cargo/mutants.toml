@@ -260,6 +260,13 @@ exclude_re = [
     "replace > with (>=|<|==) in Daemon::run_gc",
     "replace \\+ with . in Daemon::run_gc",
     "replace < with <= in join_inflight_download",
+    # `capture_rustc_stderr` reads until end of file, and that comparison is
+    # the loop's only exit. Inverted, the reader spins on the zero-length read
+    # that means EOF, so the lane reports a timeout: there is no test that can
+    # observe a loop which never finishes. Every other mutation of this
+    # function is tested — the delivered, undelivered and verbatim bytes are
+    # all asserted.
+    "replace != with == in capture_rustc_stderr",
     "MacOsPlatform>::package_debug_bundle",
     "replace default_cache_executables -> bool with true",
     "replace \\| with \\^ in touch_mtime_write_clock",

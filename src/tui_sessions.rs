@@ -629,6 +629,13 @@ fn cause_of(
         groups.dedup();
         return Cause::OwnInputs(groups);
     }
+    // The first compile in a new worktree has no same-tree diff; another build
+    // tree of the same unit can still name the inputs that differ.
+    if let Some(checkout) = miss_chain::compare_checkout(events, index)
+        && checkout.verdict == miss_chain::CheckoutVerdict::OwnInputs
+    {
+        return Cause::OwnInputs(checkout.groups);
+    }
     if event.root.is_empty() {
         // "Here" has no identity; two unknown-root events with one crate
         // name may be unrelated workspaces.
@@ -1119,15 +1126,39 @@ mod tests {
         events.extend(build("/second", "now", 100, "2222", "bbbb"));
 
         let analysis = analyze_one(&events);
-        assert!(
-            analysis.causes.iter().any(|g| g.cause
-                == Cause::Downstream {
-                    root: "leaf".into(),
-                    complete: true
-                }),
+        let cause_of_crate = |name: &str| {
+            analysis
+                .causes
+                .iter()
+                .find(|g| g.examples.iter().any(|e| e == name))
+                .map(|g| g.cause.clone())
+        };
+        assert_eq!(
+            cause_of_crate("app"),
+            Some(Cause::Downstream {
+                root: "leaf".into(),
+                complete: true
+            }),
             "{:?}",
             analysis.causes
         );
+        assert_eq!(
+            cause_of_crate("leaf"),
+            Some(Cause::OwnInputs(vec!["sources".into()])),
+            "{:?}",
+            analysis.causes
+        );
+
+        // Same inputs in both trees: nothing to name, so no cause is invented.
+        let mut events = build("/first", "before", 0, "1111", "aaaa");
+        events.extend(build("/second", "now", 100, "1111", "bbbb"));
+        let analysis = analyze_one(&events);
+        let leaf = analysis
+            .causes
+            .iter()
+            .find(|g| g.examples.iter().any(|e| e == "leaf"))
+            .unwrap();
+        assert_eq!(leaf.cause, Cause::NoHistory);
     }
 
     /// A miss below two changed leaves names both, not the first one the

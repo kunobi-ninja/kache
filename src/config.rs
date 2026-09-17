@@ -3738,7 +3738,7 @@ pub(crate) mod tests {
         }
     }
 
-    struct TestEnvGuard {
+    pub(crate) struct TestEnvGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
@@ -3754,7 +3754,10 @@ pub(crate) mod tests {
         }
     }
 
-    fn set_env_for_test(key: &'static str, value: Option<&std::ffi::OsStr>) -> TestEnvGuard {
+    pub(crate) fn set_env_for_test(
+        key: &'static str,
+        value: Option<&std::ffi::OsStr>,
+    ) -> TestEnvGuard {
         let previous = std::env::var_os(key);
         unsafe {
             match value {

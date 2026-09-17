@@ -1,0 +1,757 @@
+//! Assemble build timeline records from the logs a build already wrote.
+//!
+//! Everything here is a pure function over log contents plus a snapshot of the
+//! environment: the wrapper and daemon are untouched, and `kache telemetry
+//! push` is the only caller.
+//!
+//! Two joins carry the weight. Events group into sessions by the wrapper's own
+//! `session_id`. Transfers carry no session id, so they are matched to a
+//! session by cache key first and by time second, and a transfer that could
+//! belong to two sessions is dropped rather than guessed at.
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+
+use kache_core::timeline::{
+    BUILD_TIMELINE_SCHEMA, BuildTimeline, IdentitySource, LogLimits, RunContext, TimelineIdentity,
+    TimelineSummary, TimelineTransfer, TimelineUnit, TransferAttribution, TransferDirection,
+};
+
+use crate::daemon::{TransferDirection as LoggedDirection, TransferEvent};
+use crate::events::{BuildEvent, BuildSummaryEvent};
+
+/// How far outside a session's own compiles a transfer may sit and still count
+/// as part of it. Prefetch starts before the first compile logs and can still
+/// be running after the last one.
+pub(crate) const TRANSFER_SLACK_MS: u64 = 60_000;
+
+/// Environment values a record is allowed to carry, read once by the caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EnvSnapshot {
+    pub repository: Option<String>,
+    pub workflow: Option<String>,
+    pub job: Option<String>,
+    pub run_id: Option<String>,
+    pub run_attempt: Option<String>,
+    pub event: Option<String>,
+    pub git_ref: Option<String>,
+    pub commit: Option<String>,
+    pub runner_os: Option<String>,
+    pub runner_arch: Option<String>,
+    pub runner_pool: Option<String>,
+    pub manifest_key: Option<String>,
+    pub target: Option<String>,
+    pub profile: Option<String>,
+}
+
+impl EnvSnapshot {
+    /// Read the allowlisted variables. Nothing else in the environment can
+    /// reach a record.
+    pub(crate) fn from_env() -> Self {
+        let read = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        Self {
+            repository: read("GITHUB_REPOSITORY"),
+            workflow: read("GITHUB_WORKFLOW"),
+            job: read("GITHUB_JOB"),
+            run_id: read("GITHUB_RUN_ID"),
+            run_attempt: read("GITHUB_RUN_ATTEMPT"),
+            event: read("GITHUB_EVENT_NAME"),
+            git_ref: read("GITHUB_REF"),
+            commit: read("GITHUB_SHA"),
+            runner_os: read("RUNNER_OS"),
+            runner_arch: read("RUNNER_ARCH"),
+            runner_pool: read("KACHE_RUNNER_POOL"),
+            manifest_key: read("KACHE_MANIFEST_KEY"),
+            target: read("KACHE_TARGET"),
+            profile: read("KACHE_PROFILE").or_else(|| read("PROFILE")),
+        }
+    }
+
+    fn context(&self, labels: BTreeMap<String, String>) -> RunContext {
+        RunContext {
+            repository: self.repository.clone(),
+            workflow: self.workflow.clone(),
+            job: self.job.clone(),
+            run_id: self.run_id.clone(),
+            run_attempt: self.run_attempt.clone(),
+            event: self.event.clone(),
+            git_ref: self.git_ref.clone(),
+            commit: self.commit.clone(),
+            runner_os: self.runner_os.clone(),
+            runner_arch: self.runner_arch.clone(),
+            runner_pool: self.runner_pool.clone(),
+            labels,
+        }
+    }
+}
+
+/// Everything a record is built from.
+pub(crate) struct TimelineInputs<'a> {
+    pub events: &'a [BuildEvent],
+    pub transfers: &'a [TransferEvent],
+    pub summaries: &'a [BuildSummaryEvent],
+    pub env: &'a EnvSnapshot,
+    pub labels: BTreeMap<String, String>,
+    pub log: LogLimits,
+    pub kache_version: String,
+}
+
+/// One session's events, before transfers are attached.
+#[derive(Debug, Default)]
+struct SessionEvents {
+    units: Vec<TimelineUnit>,
+    roots: HashMap<String, usize>,
+    started_at_ms: u64,
+    finished_at_ms: u64,
+}
+
+impl SessionEvents {
+    /// The root most of the session's compiles named. A session belongs to one
+    /// build tree; a tie is resolved by name so the choice is deterministic.
+    fn root(&self) -> Option<&str> {
+        self.roots
+            .iter()
+            .max_by(|(left_root, left), (right_root, right)| {
+                left.cmp(right).then_with(|| right_root.cmp(left_root))
+            })
+            .map(|(root, _)| root.as_str())
+    }
+}
+
+/// Build one record per session found in `events`, oldest first.
+pub(crate) fn build_timelines(inputs: &TimelineInputs<'_>) -> Vec<BuildTimeline> {
+    let sessions = group_sessions(inputs.events);
+    let windows: Vec<(String, u64, u64)> = sessions
+        .iter()
+        .map(|(id, session)| (id.clone(), session.started_at_ms, session.finished_at_ms))
+        .collect();
+    let summaries = summaries_by_session(inputs.summaries);
+
+    let mut records: Vec<BuildTimeline> = sessions
+        .into_iter()
+        .map(|(session_id, session)| {
+            let root = session.root().unwrap_or_default().to_string();
+            let identity = identity_for_root(Path::new(&root), inputs.env);
+            let transfers = attribute_transfers(&session_id, &session, &windows, inputs.transfers);
+            let context = inputs.env.context(inputs.labels.clone());
+            BuildTimeline {
+                schema: BUILD_TIMELINE_SCHEMA,
+                client_record_id: client_record_id(&session_id, &context, session.started_at_ms),
+                session_id: session_id.clone(),
+                kache_version: inputs.kache_version.clone(),
+                started_at_ms: session.started_at_ms,
+                finished_at_ms: session.finished_at_ms,
+                identity,
+                root_hash: short_hash(&root),
+                context,
+                log: inputs.log.clone(),
+                summary: summaries.get(&session_id).map(summary_projection),
+                units: session.units,
+                transfers,
+            }
+        })
+        .collect();
+    records.sort_by_key(|record| (record.started_at_ms, record.session_id.clone()));
+    records
+}
+
+/// Group compiles by the session the wrapper stamped on them. Events without a
+/// session id come from a wrapper too old to stamp one and are skipped.
+fn group_sessions(events: &[BuildEvent]) -> BTreeMap<String, SessionEvents> {
+    let mut sessions: BTreeMap<String, SessionEvents> = BTreeMap::new();
+    for event in events {
+        if event.session_id.is_empty() {
+            continue;
+        }
+        let finished_at_ms = event_finished_ms(event);
+        let started_at_ms = finished_at_ms.saturating_sub(event.elapsed_ms);
+        let session = sessions.entry(event.session_id.clone()).or_default();
+        if session.units.is_empty() {
+            session.started_at_ms = started_at_ms;
+            session.finished_at_ms = finished_at_ms;
+        } else {
+            session.started_at_ms = session.started_at_ms.min(started_at_ms);
+            session.finished_at_ms = session.finished_at_ms.max(finished_at_ms);
+        }
+        if !event.root.is_empty() {
+            *session.roots.entry(event.root.clone()).or_default() += 1;
+        }
+        session.units.push(TimelineUnit {
+            cache_key: event.cache_key.clone(),
+            crate_name: event.crate_name.clone(),
+            result: event.result.to_string(),
+            started_at_ms,
+            finished_at_ms,
+            compile_time_ms: event.compile_time_ms,
+            size: event.size,
+            key_ms: event.key_ms,
+            lookup_ms: event.lookup_ms,
+            restore_ms: event.restore_ms,
+            store_ms: event.store_ms,
+            startup_ms: event.startup_ms,
+            flight_wait_ms: event.flight_wait_ms,
+            permit_wait_ms: event.permit_wait_ms,
+            compiler_runs: event.compiler_runs,
+            event_schema: event.schema,
+        });
+    }
+    for session in sessions.values_mut() {
+        session
+            .units
+            .sort_by_key(|unit| (unit.started_at_ms, unit.cache_key.clone()));
+    }
+    sessions
+}
+
+/// The wrapper stamps an event when the invocation ends.
+fn event_finished_ms(event: &BuildEvent) -> u64 {
+    u64::try_from(event.ts.timestamp_millis()).unwrap_or(0)
+}
+
+/// Attach the transfers that belong to this session.
+///
+/// A cache key the session compiled is direct evidence. Failing that, a
+/// transfer inside this session's window and no other session's window is
+/// taken as this session's; one that could belong to two sessions is dropped,
+/// because a wrong parent would read as a prefetch that was never used.
+fn attribute_transfers(
+    session_id: &str,
+    session: &SessionEvents,
+    windows: &[(String, u64, u64)],
+    transfers: &[TransferEvent],
+) -> Vec<TimelineTransfer> {
+    let keys: std::collections::HashSet<&str> = session
+        .units
+        .iter()
+        .map(|unit| unit.cache_key.as_str())
+        .filter(|key| !key.is_empty())
+        .collect();
+
+    let mut attributed: Vec<TimelineTransfer> = transfers
+        .iter()
+        .filter(|transfer| transfer.started_at_unix_ms > 0)
+        .filter_map(|transfer| {
+            let attribution = if !transfer.cache_key.is_empty()
+                && keys.contains(transfer.cache_key.as_str())
+                && transfer.started_at_unix_ms
+                    <= session.finished_at_ms.saturating_add(TRANSFER_SLACK_MS)
+            {
+                TransferAttribution::Key
+            } else if in_window(transfer, session.started_at_ms, session.finished_at_ms)
+                && windows
+                    .iter()
+                    .filter(|(id, start, finish)| {
+                        id != session_id && in_window(transfer, *start, *finish)
+                    })
+                    .count()
+                    == 0
+            {
+                TransferAttribution::Window
+            } else {
+                return None;
+            };
+            Some(TimelineTransfer {
+                cache_key: transfer.cache_key.clone(),
+                crate_name: transfer.crate_name.clone(),
+                direction: match transfer.direction {
+                    LoggedDirection::Upload => TransferDirection::Upload,
+                    LoggedDirection::Download => TransferDirection::Download,
+                },
+                ok: transfer.ok,
+                compressed_bytes: transfer.compressed_bytes,
+                original_bytes: transfer.original_bytes,
+                started_at_ms: transfer.started_at_unix_ms,
+                finished_at_ms: transfer.finished_at_unix_ms,
+                network_ms: transfer.network_ms,
+                semaphore_wait_ms: transfer.semaphore_wait_ms,
+                request_count: transfer.request_count,
+                import_ms: transfer.import_ms,
+                attribution,
+            })
+        })
+        .collect();
+    attributed.sort_by_key(|transfer| (transfer.started_at_ms, transfer.cache_key.clone()));
+    attributed
+}
+
+/// Whether a transfer overlaps a session window widened by the slack.
+fn in_window(transfer: &TransferEvent, started_at_ms: u64, finished_at_ms: u64) -> bool {
+    let from = started_at_ms.saturating_sub(TRANSFER_SLACK_MS);
+    let to = finished_at_ms.saturating_add(TRANSFER_SLACK_MS);
+    transfer.started_at_unix_ms <= to
+        && transfer
+            .finished_at_unix_ms
+            .max(transfer.started_at_unix_ms)
+            >= from
+}
+
+fn summaries_by_session(summaries: &[BuildSummaryEvent]) -> HashMap<String, &BuildSummaryEvent> {
+    let mut latest: HashMap<String, &BuildSummaryEvent> = HashMap::new();
+    for summary in summaries {
+        if summary.session_id.is_empty() {
+            continue;
+        }
+        latest
+            .entry(summary.session_id.clone())
+            .and_modify(|held| {
+                if summary.last_activity_ms >= held.last_activity_ms {
+                    *held = summary;
+                }
+            })
+            .or_insert(summary);
+    }
+    latest
+}
+
+fn summary_projection(summary: &&BuildSummaryEvent) -> TimelineSummary {
+    TimelineSummary {
+        plan_id: summary.plan_id.clone(),
+        plan_source: summary.plan_source.clone(),
+        closure_reason: summary.closure_reason.clone(),
+        started_at_ms: summary.started_at_ms,
+        last_activity_ms: summary.last_activity_ms,
+        candidate_keys: summary.candidate_keys,
+        downloaded_keys: summary.downloaded_keys,
+        downloaded_bytes: summary.downloaded_bytes,
+        used_keys: summary.used_keys,
+        demanded_keys: summary.demanded_keys,
+        demanded_candidate_keys: summary.demanded_candidate_keys,
+        cancelled: summary.cancelled,
+    }
+}
+
+/// What build this was.
+///
+/// An explicit manifest key wins, as it does on the prefetch path. Otherwise a
+/// full identity key needs a profile from the environment: without one, debug
+/// and release would share an identity and their timings would be averaged
+/// together. The lockfile digest is recorded either way.
+fn identity_for_root(root: &Path, env: &EnvSnapshot) -> TimelineIdentity {
+    let lock_digest = lock_digest_for_root(root);
+    if let Some(explicit) = env.manifest_key.clone() {
+        return TimelineIdentity {
+            lock_digest,
+            identity_key: Some(explicit),
+            source: IdentitySource::Explicit,
+        };
+    }
+    let target = env
+        .target
+        .clone()
+        .unwrap_or_else(crate::identity::host_target_triple);
+    let identity_key = env
+        .profile
+        .as_deref()
+        .and_then(|profile| crate::identity::identity_key(&lock_path(root), &target, profile));
+    let source = if identity_key.is_some() {
+        IdentitySource::LockEnv
+    } else {
+        IdentitySource::Absent
+    };
+    TimelineIdentity {
+        lock_digest,
+        identity_key,
+        source,
+    }
+}
+
+fn lock_path(root: &Path) -> PathBuf {
+    root.join("Cargo.lock")
+}
+
+fn lock_digest_for_root(root: &Path) -> Option<String> {
+    if root.as_os_str().is_empty() {
+        return None;
+    }
+    crate::identity::lockfile_digest(&lock_path(root))
+}
+
+/// Identifies one session from one run, so a second push of the same build
+/// replaces the first instead of adding a second record.
+fn client_record_id(session_id: &str, context: &RunContext, started_at_ms: u64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in [
+        session_id,
+        context.run_id.as_deref().unwrap_or_default(),
+        context.run_attempt.as_deref().unwrap_or_default(),
+        context.job.as_deref().unwrap_or_default(),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(&started_at_ms.to_le_bytes());
+    hasher.finalize().to_hex().as_str()[..16].to_string()
+}
+
+/// Truncated hash of a path, so records can be grouped by build tree without
+/// carrying anyone's directory layout.
+fn short_hash(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    blake3::hash(value.as_bytes()).to_hex().as_str()[..16].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::TransferEvent;
+    use crate::events::EventResult;
+    use chrono::TimeZone;
+
+    fn event(
+        session: &str,
+        crate_name: &str,
+        key: &str,
+        end_ms: i64,
+        elapsed_ms: u64,
+    ) -> BuildEvent {
+        let mut event = BuildEvent::new_for_test(crate_name, EventResult::LocalHit);
+        event.session_id = session.to_string();
+        event.cache_key = key.to_string();
+        event.root = "/w".to_string();
+        event.ts = chrono::Utc.timestamp_millis_opt(end_ms).unwrap();
+        event.elapsed_ms = elapsed_ms;
+        event
+    }
+
+    fn transfer(key: &str, started: u64, finished: u64) -> TransferEvent {
+        TransferEvent {
+            schema: 3,
+            crate_name: "serde".to_string(),
+            direction: LoggedDirection::Download,
+            format: String::new(),
+            cache_key: key.to_string(),
+            object_key: String::new(),
+            compressed_bytes: 10,
+            started_at_unix_ms: started,
+            finished_at_unix_ms: finished,
+            elapsed_ms: finished.saturating_sub(started),
+            network_ms: 1,
+            semaphore_wait_ms: 0,
+            head_ms: 0,
+            request_ms: 0,
+            body_ms: 0,
+            request_count: 1,
+            original_bytes: 20,
+            decompress_ms: 0,
+            extract_ms: 0,
+            disk_io_ms: 0,
+            import_lock_wait_ms: 0,
+            import_ms: 0,
+            compression_ms: 0,
+            head_checks_ms: 0,
+            blobs_skipped: 0,
+            blobs_total: 1,
+            ok: true,
+            timestamp: finished / 1000,
+        }
+    }
+
+    fn inputs<'a>(
+        events: &'a [BuildEvent],
+        transfers: &'a [TransferEvent],
+        summaries: &'a [BuildSummaryEvent],
+        env: &'a EnvSnapshot,
+    ) -> TimelineInputs<'a> {
+        TimelineInputs {
+            events,
+            transfers,
+            summaries,
+            env,
+            labels: BTreeMap::new(),
+            log: LogLimits {
+                event_log_max_size: 10 << 20,
+                event_log_keep_lines: 1000,
+            },
+            kache_version: "0.23.1".to_string(),
+        }
+    }
+
+    #[test]
+    fn one_record_per_session_with_unit_times_from_the_events() {
+        let events = [
+            event("s1", "serde", "k1", 5_000, 500),
+            event("s2", "syn", "k2", 9_000, 1_000),
+            event("s1", "quote", "k3", 6_000, 200),
+        ];
+        let env = EnvSnapshot::default();
+        let records = build_timelines(&inputs(&events, &[], &[], &env));
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["s1", "s2"]
+        );
+        let first = &records[0];
+        assert_eq!(first.started_at_ms, 4_500);
+        assert_eq!(first.finished_at_ms, 6_000);
+        assert_eq!(first.schema, BUILD_TIMELINE_SCHEMA);
+        assert_eq!(first.kache_version, "0.23.1");
+        assert_eq!(
+            first
+                .units
+                .iter()
+                .map(|u| u.crate_name.as_str())
+                .collect::<Vec<_>>(),
+            ["serde", "quote"]
+        );
+        assert_eq!(first.units[0].started_at_ms, 4_500);
+        assert_eq!(first.units[0].finished_at_ms, 5_000);
+        assert_eq!(first.units[0].result, "local_hit");
+    }
+
+    #[test]
+    fn events_without_a_session_are_skipped() {
+        let mut orphan = event("", "serde", "k1", 1_000, 10);
+        orphan.session_id.clear();
+        let records = build_timelines(&inputs(
+            &[orphan, event("s1", "syn", "k2", 2_000, 10)],
+            &[],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].session_id, "s1");
+    }
+
+    #[test]
+    fn a_download_of_a_compiled_key_belongs_to_that_session() {
+        // Arrived before the build asked for it, and consumed as a local hit:
+        // the case daemon-side counters cannot see.
+        let events = [event("s1", "serde", "k1", 5_000, 500)];
+        let transfers = [transfer("k1", 1_000, 2_000)];
+        let records = build_timelines(&inputs(&events, &transfers, &[], &EnvSnapshot::default()));
+
+        assert_eq!(records[0].transfers.len(), 1);
+        let attached = &records[0].transfers[0];
+        assert_eq!(attached.attribution, TransferAttribution::Key);
+        assert_eq!(attached.finished_at_ms, 2_000);
+        assert!(
+            attached.finished_at_ms < records[0].units[0].started_at_ms,
+            "this is what makes it an on-time prefetch"
+        );
+    }
+
+    #[test]
+    fn a_download_of_an_uncompiled_key_is_attributed_by_time() {
+        let events = [event("s1", "serde", "k1", 5_000, 500)];
+        let transfers = [transfer("k-unused", 4_000, 4_500)];
+        let records = build_timelines(&inputs(&events, &transfers, &[], &EnvSnapshot::default()));
+        assert_eq!(
+            records[0].transfers[0].attribution,
+            TransferAttribution::Window
+        );
+    }
+
+    #[test]
+    fn a_download_two_sessions_could_claim_is_dropped() {
+        let events = [
+            event("s1", "serde", "k1", 5_000, 500),
+            event("s2", "syn", "k2", 5_200, 500),
+        ];
+        let transfers = [transfer("k-unused", 4_800, 4_900)];
+        let records = build_timelines(&inputs(&events, &transfers, &[], &EnvSnapshot::default()));
+        assert!(
+            records.iter().all(|record| record.transfers.is_empty()),
+            "an ambiguous transfer must not be handed to either session"
+        );
+
+        // The same transfer, with a key one session compiled, is no longer
+        // ambiguous.
+        let keyed = [transfer("k1", 4_800, 4_900)];
+        let records = build_timelines(&inputs(&events, &keyed, &[], &EnvSnapshot::default()));
+        assert_eq!(records[0].transfers.len(), 1);
+        assert!(records[1].transfers.is_empty());
+    }
+
+    #[test]
+    fn transfers_far_outside_the_session_are_dropped() {
+        // The session ran at t=500s; these downloads are minutes away from it.
+        let events = [event("s1", "serde", "k1", 500_000, 500)];
+        let early = [transfer("k-unused", 1_000, 2_000)];
+        let records = build_timelines(&inputs(&events, &early, &[], &EnvSnapshot::default()));
+        assert!(
+            records[0].transfers.is_empty(),
+            "a download {}s before the build is not part of it",
+            (500_000 - 2_000) / 1000
+        );
+
+        let late = [transfer("k-unused", 600_000, 600_100)];
+        let records = build_timelines(&inputs(&events, &late, &[], &EnvSnapshot::default()));
+        assert!(records[0].transfers.is_empty());
+
+        // Just inside the slack on either side, it is.
+        let just_before = [transfer(
+            "k-unused",
+            499_500 - TRANSFER_SLACK_MS,
+            499_500 - TRANSFER_SLACK_MS + 10,
+        )];
+        let records = build_timelines(&inputs(&events, &just_before, &[], &EnvSnapshot::default()));
+        assert_eq!(records[0].transfers.len(), 1);
+    }
+
+    #[test]
+    fn transfers_from_a_wrapper_without_timestamps_are_skipped() {
+        let events = [event("s1", "serde", "k1", 5_000, 500)];
+        let mut old = transfer("k1", 0, 0);
+        old.schema = 2;
+        let records = build_timelines(&inputs(&events, &[old], &[], &EnvSnapshot::default()));
+        assert!(records[0].transfers.is_empty());
+    }
+
+    #[test]
+    fn records_carry_no_paths() {
+        let events = [event("s1", "serde", "k1", 5_000, 500)];
+        let records = build_timelines(&inputs(&events, &[], &[], &EnvSnapshot::default()));
+        let json = serde_json::to_string(&records[0]).unwrap();
+        assert!(!json.contains("/w"), "{json}");
+        assert_eq!(records[0].root_hash.len(), 16);
+    }
+
+    #[test]
+    fn the_run_context_only_carries_allowlisted_values() {
+        let env = EnvSnapshot {
+            repository: Some("org/repo".to_string()),
+            job: Some("test".to_string()),
+            run_id: Some("42".to_string()),
+            ..EnvSnapshot::default()
+        };
+        let mut record_inputs = inputs(&[], &[], &[], &env);
+        record_inputs.labels = BTreeMap::from([("phase".to_string(), "cold".to_string())]);
+        let events = [event("s1", "serde", "k1", 5_000, 500)];
+        record_inputs.events = &events;
+
+        let record = &build_timelines(&record_inputs)[0];
+        assert_eq!(record.context.repository.as_deref(), Some("org/repo"));
+        assert_eq!(record.context.labels["phase"], "cold");
+        assert_eq!(record.context.workflow, None);
+    }
+
+    #[test]
+    fn the_record_id_is_stable_for_a_session_and_differs_per_run() {
+        let events = [event("s1", "serde", "k1", 5_000, 500)];
+        let env = EnvSnapshot {
+            run_id: Some("1".to_string()),
+            ..EnvSnapshot::default()
+        };
+        let first = build_timelines(&inputs(&events, &[], &[], &env))[0]
+            .client_record_id
+            .clone();
+        let again = build_timelines(&inputs(&events, &[], &[], &env))[0]
+            .client_record_id
+            .clone();
+        assert_eq!(first, again);
+        assert_eq!(first.len(), 16);
+
+        let rerun = EnvSnapshot {
+            run_id: Some("2".to_string()),
+            ..EnvSnapshot::default()
+        };
+        assert_ne!(
+            build_timelines(&inputs(&events, &[], &[], &rerun))[0].client_record_id,
+            first
+        );
+    }
+
+    #[test]
+    fn an_explicit_manifest_key_is_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), b"[[package]]\n").unwrap();
+        let env = EnvSnapshot {
+            manifest_key: Some("id/explicit".to_string()),
+            profile: Some("release".to_string()),
+            ..EnvSnapshot::default()
+        };
+        let identity = identity_for_root(dir.path(), &env);
+        assert_eq!(identity.identity_key.as_deref(), Some("id/explicit"));
+        assert_eq!(identity.source, IdentitySource::Explicit);
+        assert!(identity.lock_digest.is_some());
+    }
+
+    #[test]
+    fn without_a_profile_there_is_a_lock_digest_but_no_identity_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.lock"), b"[[package]]\n").unwrap();
+
+        let unknown = identity_for_root(dir.path(), &EnvSnapshot::default());
+        assert!(unknown.lock_digest.is_some());
+        assert_eq!(unknown.identity_key, None);
+        assert_eq!(unknown.source, IdentitySource::Absent);
+
+        let env = EnvSnapshot {
+            profile: Some("release".to_string()),
+            target: Some("x86_64-unknown-linux-gnu".to_string()),
+            ..EnvSnapshot::default()
+        };
+        let known = identity_for_root(dir.path(), &env);
+        assert_eq!(
+            known.identity_key,
+            crate::identity::identity_key(
+                &dir.path().join("Cargo.lock"),
+                "x86_64-unknown-linux-gnu",
+                "release"
+            )
+        );
+        assert_eq!(known.source, IdentitySource::LockEnv);
+    }
+
+    #[test]
+    fn a_root_without_a_lockfile_has_no_digest() {
+        let identity = identity_for_root(Path::new(""), &EnvSnapshot::default());
+        assert_eq!(identity.lock_digest, None);
+        assert_eq!(identity.source, IdentitySource::Absent);
+    }
+
+    #[test]
+    fn the_newest_summary_for_the_session_is_attached() {
+        let events = [event("s1", "serde", "k1", 5_000, 500)];
+        let summary = |last_activity_ms, plan_id: &str| BuildSummaryEvent {
+            ts: chrono::Utc.timestamp_millis_opt(1).unwrap(),
+            schema: 1,
+            session_id: "s1".to_string(),
+            root: String::new(),
+            plan_source: "advisory".to_string(),
+            plan_id: plan_id.to_string(),
+            closure_reason: "inactivity".to_string(),
+            started_at_ms: 1,
+            last_activity_ms,
+            candidate_keys: 4,
+            downloaded_keys: 3,
+            downloaded_bytes: 30,
+            used_keys: 1,
+            used_bytes: 10,
+            demanded_keys: 2,
+            demanded_candidate_keys: 1,
+            cancelled: false,
+            list_requests: 0,
+            list_duration_ms: 0,
+        };
+        let summaries = [summary(10, "old"), summary(20, "new")];
+        let records = build_timelines(&inputs(&events, &[], &summaries, &EnvSnapshot::default()));
+        let attached = records[0].summary.as_ref().unwrap();
+        assert_eq!(attached.plan_id, "new");
+        assert_eq!(attached.candidate_keys, 4);
+
+        let without = build_timelines(&inputs(&events, &[], &[], &EnvSnapshot::default()));
+        assert!(without[0].summary.is_none());
+    }
+
+    #[test]
+    fn the_sessions_own_root_wins_a_tie_deterministically() {
+        let mut session = SessionEvents::default();
+        session.roots.insert("/a".to_string(), 2);
+        session.roots.insert("/b".to_string(), 2);
+        assert_eq!(session.root(), Some("/a"));
+        session.roots.insert("/b".to_string(), 3);
+        assert_eq!(session.root(), Some("/b"));
+        assert_eq!(SessionEvents::default().root(), None);
+    }
+}

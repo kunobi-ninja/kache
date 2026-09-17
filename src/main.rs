@@ -61,6 +61,8 @@ mod compiler_store;
 use compiler_store as store;
 #[cfg(test)]
 mod test_support;
+mod timeline;
+mod timeline_client;
 mod transport;
 mod tui;
 mod tui_sessions;
@@ -406,6 +408,21 @@ enum TelemetryCommands {
         /// Bench phase this dump belongs to (`cold`, `warm`, `pull`).
         #[arg(long)]
         phase: Option<String>,
+    },
+    /// Send build timeline records for finished builds to the service
+    Push {
+        /// Send every session still in the logs, not just the last build
+        #[arg(long, conflicts_with = "session")]
+        all: bool,
+        /// Send one session by id
+        #[arg(long)]
+        session: Option<String>,
+        /// Extra `key=value` label recorded with the build, repeatable
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+        /// Print the records instead of sending them
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -853,6 +870,22 @@ fn main() -> Result<()> {
                     phase,
                 },
         }) => cli::telemetry_write(&config, &dir, scenario.as_deref(), phase.as_deref()),
+        Some(Commands::Telemetry {
+            command:
+                TelemetryCommands::Push {
+                    all,
+                    session,
+                    labels,
+                    dry_run,
+                },
+        }) => {
+            let selection = match (all, session) {
+                (true, _) => cli::TimelineSelection::All,
+                (false, Some(session)) => cli::TimelineSelection::Session(session),
+                (false, None) => cli::TimelineSelection::Latest,
+            };
+            cli::telemetry_push(&config, &selection, &labels, dry_run)
+        }
         Some(Commands::WhyMiss { crate_name }) => cli::why_miss(&config, &crate_name, json),
         Some(Commands::Monitor { since }) => {
             if json {

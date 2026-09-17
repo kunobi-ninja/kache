@@ -23,7 +23,7 @@ pub async fn resolve_prefetch_plan(req: &BuildIntent) -> Result<Option<PrefetchP
 /// with `rustls-no-provider` (to keep `aws-lc-sys` out of the tree — see
 /// Cargo.toml), so it needs a default provider installed before it builds a TLS
 /// client. Idempotent across threads; the already-installed error is expected.
-fn ensure_crypto_provider() {
+pub(crate) fn ensure_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();

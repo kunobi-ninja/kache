@@ -2219,6 +2219,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     const ENV_PRINTER: &str = "build_script::tests::env_printer";
 
     /// Prints the process environment, one `NAME=value` per line, when

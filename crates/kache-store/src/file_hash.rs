@@ -92,32 +92,38 @@ impl<'db> FileHashCache<'db> {
         Ok(())
     }
 
-    pub fn get_runtime_env_use(
+    /// The stored classification of how the source with `content_hash` uses
+    /// `var`. `scanner` is the caller's scanner version: a row recorded by any
+    /// other version reads as absent, so a scanner fix never reuses an answer
+    /// the old scanner gave for unchanged source. `use_kind` is opaque here.
+    pub fn get_source_env_dep_use(
         &self,
         content_hash: &str,
         var: &str,
-    ) -> rusqlite::Result<Option<bool>> {
+        scanner: u32,
+    ) -> rusqlite::Result<Option<i64>> {
         self.db()
             .query_row(
-                "SELECT has_runtime_use FROM source_env_runtime_uses
-                 WHERE content_hash = ?1 AND env_var = ?2",
-                params![content_hash, var],
-                |row| row.get::<_, i64>(0).map(|value| value != 0),
+                "SELECT use_kind FROM source_env_dep_uses
+                 WHERE content_hash = ?1 AND env_var = ?2 AND scanner = ?3",
+                params![content_hash, var, scanner],
+                |row| row.get(0),
             )
             .optional()
     }
 
-    pub fn put_runtime_env_use(
+    pub fn put_source_env_dep_use(
         &self,
         content_hash: &str,
         var: &str,
-        has_runtime_use: bool,
+        scanner: u32,
+        use_kind: i64,
     ) -> rusqlite::Result<()> {
         self.db().execute(
-            "INSERT OR REPLACE INTO source_env_runtime_uses
-             (content_hash, env_var, has_runtime_use, updated_at)
-             VALUES (?1, ?2, ?3, datetime('now'))",
-            params![content_hash, var, i64::from(has_runtime_use)],
+            "INSERT OR REPLACE INTO source_env_dep_uses
+             (content_hash, env_var, scanner, use_kind, updated_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            params![content_hash, var, scanner, use_kind],
         )?;
         Ok(())
     }
@@ -171,13 +177,17 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
             prediction_json TEXT NOT NULL,
             updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
         );
-        CREATE TABLE IF NOT EXISTS source_env_runtime_uses (
-            content_hash    TEXT NOT NULL,
-            env_var         TEXT NOT NULL,
-            has_runtime_use INTEGER NOT NULL,
-            updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        CREATE TABLE IF NOT EXISTS source_env_dep_uses (
+            content_hash TEXT NOT NULL,
+            env_var      TEXT NOT NULL,
+            scanner      INTEGER NOT NULL,
+            use_kind     INTEGER NOT NULL,
+            updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (content_hash, env_var)
-        );",
+        );
+        -- Boolean answers from the first env-use scanner, which missed
+        -- computed names and other spellings. Nothing reads them any more.
+        DROP TABLE IF EXISTS source_env_runtime_uses;",
     )?;
     for column in [
         "ALTER TABLE file_hashes ADD COLUMN ctime_ns INTEGER NOT NULL DEFAULT 0",
@@ -452,50 +462,73 @@ mod tests {
     }
 
     #[test]
-    fn runtime_env_memo_persists_both_answers_for_each_content_and_variable() {
+    fn env_dep_use_memo_persists_each_answer_per_content_variable_and_scanner() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
         let cache = FileHashCache::open(&db_path).unwrap();
         assert_eq!(
-            cache.get_runtime_env_use("source-a", "OUT_DIR").unwrap(),
+            cache
+                .get_source_env_dep_use("source-a", "OUT_DIR", 2)
+                .unwrap(),
             None
         );
         cache
-            .put_runtime_env_use("source-a", "OUT_DIR", true)
+            .put_source_env_dep_use("source-a", "OUT_DIR", 2, 1)
             .unwrap();
         cache
-            .put_runtime_env_use("source-a", "OTHER", false)
+            .put_source_env_dep_use("source-a", "OTHER", 2, 0)
             .unwrap();
         cache
-            .put_runtime_env_use("source-b", "OUT_DIR", false)
+            .put_source_env_dep_use("source-b", "OUT_DIR", 2, 2)
             .unwrap();
         drop(cache);
 
         let cache = FileHashCache::open(&db_path).unwrap();
-        assert_eq!(
-            cache.get_runtime_env_use("source-a", "OUT_DIR").unwrap(),
-            Some(true)
-        );
-        assert_eq!(
-            cache.get_runtime_env_use("source-a", "OTHER").unwrap(),
-            Some(false)
-        );
-        assert_eq!(
-            cache.get_runtime_env_use("source-b", "OUT_DIR").unwrap(),
-            Some(false)
-        );
-        assert_eq!(
-            cache.get_runtime_env_use("source-b", "OTHER").unwrap(),
-            None
-        );
+        let get = |content: &str, var: &str, scanner: u32| {
+            cache.get_source_env_dep_use(content, var, scanner).unwrap()
+        };
+        assert_eq!(get("source-a", "OUT_DIR", 2), Some(1));
+        assert_eq!(get("source-a", "OTHER", 2), Some(0));
+        assert_eq!(get("source-b", "OUT_DIR", 2), Some(2));
+        assert_eq!(get("source-b", "OTHER", 2), None);
+        // Another scanner version never sees these answers.
+        assert_eq!(get("source-a", "OUT_DIR", 1), None);
+        assert_eq!(get("source-a", "OUT_DIR", 3), None);
 
+        // A newer scanner's answer replaces the row for the same content.
         cache
-            .put_runtime_env_use("source-a", "OUT_DIR", false)
+            .put_source_env_dep_use("source-a", "OUT_DIR", 3, 2)
             .unwrap();
-        assert_eq!(
-            cache.get_runtime_env_use("source-a", "OUT_DIR").unwrap(),
-            Some(false)
-        );
+        assert_eq!(get("source-a", "OUT_DIR", 3), Some(2));
+        assert_eq!(get("source-a", "OUT_DIR", 2), None);
+    }
+
+    #[test]
+    fn schema_drops_the_boolean_env_use_memo() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE source_env_runtime_uses (
+                content_hash    TEXT NOT NULL,
+                env_var         TEXT NOT NULL,
+                has_runtime_use INTEGER NOT NULL,
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (content_hash, env_var)
+            );
+            INSERT INTO source_env_runtime_uses (content_hash, env_var, has_runtime_use)
+            VALUES ('source-a', 'OUT_DIR', 0);",
+        )
+        .unwrap();
+        ensure_file_hash_cache_schema(&conn).unwrap();
+        let tables = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(tables("source_env_runtime_uses"), 0);
+        assert_eq!(tables("source_env_dep_uses"), 1);
     }
 
     #[test]

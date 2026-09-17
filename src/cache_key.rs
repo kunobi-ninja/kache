@@ -2793,10 +2793,11 @@ fn env_dep_is_safe_to_normalize(
     // splices file content into the AST and dep-info lists the generated
     // file under OUT_DIR. That dep-info shape is necessary but not sufficient:
     // a crate can also use `env!("OUT_DIR")` as a runtime value. Normalize only
-    // when source inspection proves the env macro use is inside `include*!(...)`
-    // path-locator contexts. Other vars with the same property — e.g. a
-    // generated build-config path, or an objdir base used by an `include!`
-    // macro — can be opted into `allowlist` by the build.
+    // when source inspection shows an env macro use inside an `include*!(...)`
+    // path-locator context and no use outside one (see
+    // [`env_dep_is_include_locator_only`]). Other vars with the same property —
+    // e.g. a generated build-config path, or an objdir base used by an
+    // `include!` macro — can be opted into `allowlist` by the build.
     //
     // It must stay an explicit allowlist: for CARGO_MANIFEST_DIR and arbitrary
     // user vars the path-only test alone is not valid (normal crate sources
@@ -2820,7 +2821,7 @@ fn env_dep_is_safe_to_normalize(
     // value is still kept absolute.
     (var == "OUT_DIR" || allowlist.iter().any(|v| v == var) || value_is_under_out_dir(val))
         && path_is_only_used_for_includes(val, source_files)
-        && !env_dep_has_runtime_value_use(var, source_files, file_hasher)
+        && env_dep_is_include_locator_only(var, source_files, file_hasher)
 }
 
 /// True when `val` is an absolute path located under the current build's
@@ -2868,7 +2869,7 @@ fn out_dir_relative_suffix(val: &str) -> Option<String> {
 
 /// Decide whether dep-info shows the env_dep value acting as the parent dir
 /// of one or more `include!()`'d source files. This is only the path-shape
-/// half of the proof; [`env_dep_has_runtime_value_use`] rejects dual-pattern
+/// half of the proof; [`env_dep_is_include_locator_only`] rejects dual-pattern
 /// crates that also bake the env value into the compiled artifact.
 ///
 /// Background and contract: see the OUT_DIR comment in
@@ -2893,58 +2894,112 @@ fn path_is_only_used_for_includes(
     })
 }
 
-/// True when source text shows `env!(var)` / `option_env!(var)` outside an
-/// `include*!(...)` path-locator context. Missing files fail closed: if we
-/// cannot prove the env dep is path-only, keep the absolute value in the key.
-fn env_dep_has_runtime_value_use(
+/// True when source text proves `var` is only an `include*!(...)` path
+/// locator: at least one file shows `env!(var)` / `option_env!(var)` inside an
+/// include argument, and no file shows a use the scanner cannot place there.
+///
+/// The proof must be positive. An env macro expanded from another crate's
+/// `macro_rules!` resolves in this crate, so dep-info reports the env dep while
+/// this crate's sources never name the var; without a visible include use, its
+/// value may be baked into the artifact. Such crates keep the absolute value.
+///
+/// Residual gap: a crate that shows an include use AND also invokes another
+/// crate's macro that expands to a value use of the same var still normalizes.
+/// The scanner cannot see the foreign macro body.
+///
+/// Missing or changed files fail closed.
+fn env_dep_is_include_locator_only(
     var: &str,
     source_files: &[std::path::PathBuf],
     file_hasher: &FileHasher<'_>,
 ) -> bool {
+    let mut proven = false;
     for file in source_files {
-        match file_hasher.runtime_env_use(file, var) {
-            Ok(false) => {}
-            Ok(true) => return true,
+        match file_hasher.env_dep_use(file, var) {
+            Ok(SourceEnvDepUse::Unused) => {}
+            Ok(SourceEnvDepUse::IncludeLocator) => proven = true,
+            Ok(SourceEnvDepUse::RuntimeValue) => return false,
             Err(e) => {
                 tracing::debug!(
                     "keeping env dep {var} absolute: failed to inspect source {}: {}",
                     file.display(),
                     e
                 );
-                return true;
+                return false;
             }
         }
     }
-    false
+    proven
 }
 
-fn source_has_runtime_env_dep_use(source: &str, var: &str) -> bool {
+/// Version of [`source_env_dep_use`] answers in the persistent memo. Bump it
+/// whenever the scanner can classify unchanged source text differently;
+/// otherwise wrappers keep reusing the old answer for every file that did not
+/// change.
+///
+/// 2: computed env var names, `[`/`{` delimiters, comments between tokens,
+/// lifetimes, nested block comments and raw C strings; answers gained the
+/// include-locator state that the positive proof needs.
+const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 2;
+
+/// How one source file's text uses an env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceEnvDepUse {
+    /// No env macro names the var, and none has a name the scanner cannot read
+    /// outside an include argument.
+    Unused,
+    /// At least one `env!(var)` / `option_env!(var)` inside an `include*!`
+    /// argument, and no use outside one.
+    IncludeLocator,
+    /// `env!(var)` / `option_env!(var)` outside an include argument, or an env
+    /// macro outside one whose name is not a plain string literal
+    /// (`env!(concat!(..))`, `env!($name)` in a forwarding macro). Such a
+    /// macro may read any var, so it counts against every var.
+    RuntimeValue,
+}
+
+impl SourceEnvDepUse {
+    fn memo_code(self) -> i64 {
+        match self {
+            Self::Unused => 0,
+            Self::IncludeLocator => 1,
+            Self::RuntimeValue => 2,
+        }
+    }
+
+    fn from_memo_code(code: i64) -> Option<Self> {
+        match code {
+            0 => Some(Self::Unused),
+            1 => Some(Self::IncludeLocator),
+            2 => Some(Self::RuntimeValue),
+            _ => None,
+        }
+    }
+}
+
+fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
     let bytes = source.as_bytes();
     let mut i = 0usize;
-    let mut macro_stack: Vec<String> = Vec::new();
+    // One entry per open delimiter: the macro it belongs to, or "" for a
+    // plain group. Tracking every delimiter kind keeps `include!{..}` and
+    // `env![..]` in step with their closing token.
+    let mut groups: Vec<&str> = Vec::new();
+    let mut include_locator = false;
 
     while i < bytes.len() {
         match bytes[i] {
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-            }
+            b'/' if matches!(bytes.get(i + 1), Some(b'/' | b'*')) => i = skip_comment(bytes, i),
             b'"' => i = skip_quoted_string(bytes, i + 1),
-            b'\'' => i = skip_char_literal(bytes, i + 1),
-            b'r' | b'b' if raw_string_starts_at(bytes, i).is_some() => {
+            b'\'' => i = skip_char_literal_or_lifetime(source, i),
+            b'b' | b'c' | b'r' if raw_string_starts_at(bytes, i).is_some() => {
                 i = skip_raw_string(bytes, i);
             }
-            b')' => {
-                let _ = macro_stack.pop();
+            b'(' | b'[' | b'{' => {
+                groups.push("");
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                let _ = groups.pop();
                 i += 1;
             }
             b if is_ident_start(b) => {
@@ -2954,79 +3009,102 @@ fn source_has_runtime_env_dep_use(source: &str, var: &str) -> bool {
                     i += 1;
                 }
                 let ident = &source[ident_start..i];
-
-                if matches!(ident, "env" | "option_env")
-                    && let Some((env_var, next)) = parse_env_macro_string(source, i)
-                    && env_var == var
-                {
-                    if !macro_stack.iter().any(|name| is_include_macro(name)) {
-                        return true;
-                    }
-                    i = next;
+                let Some(open) = parse_macro_open(bytes, i) else {
                     continue;
-                }
+                };
 
-                if let Some(next) = parse_macro_open(source, i) {
-                    macro_stack.push(ident.to_string());
-                    i = next;
+                if matches!(ident, "env" | "option_env") {
+                    let in_include = groups.iter().any(|name| is_include_macro(name));
+                    match parse_env_macro_name(source, open + 1) {
+                        Some(name) if name != var => {}
+                        Some(_) if in_include => include_locator = true,
+                        None if in_include => {}
+                        _ => return SourceEnvDepUse::RuntimeValue,
+                    }
                 }
+                groups.push(ident);
+                i = open + 1;
             }
             _ => i += 1,
         }
     }
 
-    false
+    if include_locator {
+        SourceEnvDepUse::IncludeLocator
+    } else {
+        SourceEnvDepUse::Unused
+    }
 }
 
 fn is_include_macro(name: &str) -> bool {
     matches!(name, "include" | "include_str" | "include_bytes")
 }
 
-fn parse_env_macro_string(source: &str, after_ident: usize) -> Option<(&str, usize)> {
+/// The var an env macro names, when its first token is a plain string literal
+/// without escapes. `None` means the name is computed or spelled in a form the
+/// scanner does not decode (`concat!`, `$v`, `"OUT\x5FDIR"`, raw strings).
+fn parse_env_macro_name(source: &str, after_open: usize) -> Option<&str> {
     let bytes = source.as_bytes();
-    let mut i = skip_ascii_ws(bytes, after_ident);
-    if bytes.get(i) != Some(&b'!') {
+    let start = skip_trivia(bytes, after_open);
+    if bytes.get(start) != Some(&b'"') {
         return None;
     }
-    i = skip_ascii_ws(bytes, i + 1);
-    if bytes.get(i) != Some(&b'(') {
+    let len = bytes[start + 1..]
+        .iter()
+        .position(|b| matches!(b, b'"' | b'\\'))?;
+    let end = start + 1 + len;
+    (bytes[end] == b'"').then(|| &source[start + 1..end])
+}
+
+/// Position of the opening delimiter when `after_ident` starts `! (`, `! [`
+/// or `! {`, with whitespace or comments allowed between the tokens.
+fn parse_macro_open(bytes: &[u8], after_ident: usize) -> Option<usize> {
+    let bang = skip_trivia(bytes, after_ident);
+    if bytes.get(bang) != Some(&b'!') {
         return None;
     }
-    i = skip_ascii_ws(bytes, i + 1);
-    if bytes.get(i) != Some(&b'"') {
-        return None;
-    }
-    let value_start = i + 1;
-    i = value_start;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some((&source[value_start..i], i + 1)),
-            _ => i += 1,
+    let open = skip_trivia(bytes, bang + 1);
+    matches!(bytes.get(open), Some(b'(' | b'[' | b'{')).then_some(open)
+}
+
+fn skip_trivia(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        match bytes.get(i) {
+            Some(b) if b.is_ascii_whitespace() => i += 1,
+            Some(b'/') if matches!(bytes.get(i + 1), Some(b'/' | b'*')) => {
+                i = skip_comment(bytes, i);
+            }
+            _ => return i,
         }
     }
-    None
 }
 
-fn parse_macro_open(source: &str, after_ident: usize) -> Option<usize> {
-    let bytes = source.as_bytes();
-    let mut i = skip_ascii_ws(bytes, after_ident);
-    if bytes.get(i) != Some(&b'!') {
-        return None;
+/// Skip the comment starting at `i`. Block comments nest in Rust, so an inner
+/// `*/` must not end the outer comment.
+fn skip_comment(bytes: &[u8], mut i: usize) -> usize {
+    if bytes.get(i + 1) == Some(&b'/') {
+        while i < bytes.len() && bytes[i] != b'\n' {
+            i += 1;
+        }
+        return i;
     }
-    i = skip_ascii_ws(bytes, i + 1);
-    if bytes.get(i) == Some(&b'(') {
-        Some(i + 1)
-    } else {
-        None
+    let mut depth = 1usize;
+    i += 2;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return i;
+            }
+        } else {
+            i += 1;
+        }
     }
-}
-
-fn skip_ascii_ws(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    i
+    bytes.len()
 }
 
 fn skip_quoted_string(bytes: &[u8], mut i: usize) -> usize {
@@ -3040,6 +3118,26 @@ fn skip_quoted_string(bytes: &[u8], mut i: usize) -> usize {
     bytes.len()
 }
 
+/// Skip the char literal starting at the quote `quote`, or only the quote
+/// when it starts a lifetime or label (`'a`, `'static`). Skipping to the next
+/// quote after a lifetime would hide the code in between from the scanner.
+fn skip_char_literal_or_lifetime(source: &str, quote: usize) -> usize {
+    let bytes = source.as_bytes();
+    if bytes.get(quote + 1) == Some(&b'\\') {
+        return skip_char_literal(bytes, quote + 1);
+    }
+    let Some(ch) = source[quote + 1..].chars().next() else {
+        return bytes.len();
+    };
+    let close = quote + 1 + ch.len_utf8();
+    if bytes.get(close) == Some(&b'\'') {
+        close + 1
+    } else {
+        quote + 1
+    }
+}
+
+/// Skip a char literal from its first content byte through the closing quote.
 fn skip_char_literal(bytes: &[u8], mut i: usize) -> usize {
     while i < bytes.len() {
         match bytes[i] {
@@ -3053,7 +3151,7 @@ fn skip_char_literal(bytes: &[u8], mut i: usize) -> usize {
 
 fn raw_string_starts_at(bytes: &[u8], i: usize) -> Option<usize> {
     let mut cursor = i;
-    if bytes.get(cursor) == Some(&b'b') {
+    if matches!(bytes.get(cursor), Some(b'b' | b'c')) {
         cursor += 1;
     }
     if bytes.get(cursor) != Some(&b'r') {
@@ -3074,7 +3172,7 @@ fn skip_raw_string(bytes: &[u8], i: usize) -> usize {
     let Some(open_quote) = raw_string_starts_at(bytes, i) else {
         return i + 1;
     };
-    let hashes = open_quote - i - usize::from(bytes[i] == b'b') - 1;
+    let hashes = open_quote - i - usize::from(bytes[i] != b'r') - 1;
     let mut cursor = open_quote + 1;
     while cursor < bytes.len() {
         if bytes[cursor] == b'"'
@@ -3493,7 +3591,7 @@ pub struct FileHasher<'db> {
     discovery_flight: RefCell<Option<crate::store::StoreLock>>,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
     recent_hashes: RefCell<HashMap<PathBuf, RecentHash>>,
-    runtime_env_uses: RefCell<HashMap<(String, String), bool>>,
+    env_dep_uses: RefCell<HashMap<(String, String), SourceEnvDepUse>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
     /// Fingerprints of every file hashed while the too-new guard was armed.
@@ -3564,7 +3662,7 @@ impl FileHasher<'static> {
             discovery_flight: RefCell::new(None),
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
-            runtime_env_uses: RefCell::new(HashMap::new()),
+            env_dep_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
@@ -3583,7 +3681,7 @@ impl FileHasher<'static> {
                 discovery_flight: RefCell::new(None),
                 prefetched: RefCell::new(HashMap::new()),
                 recent_hashes: RefCell::new(HashMap::new()),
-                runtime_env_uses: RefCell::new(HashMap::new()),
+                env_dep_uses: RefCell::new(HashMap::new()),
                 stats: FileHashStatsCells::default(),
                 too_new: TooNewGuard::default(),
                 guard_inputs: RefCell::new(Vec::new()),
@@ -3644,7 +3742,7 @@ impl<'db> FileHasher<'db> {
             discovery_flight: RefCell::new(None),
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
-            runtime_env_uses: RefCell::new(HashMap::new()),
+            env_dep_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
@@ -4259,10 +4357,10 @@ impl<'db> FileHasher<'db> {
         Ok((hash, Some(fingerprint)))
     }
 
-    /// Return whether `var` is used by this source outside an `include*` path.
+    /// Classify how this source uses `var` (see [`source_env_dep_use`]).
     /// Decisions are keyed by the already-computed content hash, so warm key
     /// construction can reuse them without opening the source again (#557).
-    fn runtime_env_use(&self, path: &Path, var: &str) -> Result<bool> {
+    fn env_dep_use(&self, path: &Path, var: &str) -> Result<SourceEnvDepUse> {
         let absolute = absolute_path(path);
         let recent = self.recent_hashes.borrow().get(&absolute).cloned();
         let recent = match recent {
@@ -4285,37 +4383,51 @@ impl<'db> FileHasher<'db> {
                     path.display()
                 );
             }
-            return self.runtime_env_use_for_hash(path, var, &recent.hash);
+            return self.env_dep_use_for_hash(path, var, &recent.hash);
         }
 
         // Without a trustworthy fingerprint, bypass memo lookup. The scan
         // still verifies the content hash before recording a reusable result.
-        self.scan_runtime_env_use(path, var, &recent.hash)
+        self.scan_env_dep_use(path, var, &recent.hash)
     }
 
-    fn runtime_env_use_for_hash(&self, path: &Path, var: &str, content_hash: &str) -> Result<bool> {
+    fn env_dep_use_for_hash(
+        &self,
+        path: &Path,
+        var: &str,
+        content_hash: &str,
+    ) -> Result<SourceEnvDepUse> {
         let key = (content_hash.to_string(), var.to_string());
-        if let Some(result) = self.runtime_env_uses.borrow().get(&key) {
+        if let Some(result) = self.env_dep_uses.borrow().get(&key) {
             return Ok(*result);
         }
 
+        // Rows written by another scanner version are invisible, so a scanner
+        // fix reclassifies files that did not change.
         if let Some(cache) = &self.cache {
-            match cache.get_runtime_env_use(content_hash, var) {
-                Ok(Some(result)) => {
-                    self.runtime_env_uses.borrow_mut().insert(key, result);
-                    return Ok(result);
+            match cache.get_source_env_dep_use(content_hash, var, SOURCE_ENV_DEP_SCANNER_VERSION) {
+                Ok(Some(code)) => {
+                    if let Some(result) = SourceEnvDepUse::from_memo_code(code) {
+                        self.env_dep_uses.borrow_mut().insert(key, result);
+                        return Ok(result);
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::debug!("runtime env-use cache lookup failed: {error}");
+                    tracing::debug!("env-use cache lookup failed: {error}");
                 }
             }
         }
 
-        self.scan_runtime_env_use(path, var, content_hash)
+        self.scan_env_dep_use(path, var, content_hash)
     }
 
-    fn scan_runtime_env_use(&self, path: &Path, var: &str, content_hash: &str) -> Result<bool> {
+    fn scan_env_dep_use(
+        &self,
+        path: &Path,
+        var: &str,
+        content_hash: &str,
+    ) -> Result<SourceEnvDepUse> {
         let key = (content_hash.to_string(), var.to_string());
         let bytes = std::fs::read(path)
             .with_context(|| format!("reading {} for env-use scan", path.display()))?;
@@ -4328,13 +4440,18 @@ impl<'db> FileHasher<'db> {
         }
 
         let source = String::from_utf8_lossy(&bytes);
-        let result = source_has_runtime_env_dep_use(&source, var);
+        let result = source_env_dep_use(&source, var);
         if let Some(cache) = &self.cache
-            && let Err(error) = cache.put_runtime_env_use(content_hash, var, result)
+            && let Err(error) = cache.put_source_env_dep_use(
+                content_hash,
+                var,
+                SOURCE_ENV_DEP_SCANNER_VERSION,
+                result.memo_code(),
+            )
         {
-            tracing::debug!("runtime env-use cache update failed: {error}");
+            tracing::debug!("env-use cache update failed: {error}");
         }
-        self.runtime_env_uses.borrow_mut().insert(key, result);
+        self.env_dep_uses.borrow_mut().insert(key, result);
         Ok(result)
     }
 
@@ -8167,33 +8284,179 @@ mod tests {
 
     #[test]
     fn source_scanner_detects_runtime_env_use_and_skips_literals() {
-        use super::source_has_runtime_env_dep_use as scan;
+        use super::SourceEnvDepUse::{IncludeLocator, RuntimeValue, Unused};
+        use super::source_env_dep_use as scan;
 
         // A bare runtime env! use is a real dependency.
-        assert!(scan(r#"const X: &str = env!("MYVAR");"#, "MYVAR"));
-        assert!(scan(r#"let v = option_env!("MYVAR");"#, "MYVAR"));
-        // A different var name doesn't match.
-        assert!(!scan(r#"env!("OTHER")"#, "MYVAR"));
+        assert_eq!(
+            scan(r#"const X: &str = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"let v = option_env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"const N: usize = env!("MYVAR").len();"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"const P: usize = env!("MYVAR").len() % 2;"#, "MYVAR"),
+            RuntimeValue
+        );
+        // A different var name doesn't match, and proves nothing.
+        assert_eq!(scan(r#"env!("OTHER")"#, "MYVAR"), Unused);
+        assert_eq!(
+            scan(r#"include!(concat!(env!("OTHER"), "/gen.rs"));"#, "MYVAR"),
+            Unused
+        );
+        assert_eq!(scan("pub fn f() {}", "MYVAR"), Unused);
 
         // env! nested inside include!(concat!(...)) is a compile-time include,
-        // not a runtime value — must NOT count.
-        assert!(!scan(
-            r#"include!(concat!(env!("MYVAR"), "/gen.rs"));"#,
-            "MYVAR"
-        ));
+        // not a runtime value, and is the positive proof normalization needs.
+        assert_eq!(
+            scan(r#"include!(concat!(env!("MYVAR"), "/gen.rs"));"#, "MYVAR"),
+            IncludeLocator
+        );
+        assert_eq!(
+            scan(r#"include_bytes![env!("MYVAR")];"#, "MYVAR"),
+            IncludeLocator
+        );
+        assert_eq!(
+            scan(r#"include_str! { env! { "MYVAR" } }"#, "MYVAR"),
+            IncludeLocator
+        );
+        // The include context ends at the include's own closing delimiter.
+        assert_eq!(
+            scan(
+                r#"include!{ concat!(env!("MYVAR"), "/gen.rs") } const X: &str = env!("MYVAR");"#,
+                "MYVAR"
+            ),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"f(include!(env!("MYVAR"))); [env!("MYVAR")];"#, "MYVAR"),
+            RuntimeValue
+        );
+
+        // A name the scanner cannot read counts against every var outside an
+        // include, and proves nothing inside one.
+        assert_eq!(
+            scan(r#"const S: &str = env!(concat!("MY", "VAR"));"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"const S: &str = env!(concat!("OT", "HER"));"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(
+                r#"macro_rules! e { ($v:literal) => { env!($v) } } const X: &str = e!("MYVAR");"#,
+                "MYVAR"
+            ),
+            RuntimeValue
+        );
+        assert_eq!(scan(r#"env!("MY\x56AR")"#, "MYVAR"), RuntimeValue);
+        assert_eq!(scan(r##"env!(r#"MYVAR"#)"##, "MYVAR"), RuntimeValue);
+        assert_eq!(scan(r#"env!("MYVAR"#, "MYVAR"), RuntimeValue);
+        assert_eq!(scan("env!(", "MYVAR"), RuntimeValue);
+        assert_eq!(
+            scan(
+                r#"include!(concat!(env!(concat!("MY", "VAR")), "/gen.rs"));"#,
+                "MYVAR"
+            ),
+            Unused
+        );
+
+        // Whitespace and comments between the macro tokens do not hide a use.
+        assert_eq!(
+            scan(
+                r#"env /* c */ ! // c
+            ( "MYVAR" )"#,
+                "MYVAR"
+            ),
+            RuntimeValue
+        );
+        // `!` that is not a macro bang opens no macro group.
+        assert_eq!(
+            scan(r#"if a != (b) { include!(env!("MYVAR")); }"#, "MYVAR"),
+            IncludeLocator
+        );
 
         // Occurrences inside string / char / raw-string literals and comments
         // are not real uses — the scanner must skip them.
-        assert!(!scan(r#"let s = "env!(\"MYVAR\")";"#, "MYVAR"));
-        assert!(!scan(r###"let s = r#"env!("MYVAR")"#;"###, "MYVAR"));
-        assert!(!scan(r#"// env!("MYVAR")"#, "MYVAR"));
-        assert!(!scan(r#"/* env!("MYVAR") */"#, "MYVAR"));
+        assert_eq!(scan(r#"let s = "env!(\"MYVAR\")";"#, "MYVAR"), Unused);
+        assert_eq!(scan(r###"let s = r#"env!("MYVAR")"#;"###, "MYVAR"), Unused);
+        assert_eq!(scan(r###"let s = br#"env!("MYVAR")"#;"###, "MYVAR"), Unused);
+        assert_eq!(scan(r###"let s = cr#"env!("MYVAR")"#;"###, "MYVAR"), Unused);
+        assert_eq!(scan(r#"// env!("MYVAR")"#, "MYVAR"), Unused);
+        assert_eq!(scan(r#"/* env!("MYVAR") */"#, "MYVAR"), Unused);
+        assert_eq!(scan(r#"/* /* */ env!("MYVAR") */"#, "MYVAR"), Unused);
+        assert_eq!(scan(r#"/* unterminated env!("MYVAR")"#, "MYVAR"), Unused);
+
+        // Nested block comments end at the matching `*/` only.
+        assert_eq!(
+            scan(
+                r#"/* /* */ include!( */ const X: &str = env!("MYVAR");"#,
+                "MYVAR"
+            ),
+            RuntimeValue
+        );
+        assert_eq!(scan(r#"/*/ env!("MYVAR") */"#, "MYVAR"), Unused);
 
         // A char literal earlier in the line must not derail scanning of a real
-        // use that follows it (exercises skip_char_literal).
-        assert!(scan(r#"let c = '"'; let x = env!("MYVAR");"#, "MYVAR"));
+        // use that follows it.
+        assert_eq!(
+            scan(r#"let c = '"'; let x = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"let c = '\''; let x = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"let c = b'\\'; let x = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"let c = 'é'; let x = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"let c = '"'; let s = "env!(\"MYVAR\")";"#, "MYVAR"),
+            Unused
+        );
+        // A lifetime or label is not a char literal: skipping to the next quote
+        // would hide the use.
+        assert_eq!(
+            scan(
+                r#"fn f(_: &'static str) -> usize { env!("MYVAR").len() }"#,
+                "MYVAR"
+            ),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(
+                r#"fn f<'a>(_: &'a str) { 'outer: loop { env!("MYVAR"); } }"#,
+                "MYVAR"
+            ),
+            RuntimeValue
+        );
+        assert_eq!(scan("'", "MYVAR"), Unused);
         // A real use after a raw string is still found (exercises skip_raw_string).
-        assert!(scan(r###"let r = r#"noise"#; env!("MYVAR")"###, "MYVAR"));
+        assert_eq!(
+            scan(r###"let r = r#"noise"#; env!("MYVAR")"###, "MYVAR"),
+            RuntimeValue
+        );
+        // A raw C string ending in a backslash has no escape to swallow the
+        // closing quote.
+        assert_eq!(
+            scan(
+                r#"let c = cr"\"; let x = env!("MYVAR"); let t = "";"#,
+                "MYVAR"
+            ),
+            RuntimeValue
+        );
     }
 
     #[test]
@@ -9325,9 +9588,16 @@ mod tests {
             // `pkg` must exist for canonicalize to traverse `pkg/..`.
             std::fs::create_dir_all(root.join("pkg")).unwrap();
             let generated = out.join("generated.rs");
-            // Path-only include payload (no `env!("OUT_DIR")` runtime use), so
-            // the value is safe to normalize.
+            // Path-only include payload (no `env!("OUT_DIR")` runtime use), and
+            // a crate root whose include proves the locator use, so the value
+            // is safe to normalize.
             std::fs::write(&generated, b"pub fn marker() -> u8 { 7 }\n").unwrap();
+            let lib = root.join("pkg").join("lib.rs");
+            std::fs::write(
+                &lib,
+                r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#,
+            )
+            .unwrap();
 
             // The value as Windows cargo hands it over: the package dir is
             // cancelled by a literal `..` rather than pre-resolved.
@@ -9343,7 +9613,7 @@ mod tests {
                 .into_owned();
 
             let pn = PathNormalizer::from_env(Some(&target));
-            normalize_env_dep_value("test_crate", "OUT_DIR", &value, &[generated], &pn).value
+            normalize_env_dep_value("test_crate", "OUT_DIR", &value, &[lib, generated], &pn).value
         }
 
         let cold = tempfile::tempdir().unwrap();
@@ -9777,8 +10047,14 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 include_str!(concat!(env ! ( "OUT_DIR" ), "/template.txt"));
 include_bytes!(env!("BLOB_PATH"));
 "#;
-        assert!(!source_has_runtime_env_dep_use(source, "OUT_DIR"));
-        assert!(!source_has_runtime_env_dep_use(source, "BLOB_PATH"));
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::IncludeLocator
+        );
+        assert_eq!(
+            source_env_dep_use(source, "BLOB_PATH"),
+            SourceEnvDepUse::IncludeLocator
+        );
     }
 
     #[test]
@@ -9788,7 +10064,10 @@ const OUT_DIR: &str = env!("OUT_DIR");
 const MAYBE_OUT_DIR: Option<&str> = option_env!("OUT_DIR");
 const PATH: &str = concat!(env!("OUT_DIR"), "/data.txt");
 "#;
-        assert!(source_has_runtime_env_dep_use(source, "OUT_DIR"));
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::RuntimeValue
+        );
     }
 
     #[test]
@@ -9797,7 +10076,10 @@ const PATH: &str = concat!(env!("OUT_DIR"), "/data.txt");
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 "#;
-        assert!(source_has_runtime_env_dep_use(source, "OUT_DIR"));
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::RuntimeValue
+        );
     }
 
     #[test]
@@ -9809,7 +10091,10 @@ const TEXT: &str = "env!(\"OUT_DIR\")";
 const RAW: &str = r#"env!("OUT_DIR")"#;
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 "##;
-        assert!(!source_has_runtime_env_dep_use(source, "OUT_DIR"));
+        assert_eq!(
+            source_env_dep_use(source, "OUT_DIR"),
+            SourceEnvDepUse::IncludeLocator
+        );
     }
 
     #[test]
@@ -9916,6 +10201,211 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
         );
         assert_eq!(env_dep.value, out_dir_value);
+    }
+
+    /// The OUT_DIR decision for a crate whose root source is `lib_source` and
+    /// whose dep-info lists a generated include under OUT_DIR, the shape that
+    /// makes OUT_DIR a normalization candidate at all.
+    fn out_dir_decision_for(
+        lib_source: &str,
+        file_hasher: &FileHasher<'_>,
+    ) -> EnvDepNormalizationDecision {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let src = workspace.join("src");
+        let out_dir = workspace.join("target/debug/build/pkg/out");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let lib = src.join("lib.rs");
+        std::fs::write(&lib, lib_source).unwrap();
+        let included = out_dir.join("generated.rs");
+        std::fs::write(&included, b"pub fn generated() -> u8 { 1 }").unwrap();
+        let out_dir_value = out_dir
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        normalize_env_dep_value_with_hasher(
+            "test_crate",
+            "OUT_DIR",
+            &out_dir_value,
+            &[lib, included],
+            file_hasher,
+            &PathNormalizer::from_env(Some(&workspace)),
+        )
+        .decision
+    }
+
+    #[test]
+    fn env_dep_policy_keeps_out_dir_absolute_for_uses_the_scanner_cannot_prove() {
+        // Every source below includes a generated file through OUT_DIR, so
+        // dep-info alone would allow normalization, and every one also derives
+        // something from the absolute OUT_DIR that ends up in the artifact (or
+        // gives no proof of where the env dep came from). A normalized key would
+        // restore one checkout's artifact in another.
+        const INCLUDE: &str = r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#;
+        let cases: &[(&str, String)] = &[
+            (
+                "value length",
+                format!(r#"{INCLUDE} pub const N: usize = env!("OUT_DIR").len();"#),
+            ),
+            (
+                "value arithmetic",
+                format!(r#"{INCLUDE} pub const P: usize = env!("OUT_DIR").len() % 2;"#),
+            ),
+            (
+                "computed name",
+                format!(r#"{INCLUDE} pub const S: &str = env!(concat!("OUT", "_DIR"));"#),
+            ),
+            (
+                "computed name, option_env",
+                format!(
+                    r#"{INCLUDE} pub const S: Option<&str> = option_env!(concat!("OUT", "_DIR"));"#
+                ),
+            ),
+            (
+                "forwarding macro",
+                format!(
+                    r#"{INCLUDE}
+macro_rules! e {{ ($v:literal) => {{ env!($v) }} }}
+pub const X: &str = e!("OUT_DIR");"#
+                ),
+            ),
+            (
+                "brace delimiter",
+                format!(r#"{INCLUDE} pub const S: &str = env!{{"OUT_DIR"}};"#),
+            ),
+            (
+                "bracket delimiter",
+                format!(r#"{INCLUDE} pub const S: &str = env!["OUT_DIR"];"#),
+            ),
+            (
+                "escaped name",
+                format!(r#"{INCLUDE} pub const S: &str = env!("OUT\x5FDIR");"#),
+            ),
+            (
+                "raw string name",
+                format!(r##"{INCLUDE} pub const S: &str = env!(r#"OUT_DIR"#);"##),
+            ),
+            (
+                "comment before the bang",
+                format!(r#"{INCLUDE} pub const S: &str = env /* x */ !("OUT_DIR");"#),
+            ),
+            (
+                "lifetime before the use",
+                format!(
+                    r#"{INCLUDE} pub fn f(_: &'static str) -> usize {{ env!("OUT_DIR").len() }}"#
+                ),
+            ),
+            (
+                "nested block comment",
+                format!(
+                    r#"{INCLUDE} /* /* */ include!( */ pub const N: usize = env!("OUT_DIR").len();"#
+                ),
+            ),
+            (
+                "raw C string ending in a backslash",
+                format!(
+                    r#"{INCLUDE} pub const C: &core::ffi::CStr = cr"\"; pub const N: usize = env!("OUT_DIR").len(); pub const T: &str = "";"#
+                ),
+            ),
+            (
+                "no env! in the crate (the env dep comes from another crate's macro)",
+                "pub fn f() -> &'static str { some_dep::out_dir!() }".to_string(),
+            ),
+            (
+                "only a computed name inside include",
+                r#"include!(concat!(env!(concat!("OUT", "_DIR")), "/generated.rs"));"#.to_string(),
+            ),
+        ];
+        let hasher = FileHasher::new();
+        let normalized: Vec<&str> = cases
+            .iter()
+            .filter(|(_, source)| {
+                out_dir_decision_for(source, &hasher)
+                    != EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+            })
+            .map(|(label, _)| *label)
+            .collect();
+        assert!(
+            normalized.is_empty(),
+            "OUT_DIR must stay absolute for: {normalized:?}"
+        );
+    }
+
+    #[test]
+    fn env_dep_policy_normalizes_out_dir_proven_include_locators() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "include concat",
+                r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#,
+            ),
+            (
+                "include in a local macro",
+                r#"macro_rules! generated { ($f:literal) => { include!(concat!(env!("OUT_DIR"), "/", $f)); } }
+generated!("generated.rs");"#,
+            ),
+            (
+                "brace-delimited include",
+                r#"include!{ concat!(env!("OUT_DIR"), "/generated.rs") }"#,
+            ),
+            (
+                "lifetime and char literals around the include",
+                r#"pub fn f<'a>(x: &'a str) -> char { let _ = x; 'x' }
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+pub fn g(_: &'static str) {}"#,
+            ),
+        ];
+        let hasher = FileHasher::new();
+        let kept: Vec<&str> = cases
+            .iter()
+            .filter(|(_, source)| {
+                out_dir_decision_for(source, &hasher)
+                    != EnvDepNormalizationDecision::NormalizedPathOnly
+            })
+            .map(|(label, _)| *label)
+            .collect();
+        assert!(kept.is_empty(), "OUT_DIR must normalize for: {kept:?}");
+    }
+
+    #[test]
+    fn env_dep_policy_ignores_env_use_memo_rows_from_the_old_scanner() {
+        // Before the scanner learned computed names, it recorded "no runtime
+        // use" for this source. That row is keyed by content hash only, so an
+        // upgraded wrapper would reuse it for the unchanged file unless the
+        // memo is versioned.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let source = concat!(
+            r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#,
+            r#" pub const S: &str = env!(concat!("OUT", "_DIR"));"#
+        );
+        let content_hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+        drop(FileHasher::persistent(&db));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS source_env_runtime_uses (
+                content_hash    TEXT NOT NULL,
+                env_var         TEXT NOT NULL,
+                has_runtime_use INTEGER NOT NULL,
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (content_hash, env_var)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO source_env_runtime_uses
+             (content_hash, env_var, has_runtime_use) VALUES (?1, 'OUT_DIR', 0)",
+            rusqlite::params![content_hash],
+        )
+        .unwrap();
+        drop(conn);
+
+        let hasher = FileHasher::persistent(&db);
+        assert_eq!(
+            out_dir_decision_for(source, &hasher),
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+        );
     }
 
     #[test]
@@ -10584,37 +11074,122 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
     }
 
     #[test]
-    fn runtime_env_use_memo_reuses_positive_and_negative_scans() {
+    fn env_dep_use_memo_reuses_every_scan_answer() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("idx.sqlite");
         let source = dir.path().join("lib.rs");
         std::fs::write(
             &source,
-            br#"pub const OUT: &str = env!("OUT_DIR"); pub const N: usize = 1;"#,
+            br#"include!(env!("GEN")); pub const OUT: &str = env!("OUT_DIR"); pub const N: usize = 1;"#,
         )
         .unwrap();
 
         let hasher = FileHasher::persistent(&db);
         let content_hash = hasher.hash(&source).unwrap();
-        assert!(hasher.runtime_env_use(&source, "OUT_DIR").unwrap());
-        assert!(!hasher.runtime_env_use(&source, "OTHER_DIR").unwrap());
+        let answers = [
+            ("OUT_DIR", SourceEnvDepUse::RuntimeValue),
+            ("GEN", SourceEnvDepUse::IncludeLocator),
+            ("OTHER_DIR", SourceEnvDepUse::Unused),
+        ];
+        for (var, expected) in answers {
+            assert_eq!(hasher.env_dep_use(&source, var).unwrap(), expected, "{var}");
+        }
         drop(hasher);
 
-        // A fresh wrapper can answer both decisions from SQLite using the
+        // A fresh wrapper can answer every decision from SQLite using the
         // content hash it already obtained while building the cache key. The
-        // source is gone, so either attempted reread would fail this test.
+        // source is gone, so any attempted reread would fail this test.
         std::fs::remove_file(&source).unwrap();
         let fresh = FileHasher::persistent(&db);
-        assert!(
-            fresh
-                .runtime_env_use_for_hash(&source, "OUT_DIR", &content_hash)
-                .unwrap()
+        for (var, expected) in answers {
+            assert_eq!(
+                fresh
+                    .env_dep_use_for_hash(&source, var, &content_hash)
+                    .unwrap(),
+                expected,
+                "{var}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_dep_use_memo_rescans_rows_from_other_scanner_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let source = dir.path().join("lib.rs");
+        std::fs::write(
+            &source,
+            br#"pub const S: &str = env!(concat!("OUT", "_DIR"));"#,
+        )
+        .unwrap();
+        let content_hash = hash_file(&source).unwrap();
+
+        let cache = FileHashCache::open(&db).unwrap();
+        let unused = SourceEnvDepUse::Unused.memo_code();
+        cache
+            .put_source_env_dep_use(
+                &content_hash,
+                "OUT_DIR",
+                SOURCE_ENV_DEP_SCANNER_VERSION - 1,
+                unused,
+            )
+            .unwrap();
+        cache
+            .put_source_env_dep_use(&content_hash, "OTHER", SOURCE_ENV_DEP_SCANNER_VERSION, 7)
+            .unwrap();
+        drop(cache);
+
+        let hasher = FileHasher::persistent(&db);
+        assert_eq!(
+            hasher
+                .env_dep_use_for_hash(&source, "OUT_DIR", &content_hash)
+                .unwrap(),
+            SourceEnvDepUse::RuntimeValue,
+            "an older scanner's answer must not be reused"
         );
-        assert!(
-            !fresh
-                .runtime_env_use_for_hash(&source, "OTHER_DIR", &content_hash)
-                .unwrap()
+        assert_eq!(
+            hasher
+                .env_dep_use_for_hash(&source, "OTHER", &content_hash)
+                .unwrap(),
+            SourceEnvDepUse::RuntimeValue,
+            "an unknown stored code must be rescanned"
         );
+        drop(hasher);
+
+        let cache = FileHashCache::open(&db).unwrap();
+        for var in ["OUT_DIR", "OTHER"] {
+            assert_eq!(
+                cache
+                    .get_source_env_dep_use(&content_hash, var, SOURCE_ENV_DEP_SCANNER_VERSION)
+                    .unwrap(),
+                Some(SourceEnvDepUse::RuntimeValue.memo_code()),
+                "the rescan replaces the stale row for {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_dep_use_memo_codes_round_trip() {
+        for answer in [
+            SourceEnvDepUse::Unused,
+            SourceEnvDepUse::IncludeLocator,
+            SourceEnvDepUse::RuntimeValue,
+        ] {
+            assert_eq!(
+                SourceEnvDepUse::from_memo_code(answer.memo_code()),
+                Some(answer)
+            );
+        }
+        assert_eq!(
+            [
+                SourceEnvDepUse::Unused.memo_code(),
+                SourceEnvDepUse::IncludeLocator.memo_code(),
+                SourceEnvDepUse::RuntimeValue.memo_code(),
+            ],
+            [0, 1, 2]
+        );
+        assert_eq!(SourceEnvDepUse::from_memo_code(3), None);
+        assert_eq!(SourceEnvDepUse::from_memo_code(-1), None);
     }
 
     #[test]
@@ -10627,7 +11202,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         hasher.hash(&source).unwrap();
         std::fs::write(&source, br#"pub const OUT: &str = env!("OUT_DIR");"#).unwrap();
 
-        let error = hasher.runtime_env_use(&source, "OUT_DIR").unwrap_err();
+        let error = hasher.env_dep_use(&source, "OUT_DIR").unwrap_err();
         assert!(
             error
                 .to_string()

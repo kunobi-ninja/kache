@@ -1,6 +1,6 @@
 [package]
 name = "kache-store"
-version = "0.23.0"
+version = "0.23.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Local content-addressed artifact storage for kache."
@@ -15,8 +15,8 @@ name = "bench-cc-memos"
 required-features = ["test-support"]
 
 [dependencies]
-kache-format = { version = "0.23.0", path = "../kache-format" }
-kache-fs = { version = "0.23.0", path = "../kache-fs", features = ["staging"] }
+kache-format = { version = "0.23.1", path = "../kache-format" }
+kache-fs = { version = "0.23.1", path = "../kache-fs", features = ["staging"] }
 anyhow = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

@@ -13580,9 +13580,13 @@ exit 0
         );
 
         // A listening socket: the daemon owns the flush, so this leaves the
-        // entry pending and starts nothing.
+        // entry pending and starts nothing. Bound through the same transport
+        // the wrapper probes, which on Windows is a named pipe.
         let socket = dir.path().join("live.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let listener = crate::transport::ListenerOptions::new()
+            .name(crate::transport::socket_name(&socket).expect("socket name"))
+            .create_sync()
+            .expect("bind listener");
         config.socket_path_override = Some(socket);
         put("with_daemon", b"artifact-two");
         assert_eq!(store.pending_durability().unwrap(), 1);

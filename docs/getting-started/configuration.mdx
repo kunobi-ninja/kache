@@ -169,9 +169,12 @@ Keep `paths.base_dirs` narrow. Normalizing unrelated roots to stable sentinels c
 
 `path_only_env_vars` widens the built-in `OUT_DIR` rule to other variables
 whose value only locates a generated file. A plain `VAR` entry still has to
-pass Kache's checks: some source must show `env!("VAR")` inside an `include!`,
-`include_str!` or `include_bytes!` argument, and no source may read the value
-anywhere else.
+pass Kache's checks: some source must show `env!("VAR")` (or `option_env!`)
+inside an `include!`, `include_str!` or `include_bytes!` argument, and no
+source may read the value anywhere else. Kache also needs dep-info to list a
+file under the value, and it reads the proof only from `.rs` sources. When a
+listed variable is not normalized, `KACHE_LOG=trace` prints which of those
+conditions failed next to the `env_dep:` line.
 
 A crate that includes generated code through another crate's macro, such as
 `tonic::include_proto!` or `lalrpop_mod!`, never spells `env!("OUT_DIR")`
@@ -186,7 +189,9 @@ path_only_env_vars = ["my_proto_crate:OUT_DIR"]
 
 A `crate:VAR` entry skips the source checks for that crate and variable only,
 so use it when you have read the crate and know it never bakes the value into
-its artifacts. `CARGO_MANIFEST_DIR` is never accepted in either form.
+its artifacts. `CARGO_MANIFEST_DIR` is never accepted, in either form: rustc
+embeds it in crate metadata, and every crate's sources live under it, so the
+checks above would pass for a value that does change the artifact.
 
 `key_env_vars` accepts exact names and trailing-star prefix patterns:
 

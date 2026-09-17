@@ -2362,4 +2362,104 @@ fn why_miss_both_formats_include_unresolved_dependency_cascade() {
         value["dependency_chain"]["roots"][0]["kind"]["kind"],
         "no_miss_recorded"
     );
+    assert!(value["checkout_comparison"].is_null());
+    assert!(value["dependency_chain"]["baseline_root"].is_null());
+}
+
+/// The first build in a second checkout has no earlier build of its own, so
+/// why-miss compares it with the other checkout's build of the same units and
+/// names the crate whose inputs differ there.
+#[test]
+fn why_miss_compares_a_second_checkout_with_the_first() {
+    let e = env();
+    let mut events = Vec::new();
+    for (second, root, leaf_env) in [(0, "/checkouts/a", "e1"), (1, "/checkouts/b", "e2")] {
+        let leaf_out = format!("leaf-out-{leaf_env}");
+        let mid_out = format!("mid-out-{leaf_env}");
+        for (offset, name, env_deps, externs, extern_units, key) in [
+            (
+                0,
+                "leaf",
+                leaf_env,
+                serde_json::json!({}),
+                serde_json::json!({}),
+                format!("leaf-{leaf_env}"),
+            ),
+            (
+                1,
+                "mid",
+                "e",
+                serde_json::json!({"leaf": leaf_out}),
+                serde_json::json!({"leaf": "uleaf"}),
+                format!("mid-{leaf_out}"),
+            ),
+            (
+                2,
+                "app",
+                "e",
+                serde_json::json!({"mid": mid_out}),
+                serde_json::json!({"mid": "umid"}),
+                format!("app-{mid_out}"),
+            ),
+        ] {
+            events.push(
+                serde_json::json!({
+                    "ts": format!("2026-01-01T00:0{second}:0{offset}Z"), "crate_name": name,
+                    "result": "miss", "elapsed_ms": 1, "size": 1,
+                    "cache_key": key, "schema": 19, "root": root,
+                    "key_fields": {"env_deps": env_deps, "sources": "s"},
+                    "key_externs_recorded": true, "key_externs": externs,
+                    "unit_id": format!("u{name}"), "extern_units": extern_units
+                })
+                .to_string(),
+            );
+        }
+    }
+    std::fs::write(
+        e.cache.join("events.jsonl"),
+        format!("{}\n", events.join("\n")),
+    )
+    .unwrap();
+
+    e.cmd()
+        .args(["why-miss", "app"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Other checkout: no earlier build of this crate in /checkouts/b",
+        ))
+        .stdout(predicates::str::contains("compared with: /checkouts/a"))
+        .stdout(predicates::str::contains(
+            "compared with the build in another checkout: /checkouts/a",
+        ))
+        .stdout(predicates::str::contains("dependencies differ: mid"))
+        .stdout(predicates::str::contains(
+            "root: leaf -- own inputs changed: env_deps",
+        ))
+        .stdout(predicates::str::contains("via: app <- mid <- leaf"));
+
+    let output = e
+        .cmd()
+        .args(["--json", "why-miss", "leaf"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["checkout_comparison"]["baseline_root"],
+        "/checkouts/a"
+    );
+    assert_eq!(value["checkout_comparison"]["verdict"], "own_inputs");
+    assert_eq!(value["checkout_comparison"]["groups"][0], "env_deps");
+
+    let output = e
+        .cmd()
+        .args(["--json", "why-miss", "app"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["checkout_comparison"]["verdict"], "dependencies");
+    assert_eq!(value["dependency_chain"]["baseline_root"], "/checkouts/a");
+    assert_eq!(value["dependency_chain"]["roots"][0]["crate_name"], "leaf");
 }

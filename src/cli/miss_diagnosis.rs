@@ -1,7 +1,7 @@
 //! Diagnosis facts shared by terminal and JSON output.
 
 use crate::events::BuildEvent;
-use crate::miss_chain::Chain;
+use crate::miss_chain::{Chain, CheckoutComparison};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,6 +20,9 @@ pub(super) struct MissDiagnosis {
     pub other_entries: usize,
     pub dependency_chain: Option<Chain>,
     pub dependency_recording_missing: bool,
+    /// Set when the miss was compared with another checkout of the project,
+    /// because its own build tree had no earlier build of the crate.
+    pub checkout: Option<CheckoutComparison>,
 }
 
 impl MissDiagnosis {
@@ -53,6 +56,7 @@ impl MissDiagnosis {
             other_entries,
             dependency_chain,
             dependency_recording_missing,
+            checkout: None,
         }
     }
 }
@@ -125,6 +129,7 @@ mod tests {
             roots: vec![],
             direct: vec![],
             truncated: Some("limit"),
+            baseline_root: None,
         };
         let diagnosis = MissDiagnosis::new(&event, false, 0, false, Some(chain.clone()), false);
         assert!(!diagnosis.dependency_recording_missing);

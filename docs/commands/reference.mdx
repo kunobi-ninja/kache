@@ -226,6 +226,10 @@ Explains the latest recorded miss using the event log and stored entries. Store 
 
 Terminal and JSON output share the diagnosis and dependency analysis. For a recorded miss, JSON includes `dependency_chain` with changed dependencies, endpoints, and any traversal limit. An unresolved endpoint is not a confirmed cause. `dependency_recording_missing` indicates when enabling `[cache] explain_miss` and rebuilding can provide the missing dependency evidence.
 
+The first build in a second clone or worktree has no earlier build of the crate in its own tree. In that case `why-miss` compares the miss with the most recent build of the same compilation unit in another checkout. The output names that checkout and says whether the crate's own input groups differ, only its dependencies differ, or both checkouts computed the same key, which leaves the checkout path as the only difference. The cascade below it is walked against the same checkout, so the crate that actually changed is named, with the crates above it shown on the `via:` path. JSON carries this in `checkout_comparison` and in `dependency_chain.baseline_root`.
+
+Checkouts are matched by Cargo's unit id, which is the same for a workspace member in every checkout of a project. Kache records it only with `[cache] explain_miss` on, so both builds need it. A build of the crate in the same tree is always preferred.
+
 ## `kache report`
 
 ```bash

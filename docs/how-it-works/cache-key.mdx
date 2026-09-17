@@ -108,7 +108,9 @@ See [Configuration](/docs/getting-started/configuration) for syntax and safety l
 kache why-miss my_crate
 ```
 
-The command compares recent key material for that crate and prints changed groups. For individual components, run the trace command it suggests, typically:
+The command compares recent key material for that crate and prints changed groups. In a second checkout with no earlier build of the crate, it compares with the same unit built in another checkout. Groups are hashed after path normalization, so the checkout path alone does not change them. A group that differs between checkouts is a real input difference or a path that normalization missed. The same key in both checkouts means only the checkout path differs.
+
+For individual components, run the trace command it suggests, typically:
 
 ```bash
 KACHE_LOG=trace cargo build -p my_crate 2>&1 | grep '\[key:my_crate\]'

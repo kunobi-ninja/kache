@@ -1435,11 +1435,11 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         .filter(|e| e.crate_name == crate_name)
         .collect();
     let same_key_present = stored.iter().any(|e| e.cache_key == miss.cache_key);
-    let chain = all_events
+    let miss_index = all_events
         .iter()
-        .position(|event| std::ptr::eq(event, *miss))
-        .and_then(|index| crate::miss_chain::analyze(&all_events, index));
-    let diagnosis = MissDiagnosis::new(
+        .position(|event| std::ptr::eq(event, *miss));
+    let chain = miss_index.and_then(|index| crate::miss_chain::analyze(&all_events, index));
+    let mut diagnosis = MissDiagnosis::new(
         miss,
         prior_same_key_miss,
         stored.len(),
@@ -1447,6 +1447,8 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
         chain,
         config.explain_miss,
     );
+    diagnosis.checkout =
+        miss_index.and_then(|index| crate::miss_chain::compare_checkout(&all_events, index));
     if json {
         return why_miss_json(crate_name, miss, stored.len(), &diagnosis);
     }
@@ -1548,6 +1550,7 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
     print_miss_diagnosis(config, &store, miss, &stored, &diagnosis);
 
     // Render the dependency analysis shared with JSON output.
+    print_checkout_comparison(&diagnosis);
     print_extern_chain(&diagnosis);
 
     // ── Recent event history ──────────────────────────────────────────
@@ -1612,6 +1615,66 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Render the comparison with another checkout, when the miss's own build tree
+/// had no earlier build of the crate to compare with.
+fn print_checkout_comparison(diagnosis: &MissDiagnosis) {
+    let Some(checkout) = &diagnosis.checkout else {
+        return;
+    };
+    println!(
+        "\n  Other checkout: no earlier build of this crate in {}",
+        checkout.root
+    );
+    println!("    compared with: {}", checkout.baseline_root);
+    for line in checkout_comparison_lines(checkout) {
+        println!("    {line}");
+    }
+}
+
+fn checkout_comparison_lines(checkout: &crate::miss_chain::CheckoutComparison) -> Vec<String> {
+    use crate::miss_chain::CheckoutVerdict;
+    let dependencies = checkout
+        .dependencies
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut lines = Vec::new();
+    match checkout.verdict {
+        CheckoutVerdict::PathOnly => lines.push(
+            "same cache key in both checkouts -- only the checkout path differs, no key input \
+             changed"
+                .to_string(),
+        ),
+        CheckoutVerdict::OwnInputs => {
+            lines.push(format!("own inputs differ: {}", checkout.groups.join(", ")));
+            if !checkout.dependencies.is_empty() {
+                lines.push(format!("dependencies differ: {dependencies}"));
+            }
+            lines.push(
+                "(input groups hash path-normalized inputs, so this is a real input difference \
+                 or a path that escaped normalization)"
+                    .to_string(),
+            );
+            if checkout.groups.iter().any(|g| g == "remap") {
+                lines.push(
+                    "(remap: path remapping differs between the builds, or it is off and the key \
+                     holds the checkout path)"
+                        .to_string(),
+                );
+            }
+        }
+        CheckoutVerdict::Dependencies => lines.push(format!(
+            "own inputs match after path normalization; dependencies differ: {dependencies}"
+        )),
+        CheckoutVerdict::Untraced => lines.push(
+            "no input group or dependency differs, but the keys do (key salt or extra inputs?)"
+                .to_string(),
+        ),
+    }
+    lines
+}
+
 /// Render the `extern:` cascade for a miss, when one is recorded (#609).
 ///
 /// Prints nothing when the miss is not downstream of a dependency change, so
@@ -1639,6 +1702,9 @@ fn print_extern_chain(diagnosis: &MissDiagnosis) {
         },
         direct.join(", ")
     );
+    if let Some(baseline_root) = &chain.baseline_root {
+        println!("    compared with the build in another checkout: {baseline_root}");
+    }
 
     for root in &chain.roots {
         let via = if root.branches > 1 {
@@ -1651,6 +1717,11 @@ fn print_extern_chain(diagnosis: &MissDiagnosis) {
                 "    root: {}{via} -- own inputs changed: {}",
                 root.crate_name,
                 groups.join(", ")
+            ),
+            crate::miss_chain::RootKind::PathOnly => println!(
+                "    root: {}{via} -- same key in both checkouts, but its artifact differs \
+                 (its output is not reproducible across checkouts)",
+                root.crate_name
             ),
             crate::miss_chain::RootKind::NothingRecorded => println!(
                 "    root: {}{via} -- dependencies stable and no traced input group changed \
@@ -1763,6 +1834,7 @@ fn why_miss_json(
         stored_entries: usize,
         dependency_chain: &'a Option<crate::miss_chain::Chain>,
         dependency_recording_missing: bool,
+        checkout_comparison: &'a Option<crate::miss_chain::CheckoutComparison>,
     }
 
     crate::machine::emit(
@@ -1777,6 +1849,7 @@ fn why_miss_json(
             stored_entries,
             dependency_chain: &diagnosis.dependency_chain,
             dependency_recording_missing: diagnosis.dependency_recording_missing,
+            checkout_comparison: &diagnosis.checkout,
         },
         Vec::new(),
     )
@@ -9110,6 +9183,54 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn checkout_comparison_lines_separate_path_only_from_input_changes() {
+        use crate::miss_chain::{ChangedDep, CheckoutComparison, CheckoutVerdict};
+        let dep = |name: &str| ChangedDep {
+            name: name.to_string(),
+            from: Some("a".to_string()),
+            to: Some("b".to_string()),
+            unit: None,
+        };
+        let compared = |verdict, groups: &[&str], dependencies: Vec<ChangedDep>| {
+            checkout_comparison_lines(&CheckoutComparison {
+                root: "/b".to_string(),
+                baseline_root: "/a".to_string(),
+                groups: groups.iter().map(|g| g.to_string()).collect(),
+                dependencies,
+                same_key: verdict == CheckoutVerdict::PathOnly,
+                verdict,
+            })
+        };
+
+        let lines = compared(CheckoutVerdict::PathOnly, &[], vec![]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("only the checkout path differs"));
+
+        let lines = compared(CheckoutVerdict::OwnInputs, &["env_deps"], vec![]);
+        assert_eq!(lines[0], "own inputs differ: env_deps");
+        assert_eq!(lines.len(), 2, "no dependency or remap line: {lines:?}");
+        assert!(lines[1].contains("real input difference"));
+
+        let lines = compared(
+            CheckoutVerdict::OwnInputs,
+            &["args", "remap"],
+            vec![dep("mid"), dep("util")],
+        );
+        assert_eq!(lines[0], "own inputs differ: args, remap");
+        assert_eq!(lines[1], "dependencies differ: mid, util");
+        assert!(lines[3].starts_with("(remap:"), "{lines:?}");
+
+        let lines = compared(CheckoutVerdict::Dependencies, &[], vec![dep("mid")]);
+        assert_eq!(
+            lines,
+            vec!["own inputs match after path normalization; dependencies differ: mid"]
+        );
+
+        let lines = compared(CheckoutVerdict::Untraced, &[], vec![]);
+        assert!(lines[0].contains("key salt or extra inputs"));
     }
 
     #[test]

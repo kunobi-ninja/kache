@@ -1084,6 +1084,52 @@ mod tests {
         assert_eq!(analysis.causes[0].cause.describe(), "downstream of leaf");
     }
 
+    /// The first build in a new worktree has no earlier compile in its own
+    /// tree. Its cascade is still named by comparing with the same units in
+    /// the checkout that built them before.
+    #[test]
+    fn a_first_build_in_another_checkout_names_the_crate_that_changed() {
+        let unit = |mut e: BuildEvent, unit: &str| {
+            e.unit_id = unit.to_string();
+            e
+        };
+        let build = |root: &str, session: &str, at: i64, sources: &str, leaf_out: &str| {
+            let mut app = unit(
+                with_externs(
+                    event("app", EventResult::Miss, at + 1, root, session),
+                    &[("leaf", leaf_out)],
+                ),
+                "uapp",
+            );
+            app.extern_units = [("leaf".to_string(), "uleaf".to_string())]
+                .into_iter()
+                .collect();
+            vec![
+                unit(
+                    with_fields(
+                        with_externs(event("leaf", EventResult::Miss, at, root, session), &[]),
+                        &[("sources", sources)],
+                    ),
+                    "uleaf",
+                ),
+                app,
+            ]
+        };
+        let mut events = build("/first", "before", 0, "1111", "aaaa");
+        events.extend(build("/second", "now", 100, "2222", "bbbb"));
+
+        let analysis = analyze_one(&events);
+        assert!(
+            analysis.causes.iter().any(|g| g.cause
+                == Cause::Downstream {
+                    root: "leaf".into(),
+                    complete: true
+                }),
+            "{:?}",
+            analysis.causes
+        );
+    }
+
     /// A miss below two changed leaves names both, not the first one the
     /// walk happened to rank higher.
     #[test]

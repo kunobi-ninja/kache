@@ -2161,20 +2161,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let unit = dir.path().join("debug/build/pkg-1");
         std::fs::create_dir_all(&unit).unwrap();
-        // `env` stands in for both the script and kache: it prints exactly the
-        // environment it was started with. Found on PATH, since the Nix build
-        // sandbox has no /usr/bin/env. A link, not a copy: macOS kills a
-        // copied system binary.
-        let env = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-            .map(|directory| directory.join("env"))
-            .find(|candidate| candidate.is_file())
-            .expect("an env binary on PATH");
+        // This test binary stands in for both the script and kache: run with
+        // `ENV_PRINTER`, it prints the environment it was started with. Not
+        // `env`: the Nix build sandbox has no /usr/bin/env, and other tests
+        // rewrite PATH. A link, not a copy, to run whatever `current_exe` is.
+        let printer = std::env::current_exe().unwrap();
         let executable = unit.join("build_script_build-1");
-        std::os::unix::fs::symlink(&env, &executable).unwrap();
+        std::os::unix::fs::symlink(&printer, &executable).unwrap();
         install(&executable).unwrap();
         let (_, pinned) = launch_record(&unit);
         std::fs::remove_file(&pinned).unwrap();
-        std::os::unix::fs::symlink(&env, &pinned).unwrap();
+        std::os::unix::fs::symlink(&printer, &pinned).unwrap();
         let hardlink = unit.join("build-script-build");
         std::fs::hard_link(&executable, &hardlink).unwrap();
         let environment = |launcher: &Path, stale: Option<&str>| {
@@ -2183,7 +2180,12 @@ mod tests {
                 Some(value) => command.env(SHIM_PATH_ENV, value),
                 None => command.env_remove(SHIM_PATH_ENV),
             };
-            let output = command.env(NAME, "kept").output().unwrap();
+            let output = command
+                .args([ENV_PRINTER, "--exact", "--nocapture", "--test-threads=1"])
+                .env(ENV_PRINTER, "1")
+                .env(NAME, "kept")
+                .output()
+                .unwrap();
             assert!(
                 output.status.success(),
                 "{}",
@@ -2215,6 +2217,28 @@ mod tests {
             !to_script.contains(SHIM_PATH_ENV),
             "the preserved script runs as Cargo started it: {to_script}"
         );
+    }
+
+    const ENV_PRINTER: &str = "build_script::tests::env_printer";
+
+    /// Prints the process environment, one `NAME=value` per line, when
+    /// `the_launcher_passes_every_variable_name_on` runs this binary through a
+    /// launcher. A no-op in a normal test run.
+    #[cfg(unix)]
+    #[test]
+    fn env_printer() {
+        use std::io::Write as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        if std::env::var_os(ENV_PRINTER).is_none() {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        for (name, value) in std::env::vars_os() {
+            stdout.write_all(name.as_bytes()).unwrap();
+            stdout.write_all(b"=").unwrap();
+            stdout.write_all(value.as_bytes()).unwrap();
+            stdout.write_all(b"\n").unwrap();
+        }
     }
 
     /// The preserved script's name and the pinned kache from `.kache-launch`.

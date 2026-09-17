@@ -1524,6 +1524,13 @@ fn build(
                 .env("MBX_CACHE_DIR", cache_dir)
                 .env("MBX_STATS_REPORT", mbx_report_path(work_dir, phase))
                 .env("MBX_SUMMARY", "full");
+            if phase == Phase::Warm.name() {
+                // This phase builds a second, independently checked-out
+                // worktree (`clone_b`) against the cache the cold phase in
+                // `clone_a` populated, so mbx is configured to share
+                // compilations across checkouts.
+                cmd.env("MBX_SHARE_WORKSPACE_ROOT", "1");
+            }
         }
     }
     let mut child = cmd
@@ -7438,6 +7445,41 @@ objdir = "target"
                 std::fs::read_to_string(work.join("used-target")).unwrap(),
                 work.join(&profile.objdir).display().to_string()
             );
+        }
+    }
+
+    /// The `warm` phase rebuilds in a second, independently checked-out
+    /// worktree, so mbx is told to share compilations across checkouts.
+    /// `cold` and `warm-same-tree` both build the same checkout the cache was
+    /// populated from and must not set it.
+    #[cfg(unix)]
+    #[test]
+    fn mbx_warm_phase_enables_share_workspace_root_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().canonicalize().unwrap();
+        let mut profile = prepare_fixture(&work, None);
+        profile.build =
+            r#"printf '%s' "${MBX_SHARE_WORKSPACE_ROOT:-unset}" > share-workspace-root"#.into();
+        for phase in ["cold", "warm-same-tree", "warm"] {
+            build(
+                &profile,
+                &work,
+                phase,
+                &work.join("cache"),
+                &work.join("config"),
+                Path::new("/unused/mbx"),
+                &work,
+                CacheBackend::Mbx,
+                false,
+                &posix_sh().unwrap(),
+            )
+            .unwrap();
+            let recorded = std::fs::read_to_string(work.join("share-workspace-root")).unwrap();
+            if phase == "warm" {
+                assert_eq!(recorded, "1", "phase {phase}");
+            } else {
+                assert_eq!(recorded, "unset", "phase {phase}");
+            }
         }
     }
 

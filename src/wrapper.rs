@@ -205,6 +205,13 @@ fn incremental_fast_path_allowed(
     !has_refuse_reasons && !source_excluded && !skip_user_facing
 }
 
+/// Whether this unit is refused caching outright: the compiler's own refusal
+/// list, or a codegen backend dylib kache will not replay. Either one also
+/// keeps the unit off the managed-incremental fast path.
+fn unit_refuses_caching(has_refuse_reasons: bool, untrusted_codegen_backend: bool) -> bool {
+    has_refuse_reasons || untrusted_codegen_backend
+}
+
 fn incremental_cleanup_enabled(config: &Config) -> bool {
     config.clean_incremental && !config.preserve_incremental
 }
@@ -2872,7 +2879,7 @@ fn run_parsed_rustc(
     let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
 
     if incremental_fast_path_allowed(
-        !refuse.is_empty() || untrusted_codegen_backend.is_some(),
+        unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
         excluded_source.is_some() || user_bypass.is_some(),
         skip_user_facing,
     ) {
@@ -7494,6 +7501,11 @@ mod tests {
         assert!(!incremental_fast_path_allowed(false, true, false));
         assert!(!incremental_fast_path_allowed(false, false, true));
         assert!(!incremental_fast_path_allowed(true, false, false));
+        // Either refusal alone keeps a unit off the fast path.
+        assert!(!unit_refuses_caching(false, false));
+        assert!(unit_refuses_caching(true, false));
+        assert!(unit_refuses_caching(false, true));
+        assert!(unit_refuses_caching(true, true));
 
         let stripped: Vec<_> = compile::strip_incremental_flags(&args.all_args)
             .into_iter()

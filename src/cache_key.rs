@@ -2354,6 +2354,9 @@ enum EnvDepNormalizationDecision {
     /// Kept absolute: the var is not OUT_DIR, not allowlisted, and its value
     /// is not under OUT_DIR.
     KeptAbsoluteNotPathOnly,
+    /// Kept absolute: CARGO_MANIFEST_DIR, which no allowlist entry can make
+    /// path-only.
+    KeptAbsoluteManifestDir,
     /// Kept absolute: dep-info lists no include under the value, or no Rust
     /// source shows the var inside an include argument (for example when the
     /// include comes from another crate's macro).
@@ -2374,6 +2377,7 @@ impl EnvDepNormalizationDecision {
             Self::Unchanged => "unchanged",
             Self::NormalizedPathOnly => "normalized path-only",
             Self::KeptAbsoluteNotPathOnly => "kept absolute: not a path-only var",
+            Self::KeptAbsoluteManifestDir => "kept absolute: CARGO_MANIFEST_DIR is never path-only",
             Self::KeptAbsoluteNoIncludeProof => "kept absolute: no include proof",
             Self::KeptAbsoluteRuntimeUse => "kept absolute: value use in source",
             Self::KeptAbsoluteScanError => "kept absolute: source scan failed",
@@ -2727,7 +2731,7 @@ fn normalize_env_dep_value_with_hasher(
     // CARGO_MANIFEST_DIR is never forceable: rustc can embed it in crate
     // metadata and generated code, so erasing it from the key can restore an
     // rlib containing another checkout's path (#167).
-    let forced = var != "CARGO_MANIFEST_DIR"
+    let forced = !is_manifest_dir_var(var)
         && path_normalizer.path_only_env_vars().iter().any(|entry| {
             matches!(entry.split_once(':'), Some((krate, v)) if krate == crate_name && v == var)
         });
@@ -2841,15 +2845,24 @@ fn env_dep_path_only_decision(
     // embed it in crate metadata and generated code, and a crate's own sources
     // always live under it, so the include proof below is trivially satisfied
     // and normalizing it restores another checkout's path (#167).
-    if var == "CARGO_MANIFEST_DIR"
-        || !(var == "OUT_DIR" || allowlist.iter().any(|v| v == var) || value_is_under_out_dir(val))
-    {
+    if is_manifest_dir_var(var) {
+        return EnvDepNormalizationDecision::KeptAbsoluteManifestDir;
+    }
+    if !(var == "OUT_DIR" || allowlist.iter().any(|v| v == var) || value_is_under_out_dir(val)) {
         return EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly;
     }
     if !path_is_only_used_for_includes(val, source_files) {
         return EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof;
     }
     env_dep_source_decision(var, source_files, file_hasher)
+}
+
+/// Whether `var` names Cargo's manifest dir. Windows matches environment
+/// names case-insensitively, so dep-info can carry any spelling of it; on
+/// Unix a differently-cased name is a different variable, and refusing it
+/// costs misses only.
+pub(crate) fn is_manifest_dir_var(var: &str) -> bool {
+    var.eq_ignore_ascii_case("CARGO_MANIFEST_DIR")
 }
 
 /// True when `val` is an absolute path located under the current build's
@@ -3044,13 +3057,19 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
     let mut include_depth = 0usize;
     let mut include_locator = false;
 
-    while i < bytes.len() {
+    // Every pass consumes at least one byte, so a scan needs no more passes
+    // than the source has bytes. Each loop in the scanner carries that bound:
+    // it makes a change that stops advancing end with a wrong answer instead
+    // of running forever, which is the difference between a test that fails
+    // and a test that never finishes.
+    for _ in 0..bytes.len() {
+        let Some(&byte) = bytes.get(i) else { break };
         let whitespace = rust_whitespace_len(bytes, i);
         if whitespace > 0 {
             i += whitespace;
             continue;
         }
-        match bytes[i] {
+        match byte {
             b'/' if comment_starts_at(bytes, i) => i = skip_comment(bytes, i),
             b'"' => i = skip_quoted_string(bytes, i + 1),
             b'\'' => i = skip_char_literal_or_lifetime(source, i),
@@ -3134,16 +3153,17 @@ fn parse_macro_open(bytes: &[u8], after_ident: usize) -> Option<usize> {
 }
 
 fn skip_trivia(bytes: &[u8], mut i: usize) -> usize {
-    loop {
+    for _ in 0..bytes.len() {
         let whitespace = rust_whitespace_len(bytes, i);
         if whitespace > 0 {
             i += whitespace;
         } else if comment_starts_at(bytes, i) {
             i = skip_comment(bytes, i);
         } else {
-            return i;
+            break;
         }
     }
+    i
 }
 
 fn comment_starts_at(bytes: &[u8], i: usize) -> bool {
@@ -3151,9 +3171,11 @@ fn comment_starts_at(bytes: &[u8], i: usize) -> bool {
 }
 
 /// Byte length of the Rust whitespace character at `i`, or 0. Rust also
-/// accepts vertical tab, a few non-ASCII `Pattern_White_Space` characters and
-/// a leading byte-order mark between tokens; reading those as identifier bytes
-/// would hide `env` from the scanner.
+/// accepts vertical tab and a few non-ASCII `Pattern_White_Space` characters
+/// between tokens; reading those as identifier bytes would hide `env` from
+/// the scanner. A byte-order mark counts as whitespace wherever it appears:
+/// rustc strips one only at the head of a file and rejects the rest, so the
+/// extra reach concerns files that do not compile.
 fn rust_whitespace_len(bytes: &[u8], i: usize) -> usize {
     match bytes.get(i..).unwrap_or_default() {
         [b'\t' | b'\n' | b'\x0B' | b'\x0C' | b'\r' | b' ', ..] => 1,
@@ -3162,6 +3184,7 @@ fn rust_whitespace_len(bytes: &[u8], i: usize) -> usize {
         // U+200E, U+200F, U+2028, U+2029
         [0xE2, 0x80, 0x8E | 0x8F | 0xA8 | 0xA9, ..] => 3,
         // U+FEFF, which rustc strips from the head of a file.
+        // See the note above on accepting it anywhere.
         [0xEF, 0xBB, 0xBF, ..] => 3,
         _ => 0,
     }
@@ -3171,36 +3194,43 @@ fn rust_whitespace_len(bytes: &[u8], i: usize) -> usize {
 /// `*/` must not end the outer comment.
 fn skip_comment(bytes: &[u8], mut i: usize) -> usize {
     if bytes.get(i + 1) == Some(&b'/') {
-        while i < bytes.len() && bytes[i] != b'\n' {
-            i += 1;
+        for _ in 0..bytes.len() {
+            match bytes.get(i) {
+                Some(b'\n') | None => break,
+                Some(_) => i += 1,
+            }
         }
         return i;
     }
     let mut depth = 1usize;
     i += 2;
-    while i < bytes.len() {
-        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-            depth += 1;
-            i += 2;
-        } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-            depth -= 1;
-            i += 2;
-            if depth == 0 {
-                return i;
+    for _ in 0..bytes.len() {
+        match (bytes.get(i), bytes.get(i + 1)) {
+            (Some(b'/'), Some(b'*')) => {
+                depth += 1;
+                i += 2;
             }
-        } else {
-            i += 1;
+            (Some(b'*'), Some(b'/')) => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            (Some(_), _) => i += 1,
+            (None, _) => break,
         }
     }
     bytes.len()
 }
 
 fn skip_quoted_string(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return i + 1,
-            _ => i += 1,
+    for _ in 0..bytes.len() {
+        match bytes.get(i) {
+            Some(b'\\') => i += 2,
+            Some(b'"') => return i + 1,
+            Some(_) => i += 1,
+            None => break,
         }
     }
     bytes.len()
@@ -3227,11 +3257,12 @@ fn skip_char_literal_or_lifetime(source: &str, quote: usize) -> usize {
 
 /// Skip a char literal from its first content byte through the closing quote.
 fn skip_char_literal(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'\'' => return i + 1,
-            _ => i += 1,
+    for _ in 0..bytes.len() {
+        match bytes.get(i) {
+            Some(b'\\') => i += 2,
+            Some(b'\'') => return i + 1,
+            Some(_) => i += 1,
+            None => break,
         }
     }
     bytes.len()
@@ -3246,7 +3277,10 @@ fn raw_string_starts_at(bytes: &[u8], i: usize) -> Option<usize> {
         return None;
     }
     cursor += 1;
-    while bytes.get(cursor) == Some(&b'#') {
+    for _ in 0..bytes.len() {
+        if bytes.get(cursor) != Some(&b'#') {
+            break;
+        }
         cursor += 1;
     }
     if bytes.get(cursor) == Some(&b'"') {
@@ -3261,8 +3295,7 @@ fn skip_raw_string(bytes: &[u8], i: usize) -> usize {
         return i + 1;
     };
     let hashes = open_quote - i - usize::from(bytes[i] != b'r') - 1;
-    let mut cursor = open_quote + 1;
-    while cursor < bytes.len() {
+    for cursor in open_quote + 1..bytes.len() {
         if bytes[cursor] == b'"'
             && cursor + hashes < bytes.len()
             && bytes[cursor + 1..cursor + 1 + hashes]
@@ -3271,7 +3304,6 @@ fn skip_raw_string(bytes: &[u8], i: usize) -> usize {
         {
             return cursor + hashes + 1;
         }
-        cursor += 1;
     }
     bytes.len()
 }
@@ -3285,10 +3317,11 @@ fn is_ident_start(byte: u8) -> bool {
 /// Consume identifier bytes from `i`, which the caller has already read as
 /// an identifier start or a digit.
 fn skip_ident_bytes(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len()
-        && (is_ident_start(bytes[i]) || bytes[i].is_ascii_digit())
-        && rust_whitespace_len(bytes, i) == 0
-    {
+    for _ in 0..bytes.len() {
+        let Some(&byte) = bytes.get(i) else { break };
+        if !(is_ident_start(byte) || byte.is_ascii_digit()) || rust_whitespace_len(bytes, i) > 0 {
+            break;
+        }
         i += 1;
     }
     i
@@ -8634,6 +8667,26 @@ mod tests {
         // A byte-order mark does not glue to the identifier after it.
         assert_eq!(scan("\u{FEFF}env!(\"MYVAR\")", "MYVAR"), RuntimeValue);
 
+        // A file that ends inside an identifier or a number has no byte after
+        // it, and a skipped token never hides the use that follows it.
+        assert_eq!(scan("let n = 1", "MYVAR"), Unused);
+        assert_eq!(
+            scan(r#"const X: &str = env!("MYVAR"); mod tail"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(scan(r#"let s = "x"; env!("MYVAR")"#, "MYVAR"), RuntimeValue);
+        assert_eq!(
+            scan(r#"let s = "a\"b"; env!("MYVAR")"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(scan("// c\nenv!(\"MYVAR\")", "MYVAR"), RuntimeValue);
+        assert_eq!(scan("/* c */ env!(\"MYVAR\")", "MYVAR"), RuntimeValue);
+        assert_eq!(scan("/* /* c */ */ env!(\"MYVAR\")", "MYVAR"), RuntimeValue);
+        assert_eq!(
+            scan(r###"let r = r##"x"##; env!("MYVAR")"###, "MYVAR"),
+            RuntimeValue
+        );
+
         // Identifiers and numbers are consumed from their first byte, so a
         // one-byte token keeps its boundary.
         assert_eq!(scan(r#"m!(env!("MYVAR"))"#, "MYVAR"), RuntimeValue);
@@ -10296,6 +10349,10 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
                 "kept absolute: not a path-only var",
             ),
             (
+                EnvDepNormalizationDecision::KeptAbsoluteManifestDir,
+                "kept absolute: CARGO_MANIFEST_DIR is never path-only",
+            ),
+            (
                 EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof,
                 "kept absolute: no include proof",
             ),
@@ -10965,12 +11022,18 @@ pub fn g(_: &'static str) {}"#,
             .unwrap()
             .to_string_lossy()
             .to_string();
-        for entry in ["test_crate:CARGO_MANIFEST_DIR", "CARGO_MANIFEST_DIR"] {
+        for (entry, var) in [
+            ("test_crate:CARGO_MANIFEST_DIR", "CARGO_MANIFEST_DIR"),
+            ("CARGO_MANIFEST_DIR", "CARGO_MANIFEST_DIR"),
+            // Windows resolves env names case-insensitively, so dep-info can
+            // carry any spelling of the same variable.
+            ("cargo_manifest_dir", "cargo_manifest_dir"),
+        ] {
             let path_normalizer = PathNormalizer::from_env(Some(&workspace))
                 .with_path_only_env_vars(vec![entry.to_string()]);
             let env_dep = normalize_env_dep_value(
                 "test_crate",
-                "CARGO_MANIFEST_DIR",
+                var,
                 &manifest_dir_value,
                 &source_files,
                 &path_normalizer,
@@ -10978,7 +11041,7 @@ pub fn g(_: &'static str) {}"#,
 
             assert_eq!(
                 env_dep.decision,
-                EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly,
+                EnvDepNormalizationDecision::KeptAbsoluteManifestDir,
                 "CARGO_MANIFEST_DIR must stay absolute, listed as `{entry}`"
             );
             assert_eq!(env_dep.value, manifest_dir_value);

@@ -191,7 +191,8 @@ A `crate:VAR` entry skips the source checks for that crate and variable only,
 so use it when you have read the crate and know it never bakes the value into
 its artifacts. `CARGO_MANIFEST_DIR` is never accepted, in either form: rustc
 embeds it in crate metadata, and every crate's sources live under it, so the
-checks above would pass for a value that does change the artifact.
+checks above would pass for a value that does change the artifact. Kache warns
+when a list names it and ignores the entry.
 
 `key_env_vars` accepts exact names and trailing-star prefix patterns:
 

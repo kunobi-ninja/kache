@@ -6646,7 +6646,7 @@ fn mint_session_id(root: &str) -> String {
 /// Sessions close after [`BUILD_SESSION_SECS`] idle; a day leaves room for a
 /// compile that runs for hours.
 pub(crate) const SESSION_MARKER_RETENTION: std::time::Duration =
-    std::time::Duration::from_secs(24 * 3600);
+    std::time::Duration::from_secs(86_400);
 
 /// Remove session and prefetch markers untouched for at least `retention`,
 /// returning how many were removed. Every event root gets a marker (#1081),
@@ -13168,6 +13168,9 @@ exit 0
         assert!(!idle_prefetch.exists());
         assert!(recent.exists());
         assert!(sessions.join("not-a-marker").is_dir());
+
+        // GC keeps a marker for a day after its last touch.
+        assert_eq!(SESSION_MARKER_RETENTION.as_secs(), 24 * 3600);
 
         // Nothing to prune, or no directory at all, is not an error.
         assert_eq!(prune_session_markers(&config, retention, now), 0);

@@ -1,3 +1,9 @@
 **/*.patch whitespace=-blank-at-eol
 # The serialization fixture must match Serde's LF output on every platform.
 /crates/kache-format/tests/fixtures/entry-v31.json text eol=lf
+
+# A scenario's `build` and `prepare` blocks are shell scripts the benchmark
+# engine writes out and runs, and one test compares a built command against
+# the text beside it. CRLF from a Windows checkout would put carriage returns
+# in both.
+/scenarios/**/scenario.toml text eol=lf

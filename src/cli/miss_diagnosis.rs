@@ -48,8 +48,12 @@ impl MissDiagnosis {
         } else {
             Cause::FirstBuildNowCached
         };
-        let dependency_recording_missing =
-            dependency_chain.is_none() && !explain_miss && miss.key_externs.is_empty();
+        // `key_externs_recorded` covers a crate with no dependencies, whose
+        // recorded digest map is empty and skipped on the wire.
+        let dependency_recording_missing = dependency_chain.is_none()
+            && !explain_miss
+            && miss.key_externs.is_empty()
+            && !miss.key_externs_recorded;
         Self {
             cause,
             same_key_present,
@@ -125,6 +129,12 @@ mod tests {
             !MissDiagnosis::new(&event, false, 0, false, None, false).dependency_recording_missing
         );
         event.key_externs.clear();
+        event.key_externs_recorded = true;
+        assert!(
+            !MissDiagnosis::new(&event, false, 0, false, None, false).dependency_recording_missing,
+            "a dependency-free crate recorded an empty digest map"
+        );
+        event.key_externs_recorded = false;
         let chain = Chain {
             roots: vec![],
             direct: vec![],

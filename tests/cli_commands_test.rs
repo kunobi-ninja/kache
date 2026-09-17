@@ -2451,6 +2451,8 @@ fn why_miss_compares_a_second_checkout_with_the_first() {
     );
     assert_eq!(value["checkout_comparison"]["verdict"], "own_inputs");
     assert_eq!(value["checkout_comparison"]["groups"][0], "env_deps");
+    // `leaf` has no dependencies: its digests were recorded, just empty.
+    assert_eq!(value["dependency_recording_missing"], false);
 
     let output = e
         .cmd()

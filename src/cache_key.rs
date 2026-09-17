@@ -2532,8 +2532,8 @@ impl StaticLibUse {
     /// never share a row.
     fn memo_namespace(self) -> &'static str {
         match self {
-            Self::Bundled => "static-ar-v6-bundled",
-            Self::Linked => "static-ar-v6",
+            Self::Bundled => "static-ar-v7-bundled",
+            Self::Linked => "static-ar-v7",
         }
     }
 }
@@ -4296,10 +4296,11 @@ impl<'db> FileHasher<'db> {
         // things — `hash` stores plain blake3, this stores a structural or
         // path-bound archive digest). This restores the warm-build fast path the whole-file
         // hasher had: an unchanged large `static=` archive (e.g. rocksdb) is not
-        // re-read on every incremental build. `v6`: v1/v2 rows used older
+        // re-read on every incremental build. `v7`: v1/v2 rows used older
         // identity definitions, v3 predates the fail-closed ELF gate, v4
-        // predates the GCC Mach-O LTO gate, and v5 predates admitting
-        // DWARF-bearing Mach-O members (a v5 row would keep serving the
+        // predates the GCC Mach-O LTO gate, v5 predates admitting
+        // DWARF-bearing Mach-O members, and v6 predates accepting the blank
+        // `//` header GNU `ar` writes (a v5 or v6 row would keep serving the
         // path-bound digest of an unchanged archive). None may be served
         // after the final archive hardening. Bundled and linked uses get
         // separate rows because a DWARF archive hashes differently for each.
@@ -8632,6 +8633,28 @@ mod tests {
     }
 
     #[test]
+    fn hash_static_lib_gnu_longname_archive_is_checkout_independent() {
+        // Every `cc` archive on Linux has a `//` table whose header GNU `ar`
+        // leaves blank apart from name and size. Two checkouts that build the
+        // same members must get the same structural digest, not a path-bound one.
+        let bytes = crate::native_archive::gnu_crs_longname_archive_for_tests(b"payload");
+        let fh = FileHasher::new();
+        let mut digests = Vec::new();
+        for checkout in ["checkout-a", "checkout-b"] {
+            let dir = tempfile::tempdir().unwrap();
+            let lib = dir.path().join(checkout).join("libprobe.a");
+            std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+            std::fs::write(&lib, &bytes).unwrap();
+            for usage in [StaticLibUse::Bundled, StaticLibUse::Linked] {
+                let digest = fh.hash_static_lib_for(&lib, usage).unwrap();
+                assert!(digest.starts_with("gnu-ar-v2:"), "{usage:?}: {digest}");
+                digests.push(digest);
+            }
+        }
+        assert!(digests.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
     fn hash_static_lib_ignores_legacy_namespaces() {
         let dir = tempfile::tempdir().unwrap();
         let fh = FileHasher::persistent(&dir.path().join("index.db"));
@@ -8659,8 +8682,12 @@ mod tests {
             path: format!("static-ar-v5\0{}", fingerprint.path),
             ..fingerprint.clone()
         };
-        let current_key = FileFingerprint {
+        let legacy_v6_key = FileFingerprint {
             path: format!("static-ar-v6\0{}", fingerprint.path),
+            ..fingerprint.clone()
+        };
+        let current_key = FileFingerprint {
+            path: format!("static-ar-v7\0{}", fingerprint.path),
             ..fingerprint
         };
         let cache = fh.cache.as_ref().expect("persistent cache opens");
@@ -8677,6 +8704,9 @@ mod tests {
         cache
             .put(&legacy_v5_key, "legacy-path-bound-dwarf-sentinel")
             .unwrap();
+        cache
+            .put(&legacy_v6_key, "legacy-path-bound-blank-longname-sentinel")
+            .unwrap();
 
         let computed = fh.hash_static_lib(&lib).unwrap();
         assert!(computed.starts_with("gnu-ar-v2:"));
@@ -8685,6 +8715,7 @@ mod tests {
         assert_ne!(computed, "legacy-unguarded-object-sentinel");
         assert_ne!(computed, "legacy-unguarded-macho-sentinel");
         assert_ne!(computed, "legacy-path-bound-dwarf-sentinel");
+        assert_ne!(computed, "legacy-path-bound-blank-longname-sentinel");
         fh.flush_memo();
         assert_eq!(cache.get(&current_key).unwrap(), Some(computed.clone()));
         assert_eq!(fh.hash_static_lib(&lib).unwrap(), computed);
@@ -8817,8 +8848,8 @@ mod tests {
         let fingerprint = FileFingerprint::from_path(&lib).unwrap();
         let cache = fh.cache.as_ref().expect("persistent cache opens");
         for (namespace, expected) in [
-            ("static-ar-v6-bundled", &bundled),
-            ("static-ar-v6", &linked),
+            ("static-ar-v7-bundled", &bundled),
+            ("static-ar-v7", &linked),
         ] {
             let key = FileFingerprint {
                 path: format!("{namespace}\0{}", fingerprint.path),
@@ -8846,7 +8877,7 @@ mod tests {
             fh.flush_memo();
             let fingerprint = FileFingerprint::from_path(&lib).unwrap();
             let key = FileFingerprint {
-                path: format!("static-ar-v6\0{}", fingerprint.path),
+                path: format!("static-ar-v7\0{}", fingerprint.path),
                 ..fingerprint
             };
             let expected = memoized.then_some(hash);

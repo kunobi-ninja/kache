@@ -71,9 +71,61 @@ impl Outcome {
     ];
 }
 
+/// How a build timeline submission ended. Carried as the `outcome` label of
+/// `kache_timeline_submissions_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimelineOutcome {
+    /// First record for this run and session.
+    Inserted,
+    /// Replaced an earlier submission of the same record.
+    Replaced,
+    /// An earlier submission had more units and was kept.
+    Kept,
+    Unauthorized,
+    /// Not ready, or a follower without the store.
+    NotReady,
+    /// Body was not sent with `Content-Encoding: zstd`.
+    UnsupportedEncoding,
+    /// Body over the compressed or decompressed limit.
+    TooLarge,
+    /// Not valid zstd, not a record, or a schema this server does not know.
+    BadBody,
+    /// The database write failed.
+    StoreError,
+}
+
+impl TimelineOutcome {
+    fn as_label(self) -> &'static str {
+        match self {
+            TimelineOutcome::Inserted => "inserted",
+            TimelineOutcome::Replaced => "replaced",
+            TimelineOutcome::Kept => "kept",
+            TimelineOutcome::Unauthorized => "unauthorized",
+            TimelineOutcome::NotReady => "not_ready",
+            TimelineOutcome::UnsupportedEncoding => "unsupported_encoding",
+            TimelineOutcome::TooLarge => "too_large",
+            TimelineOutcome::BadBody => "bad_body",
+            TimelineOutcome::StoreError => "store_error",
+        }
+    }
+
+    const ALL: [TimelineOutcome; 9] = [
+        TimelineOutcome::Inserted,
+        TimelineOutcome::Replaced,
+        TimelineOutcome::Kept,
+        TimelineOutcome::Unauthorized,
+        TimelineOutcome::NotReady,
+        TimelineOutcome::UnsupportedEncoding,
+        TimelineOutcome::TooLarge,
+        TimelineOutcome::BadBody,
+        TimelineOutcome::StoreError,
+    ];
+}
+
 pub(crate) struct Metrics {
     registry: Registry,
     requests: IntCounterVec,
+    timelines: IntCounterVec,
     duration: HistogramVec,
     candidates: HistogramVec,
     ready: IntGauge,
@@ -92,6 +144,16 @@ impl Metrics {
             &["outcome"],
         )
         .expect("planner request counter is statically valid");
+
+        let timelines = IntCounterVec::new(
+            opts!(
+                "kache_timeline_submissions_total",
+                "Build timeline submissions by outcome. `inserted`, `replaced` and `kept` \
+                 were stored or already held; every other value lost the record."
+            ),
+            &["outcome"],
+        )
+        .expect("timeline submission counter is statically valid");
 
         let duration = HistogramVec::new(
             histogram_opts!(
@@ -126,6 +188,9 @@ impl Metrics {
             .register(Box::new(requests.clone()))
             .expect("request counter registers once");
         registry
+            .register(Box::new(timelines.clone()))
+            .expect("timeline counter registers once");
+        registry
             .register(Box::new(duration.clone()))
             .expect("duration histogram registers once");
         registry
@@ -139,10 +204,14 @@ impl Metrics {
             requests.with_label_values(&[outcome.as_label()]);
             duration.with_label_values(&[outcome.as_label()]);
         }
+        for outcome in TimelineOutcome::ALL {
+            timelines.with_label_values(&[outcome.as_label()]);
+        }
 
         Self {
             registry,
             requests,
+            timelines,
             duration,
             candidates,
             ready,
@@ -154,6 +223,13 @@ impl Metrics {
         let label = outcome.as_label();
         self.requests.with_label_values(&[label]).inc();
         self.duration.with_label_values(&[label]).observe(seconds);
+    }
+
+    /// Record a finished build timeline submission.
+    pub(crate) fn record_timeline(&self, outcome: TimelineOutcome) {
+        self.timelines
+            .with_label_values(&[outcome.as_label()])
+            .inc();
     }
 
     /// Record the size of a plan that was actually returned for execution.
@@ -226,6 +302,48 @@ mod tests {
                 "{series} missing from a fresh registry; absent reads as no-data, not zero"
             );
         }
+    }
+
+    #[test]
+    fn every_timeline_outcome_has_a_distinct_label() {
+        let labels: Vec<&str> = TimelineOutcome::ALL.iter().map(|o| o.as_label()).collect();
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(labels.len(), unique.len(), "{labels:?}");
+    }
+
+    #[test]
+    fn all_timeline_series_exist_before_any_submission() {
+        let rendered = Metrics::new().render();
+        for outcome in TimelineOutcome::ALL {
+            let series = format!(
+                "kache_timeline_submissions_total{{outcome=\"{}\"}}",
+                outcome.as_label()
+            );
+            assert_eq!(sample(&rendered, &series), Some(0.0), "{series}");
+        }
+    }
+
+    #[test]
+    fn recording_a_timeline_increments_its_outcome_only() {
+        let m = Metrics::new();
+        m.record_timeline(TimelineOutcome::Kept);
+        let rendered = m.render();
+        assert_eq!(
+            sample(
+                &rendered,
+                "kache_timeline_submissions_total{outcome=\"kept\"}"
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(
+                &rendered,
+                "kache_timeline_submissions_total{outcome=\"inserted\"}"
+            ),
+            Some(0.0)
+        );
     }
 
     #[test]

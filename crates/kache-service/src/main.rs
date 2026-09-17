@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
-use kache_service::{DEFAULT_DB_PATH, HaConfig, PlannerConfig, VERSION};
+use kache_service::{
+    DEFAULT_DB_PATH, DEFAULT_MAX_COMPRESSED_BYTES, DEFAULT_MAX_DECODED_BYTES, HaConfig,
+    PlannerConfig, TimelineLimits, VERSION,
+};
 use std::{net::SocketAddr, path::PathBuf};
 use tracing_subscriber::EnvFilter;
 
@@ -26,6 +29,22 @@ struct Cli {
     /// Optional legacy JSON seed file imported into the planner database on startup
     #[arg(long, env = "KACHE_PLANNER_SEED_STATE_FILE")]
     seed_state_file: Option<PathBuf>,
+
+    /// Largest compressed build timeline body accepted, in bytes
+    #[arg(
+        long,
+        env = "KACHE_TIMELINE_MAX_COMPRESSED_BYTES",
+        default_value_t = DEFAULT_MAX_COMPRESSED_BYTES
+    )]
+    timeline_max_compressed_bytes: usize,
+
+    /// Largest decompressed build timeline record accepted, in bytes
+    #[arg(
+        long,
+        env = "KACHE_TIMELINE_MAX_DECODED_BYTES",
+        default_value_t = DEFAULT_MAX_DECODED_BYTES
+    )]
+    timeline_max_decoded_bytes: u64,
 
     /// Enable Kubernetes Lease-based leader election via kunobi-ha
     #[arg(long, env = "KACHE_HA_ENABLED", default_value_t = false)]
@@ -56,6 +75,10 @@ fn planner_config(cli: Cli) -> PlannerConfig {
         planner_name: cli.planner_name,
         db_path: cli.db_path,
         seed_state_file: cli.seed_state_file,
+        timeline_limits: TimelineLimits {
+            max_compressed_bytes: cli.timeline_max_compressed_bytes,
+            max_decoded_bytes: cli.timeline_max_decoded_bytes,
+        },
         ha: HaConfig {
             enabled: cli.ha_enabled,
             namespace: cli.ha_namespace,
@@ -74,6 +97,15 @@ fn init_logging(configured_filter: Option<&str>, install: impl FnOnce(EnvFilter)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_limits_default_to_the_service_defaults() {
+        let cli = Cli::try_parse_from(["kache-service"]).unwrap();
+        assert_eq!(
+            planner_config(cli).timeline_limits,
+            TimelineLimits::default()
+        );
+    }
 
     #[test]
     fn logging_installs_requested_filter() {
@@ -107,6 +139,10 @@ mod tests {
             "/tmp/planner.db",
             "--seed-state-file",
             "/tmp/seed.json",
+            "--timeline-max-compressed-bytes",
+            "1024",
+            "--timeline-max-decoded-bytes",
+            "4096",
             "--ha-enabled",
             "--ha-namespace",
             "team-a",
@@ -123,6 +159,10 @@ mod tests {
                 planner_name: "remote".to_string(),
                 db_path: PathBuf::from("/tmp/planner.db"),
                 seed_state_file: Some(PathBuf::from("/tmp/seed.json")),
+                timeline_limits: TimelineLimits {
+                    max_compressed_bytes: 1024,
+                    max_decoded_bytes: 4096,
+                },
                 ha: HaConfig {
                     enabled: true,
                     namespace: Some("team-a".to_string()),

@@ -13,6 +13,7 @@ anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+http-body-util = "0.1"
 kache-core = { path = "../kache-core", default-features = false, features = ["planning"] }
 k8s-openapi = { version = "0.28", features = ["v1_34"] }
 kube = { version = "4", features = ["client"] }
@@ -26,9 +27,9 @@ subtle = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zstd = "0.14"
 
 [dev-dependencies]
-http-body-util = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["time"] }
 tower = { version = "0.5", features = ["util"] }

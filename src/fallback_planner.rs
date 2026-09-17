@@ -482,6 +482,7 @@ mod tests {
             disabled: false,
             cache_executables: false,
             cache_cc_links: false,
+            trust_codegen_backends: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,

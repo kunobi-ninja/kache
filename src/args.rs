@@ -331,6 +331,28 @@ fn parse_emit_value(value: &str, kinds: &mut Vec<String>, dep_info_output: &mut 
     }
 }
 
+/// The last `codegen-backend=` value among `-Z` flags, when it is a dylib path.
+///
+/// rustc applies repeated `-Z` options last-wins and loads the value as a
+/// dylib when it contains a `.`; a bare name (`llvm`, `cranelift`, `gcc`)
+/// selects a backend shipped with the toolchain.
+pub fn codegen_backend_dylib(unstable_flags: &[String]) -> Option<&str> {
+    unstable_flags
+        .iter()
+        .rev()
+        .find_map(|flag| flag.strip_prefix("codegen-backend="))
+        .filter(|backend| backend.contains('.'))
+}
+
+/// Whether kache can key a trusted backend dylib by the file it hashes.
+///
+/// A value without a path separator (`x.so`) is handed to the platform
+/// loader, which searches library paths rather than the working directory,
+/// so hashing `./x.so` could key a different file than rustc loads.
+pub fn codegen_backend_is_keyable(backend: &str) -> bool {
+    backend.contains('/') || (cfg!(windows) && backend.contains('\\'))
+}
+
 impl RustcArgs {
     /// Is this `clippy-driver <rustc> <args>`, Cargo's composition of
     /// `RUSTC_WRAPPER` with Clippy as `RUSTC_WORKSPACE_WRAPPER`?
@@ -722,6 +744,12 @@ impl RustcArgs {
         self.is_test || self.crate_types.iter().any(|t| t == "bin")
     }
 
+    /// The codegen backend dylib this compile loads, when `-Zcodegen-backend`
+    /// names a file rather than a toolchain backend.
+    pub fn codegen_backend_dylib(&self) -> Option<&str> {
+        codegen_backend_dylib(&self.unstable_flags)
+    }
+
     /// Derive the workspace root from `--out-dir`. Cargo invokes
     /// rustc with `--out-dir <workspace>/target/<profile>/deps`, so
     /// three `parent()` steps land on the workspace root.
@@ -1006,6 +1034,43 @@ fn record_codegen_opt(parsed: &mut RustcArgs, value: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codegen_backend_dylib_follows_rustc_selection() {
+        let flags = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(codegen_backend_dylib(&flags(&[])), None);
+        assert_eq!(
+            codegen_backend_dylib(&flags(&["codegen-backend=cranelift"])),
+            None,
+            "a bare name is a toolchain backend"
+        );
+        assert_eq!(
+            codegen_backend_dylib(&flags(&["codegen-backend=/b/librustc_codegen_cuda.so"])),
+            Some("/b/librustc_codegen_cuda.so")
+        );
+        assert_eq!(
+            codegen_backend_dylib(&flags(&[
+                "codegen-backend=/b/librustc_codegen_cuda.so",
+                "always-encode-mir",
+                "codegen-backend=llvm",
+            ])),
+            None,
+            "the last codegen-backend wins"
+        );
+        assert_eq!(
+            codegen_backend_dylib(&flags(&["codegen-backend=llvm", "codegen-backend=x.dylib"])),
+            Some("x.dylib")
+        );
+        assert!(codegen_backend_is_keyable("/b/librustc_codegen_cuda.so"));
+        assert!(codegen_backend_is_keyable("./x.so"));
+        assert!(
+            !codegen_backend_is_keyable("x.so"),
+            "the loader searches library paths for a bare file name"
+        );
+        let parsed =
+            RustcArgs::parse(&flags(&["rustc", "lib.rs", "-Z", "codegen-backend=./x.so"])).unwrap();
+        assert_eq!(parsed.codegen_backend_dylib(), Some("./x.so"));
+    }
+
     use super::*;
     use crate::test_support::process_state_test_lock;
     use proptest::prelude::*;

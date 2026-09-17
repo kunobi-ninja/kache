@@ -110,6 +110,13 @@ pub struct Config {
     /// default until path/repro gates pass. `KACHE_CACHE_CC_LINKS` or
     /// `[cache] cache_cc_links`.
     pub cache_cc_links: bool,
+    /// Opt-in caching for rustc compiles that load a codegen backend from a
+    /// dylib (`-Zcodegen-backend=<path>`). Such a backend can write files
+    /// rustc does not report, which a cache hit would not restore, so these
+    /// compiles bypass the cache unless this is set. The key covers the dylib
+    /// file only, not libraries it loads at run time.
+    /// `KACHE_TRUST_CODEGEN_BACKENDS` or `[cache] trust_codegen_backends`.
+    pub trust_codegen_backends: bool,
     pub clean_incremental: bool,
     /// Keep rustc incremental compilation for Cargo mutation workloads by
     /// bypassing artifact caching and isolating their incremental state.
@@ -699,6 +706,7 @@ pub(crate) struct CacheFileConfig {
     pub(crate) ignore_env: Option<bool>,
     pub(crate) cache_executables: Option<bool>,
     pub(crate) cache_cc_links: Option<bool>,
+    pub(crate) trust_codegen_backends: Option<bool>,
     pub(crate) clean_incremental: Option<bool>,
     pub(crate) preserve_incremental: Option<bool>,
     pub(crate) adaptive_incremental: Option<bool>,
@@ -794,6 +802,7 @@ pub(crate) struct EnvOverrides {
     pub(crate) max_size: bool,
     pub(crate) cache_executables: bool,
     pub(crate) cache_cc_links: bool,
+    pub(crate) trust_codegen_backends: bool,
     pub(crate) clean_incremental: bool,
     pub(crate) preserve_incremental: bool,
     pub(crate) adaptive_incremental: bool,
@@ -825,6 +834,8 @@ impl EnvOverrides {
             max_size: env_or_ignored("KACHE_MAX_SIZE", ignore_env).is_ok(),
             cache_executables: env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env).is_ok(),
             cache_cc_links: env_or_ignored("KACHE_CACHE_CC_LINKS", ignore_env).is_ok(),
+            trust_codegen_backends: env_or_ignored("KACHE_TRUST_CODEGEN_BACKENDS", ignore_env)
+                .is_ok(),
             clean_incremental: env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env).is_ok(),
             preserve_incremental: env_or_ignored("KACHE_PRESERVE_INCREMENTAL", ignore_env).is_ok(),
             adaptive_incremental: env_or_ignored("KACHE_ADAPTIVE_INCREMENTAL", ignore_env).is_ok(),
@@ -1036,6 +1047,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_MAX_SIZE",
     "KACHE_CACHE_EXECUTABLES",
     "KACHE_CACHE_CC_LINKS",
+    "KACHE_TRUST_CODEGEN_BACKENDS",
     "KACHE_CLEAN_INCREMENTAL",
     "KACHE_PRESERVE_INCREMENTAL",
     "KACHE_ADAPTIVE_INCREMENTAL",
@@ -1094,6 +1106,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_MAX_SIZE", "cache.local_max_size"),
     ("KACHE_CACHE_EXECUTABLES", "cache.cache_executables"),
     ("KACHE_CACHE_CC_LINKS", "cache.cache_cc_links"),
+    (
+        "KACHE_TRUST_CODEGEN_BACKENDS",
+        "cache.trust_codegen_backends",
+    ),
     ("KACHE_CLEAN_INCREMENTAL", "cache.clean_incremental"),
     ("KACHE_PRESERVE_INCREMENTAL", "cache.preserve_incremental"),
     ("KACHE_ADAPTIVE_INCREMENTAL", "cache.adaptive_incremental"),
@@ -1308,6 +1324,17 @@ impl Config {
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.cache_cc_links)
+                    .unwrap_or(false)
+            });
+
+        let trust_codegen_backends = env_or_ignored("KACHE_TRUST_CODEGEN_BACKENDS", ignore_env)
+            .map(|v| env_flag_one_or_true(&v))
+            .unwrap_or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.trust_codegen_backends)
                     .unwrap_or(false)
             });
 
@@ -1722,6 +1749,7 @@ impl Config {
             scheduler,
             cache_executables,
             cache_cc_links,
+            trust_codegen_backends,
             clean_incremental,
             preserve_incremental,
             adaptive_incremental,
@@ -5394,6 +5422,7 @@ remote_key_cache_refresh_secs = 900
                 planner: None,
                 cache_executables: Some(true),
                 cache_cc_links: None,
+                trust_codegen_backends: None,
                 clean_incremental: Some(false),
                 preserve_incremental: Some(true),
                 adaptive_incremental: Some(false),
@@ -5867,6 +5896,7 @@ remote_key_cache_refresh_secs = 900
             disabled: false,
             cache_executables: false,
             cache_cc_links: false,
+            trust_codegen_backends: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -5928,6 +5958,7 @@ remote_key_cache_refresh_secs = 900
             disabled: false,
             cache_executables: false,
             cache_cc_links: false,
+            trust_codegen_backends: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -5985,6 +6016,7 @@ remote_key_cache_refresh_secs = 900
             disabled: false,
             cache_executables: false,
             cache_cc_links: false,
+            trust_codegen_backends: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -6061,6 +6093,7 @@ remote_key_cache_refresh_secs = 900
             disabled: false,
             cache_executables: false,
             cache_cc_links: false,
+            trust_codegen_backends: false,
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
@@ -6720,6 +6753,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 planner: None,
                 cache_executables: Some(true),
                 cache_cc_links: None,
+                trust_codegen_backends: None,
                 clean_incremental: None,
                 preserve_incremental: None,
                 adaptive_incremental: None,

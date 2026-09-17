@@ -1967,7 +1967,27 @@ pub fn compute_cache_key(
     // Unstable `-Z` flags arriving on argv outside RUSTFLAGS. Can change
     // codegen (`-Zsanitizer`, `-Zshare-generics`, …); hashed raw.
     hasher.set_group("args");
+    let backend_dylib = args.codegen_backend_dylib();
     for z in &args.unstable_flags {
+        // A backend dylib is keyed by its content, not its path: the wrapper
+        // only reaches here for one when the user trusts it, and rebuilding
+        // the backend in place must change the key while another checkout's
+        // identical backend must not.
+        if let Some(path) = z
+            .strip_prefix("codegen-backend=")
+            .filter(|path| Some(*path) == backend_dylib)
+        {
+            let content = file_hasher
+                .hash(Path::new(path))
+                .with_context(|| format!("hashing codegen backend {path}"))?;
+            fold_field(
+                &mut hasher,
+                b"codegen_backend_content.v1:",
+                content.as_bytes(),
+            );
+            tracing::trace!("[key:{}] codegen_backend_content:{}", crate_name, content);
+            continue;
+        }
         hasher.update(b"unstable:");
         hasher.update(z.as_bytes());
         hasher.update(b"\n");
@@ -9284,6 +9304,45 @@ mod tests {
         std::fs::write(&spec, br#"{"llvm-target":"x","data-layout":"e-A"}"#).unwrap();
         let key_a2 = key_of_flags(&flag_base(&source, &[&spec_arg]));
         assert_eq!(key_a, key_a2, "same spec content -> same key");
+    }
+
+    /// A trusted codegen backend dylib is keyed by content: a rebuild in place
+    /// changes the key, the same bytes at another checkout's path do not.
+    /// A toolchain backend name stays keyed as written.
+    #[test]
+    fn codegen_backend_dylib_is_keyed_by_content_not_path() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let clone_a = dir.path().join("a/librustc_codegen_x.so");
+        let clone_b = dir.path().join("b/librustc_codegen_x.so");
+        for backend in [&clone_a, &clone_b] {
+            std::fs::create_dir_all(backend.parent().unwrap()).unwrap();
+            std::fs::write(backend, b"backend-v1").unwrap();
+        }
+        let flag = |backend: &Path| format!("-Zcodegen-backend={}", backend.display());
+
+        let a = key_of_flags(&flag_base(&source, &[&flag(&clone_a)]));
+        let b = key_of_flags(&flag_base(&source, &[&flag(&clone_b)]));
+        assert_eq!(a, b, "identical backends at different paths share a key");
+
+        std::fs::write(&clone_a, b"backend-v2").unwrap();
+        let rebuilt = key_of_flags(&flag_base(&source, &[&flag(&clone_a)]));
+        assert_ne!(a, rebuilt, "a rebuilt backend must change the key");
+
+        let cranelift = key_of_flags(&flag_base(&source, &["-Zcodegen-backend=cranelift"]));
+        let gcc = key_of_flags(&flag_base(&source, &["-Zcodegen-backend=gcc"]));
+        assert_ne!(cranelift, gcc, "toolchain backend names stay keyed");
+        assert_ne!(cranelift, a);
+
+        let missing = dir.path().join("missing.so");
+        let mut parsed = RustcArgs::parse(&flag_base(&source, &[&flag(&missing)])).unwrap();
+        parsed.source_file = None;
+        assert!(
+            compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty()).is_err(),
+            "an unreadable backend must not produce a key"
+        );
     }
 
     /// H2: `--sysroot` selects which std rustc links against; with the

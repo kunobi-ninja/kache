@@ -111,6 +111,7 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 | --- | --- | --- | --- |
 | `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | Linux/macOS: `true`; Windows: `false` | Cache eligible Rust bins and test executables |
 | `KACHE_CACHE_CC_LINKS` | `cache.cache_cc_links` | `false` | Cache C/C++ whole-program links and their sidecars. Off until path and reproducibility gates pass. |
+| `KACHE_TRUST_CODEGEN_BACKENDS` | `cache.trust_codegen_backends` | `false` | Cache rustc compiles that load a codegen backend dylib (`-Zcodegen-backend=<path>`), keyed by the dylib's contents. The backend must be passed as a path, and libraries it loads at run time are not part of the key. Off because a backend can write files rustc does not report, and a cache hit would not restore them. |
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Remove tracked incremental directories during cleanup |
 | `KACHE_ADAPTIVE_INCREMENTAL` | `cache.adaptive_incremental` | `true` | Learn rapidly changing Cargo units and give them isolated incremental state |
 | `KACHE_PRESERVE_INCREMENTAL` | `cache.preserve_incremental` | `false` | Force eligible Cargo units onto isolated incremental state |

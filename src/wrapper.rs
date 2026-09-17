@@ -2848,6 +2848,13 @@ fn run_parsed_rustc(
     // path. In particular, changing an exclusion or executable-cache policy
     // must take effect immediately even when this unit was already active.
     let refuse = compiler.refuse_reasons(args);
+    // A codegen backend loaded from a dylib can write files rustc never
+    // reports (cuda-oxide writes device artifacts next to the crate), and a
+    // hit would restore the artifacts without them. Such compiles bypass the
+    // cache unless the user trusts the backend.
+    let untrusted_codegen_backend = args.codegen_backend_dylib().filter(|backend| {
+        !config.trust_codegen_backends || !crate::args::codegen_backend_is_keyable(backend)
+    });
     let current_dir = std::env::current_dir().ok();
     let workspace_root = args.path_normalization_root().map(Path::to_path_buf);
     let exclude_roots: Vec<_> = workspace_root
@@ -2866,7 +2873,7 @@ fn run_parsed_rustc(
     let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
 
     if incremental_fast_path_allowed(
-        !refuse.is_empty(),
+        !refuse.is_empty() || untrusted_codegen_backend.is_some(),
         excluded_source.is_some() || user_bypass.is_some(),
         skip_user_facing,
     ) {
@@ -2934,6 +2941,22 @@ fn run_parsed_rustc(
             e
         );
     }
+    // Checked before the refusals below: those may hand the compile to a
+    // configured fallback cache, which would replay the same incomplete
+    // outputs.
+    if untrusted_codegen_backend.is_some() {
+        tracing::debug!("rustc codegen backend dylib not trusted; running rustc directly");
+        reset_adaptive_unit(adaptive_unit.as_ref());
+        return rustc_direct_passthrough_with_event(
+            config,
+            args,
+            crate_name,
+            &event_root,
+            start,
+            UNTRUSTED_CODEGEN_BACKEND_REASON,
+        );
+    }
+
     // Bypass the cache when the compiler tells us we can't safely cache this
     // invocation (today: only NotPrimary; future: response files, coverage,
     // time macros, etc.).
@@ -5639,6 +5662,35 @@ fn passthrough_with_event<R: Into<String>>(
         crate_name,
         start.elapsed().as_millis() as u64,
         reason.into(),
+        &output,
+    );
+    Ok(output.exit_code)
+}
+
+/// Passthrough reason for a rustc compile whose codegen backend dylib is not
+/// trusted. The string is a contract: reports group passthroughs by it.
+const UNTRUSTED_CODEGEN_BACKEND_REASON: &str = "unsupported|rustc codegen backend dylib (-Zcodegen-backend=<path>) may write files kache cannot restore; set cache.trust_codegen_backends and pass the backend as a path to cache it";
+
+/// Run rustc without caching and without the configured fallback, for
+/// compiles no cache can replay correctly.
+fn rustc_direct_passthrough_with_event(
+    config: &Config,
+    args: &RustcArgs,
+    crate_name: &str,
+    root: &str,
+    start: std::time::Instant,
+    reason: &str,
+) -> Result<i32> {
+    if PRECOMPILED_EXIT.with(std::cell::Cell::get).is_some() {
+        return passthrough_with_event(config, args, crate_name, root, start, reason);
+    }
+    let output = passthrough(args, None, config.preserve_incremental)?;
+    log_passthrough_event(
+        config,
+        root,
+        crate_name,
+        start.elapsed().as_millis() as u64,
+        reason.to_string(),
         &output,
     );
     Ok(output.exit_code)

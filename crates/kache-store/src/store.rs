@@ -6360,6 +6360,26 @@ mod tests {
         );
     }
 
+    /// The ingest helpers follow the flush policy of the store last opened
+    /// on this thread: deferred stores skip the inline fsync, others keep it.
+    #[test]
+    fn blob_ingest_follows_the_last_opened_store_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let _deferred = Store::open(&config).unwrap();
+        assert!(
+            !durable_writes_now(),
+            "a deferred store skips the inline fsync"
+        );
+        config.deferred_durability = false;
+        let _strict = Store::open(&config).unwrap();
+        assert!(
+            durable_writes_now(),
+            "a durable store keeps the inline fsync"
+        );
+    }
+
     /// Deferred durability: a put leaves the entry pending, a hit on a
     /// pending entry verifies the bytes (a same-size corruption is caught and
     /// evicted), the probe hands a pending entry back to the writing path,

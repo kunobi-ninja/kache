@@ -38,7 +38,7 @@ Set `--token` or `KACHE_PLANNER_TOKEN` to require bearer authentication.
 helm upgrade --install kache-service ./packaging/charts/kache-service
 ```
 
-The chart supplies a Deployment, Service, probes, optional persistent volume, optional existing-secret authentication, and optional Lease-based leader election. It does not create ingress.
+The chart supplies a Deployment, Service, probes, optional persistent volume, optional existing-secret authentication, and optional Lease-based leader election, and an optional Ingress.
 
 Point clients at it:
 
@@ -46,6 +46,21 @@ Point clients at it:
 export KACHE_PLANNER_ENDPOINT=http://kache-service.namespace.svc.cluster.local:8080
 export KACHE_PLANNER_TOKEN=secret-if-required
 ```
+
+To reach it from outside the cluster, enable the Ingress:
+
+```yaml title="values.yaml"
+ingress:
+  enabled: true
+  className: nginx
+  host: kache.example.com
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+  tls:
+    enabled: true
+```
+
+The Ingress does not add authentication. Set `auth.existingSecret` before you expose the service beyond a trusted network.
 
 The equivalent TOML is under `[cache.planner]`.
 

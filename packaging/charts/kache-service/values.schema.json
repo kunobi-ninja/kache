@@ -147,6 +147,43 @@
       },
       "required": ["type", "port", "annotations"]
     },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "className": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "pathType": {
+          "type": "string",
+          "enum": ["Prefix", "Exact", "ImplementationSpecific"]
+        },
+        "annotations": {
+          "type": "object"
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "secretName": {
+              "type": "string"
+            }
+          },
+          "required": ["enabled", "secretName"]
+        }
+      },
+      "required": ["enabled", "className", "host", "path", "pathType", "annotations", "tls"]
+    },
     "podAnnotations": {
       "type": "object"
     },

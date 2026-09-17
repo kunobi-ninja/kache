@@ -55,6 +55,21 @@ service:
   port: 8080
   annotations: {}
 
+# Expose the service through an Ingress. Set `host` when enabled. Add
+# `cert-manager.io/cluster-issuer` to `annotations` to have cert-manager issue
+# the TLS secret.
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  path: /
+  pathType: Prefix
+  annotations: {}
+  tls:
+    enabled: false
+    # Defaults to <fullname>-tls.
+    secretName: ""
+
 podAnnotations: {}
 podLabels: {}
 

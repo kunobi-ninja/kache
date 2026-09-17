@@ -63,6 +63,14 @@ impl SinceWindow {
         SinceWindow { secs, unit }
     }
 
+    /// A whole-hour window for constants; the caller keeps `hours` small.
+    pub(crate) const fn whole_hours(hours: u64) -> Self {
+        SinceWindow {
+            secs: hours * 3600,
+            unit: Unit::Hours,
+        }
+    }
+
     /// A whole-hour window. `None` on overflow.
     pub(crate) fn from_hours(hours: u64) -> Option<Self> {
         Some(SinceWindow {

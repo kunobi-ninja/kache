@@ -749,6 +749,8 @@ pub struct EventTailer {
 }
 
 impl EventTailer {
+    /// Start at the current end of the log.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(path: PathBuf) -> Self {
         let file = File::open(&path).ok();
         let position = file

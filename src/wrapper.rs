@@ -1113,7 +1113,15 @@ fn nvcc_passthrough_with_event<R: Into<String>>(
 }
 
 fn nvcc_event_root() -> String {
-    event_root_string(event_root_override().or_else(|| std::env::current_dir().ok()))
+    nvcc_event_root_in(std::env::var_os("OUT_DIR"))
+}
+
+fn nvcc_event_root_in(out_dir: Option<std::ffi::OsString>) -> String {
+    event_root_string(
+        event_root_override()
+            .or_else(|| out_dir_workspace(out_dir))
+            .or_else(|| std::env::current_dir().ok()),
+    )
 }
 
 /// Refuse to invoke the compiler over outputs that still share a
@@ -2150,17 +2158,61 @@ fn cc_depinfo_rewrite_root(parsed: &crate::compiler::cc::CcArgs) -> Option<std::
 }
 
 fn rustc_event_root(args: &RustcArgs) -> String {
+    let written_to = args.out_dir.clone().or_else(|| {
+        args.output
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+    });
     event_root_string(event_root_override().or_else(|| {
-        args.workspace_root()
+        written_to
+            .as_deref()
+            .and_then(cargo_workspace_of)
+            .or_else(|| args.workspace_root())
             .or_else(|| std::env::current_dir().ok())
     }))
 }
 
 fn cc_event_root(parsed: &crate::compiler::cc::CcArgs) -> String {
+    cc_event_root_in(parsed, std::env::var_os("OUT_DIR"))
+}
+
+fn cc_event_root_in(
+    parsed: &crate::compiler::cc::CcArgs,
+    out_dir: Option<std::ffi::OsString>,
+) -> String {
     event_root_string(
         event_root_override()
+            .or_else(|| out_dir_workspace(out_dir))
             .or_else(|| cc_depinfo_rewrite_root(parsed).or_else(|| std::env::current_dir().ok())),
     )
+}
+
+/// The workspace whose Cargo target directory holds `dir`: the parent of the
+/// nearest ancestor carrying Cargo's `CACHEDIR.TAG`.
+///
+/// Every unit of one `cargo build` writes somewhere below that directory, so
+/// this gives a build script (`target/debug/build/<pkg>`), the rustc probes it
+/// runs (`.../<pkg>/out`), and its cc compiles the same root as the crates.
+/// Deriving the root from the output layout instead named `target` or
+/// `target/debug` for those units and split one build into several (#1081).
+/// The tag's text is checked, because other tools also write `CACHEDIR.TAG`.
+fn cargo_workspace_of(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|ancestor| is_cargo_cachedir_tag(&ancestor.join("CACHEDIR.TAG")))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
+fn is_cargo_cachedir_tag(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|tag| tag.contains("created by cargo"))
+}
+
+/// The workspace of the build script a compiler runs under, from the
+/// `OUT_DIR` Cargo gives every build script and its child processes.
+fn out_dir_workspace(out_dir: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let out_dir = out_dir.filter(|value| !value.is_empty())?;
+    cargo_workspace_of(Path::new(&out_dir))
 }
 
 fn event_root_override() -> Option<PathBuf> {
@@ -2662,6 +2714,17 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         crate::build_script::install_shim(&args);
     }
     Ok(exit)
+}
+
+/// Event root for a build-script run: the workspace whose target holds its
+/// `OUT_DIR`, so the run joins the build that triggered it, falling back to
+/// the package's manifest directory outside a tagged target (#1081).
+pub(crate) fn build_script_event_root(out_dir: &Path, manifest_dir: &Path) -> String {
+    event_root_string(
+        event_root_override()
+            .or_else(|| cargo_workspace_of(out_dir))
+            .or_else(|| Some(manifest_dir.to_path_buf())),
+    )
 }
 
 /// Event for one build-script run, on the same log as compiler events.
@@ -6133,10 +6196,14 @@ fn log_event_details(
     exit_code: Option<i32>,
     fallback_attempt: Option<crate::fallback::Attempt>,
 ) {
-    // Session attribution (#583 P0.5): read the root-scoped session id and
-    // refresh the marker so the 5-minute window measures inactivity. Both are
-    // best-effort; an empty id just means a legacy or session-less build.
-    let session_id = current_session_id(config, root);
+    // Session attribution (#583 P0.5): join or open the root's build session
+    // and refresh the marker so the 5-minute window measures inactivity. Both
+    // are best-effort; an empty id only means the marker was unusable.
+    let session_id = session_id_for_event(
+        config,
+        root,
+        invocation_started_secs(now_epoch_secs(), elapsed_ms),
+    );
     refresh_session_marker(config, root, &session_id);
 
     // Per-group key digests of this compile's key computation (empty for cc /
@@ -6334,50 +6401,29 @@ fn explain_miss_diff(
     changed
 }
 
-/// Check for a new build session and trigger a prefetch hint to the daemon.
-/// Uses a marker file with flock to ensure only one wrapper process per
-/// build session sends the hint — without this, N parallel rustc invocations
-/// would all race past the check and send duplicate prefetch requests.
+/// Send the daemon a prefetch hint once per build session.
+///
+/// The session itself comes from [`session_id_for_event`], so it exists with
+/// or without a remote. A separate `.prefetch` marker records which session
+/// the hint went out for, and a flock on it keeps N parallel rustc
+/// invocations from all sending one. The marker is written only after a
+/// successful discovery, so a failed attempt (cargo metadata hanging on a git
+/// dependency, say) is retried by the next compile of the same build.
 fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
     if config.remote.is_none() {
         return;
     }
-
-    // Root-scoped marker (#583 P0.5): parallel repos sharing a cache dir get
-    // independent sessions instead of suppressing each other's plans. Falls
-    // back to the legacy cache-global path when no workspace root is known.
-    let root = args
-        .workspace_root()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let marker = if root.is_empty() {
-        config.runtime_dir.join(".build-session")
-    } else {
-        session_marker_path(config, &root)
-    };
-    // 5 minutes: long enough to span gaps between sequential cargo commands
-    // in CI (check → clippy → test → tarpaulin are ~2 min apart), short
-    // enough that a new `cargo test` after an edit still triggers a fresh
-    // prefetch.  The BFS prefetch sends ALL crates, so re-triggering within
-    // the same session provides no benefit. Event logging refreshes the
-    // marker, so this measures INACTIVITY, not build age.
-    let session_timeout_secs: u64 = BUILD_SESSION_SECS;
-
-    // Fast non-blocking check: if the marker contains a fresh timestamp, skip.
-    // We store a Unix epoch inside the file instead of relying on filesystem
-    // mtime, which can be unreliable on overlayfs (Docker) and network mounts.
-    if marker_is_fresh(&marker, session_timeout_secs) {
-        return; // Still in the same build session
+    let root = rustc_event_root(args);
+    let session_id = session_id_for_event(config, &root, now_epoch_secs());
+    if session_id.is_empty() {
+        return;
     }
-
-    // Marker is stale or missing — try to acquire an exclusive lock so only
-    // one process does the (expensive) cargo-metadata + daemon RPC.
-    // Create the marker's parent (`.build-sessions/` for root-scoped markers,
-    // the cache dir itself for the legacy path) — without this a fresh cache
-    // dir would fail the marker open and never establish a session
-    // (cross-family review finding).
-    if let Some(parent) = marker.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let marker = prefetch_marker_path(config, &root);
+    if prefetch_marker_names(
+        &std::fs::read_to_string(&marker).unwrap_or_default(),
+        &session_id,
+    ) {
+        return;
     }
     let Some(lock_file) = open_marker_for_lock(&marker) else {
         return;
@@ -6387,10 +6433,10 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
     if lock_file.try_lock().is_err() {
         return; // Another wrapper is already sending the prefetch hint
     }
-
-    // Re-check under the lock — another process may have updated the marker
-    // between our first check and acquiring the lock.
-    if marker_file_is_fresh(&lock_file, session_timeout_secs) {
+    // Re-check through the locked handle: another process may have sent the
+    // hint between our first read and acquiring the lock, and on Windows the
+    // lock blocks reads from any other handle (#348).
+    if prefetch_marker_names(&read_locked_marker(&lock_file), &session_id) {
         return;
     }
 
@@ -6415,10 +6461,6 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
         }
     );
 
-    // Mint the session id here — this wrapper won the marker lock, so it is
-    // the one process per build that establishes session identity (#583).
-    let session_id = mint_session_id(&root);
-
     crate::daemon::send_build_started(
         config,
         crate::build_intent::into_build_started_request(
@@ -6427,13 +6469,35 @@ fn maybe_trigger_prefetch(config: &Config, args: &RustcArgs) {
             session_id.clone(),
         ),
     );
+    write_locked_marker(&lock_file, &session_id);
+}
 
-    // Write the marker AFTER the prefetch send so a failed/hung attempt
-    // (e.g. cargo metadata hangs on a git dep) doesn't block retries for the
-    // full session timeout. Write through `lock_file` — the handle that owns
-    // the exclusive lock — so the record lands even on Windows, where the
-    // lock is mandatory and a second handle could not write (kache #348).
-    write_session_marker(&lock_file, &session_id);
+/// Where [`maybe_trigger_prefetch`] records the session it sent a hint for.
+fn prefetch_marker_path(config: &Config, root: &str) -> PathBuf {
+    session_marker_path(config, root).with_extension("prefetch")
+}
+
+fn prefetch_marker_names(content: &str, session_id: &str) -> bool {
+    content.trim() == session_id
+}
+
+fn read_locked_marker(mut file: &std::fs::File) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut content = String::new();
+    if file.seek(SeekFrom::Start(0)).is_ok() {
+        let _ = file.read_to_string(&mut content);
+    }
+    content
+}
+
+/// Replace a marker's content through the handle that owns its lock, the
+/// only handle Windows lets write to it (#348).
+fn write_locked_marker(mut file: &std::fs::File, content: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    let _ = file.set_len(0);
+    let _ = file.seek(SeekFrom::Start(0));
+    let _ = file.write_all(content.as_bytes());
+    let _ = file.flush();
 }
 
 /// Check if the marker file contains a timestamp within `timeout_secs` of now.
@@ -6455,33 +6519,59 @@ pub(crate) fn session_marker_path(config: &Config, root: &str) -> std::path::Pat
         .join(&hash.as_str()[..16])
 }
 
-/// The current build session id for `root`, or empty when no session marker
-/// exists. Best-effort by design — session attribution must never fail a
-/// build.
+/// The build session an invocation of `root` that started at
+/// `started_secs` belongs to, opening a new one when the root has none.
+/// Best-effort by design: session attribution must never fail a build, so an
+/// unusable marker yields an empty id.
 ///
-/// Deliberately does NOT check freshness: freshness gates the TRIGGER (should
-/// a new session start?), not attribution. A single crate compiling longer
-/// than the inactivity window (LLVM-sized) must not fragment its session —
-/// any newer build would have re-minted the marker under the trigger lock, so
-/// whatever id is present is the most recent session for this root
-/// (cross-family review finding).
-pub(crate) fn current_session_id(config: &Config, root: &str) -> String {
+/// Every compile, hit, and passthrough goes through here, with or without a
+/// remote. Sessions used to be opened only by the remote prefetch trigger,
+/// so a local-only cache recorded no session ids at all (#1081).
+///
+/// A session is open for `started_secs` when its marker was touched within
+/// the inactivity window before that moment. Judging at the invocation's
+/// start, not when it logs, keeps a crate that compiles for longer than the
+/// window (LLVM-sized) inside its build. The marker is re-read under an
+/// exclusive lock before minting, so parallel compiles of one build agree
+/// on a single id.
+pub(crate) fn session_id_for_event(config: &Config, root: &str, started_secs: u64) -> String {
     if root.is_empty() {
         return String::new();
     }
     let marker = session_marker_path(config, root);
-    if let Ok(metadata) = std::fs::symlink_metadata(&marker)
-        && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
-    {
-        return String::new();
+    if let Some(id) = open_session_id(
+        &std::fs::read_to_string(&marker).unwrap_or_default(),
+        started_secs,
+    ) {
+        return id;
     }
-    let Ok(content) = std::fs::read_to_string(&marker) else {
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Some(lock_file) = open_marker_for_lock(&marker) else {
         return String::new();
     };
-    match parse_session_marker(&content) {
-        Some((_, id)) => id,
-        None => String::new(),
+    if lock_file.lock().is_err() {
+        return String::new();
     }
+    if let Some(id) = open_session_id(&read_locked_marker(&lock_file), started_secs) {
+        return id;
+    }
+    let id = mint_session_id(root);
+    write_session_marker(&lock_file, &id);
+    id
+}
+
+/// When an invocation that has run for `elapsed_ms` started, in epoch seconds.
+fn invocation_started_secs(now_secs: u64, elapsed_ms: u64) -> u64 {
+    now_secs.saturating_sub(elapsed_ms / 1000)
+}
+
+/// The session id in marker `content` when that session was still open at
+/// `at_secs`.
+fn open_session_id(content: &str, at_secs: u64) -> Option<String> {
+    let (touched, id) = parse_session_marker(content)?;
+    (!id.is_empty() && timestamp_is_fresh_at(touched, BUILD_SESSION_SECS, at_secs)).then_some(id)
 }
 
 /// Refresh the session marker's timestamp so the 5-minute window measures
@@ -12931,39 +13021,233 @@ exit 0
 
         maybe_trigger_prefetch(&config, &args);
 
-        let marker = session_marker_path(&config, workspace.to_str().unwrap());
+        let root = std::fs::canonicalize(&workspace).unwrap();
+        let marker = session_marker_path(&config, root.to_str().unwrap());
         assert!(marker.starts_with(&config.runtime_dir));
-        let content = std::fs::read_to_string(&marker).expect("prefetch marker created");
+        let content = std::fs::read_to_string(&marker).expect("session marker created");
         let (_, session_id) = parse_session_marker(&content).expect("valid v1 marker");
         assert!(!session_id.is_empty());
         assert!(timestamp_is_fresh(&content, BUILD_SESSION_SECS));
         assert!(!config.cache_dir.join(".build-sessions").exists());
+        // The hint is recorded against the session it was sent for.
+        let sent = prefetch_marker_path(&config, root.to_str().unwrap());
+        assert_eq!(std::fs::read_to_string(sent).unwrap(), session_id);
     }
 
     #[test]
-    fn current_session_id_reads_marker_regardless_of_age() {
+    fn session_id_for_event_joins_the_open_session_and_opens_one_after_idle() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = test_config(dir.path().to_path_buf());
         let root = "/some/workspace";
         let marker = session_marker_path(&config, root);
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
 
-        // Fresh marker → id comes back.
-        std::fs::write(&marker, format!("v1 {} sess42", now_epoch_secs())).unwrap();
-        assert_eq!(current_session_id(&config, root), "sess42");
+        // Touched within the window before the invocation started: join it.
+        std::fs::write(&marker, "v1 10000 sess42").unwrap();
+        assert_eq!(session_id_for_event(&config, root, 10000), "sess42");
+        assert_eq!(
+            session_id_for_event(&config, root, 10000 + BUILD_SESSION_SECS - 1),
+            "sess42"
+        );
 
-        // STALE marker still yields the id: freshness gates the trigger, not
-        // attribution — a >5-minute crate compile must not fragment its
-        // session (any newer build would have re-minted the marker).
-        std::fs::write(&marker, "v1 1000 sess42").unwrap();
-        assert_eq!(current_session_id(&config, root), "sess42");
+        // A long compile that started while the session was open stays in
+        // it, however late it logs (#583).
+        assert_eq!(session_id_for_event(&config, root, 10100), "sess42");
 
-        // Corrupt marker → empty.
-        std::fs::write(&marker, "garbage").unwrap();
-        assert_eq!(current_session_id(&config, root), "");
+        // Idle for the whole window: a new build, recorded in the marker.
+        let started = 10000 + BUILD_SESSION_SECS;
+        let minted = session_id_for_event(&config, root, started);
+        assert!(!minted.is_empty());
+        assert_ne!(minted, "sess42");
+        let (_, recorded) =
+            parse_session_marker(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(recorded, minted);
+        // Every later compile of that build joins it.
+        assert_eq!(
+            session_id_for_event(&config, root, now_epoch_secs()),
+            minted
+        );
+    }
 
-        // Empty root → always empty, never panics.
-        assert_eq!(current_session_id(&config, ""), "");
+    #[test]
+    fn session_id_for_event_opens_a_session_without_a_usable_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = test_config(dir.path().to_path_buf());
+
+        // No marker yet: the first event opens the session (#1081).
+        let first = session_id_for_event(&config, "/fresh", now_epoch_secs());
+        assert_eq!(first.len(), 16);
+
+        // A corrupt or id-less marker is not a session to join.
+        let marker = session_marker_path(&config, "/broken");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        for content in ["garbage", &format!("v1 {} ", now_epoch_secs())] {
+            std::fs::write(&marker, content).unwrap();
+            assert_eq!(
+                session_id_for_event(&config, "/broken", now_epoch_secs()).len(),
+                16
+            );
+        }
+
+        // Empty root: never a session, never a marker.
+        assert_eq!(session_id_for_event(&config, "", now_epoch_secs()), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_id_for_event_refuses_a_symlinked_marker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = test_config(dir.path().to_path_buf());
+        let marker = session_marker_path(&config, "/linked");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let target = dir.path().join("target_file");
+        std::fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+
+        assert_eq!(
+            session_id_for_event(&config, "/linked", now_epoch_secs()),
+            ""
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn invocation_started_secs_counts_back_whole_seconds() {
+        assert_eq!(invocation_started_secs(1000, 0), 1000);
+        assert_eq!(invocation_started_secs(1000, 1999), 999);
+        assert_eq!(invocation_started_secs(1000, 400_000), 600);
+        assert_eq!(invocation_started_secs(10, 400_000), 0);
+    }
+
+    #[test]
+    fn locked_marker_helpers_replace_and_read_the_whole_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("marker");
+        std::fs::write(&marker, "a much longer previous record").unwrap();
+        let file = open_marker_for_lock(&marker).unwrap();
+        assert_eq!(read_locked_marker(&file), "a much longer previous record");
+        write_locked_marker(&file, "short");
+        assert_eq!(read_locked_marker(&file), "short");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "short");
+    }
+
+    #[test]
+    fn prefetch_marker_is_per_root_and_names_one_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = test_config(dir.path().to_path_buf());
+        let path = prefetch_marker_path(&config, "/repo");
+        assert_eq!(
+            path.parent(),
+            session_marker_path(&config, "/repo").parent()
+        );
+        assert_ne!(path, session_marker_path(&config, "/repo"));
+        assert_ne!(path, prefetch_marker_path(&config, "/other"));
+
+        assert!(prefetch_marker_names("abc\n", "abc"));
+        assert!(!prefetch_marker_names("abd", "abc"));
+        assert!(!prefetch_marker_names("", "abc"));
+    }
+
+    /// Cargo's target directory, tagged the way Cargo tags it.
+    fn tagged_target(workspace: &Path) -> PathBuf {
+        let target = workspace.join("target");
+        std::fs::create_dir_all(target.join("debug/build/anyhow-1234/out")).unwrap();
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
+        target
+    }
+
+    #[test]
+    fn cargo_workspace_of_finds_the_tagged_target_from_any_unit_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("app");
+        let target = tagged_target(&workspace);
+        for unit_dir in [
+            "debug/deps",
+            "debug/build/anyhow-1234",
+            "debug/build/anyhow-1234/out",
+        ] {
+            assert_eq!(
+                cargo_workspace_of(&target.join(unit_dir)).as_deref(),
+                Some(workspace.as_path()),
+                "{unit_dir}"
+            );
+        }
+
+        // Without a tag, or with another tool's tag, there is no answer.
+        let untagged = dir.path().join("plain/target/debug/deps");
+        std::fs::create_dir_all(&untagged).unwrap();
+        assert_eq!(cargo_workspace_of(&untagged), None);
+        let other = dir.path().join("other/cache");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_workspace_of(&other.join("x")), None);
+    }
+
+    #[test]
+    fn build_script_units_share_the_workspace_event_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("app");
+        let target = tagged_target(&workspace);
+        let expected = std::fs::canonicalize(&workspace)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let out = |dir: &str| target.join(dir).to_string_lossy().into_owned();
+
+        // A crate, a build script, and a probe the build script runs: one
+        // build, one root (#1081).
+        for out_dir in [
+            out("debug/deps"),
+            out("debug/build/anyhow-1234"),
+            out("debug/build/anyhow-1234/out"),
+        ] {
+            let args = rustc_args(&[
+                "rustc",
+                "src/lib.rs",
+                "--crate-name",
+                "x",
+                "--out-dir",
+                &out_dir,
+            ]);
+            assert_eq!(rustc_event_root(&args), expected, "{out_dir}");
+        }
+        let output = target.join("debug/build/anyhow-1234/out/probe.rlib");
+        let args = rustc_args(&["rustc", "probe.rs", "-o", output.to_str().unwrap()]);
+        assert_eq!(rustc_event_root(&args), expected);
+
+        // A build-script run joins it through its OUT_DIR; outside a tagged
+        // target it keeps its package directory.
+        assert_eq!(
+            build_script_event_root(
+                &target.join("debug/build/anyhow-1234/out"),
+                &dir.path().join("pkg")
+            ),
+            expected
+        );
+        let untagged = dir.path().join("pkg");
+        std::fs::create_dir_all(&untagged).unwrap();
+        assert_eq!(
+            build_script_event_root(&untagged.join("out"), &untagged),
+            std::fs::canonicalize(&untagged).unwrap().to_string_lossy()
+        );
+
+        // cc and nvcc under a build script find it through OUT_DIR.
+        let out_dir = Some(std::ffi::OsString::from(out("debug/build/anyhow-1234/out")));
+        let parsed = parse_cc(&["gcc", "-c", "foo.c", "-o", "foo.o"]);
+        assert_eq!(cc_event_root_in(&parsed, out_dir.clone()), expected);
+        assert_eq!(nvcc_event_root_in(out_dir), expected);
+        assert_eq!(out_dir_workspace(Some(std::ffi::OsString::new())), None);
+        assert_eq!(out_dir_workspace(None), None);
     }
 
     #[test]
@@ -13005,8 +13289,8 @@ exit 0
         );
     }
 
-    /// With no remote configured, prefetch detection is a no-op and should not
-    /// even create the build-session marker directory.
+    /// With no remote configured there is no hint to send, so prefetch
+    /// detection touches nothing; sessions come from event logging instead.
     #[test]
     fn maybe_trigger_prefetch_returns_immediately_without_remote() {
         let dir = tempfile::tempdir().unwrap();
@@ -13017,6 +13301,7 @@ exit 0
         maybe_trigger_prefetch(&config, &args);
 
         assert!(!cache_dir.join(".build-session").exists());
+        assert!(!config.runtime_dir.join(".build-sessions").exists());
     }
 
     /// Incremental cleanup only removes a real directory when the config flag

@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use crate::cli;
 use crate::config::Config;
 use crate::daemon;
-use crate::events::{self, BuildEvent, EventRecord, EventResult, EventTailer, HeartbeatEvent};
+#[cfg(test)]
+use crate::events;
+use crate::events::{BuildEvent, EventRecord, EventResult, EventTailer, HeartbeatEvent};
 use crate::since::SinceWindow;
 use crate::tui_sessions::{self, Analysis, Cause, Session, SessionState};
 
@@ -713,18 +715,9 @@ pub fn run_monitor(config: &Config, since: Option<SinceWindow>) -> Result<()> {
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let tailer = if since.is_some() {
-        EventTailer::from_start(config.event_log_path())
-    } else {
-        EventTailer::new(config.event_log_path())
-    };
-
-    let initial_events = if let Some(window) = since {
-        let cutoff = window.cutoff(chrono::Utc::now());
-        events::read_events_since(&config.event_log_path(), cutoff).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let history = since.unwrap_or(MONITOR_HISTORY);
+    let (tailer, initial_events) =
+        load_history(config.event_log_path(), history.cutoff(chrono::Utc::now()));
 
     let rustc_version_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
@@ -1757,6 +1750,33 @@ fn draw_live_build(frame: &mut Frame, state: &mut AppState, area: Rect) {
     // names and ambiguous-width glyphs).
     let table = Table::new(rows, widths).header(header).block(block);
     frame.render_widget(table, area);
+}
+
+/// How much history the monitor opens with when no `--since` was given, so
+/// builds that finished before it started are listed (#1081).
+const MONITOR_HISTORY: SinceWindow = SinceWindow::whole_hours(1);
+
+/// Read the event log once, from the start, keeping the build events at or
+/// after `cutoff`, and return a tailer positioned right after what was read.
+///
+/// One read serves both the history and the live tail, so no event is counted
+/// twice and none appended in between is lost. Heartbeats in the history are
+/// dropped: a compile still running beats again within one cadence.
+fn load_history(
+    path: std::path::PathBuf,
+    cutoff: chrono::DateTime<chrono::Utc>,
+) -> (EventTailer, Vec<BuildEvent>) {
+    let mut tailer = EventTailer::from_start(path);
+    let events = tailer
+        .poll_records()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|record| match record {
+            EventRecord::Build(event) if event.ts >= cutoff => Some(*event),
+            _ => None,
+        })
+        .collect();
+    (tailer, events)
 }
 
 /// How far back the lookup sparklines look when no `--since` was given.
@@ -4335,6 +4355,53 @@ mod tests {
                 "tab {tab:?} should render visible content"
             );
         }
+    }
+
+    #[test]
+    fn load_history_keeps_recent_builds_once_and_tails_from_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        let mut old = sample_build_event("old", EventResult::Miss, 1, 1);
+        old.ts = cutoff - chrono::Duration::seconds(1);
+        let mut edge = sample_build_event("edge", EventResult::LocalHit, 1, 1);
+        edge.ts = cutoff;
+        let recent = sample_build_event("recent", EventResult::LocalHit, 1, 1);
+        for event in [&old, &edge, &recent] {
+            events::log_event(&log, event).unwrap();
+        }
+        let beat = HeartbeatEvent {
+            schema: 1,
+            event: "heartbeat".to_string(),
+            ts: chrono::Utc::now(),
+            eta_s: None,
+            crate_name: "gone".to_string(),
+            root: "/w".to_string(),
+            pid: 1,
+            elapsed_s: 1,
+            typical_s: None,
+        };
+        events::log_heartbeat(&log, &beat).unwrap();
+
+        // Builds that finished before the monitor opened are listed (#1081).
+        let (mut tailer, history) = load_history(log.clone(), cutoff);
+        let names: Vec<&str> = history.iter().map(|e| e.crate_name.as_str()).collect();
+        assert_eq!(names, ["edge", "recent"]);
+
+        // The tail starts after the history: nothing is delivered twice.
+        assert!(tailer.poll().unwrap().is_empty());
+        let later = sample_build_event("later", EventResult::Miss, 1, 1);
+        events::log_event(&log, &later).unwrap();
+        let tailed = tailer.poll().unwrap();
+        assert_eq!(tailed.len(), 1);
+        assert_eq!(tailed[0].crate_name, "later");
+    }
+
+    #[test]
+    fn monitor_history_defaults_to_one_hour() {
+        assert_eq!(MONITOR_HISTORY.secs(), 3600);
+        assert_eq!(SinceWindow::whole_hours(3).secs(), 3 * 3600);
     }
 
     fn sample_build_event(

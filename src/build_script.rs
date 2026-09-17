@@ -987,7 +987,10 @@ impl Run {
     ) {
         crate::wrapper::log_build_script_event(
             &self.config,
-            &self.environment.manifest_dir.to_string_lossy(),
+            &crate::wrapper::build_script_event_root(
+                &self.environment.out_dir,
+                &self.environment.manifest_dir,
+            ),
             CRATE_NAME,
             result,
             self.start.elapsed().as_millis() as u64,

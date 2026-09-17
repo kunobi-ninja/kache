@@ -10,7 +10,7 @@ kache monitor
 kache monitor --since 1h
 ```
 
-The monitor attempts to start the daemon for transfer statistics. It still reads the local store and event log if the daemon is unavailable.
+Without `--since`, the monitor opens with the last hour of builds. The monitor attempts to start the daemon for transfer statistics. It still reads the local store and event log if the daemon is unavailable.
 
 <video src="https://raw.githubusercontent.com/kunobi-ninja/kache/main/assets/monitor.webm" aria-label="kache monitor following a build, then the Why, Projects, and Store tabs" autoPlay loop muted playsInline controls />
 
@@ -34,7 +34,7 @@ The monitor attempts to start the daemon for transfer statistics. It still reads
 4. `Store` lists cache entries. Press `s` to change sort order.
 5. `Transfer` shows recent remote uploads and downloads.
 
-A build is every event sharing the session id the wrapper mints per `cargo build`. Events from older wrappers have no id and are grouped by build root, split at idle gaps of five minutes. Those builds carry a `~` after their name.
+A build is every event sharing one session id. The wrapper records one per workspace, and it covers the crates, build scripts, and C/C++ compiles of that workspace until it sits idle for five minutes, so Cargo commands run back to back count as one build. Events from older wrappers have no id and are grouped by build root with the same five-minute rule. Those builds carry a `~` after their name.
 
 Cascade causes need per-dependency digests on the events, which `[cache] explain_miss = true` records. Without it the Why tab says so. Every figure on the tab describes the loaded history: with `--since`, a crate whose last compile is before the cutoff reads as having no earlier compile.
 

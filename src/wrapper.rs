@@ -411,6 +411,59 @@ fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
     }
 }
 
+/// After a put under `[cache] deferred_durability`: make sure a flusher is
+/// draining this store, so the entry reaches disk shortly after the compile
+/// instead of inside it. One detached `kache flush-durability` per store; if
+/// one is already running (its lock is held) or was spawned within the last
+/// second, nothing happens. If none can be started, this entry is flushed
+/// here, so a stored entry is never left to chance.
+fn maybe_spawn_durability_flusher(config: &Config, store: &Store, cache_key: &str) {
+    if !config.deferred_durability {
+        return;
+    }
+    match store.try_durability_flush_lock() {
+        Ok(Some(lock)) => drop(lock),
+        // Held: a flusher is running and will reach this entry.
+        Ok(None) => return,
+        Err(e) => {
+            tracing::debug!("durability flush lock unavailable ({e:#}); flushing inline");
+            let _ = store.flush_entry_durability(cache_key);
+            return;
+        }
+    }
+    let marker = config.cache_dir.join("store").join("durability.spawned");
+    let marker_age = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok());
+    if !durability_flusher_spawn_due(marker_age) {
+        // A sibling spawned a worker a moment ago; it takes the lock as it starts.
+        return;
+    }
+    let _ = std::fs::write(&marker, b"");
+    let spawned = std::env::current_exe()
+        .map_err(anyhow::Error::from)
+        .and_then(|exe| {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("flush-durability")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            crate::platform::configure_detached_process(&mut cmd);
+            cmd.spawn().map(drop).map_err(anyhow::Error::from)
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not start the durability flusher ({e:#}); flushing inline");
+        let _ = store.flush_entry_durability(cache_key);
+    }
+}
+
+/// Whether to spawn a flusher given how long ago a sibling last did: a spawn
+/// within the last second is still starting up and will take the lock.
+fn durability_flusher_spawn_due(marker_age: Option<std::time::Duration>) -> bool {
+    marker_age.is_none_or(|age| age >= std::time::Duration::from_secs(1))
+}
+
 fn event_result_for_store_put(put: StorePutResult) -> EventResult {
     if put.is_full_dup() {
         EventResult::Dup
@@ -1029,6 +1082,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     // Store grew — throttled size check + detached background GC if over
                     // budget (kunobi-ninja/kache#497). Never blocks the compile path.
                     maybe_spawn_auto_gc(config, &store);
+                    maybe_spawn_durability_flusher(config, &store, &cache_key);
                     maybe_enqueue_upload(config, &store, &cache_key, &crate_name, true);
                 }
                 Err(e) => {
@@ -1894,6 +1948,7 @@ fn run_cc_inner(
                     // Store grew — throttled size check + detached background GC if over
                     // budget (kunobi-ninja/kache#497). Never blocks the compile path.
                     maybe_spawn_auto_gc(config, &store);
+                    maybe_spawn_durability_flusher(config, &store, &cache_key);
                     maybe_enqueue_upload(
                         config,
                         &store,
@@ -3915,6 +3970,7 @@ fn run_parsed_rustc(
             // Store grew — throttled size check + detached background GC if over
             // budget (kunobi-ninja/kache#497). Never blocks the compile path.
             maybe_spawn_auto_gc(config, &store);
+            maybe_spawn_durability_flusher(config, &store, &cache_key);
         }
         // Name the crate, as the cc path already does: a failed store leaves that
         // unit re-compiling on every build while the aggregate hit rate barely
@@ -13510,6 +13566,20 @@ exit 0
             "a rejecting predicate must not return the stored meta"
         );
         assert!(take_recheck_hit(&store, "missing", &|_| true).is_none());
+    }
+
+    /// A flusher is spawned when none was spawned recently: no marker, or a
+    /// marker at least a second old; a younger marker means one is starting.
+    #[test]
+    fn a_durability_flusher_is_spawned_once_per_second_at_most() {
+        use std::time::Duration;
+        assert!(durability_flusher_spawn_due(None));
+        assert!(durability_flusher_spawn_due(Some(Duration::from_secs(1))));
+        assert!(durability_flusher_spawn_due(Some(Duration::from_secs(90))));
+        assert!(!durability_flusher_spawn_due(Some(Duration::from_millis(
+            999
+        ))));
+        assert!(!durability_flusher_spawn_due(Some(Duration::ZERO)));
     }
 
     #[test]

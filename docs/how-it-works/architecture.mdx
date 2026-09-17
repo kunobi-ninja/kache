@@ -43,6 +43,8 @@ Identical output bytes share one blob. Restores first try copy-on-write cloning.
 
 See [Deduplication](/docs/deduplication) for platform details.
 
+A miss stores its outputs without waiting for an fsync. The wrapper starts one `kache flush-durability` worker per store, which flushes the new blobs and metadata to disk a moment later and marks the entries durable; `kache gc` flushes whatever is still pending. Until an entry is flushed, a hit on it verifies every blob against its content hash before restoring, so a crash in between costs a recompile, never a wrong artifact. `[cache] deferred_durability = false` flushes inside the compile instead.
+
 ## Daemon
 
 The daemon owns remote work and periodic maintenance:

@@ -2856,6 +2856,67 @@ impl GcMode {
     }
 }
 
+/// How long the flusher waits for another entry after the queue drains
+/// before it exits. A build stores entries every few hundred milliseconds,
+/// so one worker outlives a burst of misses instead of one spawn per miss.
+const DURABILITY_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_secs(3);
+const DURABILITY_FLUSH_BATCH: usize = 64;
+
+/// Drain the entries stored without an fsync (`[cache] deferred_durability`)
+/// and exit once the queue has stayed empty for [`DURABILITY_FLUSH_IDLE`].
+/// One worker per store: a second one finds the lock held and exits.
+pub fn run_durability_flusher(config: &Config) -> Result<()> {
+    let store = Store::open(config)?;
+    let Some(_lock) = store.try_durability_flush_lock()? else {
+        return Ok(());
+    };
+    let idle = durability_flush_idle();
+    let mut idle_since = std::time::Instant::now();
+    loop {
+        let flushed = store.flush_durability(DURABILITY_FLUSH_BATCH)?;
+        match flush_step(flushed, idle_since.elapsed(), idle) {
+            FlushStep::Continue => idle_since = std::time::Instant::now(),
+            FlushStep::Exit => return Ok(()),
+            FlushStep::Sleep => std::thread::sleep(std::time::Duration::from_millis(150)),
+        }
+    }
+}
+
+/// How long the flusher waits after the queue drains. Tests shorten it with
+/// `KACHE_DURABILITY_FLUSH_IDLE_MS`; builds never set it.
+fn durability_flush_idle() -> std::time::Duration {
+    std::env::var("KACHE_DURABILITY_FLUSH_IDLE_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DURABILITY_FLUSH_IDLE)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FlushStep {
+    /// A batch was flushed: look again at once and restart the idle clock.
+    Continue,
+    /// Nothing to flush and the queue has been empty for the whole window.
+    Exit,
+    /// Nothing to flush yet; wait a little and look again.
+    Sleep,
+}
+
+/// One turn of the flusher loop, kept free of clocks and stores.
+fn flush_step(
+    flushed: usize,
+    idle_for: std::time::Duration,
+    idle: std::time::Duration,
+) -> FlushStep {
+    if flushed > 0 {
+        FlushStep::Continue
+    } else if idle_for >= idle {
+        FlushStep::Exit
+    } else {
+        FlushStep::Sleep
+    }
+}
+
 /// Run garbage collection locally under `gc.lock`.
 pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcStats> {
     let verbose = mode == GcMode::Cli;
@@ -2869,6 +2930,13 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
             return Ok(skipped_gc_stats());
         }
     };
+    // Entries stored without an fsync reach disk before anything is judged
+    // by age or size; a flusher that never ran is caught up here.
+    match store.flush_durability(usize::MAX) {
+        Ok(0) => {}
+        Ok(flushed) => tracing::info!("flushed {flushed} entries pending durability"),
+        Err(error) => tracing::warn!("durability flush before gc failed: {error:#}"),
+    }
     let mut combined = crate::store::GcStats::default();
     let started = std::time::Instant::now();
 
@@ -8772,6 +8840,128 @@ mod tests {
         assert!(backend.put_calls().is_empty());
     }
 
+    /// The flusher drains every entry stored without an fsync, exits once the
+    /// queue has stayed empty, and a second flusher for the same store exits
+    /// at once because the first holds the lock.
+    #[test]
+    fn the_durability_flusher_drains_pending_entries_and_exits() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = save_manifest_config(dir.path().join("cache"), None);
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        for key in ["one", "two", "three"] {
+            // One source per put: a stored source may become a read-only
+            // hardlink of its blob, so it cannot be rewritten for the next.
+            let output = dir.path().join(format!("out-{key}.rlib"));
+            std::fs::write(&output, format!("artifact-{key}")).unwrap();
+            store
+                .put(
+                    key,
+                    "flush_crate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(output.clone(), "libout.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        assert_eq!(store.pending_durability().unwrap(), 3);
+        // More than one batch, with no idle window: every batch is still
+        // drained before the flusher decides the queue is empty.
+        for n in 0..(DURABILITY_FLUSH_BATCH + 5) {
+            let output = dir.path().join(format!("bulk-{n}.rlib"));
+            std::fs::write(&output, format!("bulk-{n}")).unwrap();
+            store
+                .put(
+                    &format!("bulk-{n}"),
+                    "flush_crate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(output.clone(), "libout.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.pending_durability().unwrap(),
+            (DURABILITY_FLUSH_BATCH + 8) as u64
+        );
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::set_var("KACHE_DURABILITY_FLUSH_IDLE_MS", "0") };
+        // The flusher runs on its own thread with a deadline: a loop that
+        // never exits fails the test instead of hanging the whole suite.
+        let flush_within = |limit: std::time::Duration| {
+            let config = config.clone();
+            let (done, finished) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send(run_durability_flusher(&config).map_err(|e| e.to_string()));
+            });
+            finished
+                .recv_timeout(limit)
+                .unwrap_or_else(|_| panic!("the flusher did not exit within {limit:?}"))
+                .unwrap();
+        };
+        let held = store.try_durability_flush_lock().unwrap().unwrap();
+        let started = std::time::Instant::now();
+        flush_within(std::time::Duration::from_secs(10));
+        assert!(
+            started.elapsed() < DURABILITY_FLUSH_IDLE,
+            "a flusher that finds the lock held exits without waiting"
+        );
+        assert_eq!(
+            store.pending_durability().unwrap(),
+            (DURABILITY_FLUSH_BATCH + 8) as u64,
+            "and flushes nothing"
+        );
+        drop(held);
+        flush_within(std::time::Duration::from_secs(20));
+        unsafe { std::env::remove_var("KACHE_DURABILITY_FLUSH_IDLE_MS") };
+        assert_eq!(store.pending_durability().unwrap(), 0);
+        assert!(
+            store.try_durability_flush_lock().unwrap().is_some(),
+            "the flusher released its lock on exit"
+        );
+    }
+
+    /// The loop policy: a flushed batch means look again at once; an empty
+    /// queue means wait until the idle window has passed, then exit.
+    #[test]
+    fn the_flusher_exits_only_after_an_empty_idle_window() {
+        use std::time::Duration;
+        let idle = Duration::from_secs(3);
+        assert_eq!(flush_step(64, Duration::ZERO, idle), FlushStep::Continue);
+        assert_eq!(
+            flush_step(1, Duration::from_secs(9), idle),
+            FlushStep::Continue
+        );
+        assert_eq!(
+            flush_step(0, Duration::from_millis(2999), idle),
+            FlushStep::Sleep
+        );
+        assert_eq!(flush_step(0, Duration::ZERO, idle), FlushStep::Sleep);
+        assert_eq!(flush_step(0, idle, idle), FlushStep::Exit);
+        assert_eq!(flush_step(0, Duration::from_secs(4), idle), FlushStep::Exit);
+        assert_eq!(
+            flush_step(0, Duration::ZERO, Duration::ZERO),
+            FlushStep::Exit
+        );
+        let _lock = crate::test_support::process_state_test_lock();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::set_var("KACHE_DURABILITY_FLUSH_IDLE_MS", "250") };
+        assert_eq!(durability_flush_idle(), Duration::from_millis(250));
+        unsafe { std::env::set_var("KACHE_DURABILITY_FLUSH_IDLE_MS", "soon") };
+        assert_eq!(durability_flush_idle(), DURABILITY_FLUSH_IDLE);
+        unsafe { std::env::remove_var("KACHE_DURABILITY_FLUSH_IDLE_MS") };
+        assert_eq!(durability_flush_idle(), DURABILITY_FLUSH_IDLE);
+    }
+
     fn save_manifest_config(
         cache_dir: std::path::PathBuf,
         remote: Option<crate::config::RemoteConfig>,
@@ -8796,6 +8986,7 @@ mod tests {
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            deferred_durability: false,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,

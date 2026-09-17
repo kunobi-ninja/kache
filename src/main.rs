@@ -151,6 +151,11 @@ enum Commands {
         stale_schema: bool,
     },
 
+    /// Flush entries stored without an fsync, then exit (spawned by the
+    /// wrapper after a miss; see `[cache] deferred_durability`).
+    #[command(hide = true)]
+    FlushDurability,
+
     /// Wipe entire cache or entries for a specific crate
     Purge {
         /// Only purge entries for this crate
@@ -686,6 +691,7 @@ fn main() -> Result<()> {
             sort,
             no_pager,
         }) => cli::list(&config, crate_name.as_deref(), &sort, no_pager, json),
+        Some(Commands::FlushDurability) => cli::run_durability_flusher(&config),
         Some(Commands::Gc {
             max_age,
             stale_schema,

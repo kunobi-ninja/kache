@@ -176,11 +176,84 @@ where
     )
 }
 
+/// [`atomic_write_and_replace_with`] whose flush the caller may defer. With
+/// `durable == false` neither the temp file nor its directory is fsynced;
+/// the rename is still atomic, so a reader sees the whole file or none. The
+/// store uses this for blobs it marks pending and flushes off the build path
+/// (deferred durability); `after_fsync` then runs after the write instead.
+pub fn atomic_write_and_replace_deferrable<F, A>(
+    dest_path: &Path,
+    allow_concurrent_winner: bool,
+    write_fn: F,
+    after_fsync: A,
+    durable: bool,
+) -> Result<bool>
+where
+    F: FnOnce(&Path) -> Result<()>,
+    A: FnOnce(&Path) -> Result<()>,
+{
+    if durable {
+        return atomic_write_and_replace_with(
+            dest_path,
+            allow_concurrent_winner,
+            write_fn,
+            after_fsync,
+        );
+    }
+    atomic_write_and_replace_core(
+        dest_path,
+        allow_concurrent_winner,
+        write_fn,
+        after_fsync,
+        false,
+        |_| Ok(()),
+    )
+}
+
+/// [`atomic_replace`] whose flush the caller may defer; see
+/// [`atomic_write_and_replace_deferrable`].
+pub fn atomic_replace_deferrable(dest_path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
+    atomic_write_and_replace_deferrable(
+        dest_path,
+        false,
+        |temp_path| {
+            fs::write(temp_path, bytes)?;
+            Ok(())
+        },
+        |_| Ok(()),
+        durable,
+    )?;
+    Ok(())
+}
+
 fn atomic_write_and_replace_with_dir_sync<F, A, D>(
     dest_path: &Path,
     allow_concurrent_winner: bool,
     write_fn: F,
     after_fsync: A,
+    sync_dir: D,
+) -> Result<bool>
+where
+    F: FnOnce(&Path) -> Result<()>,
+    A: FnOnce(&Path) -> Result<()>,
+    D: Fn(&Path) -> Result<()>,
+{
+    atomic_write_and_replace_core(
+        dest_path,
+        allow_concurrent_winner,
+        write_fn,
+        after_fsync,
+        true,
+        sync_dir,
+    )
+}
+
+fn atomic_write_and_replace_core<F, A, D>(
+    dest_path: &Path,
+    allow_concurrent_winner: bool,
+    write_fn: F,
+    after_fsync: A,
+    sync_file: bool,
     sync_dir: D,
 ) -> Result<bool>
 where
@@ -198,7 +271,9 @@ where
 
     let res = (|| -> Result<()> {
         write_fn(&temp_path)?;
-        fsync_file(&temp_path).context("flushing temp file")?;
+        if sync_file {
+            fsync_file(&temp_path).context("flushing temp file")?;
+        }
         after_fsync(&temp_path)?;
         Ok(())
     })();

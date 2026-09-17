@@ -3937,15 +3937,25 @@ impl<'db> FileHasher<'db> {
     /// Hashing here is what the memo is validated against later. It is not
     /// free on a cold build, but every hash goes through the content cache,
     /// so a header included by many translation units is read once.
+    /// Fingerprint every file a preprocessor run read, under its mapped name.
+    ///
+    /// The raw content hash comes from the file-hash memo by stamp. The
+    /// mapped hash (the bytes with this invocation's prefix maps applied) is
+    /// memoised by raw hash and map set in the same index, so the headers a
+    /// build's translation units share are read and rewritten once per map
+    /// set rather than once per unit; `maps_key` names the map set.
     pub(crate) fn cc_preprocess_fingerprints(
         &self,
         paths: &[(String, PathBuf)],
+        maps_key: &str,
         mapped_content: &impl Fn(&Path) -> Option<String>,
     ) -> Option<Vec<CcPreprocessMemoInput>> {
         if paths.is_empty() {
             return None;
         }
-        let mut inputs = Vec::with_capacity(paths.len());
+        let _trace = crate::phase_trace::phase("cc_fingerprints");
+        let mut pending: Vec<(String, FileFingerprint, String, PathBuf)> =
+            Vec::with_capacity(paths.len());
         for (name, path) in paths {
             let fingerprint = match FileFingerprint::from_path(path) {
                 Ok(fingerprint) => fingerprint,
@@ -3968,17 +3978,98 @@ impl<'db> FileHasher<'db> {
                     return None;
                 }
             };
-            let mapped = mapped_content(path)?;
+            pending.push((name.clone(), fingerprint, content, path.clone()));
+        }
+        let memo = self.cache.as_ref().filter(|_| !maps_key.is_empty());
+        let known = match memo {
+            Some(cache) => {
+                let contents: Vec<&str> = pending.iter().map(|p| p.2.as_str()).collect();
+                cache
+                    .get_cc_mapped_hashes(maps_key, &contents)
+                    .unwrap_or_else(|error| {
+                        tracing::debug!("cc mapped hash memo lookup failed: {error}");
+                        Default::default()
+                    })
+            }
+            None => Default::default(),
+        };
+        let mut known = known;
+        let mut learned: Vec<(String, String)> = Vec::new();
+        let mut inputs = Vec::with_capacity(pending.len());
+        for (name, fingerprint, content, path) in pending {
+            let mapped = match known.get(&content) {
+                Some(mapped) => mapped.clone(),
+                None => {
+                    let mapped = mapped_content(&path)?;
+                    known.insert(content.clone(), mapped.clone());
+                    learned.push((content.clone(), mapped.clone()));
+                    mapped
+                }
+            };
             inputs.push(CcPreprocessMemoInput {
-                name: name.clone(),
+                name,
                 fingerprint,
                 content,
                 mapped,
             });
         }
+        if let Some(cache) = memo
+            && let Err(error) = cache.put_cc_mapped_hashes(maps_key, &learned)
+        {
+            tracing::debug!("cc mapped hash memo update failed: {error}");
+        }
         inputs.sort_by(|a, b| a.name.cmp(&b.name));
         inputs.dedup_by(|a, b| a.name == b.name);
         Some(inputs)
+    }
+
+    /// The first input whose raw text hides a file the assembler would read,
+    /// scanning each distinct content once: the verdict is memoised by raw
+    /// content hash, so a header shared by many units is read once. `scan`
+    /// returns `None` for a file it cannot read (skipped, not recorded),
+    /// `Some(None)` for a clean file, `Some(Some(construct))` otherwise.
+    pub(crate) fn cc_inputs_hide_assembler_input(
+        &self,
+        inputs: &[CcPreprocessMemoInput],
+        scan: &impl Fn(&Path) -> Option<Option<&'static str>>,
+    ) -> Option<String> {
+        let _trace = crate::phase_trace::phase("cc_asm_scan");
+        let known = match &self.cache {
+            Some(cache) => {
+                let contents: Vec<&str> = inputs.iter().map(|i| i.content.as_str()).collect();
+                cache.get_cc_asm_scans(&contents).unwrap_or_else(|error| {
+                    tracing::debug!("cc assembler scan memo lookup failed: {error}");
+                    Default::default()
+                })
+            }
+            None => Default::default(),
+        };
+        let mut known = known;
+        let mut learned: Vec<(String, String)> = Vec::new();
+        let mut found: Option<String> = None;
+        for input in inputs {
+            let verdict = match known.get(&input.content) {
+                Some(construct) => construct.clone(),
+                None => {
+                    let Some(scanned) = scan(Path::new(&input.fingerprint.path)) else {
+                        continue;
+                    };
+                    let construct = scanned.unwrap_or("").to_string();
+                    known.insert(input.content.clone(), construct.clone());
+                    learned.push((input.content.clone(), construct.clone()));
+                    construct
+                }
+            };
+            if !verdict.is_empty() && found.is_none() {
+                found = Some(verdict);
+            }
+        }
+        if let Some(cache) = &self.cache
+            && let Err(error) = cache.put_cc_asm_scans(&learned)
+        {
+            tracing::debug!("cc assembler scan memo update failed: {error}");
+        }
+        found
     }
 
     /// Commit a pending preprocessor memo after proving its inputs held the
@@ -10523,6 +10614,154 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         assert!(persistent.supports_cc_preprocess_memo());
     }
 
+    /// The mapped hash is memoised by raw content and map set: a second unit
+    /// that reads the same bytes, at any path, takes the memo instead of
+    /// reading and rewriting the file; another map set or an empty key does
+    /// not; a memo error or a missing store still computes.
+    #[test]
+    fn mapped_hashes_are_memoised_by_content_and_map_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let header = dir.path().join("header.h");
+        let copy = dir.path().join("copy.h");
+        let other = dir.path().join("other.h");
+        // Above MIN_PERSISTED_HASH_BYTES so the raw hash itself is memoised.
+        let body = "#define VALUE 1\n".repeat(64);
+        std::fs::write(&header, &body).unwrap();
+        std::fs::write(&copy, &body).unwrap();
+        std::fs::write(&other, format!("{body}#define OTHER 2\n")).unwrap();
+        let reads = std::cell::Cell::new(0usize);
+        let counting = |path: &Path| -> Option<String> {
+            reads.set(reads.get() + 1);
+            let bytes = std::fs::read(path).ok()?;
+            Some(
+                blake3::hash(&[b"mapped:".as_slice(), &bytes].concat())
+                    .to_hex()
+                    .to_string(),
+            )
+        };
+        let name = |path: &Path| (path.to_string_lossy().into_owned(), path.to_path_buf());
+
+        let hasher = FileHasher::persistent(&db);
+        let first = hasher
+            .cc_preprocess_fingerprints(&[name(&header)], "maps-a", &counting)
+            .unwrap();
+        assert_eq!(reads.get(), 1);
+        let second = hasher
+            .cc_preprocess_fingerprints(&[name(&copy), name(&other)], "maps-a", &counting)
+            .unwrap();
+        assert_eq!(
+            reads.get(),
+            2,
+            "the copy took the memo, the other file did not"
+        );
+        let by_name: std::collections::HashMap<_, _> =
+            second.iter().map(|i| (i.name.as_str(), i)).collect();
+        assert_eq!(by_name[name(&copy).0.as_str()].mapped, first[0].mapped);
+        assert_ne!(by_name[name(&other).0.as_str()].mapped, first[0].mapped);
+
+        // A fresh process (new hasher on the same index) still has the memo.
+        let later = FileHasher::persistent(&db);
+        later
+            .cc_preprocess_fingerprints(&[name(&header)], "maps-a", &counting)
+            .unwrap();
+        assert_eq!(reads.get(), 2, "the memo survives the process");
+        // Another map set rewrites bytes differently and computes again.
+        later
+            .cc_preprocess_fingerprints(&[name(&header)], "maps-b", &counting)
+            .unwrap();
+        assert_eq!(reads.get(), 3);
+        // An empty key never memoises.
+        later
+            .cc_preprocess_fingerprints(&[name(&header)], "", &counting)
+            .unwrap();
+        later
+            .cc_preprocess_fingerprints(&[name(&header)], "", &counting)
+            .unwrap();
+        assert_eq!(reads.get(), 5);
+        // Without a store, every unit computes.
+        let bare = FileHasher::new();
+        bare.cc_preprocess_fingerprints(&[name(&header)], "maps-a", &counting)
+            .unwrap();
+        assert_eq!(reads.get(), 6);
+    }
+
+    /// The assembler scan runs once per distinct content and its verdict is
+    /// memoised across processes; an unreadable file is skipped and not
+    /// recorded.
+    #[test]
+    fn assembler_scans_are_memoised_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("idx.sqlite");
+        let clean = dir.path().join("clean.h");
+        let twin = dir.path().join("twin.h");
+        let pasted = dir.path().join("pasted.h");
+        let body = "#define VALUE 1\n".repeat(64);
+        std::fs::write(&clean, &body).unwrap();
+        std::fs::write(&twin, &body).unwrap();
+        std::fs::write(
+            &pasted,
+            format!("{body}__asm__(\".incbin \\\"blob\\\"\");\n"),
+        )
+        .unwrap();
+        let scans = std::cell::Cell::new(0usize);
+        let scan = |path: &Path| -> Option<Option<&'static str>> {
+            scans.set(scans.get() + 1);
+            let text = std::fs::read_to_string(path).ok()?;
+            Some(text.contains(".incbin").then_some(".incbin"))
+        };
+        let name = |path: &Path| (path.to_string_lossy().into_owned(), path.to_path_buf());
+        let hasher = FileHasher::persistent(&db);
+        let inputs = hasher
+            .cc_preprocess_fingerprints(&[name(&clean), name(&twin)], "", &|_| Some(String::new()))
+            .unwrap();
+        assert_eq!(hasher.cc_inputs_hide_assembler_input(&inputs, &scan), None);
+        assert_eq!(scans.get(), 1, "twins share one scan");
+        let later = FileHasher::persistent(&db);
+        let inputs =
+            later
+                .cc_preprocess_fingerprints(&[name(&clean), name(&pasted)], "", &|_| {
+                    Some(String::new())
+                })
+                .unwrap();
+        assert_eq!(
+            later
+                .cc_inputs_hide_assembler_input(&inputs, &scan)
+                .as_deref(),
+            Some(".incbin")
+        );
+        assert_eq!(
+            scans.get(),
+            2,
+            "the clean verdict survived the process; only the new file was scanned"
+        );
+        assert_eq!(
+            later
+                .cc_inputs_hide_assembler_input(&inputs, &scan)
+                .as_deref(),
+            Some(".incbin"),
+            "the construct verdict is memoised too"
+        );
+        assert_eq!(scans.get(), 2);
+        // An unreadable file is skipped and left for the next run.
+        let mut gone = inputs.clone();
+        gone[0].fingerprint.path = dir.path().join("absent.h").to_string_lossy().into_owned();
+        gone[0].content = "c".repeat(64);
+        assert_eq!(
+            later.cc_inputs_hide_assembler_input(&gone[..1], &scan),
+            None
+        );
+        assert_eq!(
+            later.cc_inputs_hide_assembler_input(&gone[..1], &scan),
+            None
+        );
+        assert_eq!(
+            scans.get(),
+            4,
+            "an unreadable file is scanned again next time"
+        );
+    }
+
     #[test]
     fn cc_preprocess_memo_requires_every_input_fingerprint_to_match() {
         let dir = tempfile::tempdir().unwrap();
@@ -10539,6 +10778,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
                     (source.to_string_lossy().into_owned(), source.clone()),
                     (header.to_string_lossy().into_owned(), header.clone()),
                 ],
+                "",
                 &no_mapping,
             )
             .unwrap();
@@ -10666,6 +10906,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let inputs = hasher
             .cc_preprocess_fingerprints(
                 &[("<root>/gen.h".to_string(), a.join("gen.h"))],
+                "",
                 &map_under(&a),
             )
             .unwrap();
@@ -10730,6 +10971,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         let inputs = hasher
             .cc_preprocess_fingerprints(
                 &[("<root>/source.c".to_string(), source_of(&original))],
+                "",
                 &no_mapping,
             )
             .unwrap();
@@ -10786,6 +11028,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
                     (source.to_string_lossy().into_owned(), source.clone()),
                     (header.to_string_lossy().into_owned(), header.clone()),
                 ],
+                "",
                 &no_mapping,
             )
             .unwrap();

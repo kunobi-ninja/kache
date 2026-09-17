@@ -153,6 +153,7 @@ impl<'db> FileHashCache<'db> {
 
 pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
     crate::cc_memo::ensure_schema(db)?;
+    crate::cc_memo::ensure_mapped_hash_schema(db)?;
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS file_hashes (
             path       TEXT PRIMARY KEY,

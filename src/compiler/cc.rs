@@ -2221,9 +2221,11 @@ fn preprocess_hash(
                     .into_iter()
                     .map(|path| (cc_mapped_path(&path, prefix_maps), path))
                     .collect();
-                file_hasher.cc_preprocess_fingerprints(&mapped, &|path| {
-                    cc_mapped_content_hash(path, prefix_maps)
-                })
+                file_hasher.cc_preprocess_fingerprints(
+                    &mapped,
+                    &cc_prefix_maps_key(prefix_maps),
+                    &|path| cc_mapped_content_hash(path, prefix_maps),
+                )
             }
             Err(error) => {
                 tracing::debug!("cc preprocess dependency capture unavailable: {error:#}");
@@ -5118,6 +5120,28 @@ fn cc_mapped_path(path: &Path, prefix_maps: &[CcPrefixMap]) -> String {
 /// not, and the expansion each produces is identical. Comparing raw bytes
 /// alone therefore made the memo stricter than the key it feeds. `None` when
 /// the file cannot be read, which the caller treats as "cannot reuse".
+/// Identity of a map set for the mapped-hash memo: every `from => to` pair,
+/// ordered by source. Two invocations with the same pairs rewrite bytes the
+/// same way, whatever order the pairs were derived in.
+fn cc_prefix_maps_key(prefix_maps: &[CcPrefixMap]) -> String {
+    let mut pairs: Vec<(&str, &str)> = prefix_maps
+        .iter()
+        .filter(|map| !map.from.is_empty())
+        .map(|map| (map.from.as_str(), map.to.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache.cc.maps.v1\0");
+    for (from, to) in pairs {
+        hasher.update(from.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(to.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 fn cc_mapped_content_hash(path: &Path, prefix_maps: &[CcPrefixMap]) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let mapped = apply_cc_prefix_maps_to_bytes(bytes, prefix_maps);
@@ -5887,6 +5911,7 @@ fn cc_direct_probe(program: &str) -> bool {
 /// The first construct in any of `paths` that could make the assembler read
 /// a file no fingerprint covers. The classic path scans the expansion; a
 /// compile-first key never sees one, so it scans what the compile read.
+#[cfg(test)]
 fn cc_inputs_hide_assembler_input(paths: &[PathBuf]) -> Option<&'static str> {
     paths.iter().find_map(|path| {
         let bytes = fs::read(path).ok()?;
@@ -7070,20 +7095,29 @@ impl CcCompiler {
                 cwd.join(source)
             });
         }
-        if let Some(construct) = cc_inputs_hide_assembler_input(&paths) {
+        let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
+        let mapped: Vec<(String, PathBuf)> = paths
+            .into_iter()
+            .map(|path| (cc_mapped_path(&path, &prefix_maps), path))
+            .collect();
+        let inputs = file_hasher.cc_preprocess_fingerprints(
+            &mapped,
+            &cc_prefix_maps_key(&prefix_maps),
+            &|path| cc_mapped_content_hash(path, &prefix_maps),
+        )?;
+        // After the fingerprints: the scan is memoised by the content hash
+        // they carry, so a header shared by every unit is read once.
+        if let Some(construct) = file_hasher.cc_inputs_hide_assembler_input(&inputs, &|path| {
+            let bytes = fs::read(path).ok()?;
+            Some(cc_raw_assembler_hidden_input(&bytes))
+        }) {
             tracing::debug!(
                 "cc: {} not keyed from its read set: the assembler may read a file the key cannot see (`{construct}`)",
                 cc_trace_name(parsed)
             );
             return None;
         }
-        let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
-        let mapped: Vec<(String, PathBuf)> = paths
-            .into_iter()
-            .map(|path| (cc_mapped_path(&path, &prefix_maps), path))
-            .collect();
-        file_hasher
-            .cc_preprocess_fingerprints(&mapped, &|path| cc_mapped_content_hash(path, &prefix_maps))
+        Some(inputs)
     }
 
     /// Run the compiler. With `bind_on_embedded_root`, an object that spells
@@ -14461,6 +14495,51 @@ mod tests {
                 "/work/job-b/target/debug/build/libfoo-sys-abc123/out/include/x.h"
             )],
             "a recorded name resolves to this build directory's file"
+        );
+    }
+
+    /// The map-set key follows the pairs, not their order or duplicates, and
+    /// changes with either side of any pair.
+    #[test]
+    fn prefix_maps_key_follows_the_pairs_only() {
+        let map = |from: &str, to: &str| CcPrefixMap {
+            from: from.to_string(),
+            to: to.to_string(),
+        };
+        let a = cc_prefix_maps_key(&[
+            map("/w/a", "/kache/root"),
+            map("/w/a/target", "/kache/cc-target"),
+        ]);
+        let reordered = cc_prefix_maps_key(&[
+            map("/w/a/target", "/kache/cc-target"),
+            map("/w/a", "/kache/root"),
+        ]);
+        let duplicated = cc_prefix_maps_key(&[
+            map("/w/a", "/kache/root"),
+            map("/w/a", "/kache/root"),
+            map("/w/a/target", "/kache/cc-target"),
+        ]);
+        assert_eq!(a, reordered);
+        assert_eq!(a, duplicated);
+        assert_ne!(
+            a,
+            cc_prefix_maps_key(&[
+                map("/w/b", "/kache/root"),
+                map("/w/a/target", "/kache/cc-target")
+            ])
+        );
+        assert_ne!(
+            a,
+            cc_prefix_maps_key(&[
+                map("/w/a", "/kache/other"),
+                map("/w/a/target", "/kache/cc-target")
+            ])
+        );
+        assert_ne!(a, cc_prefix_maps_key(&[map("/w/a", "/kache/root")]));
+        assert_eq!(
+            cc_prefix_maps_key(&[map("", "/kache/root")]),
+            cc_prefix_maps_key(&[]),
+            "an empty source maps nothing and does not key"
         );
     }
 

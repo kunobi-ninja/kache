@@ -35,7 +35,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, hk-comparison, surrealdb, lance, opendal, cuda-oxide, eza, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx]
+        options: [all, hk-comparison, surrealdb, lance, opendal, cuda-oxide, cuda-oxide-patched, eza, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx]
         default: all
       extra_args:
         description: "Extra recipe arguments (hk/eza: sample count; other scenarios: --skip-clone, --retry)"
@@ -115,6 +115,9 @@ jobs:
           # into one target dir. Needs the CUDA toolkit headers and LLVM 22,
           # installed only for this arm below.
           cuda_oxide='{"name":"cuda-oxide","cmd":"bench cuda-oxide --warm-same-tree","dir":"bench-cuda-oxide","timeout":120,"job_timeout":180,"min_free_gb":40,"runner":"kunobi-runners"}'
+          # The same job with a cuda-oxide patch that declares every backend
+          # output, so kache can trust and cache the backend compiles.
+          cuda_oxide_patched='{"name":"cuda-oxide-patched","cmd":"bench cuda-oxide-patched --warm-same-tree","dir":"bench-cuda-oxide-patched","timeout":120,"job_timeout":180,"min_free_gb":40,"runner":"kunobi-runners"}'
           # Full cold Firefox build is the long pole — hours. `bench firefox`
           # resolves to the exact `bench-firefox` scenario: `--profile firefox`
           # is a name SUBSTRING match that also catches `bench-firefox-windows`,
@@ -176,6 +179,7 @@ jobs:
             lance)                inc="[$lance]" ;;
             opendal)              inc="[$opendal]" ;;
             cuda-oxide)           inc="[$cuda_oxide]" ;;
+            cuda-oxide-patched)   inc="[$cuda_oxide_patched]" ;;
             llvm)                 inc="[$llvm]" ;;
             hk-comparison)       inc="[$hk,$hk_nopred,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx]" ;;
             hk)                   inc="[$hk]" ;;
@@ -193,7 +197,7 @@ jobs:
             # below, so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`
             # and wastefully run the whole Linux `all` matrix alongside.
-            *)                    inc="[$surrealdb,$lance,$opendal,$cuda_oxide,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
+            *)                    inc="[$surrealdb,$lance,$opendal,$cuda_oxide,$cuda_oxide_patched,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
           esac
           if [ "$EVENT_NAME" = "schedule" ]; then
             inc="$(jq -c --argjson extra "[$firefox,$firefox_sccache,$firefox_pull]" '. + $extra' <<<"$inc")"
@@ -303,7 +307,7 @@ jobs:
       # upstream examples-compile job: CUDA 13.1 nvcc, cudart-dev, curand-dev
       # and nvjitlink-dev, plus LLVM 22 from apt.llvm.org.
       - name: Install CUDA toolkit and LLVM 22 (cuda-oxide only)
-        if: matrix.name == 'cuda-oxide'
+        if: startsWith(matrix.name, 'cuda-oxide')
         timeout-minutes: 15
         run: |
           set -euo pipefail

@@ -583,6 +583,11 @@ mod tests {
             .unwrap();
         assert_eq!(cuda_oxide.source_kind, SourceKind::Clone);
         assert!(cuda_oxide.tags.contains(&"project:cuda-oxide".to_string()));
+        assert!(
+            scenarios
+                .iter()
+                .any(|scenario| scenario.name == "bench-cuda-oxide-patched")
+        );
 
         let c_hello = scenarios
             .iter()

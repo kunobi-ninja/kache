@@ -1,0 +1,103 @@
+# cuda-oxide with a patch that makes its builds cacheable: the same subject,
+# commit, toolchain and build command as bench-cuda-oxide, plus
+# patches/cuda-oxide-materialize-side-files.patch.
+#
+# The unpatched backend writes device artifacts (.ptx, .ll, ...) next to each
+# crate, outside rustc's declared outputs, so kache runs those compiles
+# directly. The patch embeds everything the side files hold in the binary and
+# has cargo-oxide write the files from the binary after every build, comparing
+# bytes where a real build already wrote them. With it, the backend's outputs
+# are all declared, so this arm trusts the backend
+# (KACHE_TRUST_CODEGEN_BACKENDS=1) and kache caches those compiles. The
+# smoketest still checks every device artifact, so a hit that lost one fails.
+name = "bench-cuda-oxide-patched"
+tags = ["suite:bench", "project:cuda-oxide", "backend:kache", "lang:rust"]
+
+requires = ["cargo", "rustc", "clang"]
+
+setup = [
+  "echo '[bench] cuda-oxide needs the CUDA toolkit headers (cuda-nvcc, cuda-cudart-dev, libcurand-dev, libnvjitlink-dev) for bindgen, LLVM 22 llc for PTX, and clang/libclang. Set CUDA_TOOLKIT_PATH and CUDA_OXIDE_LLC if they are not at /usr/local/cuda and on PATH.'",
+]
+
+# `cargo oxide` is a Cargo alias in the tree (`run --package cargo-oxide`), so
+# the build compiles cargo-oxide itself inside the timed phase, as upstream CI
+# does.
+#
+# The tree's rust-toolchain.toml pins a nightly with rustc-dev, which the
+# codegen backend links against. A RUSTUP_TOOLCHAIN inherited from the bench
+# host (mise exports kache's own pin) would override that file and the backend
+# would fail with "can't find crate for rustc_driver", so it is unset here and
+# in the build. `rustup toolchain install` with no argument installs the
+# toolchain and components the file names, untimed.
+prepare = "unset RUSTUP_TOOLCHAIN && rustup toolchain install"
+
+# The upstream examples-compile step, run as upstream runs it: one shared
+# target dir for every example workspace, compile only.
+#
+# The codegen backend is built on the first `cargo oxide build` at
+# crates/rustc-codegen-cuda/target, outside the objdir the engine wipes. The
+# build removes that directory first, so every phase, including the same-tree
+# warm phase, builds the backend once as upstream CI does.
+#
+# Cross-clone hits are limited by Cargo, not kache: the backend is its own
+# workspace and its dialect/lowering crates are path dependencies outside it,
+# so Cargo hashes their absolute path into -C metadata. Each clone therefore
+# links a different backend, cargo-oxide's backend identity cfg changes, and
+# every downstream key follows. The same-tree phase is the one that matches CI
+# checking out at a fixed path.
+build = """
+# Input-set predictions, with a sampled cross-check (kunobi-ninja/kache#945).
+export KACHE_INPUT_PREDICTIONS=1
+export KACHE_VERIFY_INPUT_PREDICTIONS=sampled
+
+# The patch declares every backend output, so the backend can be trusted.
+export KACHE_TRUST_CODEGEN_BACKENDS=1
+
+# See prepare: the subject's rust-toolchain.toml must pick the compiler.
+unset RUSTUP_TOOLCHAIN
+
+repo="$(pwd -P)"
+rm -rf "$repo/crates/rustc-codegen-cuda/target"
+export KACHE_BASE_DIR="$repo"
+export CARGO_TARGET_DIR="$repo/target"
+# The smoketest greps Cargo's output for `error: could not compile` in its
+# expected-failure examples. The bench workflow exports CARGO_TERM_COLOR=always,
+# and the colour codes would hide that text.
+export CARGO_TERM_COLOR=never
+
+export CUDA_TOOLKIT_PATH="${CUDA_TOOLKIT_PATH:-/usr/local/cuda}"
+if [ -z "${CUDA_OXIDE_LLC:-}" ]; then
+  CUDA_OXIDE_LLC="$(command -v llc-22 || command -v llc || true)"
+fi
+if [ -z "$CUDA_OXIDE_LLC" ]; then
+  echo '[bench] no llc found; install LLVM 22 or set CUDA_OXIDE_LLC' >&2
+  exit 1
+fi
+export CUDA_OXIDE_LLC
+
+# The backend links rustc's private dylibs from the pinned sysroot.
+sysroot="$(rustc --print sysroot)"
+export LIBRARY_PATH="$sysroot/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$sysroot/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Per-example logs go where the bench workflow uploads them (logs/ in the work
+# dir), one directory per clone.
+export SMOKETEST_LOG_DIR="$repo/../logs/smoketest-$(basename "$repo")"
+
+bash scripts/smoketest.sh --compile-only --no-color
+"""
+
+[source]
+kind = "clone"
+repo = "https://github.com/NVlabs/cuda-oxide.git"
+# main as of 2026-09-15. Upstream's examples-compile job passed on this commit
+# in 9m16s (NVlabs/cuda-oxide actions run 34943345905). The last tag, v0.2.1,
+# predates that job and most of the examples. rust-toolchain.toml pins
+# nightly-2026-08-28.
+ref    = "7ce30ec798c490e6ed772dfcbad193b3733fe55a"
+objdir = "target"
+
+[[file]]
+path         = "crates/cargo-oxide, crates/rustc-codegen-cuda"
+mode         = "patch"
+content_file = "patches/cuda-oxide-materialize-side-files.patch"

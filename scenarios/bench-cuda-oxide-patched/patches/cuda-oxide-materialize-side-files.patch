@@ -1,0 +1,703 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 9902a4ac..448fadd0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -212,6 +212,7 @@ dependencies = [
+  "cuda-artifact-finalizer",
+  "libnvvm-sys",
+  "nvjitlink-sys",
++ "object",
+  "oxide-artifacts 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+  "ptx-parse",
+  "ptx-schedule",
+diff --git a/crates/cargo-oxide/Cargo.toml b/crates/cargo-oxide/Cargo.toml
+index 7c34766a..475277da 100644
+--- a/crates/cargo-oxide/Cargo.toml
++++ b/crates/cargo-oxide/Cargo.toml
+@@ -22,6 +22,8 @@ clap = { version = "4", features = ["derive"] }
+ cuda-artifact-finalizer = { workspace = true }
+ libnvvm-sys = { workspace = true }
+ nvjitlink-sys = { workspace = true }
++# Reads embedded side files from built binaries and rlibs; same version as oxide-artifacts uses.
++object = { version = "0.36", default-features = false, features = ["read", "std"] }
+ oxide-artifacts = { workspace = true }
+ ptx-parse = { workspace = true }
+ ptx-schedule = { workspace = true }
+diff --git a/crates/cargo-oxide/src/commands/artifacts.rs b/crates/cargo-oxide/src/commands/artifacts.rs
+index 85ddd2ea..f11634bd 100644
+--- a/crates/cargo-oxide/src/commands/artifacts.rs
++++ b/crates/cargo-oxide/src/commands/artifacts.rs
+@@ -104,6 +104,8 @@ pub(super) const GENERATED_ARTIFACT_SUFFIXES: &[&str] = &[
+     "ptx",
+     "ll",
+     "opt.ll",
++    "linked.ll",
++    "linked.opt.ll",
+     "ltoir",
+     "cubin",
+     "cubin.tmp",
+diff --git a/crates/cargo-oxide/src/commands/build_run.rs b/crates/cargo-oxide/src/commands/build_run.rs
+index 6e5b2979..d3c5b728 100644
+--- a/crates/cargo-oxide/src/commands/build_run.rs
++++ b/crates/cargo-oxide/src/commands/build_run.rs
+@@ -395,7 +395,7 @@ pub fn codegen_build(
+     println!("Building {}...", example);
+     println!();
+ 
+-    let status = cmd.status().expect("Failed to run cargo");
++    let status = run_cargo_build_restoring_side_files(&mut cmd, &example_dir);
+     if !status.success() {
+         eprintln!("\nBuild failed with exit code: {:?}", status.code());
+         std::process::exit(status.code().unwrap_or(1));
+diff --git a/crates/cargo-oxide/src/commands/interop.rs b/crates/cargo-oxide/src/commands/interop.rs
+index 13d8c532..1d4b4b28 100644
+--- a/crates/cargo-oxide/src/commands/interop.rs
++++ b/crates/cargo-oxide/src/commands/interop.rs
+@@ -623,7 +623,7 @@ fn build_interop_device_crate(
+     );
+     apply_device_arch_hint(&mut cmd, arch, detected_device_arch);
+ 
+-    let status = cmd.status().expect("Failed to build interop device crate");
++    let status = run_cargo_build_restoring_side_files(&mut cmd, device_dir);
+     if !status.success() {
+         eprintln!(
+             "\nDevice crate build failed with exit code: {:?}",
+diff --git a/crates/cargo-oxide/src/commands/mod.rs b/crates/cargo-oxide/src/commands/mod.rs
+index f0a94b18..f78eda75 100644
+--- a/crates/cargo-oxide/src/commands/mod.rs
++++ b/crates/cargo-oxide/src/commands/mod.rs
+@@ -26,6 +26,7 @@ mod passthrough;
+ mod pipeline_debug;
+ mod scaffold;
+ mod setup_update;
++mod side_files;
+ #[cfg(test)]
+ mod tests;
+ mod toolkit;
+@@ -47,4 +48,5 @@ pub use passthrough::*;
+ pub use pipeline_debug::*;
+ pub use scaffold::*;
+ pub use setup_update::*;
++use side_files::*;
+ use toolkit::*;
+diff --git a/crates/cargo-oxide/src/commands/side_files.rs b/crates/cargo-oxide/src/commands/side_files.rs
+new file mode 100644
+index 00000000..03630669
+--- /dev/null
++++ b/crates/cargo-oxide/src/commands/side_files.rs
+@@ -0,0 +1,315 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++//! Restore device side files from the built binaries and rlibs.
++//!
++//! The backend writes `<crate>.ptx`, `<crate>.ll`, and their siblings while
++//! rustc runs, outside rustc's declared outputs. A compiler cache that
++//! restores those outputs without running rustc skips that write. The same
++//! bytes are embedded in the build (`.oxart` holds the device artifact,
++//! `.oxside` the other side files), so after each successful build we write
++//! them back from there. A file that the build already wrote must match the
++//! embedded copy byte for byte; an older file is stale and gets replaced, as
++//! rustc would have replaced it.
++
++use std::collections::BTreeMap;
++use std::ffi::{OsStr, OsString};
++use std::io::{BufRead, BufReader};
++use std::path::{Path, PathBuf};
++use std::process::{Command, ExitStatus, Stdio};
++use std::time::SystemTime;
++
++use object::{Object, ObjectSection};
++use oxide_artifacts::{ArtifactPayloadKind, OwnedArtifactBundle};
++
++const SIDE_FILE_SECTION_NAME: &str = ".oxside";
++
++/// A binary or rlib that Cargo reports for a path package.
++struct BuiltArtifact {
++    /// Crate name of the target; its side files are named `<crate>.<suffix>`.
++    crate_name: String,
++    manifest_dir: PathBuf,
++    path: PathBuf,
++    is_rlib: bool,
++    /// Cargo reused it without invoking rustc, so no side files were written.
++    fresh: bool,
++}
++
++/// Run the `cargo build` in `cmd`, then restore device side files if it
++/// succeeded.
++///
++/// The backend writes side files into `CUDA_OXIDE_PTX_DIR` when set, and
++/// otherwise into rustc's working directory: `workspace_root` for path
++/// packages under it, the package directory for other path packages.
++pub(super) fn run_cargo_build_restoring_side_files(
++    cmd: &mut Command,
++    workspace_root: &Path,
++) -> ExitStatus {
++    // Cargo still renders diagnostics to stderr; only stdout becomes JSON.
++    cmd.arg("--message-format=json-render-diagnostics")
++        .stdout(Stdio::piped());
++    let started = SystemTime::now();
++    let mut child = cmd.spawn().expect("Failed to run cargo");
++    let stdout = child.stdout.take().expect("cargo stdout is piped");
++    let mut artifacts = Vec::new();
++    for line in BufReader::new(stdout).lines() {
++        let line = line.expect("Failed to read cargo output");
++        match serde_json::from_str::<serde_json::Value>(&line) {
++            Ok(message) => artifacts.extend(built_artifacts(&message)),
++            Err(_) => println!("{line}"),
++        }
++    }
++    let status = child.wait().expect("Failed to run cargo");
++    if status.success() {
++        let ptx_dir = command_env(cmd, "CUDA_OXIDE_PTX_DIR").map(PathBuf::from);
++        if let Err(error) =
++            restore_side_files(&artifacts, workspace_root, ptx_dir.as_deref(), started)
++        {
++            eprintln!("Error: could not restore device side files: {error}");
++            std::process::exit(1);
++        }
++    }
++    status
++}
++
++fn built_artifacts(message: &serde_json::Value) -> Vec<BuiltArtifact> {
++    if message["reason"] != "compiler-artifact"
++        || !message["package_id"]
++            .as_str()
++            .is_some_and(|id| id.starts_with("path+"))
++    {
++        return Vec::new();
++    }
++    let (Some(name), Some(manifest_dir)) = (
++        message["target"]["name"].as_str(),
++        message["manifest_path"]
++            .as_str()
++            .and_then(|path| Path::new(path).parent()),
++    ) else {
++        return Vec::new();
++    };
++    let artifact = |path: &str, is_rlib| BuiltArtifact {
++        crate_name: name.replace('-', "_"),
++        manifest_dir: manifest_dir.to_path_buf(),
++        path: PathBuf::from(path),
++        is_rlib,
++        fresh: message["fresh"] == true,
++    };
++    let rlibs = message["filenames"]
++        .as_array()
++        .into_iter()
++        .flatten()
++        .filter_map(|path| path.as_str())
++        .filter(|path| path.ends_with(".rlib"))
++        .map(|path| artifact(path, true));
++    let executable = message["executable"]
++        .as_str()
++        .map(|path| artifact(path, false));
++    rlibs.chain(executable).collect()
++}
++
++fn command_env(cmd: &Command, key: &str) -> Option<OsString> {
++    match cmd.get_envs().find(|(name, _)| *name == OsStr::new(key)) {
++        Some((_, value)) => value.map(OsStr::to_os_string),
++        None => std::env::var_os(key),
++    }
++}
++
++fn restore_side_files(
++    artifacts: &[BuiltArtifact],
++    workspace_root: &Path,
++    ptx_dir: Option<&Path>,
++    started: SystemTime,
++) -> Result<(), String> {
++    let workspace_root = canonical(workspace_root)?;
++    // Restore only what rustc would have written in this build: nothing for
++    // artifacts Cargo reused. Later artifacts win, as a later rustc overwrote
++    // the file. A binary also holds the `.oxart` bundles of the libraries it
++    // links; those came from the rlibs, so skip them rather than let them
++    // shadow its own.
++    let mut files = BTreeMap::<PathBuf, Vec<u8>>::new();
++    let mut library_bundles = Vec::new();
++    for artifact in artifacts {
++        if artifact.fresh && !artifact.is_rlib {
++            continue;
++        }
++        let manifest_dir = canonical(&artifact.manifest_dir)?;
++        let rustc_dir = if manifest_dir.starts_with(&workspace_root) {
++            &workspace_root
++        } else {
++            &manifest_dir
++        };
++        let dir = ptx_dir.map_or_else(|| rustc_dir.clone(), |dir| rustc_dir.join(dir));
++        let embedded = read_embedded(&artifact.path, artifact.is_rlib)?;
++        for bundle in embedded.bundles {
++            if !artifact.is_rlib && library_bundles.contains(&bundle) {
++                continue;
++            }
++            for payload in &bundle.payloads {
++                // The backend writes only PTX and NVVM IR artifacts to disk.
++                if !artifact.fresh
++                    && matches!(
++                        payload.kind,
++                        ArtifactPayloadKind::Ptx | ArtifactPayloadKind::NvvmIr
++                    )
++                    && is_crate_file(&payload.name, &artifact.crate_name)
++                {
++                    files.insert(dir.join(&payload.name), payload.bytes.clone());
++                }
++            }
++            if artifact.is_rlib {
++                library_bundles.push(bundle);
++            }
++        }
++        for (name, bytes) in embedded.side_files {
++            if !artifact.fresh && is_crate_file(&name, &artifact.crate_name) {
++                files.insert(dir.join(name), bytes);
++            }
++        }
++    }
++
++    for (path, bytes) in files {
++        let written_by_this_build = match std::fs::metadata(&path) {
++            Ok(metadata) => metadata
++                .modified()
++                .is_ok_and(|modified| modified >= started),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
++            Err(error) => return Err(format!("could not read {}: {error}", path.display())),
++        };
++        if written_by_this_build {
++            let existing = std::fs::read(&path)
++                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
++            if existing != bytes {
++                return Err(format!(
++                    "{} differs from the copy embedded in the build",
++                    path.display()
++                ));
++            }
++        } else {
++            std::fs::write(&path, &bytes)
++                .map_err(|error| format!("could not write {}: {error}", path.display()))?;
++        }
++    }
++    Ok(())
++}
++
++fn canonical(path: &Path) -> Result<PathBuf, String> {
++    path.canonicalize()
++        .map_err(|error| format!("could not resolve {}: {error}", path.display()))
++}
++
++/// Whether `name` is `<crate_name>.<suffix>`, a file this crate's codegen writes.
++fn is_crate_file(name: &str, crate_name: &str) -> bool {
++    name.strip_prefix(crate_name)
++        .is_some_and(|rest| rest.starts_with('.') && !rest.contains(['/', '\\']))
++}
++
++#[derive(Default)]
++struct Embedded {
++    bundles: Vec<OwnedArtifactBundle>,
++    side_files: Vec<(String, Vec<u8>)>,
++}
++
++/// Read `.oxart` bundles and `.oxside` files from a binary, or from every
++/// object member of an rlib.
++fn read_embedded(path: &Path, is_rlib: bool) -> Result<Embedded, String> {
++    let context = |error: &dyn std::fmt::Display| format!("{}: {error}", path.display());
++    let data = std::fs::read(path).map_err(|error| context(&error))?;
++    let mut embedded = Embedded::default();
++    if !is_rlib {
++        read_object(&data, &mut embedded).map_err(|error| context(&error))?;
++        return Ok(embedded);
++    }
++    let archive =
++        object::read::archive::ArchiveFile::parse(&*data).map_err(|error| context(&error))?;
++    for member in archive.members() {
++        let member_data = member
++            .and_then(|member| member.data(&*data))
++            .map_err(|error| context(&error))?;
++        // Skip members that are not objects; they carry no sections.
++        if object::File::parse(member_data).is_ok() {
++            read_object(member_data, &mut embedded).map_err(|error| context(&error))?;
++        }
++    }
++    Ok(embedded)
++}
++
++fn read_object(data: &[u8], embedded: &mut Embedded) -> Result<(), String> {
++    let file = object::File::parse(data).map_err(|error| error.to_string())?;
++    for section in file.sections() {
++        let name = section.name().map_err(|error| error.to_string())?;
++        if name != oxide_artifacts::ARTIFACT_SECTION_NAME && name != SIDE_FILE_SECTION_NAME {
++            continue;
++        }
++        let bytes = section.data().map_err(|error| error.to_string())?;
++        if name == SIDE_FILE_SECTION_NAME {
++            embedded.side_files.extend(parse_side_file_section(bytes)?);
++        } else {
++            let bundles = oxide_artifacts::parse_artifact_section(bytes)
++                .map_err(|error| error.to_string())?;
++            embedded.bundles.extend(bundles.into_iter().map(Into::into));
++        }
++    }
++    Ok(())
++}
++
++/// Parse the backend's `u32 name length, name, u64 data length, data`
++/// records (little-endian). Trailing zero bytes are linker padding.
++fn parse_side_file_section(mut bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
++    fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Result<&'a [u8], String> {
++        if bytes.len() < len {
++            return Err("truncated .oxside section".to_string());
++        }
++        let (head, tail) = bytes.split_at(len);
++        *bytes = tail;
++        Ok(head)
++    }
++
++    let mut files = Vec::new();
++    while bytes.iter().any(|byte| *byte != 0) {
++        let name_len = u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap());
++        let name = std::str::from_utf8(take(&mut bytes, name_len as usize)?)
++            .map_err(|_| "non-UTF-8 file name in .oxside section".to_string())?
++            .to_string();
++        let data_len = u64::from_le_bytes(take(&mut bytes, 8)?.try_into().unwrap());
++        let data_len = usize::try_from(data_len).map_err(|error| error.to_string())?;
++        files.push((name, take(&mut bytes, data_len)?.to_vec()));
++    }
++    Ok(files)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn side_file_section_round_trips_records_and_ignores_padding() {
++        let mut section = Vec::new();
++        for (name, data) in [("demo.ll", &b"define"[..]), ("demo.opt.ll", &b""[..])] {
++            section.extend_from_slice(&(name.len() as u32).to_le_bytes());
++            section.extend_from_slice(name.as_bytes());
++            section.extend_from_slice(&(data.len() as u64).to_le_bytes());
++            section.extend_from_slice(data);
++        }
++        section.extend_from_slice(&[0; 7]);
++        assert_eq!(
++            parse_side_file_section(&section).unwrap(),
++            vec![
++                ("demo.ll".to_string(), b"define".to_vec()),
++                ("demo.opt.ll".to_string(), Vec::new()),
++            ]
++        );
++        assert!(parse_side_file_section(&section[..10]).is_err());
++    }
++
++    #[test]
++    fn only_files_named_after_the_crate_are_restored() {
++        assert!(is_crate_file("vecadd.ptx", "vecadd"));
++        assert!(is_crate_file("vecadd.linked.opt.ll", "vecadd"));
++        assert!(!is_crate_file("vecadd_lib.ptx", "vecadd"));
++        assert!(!is_crate_file("vecadd", "vecadd"));
++        assert!(!is_crate_file("vecadd./../x.ptx", "vecadd"));
++    }
++}
+diff --git a/crates/mir-importer/src/pipeline.rs b/crates/mir-importer/src/pipeline.rs
+index 81dadaa6..59c25a6e 100644
+--- a/crates/mir-importer/src/pipeline.rs
++++ b/crates/mir-importer/src/pipeline.rs
+@@ -725,6 +725,7 @@ fn stale_compilation_artifact_paths(
+ ) -> Vec<std::path::PathBuf> {
+     [
+         "ll",
++        "opt.ll",
+         "linked.ll",
+         "linked.opt.ll",
+         "ptx",
+@@ -1261,6 +1262,7 @@ fn adversarial_export_name() -> u64 {
+         fs::create_dir_all(&root).unwrap();
+         for suffix in [
+             "ll",
++            "opt.ll",
+             "linked.ll",
+             "linked.opt.ll",
+             "ptx",
+@@ -1296,6 +1298,7 @@ fn adversarial_export_name() -> u64 {
+         assert_eq!(result.artifact_kind, CompilationArtifactKind::NvvmIr);
+         assert_ne!(fs::read(&result.ll_path).unwrap(), b"stale");
+         for suffix in [
++            "opt.ll",
+             "linked.ll",
+             "linked.opt.ll",
+             "ptx",
+diff --git a/crates/rustc-codegen-cuda/Cargo.lock b/crates/rustc-codegen-cuda/Cargo.lock
+index b4fa865c..2cb947a6 100644
+--- a/crates/rustc-codegen-cuda/Cargo.lock
++++ b/crates/rustc-codegen-cuda/Cargo.lock
+@@ -741,12 +741,14 @@ dependencies = [
+  "llvm-export",
+  "mir-importer",
+  "mir-lower",
++ "object",
+  "once_cell",
+  "oxide-artifacts",
+  "pliron",
+  "pliron-derive",
+  "reserved-oxide-symbols",
+  "serde_json",
++ "sha2",
+  "thiserror",
+ ]
+ 
+diff --git a/crates/rustc-codegen-cuda/Cargo.toml b/crates/rustc-codegen-cuda/Cargo.toml
+index efaf8aa4..36a57830 100644
+--- a/crates/rustc-codegen-cuda/Cargo.toml
++++ b/crates/rustc-codegen-cuda/Cargo.toml
+@@ -25,6 +25,9 @@ dialect-mir = { path = "../dialect-mir" }
+ dialect-nvvm = { path = "../dialect-nvvm" }
+ reserved-oxide-symbols = { path = "../reserved-oxide-symbols" }
+ oxide-artifacts = { version = "0.2.1", features = ["object-write"] }
++# Writes the `.oxside` side-file section; same version as oxide-artifacts uses.
++object = { version = "0.36", default-features = false, features = ["read_core", "write"] }
++sha2 = "0.10"             # names artifact objects by content
+ # Shared driver-independent libNVVM + nvJitLink finalization policy. This
+ # crate loads CUDA compiler libraries at run time and never links libcuda.
+ cuda-artifact-finalizer = { path = "../cuda-artifact-finalizer" }
+diff --git a/crates/rustc-codegen-cuda/src/lib.rs b/crates/rustc-codegen-cuda/src/lib.rs
+index 8deaf0cf..6c317cfe 100644
+--- a/crates/rustc-codegen-cuda/src/lib.rs
++++ b/crates/rustc-codegen-cuda/src/lib.rs
+@@ -341,7 +341,6 @@ use rustc_session::{IncrCompSession, Session};
+ use std::any::Any;
+ use std::collections::BTreeSet;
+ use std::path::{Path, PathBuf};
+-use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ /// The CUDA codegen backend.
+ ///
+@@ -368,8 +367,6 @@ struct CudaOngoingCodegen {
+     artifact_objects: Vec<PathBuf>,
+ }
+ 
+-static ARTIFACT_OBJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
+-
+ /// Configuration for the CUDA codegen backend.
+ ///
+ /// All configuration is read from environment variables at backend load time.
+@@ -752,14 +749,16 @@ impl CodegenBackend for CudaCodegenBackend {
+                                 self.config.device_codegen_crates.is_some(),
+                                 materialization_request,
+                             ) {
+-                                Ok(path) => {
+-                                    if self.config.verbose {
+-                                        eprintln!(
+-                                            "[rustc_codegen_cuda] Embedded artifact object complete: {}",
+-                                            path.display()
+-                                        );
++                                Ok(paths) => {
++                                    for path in paths {
++                                        if self.config.verbose {
++                                            eprintln!(
++                                                "[rustc_codegen_cuda] Embedded artifact object complete: {}",
++                                                path.display()
++                                            );
++                                        }
++                                        artifact_objects.push(path);
+                                     }
+-                                    artifact_objects.push(path);
+                                 }
+                                 Err(e) => {
+                                     tcx.dcx().fatal(format!(
+@@ -861,7 +860,7 @@ fn write_device_artifact_object(
+     functions: &[collector::CollectedFunction<'_>],
+     use_target_specific_anchor: bool,
+     materialization_request: Option<materialize::MaterializationRequest>,
+-) -> Result<PathBuf, Box<dyn std::error::Error>> {
++) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+     let bundle_name = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| output_name.to_string());
+     let materialized_artifact = materialize_artifact_for_embedding(
+         materialization_request,
+@@ -953,7 +952,94 @@ fn write_device_artifact_object(
+     } else {
+         oxide_artifacts::build_host_object_for_target(&blob, host_target, Some(&legacy_anchor))?
+     };
+-    write_artifact_object(output_dir, output_name, host_target, &object, "embed")
++    let mut objects = vec![write_artifact_object(
++        output_dir,
++        output_name,
++        host_target,
++        &object,
++        "embed",
++    )?];
++    objects.extend(write_side_file_object(
++        output_dir,
++        output_name,
++        host_target,
++        &artifact.name,
++        &object,
++    )?);
++    Ok(objects)
++}
++
++/// Suffixes of the files device codegen writes next to its artifact.
++const SIDE_FILE_SUFFIXES: &[&str] = &[
++    "ll",
++    "linked.ll",
++    "opt.ll",
++    "linked.opt.ll",
++    "options",
++    "target",
++];
++
++/// Section holding the side files that `.oxart` does not carry.
++const SIDE_FILE_SECTION_NAME: &str = ".oxside";
++
++/// Embeds the side files this crate's device codegen left in `output_dir`
++/// (all except the artifact `.oxart` already holds) in a `.oxside` section.
++///
++/// `.oxart` carries only the final artifact, and the runtime loader reads
++/// it, so the side files go in a separate section that nothing loads. A
++/// build that restores rustc's outputs from a cache without running this
++/// backend can then restore these files too (`cargo oxide` does this after
++/// every build). Each record is `u32 name length, name, u64 data length,
++/// data`, little-endian, with no padding.
++fn write_side_file_object(
++    output_dir: &Path,
++    output_name: &str,
++    host_target: &str,
++    embedded_name: &str,
++    artifact_object: &[u8],
++) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
++    use object::Object as _;
++
++    let mut section = Vec::new();
++    for suffix in SIDE_FILE_SUFFIXES {
++        let name = format!("{output_name}.{suffix}");
++        if name == embedded_name {
++            continue;
++        }
++        let bytes = match std::fs::read(output_dir.join(&name)) {
++            Ok(bytes) => bytes,
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
++            Err(error) => return Err(error.into()),
++        };
++        section.extend_from_slice(&u32::try_from(name.len())?.to_le_bytes());
++        section.extend_from_slice(name.as_bytes());
++        section.extend_from_slice(&u64::try_from(bytes.len())?.to_le_bytes());
++        section.extend_from_slice(&bytes);
++    }
++    if section.is_empty() {
++        return Ok(None);
++    }
++
++    // Match the artifact object's format and architecture, and its section
++    // flags, so the section survives linking into a binary the same way.
++    let template = object::File::parse(artifact_object)?;
++    let mut object = object::write::Object::new(
++        template.format(),
++        template.architecture(),
++        template.endianness(),
++    );
++    let section_id = object.add_section(
++        Vec::new(),
++        SIDE_FILE_SECTION_NAME.as_bytes().to_vec(),
++        object::SectionKind::Data,
++    );
++    let side_section = object.section_mut(section_id);
++    side_section.set_data(section, 1);
++    side_section.flags = object::SectionFlags::Elf {
++        sh_flags: u64::from(object::elf::SHF_ALLOC | object::elf::SHF_GNU_RETAIN),
++    };
++    let object = object.write()?;
++    write_artifact_object(output_dir, output_name, host_target, &object, "side").map(Some)
+ }
+ 
+ fn embedded_compile_options(
+@@ -1120,18 +1206,30 @@ fn write_artifact_object(
+     object: &[u8],
+     kind: &str,
+ ) -> Result<PathBuf, Box<dyn std::error::Error>> {
++    use sha2::Digest as _;
++
+     let safe_output_name = sanitize_path_component(output_name);
+-    let artifact_id = ARTIFACT_OBJECT_COUNTER.fetch_add(1, Ordering::Relaxed);
+     let object_dir = output_dir
+         .join(".oxide-artifacts")
+         .join(&safe_output_name)
+         .join(sanitize_path_component(host_target));
+     std::fs::create_dir_all(&object_dir)?;
+-    let object_path = object_dir.join(format!(
+-        "{safe_output_name}.{}.{artifact_id}.{kind}.o",
+-        std::process::id(),
++    // rustc archives library objects under their file name, so the name must
++    // not vary between identical builds: name the object by its content.
++    // Concurrent writers of one name write identical bytes, and the rename
++    // keeps the linker from reading a partially written file.
++    let digest = sha2::Sha256::digest(object);
++    let digest: String = digest[..8]
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect();
++    let object_path = object_dir.join(format!("{safe_output_name}.{digest}.{kind}.o"));
++    let temporary_path = object_dir.join(format!(
++        "{safe_output_name}.{digest}.{kind}.o.{}.tmp",
++        std::process::id()
+     ));
+-    std::fs::write(&object_path, object)?;
++    std::fs::write(&temporary_path, object)?;
++    std::fs::rename(&temporary_path, &object_path)?;
+     Ok(object_path)
+ }
+ 
+@@ -1374,4 +1472,52 @@ mod tests {
+             Some(&b"ptx"[..])
+         );
+     }
++
++    #[test]
++    fn side_files_are_embedded_in_a_content_named_oxside_object() {
++        use object::{Object as _, ObjectSection as _};
++
++        let dir =
++            std::env::temp_dir().join(format!("cuda-codegen-side-files-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join("demo.ll"), b"define void @kernel()").unwrap();
++        std::fs::write(dir.join("demo.opt.ll"), b"").unwrap();
++        std::fs::write(dir.join("demo.ptx"), b"embedded in .oxart").unwrap();
++        let target = "x86_64-unknown-linux-gnu";
++        let artifact_object =
++            oxide_artifacts::build_host_object_for_target(b"blob", target, None).unwrap();
++
++        let path = write_side_file_object(&dir, "demo", target, "demo.ptx", &artifact_object)
++            .unwrap()
++            .unwrap();
++        let again = write_side_file_object(&dir, "demo", target, "demo.ptx", &artifact_object)
++            .unwrap()
++            .unwrap();
++        assert_eq!(path, again, "identical content must reuse one object name");
++        let file_name = path.file_name().unwrap().to_str().unwrap();
++        assert!(file_name.starts_with("demo.") && file_name.ends_with(".side.o"));
++
++        let bytes = std::fs::read(&path).unwrap();
++        let object = object::File::parse(&*bytes).unwrap();
++        let section = object.section_by_name(SIDE_FILE_SECTION_NAME).unwrap();
++        let mut expected = Vec::new();
++        for (name, data) in [
++            ("demo.ll", &b"define void @kernel()"[..]),
++            ("demo.opt.ll", b""),
++        ] {
++            expected.extend_from_slice(&(name.len() as u32).to_le_bytes());
++            expected.extend_from_slice(name.as_bytes());
++            expected.extend_from_slice(&(data.len() as u64).to_le_bytes());
++            expected.extend_from_slice(data);
++        }
++        assert_eq!(section.data().unwrap(), expected);
++
++        std::fs::remove_file(dir.join("demo.ll")).unwrap();
++        std::fs::remove_file(dir.join("demo.opt.ll")).unwrap();
++        assert_eq!(
++            write_side_file_object(&dir, "demo", target, "demo.ptx", &artifact_object).unwrap(),
++            None
++        );
++        let _ = std::fs::remove_dir_all(dir);
++    }
+ }

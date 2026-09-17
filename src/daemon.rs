@@ -11552,6 +11552,54 @@ mod tests {
         );
     }
 
+    /// The daemon's sweep is what flushes entries a miss stored without an
+    /// fsync: it marks them durable, does nothing once the queue is empty,
+    /// and stands aside while another flusher holds the lock.
+    #[test]
+    fn the_daemon_sweep_flushes_entries_pending_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("out.rlib");
+        std::fs::write(&output, b"artifact-bytes").unwrap();
+        store
+            .put(
+                "pending",
+                "pending_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output, "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(store.pending_durability().unwrap(), 1);
+
+        // Another flusher holds the lock: the sweep leaves the entry alone.
+        let held = store
+            .try_durability_flush_lock()
+            .unwrap()
+            .expect("flush lock");
+        let daemon = Daemon::new(config);
+        daemon.flush_pending_durability();
+        assert_eq!(
+            store.pending_durability().unwrap(),
+            1,
+            "a held lock means another flusher is draining the queue"
+        );
+        drop(held);
+
+        daemon.flush_pending_durability();
+        assert_eq!(store.pending_durability().unwrap(), 0);
+        // Nothing pending: the sweep is a no-op and takes no lock.
+        daemon.flush_pending_durability();
+        assert_eq!(store.pending_durability().unwrap(), 0);
+        assert!(store.try_durability_flush_lock().unwrap().is_some());
+    }
+
     #[test]
     fn test_handle_gc_reports_lock_skip() {
         let dir = tempfile::tempdir().unwrap();

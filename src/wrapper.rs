@@ -6642,6 +6642,40 @@ fn mint_session_id(root: &str) -> String {
     hasher.finalize().to_hex().as_str()[..16].to_string()
 }
 
+/// How long GC keeps a session or prefetch marker after its last touch.
+/// Sessions close after [`BUILD_SESSION_SECS`] idle; a day leaves room for a
+/// compile that runs for hours.
+pub(crate) const SESSION_MARKER_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(24 * 3600);
+
+/// Remove session and prefetch markers untouched for at least `retention`,
+/// returning how many were removed. Every event root gets a marker (#1081),
+/// so a machine that builds many trees would otherwise collect them in the
+/// runtime dir forever.
+pub(crate) fn prune_session_markers(
+    config: &Config,
+    retention: std::time::Duration,
+    now: std::time::SystemTime,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(config.runtime_dir.join(".build-sessions")) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|touched| {
+                        now.duration_since(touched)
+                            .is_ok_and(|age| age >= retention)
+                    })
+        })
+        .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
+        .count()
+}
+
 /// The build-session inactivity window (shared by trigger + attribution).
 pub(crate) const BUILD_SESSION_SECS: u64 = 300;
 
@@ -13109,6 +13143,36 @@ exit 0
             ""
         );
         assert_eq!(std::fs::read_to_string(target).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn prune_session_markers_removes_only_markers_idle_past_retention() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = test_config(dir.path().to_path_buf());
+        let sessions = config.runtime_dir.join(".build-sessions");
+        std::fs::create_dir_all(sessions.join("not-a-marker")).unwrap();
+        let now = std::time::SystemTime::now();
+        let retention = std::time::Duration::from_secs(3600);
+        let marker = |name: &str, age: std::time::Duration| {
+            let path = sessions.join(name);
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_modified(now - age).unwrap();
+            path
+        };
+        let idle = marker("idle", retention);
+        let idle_prefetch = marker("idle.prefetch", retention * 2);
+        let recent = marker("recent", retention - std::time::Duration::from_secs(1));
+
+        assert_eq!(prune_session_markers(&config, retention, now), 2);
+        assert!(!idle.exists());
+        assert!(!idle_prefetch.exists());
+        assert!(recent.exists());
+        assert!(sessions.join("not-a-marker").is_dir());
+
+        // Nothing to prune, or no directory at all, is not an error.
+        assert_eq!(prune_session_markers(&config, retention, now), 0);
+        let empty = test_config(dir.path().join("elsewhere"));
+        assert_eq!(prune_session_markers(&empty, retention, now), 0);
     }
 
     #[test]

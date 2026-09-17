@@ -5703,6 +5703,12 @@ impl Daemon {
                     Ok((memos, inputs)) => tracing::debug!(memos, inputs, "gc: pruned C/C++ memos"),
                     Err(error) => tracing::warn!("gc: C/C++ memo pruning failed: {error}"),
                 }
+                let markers = crate::wrapper::prune_session_markers(
+                    &self.config,
+                    crate::wrapper::SESSION_MARKER_RETENTION,
+                    std::time::SystemTime::now(),
+                );
+                tracing::debug!(markers, "gc: pruned build-session markers");
 
                 // Bound the post-eviction demand log, and report what it says
                 // so far: a high demand rate means eviction is discarding

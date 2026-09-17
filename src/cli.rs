@@ -2875,6 +2875,11 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         print!("Backfilling content hashes...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
+    crate::wrapper::prune_session_markers(
+        config,
+        crate::wrapper::SESSION_MARKER_RETENTION,
+        std::time::SystemTime::now(),
+    );
     let backfilled = store.backfill_content_hashes().unwrap_or(0);
     if verbose {
         if backfilled > 0 {

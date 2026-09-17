@@ -31,7 +31,14 @@
 //!   that table the same SIZE across clones), so member-header offsets — and
 //!   thus the symbol table's bytes — are already identical across clones. Hashing
 //!   it raw is therefore portable AND keeps a stale/crafted symbol table from
-//!   colliding with one that links differently (it is NOT dropped).
+//!   colliding with one that links differently (it is NOT dropped);
+//! - each member's date field. GNU `ar` fills a header with spaces and then
+//!   prints the fields it sets. It always prints the date (and uid, gid, mode)
+//!   for the `/` and `/SYM64/` symbol tables and for object members, but sets
+//!   only the name and size of the `//` long-name table. Only that header may
+//!   have a blank date, and blank hashes as its own token, never as `0`. A
+//!   blank date anywhere else, a blank size, or any non-decimal date falls
+//!   back.
 //!
 //! The `//` long-name table is hashed byte-for-byte, and each `/N` reference is
 //! validated against it. The parser also enforces the canonical GNU layout —
@@ -160,7 +167,7 @@ fn gnu_archive_identity(bytes: &[u8]) -> Option<ArchiveIdentity> {
             return None;
         }
         let name = ar_name(&header[0..16])?;
-        let mtime = parse_ar_decimal(&header[16..28])?;
+        let mtime = parse_ar_timestamp(&header[16..28])?;
         let size = parse_ar_decimal(&header[48..58])?;
 
         let data_start = pos + AR_HEADER_LEN;
@@ -180,10 +187,21 @@ fn gnu_archive_identity(bytes: &[u8]) -> Option<ArchiveIdentity> {
             return None;
         }
 
-        hasher.update(b"mtime\0");
-        hasher.update(&(mtime as u64).to_le_bytes());
+        let kind = classify(name);
+        match mtime {
+            ArTimestamp::Decimal(mtime) => {
+                hasher.update(b"mtime\0");
+                hasher.update(&(mtime as u64).to_le_bytes());
+            }
+            // GNU `ar` leaves the date blank only on the `//` long-name
+            // table header. A distinct token keeps blank from hashing as 0.
+            ArTimestamp::Blank if matches!(kind, Member::LongNameTable) => {
+                hasher.update(b"mtime-blank\0");
+            }
+            ArTimestamp::Blank => return None,
+        }
 
-        match classify(name) {
+        match kind {
             Member::SymbolTable => {
                 // A GNU symbol table is the FIRST member, and there is exactly
                 // one. A symtab anywhere else — notably COFF `.lib`'s SECOND `/`
@@ -1148,6 +1166,22 @@ fn ar_name(field: &[u8]) -> Option<&str> {
     std::str::from_utf8(&field[..end]).ok()
 }
 
+/// A GNU member header's 12-byte date field.
+enum ArTimestamp {
+    Decimal(usize),
+    /// Every byte is a space.
+    Blank,
+}
+
+/// Parse a GNU header date: all spaces, or a decimal [`parse_ar_decimal`]
+/// accepts. `None` on anything else.
+fn parse_ar_timestamp(field: &[u8]) -> Option<ArTimestamp> {
+    if field.iter().all(|&b| b == b' ') {
+        return Some(ArTimestamp::Blank);
+    }
+    parse_ar_decimal(field).map(ArTimestamp::Decimal)
+}
+
 /// Parse a space-padded ASCII decimal `ar` header field. `None` on empty or any
 /// non-digit byte (which forces a safe fallback rather than a misparse).
 fn parse_ar_decimal(field: &[u8]) -> Option<usize> {
@@ -1165,6 +1199,14 @@ pub(crate) fn dwarf_bsd_archive_for_tests(payload: &[u8]) -> Vec<u8> {
         ("__.SYMDEF SORTED", 20, tests::BSD_SYMDEF),
         ("cafca65b3467684e-a.o", 20, &tests::dwarf_macho(payload)),
     ])
+}
+
+/// A GNU `ar crs` archive of one ELF object with a long member name, laid out
+/// byte for byte as binutils writes it (blank `//` header fields), for
+/// `cache_key` tests.
+#[cfg(test)]
+pub(crate) fn gnu_crs_longname_archive_for_tests(payload: &[u8]) -> Vec<u8> {
+    tests::gnu_crs_longname_archive("cafca65b3467684e-probe.o", &tests::elf_object(payload))
 }
 
 #[cfg(test)]
@@ -1306,7 +1348,7 @@ mod tests {
         object
     }
 
-    fn elf_object(payload: &[u8]) -> Vec<u8> {
+    pub(super) fn elf_object(payload: &[u8]) -> Vec<u8> {
         elf_object_with_section(b".data", payload)
     }
 
@@ -1333,6 +1375,150 @@ mod tests {
     // A realistic GNU symbol-table payload (its exact bytes don't matter to the
     // parser; only that it is stable across clones, which it is for GNU).
     const SYMTAB: &[u8] = b"\x00\x00\x00\x01\x00\x00\x00\x68foo\x00";
+
+    /// One 60-byte header the way binutils writes it: fill with spaces, then
+    /// print only the fields the writer sets. `None` leaves a field blank.
+    fn binutils_header(name: &str, numeric: [Option<&str>; 4], size: usize) -> Vec<u8> {
+        let mut h = vec![b' '; AR_HEADER_LEN];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        // date (12), uid (6), gid (6), mode (8)
+        for (value, start) in numeric.into_iter().zip([16, 28, 34, 40]) {
+            if let Some(value) = value {
+                h[start..start + value.len()].copy_from_slice(value.as_bytes());
+            }
+        }
+        let size = size.to_string();
+        h[48..48 + size.len()].copy_from_slice(size.as_bytes());
+        h[58..60].copy_from_slice(b"`\n");
+        h
+    }
+
+    /// The byte layout GNU `ar crs` (deterministic mode) writes for one object
+    /// whose name does not fit the 16-byte field:
+    /// - `/` symbol table: date/uid/gid/mode `0`, map NUL-padded to even size;
+    /// - `//` long-name table: only name and size set, the rest BLANK; the
+    ///   size is rounded up to even with the `\n` pad counted inside it;
+    /// - the object: `/0` reference, date/uid/gid `0`, mode `644`.
+    pub(super) fn gnu_crs_longname_archive(object_name: &str, object: &[u8]) -> Vec<u8> {
+        assert!(object_name.len() > 15, "must force the `//` table");
+        let mut longnames = format!("{object_name}/\n").into_bytes();
+        if longnames.len() % 2 == 1 {
+            longnames.push(b'\n');
+        }
+        let symbol = b"kache_archive_probe\0";
+        let mut map_len = 4 + 4 + symbol.len();
+        map_len += map_len % 2;
+        let object_offset =
+            AR_MAGIC.len() + AR_HEADER_LEN + map_len + AR_HEADER_LEN + longnames.len();
+        let mut map = Vec::with_capacity(map_len);
+        map.extend_from_slice(&1_u32.to_be_bytes());
+        map.extend_from_slice(&u32::try_from(object_offset).unwrap().to_be_bytes());
+        map.extend_from_slice(symbol);
+        map.resize(map_len, 0);
+
+        let zero = Some("0");
+        let mut a = AR_MAGIC.to_vec();
+        a.extend_from_slice(&binutils_header("/", [zero, zero, zero, zero], map.len()));
+        a.extend_from_slice(&map);
+        a.extend_from_slice(&binutils_header("//", [None; 4], longnames.len()));
+        a.extend_from_slice(&longnames);
+        assert_eq!(a.len(), object_offset);
+        a.extend_from_slice(&binutils_header(
+            "/0",
+            [zero, zero, zero, Some("644")],
+            object.len(),
+        ));
+        a.extend_from_slice(object);
+        if object.len() % 2 == 1 {
+            a.push(b'\n');
+        }
+        a
+    }
+
+    /// Offset of the `//` header's date field in [`gnu_crs_longname_archive`].
+    fn longname_header_start(archive: &[u8]) -> usize {
+        let map_len = parse_ar_decimal(&archive[AR_MAGIC.len() + 48..AR_MAGIC.len() + 58]).unwrap();
+        let start = AR_MAGIC.len() + AR_HEADER_LEN + map_len;
+        assert_eq!(&archive[start..start + 2], b"//");
+        start
+    }
+
+    #[test]
+    fn gnu_crs_longname_table_with_blank_fields_hashes_structurally() {
+        // GNU `ar` writes the `//` header with blank date/uid/gid/mode. Every
+        // `cc` archive has that table (its member names exceed 15 bytes), so
+        // rejecting blanks sent all of them to the path-bound fallback.
+        let object = elf_object(b"kache blank longname payload");
+        let a = gnu_crs_longname_archive("cafca65b3467684e-probe.o", &object);
+        let start = longname_header_start(&a);
+        assert!(
+            a[start + 16..start + 48].iter().all(|&b| b == b' '),
+            "fixture must carry the blank fields GNU ar writes"
+        );
+
+        let digest = gnu_archive_hash(&a).expect("GNU arm claims a real `ar crs` layout");
+        assert!(digest.starts_with("gnu-ar-v2:"));
+        assert_eq!(portable_static_archive_hash(&a), Some(digest.clone()));
+
+        // The same members archived from another directory hash the same.
+        let b = gnu_crs_longname_archive("cafca65b3467684e-probe.o", &object);
+        assert_eq!(gnu_archive_hash(&b), Some(digest));
+    }
+
+    #[test]
+    fn gnu_blank_longname_timestamp_never_collides_with_zero() {
+        let object = elf_object(b"payload");
+        let blank = gnu_crs_longname_archive("cafca65b3467684e-probe.o", &object);
+        let start = longname_header_start(&blank);
+        let mut zero = blank.clone();
+        zero[start + 16] = b'0';
+        let blank = gnu_archive_hash(&blank).unwrap();
+        let zero = gnu_archive_hash(&zero).expect("a numeric `//` date still parses");
+        assert_ne!(blank, zero, "blank and 0 timestamps are distinct states");
+    }
+
+    #[test]
+    fn gnu_blank_fields_only_accepted_where_gnu_ar_writes_them() {
+        let object = elf_object(b"payload");
+        let good = gnu_crs_longname_archive("cafca65b3467684e-probe.o", &object);
+        assert!(gnu_archive_hash(&good).is_some());
+
+        // binutils always prints the symbol table's date.
+        let mut symtab_blank = good.clone();
+        symtab_blank[AR_MAGIC.len() + 16] = b' ';
+        assert!(portable_static_archive_hash(&symtab_blank).is_none());
+
+        // `/SYM64/` goes through the same arm, and the module doc names it.
+        let map = b"\x00\x00\x00\x00\x00\x00\x00\x58foo\x00";
+        let sym64 = archive(&[("/SYM64/", map), ("foo.o/", b"OBJ\n")]);
+        assert!(gnu_archive_hash(&sym64).is_some());
+        let mut sym64_blank = sym64;
+        sym64_blank[AR_MAGIC.len() + 16..AR_MAGIC.len() + 28].fill(b' ');
+        assert!(portable_static_archive_hash(&sym64_blank).is_none());
+
+        // ...and every object member's date.
+        let object_header = good.len() - object.len() - object.len() % 2 - AR_HEADER_LEN;
+        assert_eq!(&good[object_header..object_header + 2], b"/0");
+        let mut object_blank = good.clone();
+        object_blank[object_header + 16] = b' ';
+        assert!(portable_static_archive_hash(&object_blank).is_none());
+
+        // Size is always set, including on `//`.
+        let start = longname_header_start(&good);
+        let mut size_blank = good.clone();
+        size_blank[start + 48..start + 58].fill(b' ');
+        assert!(portable_static_archive_hash(&size_blank).is_none());
+
+        // A partly blank or non-decimal `//` date is not the blank state.
+        for garbage in [&b" 0"[..], b"0x", b"\t", b"-1"] {
+            let mut bad = good.clone();
+            bad[start + 16..start + 16 + garbage.len()].copy_from_slice(garbage);
+            assert!(
+                portable_static_archive_hash(&bad).is_none(),
+                "`//` date {garbage:?} must fail closed"
+            );
+        }
+    }
 
     #[test]
     fn gnu_longname_table_has_one_canonical_slot() {
@@ -2967,6 +3153,65 @@ mod tests {
             digests[0], digests[1],
             "a DWARF-bearing archive hashes the same from any directory"
         );
+    }
+
+    /// Drive the system compiler and GNU `ar` on Linux. A member name longer
+    /// than 15 bytes makes `ar` write the `//` long-name table, whose header
+    /// has blank date/uid/gid/mode fields.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn real_gnu_ar_longname_archive_hashes_structurally() {
+        use std::process::Command;
+        for tool in ["cc", "ar"] {
+            if Command::new(tool).arg("--version").output().is_err() {
+                eprintln!("skipping: no `{tool}` on PATH");
+                return;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("probe.c");
+        // >15 bytes forces the `//` long-name table.
+        let object = dir.path().join("cafca65b3467684e-probe.o");
+        std::fs::write(&source, b"int kache_archive_probe(void) { return 701; }\n").unwrap();
+        let status = Command::new("cc")
+            .arg("-c")
+            .arg("-g0")
+            .arg("-O0")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .expect("system C compiler runs");
+        assert!(status.success(), "cc -c -g0 failed");
+        assert!(is_known_elf_relocatable_object(
+            &std::fs::read(&object).unwrap()
+        ));
+
+        let lib = dir.path().join("libprobe.a");
+        // `D` pins the symbol table date to 0 on hosts whose `ar` is not
+        // deterministic by default; the `//` header is blank either way.
+        let status = Command::new("ar")
+            .arg("crsD")
+            .arg(&lib)
+            .arg(&object)
+            .status()
+            .expect("system ar runs");
+        assert!(status.success(), "ar crsD failed");
+
+        let bytes = std::fs::read(&lib).unwrap();
+        // Walk to the `//` header instead of scanning for the first `2f 2f`,
+        // which a larger armap could hold in an offset or a symbol name.
+        let table = longname_header_start(&bytes);
+        assert!(
+            bytes[table + 16..table + 48].iter().all(|&b| b == b' '),
+            "GNU ar writes the `//` header with blank numeric fields"
+        );
+        let hash = gnu_archive_hash(&bytes).expect("GNU arm claims a real `ar` archive");
+        assert_portable_hash_shape(&hash);
+        // Digest equality across build directories is pinned by
+        // `cache_key::tests::hash_static_lib_gnu_longname_archive_is_checkout_independent`,
+        // which varies the archive's own path; `crsD` output here is
+        // byte-reproducible, so comparing two runs would prove nothing.
     }
 
     fn assert_portable_hash_shape(hash: &str) {

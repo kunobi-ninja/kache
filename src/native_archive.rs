@@ -1488,6 +1488,14 @@ mod tests {
         symtab_blank[AR_MAGIC.len() + 16] = b' ';
         assert!(portable_static_archive_hash(&symtab_blank).is_none());
 
+        // `/SYM64/` goes through the same arm, and the module doc names it.
+        let map = b"\x00\x00\x00\x00\x00\x00\x00\x58foo\x00";
+        let sym64 = archive(&[("/SYM64/", map), ("foo.o/", b"OBJ\n")]);
+        assert!(gnu_archive_hash(&sym64).is_some());
+        let mut sym64_blank = sym64;
+        sym64_blank[AR_MAGIC.len() + 16..AR_MAGIC.len() + 28].fill(b' ');
+        assert!(portable_static_archive_hash(&sym64_blank).is_none());
+
         // ...and every object member's date.
         let object_header = good.len() - object.len() - object.len() % 2 - AR_HEADER_LEN;
         assert_eq!(&good[object_header..object_header + 2], b"/0");
@@ -3154,9 +3162,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn real_gnu_ar_longname_archive_hashes_structurally() {
         use std::process::Command;
-        if Command::new("ar").arg("--version").output().is_err() {
-            eprintln!("skipping: no `ar` on PATH");
-            return;
+        for tool in ["cc", "ar"] {
+            if Command::new(tool).arg("--version").output().is_err() {
+                eprintln!("skipping: no `{tool}` on PATH");
+                return;
+            }
         }
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("probe.c");
@@ -3177,37 +3187,31 @@ mod tests {
             &std::fs::read(&object).unwrap()
         ));
 
-        let mut digests = Vec::new();
-        for name in ["checkout-a", "checkout-b"] {
-            let archive_dir = dir.path().join(name);
-            std::fs::create_dir(&archive_dir).unwrap();
-            let lib = archive_dir.join("libprobe.a");
-            // `D` pins the symbol table date to 0 on hosts whose `ar` is not
-            // deterministic by default; the `//` header is blank either way.
-            let status = Command::new("ar")
-                .arg("crsD")
-                .arg(&lib)
-                .arg(&object)
-                .status()
-                .expect("system ar runs");
-            assert!(status.success(), "ar crsD failed");
-            let bytes = std::fs::read(&lib).unwrap();
-            let table = bytes
-                .windows(2)
-                .position(|window| window == b"//")
-                .expect("ar must emit a `//` long-name table");
-            assert!(
-                bytes[table + 16..table + 48].iter().all(|&b| b == b' '),
-                "GNU ar writes the `//` header with blank numeric fields"
-            );
-            let hash = gnu_archive_hash(&bytes).expect("GNU arm claims a real `ar` archive");
-            assert_portable_hash_shape(&hash);
-            digests.push(hash);
-        }
-        assert_eq!(
-            digests[0], digests[1],
-            "identical members hash the same from any directory"
+        let lib = dir.path().join("libprobe.a");
+        // `D` pins the symbol table date to 0 on hosts whose `ar` is not
+        // deterministic by default; the `//` header is blank either way.
+        let status = Command::new("ar")
+            .arg("crsD")
+            .arg(&lib)
+            .arg(&object)
+            .status()
+            .expect("system ar runs");
+        assert!(status.success(), "ar crsD failed");
+
+        let bytes = std::fs::read(&lib).unwrap();
+        // Walk to the `//` header instead of scanning for the first `2f 2f`,
+        // which a larger armap could hold in an offset or a symbol name.
+        let table = longname_header_start(&bytes);
+        assert!(
+            bytes[table + 16..table + 48].iter().all(|&b| b == b' '),
+            "GNU ar writes the `//` header with blank numeric fields"
         );
+        let hash = gnu_archive_hash(&bytes).expect("GNU arm claims a real `ar` archive");
+        assert_portable_hash_shape(&hash);
+        // Digest equality across build directories is pinned by
+        // `cache_key::tests::hash_static_lib_gnu_longname_archive_is_checkout_independent`,
+        // which varies the archive's own path; `crsD` output here is
+        // byte-reproducible, so comparing two runs would prove nothing.
     }
 
     fn assert_portable_hash_shape(hash: &str) {

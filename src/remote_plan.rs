@@ -1,6 +1,4 @@
-use crate::config::{Config, RemoteConfig};
-use crate::remote_backend::RemoteBackend;
-use crate::remote_layout::RemoteLayout;
+use crate::config::Config;
 
 /// The kind of remote workload being planned.
 ///
@@ -11,10 +9,7 @@ use crate::remote_layout::RemoteLayout;
 pub enum RemoteWorkload {
     RestoreCheck,
     Prefetch,
-    SyncPull,
-    SyncPush,
     BackgroundUpload,
-    KeyDiscovery,
 }
 
 /// Remote object layout selected for an operation.
@@ -30,16 +25,6 @@ pub struct RemotePlan {
 }
 
 impl RemotePlan {
-    pub fn layout<'a>(
-        &self,
-        backend: &'a dyn RemoteBackend,
-        remote: &'a RemoteConfig,
-    ) -> RemoteLayout<'a> {
-        match self.layout {
-            RemoteLayoutKind::V3 => RemoteLayout::new(backend, remote),
-        }
-    }
-
     pub fn transfer_format(&self) -> &'static str {
         match self.layout {
             RemoteLayoutKind::V3 => "v3",
@@ -143,10 +128,7 @@ mod tests {
         for workload in [
             RemoteWorkload::RestoreCheck,
             RemoteWorkload::Prefetch,
-            RemoteWorkload::SyncPull,
-            RemoteWorkload::SyncPush,
             RemoteWorkload::BackgroundUpload,
-            RemoteWorkload::KeyDiscovery,
         ] {
             assert_eq!(planner.plan(workload).layout, RemoteLayoutKind::V3);
         }

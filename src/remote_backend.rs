@@ -1497,7 +1497,7 @@ mod tests {
         let blobs = temp.path().join("blobs");
 
         let error = layout
-            .download_entry("key123", "foo", &destination, &blobs)
+            .download_entry_until("key123", "foo", &destination, &blobs, None)
             .await
             .err()
             .expect("an oversized v3 pack must be rejected before extraction");

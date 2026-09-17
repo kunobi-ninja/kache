@@ -24,6 +24,7 @@ mod incremental_policy;
 #[cfg(unix)]
 mod init_shell;
 use kache_store::link;
+mod cache_remote;
 mod link_probe;
 mod machine;
 mod miss_chain;

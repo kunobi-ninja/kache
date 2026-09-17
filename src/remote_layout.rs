@@ -83,17 +83,6 @@ impl<'a> RemoteLayout<'a> {
         self.backend.head(&object_key).await
     }
 
-    pub async fn download_entry(
-        &self,
-        cache_key: &str,
-        crate_name: &str,
-        entry_dir: &Path,
-        _blobs_dir: &Path,
-    ) -> Result<DownloadResult> {
-        self.download_entry_until(cache_key, crate_name, entry_dir, _blobs_dir, None)
-            .await
-    }
-
     /// Deadline-aware restore used by every daemon download path. The same
     /// monotonic instant covers GET and synchronous decompression/extraction.
     pub async fn download_entry_until(
@@ -174,25 +163,6 @@ impl<'a> RemoteLayout<'a> {
             blobs_skipped: 0,
             blobs_total: 0,
         })
-    }
-
-    pub async fn upload_entry(
-        &self,
-        cache_key: &str,
-        crate_name: &str,
-        entry_dir: &Path,
-        blobs_dir: &Path,
-        compression_level: i32,
-    ) -> Result<RemoteUploadResult> {
-        self.upload_entry_until(
-            cache_key,
-            crate_name,
-            entry_dir,
-            blobs_dir,
-            compression_level,
-            None,
-        )
-        .await
     }
 
     /// Deadline-aware upload. The same monotonic instant covers local pack
@@ -721,7 +691,7 @@ fn copy_dir_all_until(src: &Path, dst: &Path, deadline: Option<Instant>) -> Resu
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         DeadlineReader, DeadlineWriter, HashingWriter, RemoteLayout, V3Manifest, blob_path,
         copy_dir_all, create_entry_pack_zstd, extract_entry_pack, extract_verified_prefetch_entry,
@@ -1411,7 +1381,7 @@ mod tests {
     }
 
     /// Build a one-file store entry and return (tmpdir, store, entry_dir).
-    fn populated_entry() -> (tempfile::TempDir, Store, std::path::PathBuf) {
+    pub(crate) fn populated_entry() -> (tempfile::TempDir, Store, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&min_config(tmp.path().join("cache"))).unwrap();
         let source_dir = tmp.path().join("source");
@@ -1509,7 +1479,7 @@ mod tests {
 
         let dest = _tmp.path().join("restored");
         let result = layout
-            .download_entry("key123", "foo", &dest, &store.blobs_dir())
+            .download_entry_until("key123", "foo", &dest, &store.blobs_dir(), None)
             .await
             .expect("download_entry should succeed");
         assert_eq!(result.format, "v3");
@@ -1527,7 +1497,7 @@ mod tests {
         let layout = RemoteLayout::new(&backend, &remote);
 
         let result = layout
-            .upload_entry("key123", "foo", &entry_dir, &store.blobs_dir(), 3)
+            .upload_entry_until("key123", "foo", &entry_dir, &store.blobs_dir(), 3, None)
             .await
             .expect("upload_entry should succeed");
         assert_eq!(result.format, "v3");
@@ -1557,13 +1527,13 @@ mod tests {
         let layout = RemoteLayout::new(&backend, &remote);
 
         layout
-            .upload_entry(&cache_key, "foo.c", &entry_dir, &store.blobs_dir(), 3)
+            .upload_entry_until(&cache_key, "foo.c", &entry_dir, &store.blobs_dir(), 3, None)
             .await
             .expect("cc object upload should reuse the v3 pack layout");
 
         let dest = _tmp.path().join("restored");
         layout
-            .download_entry(&cache_key, "foo.c", &dest, &store.blobs_dir())
+            .download_entry_until(&cache_key, "foo.c", &dest, &store.blobs_dir(), None)
             .await
             .expect("cc object download should extract the same pack");
         assert_eq!(

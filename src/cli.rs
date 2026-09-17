@@ -6,6 +6,7 @@ use std::os::unix::fs::MetadataExt;
 
 use std::sync::Arc;
 
+use crate::cache_remote::V3Prefetch;
 use crate::config::Config;
 use crate::daemon;
 use crate::events;
@@ -5288,11 +5289,12 @@ async fn sync_inner(
     let backend = crate::remote_backend::create_backend(remote, config.s3_pool_idle_secs)
         .await
         .context("connecting to the remote — check its configuration and access")?;
+    let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> =
+        Arc::new(crate::cache_remote::V3Remote::new(backend, remote.clone()));
     sync_with_client(
-        backend.as_ref(),
+        remote_cache.as_ref(),
         config,
         store,
-        remote,
         workspace_crates,
         pull_only,
         push_only,
@@ -5310,10 +5312,9 @@ async fn sync_inner(
 /// then (unless `dry_run`) pulls missing artifacts and pushes local-only ones.
 #[allow(clippy::too_many_arguments)]
 async fn sync_with_client(
-    backend: &dyn crate::remote_backend::RemoteBackend,
+    remote_cache: &dyn crate::cache_remote::CacheRemote,
     config: &Config,
     store: &Store,
-    remote: &crate::config::RemoteConfig,
     workspace_crates: Option<&std::collections::HashSet<String>>,
     pull_only: bool,
     push_only: bool,
@@ -5323,8 +5324,6 @@ async fn sync_with_client(
     pull_workspace: bool,
     allow_partial: bool,
 ) -> Result<()> {
-    let planner = crate::remote_plan::RemotePlanner::new(config);
-
     // For pull: scope the remote key listing to crate prefixes when possible (one
     // LIST per crate). `--workspace` narrows that to workspace members only;
     // otherwise it's the Cargo.lock dep set; `--all` (or no filter) lists the
@@ -5345,9 +5344,7 @@ async fn sync_with_client(
                 "Listing remote keys for {} workspace crates...",
                 crates.len()
             );
-            let keys = planner
-                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(backend, remote)
+            let keys = remote_cache
                 .list_keys_for_crates(crates)
                 .await
                 .context("listing remote keys for workspace crates")?;
@@ -5358,9 +5355,7 @@ async fn sync_with_client(
             && !crates.is_empty()
         {
             eprint!("Listing remote keys for {} crates...", crates.len());
-            let keys = planner
-                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(backend, remote)
+            let keys = remote_cache
                 .list_keys_for_crates(crates)
                 .await
                 .context("listing remote keys for dependency crates")?;
@@ -5368,9 +5363,7 @@ async fn sync_with_client(
             keys
         } else {
             eprint!("Listing remote keys...");
-            let keys = planner
-                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(backend, remote)
+            let keys = remote_cache
                 .list_keys()
                 .await
                 .context("listing remote keys")?;
@@ -5380,9 +5373,7 @@ async fn sync_with_client(
     } else {
         // Push-only mode still lists remote keys to find what's already uploaded.
         eprint!("Listing remote keys...");
-        let keys = planner
-            .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-            .layout(backend, remote)
+        let keys = remote_cache
             .list_keys()
             .await
             .context("listing remote keys")?;
@@ -5476,9 +5467,7 @@ async fn sync_with_client(
                 );
             }
 
-            let remote_cfg = remote.clone();
             let cfg = config.clone();
-            let download_plan = planner.plan(crate::remote_plan::RemoteWorkload::SyncPull);
             let ok_ref = &ok;
             let fail_ref = &fail;
 
@@ -5493,9 +5482,8 @@ async fn sync_with_client(
                 }
 
                 let blobs_dir = cfg.store_dir().join("blobs");
-                let result = download_plan
-                    .layout(backend, &remote_cfg)
-                    .download_entry(&key, &crate_name, &entry_dir, &blobs_dir)
+                let result = remote_cache
+                    .download_entry(&key, &crate_name, &entry_dir, &blobs_dir, None)
                     .await;
                 match result {
                     Ok(_bytes) => {
@@ -5577,9 +5565,7 @@ async fn sync_with_client(
                 );
             }
 
-            let remote_cfg = remote.clone();
             let cfg = config.clone();
-            let upload_plan = planner.plan(crate::remote_plan::RemoteWorkload::SyncPush);
             let ok_ref = &ok;
             let fail_ref = &fail;
 
@@ -5596,14 +5582,14 @@ async fn sync_with_client(
                 }
 
                 let blobs_dir = cfg.store_dir().join("blobs");
-                match upload_plan
-                    .layout(backend, &remote_cfg)
+                match remote_cache
                     .upload_entry(
                         &key,
                         &crate_name,
                         &entry_dir,
                         &blobs_dir,
                         cfg.compression_level,
+                        None,
                     )
                     .await
                 {
@@ -5742,12 +5728,12 @@ fn save_manifest_impl(
     let published = keys.clone();
     rt.block_on(async {
         let backend = crate::remote_backend::create_backend(remote, pool_idle_secs).await?;
+        let remote_cache = Arc::new(crate::cache_remote::V3Remote::new(backend, remote.clone()));
         for (index, key) in keys.iter().enumerate() {
             let shard_namespace =
                 shard_namespace_for_publish_key(index, effective_namespace.as_deref());
             upload_manifest_and_shards(
-                &backend,
-                remote,
+                &remote_cache,
                 key,
                 shard_namespace,
                 std::path::Path::new("Cargo.lock"),
@@ -5822,11 +5808,10 @@ fn manifest_entries_from_events(
 /// Upload the monolithic build manifest and, when a namespace is given and a
 /// `Cargo.lock` exists at `lock_path`, the content-addressed shard indexes.
 ///
-/// Takes the backend by reference so tests can drive it against a mock (the
-/// production caller injects a real one from `create_backend`).
+/// Takes the remote cache by reference so tests can drive it against a mock
+/// (the production caller injects a real one from `create_backend`).
 async fn upload_manifest_and_shards(
-    backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
-    remote: &crate::config::RemoteConfig,
+    remote_cache: &Arc<crate::cache_remote::V3Remote>,
     key: &str,
     namespace: Option<&str>,
     lock_path: &std::path::Path,
@@ -5840,13 +5825,12 @@ async fn upload_manifest_and_shards(
     };
 
     // Always upload the monolithic build manifest.
-    crate::remote::upload_manifest(backend.as_ref(), &remote.prefix, key, &manifest).await?;
+    remote_cache.put_build_manifest(key, &manifest).await?;
 
     // Upload sharded build-manifest indexes if a namespace is provided and Cargo.lock exists.
     if let Some(ns) = namespace {
         if lock_path.exists() {
-            let shard_count =
-                upload_shards(backend, &remote.prefix, ns, lock_path, &entries).await?;
+            let shard_count = upload_shards(remote_cache, ns, lock_path, &entries).await?;
             eprintln!("Uploaded {shard_count} shards for namespace '{ns}'");
         } else {
             eprintln!("No Cargo.lock found, skipping shard upload");
@@ -5862,8 +5846,7 @@ async fn upload_manifest_and_shards(
 ///
 /// Returns the number of shards uploaded.
 async fn upload_shards(
-    backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
-    prefix: &str,
+    remote_cache: &Arc<crate::cache_remote::V3Remote>,
     namespace: &str,
     lock_path: &std::path::Path,
     entries: &[crate::remote::ManifestEntry],
@@ -5912,14 +5895,11 @@ async fn upload_shards(
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     let mut handles = Vec::new();
     for (hash, shard) in uploads {
-        let backend = Arc::clone(backend);
-        let prefix = prefix.to_string();
+        let remote_cache = Arc::clone(remote_cache);
         let namespace = namespace.to_string();
         let permit = sem.clone().acquire_owned().await?;
         handles.push(tokio::spawn(async move {
-            let result =
-                crate::remote::upload_shard(backend.as_ref(), &prefix, &namespace, &hash, &shard)
-                    .await;
+            let result = remote_cache.put_shard(&namespace, &hash, &shard).await;
             drop(permit);
             result
         }));
@@ -8654,6 +8634,13 @@ mod tests {
         backend.clone()
     }
 
+    fn as_cache_remote(
+        backend: Arc<dyn crate::remote_backend::RemoteBackend>,
+        remote: &crate::config::RemoteConfig,
+    ) -> crate::cache_remote::V3Remote {
+        crate::cache_remote::V3Remote::new(backend, remote.clone())
+    }
+
     #[async_trait::async_trait]
     impl crate::remote_backend::RemoteBackend for TestBackend {
         async fn head(&self, key: &str) -> Result<bool> {
@@ -8723,8 +8710,11 @@ mod tests {
 
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
+        let remote = test_remote_cfg();
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
+            Arc::new(crate::cache_remote::V3Remote::new(client, remote));
 
-        let uploaded = upload_shards(&client, "prefix", "ns", &lock, &entries)
+        let uploaded = upload_shards(&remote_cache, "ns", &lock, &entries)
             .await
             .expect("upload_shards should succeed");
         assert_eq!(uploaded, expected);
@@ -8750,7 +8740,10 @@ mod tests {
 
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
-        let uploaded = upload_shards(&client, "prefix", "ns", &lock, &[])
+        let remote = test_remote_cfg();
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
+            Arc::new(crate::cache_remote::V3Remote::new(client, remote));
+        let uploaded = upload_shards(&remote_cache, "ns", &lock, &[])
             .await
             .expect("should succeed with nothing to upload");
         assert_eq!(uploaded, 0);
@@ -8765,8 +8758,11 @@ mod tests {
         std::fs::write(&lock, "not valid toml [[[[").unwrap();
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
+        let remote = test_remote_cfg();
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
+            Arc::new(crate::cache_remote::V3Remote::new(client, remote));
 
-        let err = upload_shards(&client, "prefix", "ns", &lock, &[])
+        let err = upload_shards(&remote_cache, "ns", &lock, &[])
             .await
             .expect_err("bad lockfile should error");
         assert!(
@@ -10382,6 +10378,8 @@ mod tests {
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
+            Arc::new(crate::cache_remote::V3Remote::new(client, remote));
         let entries = vec![crate::remote::ManifestEntry {
             cache_key: "k".to_string(),
             crate_name: "c".to_string(),
@@ -10389,8 +10387,7 @@ mod tests {
             artifact_size: 1,
         }];
         upload_manifest_and_shards(
-            &client,
-            &remote,
+            &remote_cache,
             "mykey",
             None,
             std::path::Path::new("/nonexistent/Cargo.lock"),
@@ -10407,6 +10404,8 @@ mod tests {
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
+            Arc::new(crate::cache_remote::V3Remote::new(client, remote));
         let entries = vec![crate::remote::ManifestEntry {
             cache_key: "k".to_string(),
             crate_name: "c".to_string(),
@@ -10414,8 +10413,7 @@ mod tests {
             artifact_size: 1,
         }];
         upload_manifest_and_shards(
-            &client,
-            &remote,
+            &remote_cache,
             "mykey",
             Some("ns"),
             std::path::Path::new("/nonexistent/Cargo.lock"),
@@ -10449,8 +10447,10 @@ mod tests {
         let backend = TestBackend::memory();
         let client = as_remote_backend(&backend);
         let remote = test_remote_cfg();
+        let remote_cache: Arc<crate::cache_remote::V3Remote> =
+            Arc::new(crate::cache_remote::V3Remote::new(client, remote));
 
-        upload_manifest_and_shards(&client, &remote, "mykey", Some("ns"), &lock, entries)
+        upload_manifest_and_shards(&remote_cache, "mykey", Some("ns"), &lock, entries)
             .await
             .expect("upload with shards should succeed");
         let puts = backend.put_calls();
@@ -10479,10 +10479,9 @@ mod tests {
 
         let backend = TestBackend::memory();
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             false,
             false,
@@ -10514,10 +10513,9 @@ mod tests {
 
         let backend = TestBackend::memory();
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             Some(&workspace), // workspace_crates
             true,             // pull_only
             false,            // push_only
@@ -10547,10 +10545,9 @@ mod tests {
         for workspace_crates in cases {
             let backend = TestBackend::memory();
             let err = sync_with_client(
-                backend.as_ref(),
+                &as_cache_remote(as_remote_backend(&backend), &remote),
                 &config,
                 &store,
-                &remote,
                 workspace_crates, // None or empty → cannot scope to workspace
                 true,             // pull_only
                 false,            // push_only
@@ -10605,10 +10602,9 @@ mod tests {
         let backend = TestBackend::memory();
 
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             false,
             true,
@@ -10659,10 +10655,9 @@ mod tests {
         let backend = TestBackend::memory();
 
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             false,
             true,
@@ -10695,10 +10690,9 @@ mod tests {
             )
             .await;
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             false,
             false,
@@ -10742,10 +10736,9 @@ mod tests {
             .await;
 
         let err = sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             true,
             false,
@@ -10790,10 +10783,9 @@ mod tests {
             .await;
 
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             true,
             false,
@@ -10842,10 +10834,9 @@ mod tests {
         let backend = TestBackend::failing_put();
 
         let err = sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             false,
             true,
@@ -10895,10 +10886,9 @@ mod tests {
         let backend = TestBackend::failing_put();
 
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             false,
             true,
@@ -10948,10 +10938,9 @@ mod tests {
         }
 
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             true,
             false,
@@ -11023,10 +11012,9 @@ mod tests {
             .await;
 
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             true,
             false,
@@ -11112,13 +11100,24 @@ mod tests {
         }
 
         let disappear_dir = config.store_dir().join("disappear_second");
-        let backend = DisappearingBackend {
-            inner: TestBackend::memory(),
-            on_put_delete: disappear_dir,
-        };
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(DisappearingBackend {
+                inner: TestBackend::memory(),
+                on_put_delete: disappear_dir,
+            });
 
         let err = sync_with_client(
-            &backend, &config, &store, &remote, None, false, true, false, false, None, false, false,
+            &as_cache_remote(backend, &remote),
+            &config,
+            &store,
+            None,
+            false,
+            true,
+            false,
+            false,
+            None,
+            false,
+            false,
         )
         .await
         .expect_err("disappeared local entry must cause non-zero exit by default");
@@ -11164,10 +11163,9 @@ mod tests {
             .await;
 
         let err = sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             true,
             false,
@@ -11207,10 +11205,9 @@ mod tests {
             .await;
 
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             true,
             false,
@@ -11264,10 +11261,9 @@ mod tests {
 
         // Default behavior: completes all transfers, but returns Err
         let err = sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             true,
             false,
@@ -11337,10 +11333,9 @@ mod tests {
 
         // With allow_partial: completes all transfers and returns Ok
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             true,
             false,
@@ -11729,10 +11724,9 @@ mod tests {
         let backend = TestBackend::memory();
 
         sync_with_client(
-            backend.as_ref(),
+            &as_cache_remote(as_remote_backend(&backend), &remote),
             &config,
             &store,
-            &remote,
             None,
             false,
             true,

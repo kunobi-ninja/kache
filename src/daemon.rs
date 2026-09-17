@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, RwLock};
 
+use crate::cache_remote::V3Prefetch;
 use crate::config::{Config, UPLOAD_SPOOL_MAX_JOBS};
 use crate::events;
 use crate::remote_resilience::{
@@ -2220,6 +2221,7 @@ pub(crate) struct Daemon {
     /// tests, which must not turn a scheduler SLA into a correctness oracle.
     local_lookup_budget: Option<Duration>,
     remote_backend: tokio::sync::OnceCell<Arc<dyn crate::remote_backend::RemoteBackend>>,
+    v3_remote: tokio::sync::OnceCell<Arc<crate::cache_remote::V3Remote>>,
     key_cache: Arc<S3KeyCache>,
     /// Degradation breaker consulted (and fed) by every remote op: HEAD
     /// probes, restores, uploads, and key-cache LISTs (kunobi-ninja/kache#327).
@@ -2384,6 +2386,7 @@ impl Daemon {
             local_lookup_budget,
             s3_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
             remote_backend: tokio::sync::OnceCell::new(),
+            v3_remote: tokio::sync::OnceCell::new(),
             key_cache: Arc::new(S3KeyCache::new()),
             remote_breaker: Arc::new(RemoteBreaker::new()),
             negative_keys: NegativeKeyCache::new(config.remote_negative_ttl_secs),
@@ -2552,8 +2555,7 @@ impl Daemon {
         namespace: &str,
         shard_hash: &str,
     ) -> Result<Option<crate::remote::Shard>> {
-        let remote = self
-            .config
+        self.config
             .remote
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
@@ -2562,11 +2564,11 @@ impl Daemon {
             .remote_breaker
             .try_acquire(RemoteOperation::ShardGet)
             .ok_or_else(|| anyhow::anyhow!("remote read breaker open"))?;
-        let backend = match deadline
-            .run("planner backend initialization", self.get_remote_backend())
+        let v3 = match deadline
+            .run("planner backend initialization", self.v3_remote())
             .await
         {
-            Ok(backend) => backend,
+            Ok(v3) => v3,
             Err(error) => {
                 let class = classify_remote_error(&error);
                 breaker.failure(class, &format!("{error:#}"));
@@ -2590,15 +2592,7 @@ impl Daemon {
             }
         };
         let result = deadline
-            .run(
-                "planner shard GET",
-                crate::remote::download_shard(
-                    backend.as_ref(),
-                    &remote.prefix,
-                    namespace,
-                    shard_hash,
-                ),
-            )
+            .run("planner shard GET", v3.get_shard(namespace, shard_hash))
             .await;
         drop(semaphore);
         match &result {
@@ -2636,8 +2630,7 @@ impl Daemon {
         &self,
         manifest_key: &str,
     ) -> Result<SpeculativeManifestOutcome> {
-        let remote = self
-            .config
+        self.config
             .remote
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
@@ -2649,8 +2642,8 @@ impl Daemon {
         }
 
         let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
-        let backend = deadline
-            .run("planner backend initialization", self.get_remote_backend())
+        let v3 = deadline
+            .run("planner backend initialization", self.v3_remote())
             .await?;
 
         // Identity lookahead is speculative work. Put it behind the same
@@ -2685,14 +2678,7 @@ impl Daemon {
             return Ok(SpeculativeManifestOutcome::NotAdmitted);
         };
         let result = deadline
-            .run(
-                "planner manifest GET",
-                crate::remote::try_download_manifest(
-                    backend.as_ref(),
-                    &remote.prefix,
-                    manifest_key,
-                ),
-            )
+            .run("planner manifest GET", v3.get_build_manifest(manifest_key))
             .await;
         drop(semaphore);
         drop(gate);
@@ -2714,17 +2700,16 @@ impl Daemon {
         manifest_key: &str,
         breaker: BreakerPermit,
     ) -> Result<Option<crate::remote::BuildManifest>> {
-        let remote = self
-            .config
+        self.config
             .remote
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no remote configured"))?;
         let deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
-        let backend = match deadline
-            .run("planner backend initialization", self.get_remote_backend())
+        let v3 = match deadline
+            .run("planner backend initialization", self.v3_remote())
             .await
         {
-            Ok(backend) => backend,
+            Ok(v3) => v3,
             Err(error) => {
                 let class = classify_remote_error(&error);
                 breaker.failure(class, &format!("{error:#}"));
@@ -2748,14 +2733,7 @@ impl Daemon {
             }
         };
         let result = deadline
-            .run(
-                "planner manifest GET",
-                crate::remote::try_download_manifest(
-                    backend.as_ref(),
-                    &remote.prefix,
-                    manifest_key,
-                ),
-            )
+            .run("planner manifest GET", v3.get_build_manifest(manifest_key))
             .await;
         drop(semaphore);
         match &result {
@@ -2853,6 +2831,30 @@ impl Daemon {
                 crate::remote_backend::create_backend(remote, self.config.s3_pool_idle_secs).await
             })
             .await
+    }
+
+    /// The configured remote in the v3 layout, built once from the same
+    /// backend `get_remote_backend` returns, so test injection still applies.
+    pub(crate) async fn v3_remote(&self) -> Result<&Arc<crate::cache_remote::V3Remote>> {
+        self.v3_remote
+            .get_or_try_init(|| async {
+                let backend = Arc::clone(self.get_remote_backend().await?);
+                let remote = self
+                    .config
+                    .remote
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("no remote configured"))?
+                    .clone();
+                Ok::<_, anyhow::Error>(Arc::new(crate::cache_remote::V3Remote::new(
+                    backend, remote,
+                )))
+            })
+            .await
+    }
+
+    /// Entry-level view of the configured remote.
+    pub(crate) async fn cache_remote(&self) -> Result<Arc<dyn crate::cache_remote::CacheRemote>> {
+        Ok(Arc::clone(self.v3_remote().await?) as Arc<dyn crate::cache_remote::CacheRemote>)
     }
 
     #[cfg(test)]
@@ -3433,8 +3435,8 @@ impl Daemon {
             return Response::err("retryable: write breaker open");
         };
 
-        let backend = match deadline
-            .run("upload backend initialization", self.get_remote_backend())
+        let remote_cache = match deadline
+            .run("upload backend initialization", self.cache_remote())
             .await
         {
             Ok(b) => b,
@@ -3455,7 +3457,6 @@ impl Daemon {
         };
         let plan = crate::remote_plan::RemotePlanner::new(&self.config)
             .plan(crate::remote_plan::RemoteWorkload::BackgroundUpload);
-        let layout = plan.layout(backend.as_ref(), remote);
 
         let head_queue_start = Instant::now();
         let head_semaphore = match deadline
@@ -3477,7 +3478,7 @@ impl Daemon {
         let already_exists = deadline
             .run(
                 "upload HEAD",
-                layout.exists_entry(&job.key, &job.crate_name),
+                remote_cache.exists_entry(&job.key, &job.crate_name),
             )
             .await;
         drop(head_semaphore);
@@ -3551,7 +3552,7 @@ impl Daemon {
         let upload_result = deadline
             .run(
                 "upload PUT",
-                layout.upload_entry_until(
+                remote_cache.upload_entry(
                     &job.key,
                     &job.crate_name,
                     &entry_dir,
@@ -3752,7 +3753,7 @@ impl Daemon {
             Ok(dir) => dir.to_path_buf(),
             Err(msg) => return Response::err(msg),
         };
-        let Some(remote) = &self.config.remote else {
+        let Some(_) = &self.config.remote else {
             return Response::err("no remote configured");
         };
 
@@ -3866,8 +3867,8 @@ impl Daemon {
             }
         }
 
-        let backend = match deadline
-            .run("demand backend initialization", self.get_remote_backend())
+        let remote_cache = match deadline
+            .run("demand backend initialization", self.cache_remote())
             .await
         {
             Ok(b) => b,
@@ -3882,7 +3883,6 @@ impl Daemon {
         };
         let plan = crate::remote_plan::RemotePlanner::new(&self.config)
             .plan(crate::remote_plan::RemoteWorkload::RestoreCheck);
-        let layout = plan.layout(backend.as_ref(), remote);
 
         if needs_head_probe {
             let Some(breaker_permit) = self.remote_breaker.try_acquire(RemoteOperation::DemandHead)
@@ -3916,7 +3916,7 @@ impl Daemon {
             // In particular, there is no backoff sleep while the S3 permit is
             // held; a later request can retry after breaker policy admits it.
             let exists = deadline
-                .run("demand HEAD", layout.exists_entry(&req.key, cn))
+                .run("demand HEAD", remote_cache.exists_entry(&req.key, cn))
                 .await;
             head_ms += head_start.elapsed().as_millis() as u64;
             drop(semaphore_permit);
@@ -4087,7 +4087,7 @@ impl Daemon {
         let download_result = deadline
             .run(
                 "demand GET and extraction",
-                layout.download_entry_until(&req.key, cn, &entry_dir, &blobs_dir, deadline.at()),
+                remote_cache.download_entry(&req.key, cn, &entry_dir, &blobs_dir, deadline.at()),
             )
             .await;
         drop(semaphore_permit);
@@ -4262,7 +4262,7 @@ impl Daemon {
 
     async fn packed_prefetch_list(
         &self,
-        backend: &dyn crate::remote_backend::RemoteBackend,
+        v3: &crate::cache_remote::V3Remote,
         prefix: &str,
     ) -> Result<Vec<String>> {
         let breaker = self
@@ -4291,7 +4291,7 @@ impl Daemon {
             .pack_requests_total
             .fetch_add(1, Ordering::Relaxed);
         let result = deadline
-            .run("pack catalog LIST", backend.list(prefix))
+            .run("pack catalog LIST", v3.list_prefetch_objects(prefix))
             .await;
         drop(semaphore);
         drop(gate);
@@ -4310,7 +4310,7 @@ impl Daemon {
 
     async fn packed_prefetch_get(
         &self,
-        backend: &dyn crate::remote_backend::RemoteBackend,
+        v3: &crate::cache_remote::V3Remote,
         key: &str,
         max_bytes: u64,
         stage: &'static str,
@@ -4340,7 +4340,9 @@ impl Daemon {
         self.prefetch_stats
             .pack_requests_total
             .fetch_add(1, Ordering::Relaxed);
-        let result = deadline.run(stage, backend.get(key, Some(max_bytes))).await;
+        let result = deadline
+            .run(stage, v3.get_prefetch_object(key, max_bytes))
+            .await;
         drop(semaphore);
         drop(gate);
         match result {
@@ -4367,7 +4369,7 @@ impl Daemon {
     async fn try_packed_prefetch(
         self: &Arc<Self>,
         context: &PackPrefetchContext,
-        backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
+        v3: &Arc<crate::cache_remote::V3Remote>,
         remote: &crate::config::RemoteConfig,
         candidates: &[(String, String, PathBuf)],
         bytes_at_plan_start: u64,
@@ -4386,7 +4388,7 @@ impl Daemon {
                 }
             };
         let objects = match self
-            .packed_prefetch_list(backend.as_ref(), &catalog_prefix)
+            .packed_prefetch_list(v3.as_ref(), &catalog_prefix)
             .await
         {
             Ok(objects) => objects,
@@ -4423,7 +4425,7 @@ impl Daemon {
         };
         let Some(catalog_object) = self
             .packed_prefetch_get(
-                backend.as_ref(),
+                v3.as_ref(),
                 &catalog_ref.object_key,
                 crate::remote_pack::MAX_CATALOG_BYTES as u64,
                 "packed-prefetch catalog GET",
@@ -4518,7 +4520,7 @@ impl Daemon {
                 let object = match pack_key {
                     Ok(key) => self
                         .packed_prefetch_get(
-                            backend.as_ref(),
+                            v3.as_ref(),
                             &key,
                             pack_ref.pack_bytes,
                             "packed-prefetch pack GET",
@@ -4690,14 +4692,15 @@ impl Daemon {
         };
 
         let init_deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
-        let backend = match init_deadline
-            .run("prefetch backend initialization", self.get_remote_backend())
+        let v3_remote = match init_deadline
+            .run("prefetch backend initialization", self.v3_remote())
             .await
         {
-            Ok(backend) => backend,
+            Ok(v3_remote) => v3_remote,
             Err(error) => return Response::err(format!("remote backend init failed: {error:#}")),
         };
-        let backend = Arc::clone(backend);
+        let v3_remote = Arc::clone(v3_remote);
+        let remote_cache: Arc<dyn crate::cache_remote::CacheRemote> = v3_remote.clone();
         let bytes_at_plan_start = self.prefetch_stats.bytes_downloaded.load(Ordering::Relaxed);
 
         // Filter to keys that need downloading: (cache_key, crate_name, entry_dir)
@@ -4747,13 +4750,7 @@ impl Daemon {
                 {
                     Ok(semaphore) => {
                         let result = deadline
-                            .run(
-                                "warm-all LIST",
-                                crate::remote_plan::RemotePlanner::new(&self.config)
-                                    .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                                    .layout(backend.as_ref(), remote)
-                                    .list_keys(),
-                            )
+                            .run("warm-all LIST", remote_cache.list_keys())
                             .await;
                         drop(semaphore);
                         result
@@ -4841,7 +4838,7 @@ impl Daemon {
                 let packed = daemon
                     .try_packed_prefetch(
                         context,
-                        &backend,
+                        &v3_remote,
                         &remote_config,
                         &keys_to_fetch,
                         bytes_at_plan_start,
@@ -4940,8 +4937,7 @@ impl Daemon {
 
                 let sem = daemon.s3_semaphore.clone();
                 let d = daemon.clone();
-                let remote_cfg = remote_config.clone();
-                let remote_backend = backend.clone();
+                let remote_cache = remote_cache.clone();
                 let download_plan = crate::remote_plan::RemotePlanner::new(&d.config)
                     .plan(crate::remote_plan::RemoteWorkload::Prefetch);
                 let plan_deadline = deadline;
@@ -5036,15 +5032,13 @@ impl Daemon {
                     let download_result = item_deadline
                         .run(
                             "prefetch GET and extraction",
-                            download_plan
-                                .layout(remote_backend.as_ref(), &remote_cfg)
-                                .download_entry_until(
-                                    &key,
-                                    &crate_name,
-                                    &entry_dir,
-                                    &blobs_dir,
-                                    item_deadline.at(),
-                                ),
+                            remote_cache.download_entry(
+                                &key,
+                                &crate_name,
+                                &entry_dir,
+                                &blobs_dir,
+                                item_deadline.at(),
+                            ),
                         )
                         .await;
                     drop(semaphore);
@@ -6822,7 +6816,7 @@ async fn drain_connection_handlers(
 
 /// Populate the key cache by listing every key in the remote.
 async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
-    let remote = daemon
+    daemon
         .config
         .remote
         .as_ref()
@@ -6835,11 +6829,11 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
         anyhow::bail!("remote degraded — key cache refresh suppressed");
     };
     let deadline = RemoteDeadline::from_secs(daemon.config.remote_restore_timeout_secs);
-    let backend = match deadline
-        .run("index backend initialization", daemon.get_remote_backend())
+    let remote_cache = match deadline
+        .run("index backend initialization", daemon.cache_remote())
         .await
     {
-        Ok(backend) => backend,
+        Ok(remote_cache) => remote_cache,
         Err(error) => {
             let class = classify_remote_error(&error);
             breaker_permit.failure(class, &format!("{error:#}"));
@@ -6871,15 +6865,7 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
             return Err(error);
         }
     };
-    let list_result = deadline
-        .run(
-            "index LIST",
-            crate::remote_plan::RemotePlanner::new(&daemon.config)
-                .plan(crate::remote_plan::RemoteWorkload::KeyDiscovery)
-                .layout(backend.as_ref(), remote)
-                .list_keys(),
-        )
-        .await;
+    let list_result = deadline.run("index LIST", remote_cache.list_keys()).await;
     drop(semaphore);
     let keys = match list_result {
         Ok(keys) => keys,
@@ -6945,20 +6931,20 @@ async fn manifest_prefetch(
     namespace: Option<&str>,
     lock_path: &Path,
 ) -> usize {
-    let Some(remote) = &daemon.config.remote else {
+    let Some(_) = &daemon.config.remote else {
         return 0;
     };
 
     let initialization_deadline =
         RemoteDeadline::from_secs(daemon.config.remote_restore_timeout_secs);
-    let backend = match initialization_deadline
+    let v3 = match initialization_deadline
         .run(
             "startup prefetch backend initialization",
-            daemon.get_remote_backend(),
+            daemon.v3_remote(),
         )
         .await
     {
-        Ok(b) => b,
+        Ok(v3) => v3,
         Err(e) => {
             tracing::warn!("manifest prefetch: remote backend init failed: {e}");
             return 0;
@@ -6975,7 +6961,7 @@ async fn manifest_prefetch(
 
     if let Some(namespace) = namespace {
         if lock_path.exists() {
-            match shard_prefetch(daemon, backend, &remote.prefix, namespace, lock_path).await {
+            match shard_prefetch(daemon, v3, namespace, lock_path).await {
                 Ok(n) => {
                     tracing::info!("shard prefetch: queued {n} keys from shards");
                     return n;
@@ -7000,19 +6986,17 @@ fn identity_prefetch_satisfied(count: usize) -> bool {
 /// from the remote in parallel, collect cache keys.
 async fn shard_prefetch(
     daemon: &Arc<Daemon>,
-    backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
-    prefix: &str,
+    v3: &Arc<crate::cache_remote::V3Remote>,
     namespace: &str,
     lock_path: &std::path::Path,
 ) -> anyhow::Result<usize> {
     let deps = crate::shards::parse_cargo_lock(lock_path)?;
-    shard_prefetch_for_deps(daemon, backend, prefix, namespace, &deps).await
+    shard_prefetch_for_deps(daemon, v3, namespace, &deps).await
 }
 
 async fn shard_prefetch_for_deps(
     daemon: &Arc<Daemon>,
-    backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
-    prefix: &str,
+    v3: &Arc<crate::cache_remote::V3Remote>,
     namespace: &str,
     deps: &[(String, String)],
 ) -> anyhow::Result<usize> {
@@ -7028,9 +7012,8 @@ async fn shard_prefetch_for_deps(
     // Download all shards in parallel
     let mut handles = Vec::new();
     for (hash, _entries) in &shard_set.shards {
-        let b = Arc::clone(backend);
+        let v = Arc::clone(v3);
         let d = Arc::clone(daemon);
-        let p = prefix.to_string();
         let ns = namespace.to_string();
         let h = hash.clone();
         handles.push(tokio::spawn(async move {
@@ -7054,12 +7037,7 @@ async fn shard_prefetch_for_deps(
                     return Err(error);
                 }
             };
-            let result = deadline
-                .run(
-                    "shard GET",
-                    crate::remote::download_shard(b.as_ref(), &p, &ns, &h),
-                )
-                .await;
+            let result = deadline.run("shard GET", v.get_shard(&ns, &h)).await;
             drop(semaphore);
             match &result {
                 Ok(_) => breaker.success(),
@@ -13658,6 +13636,34 @@ mod tests {
         Arc::new(crate::remote_backend::memory_backend())
     }
 
+    #[tokio::test]
+    async fn cache_remote_wraps_the_injected_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = test_remote_backend();
+        let daemon = Daemon::new(config);
+        daemon.set_remote_backend_for_test(Arc::clone(&backend));
+        let remote_cache = daemon.cache_remote().await.unwrap();
+        backend
+            .put(
+                "prefix/v3/manifests/foo/k1.json",
+                b"{}".to_vec(),
+                Some("application/json"),
+            )
+            .await
+            .unwrap();
+        assert!(remote_cache.exists_entry("k1", "foo").await.unwrap());
+        assert!(Arc::ptr_eq(
+            daemon.v3_remote().await.unwrap(),
+            daemon.v3_remote().await.unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            daemon.v3_remote().await.unwrap().backend(),
+            &backend
+        ));
+    }
+
     struct BlockingIdentityBackend {
         inner: Arc<dyn crate::remote_backend::RemoteBackend>,
         identity_gets: AtomicU64,
@@ -14694,9 +14700,11 @@ mod tests {
                 .unwrap(),
                 later_downloaded: Notify::new(),
             });
+        daemon.set_remote_backend_for_test(backend);
+        let v3 = daemon.v3_remote().await.unwrap();
         let imported = tokio::time::timeout(
             Duration::from_secs(3),
-            daemon.try_packed_prefetch(&context, &backend, &remote, &candidates, 0),
+            daemon.try_packed_prefetch(&context, v3, &remote, &candidates, 0),
         )
         .await
         .expect("catalog and pack bodies must be released while the queue is draining");
@@ -15906,9 +15914,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_shard_prefetch_all_shards_missing_returns_zero() {
-        // A Cargo.lock with two deps -> compute_shards -> one download_shard GET
-        // per shard. The mock NoSuchKey-404s every shard, so none match and the
-        // prefetch queues nothing (Ok(0)). Covers shard computation + parallel
+        // A Cargo.lock with two deps -> compute_shards -> one shard GET per
+        // shard. The empty memory backend has no shard objects, so none match
+        // and the prefetch queues nothing (Ok(0)). Covers shard computation + parallel
         // shard download + collection (miss path).
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
@@ -15923,11 +15931,55 @@ mod tests {
 
         let client = test_remote_backend();
         let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(client).is_ok());
+        let v3 = daemon.v3_remote().await.expect("v3 remote");
 
-        let count = shard_prefetch(&daemon, &client, "prefix", "ns", &lock)
+        let count = shard_prefetch(&daemon, v3, "ns", &lock)
             .await
             .expect("shard prefetch should succeed");
         assert_eq!(count, 0, "no shards matched -> nothing queued");
+    }
+
+    /// Seed one local store entry per dep and a remote shard object listing
+    /// those entries under `prefix`/`namespace`. Returns the memory backend
+    /// and the number of shard entries seeded.
+    async fn seed_prefetch_shards(
+        config: &Config,
+        dir: &Path,
+        namespace: &str,
+        deps: &[(String, String)],
+    ) -> (Arc<dyn crate::remote_backend::RemoteBackend>, usize) {
+        let shard_set = crate::shards::compute_shards(namespace, deps);
+        assert!(
+            shard_set.shards.len() >= 2,
+            "test deps must span at least two shards"
+        );
+        let client = test_remote_backend();
+        let mut seeded = 0;
+        for (hash, entries) in &shard_set.shards {
+            let mut shard = crate::remote::Shard {
+                version: 3,
+                entries: Vec::new(),
+            };
+            for (name, version) in entries {
+                let key = test_cache_key(&format!("seeded-shard-prefetch-{name}-{version}"));
+                seed_store_entry(config, &key, name, dir);
+                shard.entries.push(crate::remote::ShardEntry {
+                    cache_key: key,
+                    crate_name: name.clone(),
+                    compile_time_ms: Some(5000),
+                    artifact_size: Some(100),
+                });
+                seeded += 1;
+            }
+            put_test_object(
+                &client,
+                &crate::remote::shard_object_key("prefix", namespace, hash),
+                &serde_json::to_vec(&shard).unwrap(),
+            )
+            .await;
+        }
+        (client, seeded)
     }
 
     #[tokio::test]
@@ -15935,37 +15987,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.remote = Some(test_remote_config());
-        let key = test_cache_key("seeded-shard-prefetch");
-        seed_store_entry(&config, &key, "serde", dir.path());
-
-        let deps = vec![("serde".to_string(), "1.0.0".to_string())];
-        let shard_set = crate::shards::compute_shards("workspace", &deps);
-        assert!(!shard_set.shards.is_empty());
-        let client = test_remote_backend();
-        for (hash, _) in &shard_set.shards {
-            let shard = crate::remote::Shard {
-                version: 3,
-                entries: vec![crate::remote::ShardEntry {
-                    cache_key: key.clone(),
-                    crate_name: "serde".into(),
-                    compile_time_ms: Some(5000),
-                    artifact_size: Some(100),
-                }],
-            };
-            put_test_object(
-                &client,
-                &crate::remote::shard_object_key("prefix", "workspace", hash),
-                &serde_json::to_vec(&shard).unwrap(),
-            )
-            .await;
-        }
+        let deps = vec![
+            ("serde".to_string(), "1.0.0".to_string()),
+            ("tokio".to_string(), "1.0.0".to_string()),
+            ("anyhow".to_string(), "1.0.0".to_string()),
+        ];
+        let (client, seeded) = seed_prefetch_shards(&config, dir.path(), "workspace", &deps).await;
+        assert_eq!(seeded, 3);
         let daemon = Arc::new(Daemon::new(config));
-        assert!(daemon.remote_backend.set(client.clone()).is_ok());
+        assert!(daemon.remote_backend.set(client).is_ok());
 
-        let queued = shard_prefetch_for_deps(&daemon, &client, "prefix", "workspace", &deps)
+        let v3 = daemon.v3_remote().await.expect("v3 remote");
+        let queued = shard_prefetch_for_deps(&daemon, v3, "workspace", &deps)
             .await
             .expect("seeded shard prefetch");
-        assert_eq!(queued, shard_set.shards.len());
+        assert_eq!(queued, 3, "one queued key per seeded shard entry");
+    }
+
+    #[tokio::test]
+    async fn shard_prefetch_reads_cargo_lock_and_returns_seeded_shard_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let lock = dir.path().join("Cargo.lock");
+        std::fs::write(
+            &lock,
+            "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"tokio\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"anyhow\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let deps = crate::shards::parse_cargo_lock(&lock).unwrap();
+        assert_eq!(deps.len(), 3);
+        let (client, seeded) = seed_prefetch_shards(&config, dir.path(), "ns", &deps).await;
+        assert_eq!(seeded, 3);
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(client).is_ok());
+
+        let v3 = daemon.v3_remote().await.expect("v3 remote");
+        let count = shard_prefetch(&daemon, v3, "ns", &lock)
+            .await
+            .expect("seeded shard prefetch from Cargo.lock");
+        assert_eq!(count, 3, "one queued key per Cargo.lock package");
     }
 
     // ── New protocol types serde tests ────────────────────────────

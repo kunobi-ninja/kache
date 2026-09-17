@@ -108,7 +108,7 @@ See [Configuration](/docs/getting-started/configuration) for syntax and safety l
 kache why-miss my_crate
 ```
 
-The command compares recent key material for that crate and prints changed groups. In a second checkout with no earlier build of the crate, it compares with the same unit built in another checkout. Groups are hashed after path normalization, so the checkout path alone does not change them. A group that differs between checkouts is a real input difference or a path that normalization missed. The same key in both checkouts means only the checkout path differs.
+The command compares recent key material for that crate and prints changed groups. In a second checkout with no earlier build of the crate, it compares with the same unit built in another checkout. Groups are hashed after path normalization, so the checkout path alone does not change them. The exception is `remap` when path remapping is off: that group keys the checkout path on purpose. Any other group that differs between checkouts is a real input difference or a path that normalization missed. The same key in both checkouts means no key input differs.
 
 For individual components, run the trace command it suggests, typically:
 

@@ -2366,21 +2366,18 @@ fn why_miss_both_formats_include_unresolved_dependency_cascade() {
     assert!(value["dependency_chain"]["baseline_root"].is_null());
 }
 
-/// The first build in a second checkout has no earlier build of its own, so
-/// why-miss compares it with the other checkout's build of the same units and
-/// names the crate whose inputs differ there.
-#[test]
-fn why_miss_compares_a_second_checkout_with_the_first() {
-    let e = env();
+/// Events for one build of `app -> mid -> leaf` per `(root, leaf env digest,
+/// leaf artifact digest)`, in order, as `[cache] explain_miss` records them.
+/// Keys follow the inputs, and unit ids are the same in every build tree.
+fn write_checkout_builds(e: &Env, builds: &[(&str, &str, &str)]) {
     let mut events = Vec::new();
-    for (second, root, leaf_env) in [(0, "/checkouts/a", "e1"), (1, "/checkouts/b", "e2")] {
-        let leaf_out = format!("leaf-out-{leaf_env}");
-        let mid_out = format!("mid-out-{leaf_env}");
+    for (minute, (root, leaf_env, leaf_out)) in builds.iter().enumerate() {
+        let mid_out = format!("mid-out-{leaf_out}");
         for (offset, name, env_deps, externs, extern_units, key) in [
             (
                 0,
                 "leaf",
-                leaf_env,
+                *leaf_env,
                 serde_json::json!({}),
                 serde_json::json!({}),
                 format!("leaf-{leaf_env}"),
@@ -2404,7 +2401,7 @@ fn why_miss_compares_a_second_checkout_with_the_first() {
         ] {
             events.push(
                 serde_json::json!({
-                    "ts": format!("2026-01-01T00:0{second}:0{offset}Z"), "crate_name": name,
+                    "ts": format!("2026-01-01T00:0{minute}:0{offset}Z"), "crate_name": name,
                     "result": "miss", "elapsed_ms": 1, "size": 1,
                     "cache_key": key, "schema": 19, "root": root,
                     "key_fields": {"env_deps": env_deps, "sources": "s"},
@@ -2420,17 +2417,31 @@ fn why_miss_compares_a_second_checkout_with_the_first() {
         format!("{}\n", events.join("\n")),
     )
     .unwrap();
+}
+
+/// The first build in a second checkout has no earlier build of its own, so
+/// why-miss compares it with the other checkout's build of the same units and
+/// names the crate whose inputs differ there.
+#[test]
+fn why_miss_compares_a_second_checkout_with_the_first() {
+    let e = env();
+    write_checkout_builds(
+        &e,
+        &[
+            ("/checkouts/a", "e1", "leaf-out-e1"),
+            ("/checkouts/b", "e2", "leaf-out-e2"),
+        ],
+    );
 
     e.cmd()
         .args(["why-miss", "app"])
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "Other checkout: no earlier build of this crate in /checkouts/b",
+            "Other build tree: no earlier build of this crate in /checkouts/b",
         ))
-        .stdout(predicates::str::contains("compared with: /checkouts/a"))
         .stdout(predicates::str::contains(
-            "compared with the build in another checkout: /checkouts/a",
+            "compared with the same unit built in: /checkouts/a",
         ))
         .stdout(predicates::str::contains("dependencies differ: mid"))
         .stdout(predicates::str::contains(
@@ -2464,4 +2475,46 @@ fn why_miss_compares_a_second_checkout_with_the_first() {
     assert_eq!(value["checkout_comparison"]["verdict"], "dependencies");
     assert_eq!(value["dependency_chain"]["baseline_root"], "/checkouts/a");
     assert_eq!(value["dependency_chain"]["roots"][0]["crate_name"], "leaf");
+}
+
+/// `leaf` computes the same key in both checkouts but produces a different
+/// artifact: the cascade ends there as `path_only`, and `leaf`'s own
+/// comparison says the key is not why it missed.
+#[test]
+fn why_miss_reports_a_path_only_root_across_checkouts() {
+    let e = env();
+    write_checkout_builds(
+        &e,
+        &[
+            ("/checkouts/a", "e1", "leaf-out-a"),
+            ("/checkouts/b", "e1", "leaf-out-b"),
+        ],
+    );
+
+    e.cmd()
+        .args(["why-miss", "app"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "root: leaf -- same key in both build trees, but its artifact differs",
+        ));
+    e.cmd()
+        .args(["why-miss", "leaf"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "same cache key in both build trees: no key input differs",
+        ));
+
+    let output = e
+        .cmd()
+        .args(["--json", "why-miss", "app"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["dependency_chain"]["roots"][0]["kind"]["kind"],
+        "path_only"
+    );
 }

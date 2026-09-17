@@ -1621,11 +1621,16 @@ fn print_checkout_comparison(diagnosis: &MissDiagnosis) {
     let Some(checkout) = &diagnosis.checkout else {
         return;
     };
+    // "Build tree", not "checkout": a registry crate built with the same
+    // features and profile has one unit id in unrelated projects too.
     println!(
-        "\n  Other checkout: no earlier build of this crate in {}",
+        "\n  Other build tree: no earlier build of this crate in {}",
         checkout.root
     );
-    println!("    compared with: {}", checkout.baseline_root);
+    println!(
+        "    compared with the same unit built in: {}",
+        checkout.baseline_root
+    );
     for line in checkout_comparison_lines(checkout) {
         println!("    {line}");
     }
@@ -1642,8 +1647,8 @@ fn checkout_comparison_lines(checkout: &crate::miss_chain::CheckoutComparison) -
     let mut lines = Vec::new();
     match checkout.verdict {
         CheckoutVerdict::PathOnly => lines.push(
-            "same cache key in both checkouts -- only the checkout path differs, no key input \
-             changed"
+            "same cache key in both build trees: no key input differs, so the key is not why \
+             this missed (the entry was evicted, not stored yet, or failed to store)"
                 .to_string(),
         ),
         CheckoutVerdict::OwnInputs => {
@@ -1651,11 +1656,15 @@ fn checkout_comparison_lines(checkout: &crate::miss_chain::CheckoutComparison) -
             if !checkout.dependencies.is_empty() {
                 lines.push(format!("dependencies differ: {dependencies}"));
             }
-            lines.push(
-                "(input groups hash path-normalized inputs, so this is a real input difference \
-                 or a path that escaped normalization)"
-                    .to_string(),
-            );
+            // `remap` is the one group that holds raw checkout paths on
+            // purpose, so the normalization note would be wrong on its own.
+            if checkout.groups.iter().any(|g| g != "remap") {
+                lines.push(
+                    "(input groups hash path-normalized inputs, so this is a real input \
+                     difference or a path that escaped normalization)"
+                        .to_string(),
+                );
+            }
             if checkout.groups.iter().any(|g| g == "remap") {
                 lines.push(
                     "(remap: path remapping differs between the builds, or it is off and the key \
@@ -1702,9 +1711,6 @@ fn print_extern_chain(diagnosis: &MissDiagnosis) {
         },
         direct.join(", ")
     );
-    if let Some(baseline_root) = &chain.baseline_root {
-        println!("    compared with the build in another checkout: {baseline_root}");
-    }
 
     for root in &chain.roots {
         let via = if root.branches > 1 {
@@ -1719,8 +1725,8 @@ fn print_extern_chain(diagnosis: &MissDiagnosis) {
                 groups.join(", ")
             ),
             crate::miss_chain::RootKind::PathOnly => println!(
-                "    root: {}{via} -- same key in both checkouts, but its artifact differs \
-                 (its output is not reproducible across checkouts)",
+                "    root: {}{via} -- same key in both build trees, but its artifact differs \
+                 (its output is not reproducible across build trees)",
                 root.crate_name
             ),
             crate::miss_chain::RootKind::NothingRecorded => println!(
@@ -9207,7 +9213,7 @@ mod tests {
 
         let lines = compared(CheckoutVerdict::PathOnly, &[], vec![]);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("only the checkout path differs"));
+        assert!(lines[0].contains("the key is not why this missed"));
 
         let lines = compared(CheckoutVerdict::OwnInputs, &["env_deps"], vec![]);
         assert_eq!(lines[0], "own inputs differ: env_deps");
@@ -9221,7 +9227,13 @@ mod tests {
         );
         assert_eq!(lines[0], "own inputs differ: args, remap");
         assert_eq!(lines[1], "dependencies differ: mid, util");
+        assert!(lines[2].contains("real input difference"), "{lines:?}");
         assert!(lines[3].starts_with("(remap:"), "{lines:?}");
+
+        // Only `remap` differs: the normalization note does not apply.
+        let lines = compared(CheckoutVerdict::OwnInputs, &["remap"], vec![]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].starts_with("(remap:"), "{lines:?}");
 
         let lines = compared(CheckoutVerdict::Dependencies, &[], vec![dep("mid")]);
         assert_eq!(

@@ -98,7 +98,7 @@ Use these controls only for a real hidden input:
 - crate `kache.toml` for files read during compilation but absent from dep-info
 - `workspace.extra_inputs` for workspace-root provider inputs
 - `cache.key_env_vars` for environment read by proc macros through `std::env`
-- `cache.path_only_env_vars` for locator variables proven not to affect emitted bytes
+- `cache.path_only_env_vars` for locator variables proven not to affect emitted bytes, and for the `crate:VAR` assertion that keeps a crate whose include comes from another crate's macro (`tonic::include_proto!`, `lalrpop_mod!`) reusable across checkouts
 
 See [Configuration](/docs/getting-started/configuration) for syntax and safety limits.
 

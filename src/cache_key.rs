@@ -1113,10 +1113,53 @@ pub(crate) fn rustc_shared_prediction_identity(args: &RustcArgs) -> Option<Strin
         shared_prediction_args(&closure_shaping_args(source, &args.all_args), &target);
     let identity = rustc_prediction_identity_with_args(
         args,
-        std::env::vars_os().collect(),
+        shared_prediction_vars(std::env::vars_os(), &target),
         Some(closure_args),
     )?;
-    Some(format!("shared-target-v1:{identity}"))
+    Some(format!("shared-target-v2:{identity}"))
+}
+
+/// The environment a shared record is identified by, with this build's own
+/// `OUT_DIR` written relative to the target directory.
+///
+/// A build script's `OUT_DIR` is `<target>/<profile>/build/<unit>/out`, so
+/// folding it verbatim gave one unit a different record in every build
+/// directory: six Cargo jobs sharing a store each discovered `libc` from
+/// scratch, and a warm build in another checkout found nothing. Relative, the
+/// same unit keeps one record wherever it is built. The unit part still
+/// carries Cargo's metadata hash, so two feature sets stay apart.
+///
+/// A value outside the target directory is left alone: it is not this
+/// build's own output and nothing says another checkout would spell it the
+/// same way.
+fn shared_prediction_vars(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    target: &Path,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.map(|(name, value)| {
+        if name != "OUT_DIR" {
+            return (name, value);
+        }
+        let relative = target_relative_env_value(&value, target);
+        (name, relative.unwrap_or(value))
+    })
+    .collect()
+}
+
+/// `value` rewritten relative to `target`, tagged so a literal value cannot
+/// impersonate a rewritten one. `None` when it does not sit under `target`.
+fn target_relative_env_value(value: &std::ffi::OsStr, target: &Path) -> Option<std::ffi::OsString> {
+    let relative = Path::new(value).strip_prefix(target).ok()?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(std::ffi::OsString::from(format!(
+        "kache-target-relative:{}",
+        relative.to_str()?
+    )))
 }
 
 fn shared_prediction_args(args: &[String], target: &Path) -> Vec<String> {
@@ -7403,6 +7446,83 @@ mod tests {
             closure(&["--cfg", "feature=\"extra\""]),
             plain,
             "a cfg can add a module, so it stays in the identity"
+        );
+    }
+
+    /// A build script's `OUT_DIR` identifies the unit, not the build
+    /// directory: the same unit in two target directories shares a record,
+    /// two feature sets keep their own, and a value outside the target
+    /// directory (or one that escapes it) is left exactly as it was.
+    #[test]
+    fn shared_predictions_place_out_dir_inside_its_target() {
+        let vars = |target: &str, out_dir: &str| {
+            let pairs = vec![
+                (
+                    std::ffi::OsString::from("OUT_DIR"),
+                    std::ffi::OsString::from(out_dir),
+                ),
+                (
+                    std::ffi::OsString::from("CARGO_MANIFEST_DIR"),
+                    std::ffi::OsString::from("/registry/libc-0.2"),
+                ),
+            ];
+            shared_prediction_vars(pairs.into_iter(), Path::new(target))
+        };
+        let value = |v: &[(std::ffi::OsString, std::ffi::OsString)], name: &str| {
+            v.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+                .unwrap()
+        };
+
+        let a = vars(
+            "/a/target",
+            "/a/target/debug/build/libc-abc123def4567890/out",
+        );
+        let b = vars(
+            "/b/target",
+            "/b/target/debug/build/libc-abc123def4567890/out",
+        );
+        assert_eq!(value(&a, "OUT_DIR"), value(&b, "OUT_DIR"));
+        assert_eq!(
+            value(&a, "OUT_DIR"),
+            "kache-target-relative:debug/build/libc-abc123def4567890/out"
+        );
+        assert_eq!(
+            value(&a, "CARGO_MANIFEST_DIR"),
+            "/registry/libc-0.2",
+            "only OUT_DIR is rewritten"
+        );
+        let other_features = vars(
+            "/a/target",
+            "/a/target/debug/build/libc-0123456789abcdef/out",
+        );
+        assert_ne!(
+            value(&a, "OUT_DIR"),
+            value(&other_features, "OUT_DIR"),
+            "Cargo's metadata hash still separates two feature sets"
+        );
+        for outside in [
+            "/elsewhere/build/libc-abc123def4567890/out",
+            "/a/target/../sneaky/out",
+        ] {
+            assert_eq!(
+                value(&vars("/a/target", outside), "OUT_DIR"),
+                outside,
+                "a value the target directory does not contain is left alone"
+            );
+        }
+        assert!(
+            target_relative_env_value(
+                std::ffi::OsStr::new("/a/target/debug/build/x/out"),
+                Path::new("/a/target")
+            )
+            .is_some()
+        );
+        assert!(
+            target_relative_env_value(std::ffi::OsStr::new("/a/target"), Path::new("/a/target"))
+                .is_some(),
+            "the target directory itself is relative to itself"
         );
     }
 

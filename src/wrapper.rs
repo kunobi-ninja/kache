@@ -411,57 +411,28 @@ fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
     }
 }
 
-/// After a put under `[cache] deferred_durability`: make sure a flusher is
-/// draining this store, so the entry reaches disk shortly after the compile
-/// instead of inside it. One detached `kache flush-durability` per store; if
-/// one is already running (its lock is held) or was spawned within the last
-/// second, nothing happens. If none can be started, this entry is flushed
-/// here, so a stored entry is never left to chance.
-fn maybe_spawn_durability_flusher(config: &Config, store: &Store, cache_key: &str) {
+/// After a put under `[cache] deferred_durability`: the entry's blobs are on
+/// disk but not flushed, and something has to flush them.
+///
+/// The daemon does, on its own short sweep: it is the process that already
+/// outlives a build, and the one a build's teardown stops before anything
+/// inspects the store. Nothing is spawned here, so no kache process is left
+/// touching the store after the build that started it has finished.
+///
+/// Without a reachable daemon there is nobody to hand the work to, so this
+/// entry is flushed here and now. That costs what an inline fsync always
+/// cost, and it keeps a store that never sees a daemon from accumulating
+/// entries whose every hit re-reads them to verify.
+fn flush_or_hand_off_durability(config: &Config, store: &Store, cache_key: &str) {
     if !config.deferred_durability {
         return;
     }
-    match store.try_durability_flush_lock() {
-        Ok(Some(lock)) => drop(lock),
-        // Held: a flusher is running and will reach this entry.
-        Ok(None) => return,
-        Err(e) => {
-            tracing::debug!("durability flush lock unavailable ({e:#}); flushing inline");
-            let _ = store.flush_entry_durability(cache_key);
-            return;
-        }
-    }
-    let marker = config.cache_dir.join("store").join("durability.spawned");
-    let marker_age = std::fs::metadata(&marker)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok());
-    if !durability_flusher_spawn_due(marker_age) {
-        // A sibling spawned a worker a moment ago; it takes the lock as it starts.
+    if crate::transport::is_reachable(&config.socket_path()) {
         return;
     }
-    let _ = std::fs::write(&marker, b"");
-    let spawned = std::env::current_exe()
-        .map_err(anyhow::Error::from)
-        .and_then(|exe| {
-            let mut cmd = std::process::Command::new(exe);
-            cmd.arg("flush-durability")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            crate::platform::configure_detached_process(&mut cmd);
-            cmd.spawn().map(drop).map_err(anyhow::Error::from)
-        });
-    if let Err(e) = spawned {
-        tracing::warn!("could not start the durability flusher ({e:#}); flushing inline");
-        let _ = store.flush_entry_durability(cache_key);
+    if let Err(error) = store.flush_entry_durability(cache_key) {
+        tracing::debug!("durability flush failed for {cache_key}: {error:#}");
     }
-}
-
-/// Whether to spawn a flusher given how long ago a sibling last did: a spawn
-/// within the last second is still starting up and will take the lock.
-fn durability_flusher_spawn_due(marker_age: Option<std::time::Duration>) -> bool {
-    marker_age.is_none_or(|age| age >= std::time::Duration::from_secs(1))
 }
 
 fn event_result_for_store_put(put: StorePutResult) -> EventResult {
@@ -1082,7 +1053,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     // Store grew — throttled size check + detached background GC if over
                     // budget (kunobi-ninja/kache#497). Never blocks the compile path.
                     maybe_spawn_auto_gc(config, &store);
-                    maybe_spawn_durability_flusher(config, &store, &cache_key);
+                    flush_or_hand_off_durability(config, &store, &cache_key);
                     maybe_enqueue_upload(config, &store, &cache_key, &crate_name, true);
                 }
                 Err(e) => {
@@ -1948,7 +1919,7 @@ fn run_cc_inner(
                     // Store grew — throttled size check + detached background GC if over
                     // budget (kunobi-ninja/kache#497). Never blocks the compile path.
                     maybe_spawn_auto_gc(config, &store);
-                    maybe_spawn_durability_flusher(config, &store, &cache_key);
+                    flush_or_hand_off_durability(config, &store, &cache_key);
                     maybe_enqueue_upload(
                         config,
                         &store,
@@ -3970,7 +3941,7 @@ fn run_parsed_rustc(
             // Store grew — throttled size check + detached background GC if over
             // budget (kunobi-ninja/kache#497). Never blocks the compile path.
             maybe_spawn_auto_gc(config, &store);
-            maybe_spawn_durability_flusher(config, &store, &cache_key);
+            flush_or_hand_off_durability(config, &store, &cache_key);
         }
         // Name the crate, as the cc path already does: a failed store leaves that
         // unit re-compiling on every build while the aggregate hit rate barely
@@ -13568,18 +13539,68 @@ exit 0
         assert!(take_recheck_hit(&store, "missing", &|_| true).is_none());
     }
 
-    /// A flusher is spawned when none was spawned recently: no marker, or a
-    /// marker at least a second old; a younger marker means one is starting.
+    /// With deferred durability the entry is left for the daemon when one is
+    /// listening, and flushed here when none is: either way nothing outlives
+    /// the build, and a store never sees a daemon does not accumulate
+    /// unflushed entries. With the feature off, a put is already durable.
     #[test]
-    fn a_durability_flusher_is_spawned_once_per_second_at_most() {
-        use std::time::Duration;
-        assert!(durability_flusher_spawn_due(None));
-        assert!(durability_flusher_spawn_due(Some(Duration::from_secs(1))));
-        assert!(durability_flusher_spawn_due(Some(Duration::from_secs(90))));
-        assert!(!durability_flusher_spawn_due(Some(Duration::from_millis(
-            999
-        ))));
-        assert!(!durability_flusher_spawn_due(Some(Duration::ZERO)));
+    fn a_pending_entry_waits_for_the_daemon_or_is_flushed_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.deferred_durability = true;
+        config.socket_path_override = Some(dir.path().join("absent.sock"));
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("out.rlib");
+        let put = |key: &str, bytes: &[u8]| {
+            let output = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&output, bytes).unwrap();
+            store
+                .put(
+                    key,
+                    "pending_crate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(output, "libout.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        };
+        let _ = &output;
+
+        put("no_daemon", b"artifact-one");
+        assert_eq!(store.pending_durability().unwrap(), 1);
+        flush_or_hand_off_durability(&config, &store, "no_daemon");
+        assert_eq!(
+            store.pending_durability().unwrap(),
+            0,
+            "without a daemon the entry is flushed here"
+        );
+
+        // A listening socket: the daemon owns the flush, so this leaves the
+        // entry pending and starts nothing.
+        let socket = dir.path().join("live.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        config.socket_path_override = Some(socket);
+        put("with_daemon", b"artifact-two");
+        assert_eq!(store.pending_durability().unwrap(), 1);
+        flush_or_hand_off_durability(&config, &store, "with_daemon");
+        assert_eq!(
+            store.pending_durability().unwrap(),
+            1,
+            "a reachable daemon is left to flush it"
+        );
+        drop(listener);
+
+        config.deferred_durability = false;
+        flush_or_hand_off_durability(&config, &store, "with_daemon");
+        assert_eq!(
+            store.pending_durability().unwrap(),
+            1,
+            "the switch being off says nothing about an entry already pending"
+        );
     }
 
     #[test]

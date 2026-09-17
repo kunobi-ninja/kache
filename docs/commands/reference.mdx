@@ -65,15 +65,7 @@ GC reports store bytes removed separately from bytes reclaimed on disk. It keeps
 
 Set `cache.gc_evict_shared = true` or `KACHE_GC_EVICT_SHARED=1` to restore the older namespace-first policy. That lowers the registered store size but does not reclaim blocks retained by target directories, and the discarded entry becomes a future miss. See [Configuration: GC and shared build outputs](/docs/getting-started/configuration#gc-and-shared-build-outputs).
 
-GC first flushes any entries still pending durability (see `kache flush-durability`).
-
-## `kache flush-durability`
-
-```bash
-kache flush-durability
-```
-
-Flushes entries that a miss stored without an fsync (`cache.deferred_durability`), then exits once the queue has stayed empty for a few seconds. The wrapper starts one of these per store after a miss; it is hidden from `kache --help` because nothing else needs to run it. A second flusher for the same store exits at once because the first holds the lock. A hit on an entry the flusher has not reached yet verifies the entry's bytes before restoring.
+GC flushes any entries still pending durability before it judges them (see [Architecture](/docs/how-it-works/architecture)).
 
 ## `kache purge`
 

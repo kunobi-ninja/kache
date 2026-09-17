@@ -458,6 +458,9 @@ impl Environment {
         if let Some(cargo_home) = cargo_home {
             mappings.push((cargo_home, "${KACHE_CARGO_HOME}"));
         }
+        if let Some(base) = base_dir_root(std::env::var_os("KACHE_BASE_DIR")) {
+            mappings.push((base, "${KACHE_BASE_DIR}"));
+        }
         // A checkout reached through a symlink is spelled both ways by tools
         // that canonicalize; both spellings map to the same placeholder.
         let canonical: Vec<(PathBuf, &'static str)> = mappings
@@ -526,6 +529,17 @@ impl Environment {
         }
         Ok(true)
     }
+}
+
+/// The checkout root declared relocatable with `KACHE_BASE_DIR`, which the
+/// rustc and cc keys already normalize. Mapping it here gives a build script
+/// the same key in every checkout when a variable it reads spells that root,
+/// such as `CFLAGS=-ffile-prefix-map=<checkout>=.`. An output that spells the
+/// root still makes `OUT_DIR` non-portable. A relative value or `/` is
+/// ignored: neither names a checkout.
+fn base_dir_root(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let base = PathBuf::from(value?);
+    (base.is_absolute() && base.parent().is_some()).then_some(base)
 }
 
 /// `<target>/[<triple>/]<profile>/build/<pkg>-<hash>/out` back to `<target>`.
@@ -1662,6 +1676,64 @@ mod tests {
             usize::from(std::fs::canonicalize(&real).unwrap() != real) + 1,
             "a root that is already canonical is mapped once"
         );
+    }
+
+    #[test]
+    fn base_dir_root_accepts_only_an_absolute_checkout() {
+        let root = if cfg!(windows) { r"C:\\" } else { "/" };
+        let checkout = if cfg!(windows) {
+            r"C:\\work\\app"
+        } else {
+            "/work/app"
+        };
+        assert_eq!(
+            base_dir_root(Some(checkout.into())),
+            Some(PathBuf::from(checkout))
+        );
+        assert_eq!(base_dir_root(Some("work/app".into())), None);
+        assert_eq!(base_dir_root(Some(root.into())), None);
+        assert_eq!(base_dir_root(Some("".into())), None);
+        assert_eq!(base_dir_root(None), None);
+    }
+
+    #[test]
+    fn a_base_dir_in_a_variable_keys_the_same_in_every_checkout() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut normalized = Vec::new();
+        for checkout in ["clone-a", "clone-b"] {
+            let checkout = dir.path().join(checkout);
+            let out = checkout.join("target/release/build/libz-sys-1234/out");
+            std::fs::create_dir_all(&out).unwrap();
+            let manifest = dir.path().join("registry/libz-sys");
+            std::fs::create_dir_all(&manifest).unwrap();
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe {
+                std::env::set_var("OUT_DIR", &out);
+                std::env::set_var("CARGO_MANIFEST_DIR", &manifest);
+                std::env::set_var("KACHE_BASE_DIR", &checkout);
+                std::env::remove_var("CARGO_HOME");
+            }
+            let environment = Environment::capture();
+            unsafe {
+                std::env::remove_var("OUT_DIR");
+                std::env::remove_var("CARGO_MANIFEST_DIR");
+                std::env::remove_var("KACHE_BASE_DIR");
+            }
+            let environment = environment.unwrap();
+            let cflags = format!("-ffile-prefix-map={}=.", checkout.display());
+            normalized.push(environment.normalize_str(&cflags));
+            // An output that spells the checkout cannot move to another one.
+            let spelled = out.join("paths.txt");
+            std::fs::write(&spelled, format!("src={}/vendor", checkout.display())).unwrap();
+            assert!(
+                !environment
+                    .out_dir_is_portable(&[(spelled, "paths.txt".into())])
+                    .unwrap()
+            );
+        }
+        assert_eq!(normalized[0], "-ffile-prefix-map=${KACHE_BASE_DIR}=.");
+        assert_eq!(normalized[0], normalized[1]);
     }
 
     #[test]

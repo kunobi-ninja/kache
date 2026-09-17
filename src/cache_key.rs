@@ -8545,6 +8545,22 @@ mod tests {
             scan(r#"let c = '\''; let x = env!("MYVAR");"#, "MYVAR"),
             RuntimeValue
         );
+        // An escape longer than one character, and a char literal whose
+        // closing quote is the byte before another quote: both decide where
+        // the literal ends, and ending it in the wrong place swallows the
+        // code after it.
+        assert_eq!(
+            scan(r#"let c = '\u{41}'; let x = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"let c = '\x41'; let x = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"let v = ['\n','"']; env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
         assert_eq!(
             scan(r#"let c = b'\\'; let x = env!("MYVAR");"#, "MYVAR"),
             RuntimeValue

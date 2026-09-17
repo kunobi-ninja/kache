@@ -5791,6 +5791,38 @@ remote_key_cache_refresh_secs = 900
     }
 
     #[test]
+    fn path_only_env_vars_take_the_env_list_verbatim_without_empties() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let _cfg_guard = set_kache_config_for_test(&cfg_path);
+
+        std::fs::write(&cfg_path, "[cache]\npath_only_env_vars = [\"FROM_FILE\"]\n").unwrap();
+        {
+            let _vars = NamedEnvGuard::remove("KACHE_PATH_ONLY_ENV_VARS");
+            assert_eq!(
+                Config::load().unwrap().path_only_env_vars,
+                vec!["FROM_FILE".to_string()]
+            );
+        }
+
+        {
+            // Env replaces the file list; comma and whitespace both separate,
+            // and the separators around them produce no empty entries. Names
+            // are otherwise kept verbatim: they match what rustc reports.
+            let _vars = NamedEnvGuard::set(
+                "KACHE_PATH_ONLY_ENV_VARS",
+                ",BUILDCONFIG_RS, my_crate:OUT_DIR,",
+            );
+            assert_eq!(
+                Config::load().unwrap().path_only_env_vars,
+                vec!["BUILDCONFIG_RS".to_string(), "my_crate:OUT_DIR".to_string()]
+            );
+        }
+        assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_PATH_ONLY_ENV_VARS"));
+    }
+
+    #[test]
     fn test_incremental_crate_forced_matches_normalized_names_only() {
         let list = normalize_incremental_crates(["tap-lib".to_string()]);
         // Both spellings of the listed crate select it; other crates,

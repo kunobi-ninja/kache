@@ -380,6 +380,12 @@ pub struct Config {
     /// default; `KACHE_DEFERRED_DISCOVERY=0` or
     /// `[cache] deferred_discovery = false` keeps the pre-pass on every miss.
     pub deferred_discovery: bool,
+    /// Store new entries without an fsync on the build path. The daemon (or
+    /// the next `kache gc`) flushes them shortly after; until then a hit on
+    /// such an entry verifies its bytes before restoring. On by default;
+    /// `KACHE_DEFERRED_DURABILITY=0` or `[cache] deferred_durability = false`
+    /// flushes every entry inside the compile that stored it.
+    pub deferred_durability: bool,
     /// Opportunistic size-pressure GC (kunobi-ninja/kache#497): when on (the
     /// default), the compiler wrapper — after storing a new entry — performs a
     /// cheap, throttled store-size check and, if the store has grown past
@@ -691,6 +697,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) shared_hardlink_restores: Option<bool>,
     /// Compile-before-key toggle. See [`Config::deferred_discovery`].
     pub(crate) deferred_discovery: Option<bool>,
+    /// Deferred store flush toggle. See [`Config::deferred_durability`].
+    pub(crate) deferred_durability: Option<bool>,
     /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
     pub(crate) auto_gc: Option<bool>,
     /// Namespace-first GC compatibility mode. See [`Config::gc_evict_shared`].
@@ -1082,6 +1090,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_WINDOWS_HARDLINK",
     "KACHE_SHARED_HARDLINK_RESTORES",
     "KACHE_DEFERRED_DISCOVERY",
+    "KACHE_DEFERRED_DURABILITY",
     "KACHE_AUTO_GC",
     "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_HEARTBEAT_SECS",
@@ -1166,6 +1175,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "cache.shared_hardlink_restores",
     ),
     ("KACHE_DEFERRED_DISCOVERY", "cache.deferred_discovery"),
+    ("KACHE_DEFERRED_DURABILITY", "cache.deferred_durability"),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
     ("KACHE_HEARTBEAT_SECS", "cache.heartbeat_secs"),
@@ -1684,6 +1694,7 @@ impl Config {
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let shared_hardlink_restores = Self::shared_hardlink_restores_enabled(&file_config);
         let deferred_discovery = Self::deferred_discovery_enabled(&file_config);
+        let deferred_durability = Self::deferred_durability_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
         let storage_layout_advice = Self::storage_layout_advice_enabled(&file_config);
@@ -1740,6 +1751,7 @@ impl Config {
             windows_hardlink,
             shared_hardlink_restores,
             deferred_discovery,
+            deferred_durability,
             auto_gc,
             gc_evict_shared,
             storage_layout_advice,
@@ -2180,6 +2192,19 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.deferred_discovery)
+            .unwrap_or(true)
+    }
+
+    fn deferred_durability_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_DEFERRED_DURABILITY", ignore_env) {
+            return !(v == "0" || v.eq_ignore_ascii_case("false"));
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.deferred_durability)
             .unwrap_or(true)
     }
 
@@ -3539,6 +3564,7 @@ impl From<&Config> for kache_store::config::Config {
             max_size: config.max_size,
             gc_evict_shared: config.gc_evict_shared,
             upload_spool_max_jobs: UPLOAD_SPOOL_MAX_JOBS,
+            deferred_durability: config.deferred_durability,
         }
     }
 }
@@ -5298,6 +5324,43 @@ remote_key_cache_refresh_secs = 900
     }
 
     #[test]
+    fn deferred_durability_is_on_unless_switched_off() {
+        let _lock = config_path_lock();
+        let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
+        let off: Result<FileConfig> =
+            Ok(toml::from_str("[cache]\ndeferred_durability = false\n").unwrap());
+        let on: Result<FileConfig> =
+            Ok(toml::from_str("[cache]\ndeferred_durability = true\n").unwrap());
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::remove_var("KACHE_DEFERRED_DURABILITY") };
+        assert!(Config::deferred_durability_enabled(&none));
+        assert!(!Config::deferred_durability_enabled(&off));
+        assert!(Config::deferred_durability_enabled(&on));
+        for (value, expected) in [
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("", true),
+        ] {
+            unsafe { std::env::set_var("KACHE_DEFERRED_DURABILITY", value) };
+            assert_eq!(
+                Config::deferred_durability_enabled(&on),
+                expected,
+                "{value:?}"
+            );
+            assert_eq!(
+                Config::deferred_durability_enabled(&off),
+                expected,
+                "{value:?} overrides the file"
+            );
+        }
+        unsafe { std::env::remove_var("KACHE_DEFERRED_DURABILITY") };
+    }
+
+    #[test]
     fn deferred_discovery_is_on_unless_switched_off() {
         let _lock = config_path_lock();
         let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
@@ -5405,6 +5468,7 @@ remote_key_cache_refresh_secs = 900
                 windows_hardlink: None,
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
+                deferred_durability: None,
                 auto_gc: None,
                 gc_evict_shared: None,
                 storage_layout_advice: None,
@@ -5877,6 +5941,7 @@ remote_key_cache_refresh_secs = 900
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            deferred_durability: false,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
@@ -5939,6 +6004,7 @@ remote_key_cache_refresh_secs = 900
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            deferred_durability: false,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
@@ -5997,6 +6063,7 @@ remote_key_cache_refresh_secs = 900
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            deferred_durability: false,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
@@ -6074,6 +6141,7 @@ remote_key_cache_refresh_secs = 900
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            deferred_durability: false,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
@@ -6736,6 +6804,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 windows_hardlink: None,
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
+                deferred_durability: None,
                 auto_gc: None,
                 gc_evict_shared: None,
                 storage_layout_advice: None,

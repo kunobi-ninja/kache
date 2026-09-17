@@ -2856,6 +2856,11 @@ impl GcMode {
     }
 }
 
+/// How many entries one durability sweep flushes before yielding. The daemon
+/// sweeps again two seconds later, so a long backlog drains in batches rather
+/// than in one hold of the store.
+pub(crate) const DURABILITY_FLUSH_BATCH: usize = 64;
+
 /// Run garbage collection locally under `gc.lock`.
 pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcStats> {
     let verbose = mode == GcMode::Cli;
@@ -2869,6 +2874,13 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
             return Ok(skipped_gc_stats());
         }
     };
+    // Entries stored without an fsync reach disk before anything is judged
+    // by age or size; a flusher that never ran is caught up here.
+    match store.flush_durability(usize::MAX) {
+        Ok(0) => {}
+        Ok(flushed) => tracing::info!("flushed {flushed} entries pending durability"),
+        Err(error) => tracing::warn!("durability flush before gc failed: {error:#}"),
+    }
     let mut combined = crate::store::GcStats::default();
     let started = std::time::Instant::now();
 
@@ -8796,6 +8808,7 @@ mod tests {
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            deferred_durability: false,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,

@@ -273,6 +273,12 @@ exclude_re = [
     "replace && with \\|\\| in find_daemon_pids",
     "replace != with == in find_daemon_pids",
     "query_windows_file_identity",
+    # The Windows half of `fsync_published_blob`: a published blob is
+    # read-only and Windows needs write access to flush a handle, so the
+    # attribute comes off and goes back on around the flush. That block is
+    # `#[cfg(windows)]`, never compiled in this Linux lane, so a mutant
+    # inside it changes nothing that runs here.
+    "delete ! in fsync_published_blob",
     "observe_storage_windows",
     "observe_storage_unsupported",
     "run_cargo_non_unix",

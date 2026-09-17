@@ -125,6 +125,7 @@ mod tests {
             max_size: 1 << 20,
             gc_evict_shared: false,
             upload_spool_max_jobs: 128,
+            deferred_durability: false,
         })
         .unwrap();
         let files: Vec<_> = ["foo.wasm", "foo.rmeta", "foo.d", "foo.pdb"]

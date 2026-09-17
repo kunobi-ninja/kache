@@ -1936,6 +1936,7 @@ mod tests {
                 windows_hardlink: None,
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
+                deferred_durability: None,
                 auto_gc: None,
                 gc_evict_shared: Some(true),
                 storage_layout_advice: None,

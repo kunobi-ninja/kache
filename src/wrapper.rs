@@ -411,6 +411,30 @@ fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
     }
 }
 
+/// After a put under `[cache] deferred_durability`: the entry's blobs are on
+/// disk but not flushed, and something has to flush them.
+///
+/// The daemon does, on its own short sweep: it is the process that already
+/// outlives a build, and the one a build's teardown stops before anything
+/// inspects the store. Nothing is spawned here, so no kache process is left
+/// touching the store after the build that started it has finished.
+///
+/// Without a reachable daemon there is nobody to hand the work to, so this
+/// entry is flushed here and now. That costs what an inline fsync always
+/// cost, and it keeps a store that never sees a daemon from accumulating
+/// entries whose every hit re-reads them to verify.
+fn flush_or_hand_off_durability(config: &Config, store: &Store, cache_key: &str) {
+    if !config.deferred_durability {
+        return;
+    }
+    if crate::transport::is_reachable(&config.socket_path()) {
+        return;
+    }
+    if let Err(error) = store.flush_entry_durability(cache_key) {
+        tracing::debug!("durability flush failed for {cache_key}: {error:#}");
+    }
+}
+
 fn event_result_for_store_put(put: StorePutResult) -> EventResult {
     if put.is_full_dup() {
         EventResult::Dup
@@ -1029,6 +1053,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
                     // Store grew — throttled size check + detached background GC if over
                     // budget (kunobi-ninja/kache#497). Never blocks the compile path.
                     maybe_spawn_auto_gc(config, &store);
+                    flush_or_hand_off_durability(config, &store, &cache_key);
                     maybe_enqueue_upload(config, &store, &cache_key, &crate_name, true);
                 }
                 Err(e) => {
@@ -1894,6 +1919,7 @@ fn run_cc_inner(
                     // Store grew — throttled size check + detached background GC if over
                     // budget (kunobi-ninja/kache#497). Never blocks the compile path.
                     maybe_spawn_auto_gc(config, &store);
+                    flush_or_hand_off_durability(config, &store, &cache_key);
                     maybe_enqueue_upload(
                         config,
                         &store,
@@ -3915,6 +3941,7 @@ fn run_parsed_rustc(
             // Store grew — throttled size check + detached background GC if over
             // budget (kunobi-ninja/kache#497). Never blocks the compile path.
             maybe_spawn_auto_gc(config, &store);
+            flush_or_hand_off_durability(config, &store, &cache_key);
         }
         // Name the crate, as the cc path already does: a failed store leaves that
         // unit re-compiling on every build while the aggregate hit rate barely
@@ -13510,6 +13537,74 @@ exit 0
             "a rejecting predicate must not return the stored meta"
         );
         assert!(take_recheck_hit(&store, "missing", &|_| true).is_none());
+    }
+
+    /// With deferred durability the entry is left for the daemon when one is
+    /// listening, and flushed here when none is: either way nothing outlives
+    /// the build, and a store never sees a daemon does not accumulate
+    /// unflushed entries. With the feature off, a put is already durable.
+    #[test]
+    fn a_pending_entry_waits_for_the_daemon_or_is_flushed_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.deferred_durability = true;
+        config.socket_path_override = Some(dir.path().join("absent.sock"));
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("out.rlib");
+        let put = |key: &str, bytes: &[u8]| {
+            let output = dir.path().join(format!("{key}.rlib"));
+            std::fs::write(&output, bytes).unwrap();
+            store
+                .put(
+                    key,
+                    "pending_crate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(output, "libout.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+        };
+        let _ = &output;
+
+        put("no_daemon", b"artifact-one");
+        assert_eq!(store.pending_durability().unwrap(), 1);
+        flush_or_hand_off_durability(&config, &store, "no_daemon");
+        assert_eq!(
+            store.pending_durability().unwrap(),
+            0,
+            "without a daemon the entry is flushed here"
+        );
+
+        // A listening socket: the daemon owns the flush, so this leaves the
+        // entry pending and starts nothing. Bound through the same transport
+        // the wrapper probes, which on Windows is a named pipe.
+        let socket = dir.path().join("live.sock");
+        let listener = crate::transport::ListenerOptions::new()
+            .name(crate::transport::socket_name(&socket).expect("socket name"))
+            .create_sync()
+            .expect("bind listener");
+        config.socket_path_override = Some(socket);
+        put("with_daemon", b"artifact-two");
+        assert_eq!(store.pending_durability().unwrap(), 1);
+        flush_or_hand_off_durability(&config, &store, "with_daemon");
+        assert_eq!(
+            store.pending_durability().unwrap(),
+            1,
+            "a reachable daemon is left to flush it"
+        );
+        drop(listener);
+
+        config.deferred_durability = false;
+        flush_or_hand_off_durability(&config, &store, "with_daemon");
+        assert_eq!(
+            store.pending_durability().unwrap(),
+            1,
+            "the switch being off says nothing about an entry already pending"
+        );
     }
 
     #[test]

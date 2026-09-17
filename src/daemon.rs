@@ -3046,6 +3046,27 @@ impl Daemon {
         Response::ok()
     }
 
+    /// Flush a batch of entries stored without an fsync. Uses its own store
+    /// connection, as GC does, so a sweep of slow writes never holds the
+    /// mutex a lookup needs.
+    fn flush_pending_durability(&self) {
+        let flushed = (|| -> Result<usize> {
+            let store = Store::open(&self.config)?;
+            if store.pending_durability()? == 0 {
+                return Ok(0);
+            }
+            let Some(_lock) = store.try_durability_flush_lock()? else {
+                return Ok(0);
+            };
+            store.flush_durability(crate::cli::DURABILITY_FLUSH_BATCH)
+        })();
+        match flushed {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!("flushed {n} entries to disk"),
+            Err(error) => tracing::debug!("durability flush failed: {error:#}"),
+        }
+    }
+
     pub fn handle_compile_finished(&self, req: &CompileFinishedRequest) -> Response {
         if let Ok(mut map) = self.in_flight_compiles.lock()
             && let Some(entry) = map.get(&req.pid)
@@ -6174,6 +6195,22 @@ async fn server_main(
         loop {
             interval.tick().await;
             sweep_daemon.finalize_inactive_plan(SESSION_INACTIVITY_MS);
+        }
+    });
+
+    // Entries a miss stored without an fsync (`cache.deferred_durability`).
+    // Short interval: until an entry is flushed every hit on it re-reads its
+    // blobs to verify them, and the wrapper hands the work here precisely so
+    // the build does not wait for the disk.
+    let durability_daemon = daemon.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let daemon = durability_daemon.clone();
+            // Blocking: fsync per blob, off the async workers (#281).
+            let _ = tokio::task::spawn_blocking(move || daemon.flush_pending_durability()).await;
         }
     });
 
@@ -10197,6 +10234,7 @@ mod tests {
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            deferred_durability: false,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
@@ -11512,6 +11550,54 @@ mod tests {
                 .expect("GC must finish while the daemon store is in use")
                 .is_ok()
         );
+    }
+
+    /// The daemon's sweep is what flushes entries a miss stored without an
+    /// fsync: it marks them durable, does nothing once the queue is empty,
+    /// and stands aside while another flusher holds the lock.
+    #[test]
+    fn the_daemon_sweep_flushes_entries_pending_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("out.rlib");
+        std::fs::write(&output, b"artifact-bytes").unwrap();
+        store
+            .put(
+                "pending",
+                "pending_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output, "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(store.pending_durability().unwrap(), 1);
+
+        // Another flusher holds the lock: the sweep leaves the entry alone.
+        let held = store
+            .try_durability_flush_lock()
+            .unwrap()
+            .expect("flush lock");
+        let daemon = Daemon::new(config);
+        daemon.flush_pending_durability();
+        assert_eq!(
+            store.pending_durability().unwrap(),
+            1,
+            "a held lock means another flusher is draining the queue"
+        );
+        drop(held);
+
+        daemon.flush_pending_durability();
+        assert_eq!(store.pending_durability().unwrap(), 0);
+        // Nothing pending: the sweep is a no-op and takes no lock.
+        daemon.flush_pending_durability();
+        assert_eq!(store.pending_durability().unwrap(), 0);
+        assert!(store.try_durability_flush_lock().unwrap().is_some());
     }
 
     #[test]

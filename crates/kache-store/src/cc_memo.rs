@@ -1,7 +1,7 @@
 //! Shared C/C++ memo inputs. Artifact keys and input validation stay compiler-owned.
 
 use crate::file_hash::{FileFingerprint, FileHashCache};
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CcPreprocessMemoInput {
@@ -74,7 +74,106 @@ pub(crate) fn ensure_schema(db: &Connection) -> rusqlite::Result<()> {
     tx.commit()
 }
 
+/// The mapped-content memo: what a file's bytes hash to once the prefix maps
+/// of one invocation are applied. Keyed by the raw content hash and the map
+/// set, never by path, so a header shared by two hundred translation units
+/// is read and rewritten once per map set instead of once per unit.
+pub(crate) fn ensure_mapped_hash_schema(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cc_mapped_hashes (
+            content TEXT NOT NULL,
+            maps TEXT NOT NULL,
+            mapped TEXT NOT NULL,
+            PRIMARY KEY(content, maps)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS cc_asm_scans (
+            content TEXT PRIMARY KEY,
+            construct TEXT NOT NULL
+         ) WITHOUT ROWID;",
+    )
+}
+
 impl FileHashCache<'_> {
+    /// Memoised mapped hashes for `contents` under the map set `maps`.
+    pub fn get_cc_mapped_hashes(
+        &self,
+        maps: &str,
+        contents: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        let mut found = std::collections::HashMap::new();
+        let mut stmt = self.db().prepare_cached(
+            "SELECT mapped FROM cc_mapped_hashes WHERE content = ?1 AND maps = ?2",
+        )?;
+        for content in contents {
+            if let Some(mapped) = stmt
+                .query_row(params![content, maps], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                found.insert((*content).to_string(), mapped);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Memoised assembler scans for `contents`: the construct found, or an
+    /// empty string for a clean file.
+    pub fn get_cc_asm_scans(
+        &self,
+        contents: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        let mut found = std::collections::HashMap::new();
+        let mut stmt = self
+            .db()
+            .prepare_cached("SELECT construct FROM cc_asm_scans WHERE content = ?1")?;
+        for content in contents {
+            if let Some(construct) = stmt
+                .query_row(params![content], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                found.insert((*content).to_string(), construct);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Record assembler scans from this invocation, in one transaction.
+    pub fn put_cc_asm_scans(&self, pairs: &[(String, String)]) -> rusqlite::Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        {
+            let mut put = tx.prepare_cached(
+                "INSERT OR IGNORE INTO cc_asm_scans(content, construct) VALUES (?1, ?2)",
+            )?;
+            for (content, construct) in pairs {
+                put.execute(params![content, construct])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// Record mapped hashes computed this invocation, in one transaction.
+    pub fn put_cc_mapped_hashes(
+        &self,
+        maps: &str,
+        pairs: &[(String, String)],
+    ) -> rusqlite::Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        {
+            let mut put = tx.prepare_cached(
+                "INSERT OR IGNORE INTO cc_mapped_hashes(content, maps, mapped) VALUES (?1, ?2, ?3)",
+            )?;
+            for (content, mapped) in pairs {
+                put.execute(params![content, maps, mapped])?;
+            }
+        }
+        tx.commit()
+    }
+
     /// Compact only during explicit repair. Ordinary opens and GC leave free
     /// SQLite pages available for reuse without blocking builds for VACUUM.
     pub fn compact_sparse_index(&self) -> anyhow::Result<Option<(u64, u64)>> {
@@ -365,6 +464,62 @@ mod tests {
                 .len(),
             4
         );
+    }
+
+    /// The mapped-hash memo answers by content and map set, the assembler
+    /// scan memo by content; both keep what was put across a reopen, and a
+    /// duplicate put leaves the first value in place.
+    #[test]
+    fn mapped_hash_and_asm_scan_memos_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let cache = FileHashCache::open(&path).unwrap();
+        cache
+            .put_cc_mapped_hashes(
+                "maps-a",
+                &[
+                    ("c1".to_string(), "m1".to_string()),
+                    ("c2".to_string(), "m2".to_string()),
+                ],
+            )
+            .unwrap();
+        cache.put_cc_mapped_hashes("maps-a", &[]).unwrap();
+        cache
+            .put_cc_asm_scans(&[
+                ("c1".to_string(), String::new()),
+                ("c3".to_string(), ".incbin".to_string()),
+            ])
+            .unwrap();
+        cache.put_cc_asm_scans(&[]).unwrap();
+        drop(cache);
+        let cache = FileHashCache::open(&path).unwrap();
+        let mapped = cache
+            .get_cc_mapped_hashes("maps-a", &["c1", "c2", "c9"])
+            .unwrap();
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped["c1"], "m1");
+        assert_eq!(mapped["c2"], "m2");
+        assert!(
+            cache
+                .get_cc_mapped_hashes("maps-b", &["c1"])
+                .unwrap()
+                .is_empty()
+        );
+        let scans = cache.get_cc_asm_scans(&["c1", "c3", "c9"]).unwrap();
+        assert_eq!(scans.len(), 2);
+        assert_eq!(scans["c1"], "");
+        assert_eq!(scans["c3"], ".incbin");
+        cache
+            .put_cc_mapped_hashes("maps-a", &[("c1".to_string(), "changed".to_string())])
+            .unwrap();
+        cache
+            .put_cc_asm_scans(&[("c3".to_string(), String::new())])
+            .unwrap();
+        assert_eq!(
+            cache.get_cc_mapped_hashes("maps-a", &["c1"]).unwrap()["c1"],
+            "m1"
+        );
+        assert_eq!(cache.get_cc_asm_scans(&["c3"]).unwrap()["c3"], ".incbin");
     }
 
     #[test]

@@ -79,6 +79,7 @@ mod tests {
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            deferred_durability: false,
             auto_gc: true,
             gc_evict_shared: false,
             storage_layout_advice: true,

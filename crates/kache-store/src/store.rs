@@ -34,6 +34,17 @@ impl StorePutResult {
     }
 }
 
+thread_local! {
+    /// `[cache] deferred_durability` of the store last opened on this thread;
+    /// see [`Store::open`].
+    static DEFERRED_DURABILITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a blob written now must be fsynced before it is published.
+fn durable_writes_now() -> bool {
+    !DEFERRED_DURABILITY.with(|deferred| deferred.get())
+}
+
 /// Mark a blob read-only so accidental writes can't corrupt the shared,
 /// content-addressed copy. Best-effort.
 fn set_blob_readonly(blob: &Path) {
@@ -43,6 +54,29 @@ fn set_blob_readonly(blob: &Path) {
 /// Mark a blob read-only, reporting failure. The hardlink ingest path needs
 /// the result: there the guard is a correctness requirement (the blob shares
 /// an inode with the build's own output), not a courtesy.
+/// Flush a published blob to disk. Published blobs are read-only, and
+/// Windows needs write access to flush a handle, so there the read-only
+/// attribute comes off for the flush and goes straight back on.
+fn fsync_published_blob(blob: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        crate::atomic::fsync_file(blob)
+    }
+    #[cfg(windows)]
+    {
+        let meta = fs::metadata(blob)?;
+        if !meta.permissions().readonly() {
+            return crate::atomic::fsync_file(blob);
+        }
+        let mut writable = meta.permissions();
+        writable.set_readonly(false);
+        fs::set_permissions(blob, writable)?;
+        let flushed = crate::atomic::fsync_file(blob);
+        let _ = set_blob_readonly_checked(blob);
+        flushed
+    }
+}
+
 fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
     let meta = fs::metadata(blob)?;
     let mut perms = meta.permissions();
@@ -344,6 +378,7 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
     if blob.is_file() {
         return Ok(false);
     }
+    let durable = durable_writes_now();
     fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
     let bytes = fs::metadata(source).map(|m| m.len()).unwrap_or(0);
     let ingest = std::cell::Cell::new(StoreIngest::Copy(StoreCopyReason::Other));
@@ -362,7 +397,7 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
     // across bind mounts, EPERM, and other errnos are classified into
     // `StoreCopyReason` so the report can show *why* zero-copy did not happen.
     // What gets linked is unchanged — a failure still falls back to a copy.
-    let published = match crate::atomic::atomic_write_and_replace_with(
+    let published = match crate::atomic::atomic_write_and_replace_deferrable(
         blob,
         true,
         |tmp| {
@@ -425,6 +460,7 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
             }
             Ok(())
         },
+        durable,
     ) {
         Ok(published) => published,
         Err(_e) if ro_failed.get() => {
@@ -607,13 +643,16 @@ pub enum ProbeOutcome {
 /// probes never contend on the daemon's store mutex (#565).
 pub fn probe_entry_readonly(db: &Connection, store_dir: &Path, cache_key: &str) -> ProbeOutcome {
     let committed = db.query_row(
-        "SELECT committed FROM entries WHERE cache_key = ?1",
+        "SELECT committed, durable FROM entries WHERE cache_key = ?1",
         params![cache_key],
-        |row| row.get::<_, bool>(0),
+        |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
     );
     match committed {
-        Ok(true) => {}
-        Ok(false) => return ProbeOutcome::Miss,
+        Ok((true, true)) => {}
+        // Stored without an fsync and not flushed yet: the writing path
+        // verifies the bytes before serving it.
+        Ok((true, false)) => return ProbeOutcome::Fallback("entry pending durability"),
+        Ok((false, _)) => return ProbeOutcome::Miss,
         Err(SqlError::QueryReturnedNoRows) => return ProbeOutcome::Miss,
         Err(_) => return ProbeOutcome::Fallback("index read failed"),
     }
@@ -1297,6 +1336,9 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     let _ =
         db.execute_batch("ALTER TABLE entries ADD COLUMN num_features INTEGER NOT NULL DEFAULT 0");
     let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN content_hash TEXT");
+    // Whether the entry's blobs and metadata were fsynced (deferred
+    // durability). Rows from before the column were always flushed on put.
+    let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN durable INTEGER NOT NULL DEFAULT 1");
     // What a miss on this entry would cost to rebuild (kunobi-ninja/kache#594).
     // Recorded in every entry's meta.json since long before this column, so
     // pre-existing rows are backfilled by `backfill_compile_times` rather than
@@ -1398,7 +1440,7 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 
 /// The `user_version` an index carries once every statement of
 /// [`initialize_db`] has run. Bump it with any schema change.
-const INDEX_SCHEMA_GENERATION: i64 = 1;
+const INDEX_SCHEMA_GENERATION: i64 = 2;
 
 /// Replace `cache_key`'s rows in `entry_blobs` with one row per unique hash
 /// in `files`, `refs` counting per-file references (kunobi-ninja/kache#608).
@@ -1640,6 +1682,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let (db, recovered) = open_index_db_reporting_recovery(&db_path)
             .with_context(|| format!("opening index database {}", db_path.display()))?;
 
+        // The blob ingest helpers are free functions; they read the flush
+        // policy of the store last opened on this thread. A thread that never
+        // opened a store flushes inline.
+        DEFERRED_DURABILITY.with(|deferred| deferred.set(config.deferred_durability));
         let store = Self {
             policy: std::marker::PhantomData,
             config: config.clone(),
@@ -1791,7 +1837,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // Decide once per hit whether to content-verify, so all of an entry's
         // blobs are checked together (or none) and `Sampled` advances its
         // counter once per hit, not once per blob (kunobi-ninja/kache#332).
-        let verify_content = should_verify_this_restore(verify_restores_mode());
+        // An entry stored without an fsync (deferred durability) is verified
+        // byte for byte until the flush lands: a crash between the two could
+        // have left a blob whose size is right and whose bytes are not.
+        let pending_durability = !self.entry_is_durable(cache_key);
+        let verify_content =
+            pending_durability || should_verify_this_restore(verify_restores_mode());
 
         // Verify all cached blobs still exist on disk and match expected size
         for cached_file in &meta.files {
@@ -1896,6 +1947,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// GC already holds it (the caller should skip).
     pub fn try_gc_lock(&self) -> Result<Option<GcLock>> {
         StoreLock::try_acquire(&self.config.store_dir().join("gc.lock"))
+    }
+
+    /// The lock a durability flusher holds while it drains entries stored
+    /// without an fsync. A wrapper that finds it held knows a flusher is
+    /// already running for this store.
+    pub fn try_durability_flush_lock(&self) -> Result<Option<StoreLock>> {
+        StoreLock::try_acquire(&self.config.store_dir().join("durability.lock"))
     }
 
     /// Block until the cross-process GC lock is held.
@@ -2217,11 +2275,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // partially written meta.json, and the rename's parent-directory
         // fsync makes the new name durable alongside the contents.
         fs::create_dir_all(&entry_dir).context("creating entry directory")?;
-        crate::atomic::atomic_replace(&meta_path, meta_json.as_bytes())
+        let durable = self.durable_writes();
+        crate::atomic::atomic_replace_deferrable(&meta_path, meta_json.as_bytes(), durable)
             .context("writing entry metadata")?;
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
-            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, kache_format::CACHE_KEY_VERSION],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)",
+            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, durable],
         )?;
         tx.commit()?;
 
@@ -3198,7 +3257,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     .with_context(|| format!("copying {} into store staging", source.display()))?;
                 StoreIngest::Copy(StoreCopyReason::Ineligible)
             };
-            crate::atomic::fsync_file(tmp).context("flushing staged blob")?;
+            if self.durable_writes() {
+                crate::atomic::fsync_file(tmp).context("flushing staged blob")?;
+            }
             let mut ro_guard_failed = false;
             if matches!(ingest, StoreIngest::Hardlink) && set_blob_readonly_checked(tmp).is_err() {
                 // The guard is a correctness requirement on a shared inode; a
@@ -3269,7 +3330,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // occupied *now* having found it free above.
             return publish_rename_outcome(e, blob.is_file());
         }
-        let _ = crate::atomic::fsync_dir(blob.parent().unwrap());
+        if self.durable_writes() {
+            let _ = crate::atomic::fsync_dir(blob.parent().unwrap());
+        }
         match ingest {
             StoreIngest::Reflink => crate::opcounts::record_store_reflinked(size_bytes),
             StoreIngest::Hardlink => crate::opcounts::record_store_hardlinked(size_bytes),
@@ -3367,6 +3430,113 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 
     /// Get the directory for a cache entry.
+    /// Whether puts flush on the build path. Off under deferred durability,
+    /// where [`Store::flush_durability`] flushes later.
+    fn durable_writes(&self) -> bool {
+        !self.config.deferred_durability
+    }
+
+    /// Whether an entry's blobs and metadata have reached disk. Unknown rows
+    /// read as durable: the size check and the verification policy still apply.
+    fn entry_is_durable(&self, cache_key: &str) -> bool {
+        self.db
+            .query_row(
+                "SELECT durable FROM entries WHERE cache_key = ?1",
+                params![cache_key],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(true)
+    }
+
+    /// Entries stored without an fsync that no flush has reached yet.
+    pub fn pending_durability(&self) -> Result<u64> {
+        Ok(self.db.query_row(
+            "SELECT count(*) FROM entries WHERE committed = 1 AND durable = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    /// Flush up to `limit` entries stored without an fsync: every blob and
+    /// its shard directory, then the entry's `meta.json` and directory, and
+    /// mark them durable. An entry whose blob went missing meanwhile is
+    /// evicted instead. Returns how many entries were flushed.
+    pub fn flush_durability(&self, limit: usize) -> Result<usize> {
+        let keys: Vec<String> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT cache_key FROM entries WHERE committed = 1 AND durable = 0
+                 ORDER BY created_at LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut flushed = 0;
+        for key in keys {
+            if self.flush_entry_durability(&key)? {
+                flushed += 1;
+            }
+        }
+        Ok(flushed)
+    }
+
+    /// Flush one entry stored without an fsync and mark it durable. `Ok(false)`
+    /// when the entry was already durable or had to be evicted.
+    pub fn flush_entry_durability(&self, cache_key: &str) -> Result<bool> {
+        if self.entry_is_durable(cache_key) {
+            return Ok(false);
+        }
+        let entry_dir = self.entry_dir(cache_key);
+        let meta_path = entry_dir.join("meta.json");
+        let meta: EntryMeta = match fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+        {
+            Some(meta) => meta,
+            None => {
+                tracing::warn!(
+                    "cache entry {} has no readable meta.json to flush, evicting",
+                    cache_key.get(..16).unwrap_or(cache_key)
+                );
+                let _ = self.remove_entry(cache_key);
+                return Ok(false);
+            }
+        };
+        for file in &meta.files {
+            let blob = self.blob_path(&file.hash);
+            if let Err(error) = fsync_published_blob(&blob) {
+                // A blob that is gone takes the entry with it; anything else
+                // (a busy handle, a transient IO error) leaves the entry
+                // pending, to be flushed by a later worker or by GC. An
+                // unflushed entry is still served, with its bytes verified.
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "cache entry {} blob {} vanished before it was flushed, evicting",
+                        cache_key.get(..16).unwrap_or(cache_key),
+                        file.name
+                    );
+                    let _ = self.remove_entry(cache_key);
+                } else {
+                    tracing::debug!(
+                        "cache entry {} blob {} could not be flushed ({error}); still pending",
+                        cache_key.get(..16).unwrap_or(cache_key),
+                        file.name
+                    );
+                }
+                return Ok(false);
+            }
+            if let Some(parent) = blob.parent() {
+                let _ = crate::atomic::fsync_dir(parent);
+            }
+        }
+        fsync_published_blob(&meta_path).context("flushing entry metadata")?;
+        let _ = crate::atomic::fsync_dir(&entry_dir);
+        self.db.execute(
+            "UPDATE entries SET durable = 1 WHERE cache_key = ?1",
+            params![cache_key],
+        )?;
+        Ok(true)
+    }
+
     pub fn entry_dir(&self, cache_key: &str) -> PathBuf {
         self.config.store_dir().join(cache_key)
     }
@@ -5089,6 +5259,33 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        // A generation-1 index (0.23) lacks the durability column and the two
+        // C memo tables; the generation bump is what makes it migrate.
+        db.pragma_update(None, "user_version", 1_i64).unwrap();
+        db.execute_batch(
+            "ALTER TABLE entries DROP COLUMN durable;
+             DROP TABLE cc_mapped_hashes;
+             DROP TABLE cc_asm_scans;",
+        )
+        .unwrap();
+        drop(db);
+        let db = open_index_db(&path).unwrap();
+        let durable_column: i64 = db
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('entries') WHERE name = 'durable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(durable_column, 1, "generation 1 gains the durable column");
+        let memo_tables: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('cc_mapped_hashes', 'cc_asm_scans')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memo_tables, 2, "generation 1 gains the C memo tables");
         assert_eq!(
             tables, 1,
             "the dropped table was recreated by the migration"
@@ -6198,6 +6395,172 @@ mod tests {
         );
     }
 
+    /// A published blob is read-only; flushing one must work anyway, and a
+    /// blob that is gone reports `NotFound` so the flusher can tell a lost
+    /// entry from a transient error.
+    #[test]
+    fn a_read_only_blob_flushes_and_a_missing_one_reports_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        fs::write(&blob, b"artifact-bytes").unwrap();
+        set_blob_readonly(&blob);
+        assert!(
+            fs::metadata(&blob).unwrap().permissions().readonly(),
+            "the fixture must reproduce a published blob"
+        );
+        fsync_published_blob(&blob).expect("a published blob flushes");
+        assert!(
+            fs::metadata(&blob).unwrap().permissions().readonly(),
+            "and stays read-only afterwards"
+        );
+        assert_eq!(
+            fsync_published_blob(&dir.path().join("absent"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// The ingest helpers follow the flush policy of the store last opened
+    /// on this thread: deferred stores skip the inline fsync, others keep it.
+    #[test]
+    fn blob_ingest_follows_the_last_opened_store_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let _deferred = Store::open(&config).unwrap();
+        assert!(
+            !durable_writes_now(),
+            "a deferred store skips the inline fsync"
+        );
+        config.deferred_durability = false;
+        let _strict = Store::open(&config).unwrap();
+        assert!(
+            durable_writes_now(),
+            "a durable store keeps the inline fsync"
+        );
+    }
+
+    /// Deferred durability: a put leaves the entry pending, a hit on a
+    /// pending entry verifies the bytes (a same-size corruption is caught and
+    /// evicted), the probe hands a pending entry back to the writing path,
+    /// the flush marks it durable, and a durable entry is served on its size
+    /// check as before. With the feature off, a put is durable at once.
+    #[test]
+    fn deferred_durability_verifies_pending_hits_until_the_flush() {
+        let _env_lock = crate::test_support::process_state_test_lock();
+        let _verify = EnvVarGuard::remove("KACHE_VERIFY_RESTORES");
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        // One source per put: a stored source may become a read-only
+        // hardlink of its blob, so it cannot be rewritten for the next.
+        let puts = std::cell::Cell::new(0u32);
+        let put = |bytes: &[u8]| {
+            puts.set(puts.get() + 1);
+            let output_file = dir.path().join(format!("out-{}.rlib", puts.get()));
+            fs::write(&output_file, bytes).unwrap();
+            store
+                .put(
+                    "pending_key",
+                    "pending_crate",
+                    &["lib".to_string()],
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "dev",
+                    &[(output_file.clone(), "libout.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap()
+        };
+        let corrupt_same_size = |blob: &Path| {
+            let mut perms = fs::metadata(blob).unwrap().permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(blob, perms).unwrap();
+            let mut bytes = fs::read(blob).unwrap();
+            bytes[0] ^= 0xff;
+            fs::write(blob, bytes).unwrap();
+        };
+
+        put(b"artifact-bytes-one");
+        assert_eq!(store.pending_durability().unwrap(), 1);
+        let ro = open_index_db_readonly(&config.index_db_path()).unwrap();
+        assert!(matches!(
+            probe_entry_readonly(&ro, &config.store_dir(), "pending_key"),
+            ProbeOutcome::Fallback("entry pending durability")
+        ));
+        let meta = store
+            .get("pending_key")
+            .unwrap()
+            .expect("intact pending entry hits");
+        let blob = store.blob_path(&meta.files[0].hash);
+        corrupt_same_size(&blob);
+        assert!(
+            store.get("pending_key").unwrap().is_none(),
+            "a pending entry whose bytes changed is evicted, not served"
+        );
+        assert!(!store.contains("pending_key"));
+
+        put(b"artifact-bytes-two");
+        assert_eq!(store.pending_durability().unwrap(), 1);
+        assert_eq!(store.flush_durability(10).unwrap(), 1);
+        assert_eq!(store.pending_durability().unwrap(), 0);
+        assert_eq!(
+            store.flush_durability(10).unwrap(),
+            0,
+            "nothing left to flush"
+        );
+        assert!(!store.flush_entry_durability("pending_key").unwrap());
+        assert!(matches!(
+            probe_entry_readonly(&ro, &config.store_dir(), "pending_key"),
+            ProbeOutcome::Hit(_)
+        ));
+        let meta = store.get("pending_key").unwrap().unwrap();
+        corrupt_same_size(&store.blob_path(&meta.files[0].hash));
+        assert!(
+            store.get("pending_key").unwrap().is_some(),
+            "a durable entry keeps the size-only check the verification policy asks for"
+        );
+
+        // A pending entry whose blob vanished is evicted by the flush.
+        store.remove_entry("pending_key").unwrap();
+        put(b"artifact-bytes-three");
+        let meta = store.get("pending_key").unwrap().unwrap();
+        let blob = store.blob_path(&meta.files[0].hash);
+        let mut perms = fs::metadata(&blob).unwrap().permissions();
+        perms.set_readonly(false);
+        fs::set_permissions(&blob, perms).unwrap();
+        fs::remove_file(&blob).unwrap();
+        assert_eq!(store.flush_durability(10).unwrap(), 0);
+        assert!(
+            !store.contains("pending_key"),
+            "evicted rather than marked durable"
+        );
+
+        // Feature off: the put is durable inside the compile.
+        config.deferred_durability = false;
+        let strict = Store::open(&config).unwrap();
+        let strict_file = dir.path().join("out-strict.rlib");
+        fs::write(&strict_file, b"artifact-bytes-four").unwrap();
+        strict
+            .put(
+                "strict_key",
+                "strict_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(strict_file.clone(), "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(strict.pending_durability().unwrap(), 0);
+        assert!(strict.try_durability_flush_lock().unwrap().is_some());
+    }
+
     /// The read-only probe (#565) must mirror `Store::get`'s servable/hit
     /// decision without any write side effect: a committed, blob-complete
     /// entry probes `Hit` and leaves `hit_count` untouched; an unknown key is
@@ -6324,6 +6687,7 @@ mod tests {
             max_size: 1024 * 1024,
             gc_evict_shared: false,
             upload_spool_max_jobs: 65_536,
+            deferred_durability: false,
         }
     }
 

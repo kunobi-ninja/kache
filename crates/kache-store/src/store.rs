@@ -54,6 +54,29 @@ fn set_blob_readonly(blob: &Path) {
 /// Mark a blob read-only, reporting failure. The hardlink ingest path needs
 /// the result: there the guard is a correctness requirement (the blob shares
 /// an inode with the build's own output), not a courtesy.
+/// Flush a published blob to disk. Published blobs are read-only, and
+/// Windows needs write access to flush a handle, so there the read-only
+/// attribute comes off for the flush and goes straight back on.
+fn fsync_published_blob(blob: &Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        crate::atomic::fsync_file(blob)
+    }
+    #[cfg(windows)]
+    {
+        let meta = fs::metadata(blob)?;
+        if !meta.permissions().readonly() {
+            return crate::atomic::fsync_file(blob);
+        }
+        let mut writable = meta.permissions();
+        writable.set_readonly(false);
+        fs::set_permissions(blob, writable)?;
+        let flushed = crate::atomic::fsync_file(blob);
+        let _ = set_blob_readonly_checked(blob);
+        flushed
+    }
+}
+
 fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
     let meta = fs::metadata(blob)?;
     let mut perms = meta.permissions();
@@ -3480,20 +3503,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         };
         for file in &meta.files {
             let blob = self.blob_path(&file.hash);
-            if let Err(error) = crate::atomic::fsync_file(&blob) {
-                tracing::warn!(
-                    "cache entry {} blob {} could not be flushed ({error}), evicting",
-                    cache_key.get(..16).unwrap_or(cache_key),
-                    file.name
-                );
-                let _ = self.remove_entry(cache_key);
+            if let Err(error) = fsync_published_blob(&blob) {
+                // A blob that is gone takes the entry with it; anything else
+                // (a busy handle, a transient IO error) leaves the entry
+                // pending, to be flushed by a later worker or by GC. An
+                // unflushed entry is still served, with its bytes verified.
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "cache entry {} blob {} vanished before it was flushed, evicting",
+                        cache_key.get(..16).unwrap_or(cache_key),
+                        file.name
+                    );
+                    let _ = self.remove_entry(cache_key);
+                } else {
+                    tracing::debug!(
+                        "cache entry {} blob {} could not be flushed ({error}); still pending",
+                        cache_key.get(..16).unwrap_or(cache_key),
+                        file.name
+                    );
+                }
                 return Ok(false);
             }
             if let Some(parent) = blob.parent() {
                 let _ = crate::atomic::fsync_dir(parent);
             }
         }
-        crate::atomic::fsync_file(&meta_path).context("flushing entry metadata")?;
+        fsync_published_blob(&meta_path).context("flushing entry metadata")?;
         let _ = crate::atomic::fsync_dir(&entry_dir);
         self.db.execute(
             "UPDATE entries SET durable = 1 WHERE cache_key = ?1",
@@ -6357,6 +6392,32 @@ mod tests {
         assert!(
             err.to_string().contains("refusing to commit"),
             "expected digest-mismatch refusal, got: {err:#}"
+        );
+    }
+
+    /// A published blob is read-only; flushing one must work anyway, and a
+    /// blob that is gone reports `NotFound` so the flusher can tell a lost
+    /// entry from a transient error.
+    #[test]
+    fn a_read_only_blob_flushes_and_a_missing_one_reports_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        fs::write(&blob, b"artifact-bytes").unwrap();
+        set_blob_readonly(&blob);
+        assert!(
+            fs::metadata(&blob).unwrap().permissions().readonly(),
+            "the fixture must reproduce a published blob"
+        );
+        fsync_published_blob(&blob).expect("a published blob flushes");
+        assert!(
+            fs::metadata(&blob).unwrap().permissions().readonly(),
+            "and stays read-only afterwards"
+        );
+        assert_eq!(
+            fsync_published_blob(&dir.path().join("absent"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
         );
     }
 

@@ -1886,6 +1886,44 @@ mod tests {
         unsafe { std::env::remove_var("DEP_KT_INCLUDE") };
     }
 
+    /// 0.23.0 started kache through a `/bin/sh` launcher, and dash drops a
+    /// variable such as `DEP_TAURI_CORE:WINDOW__…_PATH`. A run recorded
+    /// without it must stay out of reach of a run that sees it, so a store
+    /// written by 0.23.0 needs no migration: those entries miss and age out.
+    #[test]
+    fn a_run_that_could_not_see_a_links_key_is_never_restored_for_one_that_can() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config: config.clone(),
+            binary_hash: "aaaa".to_string(),
+            environment: environment(&dir.path().join("out"), &dir.path().join("pkg")),
+            start: std::time::Instant::now(),
+        };
+        let prediction = Prediction {
+            version: PREDICTION_SCHEMA,
+            inputs: Vec::new(),
+            env: Vec::new(),
+            default_package: false,
+            portable_out_dir: true,
+        };
+        const NAME: &str = "DEP_KT_CORE:WINDOW__CORE_PLUGIN___PERMISSION_FILES_PATH";
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::remove_var(NAME) };
+        let stripped = run.action_key(&prediction).unwrap();
+        let files = dir.path().join("permission-files");
+        std::fs::write(&files, "[]").unwrap();
+        unsafe { std::env::set_var(NAME, &files) };
+        let complete = run.action_key(&prediction).unwrap();
+        unsafe { std::env::remove_var(NAME) };
+        assert_ne!(
+            stripped, complete,
+            "a DEP_ key that is not a shell identifier is part of the action key"
+        );
+    }
+
     #[test]
     fn input_digests_are_bounded_and_refuse_symlink_cycles() {
         let dir = tempfile::tempdir().unwrap();

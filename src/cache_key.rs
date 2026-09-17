@@ -6767,6 +6767,21 @@ mod tests {
     #[test]
     fn discovery_defers_to_the_compile_and_takes_the_emitted_closure() {
         let _lock = key_test_lock();
+        // A unit with an OUT_DIR never defers. Cargo and nextest set kache's
+        // own OUT_DIR on the test process, so clear it for this unit.
+        let out_dir = std::env::var_os("OUT_DIR");
+        // SAFETY: the key-test lock serialises environment edits.
+        unsafe { std::env::remove_var("OUT_DIR") };
+        struct RestoreOutDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreOutDir {
+            fn drop(&mut self) {
+                if let Some(value) = self.0.take() {
+                    // SAFETY: still under the key-test lock, dropped first.
+                    unsafe { std::env::set_var("OUT_DIR", value) };
+                }
+            }
+        }
+        let _restore = RestoreOutDir(out_dir);
         if get_rustc_version(Path::new("rustc")).is_err() {
             return;
         }

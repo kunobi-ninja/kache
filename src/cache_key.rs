@@ -2837,7 +2837,13 @@ fn env_dep_path_only_decision(
     // eligibility without re-opening #167. The same include-only proof below
     // still applies, so a VAR pointing under OUT_DIR but baked as a runtime
     // value is still kept absolute.
-    if !(var == "OUT_DIR" || allowlist.iter().any(|v| v == var) || value_is_under_out_dir(val)) {
+    // CARGO_MANIFEST_DIR is refused in every form, listed or not: rustc can
+    // embed it in crate metadata and generated code, and a crate's own sources
+    // always live under it, so the include proof below is trivially satisfied
+    // and normalizing it restores another checkout's path (#167).
+    if var == "CARGO_MANIFEST_DIR"
+        || !(var == "OUT_DIR" || allowlist.iter().any(|v| v == var) || value_is_under_out_dir(val))
+    {
         return EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly;
     }
     if !path_is_only_used_for_includes(val, source_files) {
@@ -2925,8 +2931,11 @@ fn path_is_only_used_for_includes(
 /// `macro_rules!` resolves in this crate, so dep-info reports the env dep while
 /// this crate's sources never name the var; without a visible include use, its
 /// value may be baked into the artifact. Such crates keep the absolute value.
-/// Proof comes only from `.rs` files: an `include_str!`'d README that quotes
-/// an include is not code. Every file still counts against the var.
+/// Proof comes only from files whose path ends in `.rs`, so an `include_str!`'d
+/// README that quotes an include is not proof. The test is the path, not what
+/// rustc did with the file: a `.rs` file read as text (`include_str!` of a
+/// codegen template or a UI-test fixture) still counts. Every file, whatever
+/// its extension, still counts AGAINST the var.
 ///
 /// Residual gaps, where the text looks like a locator but the compiled crate
 /// can still bake the value:
@@ -2936,7 +2945,12 @@ fn path_is_only_used_for_includes(
 ///   builtin (a local `macro_rules!`, an import, or a path like
 ///   `mycrate::include!`);
 /// - an include inside another macro's arguments, or on an item under an
-///   attribute macro, which can move the tokens out of the include.
+///   attribute macro, which can move the tokens out of the include;
+/// - a `.rs` file rustc only read as text, whose quoted include reads as proof.
+///
+/// The `.rs` rule also costs hits: an `include!`'d fragment named `.in`,
+/// `.txt` or without an extension supplies no proof, so its crate keeps the
+/// absolute value.
 ///
 /// Missing or changed files fail closed.
 fn env_dep_source_decision(
@@ -2976,11 +2990,13 @@ fn env_dep_source_decision(
 /// otherwise wrappers keep reusing the old answer for every file that did not
 /// change.
 ///
-/// 2: computed env var names, `[`/`{` delimiters, comments and non-ASCII
-/// whitespace between tokens, lifetimes, nested block comments, raw C strings,
-/// number suffixes and non-ASCII identifiers; answers gained the
+/// 2: computed env var names, `[`/`{` delimiters, comments between tokens,
+/// lifetimes, nested block comments and raw C strings; answers gained the
 /// include-locator state that the positive proof needs.
-const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 2;
+///
+/// 3: number suffixes, non-ASCII identifier bytes, and the non-ASCII
+/// whitespace and byte-order mark rustc accepts between tokens.
+const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 3;
 
 /// How one source file's text uses an env var.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3053,10 +3069,10 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
             }
             // A number with its suffix (`1u8`, `1r`), so a suffix cannot
             // start a raw string that hides the code after it.
-            b'0'..=b'9' => i = skip_ident_bytes(bytes, i + 1),
+            b'0'..=b'9' => i = skip_ident_bytes(bytes, i),
             b if is_ident_start(b) => {
                 let ident_start = i;
-                i = skip_ident_bytes(bytes, i + 1);
+                i = skip_ident_bytes(bytes, i);
                 let ident = &bytes[ident_start..i];
                 let Some(open) = parse_macro_open(bytes, i) else {
                     continue;
@@ -3135,9 +3151,9 @@ fn comment_starts_at(bytes: &[u8], i: usize) -> bool {
 }
 
 /// Byte length of the Rust whitespace character at `i`, or 0. Rust also
-/// accepts vertical tab and a few non-ASCII `Pattern_White_Space` characters
-/// between tokens; reading those as identifier bytes would hide `env` from
-/// the scanner.
+/// accepts vertical tab, a few non-ASCII `Pattern_White_Space` characters and
+/// a leading byte-order mark between tokens; reading those as identifier bytes
+/// would hide `env` from the scanner.
 fn rust_whitespace_len(bytes: &[u8], i: usize) -> usize {
     match bytes.get(i..).unwrap_or_default() {
         [b'\t' | b'\n' | b'\x0B' | b'\x0C' | b'\r' | b' ', ..] => 1,
@@ -3145,6 +3161,8 @@ fn rust_whitespace_len(bytes: &[u8], i: usize) -> usize {
         [0xC2, 0x85, ..] => 2,
         // U+200E, U+200F, U+2028, U+2029
         [0xE2, 0x80, 0x8E | 0x8F | 0xA8 | 0xA9, ..] => 3,
+        // U+FEFF, which rustc strips from the head of a file.
+        [0xEF, 0xBB, 0xBF, ..] => 3,
         _ => 0,
     }
 }
@@ -3264,6 +3282,8 @@ fn is_ident_start(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphabetic() || !byte.is_ascii()
 }
 
+/// Consume identifier bytes from `i`, which the caller has already read as
+/// an identifier start or a digit.
 fn skip_ident_bytes(bytes: &[u8], mut i: usize) -> usize {
     while i < bytes.len()
         && (is_ident_start(bytes[i]) || bytes[i].is_ascii_digit())
@@ -8611,6 +8631,18 @@ mod tests {
         }
         // U+00A9 shares U+0085's lead byte but is not whitespace.
         assert_eq!(scan("env\u{A9}!(\"MYVAR\")", "MYVAR"), Unused);
+        // A byte-order mark does not glue to the identifier after it.
+        assert_eq!(scan("\u{FEFF}env!(\"MYVAR\")", "MYVAR"), RuntimeValue);
+
+        // Identifiers and numbers are consumed from their first byte, so a
+        // one-byte token keeps its boundary.
+        assert_eq!(scan(r#"m!(env!("MYVAR"))"#, "MYVAR"), RuntimeValue);
+        assert_eq!(scan(r#"e!("MYVAR")"#, "MYVAR"), Unused);
+        assert_eq!(scan(r#"let n = 1; env!("MYVAR");"#, "MYVAR"), RuntimeValue);
+        assert_eq!(
+            scan(r#"include!(1, env!("MYVAR"))"#, "MYVAR"),
+            IncludeLocator
+        );
     }
 
     #[test]
@@ -10912,7 +10944,9 @@ pub fn g(_: &'static str) {}"#,
     }
 
     #[test]
-    fn env_dep_policy_refuses_to_force_manifest_dir() {
+    fn env_dep_policy_refuses_manifest_dir_in_every_allowlist_form() {
+        // A crate's own sources live under CARGO_MANIFEST_DIR, so the include
+        // proof is trivially satisfied and only the refusal keeps #167 shut.
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         let manifest_dir = workspace.join("helper");
@@ -10921,32 +10955,34 @@ pub fn g(_: &'static str) {}"#,
         let lib = src.join("lib.rs");
         std::fs::write(
             &lib,
-            b"pub fn manifest_dir() -> &'static str { env!(\"CARGO_MANIFEST_DIR\") }",
+            br#"include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/gen.rs"));"#,
         )
         .unwrap();
 
         let source_files = vec![lib];
-        let path_normalizer = PathNormalizer::from_env(Some(&workspace))
-            .with_path_only_env_vars(vec!["test_crate:CARGO_MANIFEST_DIR".to_string()]);
         let manifest_dir_value = manifest_dir
             .canonicalize()
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let env_dep = normalize_env_dep_value(
-            "test_crate",
-            "CARGO_MANIFEST_DIR",
-            &manifest_dir_value,
-            &source_files,
-            &path_normalizer,
-        );
+        for entry in ["test_crate:CARGO_MANIFEST_DIR", "CARGO_MANIFEST_DIR"] {
+            let path_normalizer = PathNormalizer::from_env(Some(&workspace))
+                .with_path_only_env_vars(vec![entry.to_string()]);
+            let env_dep = normalize_env_dep_value(
+                "test_crate",
+                "CARGO_MANIFEST_DIR",
+                &manifest_dir_value,
+                &source_files,
+                &path_normalizer,
+            );
 
-        assert_eq!(
-            env_dep.decision,
-            EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly,
-            "CARGO_MANIFEST_DIR must stay absolute even when crate-scoped forcing is requested"
-        );
-        assert_eq!(env_dep.value, manifest_dir_value);
+            assert_eq!(
+                env_dep.decision,
+                EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly,
+                "CARGO_MANIFEST_DIR must stay absolute, listed as `{entry}`"
+            );
+            assert_eq!(env_dep.value, manifest_dir_value);
+        }
     }
 
     #[test]

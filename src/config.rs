@@ -230,7 +230,8 @@ pub struct Config {
     /// `VAR` entries remain gated by source/include safety checks. A scoped
     /// `rustc_crate_name:VAR` entry is an explicit assertion that bypasses
     /// those scans for exactly that crate and variable; crate names use
-    /// rustc's underscore form. `CARGO_MANIFEST_DIR` is never forceable.
+    /// rustc's underscore form. `CARGO_MANIFEST_DIR` is refused in both
+    /// forms.
     /// Set via `KACHE_PATH_ONLY_ENV_VARS` (comma/space-separated) or
     /// `[cache] path_only_env_vars`. Empty (the default) leaves only built-in
     /// OUT_DIR normalization.

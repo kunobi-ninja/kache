@@ -1066,6 +1066,11 @@ mod tests {
             !codegen_backend_is_keyable("x.so"),
             "the loader searches library paths for a bare file name"
         );
+        assert_eq!(
+            codegen_backend_is_keyable("dir\\x.so"),
+            cfg!(windows),
+            "a backslash separates paths only on Windows"
+        );
         let parsed =
             RustcArgs::parse(&flags(&["rustc", "lib.rs", "-Z", "codegen-backend=./x.so"])).unwrap();
         assert_eq!(parsed.codegen_backend_dylib(), Some("./x.so"));

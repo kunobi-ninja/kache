@@ -2852,9 +2852,8 @@ fn run_parsed_rustc(
     // reports (cuda-oxide writes device artifacts next to the crate), and a
     // hit would restore the artifacts without them. Such compiles bypass the
     // cache unless the user trusts the backend.
-    let untrusted_codegen_backend = args.codegen_backend_dylib().filter(|backend| {
-        !config.trust_codegen_backends || !crate::args::codegen_backend_is_keyable(backend)
-    });
+    let untrusted_codegen_backend =
+        untrusted_codegen_backend(args.codegen_backend_dylib(), config.trust_codegen_backends);
     let current_dir = std::env::current_dir().ok();
     let workspace_root = args.path_normalization_root().map(Path::to_path_buf);
     let exclude_roots: Vec<_> = workspace_root
@@ -5665,6 +5664,12 @@ fn passthrough_with_event<R: Into<String>>(
         &output,
     );
     Ok(output.exit_code)
+}
+
+/// The codegen backend dylib that keeps a rustc compile out of the cache: any
+/// dylib when backends are untrusted, and a trusted one kache cannot key.
+fn untrusted_codegen_backend(backend: Option<&str>, trusted: bool) -> Option<&str> {
+    backend.filter(|backend| !trusted || !crate::args::codegen_backend_is_keyable(backend))
 }
 
 /// Passthrough reason for a rustc compile whose codegen backend dylib is not
@@ -11353,6 +11358,27 @@ exit 0
         assert!(!cc_key_error_skips_fallback(&anyhow::anyhow!(
             "cc -E key probe exited 1"
         )));
+    }
+
+    #[test]
+    fn untrusted_codegen_backend_bypasses_unless_trusted_and_keyable() {
+        assert_eq!(untrusted_codegen_backend(None, false), None);
+        assert_eq!(untrusted_codegen_backend(None, true), None);
+        assert_eq!(
+            untrusted_codegen_backend(Some("/b/backend.so"), false),
+            Some("/b/backend.so"),
+            "an untrusted backend always bypasses"
+        );
+        assert_eq!(
+            untrusted_codegen_backend(Some("/b/backend.so"), true),
+            None,
+            "a trusted backend passed as a path is cached"
+        );
+        assert_eq!(
+            untrusted_codegen_backend(Some("backend.so"), true),
+            Some("backend.so"),
+            "a trusted bare file name cannot be keyed"
+        );
     }
 
     #[cfg(unix)]

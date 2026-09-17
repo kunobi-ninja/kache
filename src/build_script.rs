@@ -2162,14 +2162,19 @@ mod tests {
         let unit = dir.path().join("debug/build/pkg-1");
         std::fs::create_dir_all(&unit).unwrap();
         // `env` stands in for both the script and kache: it prints exactly the
-        // environment it was started with.
-        // A link, not a copy: macOS kills a copied system binary.
+        // environment it was started with. Found on PATH, since the Nix build
+        // sandbox has no /usr/bin/env. A link, not a copy: macOS kills a
+        // copied system binary.
+        let env = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("env"))
+            .find(|candidate| candidate.is_file())
+            .expect("an env binary on PATH");
         let executable = unit.join("build_script_build-1");
-        std::os::unix::fs::symlink("/usr/bin/env", &executable).unwrap();
+        std::os::unix::fs::symlink(&env, &executable).unwrap();
         install(&executable).unwrap();
         let (_, pinned) = launch_record(&unit);
         std::fs::remove_file(&pinned).unwrap();
-        std::os::unix::fs::symlink("/usr/bin/env", &pinned).unwrap();
+        std::os::unix::fs::symlink(&env, &pinned).unwrap();
         let hardlink = unit.join("build-script-build");
         std::fs::hard_link(&executable, &hardlink).unwrap();
         let environment = |launcher: &Path, stale: Option<&str>| {

@@ -409,7 +409,7 @@ pub(crate) fn apply_key_salt(base: String, salt: Option<&str>, label: &str) -> S
 /// rate. The cost is real and is the right way round: a declared variable
 /// holding a machine-local path makes that crate's key machine-specific. Declare
 /// the switch a macro actually branches on, not a glob that sweeps in path
-/// variables. This matches the policy [`env_dep_is_safe_to_normalize`] already
+/// variables. This matches the policy [`env_dep_path_only_decision`] already
 /// applies to reported `env!` deps — normalize only where a value is *proven*
 /// to be nothing but a locator.
 ///
@@ -2351,7 +2351,18 @@ fn fold_unremapped_path_identity<H: KeyFold>(
 enum EnvDepNormalizationDecision {
     Unchanged,
     NormalizedPathOnly,
-    KeptAbsoluteRuntimePath,
+    /// Kept absolute: the var is not OUT_DIR, not allowlisted, and its value
+    /// is not under OUT_DIR.
+    KeptAbsoluteNotPathOnly,
+    /// Kept absolute: dep-info lists no include under the value, or no Rust
+    /// source shows the var inside an include argument (for example when the
+    /// include comes from another crate's macro).
+    KeptAbsoluteNoIncludeProof,
+    /// Kept absolute: a source uses the var outside an include argument, or
+    /// has an env macro whose var name the scanner cannot read.
+    KeptAbsoluteRuntimeUse,
+    /// Kept absolute: a source could not be read, or changed during the scan.
+    KeptAbsoluteScanError,
     /// Normalized because the var (optionally crate-scoped) is in the
     /// user-asserted force list, bypassing the source scans.
     ForcedPathOnly,
@@ -2362,7 +2373,10 @@ impl EnvDepNormalizationDecision {
         match self {
             Self::Unchanged => "unchanged",
             Self::NormalizedPathOnly => "normalized path-only",
-            Self::KeptAbsoluteRuntimePath => "kept absolute runtime path",
+            Self::KeptAbsoluteNotPathOnly => "kept absolute: not a path-only var",
+            Self::KeptAbsoluteNoIncludeProof => "kept absolute: no include proof",
+            Self::KeptAbsoluteRuntimeUse => "kept absolute: value use in source",
+            Self::KeptAbsoluteScanError => "kept absolute: source scan failed",
             Self::ForcedPathOnly => "forced path-only (user-asserted)",
         }
     }
@@ -2724,13 +2738,14 @@ fn normalize_env_dep_value_with_hasher(
         };
     }
 
-    if env_dep_is_safe_to_normalize(
+    let decision = env_dep_path_only_decision(
         var,
         &resolved,
         source_files,
         path_normalizer.path_only_env_vars(),
         file_hasher,
-    ) {
+    );
+    if decision == EnvDepNormalizationDecision::NormalizedPathOnly {
         // A value under the build's own OUT_DIR normalizes relative to
         // OUT_DIR itself (kunobi-ninja/kache#330): the generic prefix rules
         // keep per-LOCATION path components inside the sentinel'd value
@@ -2751,10 +2766,11 @@ fn normalize_env_dep_value_with_hasher(
     // Keep-absolute branch: by design the raw path stays in the key
     // because the compiled artifact may embed it via `env!`. Do not
     // warn here: this is an intentional key discriminator, and Cargo
-    // fingerprints RUSTC_WRAPPER stderr for build freshness.
+    // fingerprints RUSTC_WRAPPER stderr for build freshness. The decision
+    // names the reason for the trace.
     NormalizedEnvDep {
         value: val.to_string(),
-        decision: EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+        decision,
     }
 }
 
@@ -2776,16 +2792,18 @@ fn normalize_env_dep_value(
     )
 }
 
-/// Whether `var`'s value may be path-normalized in the cache key. `allowlist`
-/// is the user-configured opt-in set (`KACHE_PATH_ONLY_ENV_VARS` /
-/// `[cache] path_only_env_vars`); OUT_DIR is always included.
-fn env_dep_is_safe_to_normalize(
+/// Whether `var`'s value may be path-normalized in the cache key:
+/// [`EnvDepNormalizationDecision::NormalizedPathOnly`], or the reason it stays
+/// absolute. `allowlist` is the user-configured opt-in set
+/// (`KACHE_PATH_ONLY_ENV_VARS` / `[cache] path_only_env_vars`); OUT_DIR is
+/// always included.
+fn env_dep_path_only_decision(
     var: &str,
     val: &str,
     source_files: &[std::path::PathBuf],
     allowlist: &[String],
     file_hasher: &FileHasher<'_>,
-) -> bool {
+) -> EnvDepNormalizationDecision {
     // OUT_DIR is the built-in path-only exception:
     //
     //   include!(concat!(env!("OUT_DIR"), "/foo"))
@@ -2795,7 +2813,7 @@ fn env_dep_is_safe_to_normalize(
     // a crate can also use `env!("OUT_DIR")` as a runtime value. Normalize only
     // when source inspection shows an env macro use inside an `include*!(...)`
     // path-locator context and no use outside one (see
-    // [`env_dep_is_include_locator_only`]). Other vars with the same property —
+    // [`env_dep_source_decision`]). Other vars with the same property —
     // e.g. a generated build-config path, or an objdir base used by an
     // `include!` macro — can be opted into `allowlist` by the build.
     //
@@ -2819,9 +2837,13 @@ fn env_dep_is_safe_to_normalize(
     // eligibility without re-opening #167. The same include-only proof below
     // still applies, so a VAR pointing under OUT_DIR but baked as a runtime
     // value is still kept absolute.
-    (var == "OUT_DIR" || allowlist.iter().any(|v| v == var) || value_is_under_out_dir(val))
-        && path_is_only_used_for_includes(val, source_files)
-        && env_dep_is_include_locator_only(var, source_files, file_hasher)
+    if !(var == "OUT_DIR" || allowlist.iter().any(|v| v == var) || value_is_under_out_dir(val)) {
+        return EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly;
+    }
+    if !path_is_only_used_for_includes(val, source_files) {
+        return EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof;
+    }
+    env_dep_source_decision(var, source_files, file_hasher)
 }
 
 /// True when `val` is an absolute path located under the current build's
@@ -2869,7 +2891,7 @@ fn out_dir_relative_suffix(val: &str) -> Option<String> {
 
 /// Decide whether dep-info shows the env_dep value acting as the parent dir
 /// of one or more `include!()`'d source files. This is only the path-shape
-/// half of the proof; [`env_dep_is_include_locator_only`] rejects dual-pattern
+/// half of the proof; [`env_dep_source_decision`] rejects dual-pattern
 /// crates that also bake the env value into the compiled artifact.
 ///
 /// Background and contract: see the OUT_DIR comment in
@@ -2894,42 +2916,59 @@ fn path_is_only_used_for_includes(
     })
 }
 
-/// True when source text proves `var` is only an `include*!(...)` path
-/// locator: at least one file shows `env!(var)` / `option_env!(var)` inside an
-/// include argument, and no file shows a use the scanner cannot place there.
+/// Normalizes only when source text proves `var` is only an `include*!(...)`
+/// path locator: at least one Rust file shows `env!(var)` / `option_env!(var)`
+/// inside an include argument, and no file shows a use the scanner cannot
+/// place there.
 ///
 /// The proof must be positive. An env macro expanded from another crate's
 /// `macro_rules!` resolves in this crate, so dep-info reports the env dep while
 /// this crate's sources never name the var; without a visible include use, its
 /// value may be baked into the artifact. Such crates keep the absolute value.
+/// Proof comes only from `.rs` files: an `include_str!`'d README that quotes
+/// an include is not code. Every file still counts against the var.
 ///
-/// Residual gap: a crate that shows an include use AND also invokes another
-/// crate's macro that expands to a value use of the same var still normalizes.
-/// The scanner cannot see the foreign macro body.
+/// Residual gaps, where the text looks like a locator but the compiled crate
+/// can still bake the value:
+/// - another crate's macro, invoked alongside a visible include use, that
+///   expands to a value use of the same var;
+/// - a macro named `include`, `include_str` or `include_bytes` that is not the
+///   builtin (a local `macro_rules!`, an import, or a path like
+///   `mycrate::include!`);
+/// - an include inside another macro's arguments, or on an item under an
+///   attribute macro, which can move the tokens out of the include.
 ///
 /// Missing or changed files fail closed.
-fn env_dep_is_include_locator_only(
+fn env_dep_source_decision(
     var: &str,
     source_files: &[std::path::PathBuf],
     file_hasher: &FileHasher<'_>,
-) -> bool {
+) -> EnvDepNormalizationDecision {
     let mut proven = false;
     for file in source_files {
         match file_hasher.env_dep_use(file, var) {
             Ok(SourceEnvDepUse::Unused) => {}
-            Ok(SourceEnvDepUse::IncludeLocator) => proven = true,
-            Ok(SourceEnvDepUse::RuntimeValue) => return false,
+            Ok(SourceEnvDepUse::IncludeLocator) => {
+                proven |= file.extension().is_some_and(|ext| ext == "rs");
+            }
+            Ok(SourceEnvDepUse::RuntimeValue) => {
+                return EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse;
+            }
             Err(e) => {
                 tracing::debug!(
                     "keeping env dep {var} absolute: failed to inspect source {}: {}",
                     file.display(),
                     e
                 );
-                return false;
+                return EnvDepNormalizationDecision::KeptAbsoluteScanError;
             }
         }
     }
-    proven
+    if proven {
+        EnvDepNormalizationDecision::NormalizedPathOnly
+    } else {
+        EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof
+    }
 }
 
 /// Version of [`source_env_dep_use`] answers in the persistent memo. Bump it
@@ -2937,8 +2976,9 @@ fn env_dep_is_include_locator_only(
 /// otherwise wrappers keep reusing the old answer for every file that did not
 /// change.
 ///
-/// 2: computed env var names, `[`/`{` delimiters, comments between tokens,
-/// lifetimes, nested block comments and raw C strings; answers gained the
+/// 2: computed env var names, `[`/`{` delimiters, comments and non-ASCII
+/// whitespace between tokens, lifetimes, nested block comments, raw C strings,
+/// number suffixes and non-ASCII identifiers; answers gained the
 /// include-locator state that the positive proof needs.
 const SOURCE_ENV_DEP_SCANNER_VERSION: u32 = 2;
 
@@ -2980,49 +3020,59 @@ impl SourceEnvDepUse {
 fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
     let bytes = source.as_bytes();
     let mut i = 0usize;
-    // One entry per open delimiter: the macro it belongs to, or "" for a
-    // plain group. Tracking every delimiter kind keeps `include!{..}` and
-    // `env![..]` in step with their closing token.
-    let mut groups: Vec<&str> = Vec::new();
+    // One entry per open delimiter, true when it opens an `include*!`
+    // argument. Tracking every delimiter kind keeps `include!{..}` and
+    // `env![..]` in step with their closing token; the depth counter keeps
+    // the include test constant-time however deep the nesting goes.
+    let mut groups: Vec<bool> = Vec::new();
+    let mut include_depth = 0usize;
     let mut include_locator = false;
 
     while i < bytes.len() {
+        let whitespace = rust_whitespace_len(bytes, i);
+        if whitespace > 0 {
+            i += whitespace;
+            continue;
+        }
         match bytes[i] {
-            b'/' if matches!(bytes.get(i + 1), Some(b'/' | b'*')) => i = skip_comment(bytes, i),
+            b'/' if comment_starts_at(bytes, i) => i = skip_comment(bytes, i),
             b'"' => i = skip_quoted_string(bytes, i + 1),
             b'\'' => i = skip_char_literal_or_lifetime(source, i),
             b'b' | b'c' | b'r' if raw_string_starts_at(bytes, i).is_some() => {
                 i = skip_raw_string(bytes, i);
             }
             b'(' | b'[' | b'{' => {
-                groups.push("");
+                groups.push(false);
                 i += 1;
             }
             b')' | b']' | b'}' => {
-                let _ = groups.pop();
+                if groups.pop() == Some(true) {
+                    include_depth -= 1;
+                }
                 i += 1;
             }
+            // A number with its suffix (`1u8`, `1r`), so a suffix cannot
+            // start a raw string that hides the code after it.
+            b'0'..=b'9' => i = skip_ident_bytes(bytes, i + 1),
             b if is_ident_start(b) => {
                 let ident_start = i;
-                i += 1;
-                while i < bytes.len() && is_ident_continue(bytes[i]) {
-                    i += 1;
-                }
-                let ident = &source[ident_start..i];
+                i = skip_ident_bytes(bytes, i + 1);
+                let ident = &bytes[ident_start..i];
                 let Some(open) = parse_macro_open(bytes, i) else {
                     continue;
                 };
 
-                if matches!(ident, "env" | "option_env") {
-                    let in_include = groups.iter().any(|name| is_include_macro(name));
+                if matches!(ident, b"env" | b"option_env") {
                     match parse_env_macro_name(source, open + 1) {
                         Some(name) if name != var => {}
-                        Some(_) if in_include => include_locator = true,
-                        None if in_include => {}
+                        Some(_) if include_depth > 0 => include_locator = true,
+                        None if include_depth > 0 => {}
                         _ => return SourceEnvDepUse::RuntimeValue,
                     }
                 }
-                groups.push(ident);
+                let include = is_include_macro(ident);
+                groups.push(include);
+                include_depth += usize::from(include);
                 i = open + 1;
             }
             _ => i += 1,
@@ -3036,8 +3086,8 @@ fn source_env_dep_use(source: &str, var: &str) -> SourceEnvDepUse {
     }
 }
 
-fn is_include_macro(name: &str) -> bool {
-    matches!(name, "include" | "include_str" | "include_bytes")
+fn is_include_macro(name: &[u8]) -> bool {
+    matches!(name, b"include" | b"include_str" | b"include_bytes")
 }
 
 /// The var an env macro names, when its first token is a plain string literal
@@ -3069,13 +3119,33 @@ fn parse_macro_open(bytes: &[u8], after_ident: usize) -> Option<usize> {
 
 fn skip_trivia(bytes: &[u8], mut i: usize) -> usize {
     loop {
-        match bytes.get(i) {
-            Some(b) if b.is_ascii_whitespace() => i += 1,
-            Some(b'/') if matches!(bytes.get(i + 1), Some(b'/' | b'*')) => {
-                i = skip_comment(bytes, i);
-            }
-            _ => return i,
+        let whitespace = rust_whitespace_len(bytes, i);
+        if whitespace > 0 {
+            i += whitespace;
+        } else if comment_starts_at(bytes, i) {
+            i = skip_comment(bytes, i);
+        } else {
+            return i;
         }
+    }
+}
+
+fn comment_starts_at(bytes: &[u8], i: usize) -> bool {
+    bytes.get(i) == Some(&b'/') && matches!(bytes.get(i + 1), Some(b'/' | b'*'))
+}
+
+/// Byte length of the Rust whitespace character at `i`, or 0. Rust also
+/// accepts vertical tab and a few non-ASCII `Pattern_White_Space` characters
+/// between tokens; reading those as identifier bytes would hide `env` from
+/// the scanner.
+fn rust_whitespace_len(bytes: &[u8], i: usize) -> usize {
+    match bytes.get(i..).unwrap_or_default() {
+        [b'\t' | b'\n' | b'\x0B' | b'\x0C' | b'\r' | b' ', ..] => 1,
+        // U+0085
+        [0xC2, 0x85, ..] => 2,
+        // U+200E, U+200F, U+2028, U+2029
+        [0xE2, 0x80, 0x8E | 0x8F | 0xA8 | 0xA9, ..] => 3,
+        _ => 0,
     }
 }
 
@@ -3188,12 +3258,20 @@ fn skip_raw_string(bytes: &[u8], i: usize) -> usize {
     bytes.len()
 }
 
+/// Non-ASCII bytes count as identifier bytes: reading `éinclude` as
+/// `include` would invent an include context.
 fn is_ident_start(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphabetic()
+    byte == b'_' || byte.is_ascii_alphabetic() || !byte.is_ascii()
 }
 
-fn is_ident_continue(byte: u8) -> bool {
-    is_ident_start(byte) || byte.is_ascii_digit()
+fn skip_ident_bytes(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len()
+        && (is_ident_start(bytes[i]) || bytes[i].is_ascii_digit())
+        && rust_whitespace_len(bytes, i) == 0
+    {
+        i += 1;
+    }
+    i
 }
 
 // `normalize_flags` (CWD-only literal-replace) used to live here.
@@ -3246,7 +3324,7 @@ pub struct DepInfo {
     /// Environment variables tracked by rustc (`env!()` / `option_env!()`).
     /// Values are RAW — `compute_cache_key` decides whether to
     /// path-normalize each one based on per-var safety (see
-    /// `env_dep_is_safe_to_normalize`). Storing raw values keeps that
+    /// `env_dep_path_only_decision`). Storing raw values keeps that
     /// decision available to the consumer; pre-normalizing here
     /// would erase the absolute-path information the discriminator
     /// needs to read.
@@ -8460,6 +8538,82 @@ mod tests {
     }
 
     #[test]
+    fn source_scanner_tokenizes_operators_numbers_and_idents_like_rustc() {
+        use super::SourceEnvDepUse::{IncludeLocator, RuntimeValue, Unused};
+        use super::source_env_dep_use as scan;
+
+        // A division is not a comment.
+        assert_eq!(
+            scan(r#"let q = a / b; let x = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        // Nor between macro tokens: `env / 2 */ !(..)` is no macro call.
+        assert_eq!(scan(r#"let q = env / 2 */ !("MYVAR");"#, "MYVAR"), Unused);
+        // An identifier that merely starts like a raw string prefix.
+        assert_eq!(scan(r#"rinclude!(env!("MYVAR"))"#, "MYVAR"), RuntimeValue);
+        // A variable named `env` compared with `!=` opens no macro.
+        assert_eq!(scan("fn f(env: u8) -> bool { env != 0 }", "MYVAR"), Unused);
+        // Plain groups inside an include keep the include context open.
+        assert_eq!(
+            scan(r#"include!(concat!(("a"), ("b"), env!("MYVAR")))"#, "MYVAR"),
+            IncludeLocator
+        );
+        assert_eq!(
+            scan(r#"include!(m!('a'('b')), env!("MYVAR"))"#, "MYVAR"),
+            IncludeLocator
+        );
+        // Closing an include leaves its context; nested includes count down.
+        assert_eq!(
+            scan(r#"include!(()) const X: &str = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"include!(include!("a"), env!("MYVAR"))"#, "MYVAR"),
+            IncludeLocator
+        );
+
+        // Char literals: escaped quote, non-ASCII, and a lone quote at EOF.
+        assert_eq!(
+            scan(r#"let c = '\"'; let x = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(
+            scan(r#"let c = ['é','"']; let x = env!("MYVAR");"#, "MYVAR"),
+            RuntimeValue
+        );
+        assert_eq!(scan("let s = '", "MYVAR"), Unused);
+
+        // A number's suffix cannot start a raw string.
+        assert_eq!(
+            scan(
+                r##"m!{ 1r#"x" } const P: &str = env!("MYVAR"); // "#"##,
+                "MYVAR"
+            ),
+            RuntimeValue
+        );
+        // Non-ASCII identifier bytes belong to the identifier.
+        assert_eq!(scan(r#"éinclude!(env!("MYVAR"))"#, "MYVAR"), RuntimeValue);
+        assert_eq!(scan(r#"include!(envé!("MYVAR"))"#, "MYVAR"), Unused);
+        // Rust whitespace beyond ASCII space separates tokens.
+        for space in [
+            "\x0B", "\x0C", "\u{85}", "\u{200E}", "\u{200F}", "\u{2028}", "\u{2029}",
+        ] {
+            assert_eq!(
+                scan(&format!("env{space}!{space}(\"MYVAR\")"), "MYVAR"),
+                RuntimeValue,
+                "{space:?}"
+            );
+            assert_eq!(
+                scan(&format!("{space}env!(\"MYVAR\")"), "MYVAR"),
+                RuntimeValue,
+                "leading {space:?}"
+            );
+        }
+        // U+00A9 shares U+0085's lead byte but is not whitespace.
+        assert_eq!(scan("env\u{A9}!(\"MYVAR\")", "MYVAR"), Unused);
+    }
+
+    #[test]
     fn unescape_env_dep_value_undoes_rustc_escaping() {
         // rustc's `escape_dep_env`: `\`→`\\`, newline→`\n`, CR→`\r`.
         // A Windows OUT_DIR arrives doubled; unescaping restores the
@@ -10106,8 +10260,20 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
                 "normalized path-only",
             ),
             (
-                EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
-                "kept absolute runtime path",
+                EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly,
+                "kept absolute: not a path-only var",
+            ),
+            (
+                EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof,
+                "kept absolute: no include proof",
+            ),
+            (
+                EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse,
+                "kept absolute: value use in source",
+            ),
+            (
+                EnvDepNormalizationDecision::KeptAbsoluteScanError,
+                "kept absolute: source scan failed",
             ),
             (
                 EnvDepNormalizationDecision::ForcedPathOnly,
@@ -10198,7 +10364,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
 
         assert_eq!(
             env_dep.decision,
-            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
         );
         assert_eq!(env_dep.value, out_dir_value);
     }
@@ -10210,16 +10376,31 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
         lib_source: &str,
         file_hasher: &FileHasher<'_>,
     ) -> EnvDepNormalizationDecision {
+        out_dir_decision_for_files(&[("src/lib.rs", Some(lib_source))], file_hasher)
+    }
+
+    /// Like [`out_dir_decision_for`], with every workspace-relative file in
+    /// `files` listed in dep-info. A `None` body is listed but never written.
+    fn out_dir_decision_for_files(
+        files: &[(&str, Option<&str>)],
+        file_hasher: &FileHasher<'_>,
+    ) -> EnvDepNormalizationDecision {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
-        let src = workspace.join("src");
         let out_dir = workspace.join("target/debug/build/pkg/out");
-        std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&out_dir).unwrap();
-        let lib = src.join("lib.rs");
-        std::fs::write(&lib, lib_source).unwrap();
+        let mut source_files = Vec::new();
+        for (relative, body) in files {
+            let path = workspace.join(relative);
+            if let Some(body) = body {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, body).unwrap();
+            }
+            source_files.push(path);
+        }
         let included = out_dir.join("generated.rs");
         std::fs::write(&included, b"pub fn generated() -> u8 { 1 }").unwrap();
+        source_files.push(included);
         let out_dir_value = out_dir
             .canonicalize()
             .unwrap()
@@ -10229,7 +10410,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             "test_crate",
             "OUT_DIR",
             &out_dir_value,
-            &[lib, included],
+            &source_files,
             file_hasher,
             &PathNormalizer::from_env(Some(&workspace)),
         )
@@ -10240,11 +10421,10 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
     fn env_dep_policy_keeps_out_dir_absolute_for_uses_the_scanner_cannot_prove() {
         // Every source below includes a generated file through OUT_DIR, so
         // dep-info alone would allow normalization, and every one also derives
-        // something from the absolute OUT_DIR that ends up in the artifact (or
-        // gives no proof of where the env dep came from). A normalized key would
-        // restore one checkout's artifact in another.
+        // something from the absolute OUT_DIR that ends up in the artifact. A
+        // normalized key would restore one checkout's artifact in another.
         const INCLUDE: &str = r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#;
-        let cases: &[(&str, String)] = &[
+        let value_uses: &[(&str, String)] = &[
             (
                 "value length",
                 format!(r#"{INCLUDE} pub const N: usize = env!("OUT_DIR").len();"#),
@@ -10292,6 +10472,14 @@ pub const X: &str = e!("OUT_DIR");"#
                 format!(r#"{INCLUDE} pub const S: &str = env /* x */ !("OUT_DIR");"#),
             ),
             (
+                "non-ASCII whitespace before the bang",
+                format!("{INCLUDE} pub const S: &str = env\u{200E}!(\"OUT_DIR\");"),
+            ),
+            (
+                "vertical tab before the bang",
+                format!("{INCLUDE} pub const S: &str = env\x0B!(\"OUT_DIR\");"),
+            ),
+            (
                 "lifetime before the use",
                 format!(
                     r#"{INCLUDE} pub fn f(_: &'static str) -> usize {{ env!("OUT_DIR").len() }}"#
@@ -10310,7 +10498,23 @@ pub const X: &str = e!("OUT_DIR");"#
                 ),
             ),
             (
-                "no env! in the crate (the env dep comes from another crate's macro)",
+                "number suffix before a raw-string look-alike",
+                format!(r##"{INCLUDE} m!{{ 1r#"x" }} pub const P: &str = env!("OUT_DIR"); // "#"##),
+            ),
+            (
+                "non-ASCII prefix on an include look-alike",
+                format!(
+                    r#"{INCLUDE}
+macro_rules! éinclude {{ ($e:expr) => {{ pub const P: &str = $e; }} }}
+éinclude!(env!("OUT_DIR"));"#
+                ),
+            ),
+        ];
+        // No visible include use: the env dep may come from another crate's
+        // macro that bakes the value.
+        let unproven: &[(&str, String)] = &[
+            (
+                "no env! in the crate",
                 "pub fn f() -> &'static str { some_dep::out_dir!() }".to_string(),
             ),
             (
@@ -10319,17 +10523,70 @@ pub const X: &str = e!("OUT_DIR");"#
             ),
         ];
         let hasher = FileHasher::new();
-        let normalized: Vec<&str> = cases
+        let wrong: Vec<(&str, EnvDepNormalizationDecision)> = value_uses
             .iter()
-            .filter(|(_, source)| {
-                out_dir_decision_for(source, &hasher)
-                    != EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+            .map(|case| (case, EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse))
+            .chain(unproven.iter().map(|case| {
+                (
+                    case,
+                    EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof,
+                )
+            }))
+            .filter_map(|((label, source), expected)| {
+                let decision = out_dir_decision_for(source, &hasher);
+                (decision != expected).then_some((*label, decision))
             })
-            .map(|(label, _)| *label)
             .collect();
-        assert!(
-            normalized.is_empty(),
-            "OUT_DIR must stay absolute for: {normalized:?}"
+        assert!(wrong.is_empty(), "unexpected OUT_DIR decisions: {wrong:?}");
+    }
+
+    #[test]
+    fn env_dep_policy_takes_include_proof_only_from_rust_sources() {
+        // `#![doc = include_str!("../README.md")]` puts the README in dep-info.
+        // A code block in it that shows the include pattern is not code.
+        let readme = r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#;
+        let lib = r#"#![doc = include_str!("../README.md")] some_dep::out_dir!();"#;
+        let hasher = FileHasher::new();
+        assert_eq!(
+            out_dir_decision_for_files(
+                &[("src/lib.rs", Some(lib)), ("README.md", Some(readme))],
+                &hasher
+            ),
+            EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof
+        );
+        // The same text in a Rust file is proof.
+        assert_eq!(
+            out_dir_decision_for_files(
+                &[("src/lib.rs", Some(lib)), ("src/gen.rs", Some(readme))],
+                &hasher
+            ),
+            EnvDepNormalizationDecision::NormalizedPathOnly
+        );
+        // A value use in any file still counts.
+        assert_eq!(
+            out_dir_decision_for_files(
+                &[
+                    ("src/lib.rs", Some(readme)),
+                    (
+                        "README.md",
+                        Some(r#"const N: usize = env!("OUT_DIR").len();"#)
+                    ),
+                ],
+                &hasher
+            ),
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
+        );
+    }
+
+    #[test]
+    fn env_dep_policy_keeps_out_dir_absolute_when_a_source_cannot_be_scanned() {
+        let include = r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));"#;
+        assert_eq!(
+            out_dir_decision_for_files(
+                &[("src/lib.rs", Some(include)), ("src/missing.rs", None)],
+                &FileHasher::new()
+            ),
+            EnvDepNormalizationDecision::KeptAbsoluteScanError
         );
     }
 
@@ -10404,7 +10661,7 @@ pub fn g(_: &'static str) {}"#,
         let hasher = FileHasher::persistent(&db);
         assert_eq!(
             out_dir_decision_for(source, &hasher),
-            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+            EnvDepNormalizationDecision::KeptAbsoluteRuntimeUse
         );
     }
 
@@ -10442,7 +10699,7 @@ pub fn g(_: &'static str) {}"#,
         );
         assert_eq!(
             off.decision,
-            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+            EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly
         );
         assert_eq!(off.value, value);
 
@@ -10535,7 +10792,7 @@ pub fn g(_: &'static str) {}"#,
         );
         assert_eq!(
             no_anchor.decision,
-            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+            EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly,
             "without an OUT_DIR anchor the same non-allowlisted var must stay absolute"
         );
     }
@@ -10564,7 +10821,7 @@ pub fn g(_: &'static str) {}"#,
 
         assert_eq!(
             env_dep.decision,
-            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+            EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof
         );
         assert_eq!(env_dep.value, out_dir_value);
     }
@@ -10606,7 +10863,7 @@ pub fn g(_: &'static str) {}"#,
 
         assert_eq!(
             kept.decision,
-            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+            EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof
         );
         assert_eq!(
             forced.decision,
@@ -10649,7 +10906,7 @@ pub fn g(_: &'static str) {}"#,
         );
         assert_eq!(
             scoped_other.decision,
-            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+            EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof,
             "a crate-scoped force entry must not leak to other crates: {scoped_other:?}"
         );
     }
@@ -10686,7 +10943,7 @@ pub fn g(_: &'static str) {}"#,
 
         assert_eq!(
             env_dep.decision,
-            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath,
+            EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly,
             "CARGO_MANIFEST_DIR must stay absolute even when crate-scoped forcing is requested"
         );
         assert_eq!(env_dep.value, manifest_dir_value);
@@ -10716,7 +10973,7 @@ pub fn g(_: &'static str) {}"#,
 
         assert_eq!(
             env_dep.decision,
-            EnvDepNormalizationDecision::KeptAbsoluteRuntimePath
+            EnvDepNormalizationDecision::KeptAbsoluteNotPathOnly
         );
         assert_eq!(env_dep.value, config_dir_value);
     }

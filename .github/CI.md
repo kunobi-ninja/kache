@@ -72,7 +72,7 @@ Pushes to `main` and tags always run everything.
 | Files | Jobs |
 | --- | --- |
 | Markdown, `docs/`, `notes/`, `assets/`, `LICENSE`, issue templates | none |
-| `scripts/bench-short.py` and its test, `install-bench-mbx.sh`, the bench and perf-gate workflows | Check (Linux) |
+| `scripts/bench-short.py` and its test, `perf-gate-report.py`, `install-bench-mbx.sh`, the bench and perf-gate workflows | Check (Linux) |
 | `scenarios/` | Check (Linux), E2E smoke on every platform |
 | `packaging/`, `flake.nix`, `flake.lock`, apt/AUR/release scripts, publication workflows | Check (Linux), Nix package |
 | anything else, including `ci.yml` and the classifier itself | every job |

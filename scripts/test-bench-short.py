@@ -260,9 +260,10 @@ class BenchTests(unittest.TestCase):
             payload = json.loads((args.output / "samples.json").read_text())
             self.assertEqual(len(payload["records"]), 24)
             self.assertEqual(payload["contention_samples"], "contention/samples.json")
-            self.assertIn(
-                "## Contention: hk", (args.output / "perf-gate.md").read_text()
-            )
+            text = (args.output / "perf-gate.md").read_text()
+            self.assertTrue(text.startswith("## Perf gate: pass (hk)\n"))
+            self.assertIn("| Build | hk base | hk head | hk change |", text)
+            self.assertIn("<summary>All tools, isolated builds</summary>", text)
             self.assertFalse((args.output / "scratch").exists())
             metrics = json.loads((args.output / "metrics.otlp.json").read_text())
             points = [
@@ -383,6 +384,119 @@ class BenchTests(unittest.TestCase):
                 "INVALID MEASUREMENT", (args.output / "perf-gate.md").read_text()
             )
             self.assertTrue((args.output / "logs/00-kache/engine.log").exists())
+
+
+def subject(root, name, records, contention=None, error=None):
+    """A bench-short output directory as the report job downloads it."""
+    directory = root / name
+    directory.mkdir()
+    payload = {"project": name, "records": []}
+    if error:
+        payload["error"] = error
+    (directory / "samples.json").write_text(json.dumps(payload))
+    if error:
+        return directory
+    summary = bench.summarize(records)
+    if contention:
+        summary["contention"] = contention
+    (directory / "summary.json").write_text(json.dumps(summary))
+    return directory
+
+
+def paired(ms_base, ms_head, samples=1):
+    return [
+        record(arm, i, ms)
+        for i in range(samples)
+        for arm, ms in (("base", ms_base), ("head", ms_head))
+    ]
+
+
+class ReportTests(unittest.TestCase):
+    render = staticmethod(bench.perf_gate_report.render)
+
+    def test_head_against_base_leads_and_the_rest_folds_away(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contention = {
+                "statistics": [
+                    {
+                        "arm": arm,
+                        "phase": phase,
+                        "n": 1,
+                        "median_ms": 9000,
+                        "min_ms": 9000,
+                        "max_ms": 9000,
+                        "compiler_runs": 3,
+                        "duplicate_key_compiles": 0,
+                        "flight_wait_ms": 0,
+                        "permit_wait_ms": None,
+                    }
+                    for arm in ("base", "head")
+                    for phase in ("cold", "warm")
+                ],
+            }
+            hk = subject(root, "hk", paired(84615, 97269), contention)
+            summary = json.loads((hk / "summary.json").read_text())
+            summary["comparisons"].append(
+                {"phase": "contention_warm", "n": 1, "median_pct": -10.2,
+                 "interval_95_pct": None, "outcome": "inconclusive"}
+            )
+            (hk / "summary.json").write_text(json.dumps(summary))
+            eza = subject(root, "eza", paired(1869, 2885))
+            text = self.render([hk, eza])
+
+        self.assertTrue(text.startswith("## Perf gate: pass (hk, eza)\n"))
+        self.assertIn("did not rise against base", text)
+        self.assertIn(
+            "| Build | hk base | hk head | hk change | eza base | eza head | eza change |",
+            text,
+        )
+        self.assertIn("| Cold | 84.6 s | 97.3 s | +15.0% | 1.87 s | 2.88 s | +54.4% |", text)
+        self.assertIn("| Contention, warm | 9.00 s | 9.00 s | -10.2% | — | — | — |", text)
+        self.assertIn("every change is inconclusive", text)
+        self.assertEqual(text.count("<details>"), 3)
+        self.assertEqual(text.count("<details>"), text.count("</details>"))
+        self.assertIn("| head, warm | 3 | 0 | 0.00 s | — |", text)
+        self.assertNotIn("<details open>", text)
+        # One table per subject inside a fold, never a row per tool and phase.
+        self.assertIn("| hk | head | base |", text)
+
+    def test_regression_and_count_failures_are_the_first_thing_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = paired(10000, 12000, samples=6)
+            records[-1]["result"]["warm"]["misses"] = 2
+            text = self.render([subject(root, "hk", records)])
+        headline, _, failed, _, first = text.splitlines()[:5]
+        self.assertEqual(headline, "## Perf gate: FAIL (hk)")
+        self.assertEqual(failed, "**Failed checks**")
+        self.assertIn("misses rose 0 → 2", first)
+        self.assertIn("**+20.0% regression**", text)
+        self.assertIn("fewer than 5 pairs stay inconclusive", text)
+        self.assertIn("<sub>10.0–10.0</sub>", text)
+        self.assertIn("(+20.0% to +20.0%), 6 pairs, regression", text)
+
+    def test_invalid_subject_is_named_and_the_valid_one_still_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hk = subject(root, "hk", [], error="warm: restored nothing")
+            eza = subject(root, "eza", paired(10000, 10000))
+            text = self.render([hk, eza], verdict="INVALID MEASUREMENT")
+            missing = root / "gone"
+            missing.mkdir()
+            (missing / "perf-gate.md").write_text("## Perf gate: INVALID MEASUREMENT (gone)\n\nno disk\n")
+            self.assertIn("**gone: invalid measurement.** no disk", self.render([missing]))
+        self.assertTrue(text.startswith("## Perf gate: INVALID MEASUREMENT (hk, eza)\n"))
+        self.assertIn("**hk: invalid measurement.** warm: restored nothing", text)
+        self.assertIn("| Build | eza base | eza head | eza change |", text)
+
+    def test_single_kache_run_opens_the_tool_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            text = self.render([subject(root, "hk", [record("kache", 0)])])
+        self.assertIn("<details open>", text)
+        self.assertNotIn("| Build |", text)
+        self.assertNotIn("did not rise", text)
 
 
 if __name__ == "__main__":

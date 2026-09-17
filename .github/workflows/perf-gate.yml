@@ -45,7 +45,7 @@ on:
   # trustworthy. The usual hazard — checking out and executing the triggering
   # PR's code with a write-capable token — does not apply: the `authorize` job
   # refuses anything that is not a same-repository branch, and the only job that
-  # holds write scopes (`report`) never checks out any code. See the header.
+  # holds write scopes (`report`) never checks out PR code. See the header.
   workflow_run:
     workflows: ["Perf gate (preflight)"]
     types: [completed]
@@ -316,7 +316,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/instrument"
           cp target/release/kache-scenario "$RUNNER_TEMP/instrument/kache-scenario"
           cp -R scenarios "$RUNNER_TEMP/instrument/scenarios"
-          cp scripts/bench-short.py scripts/bench-contention.py "$RUNNER_TEMP/instrument/"
+          cp scripts/bench-short.py scripts/bench-contention.py scripts/perf-gate-report.py "$RUNNER_TEMP/instrument/"
 
       - name: Build kache from the merge base
         env:
@@ -413,6 +413,16 @@ jobs:
       # else.
       statuses: write
     steps:
+      # The comment renderer, from the default branch like the rest of the
+      # instrument. Only this one script is checked out, and never the PR head.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          path: renderer
+          sparse-checkout: scripts/perf-gate-report.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: perf-gate-*
@@ -448,11 +458,17 @@ jobs:
             else
               verdict=FAIL
             fi
-            {
-              echo "## Perf gate: $verdict — hk and eza"
-              echo
-              cat perf-gate/hk/perf-gate.md perf-gate/eza/perf-gate.md
-            } > perf-gate/report/perf-gate.md
+            # One comment for both subjects: head against base first, every
+            # other table folded. If the renderer breaks, post the per-subject
+            # reports rather than no comment at all.
+            if ! python3 renderer/scripts/perf-gate-report.py --verdict "$verdict" \
+                --output perf-gate/report/perf-gate.md perf-gate/hk perf-gate/eza; then
+              {
+                echo "## Perf gate: $verdict (hk, eza)"
+                echo
+                cat perf-gate/hk/perf-gate.md perf-gate/eza/perf-gate.md
+              } > perf-gate/report/perf-gate.md
+            fi
           fi
 
           # Three outcomes, not two. "The gate could not run" and "the gate ran
@@ -463,8 +479,7 @@ jobs:
           # that could not be carried out.
           if [ -f perf-gate/report/perf-gate.md ]; then
             # The report's first line is the verdict headline the comparison
-            # script wrote, e.g. "## Perf gate: FAIL — warm build +10.0%
-            # (limit +5.0%)". Reusing it keeps the status and the comment from
+            # renderer wrote, e.g. "## Perf gate: FAIL (hk, eza)". Reusing it keeps the status and the comment from
             # ever disagreeing about what happened. GitHub truncates a status
             # description at 140 characters.
             headline="$(head -n 1 perf-gate/report/perf-gate.md | sed -e 's/^#\{1,\} *//' -e 's/^Perf gate: *//')"

@@ -59,7 +59,10 @@ that seed and clears its build artifacts before starting.
 
 ## Reading a PR result
 
-The report lists mean, median, range, and sample count for each tool and phase.
+The pull-request comment opens with one table: Kache base and head for each
+subject, as median times per build with the paired change. Timings for every
+tool, contention counters, disk use and the paired test sit in folded sections
+below it; with more than one sample, each time shows its range.
 `summary.json` carries the statistics; `samples.json` retains raw measurements,
 source/tool versions, arm order, and the head/base/instrument identities.
 Build logs and engine reports are retained for each sample.

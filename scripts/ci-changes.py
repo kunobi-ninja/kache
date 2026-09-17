@@ -37,7 +37,7 @@ CATEGORIES = (
     (
         "bench",
         (
-            r"^scripts/(bench-short|test-bench-short)\.py$",
+            r"^scripts/(bench-short|test-bench-short|perf-gate-report)\.py$",
             r"^scripts/install-bench-mbx\.sh$",
             r"^\.github/workflows/(bench|perf-gate|perf-gate-preflight)\.yml$",
         ),

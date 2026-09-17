@@ -68,6 +68,7 @@ class ChangeTests(unittest.TestCase):
             self.groups(
                 "scripts/bench-short.py",
                 "scripts/test-bench-short.py",
+                "scripts/perf-gate-report.py",
                 "scripts/install-bench-mbx.sh",
                 ".github/workflows/perf-gate.yml",
                 ".github/workflows/perf-gate-preflight.yml",

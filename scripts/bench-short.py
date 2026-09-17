@@ -2,6 +2,7 @@
 """Repeated hk/eza measurements; each arm owns its cache and checkout paths."""
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -15,12 +16,13 @@ import sys
 import time
 from pathlib import Path
 
-PHASES = ("cold", "warm_same_tree", "warm")
-LABELS = (
-    "cold (empty store)",
-    "warm (same path, fresh artifacts)",
-    "warm (other checkout)",
+_spec = importlib.util.spec_from_file_location(
+    "perf_gate_report", Path(__file__).with_name("perf-gate-report.py")
 )
+perf_gate_report = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(perf_gate_report)
+
+PHASES = ("cold", "warm_same_tree", "warm")
 
 
 def positive(value):
@@ -152,44 +154,6 @@ def summarize(records):
             if change["outcome"] == "regression":
                 failures.append(f"{phase}: paired timing regression")
     return {"statistics": stats, "comparisons": comparisons, "failures": failures}
-
-
-def report(summary, project, path):
-    failed = bool(summary["failures"])
-    lines = [
-        f"## Perf gate: {'FAIL' if failed else 'pass'} — {project}",
-        "",
-        "Isolated build times exclude setup. Each isolated warm phase starts from the cold cache snapshot and an empty build directory.",
-        "",
-        "| Tool | Phase | Samples | Mean | Median | Min–max |",
-        "| --- | --- | ---: | ---: | ---: | ---: |",
-    ]
-    for s in summary["statistics"]:
-        label = LABELS[PHASES.index(s["phase"])]
-        lines.append(
-            f"| {s['arm']} | {label} | {s['n']} | {s['mean_ms'] / 1000:.3f}s | {s['median_ms'] / 1000:.3f}s | {s['min_ms'] / 1000:.3f}–{s['max_ms'] / 1000:.3f}s |"
-        )
-    lines += [
-        "",
-        "Head vs base uses paired samples; positive means slower. Timing needs at least five pairs, a 95% bootstrap interval beyond ±5%, and a median change beyond ±250 ms. Otherwise it is inconclusive. Increased Kache misses or passthroughs fail independently.",
-        "",
-    ]
-    for c in summary["comparisons"]:
-        interval = c["interval_95_pct"]
-        bounds = (
-            "insufficient samples"
-            if interval is None
-            else f"95% interval {interval[0]:+.1f}% to {interval[1]:+.1f}%"
-        )
-        lines.append(
-            f"- {c['phase']}: {c['median_pct']:+.1f}%, {bounds}; **{c['outcome']}** ({c['n']} pairs)."
-        )
-    lines += [
-        "",
-        "Competitor timings are context; they do not decide the PR verdict. Inspect `samples.json` for source/tool versions, run order, and raw reports.",
-    ]
-    lines += ["", *[f"- {failure}" for failure in summary["failures"]]]
-    path.write_text("\n".join(lines) + "\n")
 
 
 def run_measurement(command, **kwargs):
@@ -443,10 +407,7 @@ def run(args):
             payload["elapsed_s"] = time.monotonic() - started
             (root / "samples.json").write_text(json.dumps(payload, indent=2) + "\n")
         (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-        report(summary, args.project, root / "perf-gate.md")
-        if "contention" in summary:
-            with (root / "perf-gate.md").open("a") as stream:
-                stream.write("\n" + (root / "contention" / "report.md").read_text())
+        (root / "perf-gate.md").write_text(perf_gate_report.render([root]))
         # Every sample has its own timestamp. Reused cold observations are not new samples.
         resources = []
         if "contention" in summary:
@@ -507,7 +468,7 @@ def run(args):
         payload["error"] = str(error)
         (root / "samples.json").write_text(json.dumps(payload, indent=2) + "\n")
         (root / "perf-gate.md").write_text(
-            f"## Perf gate: INVALID MEASUREMENT — {args.project}\n\n{error}\n"
+            f"## Perf gate: INVALID MEASUREMENT ({args.project})\n\n{error}\n"
         )
         return 1
     finally:

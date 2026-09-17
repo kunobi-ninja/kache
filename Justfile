@@ -376,9 +376,6 @@ helm-lint:
   helm template kache packaging/charts/kache-service \
     --set podAnnotations.example/annotation=set \
     --set podLabels.example/label=set \
-    --set ingress.enabled=true \
-    --set ingress.host=kache.example.com \
-    --set ingress.tls.enabled=true \
     | kubeconform -strict -ignore-missing-schemas -summary
 
 # Run cargo-llvm-cov and emit JSON + HTML reports under tmp/llvm-cov/.

@@ -1,0 +1,72 @@
+# The Firefox sccache comparison, on its own cadence and in its own run.
+#
+# sccache is pinned in `mise.toml`, so this arm measures the same binary every
+# time while only Kache moves — and Kache against Kache is what the per-pull-
+# request perf gate reports. Running it nightly cost 75 to 82 minutes for a
+# baseline that cannot change between runs, and held the nightly's telemetry
+# back until it finished.
+#
+# So it runs weekly, and on the one commit that does move the baseline: a
+# change to the sccache pin. Dispatching `bench.yml` rather than duplicating
+# its 300-line job keeps one definition of how a benchmark runs; the result is
+# a separate workflow run, which is what takes it off the nightly's critical
+# path and lets the collector import it independently.
+name: Bench sccache
+
+on:
+  schedule:
+    # Sundays, an hour before the nightly so the two do not contend for the
+    # runner pool.
+    - cron: "37 2 * * 0"
+  push:
+    branches: [main]
+    paths:
+      - mise.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Run the sccache comparison
+    if: github.repository == 'kunobi-ninja/kache'
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # The commit and its parent, so the pin check below can read both.
+          fetch-depth: 2
+        timeout-minutes: 10
+
+      - id: reason
+        name: Decide whether to measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # `mise.toml` carries every pinned tool, so most pushes that touch it
+          # are about something else. Compare the sccache line alone.
+          before="$(git show "${{ github.event.before }}:mise.toml" 2>/dev/null \
+            | grep -E '^"github:mozilla/sccache"' || true)"
+          after="$(grep -E '^"github:mozilla/sccache"' mise.toml || true)"
+          if [ "$before" = "$after" ]; then
+            echo "sccache pin unchanged (${after:-<absent>}); nothing to measure"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "sccache pin ${before:-<absent>} -> ${after:-<absent>}"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch
+        if: steps.reason.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bench.yml -R "${{ github.repository }}" -f scenario=firefox-sccache

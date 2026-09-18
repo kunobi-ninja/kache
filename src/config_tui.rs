@@ -1955,6 +1955,7 @@ mod tests {
                     endpoint: Some("https://planner.example.com".to_string()),
                     timeout_ms: Some(2000),
                     token: Some("secret-token".to_string()),
+                    github_audience: None,
                 }),
                 cache_executables: Some(true),
                 cache_cc_links: None,

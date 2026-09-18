@@ -34,6 +34,7 @@ mod opcounts;
 mod otel;
 mod path_normalizer;
 mod phase_trace;
+mod planner_auth;
 mod planner_client;
 mod platform;
 mod policy;

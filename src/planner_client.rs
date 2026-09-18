@@ -23,7 +23,7 @@ pub async fn resolve_prefetch_plan(req: &BuildIntent) -> Result<Option<PrefetchP
 /// with `rustls-no-provider` (to keep `aws-lc-sys` out of the tree — see
 /// Cargo.toml), so it needs a default provider installed before it builds a TLS
 /// client. Idempotent across threads; the already-installed error is expected.
-fn ensure_crypto_provider() {
+pub(crate) fn ensure_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -41,7 +41,7 @@ pub async fn resolve_prefetch_plan_with_config(
         .context("building planner client")?;
 
     let mut request = client.post(prefetch_plan_url(&config.endpoint)).json(req);
-    if let Some(token) = config.token.as_deref() {
+    if let Some(token) = crate::planner_auth::bearer(config).await {
         request = request.bearer_auth(token);
     }
 
@@ -96,10 +96,23 @@ mod tests {
         let status = status_line.to_string();
 
         tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let n = socket.read(&mut buf).await.unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]);
+            // Without an explicit token the client first looks for the
+            // planner's login (`/.well-known/kunobi-auth`); answer it like a
+            // planner that offers none, then serve the plan request.
+            let (mut socket, request) = loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                if request.starts_with("GET /.well-known/kunobi-auth ") {
+                    socket
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                break (socket, request);
+            };
             assert!(
                 request.starts_with(&format!("POST {} HTTP/1.1", expected_prefetch_plan_path()))
             );
@@ -157,6 +170,7 @@ mod tests {
             endpoint,
             timeout_ms: 1000,
             token: Some("token-123".into()),
+            github_audience: "kache".to_string(),
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],
@@ -186,6 +200,7 @@ mod tests {
             endpoint,
             timeout_ms: 1000,
             token: None,
+            github_audience: "kache".to_string(),
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],
@@ -214,6 +229,7 @@ mod tests {
             endpoint,
             timeout_ms: 1000,
             token: None,
+            github_audience: "kache".to_string(),
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],

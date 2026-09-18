@@ -24,6 +24,10 @@ _spec.loader.exec_module(perf_gate_report)
 
 PHASES = ("cold", "warm_same_tree", "warm")
 
+# Context arms and the bare names they default to. A default that is not
+# installed skips its arm; an explicitly named binary never does.
+DEFAULT_TOOL = {"sccache": "sccache", "mbx": "mbx"}
+
 
 def positive(value):
     return (
@@ -282,6 +286,39 @@ def tool_path(binary):
     return str(found.resolve())
 
 
+def cold_is_reused(sample, cold_every):
+    """Whether this sample reuses the previous cold build instead of measuring one.
+
+    A cold build is the expensive part of a sample, so the default measures one
+    every third and reuses it in between. The comparison then has three warm
+    pairs and one cold pair, which is the right trade for a change aimed at
+    warm and the wrong one for a change aimed at cold.
+    """
+    return sample % cold_every != 0
+
+
+def installed(binary):
+    return Path(binary).is_file() or shutil.which(binary) is not None
+
+
+def wanted_arm(arm, args):
+    """Whether to measure this arm.
+
+    The Kache arms decide the verdict, so a missing binary there is fatal and
+    is caught before any cloning. sccache and mbx are context: their defaults
+    are bare names, and on a machine where neither is installed the honest
+    answer is a run without them, not a run that clones a subject and then
+    dies. Naming one explicitly asks for it, so that stays fatal too.
+    """
+    name, _, binary = arm
+    if name in ("kache", "head", "base") or binary != DEFAULT_TOOL.get(name):
+        return True
+    if installed(binary):
+        return True
+    print(f"{name}: not installed, skipping this arm", flush=True)
+    return False
+
+
 def run(args):
     root = args.output.resolve()
     if (root / "samples.json").exists() or (root / "scratch").exists():
@@ -294,6 +331,7 @@ def run(args):
     ]
     if args.base:
         arms.insert(0, ("base", "kache", args.base))
+    arms = [arm for arm in arms if wanted_arm(arm, args)]
     arms = [(name, backend, tool_path(binary)) for name, backend, binary in arms]
     records = []
     started = time.monotonic()
@@ -303,7 +341,7 @@ def run(args):
         "host": platform.node(),
         "platform": f"{platform.system()} {platform.release()} {platform.machine()}",
         "samples_requested": args.samples,
-        "cold_every": 3,
+        "cold_every": args.cold_every,
         "identity": {
             key: os.environ.get(key, "")
             for key in (
@@ -343,7 +381,7 @@ def run(args):
                     "--work-dir",
                     str(scratch),
                 ]
-                reused = sample % 3 != 0
+                reused = cold_is_reused(sample, args.cold_every)
                 if sample:
                     command.append("--skip-clone")
                 if reused:
@@ -482,8 +520,16 @@ def main():
     parser.add_argument("--scenarios", type=Path, default=Path("scenarios"))
     parser.add_argument("--kache", required=True)
     parser.add_argument("--base")
-    parser.add_argument("--sccache", default="sccache")
-    parser.add_argument("--mbx", default="mbx")
+    parser.add_argument(
+        "--sccache",
+        default=DEFAULT_TOOL["sccache"],
+        help="sccache binary; the arm is skipped when the default is not installed",
+    )
+    parser.add_argument(
+        "--mbx",
+        default=DEFAULT_TOOL["mbx"],
+        help="mbx binary; the arm is skipped when the default is not installed",
+    )
     parser.add_argument("--samples", type=int, choices=range(1, 21), default=1)
     parser.add_argument("--order-seed", type=int, default=0)
     parser.add_argument(
@@ -497,12 +543,36 @@ def main():
         action="store_true",
         help="run only isolated builds for a focused local experiment",
     )
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--cold-every",
+        type=int,
+        choices=range(1, 21),
+        default=3,
+        help="measure a fresh cold build every Nth sample and reuse it in between; 1 measures every cold build, which is what a change aimed at cold needs",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="directory to write samples.json, logs and scratch into; must not already hold a run",
+    )
     args = parser.parse_args()
     if platform.system() != "Linux" and not args.skip_contention:
         parser.error(
             "contention requires Linux; use a Linux runner or --skip-contention for isolated local builds"
         )
+    # Checked here rather than on first use: the engine is spawned after the
+    # subject is cloned and built, so a wrong path costs minutes before it
+    # says so. `--engine` wants kache-scenario, and passing the kache binary
+    # instead is the easy mistake.
+    if not args.engine.is_file() or not os.access(args.engine, os.X_OK):
+        parser.error(
+            f"--engine is not an executable file: {args.engine} "
+            "(it wants the measuring instrument, target/release/kache-scenario, not the kache binary)"
+        )
+    for flag, binary in (("--kache", args.kache), ("--base", args.base)):
+        if binary is not None and not installed(binary):
+            parser.error(f"{flag} is not installed: {binary}")
     return run(args)
 
 

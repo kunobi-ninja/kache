@@ -291,6 +291,27 @@ bench-contention *ARGS:
 test-bench-contention:
   python3 scripts/test-bench-contention.py
 
+# Two kache builds and one instrument from the default branch, then the gate's
+# own verdict over cold, warm and warm-same-tree. Run this before believing a
+# performance change: a change measured only on the phase it targets can be
+# paying for that phase out of another one.
+#
+#   just perf-gate-local                                  # both subjects
+#   just perf-gate-local --projects eza --cold-every 1    # a cold-aimed change
+#
+# Measure HEAD against its merge base the way the perf gate does, without a PR.
+[group('bench')]
+perf-gate-local *ARGS:
+  python3 scripts/perf-gate-local.py {{ARGS}}
+
+#   KACHE_PHASE_TRACE_DIR=/tmp/tr cargo build
+#   just trace-phases /tmp/tr --phase dep-info
+#
+# Roll up a build's phase traces: self time per phase, summed over processes.
+[group('bench')]
+trace-phases DIR *ARGS:
+  python3 scripts/trace-phases.py "{{DIR}}" {{ARGS}}
+
 # Run isolated builds (2 cold / 6 warm) and contention (2 cold / 6 warm), three tools.
 [group('bench')]
 bench-short PROJECT SAMPLES="6" *ARGS:
@@ -309,6 +330,8 @@ bench-pr:
 [group('bench')]
 test-bench-short:
   @python3 scripts/test-bench-short.py
+  @python3 scripts/test-perf-gate-local.py
+  @python3 scripts/test-trace-phases.py
 
 # Same cold/warm clone benchmark, but with sccache as the compiler cache.
 # Omit PROFILE to list sccache-backed profiles.

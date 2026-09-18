@@ -44,13 +44,25 @@ pub fn logout() -> Result<()> {
         crate::planner_client::ensure_crypto_provider();
         let service = kunobi_auth::client::discover(&endpoint).await?;
         let _session = session_lock(&service).await?;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+        let issuer = service.issuer.clone();
+        let store = crate::planner_auth::ScopedTokenStore::new(&service.client_id)?;
+        // Revoking at the IdP is best-effort and bounded; forgetting the
+        // session locally always happens, so a slow IdP cannot leave it usable.
+        let revoked = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
             scoped_client(service)?.logout_async(),
         )
-        .await
-        .context("revoking the session at the IdP timed out")??;
-        println!("Logged out of the planner at {endpoint} (session revoked at the IdP).");
+        .await;
+        store.remove(&issuer)?;
+        match revoked {
+            Ok(Ok(())) => println!("Logged out of the planner at {endpoint} (session revoked at the IdP)."),
+            Ok(Err(error)) => eprintln!(
+                "Logged out of the planner at {endpoint}; revoking the session at the IdP failed: {error:#}"
+            ),
+            Err(_) => eprintln!(
+                "Logged out of the planner at {endpoint}; revoking the session at the IdP timed out"
+            ),
+        }
         Ok(())
     })
 }

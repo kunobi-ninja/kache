@@ -2285,6 +2285,8 @@ dependencies = [
 [[package]]
 name = "kunobi-auth"
 version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c07a36ad91208b240c54832df052f62476e6b484ae156cb858ba25a861adefdb"
 dependencies = [
  "anyhow",
  "axum",

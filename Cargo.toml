@@ -176,7 +176,3 @@ warnings = "deny"
 [lints.clippy]
 permissions_set_readonly_false = "allow"
 too_many_arguments = "allow"
-
-# TEMPORARY: until kunobi-auth 0.12.0 is on crates.io.
-[patch.crates-io]
-kunobi-auth = { path = "../kunobi-auth-tls" }

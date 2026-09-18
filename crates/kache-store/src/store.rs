@@ -1493,7 +1493,9 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 
 /// The `user_version` an index carries once every statement of
 /// [`initialize_db`] has run. Bump it with any schema change.
-const INDEX_SCHEMA_GENERATION: i64 = 2;
+///
+/// 3: the boolean env-use memo became the versioned `source_env_dep_uses`.
+const INDEX_SCHEMA_GENERATION: i64 = 3;
 
 /// Replace `cache_key`'s rows in `entry_blobs` with one row per unique hash
 /// in `files`, `refs` counting per-file references (kunobi-ninja/kache#608).
@@ -5353,6 +5355,41 @@ mod tests {
             tables, 1,
             "the dropped table was recreated by the migration"
         );
+    }
+
+    /// An index stamped before the env-use memo was versioned still carries
+    /// the boolean table, whose rows the fixed scanner must never reuse.
+    #[test]
+    fn index_from_generation_one_moves_to_the_versioned_env_use_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = open_index_db(&path).unwrap();
+        db.execute_batch(
+            "DROP TABLE source_env_dep_uses;
+             CREATE TABLE source_env_runtime_uses (
+                content_hash    TEXT NOT NULL,
+                env_var         TEXT NOT NULL,
+                has_runtime_use INTEGER NOT NULL,
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (content_hash, env_var)
+             );",
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 1_i64).unwrap();
+        drop(db);
+
+        let db = open_index_db(&path).unwrap();
+        let tables: Vec<String> = db
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table'
+                 AND name IN ('source_env_runtime_uses', 'source_env_dep_uses')",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(tables, vec!["source_env_dep_uses".to_string()]);
     }
     type Store = ArtifactStore<TestPolicy>;
     struct TestPolicy;

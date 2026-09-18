@@ -230,7 +230,8 @@ pub struct Config {
     /// `VAR` entries remain gated by source/include safety checks. A scoped
     /// `rustc_crate_name:VAR` entry is an explicit assertion that bypasses
     /// those scans for exactly that crate and variable; crate names use
-    /// rustc's underscore form. `CARGO_MANIFEST_DIR` is never forceable.
+    /// rustc's underscore form. `CARGO_MANIFEST_DIR` is refused in both
+    /// forms.
     /// Set via `KACHE_PATH_ONLY_ENV_VARS` (comma/space-separated) or
     /// `[cache] path_only_env_vars`. Empty (the default) leaves only built-in
     /// OUT_DIR normalization.
@@ -949,6 +950,33 @@ pub(crate) fn normalize_key_env_vars(
     out
 }
 
+/// Warn about `path_only_env_vars` entries that name `CARGO_MANIFEST_DIR`.
+///
+/// Kache refuses that variable in both the plain and the `crate:VAR` form, so
+/// the entry does nothing and the value stays in the key. Without a warning the
+/// only sign is a per-crate trace line at build time. Entries are otherwise
+/// kept verbatim: they are matched against the names rustc reports, so trimming
+/// or re-casing them here would change which variables they select.
+/// Returns the entries it warned about, so the rule is testable without a
+/// subscriber.
+pub(crate) fn warn_inert_path_only_env_vars(entries: &[String], source: &str) -> Vec<String> {
+    let mut inert = Vec::new();
+    for entry in entries {
+        let var = entry.split_once(':').map_or(entry.as_str(), |(_, var)| var);
+        if crate::cache_key::is_manifest_dir_var(var.trim()) {
+            tracing::warn!(
+                target: "kache::config",
+                "{source}: entry {entry:?} is ignored. CARGO_MANIFEST_DIR is never \
+                 path-only: rustc can embed it in crate metadata, and every crate's \
+                 sources live under it, so normalizing it would serve another \
+                 checkout's artifacts"
+            );
+            inert.push(entry.clone());
+        }
+    }
+    inert
+}
+
 /// Validate and deterministically order `[paths].base_dirs` without requiring
 /// the roots to exist on this host. Container, Snap, Flatpak, and AppImage
 /// roots are often only mounted in the environment that performs the build, so
@@ -1606,19 +1634,26 @@ impl Config {
         // Path-only env-var allowlist (the OUT_DIR-style normalization opt-in).
         // Env wins over the file: a set `KACHE_PATH_ONLY_ENV_VARS`
         // (comma/whitespace-separated) replaces the file list entirely.
-        let path_only_env_vars = match env_or_ignored("KACHE_PATH_ONLY_ENV_VARS", ignore_env) {
-            Ok(val) => val
-                .split([',', ' ', '\t', '\n'])
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .collect(),
-            Err(_) => file_config
-                .as_ref()
-                .ok()
-                .and_then(|c| c.cache.as_ref())
-                .and_then(|c| c.path_only_env_vars.clone())
-                .unwrap_or_default(),
-        };
+        let (path_only_env_vars, path_only_source) =
+            match env_or_ignored("KACHE_PATH_ONLY_ENV_VARS", ignore_env) {
+                Ok(val) => (
+                    val.split([',', ' ', '\t', '\n'])
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    "KACHE_PATH_ONLY_ENV_VARS",
+                ),
+                Err(_) => (
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.path_only_env_vars.clone())
+                        .unwrap_or_default(),
+                    "[cache] path_only_env_vars",
+                ),
+            };
+        let _inert = warn_inert_path_only_env_vars(&path_only_env_vars, path_only_source);
 
         // Incremental force-list for the managed per-crate policy.
         // Env wins over the file: a set `KACHE_INCREMENTAL_CRATES`
@@ -5756,6 +5791,38 @@ remote_key_cache_refresh_secs = 900
     }
 
     #[test]
+    fn path_only_env_vars_take_the_env_list_verbatim_without_empties() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let _cfg_guard = set_kache_config_for_test(&cfg_path);
+
+        std::fs::write(&cfg_path, "[cache]\npath_only_env_vars = [\"FROM_FILE\"]\n").unwrap();
+        {
+            let _vars = NamedEnvGuard::remove("KACHE_PATH_ONLY_ENV_VARS");
+            assert_eq!(
+                Config::load().unwrap().path_only_env_vars,
+                vec!["FROM_FILE".to_string()]
+            );
+        }
+
+        {
+            // Env replaces the file list; comma and whitespace both separate,
+            // and the separators around them produce no empty entries. Names
+            // are otherwise kept verbatim: they match what rustc reports.
+            let _vars = NamedEnvGuard::set(
+                "KACHE_PATH_ONLY_ENV_VARS",
+                ",BUILDCONFIG_RS, my_crate:OUT_DIR,",
+            );
+            assert_eq!(
+                Config::load().unwrap().path_only_env_vars,
+                vec!["BUILDCONFIG_RS".to_string(), "my_crate:OUT_DIR".to_string()]
+            );
+        }
+        assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_PATH_ONLY_ENV_VARS"));
+    }
+
+    #[test]
     fn test_incremental_crate_forced_matches_normalized_names_only() {
         let list = normalize_incremental_crates(["tap-lib".to_string()]);
         // Both spellings of the listed crate select it; other crates,
@@ -5914,6 +5981,30 @@ remote_key_cache_refresh_secs = 900
             normalize_key_env_vars(["A*B".to_string(), "  ".to_string()], "test"),
             vec!["A*B".to_string()]
         );
+    }
+
+    #[test]
+    fn path_only_entries_naming_the_manifest_dir_are_reported_inert() {
+        let entries: Vec<String> = [
+            "CARGO_MANIFEST_DIR",
+            "my_crate:CARGO_MANIFEST_DIR",
+            " cargo_manifest_dir ",
+            "OUT_DIR",
+            "my_crate:OUT_DIR",
+            "BUILDCONFIG_RS",
+        ]
+        .iter()
+        .map(|entry| (*entry).to_string())
+        .collect();
+        assert_eq!(
+            warn_inert_path_only_env_vars(&entries, "test"),
+            vec![
+                "CARGO_MANIFEST_DIR".to_string(),
+                "my_crate:CARGO_MANIFEST_DIR".to_string(),
+                " cargo_manifest_dir ".to_string(),
+            ]
+        );
+        assert!(warn_inert_path_only_env_vars(&[], "test").is_empty());
     }
 
     #[test]

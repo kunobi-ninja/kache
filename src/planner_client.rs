@@ -60,23 +60,22 @@ pub async fn resolve_prefetch_plan_with_config(
 
 fn prefetch_plan_url(endpoint: &str) -> String {
     let trimmed = endpoint.trim_end_matches('/');
-    if trimmed.ends_with(PREFETCH_PLAN_PATH_V1) || trimmed.ends_with(PREFETCH_PLAN_PATH_V2) {
+    if trimmed.ends_with(PREFETCH_PLAN_PATH_V1) {
         trimmed.to_string()
+    } else if let Some(base) = trimmed.strip_suffix(PREFETCH_PLAN_PATH_V2) {
+        // v2 was the default while the service served both paths; the server
+        // now serves v1 only, so rewrite rather than 404 (#619).
+        format!("{base}{PREFETCH_PLAN_PATH_V1}")
     } else {
-        format!("{trimmed}{PREFETCH_PLAN_PATH_V2}")
+        format!("{trimmed}{PREFETCH_PLAN_PATH_V1}")
     }
 }
 
 #[cfg(test)]
-fn expected_prefetch_plan_path(endpoint: &str) -> Cow<'static, str> {
-    if endpoint
-        .trim_end_matches('/')
-        .ends_with(PREFETCH_PLAN_PATH_V1)
-    {
-        Cow::Borrowed(PREFETCH_PLAN_PATH_V1)
-    } else {
-        Cow::Borrowed(PREFETCH_PLAN_PATH_V2)
-    }
+fn expected_prefetch_plan_path() -> Cow<'static, str> {
+    // Every endpoint resolves to v1; the helper only names the path the
+    // request assertion checks.
+    Cow::Borrowed(PREFETCH_PLAN_PATH_V1)
 }
 
 #[cfg(test)]
@@ -101,10 +100,9 @@ mod tests {
             let mut buf = [0u8; 4096];
             let n = socket.read(&mut buf).await.unwrap();
             let request = String::from_utf8_lossy(&buf[..n]);
-            assert!(request.starts_with(&format!(
-                "POST {} HTTP/1.1",
-                expected_prefetch_plan_path(&format!("http://{addr}"))
-            )));
+            assert!(
+                request.starts_with(&format!("POST {} HTTP/1.1", expected_prefetch_plan_path()))
+            );
 
             match expected_auth {
                 Some(token) => assert!(
@@ -131,14 +129,16 @@ mod tests {
     async fn test_prefetch_plan_url_appends_path_once() {
         assert_eq!(
             prefetch_plan_url("https://planner.example.com"),
-            "https://planner.example.com/v2/prefetch-plan"
-        );
-        assert_eq!(
-            prefetch_plan_url("https://planner.example.com/v2/prefetch-plan"),
-            "https://planner.example.com/v2/prefetch-plan"
+            "https://planner.example.com/v1/prefetch-plan"
         );
         assert_eq!(
             prefetch_plan_url("https://planner.example.com/v1/prefetch-plan"),
+            "https://planner.example.com/v1/prefetch-plan"
+        );
+        // Endpoints configured while v2 was the default keep working: the
+        // client rewrites the stale suffix instead of letting the server 404.
+        assert_eq!(
+            prefetch_plan_url("https://planner.example.com/v2/prefetch-plan"),
             "https://planner.example.com/v1/prefetch-plan"
         );
     }

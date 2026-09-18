@@ -984,6 +984,21 @@ impl RustcArgs {
     pub fn emits_link(&self) -> bool {
         self.emit.is_empty() || self.emit.iter().any(|kind| kind == "link")
     }
+
+    /// Whether this invocation runs the system linker: it emits `link` for a
+    /// crate type the linker produces. An rlib's `link` output is an archive
+    /// rustc writes itself, and Cargo asks for it on every library, so an
+    /// rlib compile is not a link.
+    pub fn invokes_linker(&self) -> bool {
+        const LINKED: [&str; 4] = ["bin", "dylib", "cdylib", "proc-macro"];
+        self.emits_link()
+            && (self.crate_types.is_empty()
+                || self
+                    .crate_types
+                    .iter()
+                    .flat_map(|kinds| kinds.split(','))
+                    .any(|kind| LINKED.contains(&kind.trim())))
+    }
 }
 
 fn parse_extern(s: &str) -> ExternDep {
@@ -1843,6 +1858,28 @@ mod tests {
         let dep = parse_extern("noprelude:std=/path/to/libstd.rlib");
         assert_eq!(dep.name, "std");
         assert!(dep.path.is_some());
+    }
+
+    #[test]
+    fn invokes_linker_only_for_linked_crate_types() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["rustc", "--crate-name", "foo", "src/lib.rs"];
+            argv.extend_from_slice(extra);
+            RustcArgs::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let cargo_emit = "--emit=dep-info,metadata,link";
+        assert!(!parse(&["--crate-type", "lib", cargo_emit]).invokes_linker());
+        assert!(!parse(&["--crate-type", "rlib", cargo_emit]).invokes_linker());
+        assert!(!parse(&["--crate-type", "staticlib", cargo_emit]).invokes_linker());
+        assert!(parse(&["--crate-type", "bin", cargo_emit]).invokes_linker());
+        assert!(parse(&["--crate-type", "proc-macro", cargo_emit]).invokes_linker());
+        assert!(parse(&["--crate-type=dylib", cargo_emit]).invokes_linker());
+        assert!(parse(&["--crate-type", "lib,cdylib", cargo_emit]).invokes_linker());
+        assert!(
+            parse(&[cargo_emit]).invokes_linker(),
+            "no crate type is a bin"
+        );
+        assert!(!parse(&["--crate-type", "bin", "--emit=metadata"]).invokes_linker());
     }
 
     #[test]

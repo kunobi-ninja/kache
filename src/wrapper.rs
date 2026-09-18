@@ -784,6 +784,7 @@ fn admit_scheduler_miss(
     if !config.scheduler {
         return (MissGuard::empty(), None);
     }
+    let identity = identity.with_key(cache_key);
     loop {
         match scheduler::begin_miss(&config.cache_dir, true, &identity, crate_name, is_link) {
             scheduler::BeginMiss::Recheck => {
@@ -3449,7 +3450,7 @@ fn run_parsed_rustc(
     };
 
     drop(trace_store_open);
-    let _trace_remember = crate::phase_trace::phase("remember_target_root");
+    let trace_remember = crate::phase_trace::phase("remember_target_root");
     if args.is_primary
         && let Some(target_dir) = args.target_dir()
         && let Some(workspace_root) = workspace_root.as_deref()
@@ -3461,6 +3462,7 @@ fn run_parsed_rustc(
             e
         );
     }
+    drop(trace_remember);
 
     tracing::debug!("cache key for {}: {}", crate_name, &cache_key[..16]);
 
@@ -3660,7 +3662,7 @@ fn run_parsed_rustc(
         &cache_key,
         FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()),
         crate_name,
-        args.emits_link(),
+        args.invokes_linker(),
         cache_entry_has_files,
     );
     let (lock, committed) = if let Some(meta) = scheduled_hit {
@@ -13989,7 +13991,11 @@ exit 0
         );
     }
 
-    fn spawn_flight_holder(dir: &std::path::Path, crate_name: &str) -> std::process::Child {
+    fn spawn_flight_holder(
+        dir: &std::path::Path,
+        crate_name: &str,
+        key: &str,
+    ) -> std::process::Child {
         std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -13999,6 +14005,7 @@ exit 0
             ])
             .env("KACHE_TEST_SCHEDULER_ROOT", dir)
             .env("KACHE_TEST_FLIGHT_CRATE", crate_name)
+            .env("KACHE_TEST_FLIGHT_KEY", key)
             .spawn()
             .unwrap()
     }
@@ -14024,7 +14031,7 @@ exit 0
         let (_config, store, seeded) = seed_store_entry(dir.path(), key);
         let expected_key = seeded.cache_key.clone();
         drop(store);
-        let mut child = spawn_flight_holder(dir.path(), crate_name);
+        let mut child = spawn_flight_holder(dir.path(), crate_name, key);
         wait_flight_ready(dir.path(), &mut child);
 
         let cache = dir.path().to_path_buf();
@@ -14060,7 +14067,7 @@ exit 0
         let key = "recheck-reject-key";
         let (_config, store, _seeded) = seed_store_entry(dir.path(), key);
         drop(store);
-        let mut child = spawn_flight_holder(dir.path(), crate_name);
+        let mut child = spawn_flight_holder(dir.path(), crate_name, key);
         wait_flight_ready(dir.path(), &mut child);
 
         let cache = dir.path().to_path_buf();
@@ -14097,7 +14104,8 @@ exit 0
         let root =
             PathBuf::from(std::env::var_os("KACHE_TEST_SCHEDULER_ROOT").expect("fixture root"));
         let crate_name = std::env::var("KACHE_TEST_FLIGHT_CRATE").expect("fixture crate name");
-        let identity = FlightIdentity::rustc(&crate_name, &["lib".into()], false);
+        let key = std::env::var("KACHE_TEST_FLIGHT_KEY").expect("fixture cache key");
+        let identity = FlightIdentity::rustc(&crate_name, &["lib".into()], false).with_key(&key);
         let guard = match scheduler::begin_miss(&root, true, &identity, &crate_name, false) {
             scheduler::BeginMiss::Compile(guard) => guard,
             scheduler::BeginMiss::Recheck => panic!("fixture must own the flight"),

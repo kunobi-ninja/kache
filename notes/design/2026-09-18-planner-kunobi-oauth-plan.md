@@ -229,7 +229,7 @@ impl PlannerAuth {
   - Existing tests `prefetch_plan_requires_bearer_token_when_configured`, `…rejects_wrong_bearer_token`, `…accepts…` keep passing via `config.auth.token`.
 - [ ] **Step 2:** `cargo test -p kache-service` → FAIL (fields missing).
 - [ ] **Step 3: Implement**
-  - Cli: 
+  - Cli:
     ```rust
     #[arg(long, env = "KACHE_PLANNER_OIDC_ISSUER")] oidc_issuer: Option<String>,
     #[arg(long, env = "KACHE_PLANNER_OIDC_CLIENT_ID")] oidc_client_id: Option<String>,

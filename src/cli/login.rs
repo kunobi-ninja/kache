@@ -18,6 +18,9 @@ pub fn login(device: bool, retrust: bool) -> Result<()> {
         crate::planner_client::ensure_crypto_provider();
         println!("Discovering the planner's login at {endpoint}...");
         let service = discover_for_login(&endpoint, retrust).await?;
+        // Hold the session lock across the login so a daemon refresh cannot
+        // overwrite the new session with one from the old refresh token.
+        let _session = session_lock(&service).await?;
         let client = scoped_client(service)?;
         if device {
             client
@@ -37,6 +40,7 @@ pub fn logout() -> Result<()> {
     runtime()?.block_on(async {
         crate::planner_client::ensure_crypto_provider();
         let service = kunobi_auth::client::discover(&endpoint).await?;
+        let _session = session_lock(&service).await?;
         scoped_client(service)?.logout_async().await?;
         println!("Logged out of the planner at {endpoint} (session revoked at the IdP).");
         Ok(())
@@ -48,6 +52,16 @@ pub fn logout() -> Result<()> {
 fn scoped_client(service: ServiceConfig) -> Result<AuthClient> {
     let store = crate::planner_auth::ScopedTokenStore::new(&service.client_id)?;
     Ok(AuthClient::with_storage(service, Box::new(store)))
+}
+
+async fn session_lock(service: &ServiceConfig) -> Result<std::fs::File> {
+    crate::planner_auth::session_lock(
+        &service.issuer,
+        &service.client_id,
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .context("waiting for the daemon to finish refreshing the planner session")
 }
 
 fn planner_endpoint() -> Result<String> {

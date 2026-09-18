@@ -448,10 +448,6 @@ pub struct PlannerConfig {
     pub endpoint: String,
     pub timeout_ms: u64,
     pub token: Option<String>,
-    /// Audience for the GitHub Actions ID token sent when no token is set.
-    /// `None` means the planner's own base URL, which binds the token to this
-    /// planner so no other endpoint can replay it.
-    pub github_audience: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -805,8 +801,6 @@ pub(crate) struct PlannerFileConfig {
     pub(crate) timeout_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) github_audience: Option<String>,
 }
 
 /// Tracks which config fields have active env var overrides.
@@ -1133,7 +1127,6 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_PLANNER_ENDPOINT",
     "KACHE_PLANNER_TIMEOUT_MS",
     "KACHE_PLANNER_TOKEN",
-    "KACHE_PLANNER_GITHUB_AUDIENCE",
     "KACHE_GC_EVICT_SHARED",
     "KACHE_PREFETCH_MAX_KEYS",
     "KACHE_PREFETCH_MAX_BYTES",
@@ -1219,10 +1212,6 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_PLANNER_ENDPOINT", "cache.planner.endpoint"),
     ("KACHE_PLANNER_TIMEOUT_MS", "cache.planner.timeout_ms"),
     ("KACHE_PLANNER_TOKEN", "cache.planner.token"),
-    (
-        "KACHE_PLANNER_GITHUB_AUDIENCE",
-        "cache.planner.github_audience",
-    ),
 ];
 
 /// Read a `KACHE_*` env var, unless the pinned config asked to ignore env
@@ -2412,24 +2401,10 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let github_audience = env_or_ignored("KACHE_PLANNER_GITHUB_AUDIENCE", ignore_env)
-            .ok()
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .ok()
-                    .and_then(|c| c.cache.as_ref())
-                    .and_then(|c| c.planner.as_ref())
-                    .and_then(|c| c.github_audience.clone())
-            })
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
         Some(PlannerConfig {
             endpoint,
             timeout_ms,
             token,
-            github_audience,
         })
     }
 
@@ -2914,7 +2889,6 @@ const PLANNER_ENV_VARS: &[&str] = &[
     "KACHE_PLANNER_ENDPOINT",
     "KACHE_PLANNER_TIMEOUT_MS",
     "KACHE_PLANNER_TOKEN",
-    "KACHE_PLANNER_GITHUB_AUDIENCE",
 ];
 
 /// `[cache]` tables whose host copy gives way to the environment, with the
@@ -7753,7 +7727,6 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                     endpoint: Some("https://planner.example.com".to_string()),
                     timeout_ms: Some(1200),
                     token: Some("secret".to_string()),
-                    github_audience: None,
                 }),
                 ..Default::default()
             }),
@@ -7784,7 +7757,6 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                     endpoint: Some("https://planner.example.com".to_string()),
                     timeout_ms: Some(1200),
                     token: Some("secret".to_string()),
-                    github_audience: None,
                 }),
                 ..Default::default()
             }),

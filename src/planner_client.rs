@@ -181,7 +181,6 @@ mod tests {
             endpoint,
             timeout_ms: 1000,
             token: Some("token-123".into()),
-            github_audience: None,
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],
@@ -211,7 +210,6 @@ mod tests {
             endpoint,
             timeout_ms: 1000,
             token: None,
-            github_audience: None,
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],
@@ -240,7 +238,6 @@ mod tests {
             endpoint,
             timeout_ms: 1000,
             token: None,
-            github_audience: None,
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],

@@ -3,8 +3,8 @@
 //! First match wins:
 //! 1. an explicit token (`KACHE_PLANNER_TOKEN` / `cache.planner.token`);
 //! 2. inside GitHub Actions, the job's OIDC ID token, whose audience is the
-//!    planner's own URL unless `cache.planner.github_audience` overrides it
-//!    (the job needs `id-token: write`);
+//!    planner's own base URL so no other endpoint can replay it (the job
+//!    needs `id-token: write`);
 //! 3. the Kunobi session `kache login` stored for this planner;
 //! 4. nothing.
 //!
@@ -29,9 +29,15 @@ const GITHUB_REQUEST_TOKEN: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
 /// Refresh a token this long before it expires, so a request in flight does
 /// not carry one that lapses on arrival.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
-/// How long a discovery result (including "no usable login") is reused. The
-/// daemon is long-lived; a planner's auth configuration rarely moves.
+/// How long a planner's advertised login is reused. The daemon is long-lived;
+/// a planner's auth configuration rarely moves. Trust (the pin) is checked on
+/// every use, so a fresh `kache login` takes effect at once.
 const DISCOVERY_TTL: Duration = Duration::from_secs(600);
+/// How long "this planner offers no login" is reused.
+const NO_LOGIN_TTL: Duration = Duration::from_secs(60);
+/// How long a session refresh may wait for the session lock, and how long the
+/// refresh itself may take: a stalled IdP must not hold the lock forever.
+const REFRESH_BOUND: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CachedToken {
@@ -46,13 +52,12 @@ impl CachedToken {
 }
 
 static GITHUB_TOKENS: Mutex<Option<HashMap<String, CachedToken>>> = Mutex::new(None);
-/// When a planner was asked for its login, and what it answered (`None`: no
-/// login, or one this machine has not trusted).
+/// When a planner was asked for its login, and what it answered (`None`: it
+/// offers none).
 type Discovered = (Instant, Option<ServiceConfig>);
 static DISCOVERY: Mutex<Option<HashMap<String, Discovered>>> = Mutex::new(None);
-/// Single-flight for session refreshes. Only the daemon refreshes (`kache
-/// login` writes a new session instead), so an in-process lock is enough to
-/// keep concurrent builds from spending one rotating refresh token twice.
+/// In-process single-flight for refreshes, so concurrent builds queue here
+/// instead of each blocking a thread on the cross-process [`session_lock`].
 static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The bearer for a planner request, resolved before `deadline`. The caller
@@ -81,11 +86,10 @@ async fn resolve(config: &PlannerConfig) -> Option<String> {
         std::env::var(GITHUB_REQUEST_URL),
         std::env::var(GITHUB_REQUEST_TOKEN),
     ) {
-        let audience = config
-            .github_audience
-            .clone()
-            .unwrap_or_else(|| base.clone());
-        match cached_github_token(&url, &request_token, &audience).await {
+        // Always the planner's own URL: an audience taken from config would let
+        // a project point `endpoint` elsewhere and collect a token minted for
+        // a real planner.
+        match cached_github_token(&url, &request_token, &base).await {
             Ok(token) => return Some(token),
             Err(error) => tracing::debug!("planner auth: GitHub Actions ID token: {error:#}"),
         }
@@ -246,6 +250,7 @@ pub(crate) async fn kunobi_session_token(base: &str) -> Result<Option<String>> {
 
 async fn refresh_session(service: ServiceConfig) -> Result<Option<String>> {
     let _single_flight = REFRESH.lock().await;
+    let _session = session_lock(&service.issuer, &service.client_id, REFRESH_BOUND).await?;
     let store = ScopedTokenStore::new(&service.client_id)?;
     // Re-check under the lock: another build may have refreshed meanwhile.
     let Some(stored) = store.load(&service.issuer)? else {
@@ -257,13 +262,17 @@ async fn refresh_session(service: ServiceConfig) -> Result<Option<String>> {
     let Some(refresh_token) = stored.refresh_token.as_deref() else {
         bail!("the Kunobi session expired and has no refresh token");
     };
-    let mut refreshed = kunobi_auth::client::oidc::refresh(
-        &service.issuer,
-        &service.client_id,
-        &service.redirect_uri,
-        refresh_token,
+    let mut refreshed = tokio::time::timeout(
+        REFRESH_BOUND,
+        kunobi_auth::client::oidc::refresh(
+            &service.issuer,
+            &service.client_id,
+            &service.redirect_uri,
+            refresh_token,
+        ),
     )
     .await
+    .context("the Kunobi session refresh timed out")?
     .context("refreshing the Kunobi session")?;
     refreshed.extra = stored.extra;
     let token = refreshed.id_token.clone();
@@ -272,33 +281,45 @@ async fn refresh_session(service: ServiceConfig) -> Result<Option<String>> {
 }
 
 /// The planner's login, if this machine trusted it with `kache login`.
-/// Discovery is unpinned and then checked fail-closed against the pin, so
-/// the daemon never establishes trust on its own. Cached for
-/// [`DISCOVERY_TTL`], including negative answers.
+/// Discovery is unpinned and then checked fail-closed against the pin on
+/// every call, so the daemon never establishes trust on its own and a new
+/// login is honoured immediately.
 async fn trusted_login(base: &str) -> Option<ServiceConfig> {
+    let service = advertised_login(base).await?;
+    let pinned = TofuStore::new().and_then(|pins| {
+        pins.verify_or_reject(
+            &service.endpoint,
+            &service.issuer,
+            service.audience.as_deref().unwrap_or(""),
+        )
+    });
+    match pinned {
+        Ok(()) => Some(service),
+        Err(error) => {
+            tracing::debug!(
+                "planner auth: {base} is not trusted for login ({error:#}); run `kache login`"
+            );
+            None
+        }
+    }
+}
+
+/// What `/.well-known/kunobi-auth` says, cached per planner.
+async fn advertised_login(base: &str) -> Option<ServiceConfig> {
     let cached = DISCOVERY.lock().ok().and_then(|cache| {
         let (at, service) = cache.as_ref()?.get(base)?;
-        (at.elapsed() < DISCOVERY_TTL).then(|| service.clone())
+        let ttl = if service.is_some() {
+            DISCOVERY_TTL
+        } else {
+            NO_LOGIN_TTL
+        };
+        (at.elapsed() < ttl).then(|| service.clone())
     });
     if let Some(service) = cached {
         return service;
     }
     let service = match kunobi_auth::client::discover_unpinned(base).await {
-        Ok(service) => match TofuStore::new().and_then(|pins| {
-            pins.verify_or_reject(
-                &service.endpoint,
-                &service.issuer,
-                service.audience.as_deref().unwrap_or(""),
-            )
-        }) {
-            Ok(()) => Some(service),
-            Err(error) => {
-                tracing::debug!(
-                    "planner auth: {base} is not trusted for login ({error:#}); run `kache login`"
-                );
-                None
-            }
-        },
+        Ok(service) => Some(service),
         Err(error) => {
             tracing::debug!("planner auth: no login offered by {base}: {error:#}");
             None
@@ -310,6 +331,48 @@ async fn trusted_login(base: &str) -> Option<ServiceConfig> {
             .insert(base.to_string(), (Instant::now(), service.clone()));
     }
     service
+}
+
+/// Cross-process lock for one planner session (issuer + client id). Refresh,
+/// `kache login` and `kache logout` take it, so concurrent daemons and CLIs
+/// never spend the same rotating refresh token twice, and a refresh cannot
+/// overwrite a new login or bring back a removed session. Held until the
+/// returned file is dropped.
+pub(crate) async fn session_lock(
+    issuer: &str,
+    client_id: &str,
+    wait: Duration,
+) -> Result<std::fs::File> {
+    let dir = dirs::config_dir()
+        .context("no config directory for the session lock")?
+        .join("kunobi")
+        .join("locks");
+    let key = blake3::hash(format!("kache\0{issuer}\0{client_id}").as_bytes()).to_hex();
+    let path = dir.join(format!("kache-session-{}.lock", &key[..16]));
+    tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+        std::fs::create_dir_all(&dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let started = Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    bail!("another kache process is using the planner session")
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+    })
+    .await
+    .context("the session lock task failed")?
 }
 
 /// The planner's base URL: discovery lives at its root, while the configured
@@ -394,7 +457,6 @@ mod tests {
             endpoint: "http://127.0.0.1:9".to_string(),
             timeout_ms: 50,
             token: Some("static".to_string()),
-            github_audience: None,
         };
         assert_eq!(bearer(&config, soon()).await.as_deref(), Some("static"));
     }
@@ -405,7 +467,6 @@ mod tests {
             endpoint: "http://planner.example.com".to_string(),
             timeout_ms: 50,
             token: None,
-            github_audience: None,
         };
         assert_eq!(bearer(&config, soon()).await, None);
     }
@@ -535,5 +596,30 @@ mod tests {
         kache.remove(issuer).unwrap();
         assert!(kache.load(issuer).unwrap().is_none());
         assert!(kobe.load(issuer).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn the_session_lock_excludes_a_second_holder_until_released() {
+        let issuer = format!("https://lock-test-{}.example", std::process::id());
+        let held = session_lock(&issuer, "kache-cli", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(
+            session_lock(&issuer, "kache-cli", Duration::from_millis(100))
+                .await
+                .is_err()
+        );
+        // A different client for the same issuer is a different session.
+        drop(
+            session_lock(&issuer, "kobe-cli", Duration::from_millis(100))
+                .await
+                .unwrap(),
+        );
+        drop(held);
+        drop(
+            session_lock(&issuer, "kache-cli", Duration::from_millis(100))
+                .await
+                .unwrap(),
+        );
     }
 }

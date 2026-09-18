@@ -441,6 +441,7 @@ fn macos_oso_prefix_flag_inner(
 ///
 /// Falls back to the output directory whenever the invocation is not in
 /// Cargo's layout, where widening the prefix would reach outside the build.
+#[cfg(any(test, target_os = "macos"))]
 fn macos_oso_prefix_root(parsed: &RustcArgs) -> Option<PathBuf> {
     let out_dir = parsed.out_dir.as_ref()?;
     Some(cargo_profile_dir(out_dir).unwrap_or_else(|| out_dir.clone()))
@@ -455,6 +456,7 @@ fn macos_oso_prefix_root(parsed: &RustcArgs) -> Option<PathBuf> {
 /// script in `<profile>/build/<pkg>-<hash>`. Only those two levels are
 /// examined, so a project that happens to live under a directory called
 /// `deps` cannot drag the prefix up to it.
+#[cfg(any(test, target_os = "macos"))]
 fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
     let parent = out_dir.parent();
     for cursor in [Some(out_dir), parent].into_iter().flatten() {

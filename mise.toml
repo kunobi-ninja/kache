@@ -22,7 +22,7 @@ cmake = "4.3.4"
 # CI install actions) so the same `mise install` populates every
 # tool the repo needs.
 "github:taiki-e/cargo-llvm-cov" = "0.8.7"
-"github:mozilla/sccache" = "0.15.0"
+"github:mozilla/sccache" = "0.18.0"
 # Dependency policy auditing — `just audit`. cargo-deny checks RustSec
 # advisories AND license/bans/sources policy (config in `deny.toml`),
 # matching the kunobi-* repos' tooling. The `aqua:` backend ships prebuilt

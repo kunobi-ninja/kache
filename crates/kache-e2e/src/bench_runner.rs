@@ -2108,16 +2108,54 @@ fn measure_sccache_phase(
         ensure_sccache_cache_location(&metrics, cache_dir, phase)?;
         ensure_sccache_base_dirs(&metrics, clone, phase)?;
         anyhow::ensure!(metrics.cache_hits > 0, "[{phase}] sccache restored nothing");
-        anyhow::ensure!(
-            metrics.cache_errors == 0
-                && metrics.cache_read_errors == 0
-                && metrics.cache_write_errors == 0,
-            "[{phase}] sccache reported cache errors"
-        );
+        if let Some(complaint) = sccache_cache_error_complaint(&metrics) {
+            anyhow::bail!("[{phase}] {complaint}");
+        }
         Ok(metrics)
     })();
     sccache_stop(sccache, cache_dir);
     measured
+}
+
+/// How many of sccache's generic cache errors a phase may report, as a share of
+/// the requests it executed.
+///
+/// Firefox's configure step compiles programs that are meant to fail, to find
+/// out what the toolchain supports. sccache counts each one in `cache_errors`,
+/// so the counter never reaches zero on this scenario however healthy the cache
+/// is. A share keeps the check meaningful: a store that is actually broken
+/// fails far more than one request in a hundred.
+const SCCACHE_CACHE_ERROR_BUDGET: f64 = 0.01;
+
+/// Returns what is wrong with a phase's error counters, or `None` if they are
+/// within budget.
+///
+/// Read and write errors have no budget. Those are sccache failing to reach its
+/// own storage, which would distort the timing this benchmark exists to
+/// measure, so one is enough to reject the phase.
+fn sccache_cache_error_complaint(metrics: &SccachePhaseMetrics) -> Option<String> {
+    if metrics.cache_read_errors > 0 {
+        return Some(format!(
+            "sccache reported {} cache read errors",
+            metrics.cache_read_errors
+        ));
+    }
+    if metrics.cache_write_errors > 0 {
+        return Some(format!(
+            "sccache reported {} cache write errors",
+            metrics.cache_write_errors
+        ));
+    }
+    let budget = metrics.requests_executed as f64 * SCCACHE_CACHE_ERROR_BUDGET;
+    if metrics.cache_errors as f64 > budget {
+        return Some(format!(
+            "sccache reported {} cache errors over {} requests, above the {:.0}% budget",
+            metrics.cache_errors,
+            metrics.requests_executed,
+            SCCACHE_CACHE_ERROR_BUDGET * 100.0
+        ));
+    }
+    None
 }
 
 fn run_sccache_cold_phase(
@@ -6969,6 +7007,47 @@ exit 0
         assert_eq!(metrics.wall_s, 95);
         assert_eq!(metrics.cache_hits, 8);
         assert_eq!(metrics.hit_rate_pct, 80.0);
+    }
+
+    /// The Firefox scenario always reports a few cache errors, because
+    /// configure compiles programs that are meant to fail. Those must not fail
+    /// the phase, while a store that cannot be read or written still does.
+    #[test]
+    fn sccache_cache_errors_are_budgeted_but_store_errors_are_not() {
+        let metrics = |errors: u64, read: u64, write: u64| {
+            SccachePhaseMetrics::from_raw(
+                &serde_json::json!({
+                    "stats": {
+                        "requests_executed": 5102,
+                        "cache_hits": { "counts": { "Rust": 4272 } },
+                        "cache_errors": { "counts": { "c [clang]": errors } },
+                        "cache_read_errors": read,
+                        "cache_write_errors": write,
+                    }
+                }),
+                1_000,
+            )
+        };
+
+        // What the nightly actually reported: 6 configure probes out of 5102.
+        let healthy = metrics(6, 0, 0);
+        assert_eq!(healthy.cache_errors, 6);
+        assert_eq!(sccache_cache_error_complaint(&healthy), None);
+
+        // 1% of 5102 is 51.02, so 51 is the last value inside the budget.
+        assert_eq!(sccache_cache_error_complaint(&metrics(51, 0, 0)), None);
+        let over = sccache_cache_error_complaint(&metrics(52, 0, 0)).unwrap();
+        assert!(
+            over.contains("52 cache errors over 5102 requests"),
+            "{over}"
+        );
+        assert!(over.contains("1% budget"), "{over}");
+
+        // Storage failures have no budget, and each is named on its own.
+        let read = sccache_cache_error_complaint(&metrics(0, 1, 0)).unwrap();
+        assert!(read.contains("1 cache read errors"), "{read}");
+        let write = sccache_cache_error_complaint(&metrics(0, 0, 1)).unwrap();
+        assert!(write.contains("1 cache write errors"), "{write}");
     }
 
     /// The result JSON is the perf gate's input: both wall clocks must be

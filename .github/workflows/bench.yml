@@ -6,7 +6,9 @@ name: Bench
 # gate (perf-gate.yml) measures hk and eza separately.
 #
 # Triggers:
-#   - schedule  : nightly, runs every arm in the matrix below.
+#   - schedule  : nightly, runs every arm in the matrix below except the
+#                 Firefox sccache comparison, which bench-sccache.yml dispatches
+#                 on its own weekly cadence.
 #   - dispatch  : manual, pick a scenario (default all, excluding Firefox).
 #                 Extra flags depend on the selected recipe.
 #
@@ -193,9 +195,12 @@ jobs:
             opendal-mbx)          inc="[$opendal_mbx]" ;;
             lance-mbx)            inc="[$lance_mbx]" ;;
             surrealdb-mbx)        inc="[$surrealdb_mbx]" ;;
-            # Dispatched by `bench-sccache-pin.yml` when the pinned sccache
-            # version changes, and selectable by hand. The nightly adds this
-            # arm only on Sundays (see below).
+            # Not in the nightly: sccache is pinned in mise.toml, so this arm
+            # measures the same binary every night while only kache moves, and
+            # kache against kache is what the per-PR perf gate reports.
+            # `bench-sccache.yml` gives it its own run — weekly, and on a pin
+            # bump — so the nightly never waits for it and its results reach
+            # the collector on their own schedule.
             firefox-sccache)      inc="[$firefox_sccache]" ;;
             # Windows-only scenarios are served by their own self-hosted jobs
             # below, so the Linux matrix is EMPTY for them (an empty include
@@ -205,15 +210,6 @@ jobs:
           esac
           if [ "$EVENT_NAME" = "schedule" ]; then
             inc="$(jq -c --argjson extra "[$firefox,$firefox_pull]" '. + $extra' <<<"$inc")"
-            # sccache is pinned in mise.toml, so the arm measures the same
-            # binary every night while only kache moves — and kache against
-            # kache is what the per-PR perf gate already reports. Weekly keeps
-            # a current comparison without paying for it six nights out of
-            # seven; `bench-sccache-pin.yml` dispatches this arm whenever the pin
-            # itself changes, which is the only thing that moves the baseline.
-            if [ "$(date -u +%u)" = "7" ]; then
-              inc="$(jq -c --argjson extra "[$firefox_sccache]" '. + $extra' <<<"$inc")"
-            fi
           fi
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
           if [ "$inc" = "[]" ]; then

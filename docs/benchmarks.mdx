@@ -31,11 +31,13 @@ benchmark subject.
 | Firefox Windows, LLVM, cuda-oxide | yes | — | — |
 | SurrealDB, Lance, OpenDAL | yes | — | yes |
 
-The Firefox sccache arm runs weekly rather than nightly, and whenever the
-pinned sccache version changes. sccache is pinned in `mise.toml`, so that arm
-measures the same binary every night while only Kache moves, and Kache against
-Kache is what the per-pull-request perf gate reports. mbx tracks its latest
-release, so it stays nightly.
+The Firefox sccache arm has its own workflow and its own schedule: weekly, and
+again whenever the pinned sccache version changes. sccache is pinned in
+`mise.toml`, so the arm measures the same binary every night while only Kache
+moves, and Kache against Kache is what the per-pull-request perf gate already
+reports. Running it separately also keeps its 75 minutes off the nightly's
+critical path, so nightly results reach the collector sooner. mbx tracks its
+latest release, so it stays nightly.
 
 hk retains its prediction-disabled and next-commit scenarios. The next-commit
 Kache variants separate exhaustive prediction verification from timing.

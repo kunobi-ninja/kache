@@ -4,8 +4,19 @@
 2. Point kache clients at the planner:
   KACHE_PLANNER_ENDPOINT=http://{{ include "kache-service.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
 
-3. If kunobi-auth bearer-token auth is enabled, make sure clients also set:
-  KACHE_PLANNER_TOKEN=<matching token>
+3. Authentication:
+{{- if .Values.auth.existingSecret }}
+  - static token: clients set KACHE_PLANNER_TOKEN=<matching token>
+{{- end }}
+{{- if .Values.auth.oidc.issuer }}
+  - Kunobi login: people run `kache login` (issuer {{ .Values.auth.oidc.issuer }})
+{{- end }}
+{{- if .Values.auth.githubOidc.audience }}
+  - GitHub Actions OIDC: jobs need `permissions: id-token: write` (audience {{ .Values.auth.githubOidc.audience }})
+{{- end }}
+{{- if not (or .Values.auth.existingSecret .Values.auth.oidc.issuer .Values.auth.githubOidc.audience) }}
+  - none: the planner accepts unauthenticated requests
+{{- end }}
 
 {{- if .Values.ha.enabled }}
 4. HA leader election is enabled with Lease:

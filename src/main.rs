@@ -34,6 +34,7 @@ mod opcounts;
 mod otel;
 mod path_normalizer;
 mod phase_trace;
+mod planner_auth;
 mod planner_client;
 mod platform;
 mod policy;
@@ -349,6 +350,20 @@ enum Commands {
 
     /// Open the configuration editor
     Config,
+
+    /// Log in to the planner with your Kunobi account (for planner auth)
+    Login {
+        /// Sign in on another device (prints a URL and a code)
+        #[arg(long)]
+        device: bool,
+        /// Accept and re-pin the planner's current login issuer when it no
+        /// longer matches the one first trusted
+        #[arg(long)]
+        retrust: bool,
+    },
+
+    /// Log out of the planner and revoke the stored Kunobi session
+    Logout,
 
     /// Create compiler-name symlinks pointing at kache, for transparent
     /// interception by prepending the directory to PATH
@@ -666,6 +681,13 @@ fn main() -> Result<()> {
             )?;
             return config_tui::run_config_editor();
         }
+        Some(Commands::Login { device, retrust }) => {
+            if json {
+                anyhow::bail!("`kache login` is interactive and has no JSON form.");
+            }
+            return cli::login::login(*device, *retrust);
+        }
+        Some(Commands::Logout) => return cli::login::logout(),
         Some(Commands::Cargo { args }) => return cargo_proxy::run(args.clone()),
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;
@@ -888,6 +910,7 @@ fn main() -> Result<()> {
         )),
         Some(Commands::Cargo { .. }) => unreachable!(),
         Some(Commands::Config) => unreachable!(),
+        Some(Commands::Login { .. } | Commands::Logout) => unreachable!(),
         Some(Commands::Completions { .. }) => unreachable!(),
         None => {
             // No subcommand — print help. New users often find an unexpected TUI

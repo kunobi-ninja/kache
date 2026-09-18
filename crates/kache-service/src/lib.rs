@@ -9,7 +9,7 @@ use kache_core::{
     BuildIntent, PlannerDataSource, PrefetchDisposition, PrefetchPlan, build_prefetch_plan,
 };
 use kunobi_auth::{
-    AuthError, AuthIdentity,
+    AuthError, AuthIdentity, KunobiAuthDiscovery,
     server::{AuthnProvider, OptionalAuth},
 };
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,11 @@ use std::{
 };
 use tokio::sync::{RwLock, watch};
 
+mod auth;
 mod metrics;
+
+pub use auth::AuthSettings;
+use auth::PlannerAuth;
 
 mod state;
 
@@ -59,7 +63,7 @@ pub const VERSION: &str = {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannerConfig {
     pub bind: SocketAddr,
-    pub token: Option<String>,
+    pub auth: AuthSettings,
     pub planner_name: String,
     pub db_path: PathBuf,
     pub seed_state_file: Option<PathBuf>,
@@ -85,7 +89,9 @@ impl Default for HaConfig {
 
 #[derive(Clone)]
 struct AppState {
-    token: Option<String>,
+    /// `None` when no provider is configured: the planner stays open.
+    auth: Option<PlannerAuth>,
+    discovery: Option<KunobiAuthDiscovery>,
     planner_name: String,
     repository: Arc<RwLock<Option<SharedPlannerDataSource>>>,
     ready: Arc<AtomicBool>,
@@ -98,7 +104,8 @@ struct HealthResponse {
     version: String,
 }
 
-pub async fn app(config: PlannerConfig) -> Result<Router> {
+pub async fn app(mut config: PlannerConfig) -> Result<Router> {
+    config.auth = config.auth.validated()?;
     let repository = load_repository(&config).await?;
     Ok(app_with_repository(config, repository))
 }
@@ -108,7 +115,8 @@ fn app_with_repository(
     repository: Option<SharedPlannerDataSource>,
 ) -> Router {
     let state = AppState {
-        token: normalize_optional(config.token),
+        auth: PlannerAuth::from_settings(&config.auth),
+        discovery: config.auth.discovery(),
         planner_name: normalize_name(config.planner_name),
         repository: Arc::new(RwLock::new(repository)),
         ready: Arc::new(AtomicBool::new(true)),
@@ -118,17 +126,25 @@ fn app_with_repository(
 }
 
 fn router(state: AppState) -> Router {
-    Router::new()
+    let discovery = state.discovery.clone();
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
         .route("/readyz", get(readyz))
         // v1 is the only prefetch-plan contract (#619). Add a v2 handler only
         // when the intent or plan schema actually changes, and keep v1 serving.
         .route("/v1/prefetch-plan", post(prefetch_plan))
-        .with_state(state)
+        .with_state(state);
+    // Where `kache login` finds the issuer and client id. Unauthenticated,
+    // like the health endpoints: it carries no secret.
+    match discovery {
+        Some(metadata) => router.merge(kunobi_auth::server::kunobi_auth_discovery_router(metadata)),
+        None => router,
+    }
 }
 
-pub async fn serve(config: PlannerConfig) -> Result<()> {
+pub async fn serve(mut config: PlannerConfig) -> Result<()> {
+    config.auth = config.auth.validated()?;
     let bind = config.bind;
     let planner_name = normalize_name(config.planner_name.clone());
     let listener = tokio::net::TcpListener::bind(bind)
@@ -138,7 +154,8 @@ pub async fn serve(config: PlannerConfig) -> Result<()> {
         .local_addr()
         .context("reading planner local address")?;
     let state = AppState {
-        token: normalize_optional(config.token.clone()),
+        auth: PlannerAuth::from_settings(&config.auth),
+        discovery: config.auth.discovery(),
         planner_name: planner_name.clone(),
         repository: Arc::new(RwLock::new(None)),
         ready: Arc::new(AtomicBool::new(false)),
@@ -350,21 +367,10 @@ async fn readyz(State(state): State<AppState>) -> Result<Json<HealthResponse>, S
 
 impl AuthnProvider for AppState {
     async fn authenticate(&self, token: &str) -> Result<AuthIdentity, AuthError> {
-        // Constant-time comparison: a plain `==` short-circuits on the
-        // first differing byte, letting a network peer binary-search the
-        // token one byte at a time from response timing. Only the length
-        // check can leak, which a random bearer token doesn't hinge on.
-        use subtle::ConstantTimeEq;
-        match self.token.as_deref() {
-            Some(expected) if bool::from(token.as_bytes().ct_eq(expected.as_bytes())) => {
-                Ok(AuthIdentity {
-                    provider: "kache".to_string(),
-                    identity: "planner-client".to_string(),
-                    method: "token".to_string(),
-                    claims: HashMap::new(),
-                })
-            }
-            Some(_) => Err(AuthError::Unauthorized("invalid bearer token".to_string())),
+        match &self.auth {
+            // Static token (constant-time compare), Kunobi and GitHub OIDC,
+            // plus the GitHub owner allow-list: see `auth.rs`.
+            Some(auth) => auth.authenticate(token).await,
             None => Ok(AuthIdentity {
                 provider: "kache".to_string(),
                 identity: "anonymous".to_string(),
@@ -388,7 +394,7 @@ async fn prefetch_plan(
         metrics::metrics().record_request(outcome, started.elapsed().as_secs_f64());
     };
 
-    if state.token.is_some() && identity.is_none() {
+    if state.auth.is_some() && identity.is_none() {
         record(metrics::Outcome::Unauthorized);
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -531,7 +537,7 @@ mod tests {
     fn test_config(db_path: PathBuf) -> PlannerConfig {
         PlannerConfig {
             bind: "127.0.0.1:8080".parse().unwrap(),
-            token: None,
+            auth: AuthSettings::default(),
             planner_name: "planner".to_string(),
             db_path,
             seed_state_file: None,
@@ -541,13 +547,14 @@ mod tests {
 
     fn test_app(token: Option<&str>, repository: Option<SharedPlannerDataSource>) -> Router {
         let mut config = test_config(PathBuf::from(DEFAULT_DB_PATH));
-        config.token = token.map(str::to_string);
+        config.auth.token = token.map(str::to_string);
         app_with_repository(config, repository)
     }
 
     fn test_app_with_readiness(ready: bool) -> Router {
         router(AppState {
-            token: None,
+            auth: None,
+            discovery: None,
             planner_name: "planner".to_string(),
             repository: Arc::new(RwLock::new(None)),
             ready: Arc::new(AtomicBool::new(ready)),
@@ -647,7 +654,8 @@ mod tests {
         };
 
         let state = AppState {
-            token: None,
+            auth: None,
+            discovery: None,
             planner_name: "planner".to_string(),
             repository: Arc::new(RwLock::new(None)),
             ready: Arc::new(AtomicBool::new(false)),
@@ -784,6 +792,48 @@ mod tests {
                 version: VERSION.to_string(),
             }
         );
+    }
+
+    async fn get_well_known(config: PlannerConfig) -> (StatusCode, serde_json::Value) {
+        let response = app_with_repository(config, None)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/kunobi-auth")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// `kache login` discovers the issuer and client id here. The audience
+    /// must be absent: the CLI would forward it to the IdP, and Clerk rejects
+    /// a requested audience it has not whitelisted.
+    #[tokio::test]
+    async fn well_known_kunobi_auth_is_served_with_a_client_id() {
+        let mut config = test_config(PathBuf::from(DEFAULT_DB_PATH));
+        config.auth.oidc_issuer = Some("https://clerk.example".to_string());
+        config.auth.oidc_client_id = Some("kache-cli".to_string());
+        let (status, body) = get_well_known(config).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["issuer"], "https://clerk.example");
+        assert_eq!(body["clientId"], "kache-cli");
+        assert!(body.get("audience").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn well_known_kunobi_auth_is_absent_without_a_client_id() {
+        let (status, _) = get_well_known(test_config(PathBuf::from(DEFAULT_DB_PATH))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// The scrape endpoint has to be reachable without a token.

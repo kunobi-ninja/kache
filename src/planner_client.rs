@@ -23,7 +23,7 @@ pub async fn resolve_prefetch_plan(req: &BuildIntent) -> Result<Option<PrefetchP
 /// with `rustls-no-provider` (to keep `aws-lc-sys` out of the tree — see
 /// Cargo.toml), so it needs a default provider installed before it builds a TLS
 /// client. Idempotent across threads; the already-installed error is expected.
-fn ensure_crypto_provider() {
+pub(crate) fn ensure_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -40,8 +40,19 @@ pub async fn resolve_prefetch_plan_with_config(
         .build()
         .context("building planner client")?;
 
-    let mut request = client.post(prefetch_plan_url(&config.endpoint)).json(req);
-    if let Some(token) = config.token.as_deref() {
+    // One deadline covers resolving the bearer and the plan request, so auth
+    // never stretches the planner's time budget.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(config.timeout_ms);
+    let bearer = crate::planner_auth::bearer(config, deadline).await;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("planner timeout spent before the request could be sent");
+    }
+    let mut request = client
+        .post(prefetch_plan_url(&config.endpoint))
+        .timeout(remaining)
+        .json(req);
+    if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
 
@@ -96,10 +107,23 @@ mod tests {
         let status = status_line.to_string();
 
         tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let n = socket.read(&mut buf).await.unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]);
+            // Without an explicit token the client first looks for the
+            // planner's login (`/.well-known/kunobi-auth`); answer it like a
+            // planner that offers none, then serve the plan request.
+            let (mut socket, request) = loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                if request.starts_with("GET /.well-known/kunobi-auth ") {
+                    socket
+                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                break (socket, request);
+            };
             assert!(
                 request.starts_with(&format!("POST {} HTTP/1.1", expected_prefetch_plan_path()))
             );

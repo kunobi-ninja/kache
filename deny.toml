@@ -68,6 +68,5 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # First-party dependencies.
 allow-git = [
-    "https://github.com/kunobi-ninja/kunobi-auth.git",
     "https://github.com/kunobi-ninja/kunobi-ha.git",
 ]

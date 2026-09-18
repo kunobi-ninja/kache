@@ -272,6 +272,18 @@ prefetch_enabled = false
 
 Exact remote lookup and background upload continue to work.
 
+### Planner authentication
+
+A planner that requires authentication gets a bearer from the first of these that applies:
+
+1. `KACHE_PLANNER_TOKEN` / `cache.planner.token`, when set.
+2. In GitHub Actions, the job's OIDC ID token. Its audience is the planner's base URL, so no other endpoint can replay it. The job needs `permissions: id-token: write`, and the planner must trust the repository's owner.
+3. Your Kunobi session. Run `kache login` once: it trusts this planner and stores a session that the daemon refreshes quietly from then on. The session is kept per planner client, so it never replaces another Kunobi tool's login.
+
+The second and third are sent only to a planner reached over HTTPS (or on loopback), and a session only to a planner you logged in to, so a planner URL picked up from a project's config cannot collect your credentials. Use `kache login --device` on a machine without a browser, and `kache logout` to revoke it.
+
+Nothing here prompts during a build. Without a usable bearer the planner answers 401 and kache plans locally, the same as when the planner is unreachable. If the planner's login issuer changes after you first trusted it, `kache login` refuses; run `kache login --retrust` when the change is expected.
+
 ## Telemetry
 
 Kache does not push metrics to a collector. It writes OTLP JSON files that Kartero imports from CI artifacts, the same way nightly benches already work.

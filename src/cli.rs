@@ -13,6 +13,7 @@ use crate::events;
 use crate::since::SinceWindow;
 use crate::store::{STAGING_SWEEP_GRACE, Store};
 
+pub mod login;
 mod miss_diagnosis;
 use miss_diagnosis::{Cause, MissDiagnosis};
 

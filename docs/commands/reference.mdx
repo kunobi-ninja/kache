@@ -279,6 +279,24 @@ kache config
 
 This command can open even when the current config file is invalid. See [Configuration](/docs/getting-started/configuration).
 
+## `kache login`
+
+```bash
+kache login
+kache login --device
+kache login --retrust
+```
+
+Logs in to the configured planner with your Kunobi account, for a planner that requires authentication. It reads the planner's issuer and client id from `/.well-known/kunobi-auth`, trusts that planner, and stores a session the daemon refreshes quietly. `--device` prints a URL and a code for a machine without a browser. `--retrust` accepts a planner whose login issuer changed since it was first trusted. See [Planner authentication](/docs/getting-started/configuration#planner-authentication).
+
+## `kache logout`
+
+```bash
+kache logout
+```
+
+Forgets the stored planner session and asks the identity provider to revoke it.
+
 ## `kache install-shims`
 
 ```bash

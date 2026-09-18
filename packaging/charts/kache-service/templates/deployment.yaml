@@ -107,6 +107,22 @@ spec:
                   name: {{ .Values.auth.existingSecret | quote }}
                   key: {{ .Values.auth.existingSecretKey | quote }}
             {{- end }}
+            {{- with .Values.auth.oidc }}
+            {{- if .issuer }}
+            - name: KACHE_PLANNER_OIDC_ISSUER
+              value: {{ .issuer | quote }}
+            - name: KACHE_PLANNER_OIDC_CLIENT_ID
+              value: {{ required "auth.oidc.clientId is required with auth.oidc.issuer" .clientId | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.auth.githubOidc }}
+            {{- if .audience }}
+            - name: KACHE_PLANNER_GITHUB_AUDIENCE
+              value: {{ .audience | quote }}
+            - name: KACHE_PLANNER_GITHUB_OWNERS
+              value: {{ required "auth.githubOidc.owners is required with auth.githubOidc.audience" (join "," .owners) | quote }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.ha.enabled }}
             - name: KACHE_HA_ENABLED
               value: "true"

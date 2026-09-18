@@ -107,8 +107,8 @@ const publicationWorkflows = new Set([
 ]);
 const measurementJobs = new Set([
   "bench.yml:bench",
-  "bench.yml:bench-firefox-windows",
-  "bench.yml:bench-firefox-pull-windows",
+  "bench-firefox-windows.yml:bench-firefox-windows",
+  "bench-firefox-windows.yml:bench-firefox-pull-windows",
   "perf-gate.yml:measure",
 ]);
 const routing = [];
@@ -247,7 +247,10 @@ for (const repo of ["Zondax/example", "contributor/example"]) {
     "copy benchmark disabled",
   );
   eq(
-    evaluate(files["bench.yml"].jobs["bench-firefox-windows"].if, ctx),
+    evaluate(
+      files["bench-firefox-windows.yml"].jobs["bench-firefox-windows"].if,
+      ctx,
+    ),
     false,
     "copy Windows benchmark disabled",
   );
@@ -342,7 +345,7 @@ eq(
 );
 eq(
   evaluate(
-    files["bench.yml"].jobs["bench-firefox-windows"]["runs-on"],
+    files["bench-firefox-windows.yml"].jobs["bench-firefox-windows"]["runs-on"],
     canonical,
   ),
   ["self-hosted", "Windows", "X64", "kunobi-windows"],

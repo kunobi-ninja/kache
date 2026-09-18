@@ -24,6 +24,11 @@ Firefox Linux/Windows, including the next-commit variants, run only on the
 nightly schedule. Manual `all` excludes Firefox. Substrate is no longer a
 benchmark subject.
 
+The two Firefox/Windows arms run in their own workflow on the same nightly
+cron. Each takes five to six hours, and a workflow run counts as finished only
+when its slowest job is, so keeping them beside the Linux matrix held every
+other arm's telemetry behind them.
+
 | Subject | Kache | sccache | mbx |
 | --- | --- | --- | --- |
 | hk, eza | yes | yes | yes |

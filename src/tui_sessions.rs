@@ -629,6 +629,13 @@ fn cause_of(
         groups.dedup();
         return Cause::OwnInputs(groups);
     }
+    // The first compile in a new worktree has no same-tree diff; another build
+    // tree of the same unit can still name the inputs that differ.
+    if let Some(checkout) = miss_chain::compare_checkout(events, index)
+        && checkout.verdict == miss_chain::CheckoutVerdict::OwnInputs
+    {
+        return Cause::OwnInputs(checkout.groups);
+    }
     if event.root.is_empty() {
         // "Here" has no identity; two unknown-root events with one crate
         // name may be unrelated workspaces.
@@ -1082,6 +1089,76 @@ mod tests {
             Cause::OwnInputs(vec!["sources".into()])
         );
         assert_eq!(analysis.causes[0].cause.describe(), "downstream of leaf");
+    }
+
+    /// The first build in a new worktree has no earlier compile in its own
+    /// tree. Its cascade is still named by comparing with the same units in
+    /// the checkout that built them before.
+    #[test]
+    fn a_first_build_in_another_checkout_names_the_crate_that_changed() {
+        let unit = |mut e: BuildEvent, unit: &str| {
+            e.unit_id = unit.to_string();
+            e
+        };
+        let build = |root: &str, session: &str, at: i64, sources: &str, leaf_out: &str| {
+            let mut app = unit(
+                with_externs(
+                    event("app", EventResult::Miss, at + 1, root, session),
+                    &[("leaf", leaf_out)],
+                ),
+                "uapp",
+            );
+            app.extern_units = [("leaf".to_string(), "uleaf".to_string())]
+                .into_iter()
+                .collect();
+            vec![
+                unit(
+                    with_fields(
+                        with_externs(event("leaf", EventResult::Miss, at, root, session), &[]),
+                        &[("sources", sources)],
+                    ),
+                    "uleaf",
+                ),
+                app,
+            ]
+        };
+        let mut events = build("/first", "before", 0, "1111", "aaaa");
+        events.extend(build("/second", "now", 100, "2222", "bbbb"));
+
+        let analysis = analyze_one(&events);
+        let cause_of_crate = |name: &str| {
+            analysis
+                .causes
+                .iter()
+                .find(|g| g.examples.iter().any(|e| e == name))
+                .map(|g| g.cause.clone())
+        };
+        assert_eq!(
+            cause_of_crate("app"),
+            Some(Cause::Downstream {
+                root: "leaf".into(),
+                complete: true
+            }),
+            "{:?}",
+            analysis.causes
+        );
+        assert_eq!(
+            cause_of_crate("leaf"),
+            Some(Cause::OwnInputs(vec!["sources".into()])),
+            "{:?}",
+            analysis.causes
+        );
+
+        // Same inputs in both trees: nothing to name, so no cause is invented.
+        let mut events = build("/first", "before", 0, "1111", "aaaa");
+        events.extend(build("/second", "now", 100, "1111", "bbbb"));
+        let analysis = analyze_one(&events);
+        let leaf = analysis
+            .causes
+            .iter()
+            .find(|g| g.examples.iter().any(|e| e == "leaf"))
+            .unwrap();
+        assert_eq!(leaf.cause, Cause::NoHistory);
     }
 
     /// A miss below two changed leaves names both, not the first one the

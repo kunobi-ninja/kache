@@ -69,7 +69,7 @@ kache report --last-build --root "$kache_trial/second"
 
 Compiler work avoided is an aggregate estimate, not elapsed build time saved. This example demonstrates reuse; a speed comparison needs repeated measurements of the same workload. Rust hits also do not prove that C or C++ compilations were cached.
 
-If the second build misses, run `kache why-miss <crate>` from that worktree, using a Rust crate name from the report. It compares the latest recorded key material for that crate. Check the reported input changes and the [cache limits](/docs/how-it-works/limits).
+If the second build misses, run `kache why-miss <crate>` from that worktree, using a Rust crate name from the report. It compares the latest recorded key material for that crate. When that worktree has no earlier build of the crate and both builds ran with `[cache] explain_miss` on, it compares with the first worktree's build instead. Check the reported input changes and the [cache limits](/docs/how-it-works/limits).
 
 ## Save a report
 

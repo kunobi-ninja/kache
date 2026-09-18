@@ -1,7 +1,7 @@
 //! Diagnosis facts shared by terminal and JSON output.
 
 use crate::events::BuildEvent;
-use crate::miss_chain::Chain;
+use crate::miss_chain::{Chain, CheckoutComparison};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,6 +20,9 @@ pub(super) struct MissDiagnosis {
     pub other_entries: usize,
     pub dependency_chain: Option<Chain>,
     pub dependency_recording_missing: bool,
+    /// Set when the miss was compared with another checkout of the project,
+    /// because its own build tree had no earlier build of the crate.
+    pub checkout: Option<CheckoutComparison>,
 }
 
 impl MissDiagnosis {
@@ -45,14 +48,19 @@ impl MissDiagnosis {
         } else {
             Cause::FirstBuildNowCached
         };
-        let dependency_recording_missing =
-            dependency_chain.is_none() && !explain_miss && miss.key_externs.is_empty();
+        // `key_externs_recorded` covers a crate with no dependencies, whose
+        // recorded digest map is empty and skipped on the wire.
+        let dependency_recording_missing = dependency_chain.is_none()
+            && !explain_miss
+            && miss.key_externs.is_empty()
+            && !miss.key_externs_recorded;
         Self {
             cause,
             same_key_present,
             other_entries,
             dependency_chain,
             dependency_recording_missing,
+            checkout: None,
         }
     }
 }
@@ -121,10 +129,17 @@ mod tests {
             !MissDiagnosis::new(&event, false, 0, false, None, false).dependency_recording_missing
         );
         event.key_externs.clear();
+        event.key_externs_recorded = true;
+        assert!(
+            !MissDiagnosis::new(&event, false, 0, false, None, false).dependency_recording_missing,
+            "a dependency-free crate recorded an empty digest map"
+        );
+        event.key_externs_recorded = false;
         let chain = Chain {
             roots: vec![],
             direct: vec![],
             truncated: Some("limit"),
+            baseline_root: None,
         };
         let diagnosis = MissDiagnosis::new(&event, false, 0, false, Some(chain.clone()), false);
         assert!(!diagnosis.dependency_recording_missing);

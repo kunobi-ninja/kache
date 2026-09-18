@@ -55,6 +55,24 @@
 //! over a confident wrong one wherever the history does not support a
 //! conclusion.
 //!
+//! # Another checkout as the baseline
+//!
+//! The first build in a second clone or worktree has no earlier build in its
+//! own tree, so a same-tree walk has nothing to diff. That is the cross-clone
+//! case, where one checkout filled the cache and the next still misses some
+//! crates. When the tree has no baseline for the crate being explained, the
+//! walk uses the most recent build of the same unit in another checkout, and
+//! takes every baseline from that one checkout. Unit ids make that pairing
+//! safe: cargo hashes a workspace member relative to its workspace root, so two
+//! checkouts of one project agree on them. Without a unit id nothing crosses
+//! checkouts.
+//!
+//! Key group digests hash path-normalized inputs, so a group that differs
+//! between checkouts is a real input difference, or a path normalization
+//! missed. A unit with the same key in both checkouts whose artifact still
+//! differs ends the walk as `PathOnly`: nothing it is keyed on differs, and its
+//! output is not reproducible across checkouts.
+//!
 //! Everything here is a pure function over already-read events: no store, no
 //! filesystem, no clock. `cli` renders the result.
 
@@ -127,13 +145,21 @@ pub enum RootKind {
     NoDiffableHistory,
     /// The branch was still descending when a limit was hit.
     LimitReached,
+    /// Only against another checkout: this unit computed the same cache key
+    /// there, so nothing it is keyed on differs beyond the checkout path, yet
+    /// its artifact moved. The compile's output is not reproducible across
+    /// checkouts.
+    PathOnly,
 }
 
 impl RootKind {
     /// Whether this endpoint actually explains anything. Renderers must not
     /// present an unresolved endpoint as the cause.
     pub fn is_resolved(&self) -> bool {
-        matches!(self, RootKind::Groups(_) | RootKind::NothingRecorded)
+        matches!(
+            self,
+            RootKind::Groups(_) | RootKind::NothingRecorded | RootKind::PathOnly
+        )
     }
 }
 
@@ -174,6 +200,11 @@ pub struct Chain {
     pub direct: Vec<ChangedDep>,
     /// Set when exploration stopped early rather than exhausting the graph.
     pub truncated: Option<&'static str>,
+    /// The other checkout every baseline came from, when the build tree being
+    /// explained had no earlier build of the crate. `None` means the usual
+    /// same-tree comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_root: Option<String>,
 }
 
 impl Chain {
@@ -181,6 +212,141 @@ impl Chain {
     pub fn has_resolved_root(&self) -> bool {
         self.roots.iter().any(|r| r.kind.is_resolved())
     }
+}
+
+/// What a compile differs in from the same unit built in another checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckoutVerdict {
+    /// Same cache key in both checkouts: only the checkout path differs.
+    PathOnly,
+    /// At least one of the unit's own key input groups differs.
+    OwnInputs,
+    /// Its own inputs match; only dependency artifacts moved.
+    Dependencies,
+    /// No traced group or dependency differs, but the keys do: the difference
+    /// sits in a post-hoc fold (key salt, extra inputs).
+    Untraced,
+}
+
+/// A compile compared with the same unit built in another checkout of the
+/// project, for a build tree that has no earlier build of its own to diff.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CheckoutComparison {
+    /// Build tree of the compile being explained.
+    pub root: String,
+    /// The other checkout whose build is the baseline.
+    pub baseline_root: String,
+    /// Own key input groups that differ, `externs` excluded. Each group is
+    /// hashed over path-normalized inputs, so a checkout path alone does not
+    /// move one; the exception is `remap` with path remapping turned off, which
+    /// keys the raw checkout path on purpose.
+    pub groups: Vec<String>,
+    /// Dependencies whose artifact digests differ.
+    pub dependencies: Vec<ChangedDep>,
+    /// Whether both checkouts computed the same final cache key.
+    pub same_key: bool,
+    pub verdict: CheckoutVerdict,
+}
+
+/// Compare the compile at `miss_index` with the same unit in another
+/// checkout.
+///
+/// `None` when the compile's own build tree has an earlier build to diff
+/// against (the same-tree comparison stays authoritative), or when no other
+/// checkout built this unit.
+pub fn compare_checkout(events: &[BuildEvent], miss_index: usize) -> Option<CheckoutComparison> {
+    let compiled = events.get(miss_index)?;
+    let (baseline, cross_checkout) = top_baseline(events, miss_index)?;
+    if !cross_checkout {
+        return None;
+    }
+    let baseline = &events[baseline];
+    let groups = own_groups(&baseline.key_fields, &compiled.key_fields);
+    let dependencies = diff_externs(
+        &baseline.key_externs,
+        &compiled.key_externs,
+        &compiled.extern_units,
+    );
+    let same_key = same_key(baseline, compiled);
+    let verdict = if !groups.is_empty() {
+        CheckoutVerdict::OwnInputs
+    } else if !dependencies.is_empty() {
+        CheckoutVerdict::Dependencies
+    } else if same_key {
+        CheckoutVerdict::PathOnly
+    } else {
+        CheckoutVerdict::Untraced
+    };
+    Some(CheckoutComparison {
+        root: compiled.root.clone(),
+        baseline_root: baseline.root.clone(),
+        groups,
+        dependencies,
+        same_key,
+        verdict,
+    })
+}
+
+/// Baseline of the compile a walk starts from, and whether it is in another
+/// checkout.
+///
+/// The compile's own tree whenever it has an earlier build of the crate there,
+/// exactly as before. Otherwise the most recent build of the same unit in
+/// another checkout. Unit ids qualify for that because cargo hashes a
+/// workspace member's package id relative to the workspace root, so two
+/// checkouts of one project produce the same id while an unrelated workspace
+/// with a crate of the same name does not. Without a unit id there is only the
+/// name, which is the wrong pairing `same_root` exists to refuse.
+///
+/// That checkout supplies every baseline of the walk: diffing one crate
+/// against one checkout and its dependency against another would mix two
+/// unrelated comparisons. See [`dependency_baseline`] for which of its builds.
+fn top_baseline(events: &[BuildEvent], index: usize) -> Option<(usize, bool)> {
+    let compiled = events.get(index)?;
+    if compiled.root.is_empty() {
+        return None;
+    }
+    if let Some(same_tree) = last_baseline_index(events, compiled, &compiled.root, index) {
+        return Some((same_tree, false));
+    }
+    let unit = unit_of(compiled)?;
+    events[..index]
+        .iter()
+        .rposition(|e| {
+            !e.root.is_empty() && e.root != compiled.root && unit_of(e) == Some(unit) && is_keyed(e)
+        })
+        .map(|other| (other, true))
+}
+
+/// Baseline of the dependency compiled at `dep_index`, reached from a consumer
+/// whose own baseline is `consumer_baseline`.
+///
+/// In one tree, the dependency's previous state before its compile: builds
+/// there run one after another. Across checkouts, this tree's positions say
+/// nothing about the other checkout's timeline. Two worktrees building at once
+/// interleave, and a tree that built part of the project early compiled some
+/// dependencies long before the other checkout's latest build. So the baseline
+/// is the other checkout's build of the dependency before the consumer's
+/// baseline: the one that consumer was keyed on.
+fn dependency_baseline(
+    events: &[BuildEvent],
+    dep_index: usize,
+    baseline_root: &str,
+    cross_checkout: bool,
+    consumer_baseline: usize,
+) -> Option<usize> {
+    let bound = if cross_checkout {
+        consumer_baseline
+    } else {
+        dep_index
+    };
+    last_baseline_index(events, &events[dep_index], baseline_root, bound)
+}
+
+/// Both compiles computed the same, non-empty final key.
+fn same_key(baseline: &BuildEvent, compiled: &BuildEvent) -> bool {
+    !compiled.cache_key.is_empty() && compiled.cache_key == baseline.cache_key
 }
 
 /// Walk the cascade below the compile at `miss_index`.
@@ -195,7 +361,9 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
     if !miss.key_externs_recorded || miss.root.is_empty() {
         return None;
     }
-    let direct = changed_deps_at(events, miss_index)?;
+    let (top, cross_checkout) = top_baseline(events, miss_index)?;
+    let baseline_root = events[top].root.as_str();
+    let direct = changed_deps_at(events, miss_index, Some(top))?;
     if direct.is_empty() {
         return None;
     }
@@ -206,7 +374,9 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
     // than silently folding into one (#627); revisiting a node on another
     // branch adds no information beyond the convergence count, tracked
     // separately.
-    let mut queue: Vec<(usize, Vec<Hop>)> = vec![(miss_index, Vec::new())];
+    // Each node carries its baseline, which a dependency's own lookup is
+    // bounded by across checkouts.
+    let mut queue: Vec<(usize, usize, Vec<Hop>)> = vec![(miss_index, top, Vec::new())];
     let mut seen: HashSet<String> = HashSet::from([node_key(&miss.crate_name, unit_of(miss))]);
     // Branches that reached each node, counted independently of `roots`: a node
     // can be reached again while it is still queued, long before it becomes an
@@ -216,8 +386,8 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
     let mut nodes = 0usize;
     let mut truncated = None;
 
-    while let Some((index, path)) = queue.pop() {
-        let changed = match changed_deps_at(events, index) {
+    while let Some((index, baseline, path)) = queue.pop() {
+        let changed = match changed_deps_at(events, index, Some(baseline)) {
             Some(changed) => changed,
             // Guarded by the caller for the first node; deeper nodes are
             // checked before being enqueued.
@@ -293,10 +463,16 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
                 continue;
             }
 
-            match changed_deps_at(events, dep_index) {
+            let diffed =
+                dependency_baseline(events, dep_index, baseline_root, cross_checkout, baseline)
+                    .and_then(|dep_baseline| {
+                        changed_deps_at(events, dep_index, Some(dep_baseline))
+                            .map(|next| (dep_baseline, next))
+                    });
+            match diffed {
                 // Its own dependencies moved: keep descending, unless this
                 // branch has run out of depth.
-                Some(next) if !next.is_empty() => {
+                Some((dep_baseline, next)) if !next.is_empty() => {
                     if next_path.len() >= MAX_DEPTH {
                         truncated = Some("chain longer than the walk limit");
                         roots.push(unresolved(
@@ -307,11 +483,17 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
                         ));
                         continue;
                     }
-                    queue.push((dep_index, next_path));
+                    queue.push((dep_index, dep_baseline, next_path));
                 }
                 // Compared cleanly and stable: this is a genuine endpoint.
                 // `classify_at` derives the same identity from the same event.
-                Some(_) => roots.push(classify_at(events, dep_index, next_path)),
+                Some((dep_baseline, _)) => roots.push(classify_at(
+                    events,
+                    dep_index,
+                    Some(dep_baseline),
+                    cross_checkout,
+                    next_path,
+                )),
                 // Not comparable. NOT the same as stable — saying so would
                 // invent a root out of missing data.
                 None => {
@@ -345,6 +527,7 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
         roots,
         direct,
         truncated,
+        baseline_root: cross_checkout.then(|| baseline_root.to_string()),
     })
 }
 
@@ -372,19 +555,24 @@ fn unresolved(crate_name: String, unit: Option<String>, kind: RootKind, path: Ve
     }
 }
 
-/// Dependencies whose digests differ between the compile at `index` and the
-/// previous recorded state of the same crate in the same build tree.
+/// Dependencies whose digests differ between the compile at `index` and its
+/// `baseline` event: the previous recorded state of the same crate, in the
+/// compile's own tree or in the other checkout the walk compares against.
 ///
 /// `None` means the history is not diffable (no baseline, or either side
 /// recorded no digests). That is deliberately distinct from `Some(vec![])`,
 /// which means the comparison succeeded and the dependencies are identical —
 /// only the latter supports concluding that a crate ends the cascade.
-fn changed_deps_at(events: &[BuildEvent], index: usize) -> Option<Vec<ChangedDep>> {
+fn changed_deps_at(
+    events: &[BuildEvent],
+    index: usize,
+    baseline: Option<usize>,
+) -> Option<Vec<ChangedDep>> {
     let compiled = events.get(index)?;
     if !compiled.key_externs_recorded {
         return None;
     }
-    let baseline = last_baseline_index(events, compiled, &compiled.root, index)?;
+    let baseline = baseline?;
     Some(diff_externs(
         &events[baseline].key_externs,
         &compiled.key_externs,
@@ -431,10 +619,16 @@ fn diff_externs(
 }
 
 /// Explain a crate's own divergence, dependencies aside.
-fn classify_at(events: &[BuildEvent], index: usize, path: Vec<Hop>) -> Root {
+fn classify_at(
+    events: &[BuildEvent],
+    index: usize,
+    baseline: Option<usize>,
+    cross_checkout: bool,
+    path: Vec<Hop>,
+) -> Root {
     let compiled = &events[index];
     let passthroughs = passthroughs_for(events, &compiled.crate_name, index);
-    let Some(baseline) = last_baseline_index(events, compiled, &compiled.root, index) else {
+    let Some(baseline) = baseline else {
         return Root {
             crate_name: compiled.crate_name.clone(),
             unit: unit_of(compiled).map(str::to_string),
@@ -449,20 +643,23 @@ fn classify_at(events: &[BuildEvent], index: usize, path: Vec<Hop>) -> Root {
     // wrapper's own `key_diff` is computed against that crate's last hit, which
     // can be an older event than this baseline, so preferring it here would mix
     // two different comparisons.
-    let mut groups = changed_groups(&events[baseline].key_fields, &compiled.key_fields);
-    if groups.is_empty() && !compiled.key_diff.is_empty() {
+    let mut groups = own_groups(&events[baseline].key_fields, &compiled.key_fields);
+    if groups.is_empty() && !cross_checkout && !compiled.key_diff.is_empty() {
         // No group digests recorded to diff (pre-#131 events): fall back to
-        // whatever the wrapper concluded at the time.
+        // whatever the wrapper concluded at the time. Never across checkouts:
+        // the wrapper diffed against this tree, not the other one.
         groups = compiled.key_diff.clone();
+        groups.retain(|g| g != "externs");
+        groups.sort();
+        groups.dedup();
     }
-    groups.retain(|g| g != "externs");
-    groups.sort();
-    groups.dedup();
 
-    let kind = if groups.is_empty() {
-        RootKind::NothingRecorded
-    } else {
+    let kind = if !groups.is_empty() {
         RootKind::Groups(groups)
+    } else if cross_checkout && same_key(&events[baseline], compiled) {
+        RootKind::PathOnly
+    } else {
+        RootKind::NothingRecorded
     };
     Root {
         crate_name: compiled.crate_name.clone(),
@@ -474,16 +671,18 @@ fn classify_at(events: &[BuildEvent], index: usize, path: Vec<Hop>) -> Root {
     }
 }
 
-fn changed_groups(
-    before: &BTreeMap<String, String>,
-    after: &BTreeMap<String, String>,
-) -> Vec<String> {
+/// Key input groups that differ, `externs` excluded: dependency movement is
+/// the walk's business, not the crate's own.
+fn own_groups(before: &BTreeMap<String, String>, after: &BTreeMap<String, String>) -> Vec<String> {
     let mut out: Vec<String> = after
         .iter()
         .filter(|(group, digest)| before.get(*group) != Some(digest))
         .map(|(group, _)| group.clone())
         .collect();
     out.extend(before.keys().filter(|g| !after.contains_key(*g)).cloned());
+    out.retain(|g| g != "externs");
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -625,18 +824,7 @@ fn last_baseline_index(
     root: &str,
     before: usize,
 ) -> Option<usize> {
-    let keyed = |e: &BuildEvent| {
-        same_root(e, root)
-            && e.key_externs_recorded
-            && matches!(
-                e.result,
-                EventResult::LocalHit
-                    | EventResult::PrefetchHit
-                    | EventResult::RemoteHit
-                    | EventResult::Miss
-                    | EventResult::Dup
-            )
-    };
+    let keyed = |e: &BuildEvent| same_root(e, root) && is_keyed(e);
     let window = &events[..before.min(events.len())];
 
     if let Some(unit) = unit_of(compiled) {
@@ -655,6 +843,19 @@ fn last_baseline_index(
     window
         .iter()
         .rposition(|e| e.crate_name == compiled.crate_name && keyed(e))
+}
+
+/// A keyed outcome that recorded dependency digests.
+fn is_keyed(e: &BuildEvent) -> bool {
+    e.key_externs_recorded
+        && matches!(
+            e.result,
+            EventResult::LocalHit
+                | EventResult::PrefetchHit
+                | EventResult::RemoteHit
+                | EventResult::Miss
+                | EventResult::Dup
+        )
 }
 
 /// Exact build-tree match.
@@ -710,6 +911,12 @@ mod tests {
 
     fn analyze_last(events: &[BuildEvent]) -> Option<Chain> {
         analyze(events, events.len() - 1)
+    }
+
+    /// Same-tree dependency diff of the compile at `index`.
+    fn deps_at(events: &[BuildEvent], index: usize) -> Option<Vec<ChangedDep>> {
+        let baseline = last_baseline_index(events, &events[index], "/w", index);
+        changed_deps_at(events, index, baseline)
     }
 
     /// This event's own compilation unit (cargo's `-C extra-filename`).
@@ -894,14 +1101,14 @@ mod tests {
         ];
 
         // Same unit, same digests: comparison succeeded and nothing moved.
-        assert_eq!(changed_deps_at(&events, 2), Some(vec![]));
+        assert_eq!(deps_at(&events, 2), Some(vec![]));
 
         let mut cross = events.clone();
         cross[1].key_externs = [("winapi".to_string(), "bbbb".to_string())]
             .into_iter()
             .collect();
         assert_eq!(
-            changed_deps_at(&cross, 2),
+            deps_at(&cross, 2),
             Some(vec![]),
             "the target unit's different dependency set must not leak into the host unit's diff"
         );
@@ -1121,7 +1328,7 @@ mod tests {
         ];
 
         assert_eq!(
-            changed_deps_at(&events, 2),
+            deps_at(&events, 2),
             Some(vec![ChangedDep {
                 name: "libc".to_string(),
                 from: Some("aaaa".to_string()),
@@ -1146,7 +1353,7 @@ mod tests {
         ];
 
         assert_eq!(
-            changed_deps_at(&events, 1),
+            deps_at(&events, 1),
             Some(vec![ChangedDep {
                 name: "libc".to_string(),
                 from: Some("aaaa".to_string()),
@@ -1542,7 +1749,9 @@ mod tests {
                 &[("sources", "2222")],
             ),
         ];
-        let root = classify_at(&events, events.len() - 1, Vec::new());
+        let last = events.len() - 1;
+        let baseline = last_baseline_index(&events, &events[last], "/w", last);
+        let root = classify_at(&events, last, baseline, false, Vec::new());
         assert_eq!(root.passthroughs.len(), 1);
         assert_eq!(root.passthroughs[0].count, 2);
         assert!(root.passthroughs[0].reason.contains("--include="));
@@ -1560,5 +1769,429 @@ mod tests {
             pt,
         ];
         assert!(passthroughs_for(&events, "aws_lc_sys", 1).is_empty());
+    }
+
+    /// One build of `app -> mid -> leaf` in checkout `root`, oldest first, as
+    /// `explain_miss` records it. Keys follow the inputs: `leaf` is keyed on
+    /// `leaf_env`, each dependent on the artifact digest of the crate below
+    /// it, and `leaf_out` is the artifact `leaf` produced. Unit ids are the
+    /// same in every checkout, as cargo computes them relative to the
+    /// workspace.
+    fn project_build(
+        root: &str,
+        at: i64,
+        leaf_env: &str,
+        leaf_out: &str,
+        results: [EventResult; 3],
+    ) -> Vec<BuildEvent> {
+        let [leaf_result, mid_result, app_result] = results;
+        let mid_out = format!("m-{leaf_out}");
+        let mut leaf = with_unit(
+            with_fields(
+                event("leaf", leaf_result, at, &[("libc", "cccc")]),
+                &[("env_deps", leaf_env), ("sources", "1111")],
+            ),
+            "uleaf",
+        );
+        leaf.cache_key = format!("leaf-{leaf_env}");
+        let mut mid = with_extern_units(
+            with_unit(
+                with_fields(
+                    event("mid", mid_result, at + 1, &[("leaf", leaf_out)]),
+                    &[("env_deps", "e"), ("sources", "2222")],
+                ),
+                "umid",
+            ),
+            &[("leaf", "uleaf")],
+        );
+        mid.cache_key = format!("mid-{leaf_out}");
+        let mut app = with_extern_units(
+            with_unit(
+                with_fields(
+                    event("app", app_result, at + 2, &[("mid", &mid_out)]),
+                    &[("env_deps", "e"), ("sources", "3333")],
+                ),
+                "uapp",
+            ),
+            &[("mid", "umid")],
+        );
+        app.cache_key = format!("app-{mid_out}");
+        let mut build = vec![leaf, mid, app];
+        for e in &mut build {
+            e.root = root.to_string();
+        }
+        build
+    }
+
+    fn builds(builds: Vec<Vec<BuildEvent>>) -> Vec<BuildEvent> {
+        builds.into_iter().flatten().collect()
+    }
+
+    const MISSES: [EventResult; 3] = [EventResult::Miss, EventResult::Miss, EventResult::Miss];
+
+    fn position_of(events: &[BuildEvent], root: &str, crate_name: &str) -> usize {
+        events
+            .iter()
+            .rposition(|e| e.root == root && e.crate_name == crate_name)
+            .unwrap()
+    }
+
+    /// The cross-clone warm case with nothing actually different: a second
+    /// checkout of the project computes the same keys, and `app` still missed
+    /// (its entry was gone). Without a baseline in its own tree the miss used to
+    /// have no comparison at all; against the first checkout it reads as what
+    /// it is, a difference of checkout path only.
+    #[test]
+    fn a_second_checkout_with_the_same_keys_differs_only_in_its_path() {
+        let events = builds(vec![
+            project_build("/a", 0, "e1", "L1", MISSES),
+            project_build(
+                "/b",
+                10,
+                "e1",
+                "L1",
+                [
+                    EventResult::LocalHit,
+                    EventResult::LocalHit,
+                    EventResult::Miss,
+                ],
+            ),
+        ]);
+        let app = position_of(&events, "/b", "app");
+
+        assert_eq!(
+            compare_checkout(&events, app),
+            Some(CheckoutComparison {
+                root: "/b".to_string(),
+                baseline_root: "/a".to_string(),
+                groups: vec![],
+                dependencies: vec![],
+                same_key: true,
+                verdict: CheckoutVerdict::PathOnly,
+            })
+        );
+        assert!(
+            analyze(&events, app).is_none(),
+            "no dependency moved, so there is no cascade to walk"
+        );
+    }
+
+    /// The common cross-checkout cascade: `leaf` computes the same key in both
+    /// checkouts but produces a different artifact, which re-keys everything
+    /// above it. `leaf` is the root, and it is reported as reproducibility
+    /// rather than as an input change nobody can find.
+    #[test]
+    fn a_leaf_whose_output_varies_by_checkout_is_a_path_only_root() {
+        let mut events = builds(vec![
+            project_build("/a", 0, "e1", "L1", MISSES),
+            project_build("/b", 10, "e1", "L2", MISSES),
+        ]);
+        // The wrapper's own same-tree diff never applies across checkouts; it
+        // must not be taken for this comparison's result.
+        let leaf = position_of(&events, "/b", "leaf");
+        events[leaf].key_diff = vec!["sources".to_string()];
+        let app = position_of(&events, "/b", "app");
+
+        let chain = analyze(&events, app).expect("cascade should be reported");
+        assert_eq!(chain.baseline_root.as_deref(), Some("/a"));
+        assert_eq!(chain.roots.len(), 1, "{:?}", chain.roots);
+        let root = &chain.roots[0];
+        assert_eq!(root.crate_name, "leaf");
+        assert_eq!(root.kind, RootKind::PathOnly);
+        assert!(chain.has_resolved_root());
+
+        let compared = compare_checkout(&events, app).unwrap();
+        assert_eq!(compared.verdict, CheckoutVerdict::Dependencies);
+        assert!(compared.groups.is_empty());
+        assert!(!compared.same_key);
+        assert_eq!(compared.dependencies[0].name, "mid");
+
+        let compared = compare_checkout(&events, leaf).unwrap();
+        assert_eq!(compared.verdict, CheckoutVerdict::PathOnly);
+        assert!(compared.same_key);
+    }
+
+    /// A real input difference in the second checkout: `leaf` sees another
+    /// value for an environment dependency. The walk names `leaf` and the group
+    /// that moved, and both crates above it are attributed to it through the
+    /// path rather than reported as changed themselves.
+    #[test]
+    fn an_input_change_in_another_checkout_names_the_leaf_and_attributes_dependents() {
+        let events = builds(vec![
+            project_build("/a", 0, "e1", "L1", MISSES),
+            project_build("/b", 10, "e2", "L2", MISSES),
+        ]);
+        let app = position_of(&events, "/b", "app");
+        let mid = position_of(&events, "/b", "mid");
+        let leaf = position_of(&events, "/b", "leaf");
+
+        let chain = analyze(&events, app).expect("cascade should be reported");
+        assert_eq!(chain.baseline_root.as_deref(), Some("/a"));
+        assert_eq!(chain.roots.len(), 1, "{:?}", chain.roots);
+        let root = &chain.roots[0];
+        assert_eq!(root.crate_name, "leaf");
+        assert_eq!(root.kind, RootKind::Groups(vec!["env_deps".to_string()]));
+        assert_eq!(
+            root.path
+                .iter()
+                .map(|h| (h.crate_name.as_str(), h.via.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("app", "mid"), ("mid", "leaf")]
+        );
+
+        let chain = analyze(&events, mid).unwrap();
+        assert_eq!(chain.roots[0].crate_name, "leaf");
+
+        let compared = compare_checkout(&events, leaf).unwrap();
+        assert_eq!(compared.verdict, CheckoutVerdict::OwnInputs);
+        assert_eq!(compared.groups, vec!["env_deps".to_string()]);
+        assert!(compared.dependencies.is_empty());
+        assert_eq!(
+            compare_checkout(&events, mid).unwrap().verdict,
+            CheckoutVerdict::Dependencies
+        );
+    }
+
+    /// Keys differ, yet no traced group and no dependency does: the difference
+    /// is in a post-hoc fold, not in the checkout path.
+    #[test]
+    fn a_key_difference_outside_every_group_is_untraced() {
+        let mut events = builds(vec![
+            project_build("/a", 0, "e1", "L1", MISSES),
+            project_build("/b", 10, "e1", "L1", MISSES),
+        ]);
+        let leaf = position_of(&events, "/b", "leaf");
+        events[leaf].cache_key = "salted".to_string();
+        assert_eq!(
+            compare_checkout(&events, leaf).unwrap().verdict,
+            CheckoutVerdict::Untraced
+        );
+        // An empty key is no evidence of a same key.
+        events[leaf].cache_key.clear();
+        let baseline = position_of(&events, "/a", "leaf");
+        events[baseline].cache_key.clear();
+        assert_eq!(
+            compare_checkout(&events, leaf).unwrap().verdict,
+            CheckoutVerdict::Untraced
+        );
+    }
+
+    /// Another checkout is a fallback. When this tree built the crate before,
+    /// that build stays the baseline, even though the other checkout would
+    /// report something else.
+    #[test]
+    fn an_earlier_build_in_the_same_checkout_is_preferred() {
+        let events = builds(vec![
+            project_build("/a", 0, "e1", "L1", MISSES),
+            project_build("/b", 10, "e2", "L2", MISSES),
+            project_build("/b", 20, "e1", "L1", MISSES),
+        ]);
+        let app = events.len() - 1;
+
+        assert!(compare_checkout(&events, app).is_none());
+        let chain = analyze(&events, app).expect("same-tree cascade");
+        assert_eq!(chain.baseline_root, None);
+        assert_eq!(chain.roots[0].crate_name, "leaf");
+        assert_eq!(
+            chain.roots[0].kind,
+            RootKind::Groups(vec!["env_deps".to_string()]),
+            "diffed against the earlier /b build, not the identical /a one"
+        );
+    }
+
+    /// Two worktrees building at once. `/b`'s leaf compiles before `/a`'s new
+    /// one, but `/b`'s app is compared with `/a`'s app, which was keyed on the
+    /// NEW leaf. Every dependency has to be compared with the build the other
+    /// checkout's consumer actually used; bounding it by this tree's compile
+    /// instead picks `/a`'s older leaf, whose key matches, and invents a
+    /// reproducibility problem.
+    #[test]
+    fn concurrent_checkouts_compare_each_dependency_with_what_the_baseline_used() {
+        let old_a = project_build("/a", 0, "e1", "L1", MISSES);
+        let new_a = project_build("/a", 20, "e3", "L3", MISSES);
+        let b = project_build("/b", 20, "e1", "Lb", MISSES);
+        let interleaved = |old: Vec<BuildEvent>| -> Vec<BuildEvent> {
+            let mut events = old;
+            events.extend([
+                b[0].clone(),
+                new_a[0].clone(),
+                new_a[1].clone(),
+                b[1].clone(),
+                new_a[2].clone(),
+                b[2].clone(),
+            ]);
+            events
+        };
+
+        let events = interleaved(old_a);
+        let chain = analyze(&events, events.len() - 1).expect("cascade should be reported");
+        assert_eq!(chain.baseline_root.as_deref(), Some("/a"));
+        assert_eq!(chain.roots.len(), 1, "{:?}", chain.roots);
+        assert_eq!(chain.roots[0].crate_name, "leaf");
+        assert_eq!(
+            chain.roots[0].kind,
+            RootKind::Groups(vec!["env_deps".to_string()]),
+            "the leaf /a's app was built on differs in env_deps"
+        );
+
+        // Without the older /a build the stale lookup finds nothing at all and
+        // loses the cause instead of misreporting it.
+        let events = interleaved(Vec::new());
+        let chain = analyze(&events, events.len() - 1).unwrap();
+        assert_eq!(
+            chain.roots[0].kind,
+            RootKind::Groups(vec!["env_deps".to_string()])
+        );
+    }
+
+    /// The new tree built part of the project early (`cargo build -p leaf`),
+    /// then the first checkout rebuilt with another input, then the new tree
+    /// built the rest with `leaf` served as a hit. `leaf`'s compile is the old
+    /// one, but the baseline is what the first checkout's latest build used.
+    #[test]
+    fn a_partial_early_build_is_compared_with_the_latest_baseline_build() {
+        let mut events = project_build("/a", 0, "e1", "L1", MISSES);
+        events.push(project_build("/b", 10, "e1", "L1b", MISSES)[0].clone());
+        events.extend(project_build("/a", 20, "e2", "L2", MISSES));
+        events.extend(project_build(
+            "/b",
+            30,
+            "e1",
+            "L1b",
+            [EventResult::LocalHit, EventResult::Miss, EventResult::Miss],
+        ));
+
+        let chain = analyze(&events, events.len() - 1).expect("cascade should be reported");
+        assert_eq!(chain.baseline_root.as_deref(), Some("/a"));
+        assert_eq!(chain.roots.len(), 1, "{:?}", chain.roots);
+        assert_eq!(chain.roots[0].crate_name, "leaf");
+        assert_eq!(
+            chain.roots[0].kind,
+            RootKind::Groups(vec!["env_deps".to_string()])
+        );
+    }
+
+    /// The wrapper's own `key_diff` stands in for group digests an older event
+    /// did not record. It names groups relative to the same tree, so it is
+    /// cleaned like a digest diff: no `externs`, sorted, once each.
+    #[test]
+    fn a_same_tree_root_without_group_digests_uses_the_recorded_key_diff() {
+        let mut leaf_miss = event("leaf", EventResult::Miss, 10, &[("libc", "cccc")]);
+        leaf_miss.key_diff = ["sources", "externs", "args", "sources"]
+            .map(str::to_string)
+            .to_vec();
+        let events = vec![
+            event("leaf", EventResult::LocalHit, 0, &[("libc", "cccc")]),
+            event("app", EventResult::LocalHit, 1, &[("leaf", "aaaa")]),
+            leaf_miss,
+            event("app", EventResult::Miss, 11, &[("leaf", "bbbb")]),
+        ];
+
+        let chain = analyze_last(&events).expect("cascade should be reported");
+        assert_eq!(
+            chain.roots[0].kind,
+            RootKind::Groups(vec!["args".to_string(), "sources".to_string()])
+        );
+    }
+
+    /// With several other checkouts, the latest build is the baseline.
+    #[test]
+    fn the_most_recent_other_checkout_is_the_baseline() {
+        let events = builds(vec![
+            project_build("/a", 0, "e1", "L1", MISSES),
+            project_build("/c", 10, "e2", "L2", MISSES),
+            project_build("/b", 20, "e2", "L2", MISSES),
+        ]);
+        let compared = compare_checkout(&events, events.len() - 1).unwrap();
+        assert_eq!(compared.baseline_root, "/c");
+        assert_eq!(compared.verdict, CheckoutVerdict::PathOnly);
+    }
+
+    /// Crossing checkouts is only safe on unit identity: a crate name alone
+    /// matches unrelated workspaces. Events without unit ids, a different unit,
+    /// a rootless event, and an event with no recorded key material are never
+    /// taken as another checkout's build.
+    #[test]
+    fn another_checkout_is_matched_by_recorded_unit_only() {
+        let base = builds(vec![
+            project_build("/a", 0, "e1", "L1", MISSES),
+            project_build("/b", 10, "e2", "L2", MISSES),
+        ]);
+        let app = base.len() - 1;
+
+        let by_name: Vec<BuildEvent> = base
+            .iter()
+            .cloned()
+            .map(|mut e| {
+                e.unit_id.clear();
+                e.extern_units.clear();
+                e
+            })
+            .collect();
+        assert!(compare_checkout(&by_name, app).is_none());
+        assert!(analyze(&by_name, app).is_none());
+
+        let mut other_unit = base.clone();
+        let a_app = position_of(&other_unit, "/a", "app");
+        other_unit[a_app].unit_id = "uapp_v2".to_string();
+        assert!(compare_checkout(&other_unit, app).is_none());
+        assert!(analyze(&other_unit, app).is_none());
+
+        // Newer candidates that must not shadow the valid /a build.
+        let mut shadowed = base.clone();
+        let mut rootless = shadowed[a_app].clone();
+        rootless.root.clear();
+        rootless.cache_key = "rootless".to_string();
+        let mut unrecorded = shadowed[a_app].clone();
+        unrecorded.root = "/c".to_string();
+        unrecorded.key_externs_recorded = false;
+        let insert_at = position_of(&shadowed, "/b", "leaf");
+        shadowed.insert(insert_at, rootless);
+        shadowed.insert(insert_at, unrecorded);
+        let app = shadowed.len() - 1;
+        assert_eq!(
+            compare_checkout(&shadowed, app).unwrap().baseline_root,
+            "/a"
+        );
+        assert_eq!(
+            analyze(&shadowed, app).unwrap().baseline_root.as_deref(),
+            Some("/a")
+        );
+    }
+
+    /// `PathOnly` is a claim about two checkouts agreeing on a key. In one tree
+    /// the same evidence keeps its old reading, and across checkouts a key
+    /// that differs with no group to show for it is not path-only either.
+    #[test]
+    fn path_only_needs_another_checkout_and_the_same_key() {
+        let same_tree = builds(vec![
+            project_build("/b", 0, "e1", "L1", MISSES),
+            project_build("/b", 10, "e1", "L2", MISSES),
+        ]);
+        let chain = analyze(&same_tree, same_tree.len() - 1).unwrap();
+        assert_eq!(chain.roots[0].crate_name, "leaf");
+        assert_eq!(chain.roots[0].kind, RootKind::NothingRecorded);
+
+        let mut other_key = builds(vec![
+            project_build("/a", 0, "e1", "L1", MISSES),
+            project_build("/b", 10, "e1", "L2", MISSES),
+        ]);
+        let leaf = position_of(&other_key, "/b", "leaf");
+        other_key[leaf].cache_key = "salted".to_string();
+        let chain = analyze(&other_key, other_key.len() - 1).unwrap();
+        assert_eq!(chain.roots[0].crate_name, "leaf");
+        assert_eq!(chain.roots[0].kind, RootKind::NothingRecorded);
+    }
+
+    /// A compile with no build tree of its own has no checkout to compare.
+    #[test]
+    fn a_rootless_compile_has_no_checkout_comparison() {
+        let mut events = builds(vec![
+            project_build("/a", 0, "e1", "L1", MISSES),
+            project_build("/b", 10, "e2", "L2", MISSES),
+        ]);
+        let app = events.len() - 1;
+        events[app].root.clear();
+        assert!(compare_checkout(&events, app).is_none());
     }
 }

@@ -36,7 +36,7 @@ Without `--since`, the monitor opens with the last hour of builds. The monitor a
 
 A build is every event sharing one session id. The wrapper records one per workspace, and it covers the crates, build scripts, and C/C++ compiles of that workspace until it sits idle for five minutes, so Cargo commands run back to back count as one build. Events from older wrappers have no id and are grouped by build root with the same five-minute rule. Those builds carry a `~` after their name.
 
-Cascade causes need per-dependency digests on the events, which `[cache] explain_miss = true` records. Without it the Why tab says so. Every figure on the tab describes the loaded history: with `--since`, a crate whose last compile is before the cutoff reads as having no earlier compile.
+Cascade causes need per-dependency digests on the events, which `[cache] explain_miss = true` records. Without it the Why tab says so. When a crate has no earlier compile in its own tree, the Why tab compares it with its latest build in another build tree, such as another worktree of the project. A cascade is then named by the crate that changed, and that crate shows the input groups that differ. A crate whose inputs match the other tree still reads as having no earlier compile. Every figure on the tab describes the loaded history: with `--since`, a crate whose last compile is before the cutoff reads as having no earlier compile.
 
 `dup` means the compiler ran after a key miss but produced blobs already in the store. It is not a cache hit. A passthrough is not a miss either: kache never consulted the cache for it.
 

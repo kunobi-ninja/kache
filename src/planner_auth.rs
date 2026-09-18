@@ -600,9 +600,22 @@ mod tests {
     #[tokio::test]
     async fn a_planner_without_login_yields_no_session() {
         crate::planner_client::ensure_crypto_provider();
-        // Nothing listens here: discovery fails, which means "no login".
-        let token = kunobi_session_token("http://127.0.0.1:9").await.unwrap();
-        assert_eq!(token, None);
+        // Nothing listens here: discovery fails, which means "no login". The
+        // pin store is a temporary one, so this holds in sandboxes (Nix) where
+        // HOME is not writable.
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            trusted_login("http://127.0.0.1:9", &pins(&directory))
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_locks_live_under_the_kunobi_config_directory() {
+        let dir = default_lock_dir().unwrap();
+        assert!(dir.ends_with("kunobi/locks"), "{}", dir.display());
+        assert!(dir.is_absolute(), "{}", dir.display());
     }
 
     /// In-memory stand-in for kunobi-auth's file store, keyed like it is.
@@ -675,29 +688,43 @@ mod tests {
         .await
     }
 
-    #[tokio::test]
-    async fn the_session_lock_excludes_a_second_holder_until_released() {
+    /// Runs `test` on a runtime that does not wait for blocking threads at
+    /// shutdown, so a lock that polls forever fails the test instead of
+    /// hanging it.
+    fn on_short_lived_runtime<T>(test: impl std::future::Future<Output = T>) -> T {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let outcome = runtime.block_on(test);
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        outcome
+    }
+
+    #[test]
+    fn the_session_lock_excludes_a_second_holder_until_released() {
         let dir = tempfile::tempdir().unwrap();
-        let held = lock_in(&dir, "kache-cli", Duration::from_secs(1))
+        on_short_lived_runtime(async {
+            let held = lock_in(&dir, "kache-cli", Duration::from_secs(1))
+                .await
+                .unwrap();
+            let second = tokio::time::timeout(
+                Duration::from_secs(5),
+                lock_in(&dir, "kache-cli", Duration::from_millis(100)),
+            )
             .await
-            .unwrap();
-        assert!(
-            lock_in(&dir, "kache-cli", Duration::from_millis(100))
-                .await
-                .is_err()
-        );
-        // A different client for the same issuer is a different session.
-        drop(
-            lock_in(&dir, "kobe-cli", Duration::from_millis(100))
-                .await
-                .unwrap(),
-        );
-        drop(held);
-        drop(
-            lock_in(&dir, "kache-cli", Duration::from_millis(100))
-                .await
-                .unwrap(),
-        );
+            .expect("a bounded wait must end");
+            assert!(second.is_err());
+            // A different client for the same issuer is a different session.
+            drop(
+                lock_in(&dir, "kobe-cli", Duration::from_millis(100))
+                    .await
+                    .unwrap(),
+            );
+            drop(held);
+            drop(
+                lock_in(&dir, "kache-cli", Duration::from_millis(100))
+                    .await
+                    .unwrap(),
+            );
+        });
     }
 
     #[test]
@@ -942,11 +969,8 @@ mod tests {
 
     #[test]
     fn the_session_lock_gives_up_after_its_wait() {
-        // A runtime that does not wait for the polling thread at shutdown, so
-        // a lock that never gives up fails this test instead of hanging it.
-        let runtime = tokio::runtime::Runtime::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let outcome = runtime.block_on(async {
+        let second = on_short_lived_runtime(async {
             let _held = lock_in(&dir, "kache-cli", Duration::from_secs(1))
                 .await
                 .unwrap();
@@ -955,9 +979,8 @@ mod tests {
                 lock_in(&dir, "kache-cli", Duration::from_millis(100)),
             )
             .await
-        });
-        runtime.shutdown_timeout(Duration::from_millis(100));
-        let second = outcome.expect("a bounded wait must end");
+        })
+        .expect("a bounded wait must end");
         assert!(second.is_err());
     }
 

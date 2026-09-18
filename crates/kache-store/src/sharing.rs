@@ -22,9 +22,23 @@ impl Sharing {
 
 /// Best-effort cache estimate. Callers account for hardlinks from their metadata.
 pub fn probe(path: &Path, size: u64) -> Sharing {
+    probe_with_links(path, size).0
+}
+
+/// The same estimate plus the file's hardlink count, from one measurement.
+///
+/// The count has to come from `kache_fs`: `std::fs::Metadata` carries `nlink`
+/// on Unix only, while Windows needs a `GetFileInformationByHandle` call that
+/// `kache_fs::measure_file` already makes. A caller that reads the count off
+/// `MetadataExt` gets a guard that is compiled out on Windows.
+///
+/// An unmeasurable file reports one link: unknown sharing already means
+/// "assume every byte is private", and claiming extra links would make the
+/// store refuse to evict blobs it can free.
+pub fn probe_with_links(path: &Path, size: u64) -> (Sharing, u64) {
     match kache_fs::measure_file(path) {
-        Ok(s) => from_measurement(s.sharing, s.unique, size),
-        Err(_) => Sharing::unknown_for(size),
+        Ok(s) => (from_measurement(s.sharing, s.unique, size), s.nlink),
+        Err(_) => (Sharing::unknown_for(size), 1),
     }
 }
 
@@ -118,6 +132,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = probe(&dir.path().join("does-not-exist"), 1234);
         assert_eq!(s, Sharing::unknown_for(1234));
+        let (fallback, links) = probe_with_links(&dir.path().join("does-not-exist"), 1234);
+        assert_eq!(fallback, Sharing::unknown_for(1234));
+        assert_eq!(
+            links, 1,
+            "a file we could not measure must not read as hardlinked: \
+             the store would then refuse to evict blobs it can free"
+        );
+    }
+
+    /// The count `retainer_from_meta` decides on. `std::fs::Metadata` has it
+    /// on Unix only, so it comes from the kache-fs measurement instead — the
+    /// same path on Windows, where `GetFileInformationByHandle` supplies it.
+    #[test]
+    fn probe_with_links_reports_how_many_names_hold_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.bin");
+        std::fs::write(&path, vec![3u8; 4096]).unwrap();
+        assert_eq!(probe_with_links(&path, 4096).1, 1, "one name, one link");
+
+        std::fs::hard_link(&path, dir.path().join("second-name.bin")).unwrap();
+        assert_eq!(
+            probe_with_links(&path, 4096).1,
+            2,
+            "a second name is a link"
+        );
     }
 
     #[test]

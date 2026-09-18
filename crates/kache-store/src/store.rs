@@ -7904,7 +7904,10 @@ mod tests {
         assert_eq!(stats.entries_busy_snapshot, 1);
     }
 
-    #[cfg(unix)]
+    /// Not `#[cfg(unix)]`: NTFS has hardlinks, `cache.windows_hardlink` and
+    /// `cache.shared_hardlink_restores` make them, so the #725 guard has to
+    /// hold there too. Gating this test to Unix is how the guard stayed
+    /// compiled out on Windows.
     #[test]
     fn evict_leaves_an_entry_whose_blob_is_still_hardlinked_outside() {
         let dir = tempfile::tempdir().unwrap();

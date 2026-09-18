@@ -242,7 +242,7 @@ pub(crate) async fn kunobi_session_token(base: &str) -> Result<Option<String>> {
         return Ok(None);
     };
     let store = ScopedTokenStore::new(&service.client_id)?;
-    session_token(service, Box::new(store), oidc_refresh).await
+    session_token(service, Box::new(store), default_lock_dir()?, oidc_refresh).await
 }
 
 /// Exchange a refresh token at the issuer, bounded by [`REFRESH_BOUND`].
@@ -265,6 +265,7 @@ async fn oidc_refresh(service: ServiceConfig, refresh_token: String) -> Result<S
 async fn session_token<R, F>(
     service: ServiceConfig,
     store: Box<dyn TokenStorage>,
+    lock_dir: std::path::PathBuf,
     refresh: R,
 ) -> Result<Option<String>>
 where
@@ -284,7 +285,7 @@ where
     // token even when this build stops waiting for it.
     tokio::spawn(async move {
         let _in_flight = in_flight;
-        refresh_session(service, store, refresh).await
+        refresh_session(service, store, lock_dir, refresh).await
     })
     .await
     .context("the session refresh task failed")?
@@ -293,13 +294,21 @@ where
 async fn refresh_session<R, F>(
     service: ServiceConfig,
     store: Box<dyn TokenStorage>,
+    lock_dir: std::path::PathBuf,
     refresh: R,
 ) -> Result<Option<String>>
 where
     R: FnOnce(ServiceConfig, String) -> F,
     F: std::future::Future<Output = Result<StoredToken>>,
 {
-    let _session = session_lock(&service.issuer, &service.client_id, REFRESH_BOUND).await?;
+    let _session = session_lock_in(
+        lock_dir,
+        &service.issuer,
+        &service.client_id,
+        REFRESH_BOUND,
+        || {},
+    )
+    .await?;
     // Re-check under the lock: another process may have refreshed meanwhile.
     let Some(stored) = store.load(&service.issuer)? else {
         return Ok(None);
@@ -378,11 +387,14 @@ pub(crate) async fn session_lock(
     client_id: &str,
     wait: Duration,
 ) -> Result<std::fs::File> {
-    let dir = dirs::config_dir()
+    session_lock_in(default_lock_dir()?, issuer, client_id, wait, || {}).await
+}
+
+fn default_lock_dir() -> Result<std::path::PathBuf> {
+    Ok(dirs::config_dir()
         .context("no config directory for the session lock")?
         .join("kunobi")
-        .join("locks");
-    session_lock_in(dir, issuer, client_id, wait, || {}).await
+        .join("locks"))
 }
 
 /// [`session_lock`] in `dir`; `on_wait` runs each time the lock is found
@@ -813,20 +825,27 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_session_is_used_as_is() {
         let _serial = SESSION_TESTS.lock().await;
+        let lock_dir = tempfile::tempdir().unwrap();
         let service = service();
         let store = MemoryStore::default();
         store
             .save(&stored(&service, "fresh", 3600, Some("rt")))
             .unwrap();
-        let token = session_token(service, Box::new(store), no_refresh)
-            .await
-            .unwrap();
+        let token = session_token(
+            service,
+            Box::new(store),
+            lock_dir.path().to_path_buf(),
+            no_refresh,
+        )
+        .await
+        .unwrap();
         assert_eq!(token.as_deref(), Some("fresh"));
     }
 
     #[tokio::test]
     async fn an_expired_session_is_refreshed_and_saved() {
         let _serial = SESSION_TESTS.lock().await;
+        let lock_dir = tempfile::tempdir().unwrap();
         let service = service();
         let store = MemoryStore::default();
         store
@@ -837,9 +856,14 @@ mod tests {
             assert_eq!(refresh_token, "rt-1");
             Ok(issued)
         };
-        let token = session_token(service.clone(), Box::new(store.clone()), refresh)
-            .await
-            .unwrap();
+        let token = session_token(
+            service.clone(),
+            Box::new(store.clone()),
+            lock_dir.path().to_path_buf(),
+            refresh,
+        )
+        .await
+        .unwrap();
         assert_eq!(token.as_deref(), Some("new"));
         let saved = store.load(&service.issuer).unwrap().unwrap();
         assert_eq!(saved.id_token, "new");
@@ -849,27 +873,39 @@ mod tests {
     #[tokio::test]
     async fn an_expired_session_without_a_refresh_token_is_not_sent() {
         let _serial = SESSION_TESTS.lock().await;
+        let lock_dir = tempfile::tempdir().unwrap();
         let service = service();
         let store = MemoryStore::default();
         store.save(&stored(&service, "old", -10, None)).unwrap();
         assert!(
-            session_token(service, Box::new(store), no_refresh)
-                .await
-                .is_err()
+            session_token(
+                service,
+                Box::new(store),
+                lock_dir.path().to_path_buf(),
+                no_refresh
+            )
+            .await
+            .is_err()
         );
     }
 
     #[tokio::test]
     async fn a_refresh_that_finds_the_session_already_renewed_keeps_it() {
         let _serial = SESSION_TESTS.lock().await;
+        let lock_dir = tempfile::tempdir().unwrap();
         let service = service();
         let store = MemoryStore::default();
         store
             .save(&stored(&service, "renewed", 3600, Some("rt")))
             .unwrap();
-        let token = refresh_session(service, Box::new(store), no_refresh)
-            .await
-            .unwrap();
+        let token = refresh_session(
+            service,
+            Box::new(store),
+            lock_dir.path().to_path_buf(),
+            no_refresh,
+        )
+        .await
+        .unwrap();
         assert_eq!(token.as_deref(), Some("renewed"));
     }
 
@@ -928,6 +964,7 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_session_needs_no_refresh_slot() {
         let _serial = SESSION_TESTS.lock().await;
+        let lock_dir = tempfile::tempdir().unwrap();
         // Another build holds the refresh slot: a fresh session is still sent.
         let _busy = REFRESH.try_lock().unwrap();
         let service = service();
@@ -935,9 +972,14 @@ mod tests {
         store
             .save(&stored(&service, "fresh", 3600, Some("rt")))
             .unwrap();
-        let token = session_token(service, Box::new(store), no_refresh)
-            .await
-            .unwrap();
+        let token = session_token(
+            service,
+            Box::new(store),
+            lock_dir.path().to_path_buf(),
+            no_refresh,
+        )
+        .await
+        .unwrap();
         assert_eq!(token.as_deref(), Some("fresh"));
     }
 

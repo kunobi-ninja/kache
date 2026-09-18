@@ -22,7 +22,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{RwLock, watch};
 
@@ -123,8 +122,9 @@ fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
         .route("/readyz", get(readyz))
+        // v1 is the only prefetch-plan contract (#619). Add a v2 handler only
+        // when the intent or plan schema actually changes, and keep v1 serving.
         .route("/v1/prefetch-plan", post(prefetch_plan))
-        .route("/v2/prefetch-plan", post(prefetch_plan))
         .with_state(state)
 }
 
@@ -453,12 +453,14 @@ async fn prefetch_plan(
     Ok(Json(plan))
 }
 
+/// Plan ids must stay unique across HA replicas without shared state, since
+/// feedback (#583) will be scoped to the id of the plan it describes. A
+/// millisecond timestamp collides within a millisecond and across replicas; a
+/// UUIDv4 does not. The `plan-` prefix keeps existing log and client checks
+/// matching. Issued ids are not recorded yet: that lands with the feedback
+/// endpoint that reads them.
 fn next_plan_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("plan-{millis}")
+    format!("plan-{}", uuid::Uuid::new_v4().as_hyphenated())
 }
 
 fn fallback_plan(planner_name: &str) -> PrefetchPlan {
@@ -833,7 +835,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v2/prefetch-plan")
+                    .uri("/v1/prefetch-plan")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&BuildIntent::default()).unwrap(),
@@ -852,7 +854,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v2/prefetch-plan")
+                    .uri("/v1/prefetch-plan")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::AUTHORIZATION, "Bearer wrong-token")
                     .body(Body::from(
@@ -887,7 +889,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v2/prefetch-plan")
+                    .uri("/v1/prefetch-plan")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::AUTHORIZATION, "Bearer secret-token")
                     .body(Body::from(
@@ -917,6 +919,86 @@ mod tests {
         );
     }
 
+    /// Plan ids must be unique without coordination and unguessable (#619).
+    ///
+    /// A millisecond timestamp fails both: 512 ids issued back-to-back land
+    /// in a handful of milliseconds, and the suffix is a guessable counter.
+    /// This fails against that implementation (collisions) and against one
+    /// that drops the UUID parse (non-UUID suffix).
+    #[test]
+    fn plan_ids_are_unique_and_uuid_shaped() {
+        let ids: Vec<String> = (0..512).map(|_| next_plan_id()).collect();
+
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "two plans shared an id, so feedback scoped to a plan id could be misattributed"
+        );
+
+        for id in &ids {
+            let suffix = id
+                .strip_prefix("plan-")
+                .unwrap_or_else(|| panic!("plan id lost its prefix: {id}"));
+            assert!(
+                uuid::Uuid::parse_str(suffix).is_ok_and(|parsed| parsed.get_version_num() == 4),
+                "plan id suffix is not a UUIDv4: {id}"
+            );
+        }
+    }
+
+    /// v1 is the only prefetch-plan contract: it serves the current plan
+    /// shape with a fresh id.
+    #[tokio::test]
+    async fn v1_prefetch_plan_serves_the_current_contract() {
+        let response = test_app(None, None)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/prefetch-plan")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&BuildIntent::default()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let plan: PrefetchPlan = serde_json::from_slice(&body).unwrap();
+        assert_eq!(plan.disposition, PrefetchDisposition::UseFallback);
+        assert!(
+            plan.plan_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("plan-"))
+        );
+    }
+
+    /// There is no v2 route (#619). Re-adding one turns this 404 into a 200.
+    #[tokio::test]
+    async fn v2_prefetch_plan_is_not_served() {
+        let response = test_app(None, None)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    // Pins the removal. Do not change this to v1.
+                    .uri("/v2/prefetch-plan")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&BuildIntent::default()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn prefetch_plan_returns_execute_when_repository_has_candidates() {
         let dir = tempfile::tempdir().unwrap();
@@ -943,7 +1025,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v2/prefetch-plan")
+                    .uri("/v1/prefetch-plan")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&BuildIntent {
@@ -985,7 +1067,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v2/prefetch-plan")
+                    .uri("/v1/prefetch-plan")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&BuildIntent {

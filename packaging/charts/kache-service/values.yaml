@@ -37,8 +37,19 @@ planner:
       - ReadWriteOnce
 
 auth:
+  # Static shared token (`KACHE_PLANNER_TOKEN`) from an existing Secret.
   existingSecret: ""
   existingSecretKey: token
+  # People log in with `kache login` against this issuer. The client id is
+  # the accepted token audience and is advertised at /.well-known/kunobi-auth.
+  oidc:
+    issuer: ""
+    clientId: ""
+  # GitHub Actions ID tokens issued for this audience, accepted only from
+  # these repository owners. Jobs need `permissions: id-token: write`.
+  githubOidc:
+    audience: ""
+    owners: []
 
 ha:
   enabled: false

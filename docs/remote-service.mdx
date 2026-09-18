@@ -16,6 +16,7 @@ The service in [`crates/kache-service`](https://github.com/kunobi-ninja/kache/tr
 - `POST /v1/prefetch-plan`
 - `GET /healthz`
 - `GET /readyz`
+- `GET /.well-known/kunobi-auth` (only with [Kunobi login](#authentication) enabled)
 
 The client rewrites an endpoint configured with the older `/v2/prefetch-plan` path to `/v1`. When no useful candidates exist, the service returns a fallback disposition and the client uses its normal planner.
 
@@ -29,7 +30,23 @@ cargo run -p kache-service
 
 The default bind address is `0.0.0.0:8080` and the default database path is `/var/lib/kache/planner.db`. Override them with `--bind` / `KACHE_PLANNER_BIND` and `--db-path` / `KACHE_PLANNER_DB_PATH`.
 
-Set `--token` or `KACHE_PLANNER_TOKEN` to require bearer authentication.
+See [Authentication](#authentication) to require a bearer.
+
+## Authentication
+
+With no provider configured, the planner accepts anonymous requests. Configure any of these and `POST /v1/prefetch-plan` requires a bearer that one of them accepts. The health, metrics and discovery endpoints stay open.
+
+| Provider | Service flags (env) | Clients |
+|---|---|---|
+| Static token | `--token` (`KACHE_PLANNER_TOKEN`) | set `KACHE_PLANNER_TOKEN` |
+| Kunobi login (OIDC) | `--oidc-issuer` (`KACHE_PLANNER_OIDC_ISSUER`), `--oidc-client-id` (`KACHE_PLANNER_OIDC_CLIENT_ID`) | run `kache login` once |
+| GitHub Actions OIDC | `--github-oidc-audience` (`KACHE_PLANNER_GITHUB_AUDIENCE`), `--github-owner` (`KACHE_PLANNER_GITHUB_OWNERS`, comma list) | job has `permissions: id-token: write` |
+
+**Kunobi login.** Register a public OAuth client (PKCE, no secret) with redirect URI `http://localhost:8329/callback` and scopes `openid profile email offline_access`; enable the device grant for `kache login --device`. The client id is the accepted token audience. The service advertises the issuer and client id at `/.well-known/kunobi-auth`, which is how `kache login` finds them.
+
+**GitHub Actions.** Tokens must carry the configured audience, and their `repository_owner` claim must match one of the `--github-owner` values (case-insensitive). The service refuses to start with an audience but no owner, since that would trust every repository on GitHub. The kache client fetches the job's token itself when `ACTIONS_ID_TOKEN_REQUEST_URL` is present; its audience is `KACHE_PLANNER_GITHUB_AUDIENCE` / `cache.planner.github_audience` (default `kache`).
+
+A client that cannot authenticate plans locally, exactly as when the planner is unreachable.
 
 ## Helm
 
@@ -37,7 +54,17 @@ Set `--token` or `KACHE_PLANNER_TOKEN` to require bearer authentication.
 helm upgrade --install kache-service ./packaging/charts/kache-service
 ```
 
-The chart supplies a Deployment, Service, probes, optional persistent volume, optional existing-secret authentication, and optional Lease-based leader election, and an optional Ingress.
+The chart supplies a Deployment, Service, probes, optional persistent volume, optional authentication (existing-secret token, Kunobi login, GitHub Actions OIDC), optional Lease-based leader election, and an optional Ingress.
+
+```yaml title="values.yaml"
+auth:
+  oidc:
+    issuer: https://clerk.kunobi.com
+    clientId: <public client id>
+  githubOidc:
+    audience: kache
+    owners: [my-org]
+```
 
 Point clients at it:
 
@@ -59,7 +86,7 @@ ingress:
     enabled: true
 ```
 
-The Ingress does not add authentication. Set `auth.existingSecret` before you expose the service beyond a trusted network.
+The Ingress does not add authentication. Configure [a provider](#authentication) before you expose the service beyond a trusted network.
 
 The equivalent TOML is under `[cache.planner]`.
 

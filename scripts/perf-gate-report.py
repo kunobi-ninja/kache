@@ -77,6 +77,11 @@ def load(directory):
         if payload.get("error"):
             project["error"] = payload["error"]
             return project
+        project["versions"] = {
+            r["arm"]: r["result"]["cache_tool_version"]
+            for r in payload.get("records", [])
+            if r.get("result", {}).get("cache_tool_version")
+        }
     summary = directory / "summary.json"
     if not summary.exists():
         report = directory / "perf-gate.md"
@@ -169,6 +174,27 @@ def head_vs_base(projects):
             f"Times are medians; positive changes are slower. A change is marked only when it clears the paired test below, so builds with fewer than {MIN_PAIRS} pairs stay inconclusive."
         )
     return lines
+
+
+def tool_versions(projects):
+    """Each arm's `--version`, per subject only where the subjects disagree."""
+    per_arm = {}
+    for p in projects:
+        for arm, version in p.get("versions", {}).items():
+            per_arm.setdefault(arm, {}).setdefault(version, []).append(p["name"])
+    if not per_arm:
+        return []
+    parts = []
+    for arm in arms([{"arm": arm} for arm in per_arm]):
+        versions = per_arm[arm]
+        if len(versions) == 1:
+            parts.append(f"{arm} `{next(iter(versions))}`")
+        else:
+            parts += [
+                f"{arm} `{version}` ({', '.join(names)})"
+                for version, names in versions.items()
+            ]
+    return ["Versions: " + ", ".join(parts) + ".", ""]
 
 
 def all_tools(projects, open_):
@@ -319,6 +345,7 @@ def render(directories, verdict=None):
     if valid:
         table = head_vs_base(valid)
         lines += table + ([""] if table else [])
+        lines += tool_versions(valid)
         lines += all_tools(valid, open_=not table)
         lines += contention(valid)
         lines += disk_use([p for p in valid if "contention" in p])

@@ -1,0 +1,56 @@
+# The sccache comparison arm measures a pinned binary (`mise.toml`:
+# `github:mozilla/sccache`), so its side of the comparison only moves when that
+# pin does. The nightly therefore runs it weekly rather than every night, and
+# this workflow covers the case the weekly cadence would otherwise delay by up
+# to seven days: a version bump, which is the one commit that actually changes
+# what the arm measures.
+name: Bench sccache on a pin bump
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - mise.toml
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch the sccache arm
+    if: github.repository == 'kunobi-ninja/kache'
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # The commit and its parent, so the diff below can read the change.
+          fetch-depth: 2
+        timeout-minutes: 10
+
+      - id: pin
+        name: Did the sccache pin change?
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `mise.toml` carries every pinned tool, so a push that touches it is
+          # usually about something else. Compare the sccache line alone.
+          before="$(git show "${{ github.event.before }}:mise.toml" 2>/dev/null \
+            | grep -E '^"github:mozilla/sccache"' || true)"
+          after="$(grep -E '^"github:mozilla/sccache"' mise.toml || true)"
+          if [ "$before" = "$after" ]; then
+            echo "sccache pin unchanged ($after); nothing to measure"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "sccache pin ${before:-<absent>} -> ${after:-<absent>}"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run the sccache comparison
+        if: steps.pin.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bench.yml -R "${{ github.repository }}" -f scenario=firefox-sccache

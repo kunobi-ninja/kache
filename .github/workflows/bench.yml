@@ -35,7 +35,7 @@ on:
       scenario:
         description: "Which scenario(s) to run"
         type: choice
-        options: [all, hk-comparison, surrealdb, lance, opendal, cuda-oxide, cuda-oxide-patched, eza, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx]
+        options: [all, hk-comparison, surrealdb, lance, opendal, cuda-oxide, cuda-oxide-patched, eza, llvm, hk, hk-nopred, hk-pull, hk-pull-perf, hk-pull-nopred, hk-mbx, hk-pull-mbx, opendal-mbx, lance-mbx, surrealdb-mbx, firefox-sccache]
         default: all
       extra_args:
         description: "Extra recipe arguments (hk/eza: sample count; other scenarios: --skip-clone, --retry)"
@@ -143,7 +143,7 @@ jobs:
           # the way `kache init` does it so both compiler families are measured.
           # `--warm-same-tree` adds the same-path warm phase between cold and the
           # cross-clone warm. Minutes, not hours; a C compiler is all it needs.
-          hk='{"name":"hk","cmd":"bench-short hk","dir":"bench-hk","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
+          hk='{"name":"hk","cmd":"bench-short hk","dir":"bench-hk","timeout":120,"job_timeout":150,"min_free_gb":40,"runner":"kunobi-runners"}'
           # hk with input predictions off: the control for the arm above, so
           # the same nightly shows what predictions are worth (#1000).
           hk_nopred='{"name":"hk-nopred","cmd":"bench hk-nopred --warm-same-tree","dir":"bench-hk-nopred","timeout":60,"job_timeout":90,"min_free_gb":40,"runner":"kunobi-runners"}'
@@ -193,6 +193,10 @@ jobs:
             opendal-mbx)          inc="[$opendal_mbx]" ;;
             lance-mbx)            inc="[$lance_mbx]" ;;
             surrealdb-mbx)        inc="[$surrealdb_mbx]" ;;
+            # Dispatched by `bench-sccache-pin.yml` when the pinned sccache
+            # version changes, and selectable by hand. The nightly adds this
+            # arm only on Sundays (see below).
+            firefox-sccache)      inc="[$firefox_sccache]" ;;
             # Windows-only scenarios are served by their own self-hosted jobs
             # below, so the Linux matrix is EMPTY for them (an empty include
             # skips the `bench` job cleanly). Without this they'd fall to `*)`
@@ -200,7 +204,16 @@ jobs:
             *)                    inc="[$surrealdb,$lance,$opendal,$cuda_oxide,$cuda_oxide_patched,$llvm,$hk,$hk_nopred,$hk_pull,$hk_pull_perf,$hk_pull_nopred,$hk_pull_mbx,$eza,$opendal_mbx,$lance_mbx,$surrealdb_mbx]" ;;
           esac
           if [ "$EVENT_NAME" = "schedule" ]; then
-            inc="$(jq -c --argjson extra "[$firefox,$firefox_sccache,$firefox_pull]" '. + $extra' <<<"$inc")"
+            inc="$(jq -c --argjson extra "[$firefox,$firefox_pull]" '. + $extra' <<<"$inc")"
+            # sccache is pinned in mise.toml, so the arm measures the same
+            # binary every night while only kache moves — and kache against
+            # kache is what the per-PR perf gate already reports. Weekly keeps
+            # a current comparison without paying for it six nights out of
+            # seven; `bench-sccache-pin.yml` dispatches this arm whenever the pin
+            # itself changes, which is the only thing that moves the baseline.
+            if [ "$(date -u +%u)" = "7" ]; then
+              inc="$(jq -c --argjson extra "[$firefox_sccache]" '. + $extra' <<<"$inc")"
+            fi
           fi
           echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
           if [ "$inc" = "[]" ]; then

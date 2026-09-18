@@ -7,8 +7,8 @@
 
 use anyhow::Result;
 use std::borrow::Cow;
-#[cfg(test)]
-use std::path::Path;
+#[cfg(any(test, target_os = "macos"))]
+use std::path::{Path, PathBuf};
 
 use crate::args::RustcArgs;
 use crate::cache_key::compute_cache_key;
@@ -417,15 +417,55 @@ fn macos_oso_prefix_flag_inner(
     {
         return None;
     }
-    let out_dir = parsed.out_dir.as_ref()?;
-    if !out_dir.is_absolute() {
+    let root = macos_oso_prefix_root(parsed)?;
+    if !root.is_absolute() {
         return None;
     }
-    let mut prefix = out_dir.display().to_string();
+    let mut prefix = root.display().to_string();
     if !prefix.ends_with(['/', '\\']) {
         prefix.push('/');
     }
     Some(format!("-Clink-arg=-Wl,-oso_prefix,{prefix}"))
+}
+
+/// The directory every OSO path in this link sits under: Cargo's profile
+/// directory, `<target>/debug` or `<target>/<triple>/release`.
+///
+/// Not the output directory. An example links `<profile>/examples/demo` but
+/// its rlibs live in `<profile>/deps`, a sibling, so a prefix of the output
+/// directory strips nothing from them and the binary keeps the absolute path
+/// of the checkout that built it (kunobi-ninja/kache#1010). The profile
+/// directory covers `deps`, `examples` and a build script's own directory
+/// alike. `-oso_prefix` takes one prefix, so this is the only root that can
+/// be stripped; the toolchain's own rlibs keep their paths.
+///
+/// Falls back to the output directory whenever the invocation is not in
+/// Cargo's layout, where widening the prefix would reach outside the build.
+#[cfg(any(test, target_os = "macos"))]
+fn macos_oso_prefix_root(parsed: &RustcArgs) -> Option<PathBuf> {
+    let out_dir = parsed.out_dir.as_ref()?;
+    Some(cargo_profile_dir(out_dir).unwrap_or_else(|| out_dir.clone()))
+}
+
+/// `out_dir`'s ancestor that is Cargo's profile directory, or `None` when
+/// this is not one of Cargo's link output directories.
+///
+/// Anchored on the directory names Cargo itself uses rather than on the
+/// depth below the target directory, because those differ: a binary and an
+/// example land in `<profile>/deps` and `<profile>/examples`, a build
+/// script in `<profile>/build/<pkg>-<hash>`. Only those two levels are
+/// examined, so a project that happens to live under a directory called
+/// `deps` cannot drag the prefix up to it.
+#[cfg(any(test, target_os = "macos"))]
+fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
+    let parent = out_dir.parent();
+    for cursor in [Some(out_dir), parent].into_iter().flatten() {
+        let name = cursor.file_name()?;
+        if name == "deps" || name == "examples" || name == "build" {
+            return cursor.parent().map(Path::to_path_buf);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1044,16 +1084,73 @@ mod tests {
     #[test]
     fn oso_prefix_is_injected_for_cached_macos_debug_links() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("deps");
+        let profile = dir.path().join("target/debug");
+        let out_dir = profile.join("deps");
         std::fs::create_dir_all(&out_dir).unwrap();
 
+        let expected = |root: &Path| format!("-Clink-arg=-Wl,-oso_prefix,{}/", root.display());
         let (parsed, argv) = debug_bin_args(&out_dir, &[]);
         let flag = macos_oso_prefix_flag_inner(&parsed, &argv, true).unwrap();
-        let mut prefix = out_dir.display().to_string();
-        if !prefix.ends_with('/') && !prefix.ends_with('\\') {
-            prefix.push('/');
-        }
-        assert_eq!(flag, format!("-Clink-arg=-Wl,-oso_prefix,{prefix}"));
+        assert_eq!(flag, expected(&profile));
+
+        // An example links `<profile>/examples/demo` against rlibs in
+        // `<profile>/deps`, a sibling: only the profile directory strips both
+        // (kunobi-ninja/kache#1010).
+        let examples = profile.join("examples");
+        std::fs::create_dir_all(&examples).unwrap();
+        let (parsed, argv) = debug_bin_args(&examples, &[]);
+        assert_eq!(
+            macos_oso_prefix_flag_inner(&parsed, &argv, true).unwrap(),
+            expected(&profile),
+            "an example strips the same root as a binary"
+        );
+
+        // Cross builds put the profile under the triple.
+        let cross_profile = dir.path().join("target/aarch64-apple-darwin/debug");
+        let cross_out = cross_profile.join("examples");
+        std::fs::create_dir_all(&cross_out).unwrap();
+        let (parsed, argv) = debug_bin_args(&cross_out, &["--target", "aarch64-apple-darwin"]);
+        assert_eq!(
+            macos_oso_prefix_flag_inner(&parsed, &argv, true).unwrap(),
+            expected(&cross_profile)
+        );
+
+        // A build script's own directory is two levels below the profile.
+        let build_out = profile.join("build/pkg-abc123");
+        std::fs::create_dir_all(&build_out).unwrap();
+        let (parsed, argv) = debug_bin_args(&build_out, &[]);
+        assert_eq!(
+            macos_oso_prefix_flag_inner(&parsed, &argv, true).unwrap(),
+            expected(&profile)
+        );
+
+        // Nothing below the profile directory: its own path is already the
+        // root, and widening further would reach outside the build.
+        let (parsed, argv) = debug_bin_args(&profile, &[]);
+        assert_eq!(
+            macos_oso_prefix_flag_inner(&parsed, &argv, true).unwrap(),
+            expected(&profile)
+        );
+        assert_eq!(cargo_profile_dir(&profile), None);
+        // Only two levels are examined, so a checkout that lives under a
+        // directory named `deps` keeps its own output directory.
+        let sneaky = dir.path().join("deps/proj/target/debug");
+        std::fs::create_dir_all(&sneaky).unwrap();
+        assert_eq!(cargo_profile_dir(&sneaky), None);
+        assert_eq!(
+            cargo_profile_dir(Path::new("/deps")),
+            Some(PathBuf::from("/")),
+            "a profile directory at the root still yields a root prefix"
+        );
+        assert_eq!(
+            cargo_profile_dir(Path::new("relative/deps")),
+            Some(PathBuf::from("relative"))
+        );
+        let (parsed, argv) = debug_bin_args(Path::new("relative/deps"), &[]);
+        assert!(
+            macos_oso_prefix_flag_inner(&parsed, &argv, true).is_none(),
+            "a relative output directory cannot anchor a prefix"
+        );
 
         let already = debug_bin_args(&out_dir, &["-Clink-arg=-Wl,-oso_prefix,/elsewhere/"]);
         assert!(macos_oso_prefix_flag_inner(&already.0, &already.1, true).is_none());

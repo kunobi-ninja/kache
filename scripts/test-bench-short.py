@@ -427,7 +427,7 @@ def subject(root, name, records, contention=None, error=None):
     """A bench-short output directory as the report job downloads it."""
     directory = root / name
     directory.mkdir()
-    payload = {"project": name, "records": []}
+    payload = {"project": name, "records": records}
     if error:
         payload["error"] = error
     (directory / "samples.json").write_text(json.dumps(payload))
@@ -497,6 +497,25 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("<details open>", text)
         # One table per subject inside a fold, never a row per tool and phase.
         self.assertIn("| hk | head | base |", text)
+        self.assertIn("Versions: head `kache 1.0`, base `kache 1.0`.", text)
+
+    def test_versions_name_each_tool_and_split_only_where_subjects_differ(self):
+        def run(arm, version):
+            r = record(arm, 0)
+            r["result"]["cache_tool_version"] = version
+            return r
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hk = subject(root, "hk", [run("kache", "kache 0.24.0"), run("mbx", "mbx 1.10.1"),
+                                      run("sccache", "sccache 0.10.0")])
+            eza = subject(root, "eza", [run("kache", "kache 0.24.0"), run("mbx", "mbx 1.11.0")])
+            text = self.render([hk, eza])
+        self.assertIn(
+            "Versions: kache `kache 0.24.0`, mbx `mbx 1.10.1` (hk), "
+            "mbx `mbx 1.11.0` (eza), sccache `sccache 0.10.0`.",
+            text,
+        )
 
     def test_regression_and_count_failures_are_the_first_thing_read(self):
         with tempfile.TemporaryDirectory() as tmp:

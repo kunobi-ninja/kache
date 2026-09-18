@@ -56,8 +56,9 @@ static GITHUB_TOKENS: Mutex<Option<HashMap<String, CachedToken>>> = Mutex::new(N
 /// offers none).
 type Discovered = (Instant, Option<ServiceConfig>);
 static DISCOVERY: Mutex<Option<HashMap<String, Discovered>>> = Mutex::new(None);
-/// In-process single-flight for refreshes, so concurrent builds queue here
-/// instead of each blocking a thread on the cross-process [`session_lock`].
+/// At most one refresh in flight per process. A build that finds one running
+/// sends no bearer rather than queueing behind it; later builds pick up the
+/// refreshed session.
 static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The bearer for a planner request, resolved before `deadline`. The caller
@@ -241,15 +242,21 @@ pub(crate) async fn kunobi_session_token(base: &str) -> Result<Option<String>> {
         Some(stored) if !stored.is_expired() => return Ok(Some(stored.id_token)),
         Some(_) => {}
     }
+    let Ok(in_flight) = REFRESH.try_lock() else {
+        tracing::debug!("planner auth: a session refresh is already running");
+        return Ok(None);
+    };
     // Refresh in its own task so it completes and persists the rotated refresh
     // token even when this build stops waiting for it.
-    tokio::spawn(refresh_session(service))
-        .await
-        .context("the session refresh task failed")?
+    tokio::spawn(async move {
+        let _in_flight = in_flight;
+        refresh_session(service).await
+    })
+    .await
+    .context("the session refresh task failed")?
 }
 
 async fn refresh_session(service: ServiceConfig) -> Result<Option<String>> {
-    let _single_flight = REFRESH.lock().await;
     let _session = session_lock(&service.issuer, &service.client_id, REFRESH_BOUND).await?;
     let store = ScopedTokenStore::new(&service.client_id)?;
     // Re-check under the lock: another build may have refreshed meanwhile.

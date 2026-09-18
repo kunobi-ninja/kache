@@ -7,7 +7,8 @@
 
 use anyhow::{Context, Result};
 use kunobi_auth::client::{
-    AuthClient, ServiceConfig, TofuResult, TofuStore, oidc::DeviceFlowPrompt,
+    AuthClient, ServiceConfig, StoredToken, TofuResult, TofuStore, TokenStorage,
+    oidc::DeviceFlowPrompt,
 };
 
 const DEVICE_SCOPE: &str = "openid profile email offline_access";
@@ -18,18 +19,20 @@ pub fn login(device: bool, retrust: bool) -> Result<()> {
         crate::planner_client::ensure_crypto_provider();
         println!("Discovering the planner's login at {endpoint}...");
         let service = discover_for_login(&endpoint, retrust).await?;
-        // Hold the session lock across the login so a daemon refresh cannot
-        // overwrite the new session with one from the old refresh token.
-        let _session = session_lock(&service).await?;
-        let client = scoped_client(service)?;
-        if device {
+        // Log in without holding any lock (the user may take a while), into
+        // a throwaway store; then save under the session lock, so a daemon
+        // refresh cannot overwrite the new session with one from an old token.
+        let client = AuthClient::with_storage(service.clone(), Box::new(Discard));
+        let session = if device {
             client
                 .device_login(DEVICE_SCOPE, print_device_prompt)
-                .await?;
+                .await?
         } else {
             println!("Opening the browser to log in...");
-            client.login().await?;
-        }
+            client.login().await?
+        };
+        let _session = session_lock(&service).await?;
+        crate::planner_auth::ScopedTokenStore::new(&service.client_id)?.save(&session)?;
         println!("Logged in to the planner at {endpoint}.");
         Ok(())
     })
@@ -41,10 +44,31 @@ pub fn logout() -> Result<()> {
         crate::planner_client::ensure_crypto_provider();
         let service = kunobi_auth::client::discover(&endpoint).await?;
         let _session = session_lock(&service).await?;
-        scoped_client(service)?.logout_async().await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            scoped_client(service)?.logout_async(),
+        )
+        .await
+        .context("revoking the session at the IdP timed out")??;
         println!("Logged out of the planner at {endpoint} (session revoked at the IdP).");
         Ok(())
     })
+}
+
+/// Keeps nothing: `kache login` saves the session it gets back itself, under
+/// the session lock.
+struct Discard;
+
+impl TokenStorage for Discard {
+    fn load(&self, _issuer: &str) -> Result<Option<StoredToken>> {
+        Ok(None)
+    }
+    fn save(&self, _token: &StoredToken) -> Result<()> {
+        Ok(())
+    }
+    fn remove(&self, _issuer: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Sessions are stored per issuer and client id, so logging in here never

@@ -991,6 +991,9 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
     policy: std::marker::PhantomData<P>,
     config: Config,
     db: Connection,
+    /// Write slice and pause for eviction sweeps: [`EVICTION_WRITE_SLICE`]
+    /// and [`EVICTION_WRITE_PAUSE`] outside tests.
+    eviction_pacing: (Duration, Duration),
 }
 
 /// How recently an entry must have been accessed for eviction to treat it as
@@ -1009,6 +1012,56 @@ pub const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
 /// still pinned, and rare enough that concurrent hits stop contending for
 /// the index's write lock.
 pub const HIT_STAMP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Write-lock time an eviction sweep may spend on removals before it pauses.
+///
+/// SQLite's write lock is not fair. A build's `put` that finds it taken
+/// sleeps in the busy handler, polling at most every 100 ms, while a sweep
+/// takes the lock again microseconds after each commit. Without pauses, a
+/// build's `put` waited for most of the sweep.
+pub const EVICTION_WRITE_SLICE: Duration = Duration::from_millis(50);
+
+/// How long an eviction sweep stands off the write lock after each
+/// [`EVICTION_WRITE_SLICE`], or after it lost the lock to another writer.
+/// Longer than the busy handler's 100 ms poll interval, so every waiting
+/// writer polls at least once while the lock is free.
+pub const EVICTION_WRITE_PAUSE: Duration = Duration::from_millis(150);
+
+/// Paces an eviction sweep's writes so build processes waiting on the index
+/// write lock get it between slices.
+#[derive(Debug)]
+struct EvictionWritePacer {
+    slice: Duration,
+    pause: Duration,
+    held: Duration,
+}
+
+impl EvictionWritePacer {
+    fn new(slice: Duration, pause: Duration) -> Self {
+        Self {
+            slice,
+            pause,
+            held: Duration::ZERO,
+        }
+    }
+
+    /// Record a removal that wrote to the index. Returns the pause to take
+    /// once the sweep has spent a full slice writing.
+    fn after_write(&mut self, took: Duration) -> Option<Duration> {
+        self.held += took;
+        if self.held < self.slice {
+            return None;
+        }
+        self.held = Duration::ZERO;
+        Some(self.pause)
+    }
+
+    /// Another writer holds the lock: stand off for a full pause.
+    fn after_contention(&mut self) -> Duration {
+        self.held = Duration::ZERO;
+        self.pause
+    }
+}
 
 /// Entries backfilled with their rebuild cost per GC sweep
 /// (kunobi-ninja/kache#594).
@@ -1690,6 +1743,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             policy: std::marker::PhantomData,
             config: config.clone(),
             db,
+            eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
         };
 
         // A quarantined index comes back empty, but the blobs and every entry's
@@ -3883,6 +3937,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ) -> GcStats {
         let mut stats = GcStats::default();
         let mut eviction_writes = std::time::Duration::ZERO;
+        let (slice, pause) = self.eviction_pacing;
+        let mut pacer = EvictionWritePacer::new(slice, pause);
         let (mut current_size, target) = match stop_at {
             Some((current, target)) => (current, Some(target)),
             None => (0, None),
@@ -3910,9 +3966,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             let write_started = std::time::Instant::now();
             let removal = self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE));
-            eviction_writes += write_started.elapsed();
+            let took = write_started.elapsed();
+            eviction_writes += took;
             match removal {
                 Ok(GuardedRemoval::Reclaimed(reclaim)) => {
+                    if let Some(pause) = pacer.after_write(took) {
+                        std::thread::sleep(pause);
+                    }
                     stats.entries_evicted += 1;
                     // Budget on bytes the removal *actually* freed on disk, not
                     // the entry's logical size: evicting an entry whose blobs
@@ -3952,6 +4012,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     // evicting the rest rather than aborting the whole sweep.
                     record_eviction_failure(&mut stats, &e);
                     tracing::warn!("gc: skipping eviction of {key}: {e:#}");
+                    if is_sqlite_contention(&e) {
+                        std::thread::sleep(pacer.after_contention());
+                    }
                     continue;
                 }
             }
@@ -7846,7 +7909,10 @@ mod tests {
         assert_eq!(stats.entries_busy_snapshot, 1);
     }
 
-    #[cfg(unix)]
+    /// Not `#[cfg(unix)]`: NTFS has hardlinks, `cache.windows_hardlink` and
+    /// `cache.shared_hardlink_restores` make them, so the #725 guard has to
+    /// hold there too. Gating this test to Unix is how the guard stayed
+    /// compiled out on Windows.
     #[test]
     fn evict_leaves_an_entry_whose_blob_is_still_hardlinked_outside() {
         let dir = tempfile::tempdir().unwrap();
@@ -14472,6 +14538,128 @@ mod tests {
         assert!(
             crate::opcounts::store_copy_ineligible_bytes() >= before + bytes,
             "policy refusal must record the ineligible reason"
+        );
+    }
+
+    #[test]
+    fn eviction_write_pacer_pauses_once_per_full_slice() {
+        let slice = Duration::from_millis(50);
+        let pause = Duration::from_millis(150);
+        let mut pacer = EvictionWritePacer::new(slice, pause);
+        assert_eq!(pacer.after_write(Duration::from_millis(30)), None);
+        assert_eq!(
+            pacer.after_write(Duration::from_millis(20)),
+            Some(pause),
+            "a slice exactly used up pauses"
+        );
+        assert_eq!(
+            pacer.after_write(Duration::from_millis(49)),
+            None,
+            "the pause starts a fresh slice"
+        );
+        assert_eq!(pacer.after_contention(), pause);
+        assert_eq!(
+            pacer.after_write(Duration::from_millis(49)),
+            None,
+            "contention starts a fresh slice too"
+        );
+        assert_eq!(pacer.after_write(Duration::from_millis(1)), Some(pause));
+    }
+
+    /// Put `n` small entries that eviction may remove: unique blobs, idle
+    /// past the active-pin grace.
+    fn put_evictable_entries(store: &Store, dir: &Path, n: usize) {
+        for i in 0..n {
+            let src = dir.join(format!("evictable-{i}.rlib"));
+            std::fs::write(&src, format!("evictable payload {i}").repeat(8)).unwrap();
+            store
+                .put(
+                    &format!("{i:064x}"),
+                    "c",
+                    &["lib".into()],
+                    &[],
+                    "",
+                    "dev",
+                    &[(src.clone(), "lib.rlib".into())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            let _ = std::fs::remove_file(&src);
+        }
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+    }
+
+    /// A sweep that finds a build holding the index write lock stands off
+    /// before its next removal. It used to retry the next entry at once,
+    /// and a build's own writes then competed with a sweep that never let go.
+    #[test]
+    fn eviction_stands_off_after_losing_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        put_evictable_entries(&store, dir.path(), 3);
+
+        let build = Store::open(&config).unwrap();
+        build.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let mut gc_config = config.clone();
+        gc_config.max_size = 1;
+        let gc = Store::open(&gc_config).unwrap();
+        let started = std::time::Instant::now();
+        let stats = gc.evict().unwrap();
+        let elapsed = started.elapsed();
+        build.db.execute_batch("ROLLBACK").unwrap();
+
+        assert_eq!(stats.entries_locked, 3, "{stats:?}");
+        assert!(
+            elapsed >= EVICTION_WRITE_PAUSE * 3,
+            "one pause per lost write lock, swept in {elapsed:?}"
+        );
+    }
+
+    /// A sweep with enough removals to use up a write slice pauses between
+    /// slices, so builds waiting on the write lock get it. Without the pause
+    /// a waiting `put` sat in SQLite's busy handler for most of the sweep.
+    ///
+    /// The slice is shrunk so a few hundred removals use it up. With the
+    /// production slice this needed 1500 entries, and a pacer broken into
+    /// pausing after every removal then slept 150 ms 1500 times, past the
+    /// mutation lane's timeout.
+    #[test]
+    fn eviction_pauses_between_write_slices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        put_evictable_entries(&store, dir.path(), 500);
+
+        let mut gc_config = config.clone();
+        gc_config.max_size = 1;
+        let mut gc = Store::open(&gc_config).unwrap();
+        let slice = Duration::from_millis(5);
+        let pause = Duration::from_millis(20);
+        gc.eviction_pacing = (slice, pause);
+        let started = std::time::Instant::now();
+        let stats = gc.evict().unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(stats.entries_evicted, 500, "{stats:?}");
+        let writing = Duration::from_millis(stats.evict_write_ms);
+        assert!(
+            writing >= slice,
+            "fixture too small to use up a slice: {stats:?}"
+        );
+        assert!(
+            elapsed >= writing + pause,
+            "{writing:?} of writes must include a pause, swept in {elapsed:?}"
         );
     }
 }

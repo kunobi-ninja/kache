@@ -298,6 +298,125 @@ const AUTO_GC_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// keeps the two thresholds apart so the store doesn't thrash at the boundary.
 const AUTO_GC_SLACK_PERCENT: u64 = 10;
 
+/// Longest the auto-GC backoff grows. The daemon's periodic sweep runs every
+/// six hours, so a store that stays over budget still sees a sweep this often.
+const AUTO_GC_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
+/// Where the auto-GC worker leaves its backoff when a sweep could not bring
+/// the store back under the trigger.
+fn auto_gc_backoff_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("auto-gc-backoff.json")
+}
+
+/// Size at which the wrapper spawns a background GC: `max_size` plus slack.
+fn auto_gc_threshold(max_size: u64) -> u64 {
+    max_size.saturating_add(max_size / 100 * AUTO_GC_SLACK_PERCENT)
+}
+
+/// A sweep ended with the store still over the trigger. Most often the
+/// remaining bytes are blobs that target directories still hardlink or
+/// clone, which no eviction can free, so another sweep five minutes later
+/// frees nothing and only competes with builds for the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AutoGcBackoff {
+    /// Unix seconds when the sweep finished.
+    since: u64,
+    /// No automatic sweep before `since + interval_secs`.
+    interval_secs: u64,
+    /// Physical store size the sweep left behind.
+    size_after: u64,
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn read_auto_gc_backoff(cache_dir: &Path) -> Option<AutoGcBackoff> {
+    let json = std::fs::read(auto_gc_backoff_path(cache_dir)).ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
+/// The backoff after a sweep that left the store at `size_after`: none once
+/// the store is back under the trigger, otherwise double the previous
+/// interval, starting from the check interval, up to [`AUTO_GC_MAX_BACKOFF`].
+fn next_auto_gc_backoff(
+    previous: Option<AutoGcBackoff>,
+    now: u64,
+    size_after: u64,
+    max_size: u64,
+) -> Option<AutoGcBackoff> {
+    if size_after <= auto_gc_threshold(max_size) {
+        return None;
+    }
+    let interval_secs = previous
+        .map_or(AUTO_GC_CHECK_INTERVAL.as_secs(), |b| b.interval_secs)
+        .saturating_mul(2)
+        .min(AUTO_GC_MAX_BACKOFF.as_secs());
+    Some(AutoGcBackoff {
+        since: now,
+        interval_secs,
+        size_after,
+    })
+}
+
+/// Whether `backoff` still suppresses a sweep of a store now at `total`.
+/// Growth past what the last sweep left, by more than the slack, is new data
+/// a sweep may be able to free, so it ends the backoff early.
+fn auto_gc_backoff_holds(
+    backoff: Option<AutoGcBackoff>,
+    now: u64,
+    total: u64,
+    max_size: u64,
+) -> bool {
+    let Some(backoff) = backoff else {
+        return false;
+    };
+    let grown = total.saturating_sub(backoff.size_after);
+    now < backoff.since.saturating_add(backoff.interval_secs)
+        && grown <= max_size / 100 * AUTO_GC_SLACK_PERCENT
+}
+
+/// Whether an automatic sweep of a store now at `total` should wait out the
+/// backoff the last sweep left.
+pub(crate) fn auto_gc_backing_off(config: &Config, total: u64) -> bool {
+    auto_gc_backoff_holds(
+        read_auto_gc_backoff(&config.cache_dir),
+        unix_now_secs(),
+        total,
+        config.max_size,
+    )
+}
+
+/// Called by the auto-GC worker after its sweeps: store the next backoff, or
+/// clear it once the store is back under the trigger.
+pub(crate) fn record_auto_gc_outcome(config: &Config, size_after: u64) {
+    let path = auto_gc_backoff_path(&config.cache_dir);
+    let next = next_auto_gc_backoff(
+        read_auto_gc_backoff(&config.cache_dir),
+        unix_now_secs(),
+        size_after,
+        config.max_size,
+    );
+    let Some(next) = next else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    tracing::info!(
+        "auto-gc: store still at {} after the sweep (max {}); next automatic sweep in {}s at the earliest",
+        size_after,
+        config.max_size,
+        next.interval_secs
+    );
+    if let Ok(json) = serde_json::to_vec(&next)
+        && let Err(e) = crate::atomic::atomic_replace(&path, &json)
+    {
+        tracing::debug!("auto-gc: could not write {}: {e:#}", path.display());
+    }
+}
+
 /// Throttle stamp for the auto-GC size check. Lives next to the store so all
 /// wrappers sharing a cache dir share the throttle.
 fn auto_gc_stamp_path(cache_dir: &Path) -> PathBuf {
@@ -334,10 +453,8 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
             return false;
         }
     };
-    let threshold = config
-        .max_size
-        .saturating_add(config.max_size / 100 * AUTO_GC_SLACK_PERCENT);
-    if total <= threshold {
+    let threshold = auto_gc_threshold(config.max_size);
+    if total <= threshold || auto_gc_backing_off(config, total) {
         let now_str = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
@@ -7192,6 +7309,194 @@ mod tests {
             !auto_gc_wanted(&cfg, &store),
             "inside the slack band must not trigger"
         );
+    }
+
+    /// Age the auto-GC throttle stamp past the check interval.
+    fn expire_auto_gc_stamp(cfg: &Config) {
+        let stamp = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(auto_gc_stamp_path(&cfg.cache_dir))
+            .unwrap();
+        stamp
+            .set_modified(std::time::SystemTime::now() - AUTO_GC_CHECK_INTERVAL * 2)
+            .unwrap();
+    }
+
+    /// Store an idle entry whose blob a target directory still hardlinks:
+    /// eviction reaches it and cannot free it.
+    fn put_retained_entry(store: &Store, dir: &std::path::Path, key: &str) {
+        let src = dir.join(format!("{key}.o"));
+        std::fs::write(&src, &key.as_bytes().repeat(4096)[..4096]).unwrap();
+        store
+            .put(
+                key,
+                "test-crate",
+                &[],
+                &[],
+                "host",
+                "dev",
+                &[(src, format!("{key}.o"))],
+                "",
+                "",
+            )
+            .unwrap();
+        let meta = store.get(key).unwrap().unwrap();
+        std::fs::hard_link(
+            store.blob_path(&meta.files[0].hash),
+            dir.join(format!("{key}-target.o")),
+        )
+        .unwrap();
+        store.set_last_accessed_for_test(key, "-1 hour");
+    }
+
+    /// The production thrash: a store over budget whose bytes target
+    /// directories still hold. Every sweep freed nothing and the next check,
+    /// five minutes later, spawned another one, around the clock, contending
+    /// with builds for the index each time.
+    #[test]
+    fn auto_gc_backs_off_while_a_sweep_leaves_the_store_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1024;
+        let store = Store::open(&cfg).unwrap();
+        put_retained_entry(&store, dir.path(), "retained-1");
+        put_retained_entry(&store, dir.path(), "retained-2");
+
+        crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
+        assert!(store.contains("retained-1") && store.contains("retained-2"));
+        let backoff = read_auto_gc_backoff(&cfg.cache_dir).expect("backoff recorded");
+        assert_eq!(backoff.interval_secs, 600);
+        assert_eq!(backoff.size_after, 8192);
+
+        expire_auto_gc_stamp(&cfg);
+        assert!(
+            !auto_gc_wanted(&cfg, &store),
+            "a sweep that could not clear the pressure must not re-run at the next check"
+        );
+
+        crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
+        assert_eq!(
+            read_auto_gc_backoff(&cfg.cache_dir).unwrap().interval_secs,
+            1200,
+            "another fruitless sweep doubles the wait"
+        );
+
+        // New bytes past the slack may be reclaimable: the backoff yields.
+        put_test_entry(&store, dir.path(), "fresh");
+        expire_auto_gc_stamp(&cfg);
+        assert!(auto_gc_wanted(&cfg, &store));
+    }
+
+    #[test]
+    fn auto_gc_worker_leaves_the_backoff_alone_when_it_did_not_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1024;
+        let store = Store::open(&cfg).unwrap();
+        put_retained_entry(&store, dir.path(), "retained");
+
+        let gc_lock = store.try_gc_lock().unwrap().expect("gc lock");
+        crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
+        assert_eq!(read_auto_gc_backoff(&cfg.cache_dir), None);
+
+        drop(gc_lock);
+        crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
+        assert!(read_auto_gc_backoff(&cfg.cache_dir).is_some());
+    }
+
+    /// The backoff is stored and read back across processes, so its clock
+    /// must be the wall clock, not a constant every process agrees on.
+    #[test]
+    fn unix_now_secs_reads_the_wall_clock() {
+        let wall = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let before = wall();
+        let now = unix_now_secs();
+        let after = wall();
+        assert!(
+            before <= now && now <= after,
+            "{before} <= {now} <= {after}"
+        );
+    }
+
+    #[test]
+    fn next_auto_gc_backoff_doubles_to_the_cap_and_clears_under_budget() {
+        // max 1000: the trigger is 1100.
+        assert_eq!(next_auto_gc_backoff(None, 50, 1100, 1000), None);
+        let first = next_auto_gc_backoff(None, 50, 1101, 1000).unwrap();
+        assert_eq!(
+            first,
+            AutoGcBackoff {
+                since: 50,
+                interval_secs: 600,
+                size_after: 1101,
+            }
+        );
+        let second = next_auto_gc_backoff(Some(first), 90, 2000, 1000).unwrap();
+        assert_eq!(
+            second,
+            AutoGcBackoff {
+                since: 90,
+                interval_secs: 1200,
+                size_after: 2000,
+            }
+        );
+        let long = AutoGcBackoff {
+            interval_secs: 5000,
+            ..second
+        };
+        assert_eq!(
+            next_auto_gc_backoff(Some(long), 90, 2000, 1000)
+                .unwrap()
+                .interval_secs,
+            7200
+        );
+        assert_eq!(next_auto_gc_backoff(Some(second), 100, 900, 1000), None);
+    }
+
+    #[test]
+    fn auto_gc_backoff_holds_until_it_expires_or_the_store_grows() {
+        let backoff = Some(AutoGcBackoff {
+            since: 1000,
+            interval_secs: 600,
+            size_after: 5000,
+        });
+        // max 1000: the slack is 100 bytes.
+        assert!(!auto_gc_backoff_holds(None, 1000, 5000, 1000));
+        assert!(auto_gc_backoff_holds(backoff, 1599, 5000, 1000));
+        assert!(!auto_gc_backoff_holds(backoff, 1600, 5000, 1000));
+        assert!(auto_gc_backoff_holds(backoff, 1000, 5100, 1000));
+        assert!(!auto_gc_backoff_holds(backoff, 1000, 5101, 1000));
+        assert!(auto_gc_backoff_holds(backoff, 1000, 4000, 1000));
+    }
+
+    #[test]
+    fn record_auto_gc_outcome_persists_the_backoff_until_the_store_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1000;
+        let before = unix_now_secs();
+        record_auto_gc_outcome(&cfg, 5000);
+        let backoff = read_auto_gc_backoff(&cfg.cache_dir).unwrap();
+        assert_eq!((backoff.interval_secs, backoff.size_after), (600, 5000));
+        assert!(backoff.since >= before && backoff.since <= unix_now_secs());
+        assert!(auto_gc_backing_off(&cfg, 5000));
+
+        record_auto_gc_outcome(&cfg, 5000);
+        assert_eq!(
+            read_auto_gc_backoff(&cfg.cache_dir).unwrap().interval_secs,
+            1200
+        );
+
+        record_auto_gc_outcome(&cfg, 900);
+        assert!(!auto_gc_backoff_path(&cfg.cache_dir).exists());
+        assert!(!auto_gc_backing_off(&cfg, 5000));
     }
 
     /// #131: explain_miss names exactly the key groups whose digests changed

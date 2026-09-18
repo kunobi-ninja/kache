@@ -89,6 +89,10 @@ On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CAC
 
 By default, GC keeps an entry when removing its last store name would reclaim zero bytes. This preserves a usable cache hit. It also means the registered store size can remain above `local_max_size` until the target output is removed. `kache gc` reports these entries as unreclaimable and separates store bytes removed from disk bytes reclaimed.
 
+When an automatic sweep leaves the store over budget, the next automatic sweep waits 10 minutes. Each further sweep that ends over budget doubles the wait, up to 2 hours. The wait ends early when the store grows by more than 10% of `local_max_size`, and resets once a sweep brings the store back under budget. The state lives in `auto-gc-backoff.json` in the cache dir. `kache gc` ignores it.
+
+A sweep pauses for 150 ms after every 50 ms of index writes, and after each removal that finds a build holding the index write lock, so builds storing entries are not held up by it.
+
 To reclaim the blocks, remove the retaining build output. For known stale targets, preview Kache's machine-local registry before deleting anything:
 
 ```bash

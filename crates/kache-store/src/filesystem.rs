@@ -63,18 +63,21 @@ pub fn retainer_from_meta(path: &Path) -> Option<BlobRetainer> {
         return None;
     }
     let size = meta.len();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.nlink() > 1 {
-            return Some(BlobRetainer {
-                size,
-                cloned: true,
-                private_bytes: 0,
-            });
-        }
+    let (sharing, links) = crate::sharing::probe_with_links(path, size);
+    // A blob a build's target directory still hardlinks frees nothing when the
+    // store drops its own name (kunobi-ninja/kache#725). This used to read
+    // `MetadataExt::nlink` behind `#[cfg(unix)]`, so on Windows the guard did
+    // not exist at all and GC evicted still-linked entries, reclaiming no disk
+    // and destroying the hits. NTFS has hardlinks, `cache.windows_hardlink`
+    // and `cache.shared_hardlink_restores` make them, and a link made by
+    // anything else holds the blocks just the same.
+    if links > 1 {
+        return Some(BlobRetainer {
+            size,
+            cloned: true,
+            private_bytes: 0,
+        });
     }
-    let sharing = crate::sharing::probe(path, size);
     Some(retainer_from_sharing(size, sharing))
 }
 
@@ -132,6 +135,38 @@ mod tests {
         );
         assert!(!r.cloned, "partly private blobs can reclaim some disk");
         assert_eq!(r.private_bytes, 1024);
+    }
+
+    /// The #725 guard on every platform kache ships on. Hardlinks exist on
+    /// NTFS too, and the count must not come from `MetadataExt`, which only
+    /// Unix has — a Unix-gated guard let Windows GC evict entries whose blobs
+    /// a target directory still held, freeing nothing.
+    #[test]
+    fn a_hardlinked_blob_reclaims_nothing_and_is_reported_as_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.bin");
+        std::fs::write(&blob, vec![7u8; 4096]).unwrap();
+
+        let alone = retainer_from_meta(&blob).expect("a plain file measures");
+        assert!(!alone.cloned, "an unlinked blob is reclaimable");
+        assert_eq!(alone.private_bytes, 4096);
+        assert!(!blob_has_external_retainer(&blob));
+        assert_eq!(blob_reclaimable_bytes(&blob), Some(4096));
+
+        std::fs::hard_link(&blob, dir.path().join("target-copy.bin")).unwrap();
+        let linked = retainer_from_meta(&blob).expect("a hardlinked file measures");
+        assert!(linked.cloned, "a second name still holds every block");
+        assert_eq!(linked.size, 4096, "the logical size is still reported");
+        assert_eq!(linked.private_bytes, 0);
+        assert!(blob_has_external_retainer(&blob));
+        assert_eq!(blob_reclaimable_bytes(&blob), Some(0));
+
+        assert_eq!(
+            retainer_from_meta(dir.path()).map(|r| r.size),
+            None,
+            "a directory is not a blob"
+        );
+        assert_eq!(blob_reclaimable_bytes(&dir.path().join("missing")), None);
     }
 
     #[test]

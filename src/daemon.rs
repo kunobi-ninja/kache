@@ -5652,7 +5652,11 @@ impl Daemon {
                 tracing::debug!("gc.lock held by another GC; skipping upload-triggered eviction");
                 return Ok(());
             };
-            if size > self.config.max_size {
+            // A store the last sweep could not bring under budget stays over
+            // it after every upload; sweeping again per upload frees nothing.
+            if size > self.config.max_size
+                && !crate::wrapper::auto_gc_backing_off(&self.config, size)
+            {
                 tracing::info!(
                     "store size {} > max {}, running LRU eviction",
                     size,
@@ -5665,6 +5669,9 @@ impl Daemon {
                     stats.duration_ms = started.elapsed().as_millis() as u64;
                     if let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats) {
                         tracing::warn!("recording upload-triggered GC run: {e:#}");
+                    }
+                    if let Ok(after) = store.physical_size() {
+                        crate::wrapper::record_auto_gc_outcome(&self.config, after);
                     }
                 }
             }
@@ -9508,6 +9515,46 @@ mod tests {
     // there) it resolves to named pipes.
     use crate::transport::{ListenerOptions, TokioListener, TokioStream, socket_name};
 
+    /// A sibling of `socket_path` that no earlier bind in this process has
+    /// used.
+    ///
+    /// On Unix the endpoint is a filesystem path and rebinding the same name
+    /// after the listener is gone is harmless. On Windows `socket_name` hashes
+    /// the path into the machine-wide `\\.\pipe\` namespace, and
+    /// `CreateNamedPipe` refuses a name any instance of the previous listener
+    /// still holds — with `ERROR_ACCESS_DENIED`, not `ERROR_ALREADY_EXISTS`.
+    /// Those instances go away when the OS closes the old handles, which is
+    /// not ordered against the next bind, so two binds on one name race
+    /// (kunobi-ninja/kache#1107). The process-wide counter keeps every bind on
+    /// its own name; the caller's temp dir keeps it off the names concurrent
+    /// nextest processes use.
+    fn fresh_endpoint(socket_path: &Path) -> std::path::PathBuf {
+        static BINDS: AtomicU64 = AtomicU64::new(0);
+        let n = BINDS.fetch_add(1, Ordering::Relaxed);
+        socket_path.with_file_name(format!("daemon-{n}.sock"))
+    }
+
+    /// #1107: two binds derived from one socket path must be live at the same
+    /// time. Binding both proves it on every platform — a repeated name is
+    /// `EADDRINUSE` on Unix and `ERROR_ACCESS_DENIED` on Windows, and either
+    /// way `bind_listener` panics here instead of intermittently in whichever
+    /// test happened to ask for a second roundtrip.
+    #[tokio::test]
+    async fn each_bind_gets_an_endpoint_name_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        let first = fresh_endpoint(&socket_path);
+        let second = fresh_endpoint(&socket_path);
+        assert_ne!(first, second, "a reused name is the collision itself");
+        assert_eq!(
+            (first.parent(), second.parent()),
+            (socket_path.parent(), socket_path.parent()),
+            "endpoints stay beside the socket path the caller gave"
+        );
+        let _first = bind_listener(&first);
+        let _second = bind_listener(&second);
+    }
+
     /// Bind a daemon-style listener at `path`, taking the cross-platform
     /// transport. Used by every roundtrip test to remove boilerplate.
     fn bind_listener(path: &Path) -> TokioListener {
@@ -9644,6 +9691,11 @@ mod tests {
     /// connect/serve/teardown ordering lives in one place and the macOS EOF
     /// hang (see `client_roundtrip`) cannot be reintroduced piecemeal.
     async fn one_shot_request(daemon: &Arc<Daemon>, socket_path: &Path, req: &Request) -> Response {
+        // One endpoint per call: a test that asks for two roundtrips would
+        // otherwise bind the same name twice (#1107). Both the listener and
+        // the client below use the derived path, so callers keep passing the
+        // socket path their config reports.
+        let socket_path = &fresh_endpoint(socket_path);
         let listener = bind_listener(socket_path);
 
         let server_daemon = daemon.clone();
@@ -11957,6 +12009,73 @@ mod tests {
         let recorded = crate::report::read_gc_stats(dir.path()).expect("gc_stats.json written");
         assert_eq!(recorded.source, "daemon");
         assert_eq!(recorded.entries_evicted, 1);
+    }
+
+    /// Store an idle `size`-byte entry for the upload-eviction tests; with
+    /// `retained`, a target directory still hardlinks its blob.
+    fn put_upload_evict_entry(
+        store: &Store,
+        dir: &std::path::Path,
+        key: &str,
+        size: usize,
+        retained: bool,
+    ) {
+        let src_file = dir.join(format!("{key}.rlib"));
+        std::fs::write(&src_file, &key.repeat(size)[..size]).unwrap();
+        store
+            .put(
+                key,
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(src_file.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        std::fs::remove_file(&src_file).unwrap();
+        if retained {
+            let meta = store.get(key).unwrap().unwrap();
+            std::fs::hard_link(
+                store.blob_path(&meta.files[0].hash),
+                dir.join(format!("{key}-target.rlib")),
+            )
+            .unwrap();
+        }
+        store.set_last_accessed_for_test(key, "-1 hour");
+    }
+
+    /// Every upload used to start another full sweep of a store the last
+    /// sweep had already failed to bring under budget.
+    #[test]
+    fn upload_triggered_eviction_waits_out_the_auto_gc_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        for i in 0..6 {
+            put_upload_evict_entry(&store, dir.path(), &format!("retained_{i}"), 200, true);
+        }
+        put_upload_evict_entry(&store, dir.path(), "evictable", 50, false);
+
+        let daemon = Daemon::new(config.clone());
+        daemon.maybe_evict_after_upload();
+        assert!(!store.contains("evictable"));
+        assert!(store.contains("retained_0"));
+        assert!(
+            dir.path().join("auto-gc-backoff.json").exists(),
+            "a sweep that leaves the store over budget records a backoff"
+        );
+
+        // Growth inside the slack: nothing a sweep could not already free.
+        put_upload_evict_entry(&store, dir.path(), "next", 50, false);
+        daemon.maybe_evict_after_upload();
+        assert!(
+            store.contains("next"),
+            "the next upload must not sweep again during the backoff"
+        );
     }
 
     #[test]

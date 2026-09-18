@@ -75,6 +75,10 @@ class ChangeTests(unittest.TestCase):
                 ".github/workflows/bench.yml",
                 ".github/workflows/bench-firefox-windows.yml",
                 ".github/workflows/bench-sccache.yml",
+                "scripts/perf-gate-local.py",
+                "scripts/test-perf-gate-local.py",
+                "scripts/trace-phases.py",
+                "scripts/test-trace-phases.py",
             ),
             {"check": True, "tests": False, "e2e": False, "nix": False},
         )

@@ -185,6 +185,7 @@ class BenchTests(unittest.TestCase):
                 mbx="/mbx",
                 samples=6,
                 order_seed=0,
+                cold_every=3,
                 skip_contention=False,
             )
             calls = []
@@ -358,6 +359,41 @@ class BenchTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "incomplete contention"):
                     bench.run_contention(args, arms)
 
+    def test_a_missing_context_tool_skips_its_arm_and_a_named_one_does_not(self):
+        """A laptop without sccache should still measure head against base.
+
+        Before this, the run cloned the subject, built it, and only then died
+        because a bare `sccache` was not on PATH.
+        """
+        args = argparse.Namespace(sccache="sccache", mbx="mbx", base="/base")
+        with patch.object(bench.shutil, "which", return_value=None):
+            self.assertFalse(bench.wanted_arm(("sccache", "sccache", "sccache"), args))
+            self.assertFalse(bench.wanted_arm(("mbx", "mbx", "mbx"), args))
+            # The arms that decide the verdict are never skipped away.
+            self.assertTrue(bench.wanted_arm(("head", "kache", "/kache"), args))
+            self.assertTrue(bench.wanted_arm(("base", "kache", "/base"), args))
+
+        # Asking for a specific binary keeps the arm, so a wrong path is still
+        # an error rather than a silently missing comparison.
+        named = argparse.Namespace(sccache="/opt/sccache", mbx="mbx", base=None)
+        with patch.object(bench.shutil, "which", return_value=None):
+            self.assertTrue(bench.wanted_arm(("sccache", "sccache", "/opt/sccache"), named))
+
+        with patch.object(bench.shutil, "which", return_value="/usr/bin/sccache"):
+            self.assertTrue(bench.wanted_arm(("sccache", "sccache", "sccache"), args))
+
+    def test_cold_every_one_measures_every_cold_build(self):
+        """A change aimed at cold needs more than one cold measurement.
+
+        The default reuses a cold build for two samples out of three, so
+        `--samples 3` yields three warm pairs and a single cold one.
+        """
+        default = [bench.cold_is_reused(sample, 3) for sample in range(6)]
+        self.assertEqual(default, [False, True, True, False, True, True])
+
+        every = [bench.cold_is_reused(sample, 1) for sample in range(4)]
+        self.assertEqual(every, [False, False, False, False])
+
     def test_subprocess_failure_keeps_logs_and_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -372,6 +408,7 @@ class BenchTests(unittest.TestCase):
                 mbx="/mbx",
                 samples=1,
                 order_seed=0,
+                cold_every=3,
                 skip_contention=True,
             )
             with patch.object(

@@ -18,7 +18,7 @@ pub fn login(device: bool, retrust: bool) -> Result<()> {
         crate::planner_client::ensure_crypto_provider();
         println!("Discovering the planner's login at {endpoint}...");
         let service = discover_for_login(&endpoint, retrust).await?;
-        let client = AuthClient::new(service)?;
+        let client = scoped_client(service)?;
         if device {
             client
                 .device_login(DEVICE_SCOPE, print_device_prompt)
@@ -37,10 +37,17 @@ pub fn logout() -> Result<()> {
     runtime()?.block_on(async {
         crate::planner_client::ensure_crypto_provider();
         let service = kunobi_auth::client::discover(&endpoint).await?;
-        AuthClient::new(service)?.logout_async().await?;
+        scoped_client(service)?.logout_async().await?;
         println!("Logged out of the planner at {endpoint} (session revoked at the IdP).");
         Ok(())
     })
+}
+
+/// Sessions are stored per issuer and client id, so logging in here never
+/// replaces another Kunobi tool's session for the same issuer.
+fn scoped_client(service: ServiceConfig) -> Result<AuthClient> {
+    let store = crate::planner_auth::ScopedTokenStore::new(&service.client_id)?;
+    Ok(AuthClient::with_storage(service, Box::new(store)))
 }
 
 fn planner_endpoint() -> Result<String> {

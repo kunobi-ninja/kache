@@ -174,6 +174,39 @@ CIAe12xZratKWzRoekhOUBIDCZChRANCAAQitjpgInyqDv9dQ4D0FZ4SiZX+KaqP
     const X: &str = "IrY6YCJ8qg7_XUOA9BWeEomV_imqj-Lkv6sbU0KD3y4";
     const Y: &str = "vJqYUpLxJhr-67SFxL4BLDHJPGwwE24yl0EEL6YsE44";
 
+    // A throwaway RSA-2048 key, for the RS256 path Clerk and GitHub use.
+    const RSA_KID: &str = "kache-test-rsa";
+    const RSA_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDgrkZGAG57hb1e
+Xjbcfe+87WReOoq9dirBzKFl2IUcbhcQ+HCmk8dHj9mcBGBLf0MhPpcE/Sh62j/f
+/i9vHIB+DoMAJc2M4FA6fNptgcsN+aq6uQyZdDgYeG3HvLGs7skxeCcEXlxzmUVG
+RO9GoQ2zmdjsg+gMMpyH5idAXeYZRLdpCZhImXIoa6VH/n3sJ/4x4JuBBY6I/NMG
+zYTCnUGPJ7LTWOZj+jxfcGM2QdLP4SPJh/ctiCnDYAvmJxcFkp/Bh3Y1Ms3p04SP
+5SbFs83mOgCHgpUyG9QFlt5UA8dVQSWne/EguYFvxyAPkjAUhU8F5D0aXtU2j+Pm
+yTRWHxhrAgMBAAECggEAS3Hpsf7aGos9m+8J//8f3fJe9g81YEpKMDpc5dyPUg0b
+nLy34w+TZpHEshF8Hk3VBlhEkM3LZnlb4oSxe993vBx2W7nV7Fy0Q/eBxyzCuOYh
+sMKLmwm9/mWOA3h2twmVsJFWlK503/JTIzXpnO9esPTTtRPT+yiRjEa53nDJX6kk
+xGJg7aN7eG7SPtM5ZonqMdMWYMd/TNUpYJdTbByUjWcRaMW2ak7yR3lVxIVpxW0v
+NqpFQtQ2SxdWK9HZYTAdOvm8xRPjArxrno2ulB+jvBIvKAUclMNMQHNcMQoCRSXO
+gngAqqByrCA7ZrH4CCF/xeyKPYw50eBUKikzyowrCQKBgQD3B/x7/NtqLwzSwBx+
+1zDPOFUA4yJPwycBjzCFwlIK/CF+whogE1euM3kooU+VUyx37mtQjAWSqWvTGIcn
+/eTeJ3nA1FCNNNJT9BrwMr+IGH0kfRdrxcYg2nid25weDil3XmVFJhYgS11sAYtF
+dny6CexJCihoJ/BL3oBUfhDuaQKBgQDo1o2/5rGliYoopcwWx+rBvqCI+hp0Q1Hu
+7Lg2D34AKVfwQsnWm01ypi+Nes+PHIZ1N8G5Fdtt8kXG/B8OVu8WdQU/nthCURiX
+WFU2puP3B2K5l921xqGF61ViapgkyFzNRD/GcUT7CIqhSTGPZYU5XT1NGExBuSkP
+SBfCv0KdswKBgQDL2ItAxSdKOAkc3+qjwG9Gj/WVBdkKeL93SfGAbxnEdsotD37/
+ePahiVgxbut9DWVkkhl8Hg97NtMDHvpoxdpWd7zAonLWEwB8xrJ0A2yJoauisJbj
+GBCmi6F8ofvx0T3mgr6OkR8xBv/QYHXMnDnQSt/wZbFyQYLJGJJNJrpSAQKBgHw6
+1aC5Hrma++saIx1Yh0neQtsyzmCP9qxLAzJc67Z8WJ4plHV7oUP1pVOQXiQWbSsn
+l6YAIna0GETGCm/lNGXABA/g2bPwfvVpPPYO73zDJQqvG608ELxaRtFe3FRrzw/6
+RSjFEK/767OIUPgYi4+Czw1OVImQmHa92WegEpP/AoGAcA/+gNO17Byg1HYcw7PM
+CKsAI1KGZ5NmzVlXyS5ZJ2kacSNYU/mS6/luQ4hUUcHZWhcF6rFe9fgDRM6MUTv/
+J6xTV3yXyjfPzsyg25edgkVLvHhvPy+/uwjddn15qhr8qlRF4OUnFfghTnOBynog
+3wVBRqOg4tMbRcesdYgYwWw=
+-----END PRIVATE KEY-----
+";
+    const RSA_N: &str = "4K5GRgBue4W9Xl423H3vvO1kXjqKvXYqwcyhZdiFHG4XEPhwppPHR4_ZnARgS39DIT6XBP0oeto_3_4vbxyAfg6DACXNjOBQOnzabYHLDfmqurkMmXQ4GHhtx7yxrO7JMXgnBF5cc5lFRkTvRqENs5nY7IPoDDKch-YnQF3mGUS3aQmYSJlyKGulR_597Cf-MeCbgQWOiPzTBs2Ewp1Bjyey01jmY_o8X3BjNkHSz-EjyYf3LYgpw2AL5icXBZKfwYd2NTLN6dOEj-UmxbPN5joAh4KVMhvUBZbeVAPHVUElp3vxILmBb8cgD5IwFIVPBeQ9Gl7VNo_j5sk0Vh8Yaw";
+
     /// Serves the test JWKS at both paths the providers use; returns the
     /// base URL, which doubles as the issuer.
     async fn test_idp() -> String {
@@ -181,6 +214,9 @@ CIAe12xZratKWzRoekhOUBIDCZChRANCAAQitjpgInyqDv9dQ4D0FZ4SiZX+KaqP
             Json(json!({"keys": [{
                 "kty": "EC", "crv": "P-256", "kid": KID, "alg": "ES256", "use": "sig",
                 "x": X, "y": Y,
+            }, {
+                "kty": "RSA", "kid": RSA_KID, "alg": "RS256", "use": "sig",
+                "n": RSA_N, "e": "AQAB",
             }]}))
         };
         let app = Router::new()
@@ -197,6 +233,14 @@ CIAe12xZratKWzRoekhOUBIDCZChRANCAAQitjpgInyqDv9dQ4D0FZ4SiZX+KaqP
         let mut header = Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some(KID.to_string());
         let key = EncodingKey::from_ec_pem(PRIV_PEM.as_bytes()).unwrap();
+        jsonwebtoken::encode(&header, &claims, &key).unwrap()
+    }
+
+    fn sign_rs256(claims: Value) -> String {
+        kunobi_auth::ensure_crypto_provider();
+        let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(RSA_KID.to_string());
+        let key = EncodingKey::from_rsa_pem(RSA_PEM.as_bytes()).unwrap();
         jsonwebtoken::encode(&header, &claims, &key).unwrap()
     }
 
@@ -358,6 +402,41 @@ CIAe12xZratKWzRoekhOUBIDCZChRANCAAQitjpgInyqDv9dQ4D0FZ4SiZX+KaqP
         let token = sign(github_claims(&issuer, None));
         assert!(
             auth(&settings("http://unused.invalid"), &issuer)
+                .authenticate(&token)
+                .await
+                .is_err()
+        );
+    }
+
+    /// The production algorithm list: what Clerk and GitHub actually sign.
+    fn production(settings: &AuthSettings, github_issuer: &str) -> PlannerAuth {
+        PlannerAuth::build(settings, github_issuer, PRODUCTION_ALGORITHMS).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rs256_kunobi_and_github_tokens_pass_the_production_algorithms() {
+        let issuer = test_idp().await;
+        let auth = production(&settings(&issuer), &issuer);
+        let kunobi =
+            sign_rs256(json!({"iss": issuer, "aud": "kache-cli", "sub": "user_1", "exp": exp()}));
+        assert_eq!(
+            auth.authenticate(&kunobi).await.unwrap().provider,
+            KUNOBI_PROVIDER
+        );
+        let github = sign_rs256(github_claims(&issuer, Some("kunobi-ninja")));
+        // Same issuer serves both providers here; the audience picks GitHub.
+        assert_eq!(
+            auth.authenticate(&github).await.unwrap().provider,
+            GITHUB_PROVIDER
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_signed_with_another_algorithm_is_rejected_in_production() {
+        let issuer = test_idp().await;
+        let token = sign(json!({"iss": issuer, "aud": "kache-cli", "sub": "user_1", "exp": exp()}));
+        assert!(
+            production(&settings(&issuer), "http://unused.invalid")
                 .authenticate(&token)
                 .await
                 .is_err()

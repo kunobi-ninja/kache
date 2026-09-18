@@ -44,7 +44,9 @@ With no provider configured, the planner accepts anonymous requests. Configure a
 
 **Kunobi login.** Register a public OAuth client (PKCE, no secret) with redirect URI `http://localhost:8329/callback` and scopes `openid profile email offline_access`; enable the device grant for `kache login --device`. The client id is the accepted token audience. The service advertises the issuer and client id at `/.well-known/kunobi-auth`, which is how `kache login` finds them.
 
-**GitHub Actions.** Tokens must carry the configured audience, and their `repository_owner` claim must match one of the `--github-owner` values (case-insensitive). The service refuses to start with an audience but no owner, since that would trust every repository on GitHub. The kache client fetches the job's token itself when `ACTIONS_ID_TOKEN_REQUEST_URL` is present; its audience is `KACHE_PLANNER_GITHUB_AUDIENCE` / `cache.planner.github_audience` (default `kache`).
+**GitHub Actions.** Tokens must carry the configured audience, and their `repository_owner` claim must match one of the `--github-owner` values (case-insensitive). The service refuses to start with an audience but no owner, since that would trust every repository on GitHub. The kache client fetches the job's token itself when `ACTIONS_ID_TOKEN_REQUEST_URL` is present. Its audience defaults to the planner's base URL (for example `https://kache.example.com`), which binds the token to this planner so no other endpoint can replay it; set the service's `--github-oidc-audience` to that URL. Clients can override the audience with `KACHE_PLANNER_GITHUB_AUDIENCE` / `cache.planner.github_audience`.
+
+Clients send these automatic credentials only to a planner reached over HTTPS (or on loopback), and a Kunobi session only to a planner trusted with `kache login`.
 
 A client that cannot authenticate plans locally, exactly as when the planner is unreachable.
 
@@ -62,7 +64,7 @@ auth:
     issuer: https://clerk.kunobi.com
     clientId: <public client id>
   githubOidc:
-    audience: kache
+    audience: https://kache.example.com   # the URL clients use
     owners: [my-org]
 ```
 

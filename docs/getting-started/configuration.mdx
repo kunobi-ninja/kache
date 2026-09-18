@@ -261,7 +261,7 @@ See [S3 setup](/docs/remote-cache/s3-setup) or [filesystem setup](/docs/remote-c
 | `KACHE_PLANNER_ENDPOINT` | `cache.planner.endpoint` | none | Planner service URL |
 | `KACHE_PLANNER_TIMEOUT_MS` | `cache.planner.timeout_ms` | `750` | Planner request timeout |
 | `KACHE_PLANNER_TOKEN` | `cache.planner.token` | none | Bearer token |
-| `KACHE_PLANNER_GITHUB_AUDIENCE` | `cache.planner.github_audience` | `kache` | Audience requested for the GitHub Actions ID token |
+| `KACHE_PLANNER_GITHUB_AUDIENCE` | `cache.planner.github_audience` | planner base URL | Audience requested for the GitHub Actions ID token |
 | `KACHE_NAMESPACE` | none | none | Shard namespace used by manifest upload and prefetch |
 
 On a long-lived runner with a warm local store, speculative prefetch may be unnecessary:
@@ -278,8 +278,10 @@ Exact remote lookup and background upload continue to work.
 A planner that requires authentication gets a bearer from the first of these that applies:
 
 1. `KACHE_PLANNER_TOKEN` / `cache.planner.token`, when set.
-2. In GitHub Actions, the job's OIDC ID token for `KACHE_PLANNER_GITHUB_AUDIENCE` (default `kache`). The job needs `permissions: id-token: write`, and the planner must trust the repository's owner.
-3. Your Kunobi session. Run `kache login` once; the daemon refreshes it quietly from then on. Use `kache login --device` on a machine without a browser, and `kache logout` to revoke it.
+2. In GitHub Actions, the job's OIDC ID token. Its audience is the planner's base URL unless `KACHE_PLANNER_GITHUB_AUDIENCE` says otherwise. The job needs `permissions: id-token: write`, and the planner must trust the repository's owner.
+3. Your Kunobi session. Run `kache login` once: it trusts this planner and stores a session that the daemon refreshes quietly from then on. The session is kept per planner client, so it never replaces another Kunobi tool's login.
+
+The second and third are sent only to a planner reached over HTTPS (or on loopback), and a session only to a planner you logged in to, so a planner URL picked up from a project's config cannot collect your credentials. Use `kache login --device` on a machine without a browser, and `kache logout` to revoke it.
 
 Nothing here prompts during a build. Without a usable bearer the planner answers 401 and kache plans locally, the same as when the planner is unreachable. If the planner's login issuer changes after you first trusted it, `kache login` refuses; run `kache login --retrust` when the change is expected.
 

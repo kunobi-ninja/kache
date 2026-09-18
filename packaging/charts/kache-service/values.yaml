@@ -46,7 +46,9 @@ auth:
     issuer: ""
     clientId: ""
   # GitHub Actions ID tokens issued for this audience, accepted only from
-  # these repository owners. Jobs need `permissions: id-token: write`.
+  # these repository owners. Jobs need `permissions: id-token: write`. The
+  # kache client requests the planner's base URL as audience by default, so
+  # set this to the URL clients use (e.g. the Ingress host).
   githubOidc:
     audience: ""
     owners: []

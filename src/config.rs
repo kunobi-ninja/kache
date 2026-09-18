@@ -9,9 +9,6 @@ pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 0;
 /// Default in-flight heartbeat cadence (kunobi-ninja/kache#131).
 pub const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 pub const DEFAULT_PLANNER_TIMEOUT_MS: u64 = 750;
-/// Audience the client requests for a GitHub Actions ID token, and what the
-/// planner service accepts by default.
-pub const DEFAULT_PLANNER_GITHUB_AUDIENCE: &str = "kache";
 pub const DEFAULT_S3_POOL_IDLE_SECS: u64 = 300;
 
 /// Prefetch plan budgets (kunobi-ninja/kache#616). These bound a pathological
@@ -452,7 +449,9 @@ pub struct PlannerConfig {
     pub timeout_ms: u64,
     pub token: Option<String>,
     /// Audience for the GitHub Actions ID token sent when no token is set.
-    pub github_audience: String,
+    /// `None` means the planner's own base URL, which binds the token to this
+    /// planner so no other endpoint can replay it.
+    pub github_audience: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2424,8 +2423,7 @@ impl Config {
                     .and_then(|c| c.github_audience.clone())
             })
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_PLANNER_GITHUB_AUDIENCE.to_string());
+            .filter(|s| !s.is_empty());
 
         Some(PlannerConfig {
             endpoint,

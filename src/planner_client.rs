@@ -40,8 +40,19 @@ pub async fn resolve_prefetch_plan_with_config(
         .build()
         .context("building planner client")?;
 
-    let mut request = client.post(prefetch_plan_url(&config.endpoint)).json(req);
-    if let Some(token) = crate::planner_auth::bearer(config).await {
+    // One deadline covers resolving the bearer and the plan request, so auth
+    // never stretches the planner's time budget.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(config.timeout_ms);
+    let bearer = crate::planner_auth::bearer(config, deadline).await;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("planner timeout spent before the request could be sent");
+    }
+    let mut request = client
+        .post(prefetch_plan_url(&config.endpoint))
+        .timeout(remaining)
+        .json(req);
+    if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
 
@@ -170,7 +181,7 @@ mod tests {
             endpoint,
             timeout_ms: 1000,
             token: Some("token-123".into()),
-            github_audience: "kache".to_string(),
+            github_audience: None,
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],
@@ -200,7 +211,7 @@ mod tests {
             endpoint,
             timeout_ms: 1000,
             token: None,
-            github_audience: "kache".to_string(),
+            github_audience: None,
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],
@@ -229,7 +240,7 @@ mod tests {
             endpoint,
             timeout_ms: 1000,
             token: None,
-            github_audience: "kache".to_string(),
+            github_audience: None,
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],

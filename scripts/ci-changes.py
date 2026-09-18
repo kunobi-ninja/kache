@@ -39,7 +39,11 @@ CATEGORIES = (
         (
             r"^scripts/(bench-short|test-bench-short|perf-gate-report)\.py$",
             r"^scripts/install-bench-mbx\.sh$",
-            r"^\.github/workflows/(bench|perf-gate|perf-gate-preflight)\.yml$",
+            # Every `bench*.yml`: the benchmark is split across several
+            # workflows now (the Firefox/Windows arms and the sccache
+            # comparison have their own), and an unmatched path falls through
+            # to "unknown", which runs the entire suite for a comment change.
+            r"^\.github/workflows/(bench(-[a-z0-9-]+)?|perf-gate|perf-gate-preflight)\.yml$",
         ),
         ("check",),
     ),

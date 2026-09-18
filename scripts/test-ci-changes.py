@@ -73,9 +73,15 @@ class ChangeTests(unittest.TestCase):
                 ".github/workflows/perf-gate.yml",
                 ".github/workflows/perf-gate-preflight.yml",
                 ".github/workflows/bench.yml",
+                ".github/workflows/bench-firefox-windows.yml",
+                ".github/workflows/bench-sccache.yml",
             ),
             {"check": True, "tests": False, "e2e": False, "nix": False},
         )
+
+    def test_an_unrelated_workflow_still_runs_everything(self):
+        """The `bench*` rule must not swallow workflows that only start alike."""
+        self.assertEqual(self.groups(".github/workflows/benchmark-release.yml"), ALL)
 
     def test_scenarios_run_check_and_e2e(self):
         self.assertEqual(

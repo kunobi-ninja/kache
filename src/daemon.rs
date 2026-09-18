@@ -9515,6 +9515,46 @@ mod tests {
     // there) it resolves to named pipes.
     use crate::transport::{ListenerOptions, TokioListener, TokioStream, socket_name};
 
+    /// A sibling of `socket_path` that no earlier bind in this process has
+    /// used.
+    ///
+    /// On Unix the endpoint is a filesystem path and rebinding the same name
+    /// after the listener is gone is harmless. On Windows `socket_name` hashes
+    /// the path into the machine-wide `\\.\pipe\` namespace, and
+    /// `CreateNamedPipe` refuses a name any instance of the previous listener
+    /// still holds — with `ERROR_ACCESS_DENIED`, not `ERROR_ALREADY_EXISTS`.
+    /// Those instances go away when the OS closes the old handles, which is
+    /// not ordered against the next bind, so two binds on one name race
+    /// (kunobi-ninja/kache#1107). The process-wide counter keeps every bind on
+    /// its own name; the caller's temp dir keeps it off the names concurrent
+    /// nextest processes use.
+    fn fresh_endpoint(socket_path: &Path) -> std::path::PathBuf {
+        static BINDS: AtomicU64 = AtomicU64::new(0);
+        let n = BINDS.fetch_add(1, Ordering::Relaxed);
+        socket_path.with_file_name(format!("daemon-{n}.sock"))
+    }
+
+    /// #1107: two binds derived from one socket path must be live at the same
+    /// time. Binding both proves it on every platform — a repeated name is
+    /// `EADDRINUSE` on Unix and `ERROR_ACCESS_DENIED` on Windows, and either
+    /// way `bind_listener` panics here instead of intermittently in whichever
+    /// test happened to ask for a second roundtrip.
+    #[tokio::test]
+    async fn each_bind_gets_an_endpoint_name_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        let first = fresh_endpoint(&socket_path);
+        let second = fresh_endpoint(&socket_path);
+        assert_ne!(first, second, "a reused name is the collision itself");
+        assert_eq!(
+            (first.parent(), second.parent()),
+            (socket_path.parent(), socket_path.parent()),
+            "endpoints stay beside the socket path the caller gave"
+        );
+        let _first = bind_listener(&first);
+        let _second = bind_listener(&second);
+    }
+
     /// Bind a daemon-style listener at `path`, taking the cross-platform
     /// transport. Used by every roundtrip test to remove boilerplate.
     fn bind_listener(path: &Path) -> TokioListener {
@@ -9651,6 +9691,11 @@ mod tests {
     /// connect/serve/teardown ordering lives in one place and the macOS EOF
     /// hang (see `client_roundtrip`) cannot be reintroduced piecemeal.
     async fn one_shot_request(daemon: &Arc<Daemon>, socket_path: &Path, req: &Request) -> Response {
+        // One endpoint per call: a test that asks for two roundtrips would
+        // otherwise bind the same name twice (#1107). Both the listener and
+        // the client below use the derived path, so callers keep passing the
+        // socket path their config reports.
+        let socket_path = &fresh_endpoint(socket_path);
         let listener = bind_listener(socket_path);
 
         let server_daemon = daemon.clone();

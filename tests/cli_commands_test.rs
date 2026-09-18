@@ -149,6 +149,22 @@ fn cc_available() -> bool {
 
 // ── version / help / dispatch ───────────────────────────────────────────────
 
+/// `kache login` / `kache logout` are dispatched before the config is loaded;
+/// without a planner they stop with a pointer to the setting instead of
+/// trying to reach an identity provider.
+#[test]
+fn login_and_logout_need_a_planner() {
+    let e = env();
+    for command in ["login", "logout"] {
+        kache(&e.home, &e.cache)
+            .arg(command)
+            .env_remove("KACHE_PLANNER_ENDPOINT")
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains("no planner is configured"));
+    }
+}
+
 #[test]
 fn version_prints_package_version() {
     let e = env();

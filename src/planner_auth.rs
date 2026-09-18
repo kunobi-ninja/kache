@@ -382,6 +382,18 @@ pub(crate) async fn session_lock(
         .context("no config directory for the session lock")?
         .join("kunobi")
         .join("locks");
+    session_lock_in(dir, issuer, client_id, wait, || {}).await
+}
+
+/// [`session_lock`] in `dir`; `on_wait` runs each time the lock is found
+/// held and the caller keeps waiting.
+async fn session_lock_in(
+    dir: std::path::PathBuf,
+    issuer: &str,
+    client_id: &str,
+    wait: Duration,
+    on_wait: impl Fn() + Send + 'static,
+) -> Result<std::fs::File> {
     let key = blake3::hash(format!("kache\0{issuer}\0{client_id}").as_bytes()).to_hex();
     let path = dir.join(format!("kache-session-{}.lock", &key[..16]));
     tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
@@ -397,6 +409,7 @@ pub(crate) async fn session_lock(
             match file.try_lock() {
                 Ok(()) => return Ok(file),
                 Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                    on_wait();
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
@@ -635,26 +648,41 @@ mod tests {
         assert!(kobe.load(issuer).unwrap().is_some());
     }
 
+    async fn lock_in(
+        dir: &tempfile::TempDir,
+        client_id: &str,
+        wait: Duration,
+    ) -> Result<std::fs::File> {
+        session_lock_in(
+            dir.path().to_path_buf(),
+            "https://idp.example",
+            client_id,
+            wait,
+            || {},
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn the_session_lock_excludes_a_second_holder_until_released() {
-        let issuer = format!("https://lock-test-{}.example", std::process::id());
-        let held = session_lock(&issuer, "kache-cli", Duration::from_secs(1))
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock_in(&dir, "kache-cli", Duration::from_secs(1))
             .await
             .unwrap();
         assert!(
-            session_lock(&issuer, "kache-cli", Duration::from_millis(100))
+            lock_in(&dir, "kache-cli", Duration::from_millis(100))
                 .await
                 .is_err()
         );
         // A different client for the same issuer is a different session.
         drop(
-            session_lock(&issuer, "kobe-cli", Duration::from_millis(100))
+            lock_in(&dir, "kobe-cli", Duration::from_millis(100))
                 .await
                 .unwrap(),
         );
         drop(held);
         drop(
-            session_lock(&issuer, "kache-cli", Duration::from_millis(100))
+            lock_in(&dir, "kache-cli", Duration::from_millis(100))
                 .await
                 .unwrap(),
         );
@@ -847,22 +875,33 @@ mod tests {
 
     #[tokio::test]
     async fn the_session_lock_waits_for_the_holder_to_release() {
-        let issuer = format!("https://lock-wait-{}.example", std::process::id());
-        let held = session_lock(&issuer, "kache-cli", Duration::from_secs(1))
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock_in(&dir, "kache-cli", Duration::from_secs(1))
             .await
             .unwrap();
-        let release = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            drop(held);
-        });
-        let waited = tokio::time::timeout(
-            Duration::from_secs(5),
-            session_lock(&issuer, "kache-cli", Duration::from_secs(3)),
-        )
-        .await
-        .expect("the waiter must not hang");
+        // Release only once the waiter has seen the lock held, so the test
+        // exercises the waiting branch rather than a lucky late start.
+        let (contended, seen) = std::sync::mpsc::channel::<()>();
+        let waiter = session_lock_in(
+            dir.path().to_path_buf(),
+            "https://idp.example",
+            "kache-cli",
+            Duration::from_secs(3),
+            move || {
+                let _ = contended.send(());
+            },
+        );
+        let waiter = tokio::spawn(waiter);
+        tokio::task::spawn_blocking(move || seen.recv_timeout(Duration::from_secs(3)))
+            .await
+            .unwrap()
+            .expect("the waiter must find the lock held and wait");
+        drop(held);
+        let waited = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter must not hang")
+            .unwrap();
         assert!(waited.is_ok(), "{waited:?}");
-        release.await.unwrap();
     }
 
     #[test]
@@ -870,14 +909,14 @@ mod tests {
         // A runtime that does not wait for the polling thread at shutdown, so
         // a lock that never gives up fails this test instead of hanging it.
         let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let outcome = runtime.block_on(async {
-            let issuer = format!("https://lock-give-up-{}.example", std::process::id());
-            let _held = session_lock(&issuer, "kache-cli", Duration::from_secs(1))
+            let _held = lock_in(&dir, "kache-cli", Duration::from_secs(1))
                 .await
                 .unwrap();
             tokio::time::timeout(
                 Duration::from_secs(5),
-                session_lock(&issuer, "kache-cli", Duration::from_millis(100)),
+                lock_in(&dir, "kache-cli", Duration::from_millis(100)),
             )
             .await
         });
@@ -912,14 +951,13 @@ mod tests {
         let _process = crate::test_support::process_state_test_lock();
         crate::planner_client::ensure_crypto_provider();
         let home = tempfile::tempdir().unwrap();
-        let saved: Vec<_> = ["XDG_CONFIG_HOME", "HOME"]
-            .into_iter()
-            .map(|key| (key, std::env::var_os(key)))
-            .collect();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
-            std::env::set_var("HOME", home.path());
-        }
+        let _env = EnvGuard::set(&[
+            (
+                "XDG_CONFIG_HOME",
+                home.path().join(".config").into_os_string(),
+            ),
+            ("HOME", home.path().as_os_str().to_owned()),
+        ]);
         let (base, _) = stub_planner("https://clerk.example").await;
         TofuStore::new()
             .unwrap()
@@ -939,14 +977,40 @@ mod tests {
             ))
             .unwrap();
         let token = kunobi_session_token(&base).await;
-        for (key, value) in saved {
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
+        assert_eq!(token.unwrap().as_deref(), Some("session-id"));
+    }
+
+    /// Sets environment variables and restores them on drop, even when the
+    /// test panics. Callers hold `process_state_test_lock`.
+    #[cfg(target_os = "linux")]
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    #[cfg(target_os = "linux")]
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, std::ffi::OsString)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(key, value)| {
+                    let previous = std::env::var_os(key);
+                    unsafe { std::env::set_var(key, value) };
+                    (*key, previous)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
                 }
             }
         }
-        assert_eq!(token.unwrap().as_deref(), Some("session-id"));
     }
 }

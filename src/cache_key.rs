@@ -1351,6 +1351,20 @@ fn prediction_discovery_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>)
     rustc_shared_prediction_identity(args).or_else(|| rustc_prediction_identity(args))
 }
 
+/// The flight two processes discovering the same unit share. With
+/// predictions on it is the record identity, so the waiter can read what
+/// the owner publishes; without them the same identity still names the
+/// unit, and the waiter finds the owner's entry in the store instead.
+fn discovery_flight_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>) -> Option<String> {
+    if !prediction_applies(&args.externs) {
+        return None;
+    }
+    if file_hasher.uses_input_predictions() {
+        return prediction_discovery_identity(args, file_hasher);
+    }
+    rustc_shared_prediction_identity(args).or_else(|| rustc_prediction_identity(args))
+}
+
 /// Discover the source closure that feeds the key.
 ///
 /// The dep-info pre-pass enumerates the real closure. If it fails we must NOT
@@ -1384,12 +1398,18 @@ fn resolve_key_inputs(
         // may well find the entry under the key the pre-pass yields.
         let mut certain_miss = rustc_shared_prediction_identity(args).is_some()
             && std::env::var_os("OUT_DIR").is_none();
+        // Whether this process holds the unit's discovery flight. Only the
+        // holder may compile before keying: a peer that also found nothing
+        // would compile the same unit a second time instead of waiting for
+        // the entry the holder stores.
+        let mut owns_flight = false;
         if prediction.is_err()
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
-            && let Some(identity) = prediction_discovery_identity(args, file_hasher)
+            && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
             let flight = crate::scheduler::join_discovery(cache_dir, &identity);
-            certain_miss = certain_miss && flight.is_some();
+            owns_flight = flight.is_some();
+            certain_miss = certain_miss && owns_flight;
             *file_hasher.discovery_flight.borrow_mut() = flight;
             // The previous owner may have published while this process waited.
             prediction = predicted_key_inputs(args, file_hasher);
@@ -1433,6 +1453,19 @@ fn resolve_key_inputs(
             {
                 crate::phase_trace::decision("prediction", "deferred");
                 tracing::trace!("[key:{}] inputs=deferred", crate_name);
+                return Err(anyhow::Error::new(DeferredDiscovery));
+            }
+            // No record here, or no records at all, but the store has never
+            // held this crate under any key: the miss is just as certain.
+            // This covers the units a record cannot vouch for (an OUT_DIR,
+            // a peer that waited) and builds with predictions off.
+            Err(Rejection::NoRecord | Rejection::Disabled | Rejection::NotEligible)
+                if owns_flight
+                    && DEFER_DISCOVERY.with(std::cell::Cell::get)
+                    && file_hasher.store_lacks_crate(crate_name) =>
+            {
+                crate::phase_trace::decision("prediction", "deferred-new-crate");
+                tracing::trace!("[key:{}] inputs=deferred(new crate)", crate_name);
                 return Err(anyhow::Error::new(DeferredDiscovery));
             }
             Err(reason) => {
@@ -3980,6 +4013,22 @@ impl<'db> FileHasher<'db> {
     /// running the pre-pass.
     pub(crate) fn supports_input_predictions(&self) -> bool {
         self.cache.is_some()
+    }
+
+    /// True only when the local store is known to hold no entry for
+    /// `crate_name`. No store, or a failed query, is "unknown": false.
+    fn store_lacks_crate(&self, crate_name: &str) -> bool {
+        let _trace = crate::phase_trace::phase("crate_presence");
+        let Some(cache) = self.cache.as_ref() else {
+            return false;
+        };
+        match cache.has_entry_for_crate(crate_name) {
+            Ok(present) => !present,
+            Err(error) => {
+                tracing::debug!("crate presence lookup failed: {error}");
+                false
+            }
+        }
     }
 
     /// Remember the closure this build discovered for `identity`.
@@ -7245,6 +7294,155 @@ mod tests {
         provide_dep_info(closure.clone());
         let used = resolve_key_inputs(&args, &on, "x").unwrap();
         assert_eq!(used, Some(closure));
+    }
+
+    /// The discovery flight names the unit whether or not predictions are on,
+    /// and stays off for a unit predictions cannot describe.
+    #[test]
+    fn discovery_flight_identity_names_the_unit_with_or_without_predictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let parse = |args: &[&str]| {
+            RustcArgs::parse(&args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let out_dir = dir.path().join("target/debug/deps").display().to_string();
+        let a = parse(&[
+            "rustc",
+            "--crate-name",
+            "a",
+            "src/a.rs",
+            "--out-dir",
+            &out_dir,
+        ]);
+        let b = parse(&[
+            "rustc",
+            "--crate-name",
+            "b",
+            "src/b.rs",
+            "--out-dir",
+            &out_dir,
+        ]);
+        let with_macro = parse(&[
+            "rustc",
+            "--crate-name",
+            "a",
+            "src/a.rs",
+            "--out-dir",
+            &out_dir,
+            "--extern",
+            "my_macro=/t/debug/deps/libmy_macro-3.so",
+        ]);
+
+        let off = FileHasher::persistent(&db);
+        let a_off =
+            discovery_flight_identity(&a, &off).expect("predictions off still names the unit");
+        assert_eq!(
+            a_off,
+            rustc_shared_prediction_identity(&a).unwrap(),
+            "the flight is the unit's shared identity"
+        );
+        assert_ne!(a_off, discovery_flight_identity(&b, &off).unwrap());
+        assert!(discovery_flight_identity(&with_macro, &off).is_none());
+
+        let on = FileHasher::persistent(&db).with_input_predictions(true);
+        assert_eq!(
+            discovery_flight_identity(&a, &on),
+            prediction_discovery_identity(&a, &on),
+            "with predictions on the flight is the record identity"
+        );
+        assert!(discovery_flight_identity(&with_macro, &on).is_none());
+    }
+
+    /// A crate the store has never held is a certain miss under any key, so
+    /// discovery defers even where no record can vouch for it: an OUT_DIR
+    /// unit, and a build with predictions off.
+    #[test]
+    fn a_crate_the_store_never_held_defers_discovery() {
+        let _lock = key_test_lock();
+        let out_dir = std::env::var_os("OUT_DIR");
+        // SAFETY: the key-test lock serialises environment edits.
+        unsafe { std::env::set_var("OUT_DIR", "/t/debug/build/x-1/out") };
+        struct RestoreOutDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreOutDir {
+            fn drop(&mut self) {
+                // SAFETY: still under the key-test lock, dropped first.
+                match self.0.take() {
+                    Some(value) => unsafe { std::env::set_var("OUT_DIR", value) },
+                    None => unsafe { std::env::remove_var("OUT_DIR") },
+                }
+            }
+        }
+        let _restore = RestoreOutDir(out_dir);
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE entries (cache_key TEXT PRIMARY KEY, crate_name TEXT NOT NULL);",
+            )
+            .unwrap();
+        let args = RustcArgs::parse(
+            &[
+                "rustc",
+                "--crate-name",
+                "x",
+                "src/lib.rs",
+                "--edition",
+                "2021",
+                "--emit=dep-info,metadata",
+                "--out-dir",
+                &dir.path().join("target/debug/deps").display().to_string(),
+            ]
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let deferred = |hasher: &FileHasher<'_>| {
+            set_defer_discovery(true);
+            let outcome = resolve_key_inputs(&args, hasher, "x");
+            set_defer_discovery(false);
+            outcome.is_err_and(|error| error.downcast_ref::<DeferredDiscovery>().is_some())
+        };
+        let flights = Some(dir.path().join("cache"));
+        for predictions in [false, true] {
+            let hasher = FileHasher::persistent(&db)
+                .with_input_predictions(predictions)
+                .with_prediction_flights(flights.clone());
+            assert!(deferred(&hasher), "predictions={predictions}");
+        }
+        {
+            // Scoped: the hasher holds the unit's discovery flight until it
+            // is dropped, and the hashers below need to take it.
+            let hasher = FileHasher::persistent(&db).with_prediction_flights(flights.clone());
+            let not_allowed = resolve_key_inputs(&args, &hasher, "x");
+            assert!(
+                !not_allowed
+                    .is_err_and(|error| error.downcast_ref::<DeferredDiscovery>().is_some()),
+                "the wrapper did not allow deferral"
+            );
+        }
+        assert!(
+            !deferred(&FileHasher::persistent(&db)),
+            "without a flight nobody owns the unit, so nobody compiles first"
+        );
+
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name) VALUES ('k', 'x')",
+                [],
+            )
+            .unwrap();
+        for predictions in [false, true] {
+            let hasher = FileHasher::persistent(&db)
+                .with_input_predictions(predictions)
+                .with_prediction_flights(flights.clone());
+            assert!(
+                !deferred(&hasher),
+                "an entry for the crate may match: predictions={predictions}"
+            );
+        }
     }
 
     /// The two gates in front of a record lookup, each refusing for its own

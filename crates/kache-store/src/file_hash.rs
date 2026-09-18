@@ -128,6 +128,18 @@ impl<'db> FileHashCache<'db> {
         Ok(())
     }
 
+    /// Whether any entry, committed or not, was stored under `crate_name`.
+    ///
+    /// Every cache key folds the crate name in, so `false` means no key this
+    /// crate can produce is in the local store.
+    pub fn has_entry_for_crate(&self, crate_name: &str) -> rusqlite::Result<bool> {
+        self.db().query_row(
+            "SELECT EXISTS(SELECT 1 FROM entries WHERE crate_name = ?1)",
+            params![crate_name],
+            |row| row.get(0),
+        )
+    }
+
     /// Return the stored schema and payload for `identity`, or `None` when absent.
     /// The caller validates the schema before interpreting the payload.
     pub fn get_input_prediction(&self, identity: &str) -> rusqlite::Result<Option<(u32, String)>> {
@@ -386,6 +398,24 @@ impl FileHashCache<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_entry_for_crate_sees_only_that_crate() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE entries (cache_key TEXT PRIMARY KEY, crate_name TEXT NOT NULL);",
+        )
+        .unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        assert!(!cache.has_entry_for_crate("gpui").unwrap());
+        db.execute(
+            "INSERT INTO entries (cache_key, crate_name) VALUES ('k', 'gpui_base')",
+            [],
+        )
+        .unwrap();
+        assert!(!cache.has_entry_for_crate("gpui").unwrap());
+        assert!(cache.has_entry_for_crate("gpui_base").unwrap());
+    }
 
     #[test]
     fn fingerprint_preserves_the_filesystem_identity() {

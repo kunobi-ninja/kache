@@ -4612,10 +4612,11 @@ struct Precompiled {
     dep_info: Option<crate::cache_key::DepInfo>,
 }
 
-/// Compile-before-key is only sound where a miss is certain from the absence
-/// of a local record: no remote to consult, predictions on (so records
-/// exist at all), no fallback store, no adaptive incremental unit and no
-/// extra-inputs declaration, the last two keying more than the closure.
+/// Compile-before-key is only sound where the miss is certain from the local
+/// store alone: no remote to consult, no fallback store, no adaptive
+/// incremental unit and no extra-inputs declaration, the last two keying more
+/// than the closure. The key computation then defers only when it can prove
+/// the miss: no closure record for the unit, or no entry for the crate.
 fn deferral_allowed(
     config: &Config,
     args: &RustcArgs,
@@ -4626,7 +4627,6 @@ fn deferral_allowed(
     // (Cargo always asks for it; a bare rustc invocation may not).
     args.dep_info_path().is_some()
         && config.deferred_discovery
-        && config.input_predictions
         && config.remote.is_none()
         && config.fallback.is_none()
         && !adaptive
@@ -7636,7 +7636,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_before_key_needs_a_local_store_with_records() {
+    fn compile_before_key_needs_a_local_store() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path().to_path_buf());
         let parse = |argv: &[&str]| {
@@ -7661,8 +7661,8 @@ mod tests {
             "/t/debug/deps",
         ]);
         assert!(
-            !deferral_allowed(&config, &cargo_like, false, None),
-            "predictions off"
+            deferral_allowed(&config, &cargo_like, false, None),
+            "predictions off still defers a provable miss"
         );
         config.input_predictions = true;
         assert!(deferral_allowed(&config, &cargo_like, false, None));

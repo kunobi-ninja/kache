@@ -55,7 +55,9 @@ pub fn logout() -> Result<()> {
         .await;
         store.remove(&issuer)?;
         match revoked {
-            Ok(Ok(())) => println!("Logged out of the planner at {endpoint} (session revoked at the IdP)."),
+            Ok(Ok(())) => println!(
+                "Logged out of the planner at {endpoint}: the local session is gone and its revocation was requested at the IdP (best effort)."
+            ),
             Ok(Err(error)) => eprintln!(
                 "Logged out of the planner at {endpoint}; revoking the session at the IdP failed: {error:#}"
             ),

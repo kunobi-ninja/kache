@@ -3000,6 +3000,27 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     Ok(combined)
 }
 
+/// The detached worker the wrapper spawns under size pressure: sweep, wait
+/// `retry_delay` for entries pinned by live builds to age out, sweep again,
+/// then record where the store ended so the wrapper backs off while it stays
+/// over budget. A worker whose sweeps both lost `gc.lock` to another driver
+/// leaves the backoff to that driver's worker.
+pub fn run_auto_gc_worker(config: &Config, retry_delay: std::time::Duration) {
+    let first = run_gc_local(config, GcMode::Background);
+    std::thread::sleep(retry_delay);
+    let second = run_gc_local(config, GcMode::Background);
+    let swept = [first, second]
+        .iter()
+        .any(|run| run.as_ref().is_ok_and(|stats| !stats.skipped));
+    if !swept {
+        return;
+    }
+    match Store::open(config).and_then(|store| store.physical_size()) {
+        Ok(size) => crate::wrapper::record_auto_gc_outcome(config, size),
+        Err(e) => tracing::debug!("auto-gc: store size after the sweep unknown: {e:#}"),
+    }
+}
+
 fn skipped_gc_stats() -> crate::store::GcStats {
     crate::store::GcStats {
         skipped: true,
@@ -3157,10 +3178,7 @@ pub fn gc(
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(121);
 
-        // Run background sweep-sleep-sweep loop
-        run_gc_local(config, GcMode::Background).ok();
-        std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
-        run_gc_local(config, GcMode::Background).ok();
+        run_auto_gc_worker(config, std::time::Duration::from_secs(sleep_secs));
         return Ok(());
     }
 

@@ -5652,7 +5652,11 @@ impl Daemon {
                 tracing::debug!("gc.lock held by another GC; skipping upload-triggered eviction");
                 return Ok(());
             };
-            if size > self.config.max_size {
+            // A store the last sweep could not bring under budget stays over
+            // it after every upload; sweeping again per upload frees nothing.
+            if size > self.config.max_size
+                && !crate::wrapper::auto_gc_backing_off(&self.config, size)
+            {
                 tracing::info!(
                     "store size {} > max {}, running LRU eviction",
                     size,
@@ -5665,6 +5669,9 @@ impl Daemon {
                     stats.duration_ms = started.elapsed().as_millis() as u64;
                     if let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats) {
                         tracing::warn!("recording upload-triggered GC run: {e:#}");
+                    }
+                    if let Ok(after) = store.physical_size() {
+                        crate::wrapper::record_auto_gc_outcome(&self.config, after);
                     }
                 }
             }
@@ -11957,6 +11964,73 @@ mod tests {
         let recorded = crate::report::read_gc_stats(dir.path()).expect("gc_stats.json written");
         assert_eq!(recorded.source, "daemon");
         assert_eq!(recorded.entries_evicted, 1);
+    }
+
+    /// Store an idle `size`-byte entry for the upload-eviction tests; with
+    /// `retained`, a target directory still hardlinks its blob.
+    fn put_upload_evict_entry(
+        store: &Store,
+        dir: &std::path::Path,
+        key: &str,
+        size: usize,
+        retained: bool,
+    ) {
+        let src_file = dir.join(format!("{key}.rlib"));
+        std::fs::write(&src_file, &key.repeat(size)[..size]).unwrap();
+        store
+            .put(
+                key,
+                "testcrate",
+                &["lib".into()],
+                &[],
+                "host",
+                "dev",
+                &[(src_file.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        std::fs::remove_file(&src_file).unwrap();
+        if retained {
+            let meta = store.get(key).unwrap().unwrap();
+            std::fs::hard_link(
+                store.blob_path(&meta.files[0].hash),
+                dir.join(format!("{key}-target.rlib")),
+            )
+            .unwrap();
+        }
+        store.set_last_accessed_for_test(key, "-1 hour");
+    }
+
+    /// Every upload used to start another full sweep of a store the last
+    /// sweep had already failed to bring under budget.
+    #[test]
+    fn upload_triggered_eviction_waits_out_the_auto_gc_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        for i in 0..6 {
+            put_upload_evict_entry(&store, dir.path(), &format!("retained_{i}"), 200, true);
+        }
+        put_upload_evict_entry(&store, dir.path(), "evictable", 50, false);
+
+        let daemon = Daemon::new(config.clone());
+        daemon.maybe_evict_after_upload();
+        assert!(!store.contains("evictable"));
+        assert!(store.contains("retained_0"));
+        assert!(
+            dir.path().join("auto-gc-backoff.json").exists(),
+            "a sweep that leaves the store over budget records a backoff"
+        );
+
+        // Growth inside the slack: nothing a sweep could not already free.
+        put_upload_evict_entry(&store, dir.path(), "next", 50, false);
+        daemon.maybe_evict_after_upload();
+        assert!(
+            store.contains("next"),
+            "the next upload must not sweep again during the backoff"
+        );
     }
 
     #[test]

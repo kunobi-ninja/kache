@@ -18,14 +18,16 @@ pub fn login(device: bool, retrust: bool) -> Result<()> {
     runtime()?.block_on(async {
         crate::planner_client::ensure_crypto_provider();
         println!("Discovering the planner's login at {endpoint}...");
-        let service = discover_for_login(&endpoint, retrust).await?;
+        let service = discover_for_login(&endpoint, retrust, &TofuStore::new()?).await?;
         // Log in without holding any lock (the user may take a while), into
         // a throwaway store; then save under the session lock, so a daemon
         // refresh cannot overwrite the new session with one from an old token.
         let client = AuthClient::with_storage(service.clone(), Box::new(Discard));
         let session = if device {
             client
-                .device_login(DEVICE_SCOPE, print_device_prompt)
+                .device_login(DEVICE_SCOPE, |prompt| {
+                    let _ = write_device_prompt(&mut std::io::stderr(), prompt);
+                })
                 .await?
         } else {
             println!("Opening the browser to log in...");
@@ -116,15 +118,19 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .context("starting the login runtime")
 }
 
-async fn discover_for_login(endpoint: &str, retrust: bool) -> Result<ServiceConfig> {
+async fn discover_for_login(
+    endpoint: &str,
+    retrust: bool,
+    pins: &TofuStore,
+) -> Result<ServiceConfig> {
     if !retrust {
-        return kunobi_auth::client::discover(endpoint)
+        return kunobi_auth::client::discover_with_store(endpoint, pins)
             .await
             .map_err(|error| {
                 if error.to_string().contains("TOFU:") {
                     error.context(
                         "the planner's login configuration changed since it was first trusted; \
-                     if that is expected, run `kache login --retrust`",
+                         if that is expected, run `kache login --retrust`",
                     )
                 } else {
                     error
@@ -132,7 +138,7 @@ async fn discover_for_login(endpoint: &str, retrust: bool) -> Result<ServiceConf
             });
     }
     let service = kunobi_auth::client::discover_unpinned(endpoint).await?;
-    if let Some(change) = retrust_pin(&TofuStore::new()?, &service)? {
+    if let Some(change) = retrust_pin(pins, &service)? {
         eprintln!("{change}");
     }
     Ok(service)
@@ -163,28 +169,34 @@ fn retrust_pin(store: &TofuStore, service: &ServiceConfig) -> Result<Option<Stri
     Ok(change)
 }
 
-fn print_device_prompt(prompt: &DeviceFlowPrompt) {
-    eprintln!();
+fn write_device_prompt(
+    out: &mut impl std::io::Write,
+    prompt: &DeviceFlowPrompt,
+) -> std::io::Result<()> {
+    writeln!(out)?;
     match &prompt.verification_uri_complete {
         Some(complete) => {
-            eprintln!("  Open this URL in any browser:\n    {complete}\n");
-            eprintln!(
+            writeln!(out, "  Open this URL in any browser:\n    {complete}\n")?;
+            writeln!(
+                out,
                 "  Or visit {} and enter code: {}",
                 prompt.verification_uri, prompt.user_code
-            );
+            )?;
         }
         None => {
-            eprintln!(
+            writeln!(
+                out,
                 "  Open this URL in any browser:\n    {}\n",
                 prompt.verification_uri
-            );
-            eprintln!("  Then enter code: {}", prompt.user_code);
+            )?;
+            writeln!(out, "  Then enter code: {}", prompt.user_code)?;
         }
     }
-    eprintln!(
+    writeln!(
+        out,
         "\n  The code expires in {} seconds. Waiting...\n",
         prompt.expires_in.as_secs()
-    );
+    )
 }
 
 #[cfg(test)]
@@ -254,5 +266,143 @@ mod tests {
             retrust_pin(&store, &service("https://idp.example")).unwrap(),
             None
         );
+    }
+
+    fn prompt(complete: Option<&str>) -> DeviceFlowPrompt {
+        DeviceFlowPrompt {
+            verification_uri: "https://idp.example/device".into(),
+            verification_uri_complete: complete.map(str::to_string),
+            user_code: "ABCD-EFGH".into(),
+            expires_in: std::time::Duration::from_secs(599),
+        }
+    }
+
+    fn rendered(prompt: &DeviceFlowPrompt) -> String {
+        let mut out = Vec::new();
+        write_device_prompt(&mut out, prompt).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_device_prompt_shows_where_to_go_and_the_code() {
+        let with_link = rendered(&prompt(Some("https://idp.example/device?code=ABCD-EFGH")));
+        assert!(
+            with_link.contains("https://idp.example/device?code=ABCD-EFGH"),
+            "{with_link}"
+        );
+        assert!(with_link.contains("ABCD-EFGH"), "{with_link}");
+        assert!(with_link.contains("599 seconds"), "{with_link}");
+        let plain = rendered(&prompt(None));
+        assert!(plain.contains("https://idp.example/device"), "{plain}");
+        assert!(plain.contains("Then enter code: ABCD-EFGH"), "{plain}");
+    }
+
+    /// A planner that advertises a login at `/.well-known/kunobi-auth`.
+    async fn stub_planner(issuer: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::json!({"issuer": issuer, "clientId": "kache-cli"}).to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_changed_issuer_needs_retrust() {
+        crate::planner_client::ensure_crypto_provider();
+        let planner = stub_planner("https://clerk.example").await;
+        let directory = tempfile::tempdir().unwrap();
+        let pins = store(&directory);
+        pins.trust(&planner, "https://old.example", "").unwrap();
+
+        let refused = discover_for_login(&planner, false, &pins)
+            .await
+            .unwrap_err();
+        assert!(format!("{refused:#}").contains("--retrust"), "{refused:#}");
+
+        let service = discover_for_login(&planner, true, &pins).await.unwrap();
+        assert_eq!(service.issuer, "https://clerk.example");
+        // Re-pinned: a plain login now succeeds.
+        discover_for_login(&planner, false, &pins).await.unwrap();
+    }
+
+    /// Point kache at an empty config and set (or clear) the planner endpoint
+    /// for the duration of a test.
+    struct PlannerEnv {
+        _lock: crate::test_support::ProcessStateTestGuard,
+        _dir: tempfile::TempDir,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl PlannerEnv {
+        fn new(endpoint: Option<&str>) -> Self {
+            let lock = crate::test_support::process_state_test_lock();
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config.toml");
+            let mut saved = Vec::new();
+            for (key, value) in [
+                ("KACHE_CONFIG", Some(config.as_os_str().to_owned())),
+                (
+                    "KACHE_PLANNER_ENDPOINT",
+                    endpoint.map(std::ffi::OsString::from),
+                ),
+            ] {
+                saved.push((key, std::env::var_os(key)));
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+            Self {
+                _lock: lock,
+                _dir: dir,
+                saved,
+            }
+        }
+    }
+
+    impl Drop for PlannerEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn login_and_logout_need_a_planner() {
+        let _env = PlannerEnv::new(None);
+        for result in [login(false, false), logout()] {
+            let error = result.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("no planner is configured"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_login_endpoint_is_the_planner_base_url() {
+        let _env = PlannerEnv::new(Some("https://planner.example/v1/prefetch-plan"));
+        assert_eq!(planner_endpoint().unwrap(), "https://planner.example");
     }
 }

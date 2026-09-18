@@ -234,6 +234,16 @@ gitignore = true
 # lane. Test (macOS) covers the native adapter with allowed/denied subprocesses.
 exclude_globs = ["crates/kache-fs/src/apfs.rs", "src/fallback/macos.rs"]
 exclude_re = [
+    # `main`'s dispatch arms for `kache login` / `kache logout`: `main` is not
+    # callable from a test, and each arm only forwards to `cli::login`, whose
+    # error paths, discovery/retrust logic, and prompt rendering are tested
+    # directly. The browser and device flows themselves need a person at an IdP.
+    "delete match arm Some\\(Commands::(Login|Logout)",
+    # `session_lock` and `advertised_login` compare an elapsed time against a
+    # bound with `<`; `<` versus `<=` differs only when the elapsed time equals
+    # the bound to the nanosecond, which no test can arrange. Both sides of
+    # each bound are tested.
+    "replace < with <= in (session_lock|advertised_login)",
     "crates/kache-fs/src/copy.rs:.*(native_reflink_macos|native_reflink_windows|native_reflink_unsupported|windows_cluster_size)",
     "crates/kache-fs/src/identity.rs:.*windows_metadata_identity",
     "crates/kache-fs/src/identity.rs:.*replace \\| with \\^ in windows_identity",

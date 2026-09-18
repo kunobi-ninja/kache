@@ -320,6 +320,27 @@ J6xTV3yXyjfPzsyg25edgkVLvHhvPy+/uwjddn15qhr8qlRF4OUnFfghTnOBynog
     }
 
     #[test]
+    fn each_provider_alone_enables_auth() {
+        let token = AuthSettings {
+            token: Some("t".into()),
+            ..Default::default()
+        };
+        let oidc = AuthSettings {
+            oidc_issuer: Some("https://idp".into()),
+            oidc_client_id: Some("cli".into()),
+            ..Default::default()
+        };
+        let github = AuthSettings {
+            github_audience: Some("kache".into()),
+            github_owners: vec!["Zondax".into()],
+            ..Default::default()
+        };
+        for settings in [token, oidc, github] {
+            assert!(settings.is_enabled(), "{settings:?}");
+        }
+    }
+
+    #[test]
     fn discovery_needs_a_client_id_and_advertises_no_audience() {
         assert!(AuthSettings::default().discovery().is_none());
         let doc = settings("https://idp").discovery().unwrap();

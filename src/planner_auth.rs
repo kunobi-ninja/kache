@@ -47,7 +47,11 @@ pub(crate) struct CachedToken {
 
 impl CachedToken {
     fn is_fresh(&self) -> bool {
-        SystemTime::now() + EXPIRY_MARGIN < self.expires_at
+        self.is_fresh_at(SystemTime::now())
+    }
+
+    fn is_fresh_at(&self, now: SystemTime) -> bool {
+        now + EXPIRY_MARGIN < self.expires_at
     }
 }
 
@@ -68,7 +72,10 @@ pub async fn bearer(config: &PlannerConfig, deadline: tokio::time::Instant) -> O
         return Some(token.clone());
     }
     crate::planner_client::ensure_crypto_provider();
-    match tokio::time::timeout_at(deadline, resolve(config)).await {
+    let github = std::env::var(GITHUB_REQUEST_URL)
+        .ok()
+        .zip(std::env::var(GITHUB_REQUEST_TOKEN).ok());
+    match tokio::time::timeout_at(deadline, resolve(config, github)).await {
         Ok(token) => token,
         Err(_) => {
             tracing::debug!("planner auth: resolving a bearer ran out of time; sending none");
@@ -77,16 +84,14 @@ pub async fn bearer(config: &PlannerConfig, deadline: tokio::time::Instant) -> O
     }
 }
 
-async fn resolve(config: &PlannerConfig) -> Option<String> {
+/// `github` is the Actions runtime's token request URL and bearer, when set.
+async fn resolve(config: &PlannerConfig, github: Option<(String, String)>) -> Option<String> {
     let base = planner_base(&config.endpoint);
     if !credentials_allowed(&base) {
         tracing::debug!("planner auth: {base} is not HTTPS; sending no automatic credential");
         return None;
     }
-    if let (Ok(url), Ok(request_token)) = (
-        std::env::var(GITHUB_REQUEST_URL),
-        std::env::var(GITHUB_REQUEST_TOKEN),
-    ) {
+    if let Some((url, request_token)) = github {
         // Always the planner's own URL: an audience taken from config would let
         // a project point `endpoint` elsewhere and collect a token minted for
         // a real planner.
@@ -233,10 +238,39 @@ impl TokenStorage for ScopedTokenStore {
 /// expired. `Ok(None)` when the planner offers no login, this machine never
 /// trusted it, or nobody logged in.
 pub(crate) async fn kunobi_session_token(base: &str) -> Result<Option<String>> {
-    let Some(service) = trusted_login(base).await else {
+    let Some(service) = trusted_login(base, &TofuStore::new()?).await else {
         return Ok(None);
     };
     let store = ScopedTokenStore::new(&service.client_id)?;
+    session_token(service, Box::new(store), oidc_refresh).await
+}
+
+/// Exchange a refresh token at the issuer, bounded by [`REFRESH_BOUND`].
+async fn oidc_refresh(service: ServiceConfig, refresh_token: String) -> Result<StoredToken> {
+    tokio::time::timeout(
+        REFRESH_BOUND,
+        kunobi_auth::client::oidc::refresh(
+            &service.issuer,
+            &service.client_id,
+            &service.redirect_uri,
+            &refresh_token,
+        ),
+    )
+    .await
+    .context("the Kunobi session refresh timed out")?
+    .context("refreshing the Kunobi session")
+}
+
+/// The stored session's ID token, refreshing it with `refresh` when expired.
+async fn session_token<R, F>(
+    service: ServiceConfig,
+    store: Box<dyn TokenStorage>,
+    refresh: R,
+) -> Result<Option<String>>
+where
+    R: FnOnce(ServiceConfig, String) -> F + Send + 'static,
+    F: std::future::Future<Output = Result<StoredToken>> + Send,
+{
     match store.load(&service.issuer)? {
         None => return Ok(None),
         Some(stored) if !stored.is_expired() => return Ok(Some(stored.id_token)),
@@ -250,37 +284,33 @@ pub(crate) async fn kunobi_session_token(base: &str) -> Result<Option<String>> {
     // token even when this build stops waiting for it.
     tokio::spawn(async move {
         let _in_flight = in_flight;
-        refresh_session(service).await
+        refresh_session(service, store, refresh).await
     })
     .await
     .context("the session refresh task failed")?
 }
 
-async fn refresh_session(service: ServiceConfig) -> Result<Option<String>> {
+async fn refresh_session<R, F>(
+    service: ServiceConfig,
+    store: Box<dyn TokenStorage>,
+    refresh: R,
+) -> Result<Option<String>>
+where
+    R: FnOnce(ServiceConfig, String) -> F,
+    F: std::future::Future<Output = Result<StoredToken>>,
+{
     let _session = session_lock(&service.issuer, &service.client_id, REFRESH_BOUND).await?;
-    let store = ScopedTokenStore::new(&service.client_id)?;
-    // Re-check under the lock: another build may have refreshed meanwhile.
+    // Re-check under the lock: another process may have refreshed meanwhile.
     let Some(stored) = store.load(&service.issuer)? else {
         return Ok(None);
     };
     if !stored.is_expired() {
         return Ok(Some(stored.id_token));
     }
-    let Some(refresh_token) = stored.refresh_token.as_deref() else {
+    let Some(refresh_token) = stored.refresh_token.clone() else {
         bail!("the Kunobi session expired and has no refresh token");
     };
-    let mut refreshed = tokio::time::timeout(
-        REFRESH_BOUND,
-        kunobi_auth::client::oidc::refresh(
-            &service.issuer,
-            &service.client_id,
-            &service.redirect_uri,
-            refresh_token,
-        ),
-    )
-    .await
-    .context("the Kunobi session refresh timed out")?
-    .context("refreshing the Kunobi session")?;
+    let mut refreshed = refresh(service, refresh_token).await?;
     refreshed.extra = stored.extra;
     let token = refreshed.id_token.clone();
     store.save(&refreshed)?;
@@ -291,15 +321,13 @@ async fn refresh_session(service: ServiceConfig) -> Result<Option<String>> {
 /// Discovery is unpinned and then checked fail-closed against the pin on
 /// every call, so the daemon never establishes trust on its own and a new
 /// login is honoured immediately.
-async fn trusted_login(base: &str) -> Option<ServiceConfig> {
+async fn trusted_login(base: &str, pins: &TofuStore) -> Option<ServiceConfig> {
     let service = advertised_login(base).await?;
-    let pinned = TofuStore::new().and_then(|pins| {
-        pins.verify_or_reject(
-            &service.endpoint,
-            &service.issuer,
-            service.audience.as_deref().unwrap_or(""),
-        )
-    });
+    let pinned = pins.verify_or_reject(
+        &service.endpoint,
+        &service.issuer,
+        service.audience.as_deref().unwrap_or(""),
+    );
     match pinned {
         Ok(()) => Some(service),
         Err(error) => {
@@ -414,7 +442,12 @@ mod tests {
 
     /// A stub Actions token endpoint. Returns its URL (with the query the
     /// runtime's URL already carries) and a request counter.
-    async fn stub_github(token: String) -> (String, Arc<AtomicUsize>) {
+    async fn stub_github(token: String, audience: &str) -> (String, Arc<AtomicUsize>) {
+        let expected = format!("get /?api-version=2.0&{} ", {
+            let mut q = reqwest::Url::parse("http://x/").unwrap();
+            q.query_pairs_mut().append_pair("audience", audience);
+            q.query().unwrap().to_lowercase()
+        });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -426,10 +459,7 @@ mod tests {
                 let mut buf = [0u8; 4096];
                 let n = socket.read(&mut buf).await.unwrap();
                 let request = String::from_utf8_lossy(&buf[..n]).to_lowercase();
-                assert!(
-                    request.starts_with("get /?api-version=2.0&audience=kache-test "),
-                    "{request}"
-                );
+                assert!(request.starts_with(&expected), "{request}");
                 assert!(
                     request.contains("authorization: bearer runtime-token"),
                     "{request}"
@@ -493,7 +523,7 @@ mod tests {
     async fn github_actions_token_requests_the_audience_and_reads_its_expiry() {
         crate::planner_client::ensure_crypto_provider();
         let exp = in_an_hour();
-        let (url, _) = stub_github(jwt_with_exp(exp)).await;
+        let (url, _) = stub_github(jwt_with_exp(exp), "kache-test").await;
         let token = github_actions_token(&url, "runtime-token", "kache-test")
             .await
             .unwrap();
@@ -504,7 +534,7 @@ mod tests {
     #[tokio::test]
     async fn github_token_is_cached_until_near_expiry() {
         crate::planner_client::ensure_crypto_provider();
-        let (url, hits) = stub_github(jwt_with_exp(in_an_hour())).await;
+        let (url, hits) = stub_github(jwt_with_exp(in_an_hour()), "kache-test").await;
         let first = cached_github_token(&url, "runtime-token", "kache-test")
             .await
             .unwrap();
@@ -628,5 +658,295 @@ mod tests {
                 .await
                 .unwrap(),
         );
+    }
+
+    #[test]
+    fn a_token_exactly_at_the_margin_is_not_fresh() {
+        let now = SystemTime::now();
+        let token = |expires_at| CachedToken {
+            token: "t".into(),
+            expires_at,
+        };
+        assert!(!token(now + EXPIRY_MARGIN).is_fresh_at(now));
+        assert!(token(now + EXPIRY_MARGIN + Duration::from_secs(1)).is_fresh_at(now));
+    }
+
+    #[tokio::test]
+    async fn resolve_sends_the_actions_token_to_a_loopback_planner_bound_to_its_url() {
+        crate::planner_client::ensure_crypto_provider();
+        let base = "http://127.0.0.1:1";
+        let token = jwt_with_exp(in_an_hour());
+        let (url, hits) = stub_github(token.clone(), base).await;
+        let config = PlannerConfig {
+            endpoint: format!("{base}/v1/prefetch-plan"),
+            timeout_ms: 1000,
+            token: None,
+        };
+        let github = Some((url.clone(), "runtime-token".to_string()));
+        assert_eq!(resolve(&config, github).await, Some(token));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // The same runtime never mints a token for a plain-HTTP remote planner.
+        let remote = PlannerConfig {
+            endpoint: "http://planner.example.com".to_string(),
+            ..config
+        };
+        assert_eq!(
+            resolve(&remote, Some((url, "runtime-token".to_string()))).await,
+            None
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A planner that advertises its login; returns its base URL and a
+    /// counter of discovery requests.
+    async fn stub_planner(issuer: &str) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let body = serde_json::json!({"issuer": issuer, "clientId": "kache-cli"}).to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn pins(directory: &tempfile::TempDir) -> TofuStore {
+        TofuStore::with_path(directory.path().join("known.json"))
+    }
+
+    #[tokio::test]
+    async fn only_a_planner_pinned_by_kache_login_offers_its_session() {
+        crate::planner_client::ensure_crypto_provider();
+        let (base, hits) = stub_planner("https://clerk.example").await;
+        let directory = tempfile::tempdir().unwrap();
+        let pins = pins(&directory);
+        assert!(
+            trusted_login(&base, &pins).await.is_none(),
+            "never logged in"
+        );
+
+        pins.trust(&base, "https://clerk.example", "").unwrap();
+        let service = trusted_login(&base, &pins).await.unwrap();
+        assert_eq!(service.issuer, "https://clerk.example");
+        assert_eq!(service.client_id, "kache-cli");
+
+        // Pinned to another issuer: refused.
+        pins.trust(&base, "https://other.example", "").unwrap();
+        assert!(trusted_login(&base, &pins).await.is_none());
+        // All three answers came from one cached discovery request.
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// `session_token` shares the process-wide refresh slot; run those tests
+    /// one at a time.
+    static SESSION_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn service() -> ServiceConfig {
+        // A per-process issuer keeps the session lock file to this test run.
+        let issuer = format!("https://session-test-{}.example", std::process::id());
+        ServiceConfig::new("https://planner.example", &issuer, "kache-cli")
+    }
+
+    fn stored(
+        service: &ServiceConfig,
+        id: &str,
+        expires_in: i64,
+        refresh: Option<&str>,
+    ) -> StoredToken {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        StoredToken::new(
+            id.into(),
+            refresh.map(str::to_string),
+            Some(now + expires_in),
+            service.issuer.clone(),
+        )
+    }
+
+    async fn no_refresh(_: ServiceConfig, _: String) -> Result<StoredToken> {
+        panic!("a fresh session must not be refreshed")
+    }
+
+    #[tokio::test]
+    async fn a_fresh_session_is_used_as_is() {
+        let _serial = SESSION_TESTS.lock().await;
+        let service = service();
+        let store = MemoryStore::default();
+        store
+            .save(&stored(&service, "fresh", 3600, Some("rt")))
+            .unwrap();
+        let token = session_token(service, Box::new(store), no_refresh)
+            .await
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("fresh"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_is_refreshed_and_saved() {
+        let _serial = SESSION_TESTS.lock().await;
+        let service = service();
+        let store = MemoryStore::default();
+        store
+            .save(&stored(&service, "old", -10, Some("rt-1")))
+            .unwrap();
+        let issued = stored(&service, "new", 3600, Some("rt-2"));
+        let refresh = move |_: ServiceConfig, refresh_token: String| async move {
+            assert_eq!(refresh_token, "rt-1");
+            Ok(issued)
+        };
+        let token = session_token(service.clone(), Box::new(store.clone()), refresh)
+            .await
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("new"));
+        let saved = store.load(&service.issuer).unwrap().unwrap();
+        assert_eq!(saved.id_token, "new");
+        assert_eq!(saved.refresh_token.as_deref(), Some("rt-2"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_without_a_refresh_token_is_not_sent() {
+        let _serial = SESSION_TESTS.lock().await;
+        let service = service();
+        let store = MemoryStore::default();
+        store.save(&stored(&service, "old", -10, None)).unwrap();
+        assert!(
+            session_token(service, Box::new(store), no_refresh)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_finds_the_session_already_renewed_keeps_it() {
+        let _serial = SESSION_TESTS.lock().await;
+        let service = service();
+        let store = MemoryStore::default();
+        store
+            .save(&stored(&service, "renewed", 3600, Some("rt")))
+            .unwrap();
+        let token = refresh_session(service, Box::new(store), no_refresh)
+            .await
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("renewed"));
+    }
+
+    #[tokio::test]
+    async fn the_session_lock_waits_for_the_holder_to_release() {
+        let issuer = format!("https://lock-wait-{}.example", std::process::id());
+        let held = session_lock(&issuer, "kache-cli", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(held);
+        });
+        let waited = tokio::time::timeout(
+            Duration::from_secs(5),
+            session_lock(&issuer, "kache-cli", Duration::from_secs(3)),
+        )
+        .await
+        .expect("the waiter must not hang");
+        assert!(waited.is_ok(), "{waited:?}");
+        release.await.unwrap();
+    }
+
+    #[test]
+    fn the_session_lock_gives_up_after_its_wait() {
+        // A runtime that does not wait for the polling thread at shutdown, so
+        // a lock that never gives up fails this test instead of hanging it.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let outcome = runtime.block_on(async {
+            let issuer = format!("https://lock-give-up-{}.example", std::process::id());
+            let _held = session_lock(&issuer, "kache-cli", Duration::from_secs(1))
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                session_lock(&issuer, "kache-cli", Duration::from_millis(100)),
+            )
+            .await
+        });
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        let second = outcome.expect("a bounded wait must end");
+        assert!(second.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_session_needs_no_refresh_slot() {
+        let _serial = SESSION_TESTS.lock().await;
+        // Another build holds the refresh slot: a fresh session is still sent.
+        let _busy = REFRESH.try_lock().unwrap();
+        let service = service();
+        let store = MemoryStore::default();
+        store
+            .save(&stored(&service, "fresh", 3600, Some("rt")))
+            .unwrap();
+        let token = session_token(service, Box::new(store), no_refresh)
+            .await
+            .unwrap();
+        assert_eq!(token.as_deref(), Some("fresh"));
+    }
+
+    /// End to end through the real per-user stores. Linux only: there the
+    /// token store (`dirs::config_dir()`, from `XDG_CONFIG_HOME`) and the pin
+    /// store (`dirs::home_dir()`, from `HOME`) both follow the environment, so
+    /// they land in a temporary directory instead of the developer's home.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_logged_in_planner_gets_the_stored_session() {
+        let _process = crate::test_support::process_state_test_lock();
+        crate::planner_client::ensure_crypto_provider();
+        let home = tempfile::tempdir().unwrap();
+        let saved: Vec<_> = ["XDG_CONFIG_HOME", "HOME"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
+            std::env::set_var("HOME", home.path());
+        }
+        let (base, _) = stub_planner("https://clerk.example").await;
+        TofuStore::new()
+            .unwrap()
+            .trust(&base, "https://clerk.example", "")
+            .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        ScopedTokenStore::new("kache-cli")
+            .unwrap()
+            .save(&StoredToken::new(
+                "session-id".into(),
+                None,
+                Some(now + 3600),
+                "https://clerk.example".into(),
+            ))
+            .unwrap();
+        let token = kunobi_session_token(&base).await;
+        for (key, value) in saved {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        assert_eq!(token.unwrap().as_deref(), Some("session-id"));
     }
 }

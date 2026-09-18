@@ -991,6 +991,9 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
     policy: std::marker::PhantomData<P>,
     config: Config,
     db: Connection,
+    /// Write slice and pause for eviction sweeps: [`EVICTION_WRITE_SLICE`]
+    /// and [`EVICTION_WRITE_PAUSE`] outside tests.
+    eviction_pacing: (Duration, Duration),
 }
 
 /// How recently an entry must have been accessed for eviction to treat it as
@@ -1740,6 +1743,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             policy: std::marker::PhantomData,
             config: config.clone(),
             db,
+            eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
         };
 
         // A quarantined index comes back empty, but the blobs and every entry's
@@ -3933,7 +3937,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ) -> GcStats {
         let mut stats = GcStats::default();
         let mut eviction_writes = std::time::Duration::ZERO;
-        let mut pacer = EvictionWritePacer::new(EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE);
+        let (slice, pause) = self.eviction_pacing;
+        let mut pacer = EvictionWritePacer::new(slice, pause);
         let (mut current_size, target) = match stop_at {
             Some((current, target)) => (current, Some(target)),
             None => (0, None),
@@ -14623,29 +14628,37 @@ mod tests {
     /// A sweep with enough removals to use up a write slice pauses between
     /// slices, so builds waiting on the write lock get it. Without the pause
     /// a waiting `put` sat in SQLite's busy handler for most of the sweep.
+    ///
+    /// The slice is shrunk so a few hundred removals use it up. With the
+    /// production slice this needed 1500 entries, and a pacer broken into
+    /// pausing after every removal then slept 150 ms 1500 times, past the
+    /// mutation lane's timeout.
     #[test]
     fn eviction_pauses_between_write_slices() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.deferred_durability = true;
         let store = Store::open(&config).unwrap();
-        put_evictable_entries(&store, dir.path(), 1500);
+        put_evictable_entries(&store, dir.path(), 500);
 
         let mut gc_config = config.clone();
         gc_config.max_size = 1;
-        let gc = Store::open(&gc_config).unwrap();
+        let mut gc = Store::open(&gc_config).unwrap();
+        let slice = Duration::from_millis(5);
+        let pause = Duration::from_millis(20);
+        gc.eviction_pacing = (slice, pause);
         let started = std::time::Instant::now();
         let stats = gc.evict().unwrap();
         let elapsed = started.elapsed();
 
-        assert_eq!(stats.entries_evicted, 1500, "{stats:?}");
+        assert_eq!(stats.entries_evicted, 500, "{stats:?}");
         let writing = Duration::from_millis(stats.evict_write_ms);
         assert!(
-            writing >= EVICTION_WRITE_SLICE,
+            writing >= slice,
             "fixture too small to use up a slice: {stats:?}"
         );
         assert!(
-            elapsed >= writing + EVICTION_WRITE_PAUSE,
+            elapsed >= writing + pause,
             "{writing:?} of writes must include a pause, swept in {elapsed:?}"
         );
     }

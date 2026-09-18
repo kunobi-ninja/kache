@@ -7406,6 +7406,25 @@ mod tests {
         assert!(read_auto_gc_backoff(&cfg.cache_dir).is_some());
     }
 
+    /// The backoff is stored and read back across processes, so its clock
+    /// must be the wall clock, not a constant every process agrees on.
+    #[test]
+    fn unix_now_secs_reads_the_wall_clock() {
+        let wall = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let before = wall();
+        let now = unix_now_secs();
+        let after = wall();
+        assert!(
+            before <= now && now <= after,
+            "{before} <= {now} <= {after}"
+        );
+    }
+
     #[test]
     fn next_auto_gc_backoff_doubles_to_the_cap_and_clears_under_budget() {
         // max 1000: the trigger is 1100.

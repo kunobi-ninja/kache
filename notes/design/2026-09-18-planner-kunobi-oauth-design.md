@@ -88,17 +88,28 @@ Commands:
 Bearer resolution for each planner request, first match wins:
 1. explicit token (`KACHE_PLANNER_TOKEN` / `cache.planner.token`) — unchanged;
 2. GitHub Actions: when `ACTIONS_ID_TOKEN_REQUEST_URL` and
-   `ACTIONS_ID_TOKEN_REQUEST_TOKEN` are present, request an ID token with
-   audience `cache.planner.github_audience` (default `kache`), cached in memory
+   `ACTIONS_ID_TOKEN_REQUEST_TOKEN` are present, request an ID token whose
+   audience is the planner's base URL (never configurable, so a project
+   config cannot aim a real planner's token elsewhere), cached in memory
    until shortly before `exp`;
-3. stored Kunobi session for the endpoint's issuer, refreshed with the refresh
+3. the stored Kunobi session for the planner, refreshed with the refresh
    token when expired — never interactive;
 4. none.
 
-A failure in any source is logged at debug and yields "no bearer"; the request
-proceeds and a 401 lands in the existing local-planning fallback. Discovery
-results and the resolved bearer are cached in the daemon so the 750 ms planner
-budget is not spent on discovery for every build.
+Credential safety (added in review):
+- automatic credentials (2, 3) go only to HTTPS or loopback planners;
+- a session goes only to a planner pinned by `kache login`: the daemon
+  discovers unpinned and checks the pin fail-closed, so it never establishes
+  trust itself;
+- sessions are stored per issuer **and** client id, so kache and kobe (same
+  Clerk issuer) never overwrite each other;
+- refresh runs at most once per process, under a cross-process session lock
+  also taken by `kache login`/`logout`, bounded, in its own task so a rotated
+  refresh token is always persisted;
+- one deadline covers resolving the bearer and the planner request.
+
+A failure in any source is logged at debug and yields "no bearer"; the
+request proceeds and a 401 lands in the existing local-planning fallback.
 
 ### 4. Helm chart
 
@@ -124,7 +135,7 @@ mapped to the env vars above. The existing optional Ingress is unchanged.
   `http://localhost:8329/callback`, scopes `openid profile email
   offline_access`, device grant on.
 - HelmRelease values: `auth.oidc` (Clerk, kache-cli client id),
-  `auth.githubOidc` (`audience: kache`, owners `kunobi-ninja`, `Zondax`),
+  `auth.githubOidc` (`audience: https://kache.${clusterDomain}`, the URL clients use; owners `kunobi-ninja`, `Zondax`),
   `ingress.enabled` on `kache.${clusterDomain}` (VPN-only, TLS via the
   cluster issuer), image ≥ the release carrying this work.
 

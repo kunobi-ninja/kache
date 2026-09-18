@@ -1,7 +1,7 @@
 //! Machine-wide miss-path scheduler.
 //!
 //! After a local and remote miss, the wrapper joins a flight for the
-//! invocation identity, then takes a memory-weighted permit, then the
+//! invocation's cache key, then takes a memory-weighted permit, then the
 //! per-key [`crate::store::Store::claim_build`] lock. Hits and passthroughs
 //! never consult this module.
 //!
@@ -11,8 +11,8 @@
 //!
 //! The permit pool size is [`default_pool_size`]:
 //! `std::thread::available_parallelism()`, with a floor of 1. Unmeasured
-//! compiles occupy [`UNMEASURED_COMPILE_WEIGHT`] slots; unmeasured link
-//! invocations occupy [`UNMEASURED_LINK_WEIGHT`]. After a real compile, Unix
+//! compiles occupy [`UNMEASURED_COMPILE_WEIGHT`] slots; unmeasured
+//! invocations that run the system linker occupy [`UNMEASURED_LINK_WEIGHT`]. After a real compile, Unix
 //! wrappers record the child's peak RSS by crate name; later invocations of
 //! that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
 //!
@@ -32,7 +32,8 @@ use crate::store::StoreLock;
 
 /// Permit slots occupied by a crate with no RSS sample.
 pub const UNMEASURED_COMPILE_WEIGHT: u32 = 1;
-/// Permit slots occupied by an unmeasured rustc `--emit=link` invocation.
+/// Permit slots occupied by an unmeasured rustc invocation that runs the
+/// system linker (see [`crate::args::RustcArgs::invokes_linker`]).
 pub const UNMEASURED_LINK_WEIGHT: u32 = 2;
 /// RSS bytes that map to one permit slot after a crate has been measured.
 pub const RSS_BYTES_PER_SLOT: u64 = 512 * 1024 * 1024;
@@ -88,12 +89,20 @@ pub fn default_pool_size() -> u32 {
     available
 }
 
-/// Identity used to join a flight without the finished cache key.
+/// Identity of a compile flight: the invocation's shape plus its cache key.
+///
+/// Only a peer computing the same key can be served by the owner's result:
+/// a waiter re-checks the store under its own key. Two compiles that merely
+/// share a name (every build script is `build_script_build`, every
+/// tree-sitter grammar has a `parser.c`, a graph can hold two versions of a
+/// crate) must not wait for each other, so [`FlightIdentity::with_key`] is
+/// part of the digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlightIdentity {
     compiler: String,
     crate_name: String,
     output_kind: String,
+    cache_key: String,
 }
 
 impl FlightIdentity {
@@ -111,6 +120,7 @@ impl FlightIdentity {
             compiler: "rustc".to_string(),
             crate_name: crate_name.to_string(),
             output_kind,
+            cache_key: String::new(),
         }
     }
 
@@ -119,7 +129,14 @@ impl FlightIdentity {
             compiler: "cc".to_string(),
             crate_name: source_name.to_string(),
             output_kind: "object".to_string(),
+            cache_key: String::new(),
         }
+    }
+
+    /// Scope the flight to one cache key.
+    pub fn with_key(mut self, cache_key: &str) -> Self {
+        self.cache_key = cache_key.to_string();
+        self
     }
 
     fn digest(&self) -> String {
@@ -129,6 +146,8 @@ impl FlightIdentity {
         hasher.update(self.crate_name.as_bytes());
         hasher.update(&[0]);
         hasher.update(self.output_kind.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(self.cache_key.as_bytes());
         hasher.finalize().to_hex().to_string()
     }
 }
@@ -1485,6 +1504,24 @@ mod tests {
         let scheduler = test_scheduler(dir.path(), 0);
         assert_eq!(scheduler.pool_size, 1);
         assert_eq!(scheduler.weight_for("unknown", true), 1);
+    }
+
+    #[test]
+    fn flights_are_scoped_to_the_cache_key() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 8);
+        let build_script = || FlightIdentity::rustc("build_script_build", &["bin".into()], true);
+        let a = build_script().with_key("key-a");
+        let b = build_script().with_key("key-b");
+        assert_ne!(a.digest(), b.digest());
+        assert_eq!(a.digest(), build_script().with_key("key-a").digest());
+        let FlightJoin::Owner(_held) = scheduler.join_flight(&a) else {
+            panic!("first compile owns its flight");
+        };
+        assert!(
+            matches!(scheduler.join_flight(&b), FlightJoin::Owner(_)),
+            "a same-named compile with a different key must not wait"
+        );
     }
 
     #[test]

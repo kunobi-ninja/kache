@@ -1523,14 +1523,15 @@ fn build(
                 .env("CARGO_TARGET_DIR", &objdir)
                 .env("MBX_CACHE_DIR", cache_dir)
                 .env("MBX_STATS_REPORT", mbx_report_path(work_dir, phase))
-                .env("MBX_SUMMARY", "full");
-            if phase == Phase::Warm.name() {
-                // This phase builds a second, independently checked-out
+                .env("MBX_SUMMARY", "full")
+                // The warm phase builds a second, independently checked-out
                 // worktree (`clone_b`) against the cache the cold phase in
                 // `clone_a` populated, so mbx is configured to share
-                // compilations across checkouts.
-                cmd.env("MBX_SHARE_WORKSPACE_ROOT", "1");
-            }
+                // compilations across checkouts. The setting is part of the
+                // action key, so every phase must set it: a cold phase
+                // without it fills the store with keys the warm phase can
+                // never look up, and the warm phase rebuilds everything.
+                .env("MBX_SHARE_WORKSPACE_ROOT", "1");
         }
     }
     let mut child = cmd
@@ -7449,12 +7450,12 @@ objdir = "target"
     }
 
     /// The `warm` phase rebuilds in a second, independently checked-out
-    /// worktree, so mbx is told to share compilations across checkouts.
-    /// `cold` and `warm-same-tree` both build the same checkout the cache was
-    /// populated from and must not set it.
+    /// worktree, so mbx is told to share compilations across checkouts. The
+    /// setting changes mbx's action keys, so the cold phase that fills the
+    /// store, and the same-tree phase between them, must set it too.
     #[cfg(unix)]
     #[test]
-    fn mbx_warm_phase_enables_share_workspace_root_env() {
+    fn mbx_every_phase_enables_share_workspace_root_env() {
         let temp = tempfile::tempdir().unwrap();
         let work = temp.path().canonicalize().unwrap();
         let mut profile = prepare_fixture(&work, None);
@@ -7475,11 +7476,7 @@ objdir = "target"
             )
             .unwrap();
             let recorded = std::fs::read_to_string(work.join("share-workspace-root")).unwrap();
-            if phase == "warm" {
-                assert_eq!(recorded, "1", "phase {phase}");
-            } else {
-                assert_eq!(recorded, "unset", "phase {phase}");
-            }
+            assert_eq!(recorded, "1", "phase {phase}");
         }
     }
 

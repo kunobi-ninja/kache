@@ -1928,7 +1928,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                     } else {
                         t.elapsed_ms
                     };
-                } else {
+                } else if t.outcome != "not_found" {
                     downloads_failed += 1;
                 }
             }
@@ -4257,6 +4257,8 @@ mod tests {
         ok: bool,
     ) -> TransferEvent {
         TransferEvent {
+            prefetch: None,
+            outcome: String::new(),
             schema: 3,
             crate_name: crate_name.to_string(),
             direction,
@@ -5988,6 +5990,8 @@ mod tests {
         };
 
         let slow = TransferEvent {
+            prefetch: None,
+            outcome: String::new(),
             schema: 3,
             crate_name: "slow".to_string(),
             direction: TransferDirection::Download,
@@ -6554,6 +6558,18 @@ mod tests {
         // Slowest-first ordering: the 50ms fallback leads.
         assert_eq!(analysis.slowest.first().unwrap().elapsed_ms, 50);
         assert!(analysis.slowest.iter().all(|d| d.crate_name != "d"));
+    }
+
+    #[test]
+    fn not_found_transfers_are_not_download_failures() {
+        let mut missing = test_transfer("gone", TransferDirection::Download, "v3", 0, 5, false);
+        missing.outcome = "not_found".to_string();
+        let network = build_network_analysis(&[missing.clone()], 10);
+        assert_eq!(network.downloads_failed, 0);
+        assert_eq!(network.downloads_ok, 0);
+        assert_eq!(network.bytes_down, 0);
+        missing.outcome = "error".to_string();
+        assert_eq!(build_network_analysis(&[missing], 10).downloads_failed, 1);
     }
 
     #[test]

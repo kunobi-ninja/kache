@@ -271,6 +271,38 @@ Every report format totals the wrapper's phases per crate: startup (process star
 
 In the trace output each crate slice carries these numbers in its `args` and nests one `X` slice per phase on the same lane, in the order `startup`, `key` (with `dep-info` as its child), `lookup`, `wait`, `compile` on compiled crates, then `restore` or `store`. Phase offsets accumulate from the crate slice's start in that order; the wrapper records durations, not start times, so a phase sits where it lands in the sum. The gap after the last phase is the unattributed remainder. Durations are whole milliseconds, so a phase under 1 ms has no slice.
 
+## `kache telemetry push`
+
+After a build, inspect its timeline or send it to the configured service:
+
+```bash
+kache telemetry push --dry-run
+kache telemetry push --all --label prefetch=on
+kache telemetry push --session SESSION_ID --label prefetch=off
+```
+
+The default selects the latest session. `--all` selects every retained session;
+`--session` selects one ID. `--label KEY=VALUE` is repeatable. Configure the
+service through `KACHE_PLANNER_ENDPOINT` and its credentials. Upload failures
+print a warning without failing a completed build.
+
+Timeline schema 2 records the session, plan, candidate source, and zero-based
+rank for ordinary prefetch downloads. Transfers retain `completed`,
+`not_found`, `error`, and `import_error` outcomes. The origin stays with a
+download even if another build starts before it finishes. A local-hit unit
+and its prefetched transfer can therefore be joined by cache key inside the
+correct session.
+
+Upgrade the service before sending schema 2 records. The updated service also
+accepts schema 1. Current demand transfers and older logs still require a
+unique key or time-window match; ambiguous transfers remain unattributed.
+Packed-prefetch transfers and exact first-demand timing are not yet covered
+by this attribution.
+
+For prefetch comparisons, keep cold builds and remote contents matched, label
+the control run, and measure the whole CI job. Timeline compiler timings alone
+do not include setup or an explicit warm step.
+
 ## `kache config`
 
 ```bash

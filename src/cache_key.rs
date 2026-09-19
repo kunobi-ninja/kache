@@ -12288,12 +12288,13 @@ pub fn g(_: &'static str) {}"#,
         let pp_hash = "b".repeat(64);
         hasher.cc_preprocess_memo_record_if_unchanged("memo-key", &pp_hash, &inputs, &no_mapping);
 
-        // Rewrite both files with identical bytes. Remove first, so the
-        // replacement gets a new inode as well as a new mtime — the shape a
-        // second checkout produces.
+        // Rewrite identical bytes with different metadata. Filesystems can
+        // reuse the inode and timestamp on an immediate rewrite, so set the
+        // mtime explicitly to exercise content-based memo validation.
         for (path, bytes) in [(&source, source_bytes), (&header, header_bytes)] {
             std::fs::remove_file(path).unwrap();
             std::fs::write(path, bytes).unwrap();
+            filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
         }
         let rewritten = FileFingerprint::from_path(&header).unwrap();
         assert_ne!(
@@ -12313,6 +12314,7 @@ pub fn g(_: &'static str) {}"#,
 
         // One byte of difference is still a miss, whatever the metadata says.
         std::fs::write(&header, "#define VALUE 2\n").unwrap();
+        filetime::set_file_mtime(&header, filetime::FileTime::from_unix_time(2, 0)).unwrap();
         assert_eq!(
             FileHasher::persistent(&db).cc_preprocess_memo_lookup(
                 "memo-key",

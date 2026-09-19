@@ -12451,7 +12451,12 @@ mod tests {
             .await
             .unwrap();
         assert!(accepted);
-        server.await.unwrap();
+        // Bounded: if no hint ever reached the socket, `accept` would wait
+        // forever and the test would hang instead of failing.
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the daemon never received the hint")
+            .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while store.contains("evictable") {

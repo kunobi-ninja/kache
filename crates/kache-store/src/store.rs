@@ -14327,7 +14327,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     const TWO_HOURS: Duration = Duration::from_secs(7200);
 
     /// A key lock file last claimed `age` ago.

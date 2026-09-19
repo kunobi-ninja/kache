@@ -17,7 +17,7 @@ The daemon keeps network and maintenance work away from compiler processes. Loca
 
 With `cache.daemon_publish` enabled (the default), a C/C++ wrapper can hand its private output snapshots to the daemon. The compiler still runs in the wrapper. If the daemon cannot accept the work within 25 ms, the wrapper keeps the local publication path. Volume-local stores also use that path.
 
-Report JSON marks completed daemon publications with `store_handed_off` and records their background time in `daemon_store_ms`. That time is separate from the wrapper's `store_ms`. A daemon crash can lose queued cache entries; the compiler outputs remain available to the build.
+Report JSON marks daemon publication attempts with `store_handed_off` and records their background time in `daemon_store_ms`. That time is separate from the wrapper's `store_ms`. A daemon crash can lose queued cache entries; the compiler outputs remain available to the build.
 
 Set `cache.prefetch_enabled = false` or `KACHE_PREFETCH_ENABLED=0` to disable speculative prefetch while retaining exact remote checks and uploads.
 

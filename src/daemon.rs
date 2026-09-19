@@ -1913,6 +1913,12 @@ struct PrefetchTaskGuard {
     cancellations: Arc<Mutex<PrefetchCancellations>>,
 }
 
+impl PrefetchTaskGuard {
+    fn complete(mut self) {
+        self.origin = None;
+    }
+}
+
 impl Drop for PrefetchTaskGuard {
     fn drop(&mut self) {
         if let Some(origin) = self.origin.take() {
@@ -4806,13 +4812,13 @@ impl Daemon {
             return None;
         }
         let (completed, receiver) = tokio::sync::oneshot::channel();
-        let mut guard = PrefetchTaskGuard {
+        let guard = PrefetchTaskGuard {
             origin: Some(origin),
             cancellations: self.prefetch_cancellations.clone(),
         };
         tasks.spawn(async move {
             task.await;
-            guard.origin = None;
+            guard.complete();
             let _ = completed.send(());
         });
         Some(receiver)

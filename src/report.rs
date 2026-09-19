@@ -4190,6 +4190,7 @@ mod tests {
         BuildEvent {
             ts: Utc::now(),
             session_id: String::new(),
+            demands: Vec::new(),
             crate_name: crate_name.to_string(),
             root: String::new(),
             version: "0.1.0".to_string(),

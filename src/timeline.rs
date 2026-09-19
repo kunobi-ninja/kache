@@ -219,6 +219,7 @@ fn group_sessions(events: &[BuildEvent]) -> BTreeMap<String, SessionEvents> {
             permit_wait_ms: event.permit_wait_ms,
             compiler_runs: event.compiler_runs,
             event_schema: event.schema,
+            demands: event.demands.clone(),
         });
     }
     for session in sessions.values_mut() {
@@ -540,6 +541,33 @@ mod tests {
         assert_eq!(first.units[0].started_at_ms, 4_500);
         assert_eq!(first.units[0].finished_at_ms, 5_000);
         assert_eq!(first.units[0].result, "local_hit");
+    }
+
+    #[test]
+    fn demand_observations_survive_timeline_projection() {
+        let mut observed = event("s1", "serde", "final", 5_000, 500);
+        observed.demands = vec![
+            kache_core::timeline::KeyDemand {
+                cache_key: "provisional".to_string(),
+                first_demand_at_ms: 4_625,
+                remote_wait_ms: 72,
+            },
+            kache_core::timeline::KeyDemand {
+                cache_key: "final".to_string(),
+                first_demand_at_ms: 4_750,
+                remote_wait_ms: 0,
+            },
+        ];
+        let expected = observed.demands.clone();
+        let legacy = event("s1", "syn", "legacy", 6_000, 100);
+        let records = build_timelines(&inputs(
+            &[observed, legacy],
+            &[],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        assert_eq!(records[0].units[0].demands, expected);
+        assert!(records[0].units[1].demands.is_empty());
     }
 
     #[test]

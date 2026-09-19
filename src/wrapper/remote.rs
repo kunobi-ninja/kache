@@ -44,13 +44,17 @@ pub(super) fn acquire_entry(
     config.remote.as_ref()?;
     let entry_dir = store.entry_dir(cache_key);
     let shard_dir = crate::daemon::remote_check_shard_dir_arg(&config.cache_dir, store.cache_dir());
+    crate::demand::record(cache_key);
+    let waiting = std::time::Instant::now();
     let reply = crate::daemon::send_remote_check(
         config,
         cache_key,
         &entry_dir,
         crate_name,
         shard_dir.as_deref().map(Path::new),
-    )?;
+    );
+    crate::demand::remote_wait(cache_key, waiting.elapsed());
+    let reply = reply?;
     if !reply.found && negative_reply == NegativeReply::ContinueCompile {
         return None;
     }

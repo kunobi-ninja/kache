@@ -1059,23 +1059,21 @@ impl PrefetchRequest {
             // S3 object keys, so drop any candidate that isn't a well-formed
             // key + safe crate name before it can become a traversal /
             // prefix-escape primitive. Reject, don't sanitize.
-            .filter(|c| {
-                let ok = crate::cache_key::is_valid_cache_key(&c.cache_key)
-                    && crate::cache_key::is_valid_crate_name(&c.crate_name);
-                if !ok {
+            .filter_map(|candidate| {
+                if !crate::cache_key::is_valid_cache_key(&candidate.cache_key)
+                    || !crate::cache_key::is_valid_crate_name(&candidate.crate_name)
+                {
                     tracing::warn!(
-                        cache_key = key_prefix(&c.cache_key),
-                        cache_key_len = c.cache_key.len(),
+                        cache_key = key_prefix(&candidate.cache_key),
+                        cache_key_len = candidate.cache_key.len(),
                         "prefetch: dropping planner candidate with invalid cache_key/crate_name"
                     );
+                    return None;
                 }
-                ok
-            })
-            .map(|candidate| {
                 candidate_sources
                     .entry(candidate.cache_key.clone())
                     .or_insert(candidate.source);
-                (candidate.cache_key, candidate.crate_name)
+                Some((candidate.cache_key, candidate.crate_name))
             })
             .collect();
         Self {
@@ -17322,6 +17320,8 @@ mod tests {
     #[test]
     fn prefetch_candidate_source_uses_the_first_valid_candidate() {
         let key = "b".repeat(64);
+        let invalid_key =
+            kache_core::PrefetchCandidate::new("not-a-cache-key".into(), "serde".into());
         let mut invalid = kache_core::PrefetchCandidate::new(key.clone(), "../evil".into());
         invalid.source = kache_core::CandidateSource::Shard;
         let mut first = kache_core::PrefetchCandidate::new(key.clone(), "serde".into());
@@ -17332,8 +17332,12 @@ mod tests {
             plan_id: None,
             planner: None,
             disposition: PrefetchDisposition::Execute,
-            candidates: vec![invalid, first, duplicate],
+            candidates: vec![invalid_key, invalid, first, duplicate],
         });
+        assert_eq!(
+            request.keys,
+            vec![(key.clone(), "serde".into()), (key.clone(), "serde".into())]
+        );
         assert_eq!(
             request.candidate_sources,
             HashMap::from([(key, kache_core::CandidateSource::Manifest)])

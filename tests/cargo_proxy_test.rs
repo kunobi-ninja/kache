@@ -5,7 +5,6 @@
 use serde_json::Value;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -147,8 +146,7 @@ fn explicit_rustflags_keep_their_cargo_precedence() {
 fn non_utf8_cargo_argument_passes_through_without_cli_panic() {
     let dir = tempfile::tempdir().unwrap();
     let fake_cargo = dir.path().join("cargo");
-    std::fs::write(&fake_cargo, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&fake_cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    kache_fs::testutil::write_executable(&fake_cargo, "#!/bin/sh\nexit 0\n");
 
     let output = Command::new(KACHE_BIN)
         .args(["cargo", "--", "build"])
@@ -169,12 +167,10 @@ fn non_utf8_wrapper_argument_fails_closed_before_compiler_execution() {
     let dir = tempfile::tempdir().unwrap();
     let fake_rustc = dir.path().join("rustc");
     let sentinel = dir.path().join("compiler-ran");
-    std::fs::write(
+    kache_fs::testutil::write_executable(
         &fake_rustc,
         format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let output = Command::new(KACHE_BIN)
         .arg(&fake_rustc)
@@ -207,12 +203,10 @@ fn configured_build_dir_reaches_cargo_without_proxy_override() {
         "[build]\nbuild-dir = \"configured-build\"\n",
     )
     .unwrap();
-    std::fs::write(
+    kache_fs::testutil::write_executable(
         &fake_cargo,
         "#!/bin/sh\nprintf '%s' \"${CARGO_BUILD_BUILD_DIR-unset}\" > \"$KACHE_TEST_CAPTURE\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let output = Command::new(KACHE_BIN)
         .args(["cargo", "--", "build"])

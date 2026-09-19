@@ -51,8 +51,6 @@ fn report_preserves_phase_metrics() {
 #[test]
 #[ignore]
 fn remote_completion_child() {
-    use std::os::unix::fs::PermissionsExt;
-
     let family = std::env::var("KACHE_TEST_HIT_FAMILY").unwrap();
     let mode = std::env::var("KACHE_TEST_HIT_MODE").unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -73,15 +71,13 @@ fn remote_completion_child() {
         .path()
         .join(if family == "cc" { "clang" } else { "nvcc" });
     let shell = crate::compiler::resolve_program_on_path("sh").unwrap();
-    std::fs::write(
+    kache_fs::testutil::write_executable(
         &compiler_path,
         format!(
             "#!{}\nprintf 'FALLBACK-STDOUT\\n'\nprintf 'FALLBACK-STDERR\\n' >&2\nexit 7\n",
             shell.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&compiler_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let output = dir.path().join(if mode == "failure" {
         "missing-parent/restored.o"
     } else {

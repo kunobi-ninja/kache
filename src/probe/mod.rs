@@ -916,7 +916,7 @@ mod tests {
 
         // Present but not executable: spawn fails with a non-NotFound error.
         let unexecutable = dir.path().join("cc-unexecutable");
-        std::fs::write(&unexecutable, "#!/bin/sh\nexit 0\n").unwrap();
+        kache_fs::testutil::write_executable(&unexecutable, "#!/bin/sh\nexit 0\n");
         std::fs::set_permissions(&unexecutable, std::fs::Permissions::from_mode(0o644)).unwrap();
         match live_probe_diagnostic_for(&unexecutable.to_string_lossy()) {
             LiveProbeDiagnostic::ProbeError { detail } => {
@@ -930,8 +930,7 @@ mod tests {
 
         // Present and executable but --version fails.
         let failing = dir.path().join("cc-version-fails");
-        std::fs::write(&failing, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&failing, "#!/bin/sh\nexit 1\n");
         match live_probe_diagnostic_for(&failing.to_string_lossy()) {
             LiveProbeDiagnostic::ProbeError { detail } => {
                 // Specifically the PREFLIGHT's report, not the prober's later
@@ -954,12 +953,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn live_probe_diagnostic_classifies_unresolvable_and_real_compilers() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("cc-resolves-nothing");
-        std::fs::write(&fake, "#!/bin/sh\necho fake-cc 1.0\nexit 0\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&fake, "#!/bin/sh\necho fake-cc 1.0\nexit 0\n");
         match live_probe_diagnostic_for(&fake.to_string_lossy()) {
             LiveProbeDiagnostic::Unresolved { version_line, .. } => {
                 assert_eq!(version_line, "fake-cc 1.0");
@@ -1307,9 +1303,7 @@ mod tests {
         #[cfg(unix)]
         {
             let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            kache_fs::testutil::write_executable(&path, format!("#!/bin/sh\n{body}\n"));
             path
         }
         #[cfg(windows)]
@@ -1513,9 +1507,7 @@ mod tests {
     #[cfg(unix)]
     fn write_nvcc_fixture(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&path, format!("#!/bin/sh\n{body}\n"));
         path
     }
 

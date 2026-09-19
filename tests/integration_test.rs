@@ -1237,8 +1237,6 @@ fn test_cc_existing_readonly_output_matches_selected_compiler() {
 #[cfg(unix)]
 #[test]
 fn test_cc_passthrough_preserves_non_utf8_streams_and_exit_status() {
-    use std::os::unix::fs::PermissionsExt;
-
     build_kache();
     let project = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
@@ -1249,15 +1247,13 @@ fn test_cc_passthrough_preserves_non_utf8_streams_and_exit_status() {
     assert!(shell.status.success());
     let shell = String::from_utf8(shell.stdout).unwrap();
     let fake_cc = project.path().join("cc");
-    std::fs::write(
+    kache_fs::testutil::write_executable(
         &fake_cc,
         format!(
             "#!{}\nprintf '\\377'\nprintf '\\376' >&2\nexit 7\n",
             shell.trim()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let output_path = project.path().join("existing.o");
     std::fs::write(&output_path, b"existing").unwrap();
 
@@ -3103,20 +3099,16 @@ cache_executables = true
 #[cfg(unix)]
 #[test]
 fn workspace_wrapper_passthrough_executes_every_time() {
-    use std::os::unix::fs::PermissionsExt;
-
     build_kache();
     let cache_dir = TempDir::new().unwrap();
     let marker = cache_dir.path().join("wrapper-runs.log");
 
     // Fake workspace wrapper: records each execution, then forwards to rustc.
     let wrapper = cache_dir.path().join("fake-driver");
-    std::fs::write(
+    kache_fs::testutil::write_executable(
         &wrapper,
         format!("#!/bin/sh\necho ran >> {}\nexec \"$@\"\n", marker.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let src = cache_dir.path().join("lib.rs");
     std::fs::write(&src, "pub fn foo() -> u32 { 42 }\n").unwrap();

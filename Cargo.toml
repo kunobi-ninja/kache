@@ -116,6 +116,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 kache-store = { version = "0.25.0", path = "crates/kache-store", features = ["test-support"] }
+kache-fs = { version = "0.25.0", path = "crates/kache-fs", features = ["testing"] }
 assert_cmd = "2"
 axum = "0.8"
 predicates = "3"

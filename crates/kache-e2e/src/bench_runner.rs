@@ -5264,17 +5264,14 @@ mod tests {
     fn fake_kache_that_records(dir: &Path, marker: &Path, exit: i32) -> PathBuf {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let path = dir.join("fake-kache");
-            std::fs::write(
+            kache_fs::testutil::write_executable(
                 &path,
                 format!(
                     "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > '{}'\nexit {exit}\n",
                     marker.display()
                 ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).unwrap();
+            );
             path
         }
         #[cfg(windows)]
@@ -6164,7 +6161,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sccache_same_tree_resets_artifacts_and_does_not_seed_cross_checkout() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let work = root.join("work");
@@ -6176,15 +6172,17 @@ mod tests {
         }
         let cache = work.join("cache");
         let tool = root.join("sccache");
-        std::fs::write(&tool, r#"#!/bin/sh
+        kache_fs::testutil::write_executable(
+            &tool,
+            r#"#!/bin/sh
 case "$1" in
   --show-stats)
     hits=$(cat "$SCCACHE_DIR/hits")
     printf '{"stats":{"cache_hits":{"counts":{"Rust":%s}}},"basedirs":["%s"],"cache_location":"%s"}' "$hits" "$SCCACHE_BASEDIRS" "$SCCACHE_DIR"
     ;;
 esac
-"#).unwrap();
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+"#,
+        );
         let scenario_dir = root.join("bench-fixture");
         std::fs::create_dir_all(&scenario_dir).unwrap();
         let scenario = scenario_dir.join("scenario.toml");
@@ -6246,7 +6244,10 @@ objdir = "target"
             assert!(otlp.contains("warm-same-tree"));
         }
         // A command that does no restoration cannot publish a successful warm phase.
-        std::fs::write(&tool, "#!/bin/sh\ncase \"$1\" in --show-stats) printf '{\"stats\":{},\"basedirs\":[\"%s\"]}' \"$SCCACHE_BASEDIRS\";; esac\n").unwrap();
+        kache_fs::testutil::write_executable(
+            &tool,
+            "#!/bin/sh\ncase \"$1\" in --show-stats) printf '{\"stats\":{},\"basedirs\":[\"%s\"]}' \"$SCCACHE_BASEDIRS\";; esac\n",
+        );
         let error = measure_sccache_phase(
             &profile,
             &tool,
@@ -6740,10 +6741,8 @@ objdir = "target"
 
     #[cfg(unix)]
     fn unix_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&path, body);
         path
     }
 

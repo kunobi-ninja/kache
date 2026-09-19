@@ -1686,22 +1686,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dependency_closure_lists_and_bails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let shell =
             crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
         let fake = dir.path().join("nvcc");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &fake,
             format!(
                 "#!{}\nprintf '%s' \"$NVCC_FAKE_M_OUT\"\nexit \"${{NVCC_FAKE_M_EXIT:-0}}\"\n",
                 shell.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let previous_out = std::env::var_os("NVCC_FAKE_M_OUT");
         let previous_exit = std::env::var_os("NVCC_FAKE_M_EXIT");
         unsafe {
@@ -2317,16 +2313,13 @@ mod tests {
         std::fs::write(&src, "void k(void) {}\n").unwrap();
         let payload = dir.path().join("payload");
         std::fs::write(&payload, format!("ELF{}", dir.path().display())).unwrap();
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &nvcc,
             format!(
                 "#!/bin/sh\nout=\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then out=$a; fi\n  prev=$a\ndone\ncp '{}' \"$out\"\n",
                 payload.display()
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&nvcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let parsed = parse_ok(&[
             nvcc.to_str().unwrap(),

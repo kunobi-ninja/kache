@@ -2,13 +2,11 @@
 //! no cache and no configured fallback, unless the backend is trusted.
 #![cfg(unix)]
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
 fn script(path: &Path, body: &str) {
-    fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    kache_fs::testutil::write_executable(path, format!("#!/bin/sh\n{body}\n"));
 }
 
 #[test]

@@ -9907,21 +9907,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stripped_fallback_receives_incremental_disabled_env() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let fallback = dir.path().join("fallback");
         let env_dump = dir.path().join("incremental-env.txt");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &fallback,
             format!(
                 "#!/bin/sh\nprintf '%s' \"${{CARGO_INCREMENTAL-unset}}\" > '{}'\nexit 0\n",
                 env_dump.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let source = dir.path().join("lib.rs");
         std::fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
@@ -9945,8 +9941,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn immediate_adaptive_compile_keeps_passthrough_remap_policy() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let profile = dir.path().join("target/debug");
         let deps = profile.join("deps");
@@ -9958,7 +9952,7 @@ mod tests {
         let rustc = dir.path().join("rustc");
         let argv_dump = dir.path().join("argv.txt");
         std::fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &rustc,
             format!(
                 r#"#!/bin/sh
@@ -9978,9 +9972,7 @@ exit 0
 "#,
                 argv_dump.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let mut args = RustcArgs::parse(&[
             rustc.display().to_string(),
@@ -10800,21 +10792,17 @@ exit 0
         let fallback = dir.path().join("fallback");
         let shell =
             crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &fake_cc,
             format!(
                 "#!{}\ncapture=\"$1\"\nshift\nprintf '%s\\n' \"$@\" > \"$capture\"\n",
                 shell.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_cc, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::write(
+        );
+        kache_fs::testutil::write_executable(
             &fallback,
             format!("#!{}\nprintf 'fallback\\n' > \"$2\"\n", shell.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::fs::write(&output, b"existing output").unwrap();
         std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o444)).unwrap();
 
@@ -10851,15 +10839,15 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn nvcc_passthrough_propagates_exit_code_and_reasons() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let fake_nvcc = dir.path().join("nvcc");
         let shell =
             crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
-        std::fs::write(&fake_nvcc, format!("#!{}\nexit 3\n", shell.display())).unwrap();
-        std::fs::set_permissions(&fake_nvcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(
+            &fake_nvcc,
+            format!("#!{}\nexit 3\n", shell.display()),
+        );
 
         let _root_guard = TestEnvGuard::set("KACHE_EVENT_ROOT", "/nvcc-phase1-root");
         let config = test_config(dir.path().join("cache"));
@@ -10907,21 +10895,17 @@ exit 0
         exit_code: i32,
         m_exit_code: i32,
     ) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-
         let shell =
             crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
         let host = dir.join("host-gcc");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &host,
             format!(
                 "#!{}\nprintf '%s\\n' '{hv}'\n",
                 shell.display(),
                 hv = host_version
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let nvcc = dir.join("nvcc");
         let argv_line = argv_record
             .map(|p| {
@@ -10939,7 +10923,7 @@ exit 0
                 )
             })
             .unwrap_or_default();
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &nvcc,
             format!(
                 "#!{sh}\n\
@@ -10980,9 +10964,7 @@ exit 0
                 ver = version,
                 headers = headers,
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&nvcc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         (nvcc, host)
     }
 
@@ -11857,8 +11839,6 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn cc_direct_passthrough_bypasses_configured_fallback() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let fake_cc = dir.path().join("cc");
         let fallback = dir.path().join("fallback");
@@ -11868,26 +11848,22 @@ exit 0
         let shell =
             crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
 
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &fake_cc,
             format!(
                 "#!{}\nprintf direct > '{}'\n",
                 shell.display(),
                 compiler_marker.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_cc, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::write(
+        );
+        kache_fs::testutil::write_executable(
             &fallback,
             format!(
                 "#!{}\nprintf fallback > '{}'\n",
                 shell.display(),
                 fallback_marker.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let parsed = CcCompiler::new()
             .parse(&s(&[
@@ -11938,16 +11914,14 @@ exit 0
         let fake_cc = dir.path().join("cc");
         let shell =
             crate::compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &fake_cc,
             format!(
                 "#!{}\nprintf ran > '{}'\n",
                 shell.display(),
                 marker.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let parsed = CcCompiler::new()
             .parse(&s(&[

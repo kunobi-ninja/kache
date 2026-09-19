@@ -20,7 +20,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -41,8 +40,10 @@ fn family_probe_forwards_to_real_compiler_recovered_from_cc_env() {
     // A fake compiler: ignores its args, prints a unique marker. Stands
     // in for clang-cl on a host where `cc` may or may not exist.
     let fake = dir.path().join("fake-cc.sh");
-    fs::write(&fake, format!("#!/bin/sh\necho '{FAKE_MARKER}'\nexit 0\n")).unwrap();
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    kache_fs::testutil::write_executable(
+        &fake,
+        format!("#!/bin/sh\necho '{FAKE_MARKER}'\nexit 0\n"),
+    );
 
     // The probe file the cc crate would have created (contents irrelevant
     // — the fake compiler ignores it).

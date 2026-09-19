@@ -6,8 +6,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn script(path: &Path, body: &str) {
-    fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    kache_fs::testutil::write_executable(path, format!("#!/bin/sh\n{body}\n"));
 }
 
 struct Fixture {

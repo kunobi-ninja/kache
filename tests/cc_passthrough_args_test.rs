@@ -11,7 +11,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 fn kache_binary() -> &'static str {
@@ -32,15 +31,13 @@ fn refused_double_dash_invocation_is_exact_passthrough() {
     // #285).
     let argv_dump = dir.path().join("argv.txt");
     let fake = dir.path().join("cc");
-    fs::write(
+    kache_fs::testutil::write_executable(
         &fake,
         format!(
             "#!/bin/sh\n: > '{dump}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{dump}'; done\nexit 0\n",
             dump = argv_dump.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     // A real source keeps the invocation representative of cc-rs.
     let source = dir.path().join("windows.c");

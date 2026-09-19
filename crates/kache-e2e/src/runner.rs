@@ -1622,12 +1622,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn compiler_shims_on_prepends_path_and_drops_cc() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let kache = tmp.path().join("kache");
-        std::fs::write(&kache, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&kache, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&kache, "#!/bin/sh\nexit 0\n");
 
         let fixture = dummy_shim_fixture(true);
         let out = super::maybe_apply_compiler_shims(&fixture, &kache, tmp.path())

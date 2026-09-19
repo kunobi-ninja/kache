@@ -6,7 +6,6 @@ use filetime::FileTime;
 use serde_json::Value;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
@@ -184,12 +183,10 @@ fn source_churn_adapts_then_returns_to_exact_cache_hits() {
     let fallback_marker = project.path().join("fallback-used");
     let config_path = project.path().join("missing-kache.toml");
     fs::create_dir(project.path().join("src")).unwrap();
-    fs::write(
+    kache_fs::testutil::write_executable(
         &fallback,
         "#!/bin/sh\ncase \" $* \" in *\" --crate-name adaptive_fixture \"*) : > \"$FALLBACK_MARKER\";; esac\nexec \"$@\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fallback, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     fs::write(
         project.path().join("Cargo.toml"),
         "[package]\nname = \"adaptive-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
@@ -366,12 +363,10 @@ fn user_facing_executable_preserves_configured_fallback_contract() {
     let fallback_marker = project.path().join("fallback-used");
 
     fs::create_dir(project.path().join("src")).unwrap();
-    fs::write(
+    kache_fs::testutil::write_executable(
         &fallback,
         "#!/bin/sh\ncase \" $* \" in *\" --crate-name adaptive_fixture \"*) : > \"$FALLBACK_MARKER\";; esac\nexec \"$@\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fallback, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     fs::write(
         project.path().join("Cargo.toml"),
         "[package]\nname = \"adaptive-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
@@ -440,7 +435,7 @@ fn contended_immediate_lane_never_shares_incremental_state() {
     let first_argv = project.path().join("first-argv.txt");
     let second_argv = project.path().join("second-argv.txt");
     fs::write(&source, "fn main() {}\n").unwrap();
-    fs::write(
+    kache_fs::testutil::write_executable(
         &fake_rustc,
         r#"#!/bin/sh
 printf '%s\n' "$@" > "$ARGV_DUMP"
@@ -468,9 +463,7 @@ else
 fi
 exit 0
 "#,
-    )
-    .unwrap();
-    fs::set_permissions(&fake_rustc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let wrapper = |argv_dump: &Path| {
         let mut command = hermetic_command(

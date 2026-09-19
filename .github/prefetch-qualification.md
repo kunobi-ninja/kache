@@ -36,7 +36,7 @@ and compiler versions are retained; concurrent unrelated pool jobs remain a
 source of noise. Three pairs are a qualification, not a statistical benchmark.
 
 Each artifact must list a deterministic fixture correctly and report the
-pinned eza version. Every arm needs schema-3 timelines with schema-20 demand
+pinned eza version. Every arm needs schema-3 or schema-4 timelines with schema-20 demand
 records on every keyed unit and remote restores. On arms must exercise speculative transfers;
 off arms must have none. The report joins first demands by immutable session and key, including
 prefetched local hits. Useful credit requires consumption by a successful hit,
@@ -48,9 +48,16 @@ Raw events, transfers, summaries, dry-run timelines and immutable seed identity
 are retained under `prefetch-qualification-*`; these names do not enter the
 existing `telemetry-otlp-v1*` ingestion path.
 
-The schema-3 report covers ordinary logged transfers. Packed operations and
+The schema-3/4 adapter covers ordinary logged transfers. Schema 4 explicitly
+adds the lifecycle `incomplete` flag, reviewed against commit
+`0ac603f944ba546dfc78cb457462537c99a35739`. After daemon drain, the harness
+retains `lifecycle.json` and raw schema-2 summaries. Incomplete outcomes,
+shutdown timeouts, or a missing final summary for a schema-4 speculative session
+fail admission. An off arm with no speculative plan needs no summary. Legacy
+schema-3 shutdown completeness remains unknown. Packed operations and
 partial physical transfer bytes may be missing, so `controls_valid` does not
-claim complete precision qualification. New timeline schemas or transfer fields
+claim complete precision qualification. Packed schema support awaits the prefetch worker's final physical-operation
+and entry fields. New timeline schemas or transfer fields
 fail admission until their adapter and physical-byte accounting are reviewed.
 
 Review complete job pairs and raw demand evidence before accepting #618's

@@ -264,7 +264,7 @@ class Telemetry(unittest.TestCase):
             elif change == "wrong-key":
                 rec["units"][0]["demands"][0]["cache_key"] = "other"
             elif change == "new-schema":
-                rec["schema"] = 4
+                rec["schema"] = 5
             else:
                 rec["transfers"][0]["entries"] = []
             with self.assertRaises(ValueError):
@@ -281,6 +281,79 @@ class Telemetry(unittest.TestCase):
         for change in ({"schema": 2}, {"units": []}, {"transfers": []}):
             with self.assertRaises(ValueError):
                 q.summarize([record() | change], True)
+
+
+class Lifecycle(unittest.TestCase):
+    def record(self, **changes):
+        rec = record()
+        rec.update(
+            schema=4,
+            summary={"incomplete": False, "closure_reason": "shutdown"} | changes,
+        )
+        return rec
+
+    def test_reviewed_schema4_preserves_ordinary_precision(self):
+        result = q.summarize([self.record()], True)
+        self.assertEqual(result["recorded_useful_prefetch_bytes"], 30)
+        self.assertEqual(result["lifecycle"]["timeline_schemas"], [4])
+        self.assertEqual(
+            result["lifecycle"]["summaries"]["session"]["closure_reason"], "shutdown"
+        )
+        self.assertFalse(result["lifecycle"]["legacy_shutdown_evidence_unknown"])
+        self.assertFalse(result["complete_precision_qualification"])
+
+    def test_incomplete_or_timed_out_shutdown_is_not_admitted(self):
+        for changes in ({"incomplete": True}, {"closure_reason": "shutdown_timeout"}):
+            rec = self.record(**changes)
+            evidence = q.lifecycle_evidence([rec])
+            self.assertTrue(evidence["problems"])
+            self.assertEqual(evidence["summaries"]["session"], rec["summary"])
+            with self.assertRaises(ValueError):
+                q.summarize([rec], True)
+
+    def test_missing_or_malformed_schema4_summary_is_not_admitted(self):
+        for summary in (None, {}, {"incomplete": "false"}):
+            rec = self.record()
+            rec["summary"] = summary
+            with self.assertRaises(ValueError):
+                q.summarize([rec], True)
+
+    def test_off_arm_without_plan_needs_no_summary(self):
+        rec = self.record()
+        rec["summary"] = None
+        rec["transfers"][0]["prefetch"] = None
+        result = q.summarize([rec], False)
+        self.assertFalse(result["lifecycle"]["problems"])
+
+    def test_raw_summary2_incomplete_cannot_hide_behind_newest_complete_summary(self):
+        raw = {
+            "schema": 2,
+            "session_id": "session",
+            "incomplete": True,
+            "closure_reason": "shutdown",
+        }
+        result = q.lifecycle_evidence([self.record()], [raw])
+        self.assertEqual(result["raw_summary_schemas"], [2])
+        self.assertTrue(result["problems"])
+        self.assertTrue(
+            q.lifecycle_evidence(
+                [self.record()], [raw | {"schema": 1, "incomplete": False}]
+            )["problems"]
+        )
+        for bad in (raw | {"schema": 3}, raw | {"incomplete": None}):
+            with self.assertRaises(ValueError):
+                q.lifecycle_evidence([self.record()], [bad])
+
+    def test_schema3_stays_explicitly_unknown_and_packed_fields_stay_blocked(self):
+        self.assertTrue(
+            q.summarize([record()], True)["lifecycle"][
+                "legacy_shutdown_evidence_unknown"
+            ]
+        )
+        rec = self.record()
+        rec["transfers"][0]["entries"] = []
+        with self.assertRaises(ValueError):
+            q.summarize([rec], True)
 
 
 class Timing(unittest.TestCase):
@@ -359,6 +432,20 @@ class Timing(unittest.TestCase):
                 self.assertFalse(report["controls_valid"])
                 self.assertEqual(report["consumers"]["on-3"]["seconds"], 60)
                 self.assertTrue(report["problems"])
+                q.dump(
+                    args.results / "prefetch-qualification-on-3" / "lifecycle.json",
+                    {
+                        "problems": ["session: shutdown timed out"],
+                        "summaries": {"session": {"incomplete": True}},
+                    },
+                )
+                with self.assertRaises(ValueError):
+                    q.collect(args)
+                report = json.loads((args.output / "job-times.json").read_text())
+                self.assertIn("on-3: session: shutdown timed out", report["problems"])
+                self.assertTrue(
+                    report["lifecycle"]["on-3"]["summaries"]["session"]["incomplete"]
+                )
 
     def test_job_api_paginates(self):
         with patch.object(

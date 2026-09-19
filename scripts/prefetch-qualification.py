@@ -186,11 +186,90 @@ def drain(runtime):
                 time.sleep(0.1)
 
 
-def summarize(records, enabled):
+# Schema 4 adds TimelineSummary.incomplete to schema 3's ordinary transfer model.
+# Reviewed against lifecycle commit 0ac603f944ba546dfc78cb457462537c99a35739.
+SUPPORTED_TIMELINE_SCHEMAS = (3, 4)
+
+
+def lifecycle_evidence(records, raw_summaries=None):
     require(
-        records and all(r["schema"] == 3 for r in records),
-        "Only ordinary timeline schema 3 is supported; add an explicit packed-schema adapter",
+        records and all(r["schema"] in SUPPORTED_TIMELINE_SCHEMAS for r in records),
+        "Only reviewed ordinary timeline schemas 3 and 4 are supported; packed schemas need an adapter",
     )
+    summaries, problems, missing = {}, [], []
+    known_summary_fields = {
+        "plan_id",
+        "plan_source",
+        "closure_reason",
+        "started_at_ms",
+        "last_activity_ms",
+        "candidate_keys",
+        "downloaded_keys",
+        "downloaded_bytes",
+        "used_keys",
+        "demanded_keys",
+        "demanded_candidate_keys",
+        "cancelled",
+    }
+    for record in records:
+        session, schema = record["session_id"], record["schema"]
+        summary = record.get("summary")
+        if summary is None:
+            if schema == 4 and any(
+                t.get("prefetch", {}).get("session_id") == session
+                for t in record["transfers"]
+                if t.get("prefetch")
+            ):
+                missing.append(session)
+                problems.append(f"{session}: speculative session has no final summary")
+            continue
+        allowed = known_summary_fields | ({"incomplete"} if schema == 4 else set())
+        require(
+            not (set(summary) - allowed),
+            "Unknown summary fields: review the schema adapter",
+        )
+        summaries[session] = summary
+        if schema == 4 and type(summary.get("incomplete")) is not bool:
+            problems.append(
+                f"{session}: schema-4 summary lacks an explicit incomplete flag"
+            )
+        if summary.get("incomplete") is True:
+            problems.append(f"{session}: shutdown left outcomes incomplete")
+        if summary.get("closure_reason") == "shutdown_timeout":
+            problems.append(f"{session}: shutdown timed out")
+    raw_schemas = []
+    for summary in raw_summaries or []:
+        raw_schemas.append(summary["schema"])
+        require(summary["schema"] in (1, 2), "Unknown raw summary schema")
+        if all(r["schema"] == 4 for r in records) and summary["schema"] != 2:
+            problems.append(
+                "Schema-4 timeline contains a legacy raw summary without lifecycle evidence"
+            )
+        if summary["schema"] == 2:
+            require(
+                type(summary.get("incomplete")) is bool,
+                "Raw summary schema 2 requires an explicit incomplete flag",
+            )
+        if (
+            summary.get("incomplete") is True
+            or summary.get("closure_reason") == "shutdown_timeout"
+        ):
+            problems.append(
+                f"{summary.get('session_id', '')}: raw summary is incomplete"
+            )
+    return {
+        "timeline_schemas": sorted({r["schema"] for r in records}),
+        "raw_summary_schemas": sorted(set(raw_schemas)),
+        "summaries": summaries,
+        "legacy_shutdown_evidence_unknown": any(r["schema"] == 3 for r in records),
+        "missing_summary_sessions": missing,
+        "problems": problems,
+    }
+
+
+def summarize(records, enabled):
+    lifecycle = lifecycle_evidence(records)
+    require(not lifecycle["problems"], "; ".join(lifecycle["problems"]))
     demands, consumed, units, transfers = {}, set(), [], {}
     sessions = {record["session_id"] for record in records}
     allowed_transfer_fields = {
@@ -292,7 +371,8 @@ def summarize(records, enabled):
         )
     denominator = sum(t["compressed_bytes"] for t in speculative)
     return {
-        "scope": "Ordinary schema-3 logged transfers only; packed and partial physical transfers may be absent",
+        "scope": "Ordinary schema-3/4 logged transfers only; packed and partial physical transfers may be absent",
+        "lifecycle": lifecycle,
         "complete_precision_qualification": False,
         "demanded_keys": len(demands),
         "unit_outcomes": dict(Counter(u["result"] for u in units)),
@@ -442,12 +522,17 @@ prefix = "artifacts"
             "prefetch=" + ("on" if enabled else "off"),
         ],
     )
+    records = json.loads(timeline)
+    raw_path = output / "summaries.jsonl"
+    raw_summaries = (
+        [json.loads(line) for line in raw_path.read_text().splitlines() if line.strip()]
+        if raw_path.exists()
+        else []
+    )
+    lifecycle = lifecycle_evidence(records, raw_summaries)
+    dump(output / "lifecycle.json", lifecycle)
+    require(not lifecycle["problems"], "; ".join(lifecycle["problems"]))
     if producer:
-        records = json.loads(timeline)
-        require(
-            records and all(r["schema"] == 3 for r in records),
-            "Merge #618 telemetry prerequisites before producing a seed",
-        )
         require(
             any(
                 u.get("demands") and u.get("event_schema", 0) >= 20
@@ -474,7 +559,7 @@ prefix = "artifacts"
                 tar.add(path, arcname=path.name)
     else:
         require(manifest["files"] == files(bundle), "Consumer mutated read-only seed")
-        dump(output / "admission.json", summarize(json.loads(timeline), enabled))
+        dump(output / "admission.json", summarize(records, enabled))
     dump(output / "identity.json", manifest)
 
 
@@ -601,7 +686,7 @@ def collect(args):
             if j["name"] == "seed"
         ]
         dump(args.output / "seed-run.json", seed_run)
-    identities, artifacts = {}, {}
+    identities, artifacts, lifecycles = {}, {}, {}
     for arm in ARMS:
         folder = args.results / ("prefetch-qualification-" + arm)
         for name, target in (("identity", identities), ("artifact", artifacts)):
@@ -610,6 +695,12 @@ def collect(args):
                 target[arm] = json.loads(path.read_text())
             else:
                 problems.append(f"{arm} lacks {name}")
+        lifecycle_path = folder / "lifecycle.json"
+        if lifecycle_path.exists():
+            lifecycles[arm] = json.loads(lifecycle_path.read_text())
+            problems.extend(
+                f"{arm}: {problem}" for problem in lifecycles[arm]["problems"]
+            )
         if not (folder / "admission.json").exists():
             problems.append(f"{arm} did not pass telemetry admission")
     require_same = {json.dumps(value, sort_keys=True) for value in identities.values()}
@@ -641,6 +732,7 @@ def collect(args):
             "pairs": pairs,
             "identities": identities,
             "artifacts": artifacts,
+            "lifecycle": lifecycles,
             "run_id": os.environ["GITHUB_RUN_ID"],
             "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
             "producer": producer_jobs,

@@ -6028,9 +6028,41 @@ impl Daemon {
         }
     }
 
+    /// Normal closure is a conservative snapshot, not a per-origin barrier.
+    /// Complete precision qualification requires the drained shutdown summary.
+    fn prefetch_accounting_incomplete(&self) -> bool {
+        let tasks_pending = {
+            let mut tasks = self
+                .prefetch_tasks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            while tasks.try_join_next().is_some() {}
+            !tasks.is_empty()
+        };
+        let receipts_pending = {
+            let queue = self
+                .prefetch_receipts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            queue.overflowed || queue.writing || !queue.events.is_empty()
+        };
+        let cancelled = {
+            let cancellations = self
+                .prefetch_cancellations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cancellations.overflowed || !cancellations.origins.is_empty()
+        };
+        tasks_pending
+            || receipts_pending
+            || cancelled
+            || self.prefetch_receipt_failed.load(Ordering::Acquire)
+    }
+
     /// Append the per-session summary to `summaries.jsonl`. Best-effort:
     /// telemetry must never fail the daemon.
     fn emit_plan_summary(&self, plan: ActivePlan, closure_reason: &str, incomplete: bool) {
+        let incomplete = incomplete || self.prefetch_accounting_incomplete();
         let used_bytes = plan.used_bytes();
         let downloaded_bytes: u64 = plan.downloaded.values().sum();
         let event = crate::events::BuildSummaryEvent {
@@ -15228,6 +15260,20 @@ mod tests {
         }
         assert_eq!(daemon.prefetch_receipt_writers.lock().unwrap().len(), 1);
         assert_eq!(daemon.prefetch_receipts.lock().unwrap().events.len(), 99);
+        daemon.install_plan(
+            "writer-session",
+            "writer-plan",
+            "fallback",
+            std::iter::empty(),
+            None,
+        );
+        daemon.finalize_inactive_plan(0);
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries[0].closure_reason, "inactivity");
+        assert!(
+            summaries[0].incomplete,
+            "a blocked writer can still lose records"
+        );
         lock.unlock().unwrap();
         assert!(daemon.finish_prefetch_receipts().await);
         assert_eq!(
@@ -15238,6 +15284,65 @@ mod tests {
         );
         assert!(daemon.prefetch_receipts.lock().unwrap().events.is_empty());
         assert!(!daemon.prefetch_receipts.lock().unwrap().writing);
+    }
+
+    #[tokio::test]
+    async fn packed_normal_summary_exposes_overflow_log_failure_and_pending_tasks() {
+        for loss in ["overflow", "log_failure", "task", "cancelled_task"] {
+            let dir = tempfile::tempdir().unwrap();
+            let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+            daemon.install_plan(
+                "normal-session",
+                "normal-plan",
+                "fallback",
+                std::iter::empty(),
+                None,
+            );
+            match loss {
+                "overflow" => daemon
+                    .prefetch_receipts
+                    .lock()
+                    .unwrap()
+                    .push(TransferEvent {
+                        object_key: String::with_capacity((2 << 20) + 1),
+                        ..Default::default()
+                    }),
+                "log_failure" => {
+                    std::fs::create_dir_all(daemon.config.transfer_log_path()).unwrap();
+                    drop(PrefetchReceipt::new(
+                        daemon.prefetch_receipts.clone(),
+                        PrefetchOrigin::default(),
+                        "pack-key",
+                        "pack",
+                        PrefetchOperation::Get,
+                    ));
+                    assert!(!daemon.finish_prefetch_receipts().await);
+                }
+                "task" => {
+                    daemon
+                        .spawn_prefetch_task(PrefetchOrigin::default(), std::future::pending())
+                        .unwrap();
+                }
+                "cancelled_task" => {
+                    let receiver = daemon
+                        .spawn_prefetch_task(PrefetchOrigin::default(), async {
+                            panic!("cancelled before normal closure")
+                        })
+                        .unwrap();
+                    assert!(receiver.await.is_err());
+                }
+                _ => unreachable!(),
+            }
+            daemon.finalize_inactive_plan(0);
+            let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].closure_reason, "inactivity");
+            assert!(
+                summaries[0].incomplete,
+                "lost or unfinished coverage: {loss}"
+            );
+            daemon.finish_prefetch_shutdown(Duration::ZERO).await;
+        }
     }
 
     #[tokio::test]

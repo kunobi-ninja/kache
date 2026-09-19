@@ -304,7 +304,9 @@ Graceful daemon shutdown writes the active session's local summary after drainin
 prefetch tasks. A timeout aborts remaining tasks and sets `incomplete: true`;
 missing transfer outcomes then remain unknown. The summary records `shutdown`
 or `shutdown_timeout` as its closure reason. Shutdown does not publish an
-identity manifest.
+identity manifest. Normal inactivity or supersession summaries are conservative
+snapshots: pending tasks or log writes mark them incomplete. Full precision
+qualification requires an orderly shutdown summary after all producers drain.
 `kache stats` marks incomplete summaries as partial totals. Forced termination
 can prevent the final write.
 

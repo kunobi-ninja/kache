@@ -397,6 +397,7 @@ pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot 
         })
         .ok()
         .map(|bytes| bytes.max(0) as u64);
+    snap.index_free_bytes = index_free_bytes(&db);
     for table in MACHINE_INDEX_TABLES {
         let top: rusqlite::Result<Option<i64>> =
             db.query_row(&rowid_high_water_sql(table), [], |row| row.get(0));
@@ -406,6 +407,22 @@ pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot 
         }
     }
     snap
+}
+
+/// Bytes `index.db` holds in free pages: both pragmas read the database
+/// header, so this costs no table scan.
+fn index_free_bytes(db: &rusqlite::Connection) -> Option<u64> {
+    let pragma = |sql: &str| db.query_row(sql, [], |row| row.get::<_, i64>(0)).ok();
+    free_page_bytes(
+        pragma("PRAGMA freelist_count")?,
+        pragma("PRAGMA page_size")?,
+    )
+}
+
+fn free_page_bytes(pages: i64, page_size: i64) -> Option<u64> {
+    u64::try_from(pages)
+        .ok()?
+        .checked_mul(u64::try_from(page_size).ok()?)
 }
 
 /// A table's rowid high-water mark: one seek to the last leaf of its b-tree,
@@ -7261,6 +7278,7 @@ mod tests {
         assert_eq!(snap.wal_bytes, Some(wal_len));
         assert_eq!(snap.index_bytes, Some(db_len + wal_len));
         assert_eq!(snap.store_physical_bytes, Some(7));
+        assert_eq!(snap.index_free_bytes, Some(0), "a fresh index has no holes");
         let tables: Vec<_> = snap
             .rowid_high_water
             .iter()
@@ -7364,6 +7382,7 @@ mod tests {
             store_physical_bytes: None,
             index_bytes: Some(29_074_419_712),
             wal_bytes: Some(1_073_741_824),
+            index_free_bytes: None,
             rowid_high_water: vec![
                 ("entries", 2),
                 ("file_hashes", 13_286_285),
@@ -7406,6 +7425,42 @@ mod tests {
         assert!(lines[1].ends_with(", 4200 ms in index writes"), "{lines:?}");
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(machine_lines(&crate::otel::MachineSnapshot::default()).is_empty());
+    }
+
+    /// Dropping a table leaves its pages on the freelist until a compaction.
+    #[test]
+    fn index_free_bytes_counts_freelist_pages() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA page_size = 4096; CREATE TABLE keep (v BLOB);")
+            .unwrap();
+        assert_eq!(index_free_bytes(&db), Some(0));
+
+        db.execute_batch(
+            "CREATE TABLE junk (v BLOB);
+             INSERT INTO junk VALUES (zeroblob(65536));
+             DROP TABLE junk;",
+        )
+        .unwrap();
+        let pages: i64 = db
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            pages >= 16,
+            "a 64 KiB blob spans at least 16 pages: {pages}"
+        );
+        assert_eq!(index_free_bytes(&db), Some(pages as u64 * 4096));
+
+        db.execute_batch("VACUUM").unwrap();
+        assert_eq!(index_free_bytes(&db), Some(0));
+    }
+
+    #[test]
+    fn free_page_bytes_multiplies_and_rejects_nonsense() {
+        assert_eq!(free_page_bytes(3, 4096), Some(12_288));
+        assert_eq!(free_page_bytes(0, 4096), Some(0));
+        assert_eq!(free_page_bytes(-1, 4096), None);
+        assert_eq!(free_page_bytes(1, -4096), None);
+        assert_eq!(free_page_bytes(i64::MAX, 4096), None);
     }
 
     /// Why the figure is not called rows: `INSERT OR REPLACE` on a TEXT key,
@@ -8908,6 +8963,7 @@ mod tests {
             deferred_discovery: true,
             deferred_durability: false,
             auto_gc: true,
+            index_auto_compact: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,

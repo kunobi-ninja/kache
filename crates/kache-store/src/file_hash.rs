@@ -1,6 +1,7 @@
 //! Persistent file fingerprints and opaque compiler memo records.
 
 pub use crate::cc_memo::{CcPreprocessMemo, CcPreprocessMemoInput};
+pub use crate::index_compaction::{IndexCompaction, IndexPageStats, index_page_stats};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};

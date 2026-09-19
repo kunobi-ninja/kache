@@ -408,6 +408,17 @@ pub(crate) enum Request {
     Shutdown,
 }
 
+impl Request {
+    /// Whether the request comes from a build. Stats pollers, a TUI and GC
+    /// commands do not keep the machine from counting as quiet.
+    fn is_build_activity(&self) -> bool {
+        !matches!(
+            self,
+            Request::Stats(_) | Request::Gc(_) | Request::GcV2(_) | Request::Shutdown
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UploadJob {
     pub key: String,
@@ -2286,6 +2297,9 @@ pub(crate) struct Daemon {
     transfer_counters: TransferCounters,
     recent_transfers: std::sync::Mutex<std::collections::VecDeque<TransferEvent>>,
     file_hash_cache: Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
+    /// When the last build request arrived. Index compaction waits for a
+    /// gap here, because a build made of cache hits holds no compile permit.
+    request_clock: Arc<crate::index_compact::RequestClock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2411,6 +2425,7 @@ impl Daemon {
             transfer_counters: TransferCounters::new(),
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
+            request_clock: Arc::new(crate::index_compact::RequestClock::new()),
             config,
         }
     }
@@ -6244,6 +6259,10 @@ async fn server_main(
         }
     });
 
+    let compact_handle = config.index_auto_compact.then(|| {
+        crate::index_compact::spawn_periodic(config.clone(), daemon.request_clock.clone())
+    });
+
     // The remote key cache only serves speculative planning. Exact-key remote
     // checks and uploads do not depend on it, so disabling prefetch also avoids
     // the expensive whole-remote LIST entirely.
@@ -6410,6 +6429,9 @@ async fn server_main(
     .await;
 
     gc_handle.abort();
+    if let Some(h) = compact_handle {
+        h.abort();
+    }
     if let Some(h) = cache_handle {
         h.abort();
     }
@@ -6428,6 +6450,13 @@ async fn server_main(
     drop(daemon);
     if drain_upload_pipeline(enqueue_handle, upload_handles, Duration::from_secs(30)).await {
         tracing::warn!("upload drain timeout, aborting remaining upload tasks");
+    }
+
+    // Handlers and uploads are done, so the index is as idle as this daemon
+    // will see it. Quiet mode only: a contended index yields at once, and a
+    // large live index is skipped, so shutdown stays short.
+    if config.index_auto_compact {
+        crate::index_compact::run_at_shutdown(config.clone()).await;
     }
 
     // Socket file is cleaned up by `_socket_guard` (Drop).
@@ -7384,6 +7413,10 @@ async fn handle_connection_started_at(
             Ok(Request::LocalLookup(req)) => req.client_epoch,
             _ => 0,
         };
+
+        if parsed.as_ref().is_ok_and(Request::is_build_activity) {
+            daemon.request_clock.touch(Instant::now());
+        }
 
         let resp = match parsed {
             Ok(Request::Upload(ref job)) => {
@@ -10288,6 +10321,7 @@ mod tests {
             deferred_discovery: true,
             deferred_durability: false,
             auto_gc: true,
+            index_auto_compact: true,
             gc_evict_shared: false,
             storage_layout_advice: true,
             heartbeat_secs: 30,
@@ -10406,6 +10440,20 @@ mod tests {
         assert!(key_cache_periodic_refresh_disabled(0));
         assert!(!key_cache_periodic_refresh_disabled(1));
         assert!(!key_cache_periodic_refresh_disabled(60));
+    }
+
+    #[test]
+    fn only_build_requests_count_as_activity() {
+        assert!(!Request::Shutdown.is_build_activity());
+        let stats: Request = serde_json::from_str(
+            r#"{"stats":{"include_entries":false,"sort_by":null,"event_hours":null}}"#,
+        )
+        .unwrap();
+        assert!(matches!(stats, Request::Stats(_)));
+        assert!(!stats.is_build_activity());
+        assert!(!Request::Gc(GcRequest::automatic(0)).is_build_activity());
+        assert!(!Request::GcV2(GcRequest::automatic(0)).is_build_activity());
+        assert!(Request::HashFiles(HashFilesRequest { files: Vec::new() }).is_build_activity());
     }
 
     #[test]

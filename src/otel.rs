@@ -434,6 +434,9 @@ pub(crate) struct MachineSnapshot {
     pub index_bytes: Option<u64>,
     /// The `-wal` file alone, also inside `index_bytes`.
     pub wal_bytes: Option<u64>,
+    /// Bytes `index.db` holds in free pages, which compaction returns to the
+    /// disk. Also inside `index_bytes`.
+    pub index_free_bytes: Option<u64>,
     /// The largest rowid per index table. This counts writes, not rows: the
     /// tables written with `INSERT OR REPLACE` give a replaced row the next
     /// rowid, so it grows with every insert and every replacement, and a
@@ -456,6 +459,13 @@ fn machine_metrics(snap: &MachineSnapshot, now: &str) -> Vec<Value> {
     if let Some(bytes) = snap.index_bytes {
         metrics.push(gauge(
             "kache.cache.index.size",
+            "By",
+            vec![as_int(bytes, now, &[])],
+        ));
+    }
+    if let Some(bytes) = snap.index_free_bytes {
+        metrics.push(gauge(
+            "kache.cache.index.free.size",
             "By",
             vec![as_int(bytes, now, &[])],
         ));
@@ -702,6 +712,7 @@ mod tests {
             store_physical_bytes: Some(107_000_000_000),
             index_bytes: Some(29_074_419_712),
             wal_bytes: Some(1_073_741_824),
+            index_free_bytes: Some(27_917_287_424),
             rowid_high_water: vec![("entries", 2_085_333), ("cc_preprocess_memos", 874_517)],
             gc: Some(crate::report::GcStatsPersisted {
                 last_run: "2026-09-12T12:11:05+00:00".to_string(),
@@ -780,6 +791,9 @@ mod tests {
             metric(&body, "kache.cache.store.physical_size")["gauge"]["dataPoints"][0]["asInt"],
             "107000000000"
         );
+        let free = metric(&body, "kache.cache.index.free.size");
+        assert_eq!(free["unit"], "By");
+        assert_eq!(free["gauge"]["dataPoints"][0]["asInt"], "27917287424");
         let wal = metric(&body, "kache.cache.index.wal.size");
         assert_eq!(wal["unit"], "By");
         assert_eq!(wal["gauge"]["dataPoints"][0]["asInt"], "1073741824");

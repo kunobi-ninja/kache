@@ -1352,17 +1352,16 @@ fn prediction_discovery_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>)
 }
 
 /// The flight two processes discovering the same unit share. With
-/// predictions on it is the record identity, so the waiter can read what
-/// the owner publishes; without them the same identity still names the
-/// unit, and the waiter finds the owner's entry in the store instead.
+/// predictions on it is the record identity where one applies, so the
+/// waiter can read what the owner publishes. Otherwise the same identity
+/// is only a name for the unit: the waiter finds the owner's entry in the
+/// store instead. A unit with a proc-macro dependency gets that name too;
+/// its record needs the crate-tree guard, but a flight is only a lock, and
+/// compiling before keying never reads a record.
 fn discovery_flight_identity(args: &RustcArgs, file_hasher: &FileHasher<'_>) -> Option<String> {
-    if !prediction_applies(&args.externs) {
-        return None;
-    }
-    if file_hasher.uses_input_predictions() {
-        return prediction_discovery_identity(args, file_hasher);
-    }
-    rustc_shared_prediction_identity(args).or_else(|| rustc_prediction_identity(args))
+    prediction_discovery_identity(args, file_hasher)
+        .or_else(|| rustc_shared_prediction_identity(args))
+        .or_else(|| rustc_prediction_identity(args))
 }
 
 /// Discover the source closure that feeds the key.
@@ -7342,7 +7341,12 @@ mod tests {
             "the flight is the unit's shared identity"
         );
         assert_ne!(a_off, discovery_flight_identity(&b, &off).unwrap());
-        assert!(discovery_flight_identity(&with_macro, &off).is_none());
+        assert!(rustc_shared_prediction_identity(&with_macro).is_none());
+        assert_eq!(
+            discovery_flight_identity(&with_macro, &off),
+            rustc_prediction_identity(&with_macro),
+            "a proc-macro dependent still gets a name: the flight is only a lock"
+        );
 
         let on = FileHasher::persistent(&db).with_input_predictions(true);
         assert_eq!(
@@ -7350,7 +7354,12 @@ mod tests {
             prediction_discovery_identity(&a, &on),
             "with predictions on the flight is the record identity"
         );
-        assert!(discovery_flight_identity(&with_macro, &on).is_none());
+        assert!(prediction_discovery_identity(&with_macro, &on).is_none());
+        assert_eq!(
+            discovery_flight_identity(&with_macro, &on),
+            rustc_prediction_identity(&with_macro),
+            "no record identity, so the unit's name serves as the flight"
+        );
     }
 
     /// A crate the store has never held is a certain miss under any key, so

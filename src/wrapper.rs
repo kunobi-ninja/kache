@@ -485,6 +485,7 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
 /// waits on the child; stdio is null so it cannot pollute the compiler's
 /// output streams.
 fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
+    let _trace = crate::phase_trace::phase("auto_gc_check");
     if !auto_gc_wanted(config, store) {
         return;
     }
@@ -541,6 +542,7 @@ fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
 /// cost, and it keeps a store that never sees a daemon from accumulating
 /// entries whose every hit re-reads them to verify.
 fn flush_or_hand_off_durability(config: &Config, store: &Store, cache_key: &str) {
+    let _trace = crate::phase_trace::phase("durability_flush");
     if !config.deferred_durability {
         return;
     }
@@ -6451,6 +6453,7 @@ fn log_event_details(
         unit_id,
         extern_units,
     };
+    let _trace = crate::phase_trace::phase("event_log");
     let _ = events::log_event(&config.event_log_path(), &event);
     let _ = events::rotate_if_needed(
         &config.event_log_path(),

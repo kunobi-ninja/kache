@@ -1,6 +1,7 @@
 //! Local artifact storage, independent of compiler parsing and remote transports.
 
 pub mod atomic;
+mod blob_drift;
 mod blob_validation;
 mod cc_memo;
 pub mod config;
@@ -16,6 +17,7 @@ mod store;
 #[cfg(test)]
 mod test_support;
 
+pub use blob_drift::{BlobRefcountDrift, blob_refcount_drift};
 pub use store::*;
 
 /// Compiler-owned rules applied when publishing an entry. Implementations must

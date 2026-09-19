@@ -4059,6 +4059,11 @@ fn run_parsed_rustc(
     ) {
         Ok(result) => {
             store_put = result;
+            if let Some(unit) = args.get_codegen_opt("metadata")
+                && let Err(e) = store.record_entry_unit(&cache_key, unit)
+            {
+                tracing::debug!("recording the unit of {crate_name}'s entry failed: {e}");
+            }
             // Store grew — throttled size check + detached background GC if over
             // budget (kunobi-ninja/kache#497). Never blocks the compile path.
             maybe_spawn_auto_gc(config, &store);

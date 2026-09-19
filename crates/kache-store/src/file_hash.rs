@@ -129,14 +129,26 @@ impl<'db> FileHashCache<'db> {
         Ok(())
     }
 
-    /// Whether any entry, committed or not, was stored under `crate_name`.
+    /// Whether any entry, committed or not, was stored under `crate_name`
+    /// for `unit`, Cargo's `-C metadata` hash, or with no unit recorded.
     ///
-    /// Every cache key folds the crate name in, so `false` means no key this
-    /// crate can produce is in the local store.
-    pub fn has_entry_for_crate(&self, crate_name: &str) -> rusqlite::Result<bool> {
+    /// Every cache key folds the crate name and that hash in, so `false`
+    /// means no key this unit can produce is in the local store. A row with
+    /// no unit (stored by an older kache, or by a path that never learns
+    /// the unit) counts for every unit of its crate name. An empty `unit`
+    /// asks about the crate name alone.
+    pub fn has_entry_for_unit(&self, crate_name: &str, unit: &str) -> rusqlite::Result<bool> {
+        if unit.is_empty() {
+            return self.db().query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries WHERE crate_name = ?1)",
+                params![crate_name],
+                |row| row.get(0),
+            );
+        }
         self.db().query_row(
-            "SELECT EXISTS(SELECT 1 FROM entries WHERE crate_name = ?1)",
-            params![crate_name],
+            "SELECT EXISTS(SELECT 1 FROM entries
+                           WHERE crate_name = ?1 AND unit_id IN (?2, ''))",
+            params![crate_name, unit],
             |row| row.get(0),
         )
     }
@@ -401,21 +413,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn has_entry_for_crate_sees_only_that_crate() {
+    fn has_entry_for_unit_sees_only_that_crate_and_unit() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
-            "CREATE TABLE entries (cache_key TEXT PRIMARY KEY, crate_name TEXT NOT NULL);",
+            "CREATE TABLE entries (cache_key TEXT PRIMARY KEY, crate_name TEXT NOT NULL,
+                                   unit_id TEXT NOT NULL DEFAULT '');",
         )
         .unwrap();
         let cache = FileHashCache::Borrowed(&db);
-        assert!(!cache.has_entry_for_crate("gpui").unwrap());
+        assert!(!cache.has_entry_for_unit("gpui", "").unwrap());
+        assert!(!cache.has_entry_for_unit("gpui", "u1").unwrap());
         db.execute(
-            "INSERT INTO entries (cache_key, crate_name) VALUES ('k', 'gpui_base')",
+            "INSERT INTO entries (cache_key, crate_name, unit_id) VALUES ('k', 'gpui_base', 'u1')",
             [],
         )
         .unwrap();
-        assert!(!cache.has_entry_for_crate("gpui").unwrap());
-        assert!(cache.has_entry_for_crate("gpui_base").unwrap());
+        assert!(!cache.has_entry_for_unit("gpui", "u1").unwrap());
+        assert!(cache.has_entry_for_unit("gpui_base", "u1").unwrap());
+        assert!(
+            cache.has_entry_for_unit("gpui_base", "").unwrap(),
+            "any unit"
+        );
+        assert!(
+            !cache.has_entry_for_unit("gpui_base", "u2").unwrap(),
+            "another unit of the same crate name is absent"
+        );
+        db.execute(
+            "INSERT INTO entries (cache_key, crate_name) VALUES ('k2', 'build_script_build')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            cache
+                .has_entry_for_unit("build_script_build", "u9")
+                .unwrap(),
+            "a row with no unit stands for every unit of its name"
+        );
     }
 
     #[test]

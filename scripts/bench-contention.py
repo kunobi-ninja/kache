@@ -349,12 +349,26 @@ def stop_kache(binary, env, dest):
             timeout=30,
             check=False,
         )
-    socket = Path(env["KACHE_RUNTIME_DIR"]) / "daemon.sock"
-    deadline = time.monotonic() + 40
-    while socket.exists():
-        if time.monotonic() >= deadline:
-            raise ValueError(f"daemon did not drain; inspect {dest}")
-        time.sleep(0.05)
+    wait_for_daemon_lock(Path(env["KACHE_RUNTIME_DIR"]) / "daemon.run.lock", 40)
+
+
+def wait_for_daemon_lock(path, timeout):
+    import fcntl
+
+    try:
+        lock = path.open("r+")
+    except FileNotFoundError:
+        return
+    deadline = time.monotonic() + timeout
+    with lock:
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError(f"daemon did not drain: {path}")
+                time.sleep(0.05)
 
 
 def run_phase(

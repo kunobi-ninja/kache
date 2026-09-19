@@ -52,6 +52,28 @@ pub fn copied_bytes() -> u64 {
 // from the objdir is NOT a second physical copy, so a naive "objdir + store"
 // sum double-counts it. Deterministic given the same source + filesystem.
 
+/// Store bytes recorded by the current thread. A daemon can snapshot these
+/// around a synchronous put without counting simultaneous remote imports.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StoreThreadBytes {
+    pub reflinked: u64,
+    pub hardlinked: u64,
+    pub copied: u64,
+    pub copy_cross_device: u64,
+    pub copy_permission: u64,
+    pub copy_ineligible: u64,
+    pub copy_other: u64,
+}
+
+thread_local! {
+    static STORE_THREAD_BYTES: std::cell::Cell<StoreThreadBytes> =
+        std::cell::Cell::new(StoreThreadBytes::default());
+}
+
+pub fn store_thread_bytes() -> StoreThreadBytes {
+    STORE_THREAD_BYTES.with(std::cell::Cell::get)
+}
+
 static STORE_REFLINKED_BYTES: AtomicU64 = AtomicU64::new(0);
 static STORE_HARDLINKED_BYTES: AtomicU64 = AtomicU64::new(0);
 static STORE_COPIED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -59,18 +81,33 @@ static STORE_COPIED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Record `bytes` ingested into the store by a CoW reflink (shares blocks
 /// with the build's output file — physically zero-copy).
 pub fn record_store_reflinked(bytes: u64) {
+    STORE_THREAD_BYTES.with(|counter| {
+        let mut value = counter.get();
+        value.reflinked += bytes;
+        counter.set(value);
+    });
     STORE_REFLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// Record `bytes` ingested into the store by a hardlink (shares an inode
 /// with the build's output file — zero-copy on filesystems without CoW).
 pub fn record_store_hardlinked(bytes: u64) {
+    STORE_THREAD_BYTES.with(|counter| {
+        let mut value = counter.get();
+        value.hardlinked += bytes;
+        counter.set(value);
+    });
     STORE_HARDLINKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// Record `bytes` ingested into the store by a full physical copy (no
 /// reflink, no hardlink — the blob is a genuine second copy).
 pub fn record_store_copied(bytes: u64) {
+    STORE_THREAD_BYTES.with(|counter| {
+        let mut value = counter.get();
+        value.copied += bytes;
+        counter.set(value);
+    });
     STORE_COPIED_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
@@ -116,12 +153,22 @@ static RESTORE_COPY_OTHER_BYTES: AtomicU64 = AtomicU64::new(0);
 /// `CrossesDevices` (EXDEV across mounts, including two bind mounts of one
 /// filesystem).
 pub fn record_store_copy_cross_device(bytes: u64) {
+    STORE_THREAD_BYTES.with(|counter| {
+        let mut value = counter.get();
+        value.copy_cross_device += bytes;
+        counter.set(value);
+    });
     STORE_COPY_CROSS_DEVICE_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// Record `bytes` copied into the store because `link(2)` failed with
 /// `PermissionDenied` (EPERM/EACCES, e.g. `protected_hardlinks`).
 pub fn record_store_copy_permission(bytes: u64) {
+    STORE_THREAD_BYTES.with(|counter| {
+        let mut value = counter.get();
+        value.copy_permission += bytes;
+        counter.set(value);
+    });
     STORE_COPY_PERMISSION_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
@@ -130,12 +177,22 @@ pub fn record_store_copy_permission(bytes: u64) {
 /// extensionless) or the put forbids source hardlinks (cc objects never share
 /// inodes).
 pub fn record_store_copy_ineligible(bytes: u64) {
+    STORE_THREAD_BYTES.with(|counter| {
+        let mut value = counter.get();
+        value.copy_ineligible += bytes;
+        counter.set(value);
+    });
     STORE_COPY_INELIGIBLE_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// Record `bytes` copied into the store because `link(2)` failed with any
 /// other errno (EMLINK, EEXIST, …).
 pub fn record_store_copy_other(bytes: u64) {
+    STORE_THREAD_BYTES.with(|counter| {
+        let mut value = counter.get();
+        value.copy_other += bytes;
+        counter.set(value);
+    });
     STORE_COPY_OTHER_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 

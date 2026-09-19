@@ -356,9 +356,8 @@ fn enqueue_upload(daemon: &Arc<Daemon>, config: &Config, request: &PublishCcRequ
     }
 }
 
-/// The process-global store byte counters, read before a put so the event
-/// can carry this put's share. One worker runs puts one at a time, so the
-/// difference is exactly this job's.
+/// Bytes recorded on the publication thread. Remote imports may run on
+/// other threads at the same time and must not be charged to this job.
 struct StoreBytes {
     reflinked: u64,
     hardlinked: u64,
@@ -371,14 +370,15 @@ struct StoreBytes {
 
 impl StoreBytes {
     fn snapshot() -> Self {
+        let bytes = crate::opcounts::store_thread_bytes();
         Self {
-            reflinked: crate::opcounts::store_reflinked_bytes(),
-            hardlinked: crate::opcounts::store_hardlinked_bytes(),
-            copied: crate::opcounts::store_copied_bytes(),
-            cross_device: crate::opcounts::store_copy_cross_device_bytes(),
-            permission: crate::opcounts::store_copy_permission_bytes(),
-            ineligible: crate::opcounts::store_copy_ineligible_bytes(),
-            other: crate::opcounts::store_copy_other_bytes(),
+            reflinked: bytes.reflinked,
+            hardlinked: bytes.hardlinked,
+            copied: bytes.copied,
+            cross_device: bytes.copy_cross_device,
+            permission: bytes.copy_permission,
+            ineligible: bytes.copy_ineligible,
+            other: bytes.copy_other,
         }
     }
 

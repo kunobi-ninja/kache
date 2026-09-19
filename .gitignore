@@ -56,3 +56,7 @@ docs/**/*.md
 # Git worktrees
 .worktrees/
 .claude/
+
+# Working notes live outside the repository.
+/notes/
+/docs/internal/

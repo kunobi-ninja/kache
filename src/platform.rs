@@ -166,49 +166,6 @@ pub fn is_process_alive(pid: u32) -> bool {
     ok != 0 && code as i32 == STILL_ACTIVE
 }
 
-/// Politely request a process to exit. On Unix this sends SIGTERM; on
-/// Windows there is no graceful kill-by-PID path, so this forcefully
-/// terminates the process (same as `kill_process`). Callers that need
-/// graceful shutdown should prefer the daemon's own RPC `Shutdown` request.
-pub fn terminate_process(pid: u32) {
-    #[cfg(unix)]
-    {
-        if !is_single_process_pid(pid) {
-            refuse_unsafe_pid(pid, "terminate_process");
-            return;
-        }
-        #[cfg(test)]
-        assert_test_owns_process(pid, "SIGTERM");
-        unsafe {
-            libc::kill(pid as i32, libc::SIGTERM);
-        }
-    }
-    #[cfg(windows)]
-    {
-        windows_terminate(pid);
-    }
-}
-
-/// Forcefully kill a process. SIGKILL on Unix, TerminateProcess on Windows.
-pub fn kill_process(pid: u32) {
-    #[cfg(unix)]
-    {
-        if !is_single_process_pid(pid) {
-            refuse_unsafe_pid(pid, "kill_process");
-            return;
-        }
-        #[cfg(test)]
-        assert_test_owns_process(pid, "SIGKILL");
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
-    }
-    #[cfg(windows)]
-    {
-        windows_terminate(pid);
-    }
-}
-
 /// Forcefully kill a process and all its descendants (process group on Unix, process tree on Windows).
 pub fn kill_process_group(pid: u32) {
     #[cfg(unix)]
@@ -230,21 +187,6 @@ pub fn kill_process_group(pid: u32) {
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .output();
-    }
-}
-
-#[cfg(windows)]
-fn windows_terminate(pid: u32) {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        TerminateProcess(handle, 1);
-        CloseHandle(handle);
     }
 }
 
@@ -422,43 +364,6 @@ mod tests {
                 "pid {pid} must not be reported alive"
             );
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_spawned_child_is_owned_and_terminable() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-
-        assert!(super::assert_test_owns_process(pid, "probe"));
-
-        // The ownership check must not get in the way of the legitimate case.
-        super::terminate_process(pid);
-        let status = child.wait().expect("reap child");
-        assert!(!status.success(), "child should have been terminated");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn kill_process_actually_kills_a_spawned_child() {
-        // SIGKILL is the escalation the daemon recovery path relies on when a
-        // polite SIGTERM does not land, so it needs its own coverage: a
-        // terminate-only test leaves "kill does nothing" indistinguishable
-        // from "kill works".
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-
-        super::kill_process(pid);
-        let status = child.wait().expect("reap child");
-
-        assert!(!status.success(), "child should have been killed");
-        assert!(!super::is_process_alive(pid), "child should be gone");
     }
 
     #[cfg(unix)]

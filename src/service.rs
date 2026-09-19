@@ -497,15 +497,56 @@ fn task_scheduler_installed() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Whether the installed login service owns this configured runtime instance.
+/// Login services load user/host configuration, not a build's KACHE_* overrides.
+pub(crate) fn manages_instance(config: &crate::config::Config) -> Result<bool> {
+    if !service_file_path().is_some_and(|path| path.is_file()) {
+        return Ok(false);
+    }
+    configured_instance_matches(
+        &config.socket_path(),
+        crate::config::default_cache_dir(),
+        crate::config::host_config_path()
+            .into_iter()
+            .chain(std::iter::once(crate::config::config_file_path())),
+    )
+}
+
+fn configured_instance_matches(
+    requested_socket: &Path,
+    mut store: PathBuf,
+    config_paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<bool> {
+    let mut runtime = None;
+    for path in config_paths {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("reading login service configuration"),
+        };
+        let file: crate::config::FileConfig =
+            toml::from_str(&text).context("parsing login service configuration")?;
+        if let Some(cache) = file.cache {
+            if let Some(path) = cache.local_store {
+                store = crate::config::shellexpand(&path);
+            }
+            if let Some(path) = cache.runtime_dir {
+                runtime = Some(crate::config::shellexpand(&path));
+            }
+        }
+    }
+    let socket = runtime.unwrap_or(store).join("daemon.sock");
+    Ok(canonical_or_original(requested_socket) == canonical_or_original(&socket))
+}
+
 // ── Kickstart ────────────────────────────────────────────────────
 
 /// Force-restart the installed service. Used by `kache daemon restart` and by
 /// `kache init` recovery when the service file is present but the daemon isn't
-/// reachable (e.g. after idle-timeout shutdown left stale lockfiles, or launchd
-/// hasn't re-spawned on its own).
+/// reachable. The lifecycle coordinator drains the owner before this operation.
 ///
 /// Returns `Ok(false)` if no service is installed on this platform.
-pub fn kickstart() -> Result<bool> {
+pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
     if cfg!(target_os = "macos") {
         let plist = plist_path();
         if !plist.exists() {
@@ -514,10 +555,11 @@ pub fn kickstart() -> Result<bool> {
         let uid = crate::platform::current_uid();
         let target = format!("gui/{uid}/{LABEL}");
         // `kickstart -k` stops the service if running and starts it again.
-        let out = std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", &target])
-            .output()
-            .context("running launchctl kickstart")?;
+        let out = command_output_until(
+            std::process::Command::new("launchctl").args(["kickstart", "-k", &target]),
+            deadline,
+        )
+        .context("running launchctl kickstart")?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             anyhow::bail!("launchctl kickstart {target} failed: {stderr}");
@@ -528,28 +570,34 @@ pub fn kickstart() -> Result<bool> {
         if !unit.exists() {
             return Ok(false);
         }
-        let out = std::process::Command::new("systemctl")
-            .args(["--user", "restart", UNIT_NAME])
-            .output()
-            .context("running systemctl --user restart")?;
+        let out = command_output_until(
+            std::process::Command::new("systemctl").args(["--user", "restart", UNIT_NAME]),
+            deadline,
+        )
+        .context("running systemctl --user restart")?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             anyhow::bail!("systemctl --user restart {UNIT_NAME} failed: {stderr}");
         }
         Ok(true)
     } else if cfg!(windows) {
-        if !task_scheduler_installed() {
+        let installed = command_output_until(
+            std::process::Command::new("schtasks").args(["/query", "/tn", TASK_NAME]),
+            deadline,
+        )?;
+        if !installed.status.success() {
             return Ok(false);
         }
         // Stop running instance, then start fresh
-        let _ = std::process::Command::new("schtasks")
-            .args(["/end", "/tn", TASK_NAME])
-            .output();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let out = std::process::Command::new("schtasks")
-            .args(["/run", "/tn", TASK_NAME])
-            .output()
-            .context("running schtasks /run")?;
+        let _ = command_output_until(
+            std::process::Command::new("schtasks").args(["/end", "/tn", TASK_NAME]),
+            deadline,
+        )?;
+        let out = command_output_until(
+            std::process::Command::new("schtasks").args(["/run", "/tn", TASK_NAME]),
+            deadline,
+        )
+        .context("running schtasks /run")?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             anyhow::bail!("schtasks /run {TASK_NAME} failed: {stderr}");
@@ -558,6 +606,36 @@ pub fn kickstart() -> Result<bool> {
     } else {
         Ok(false)
     }
+}
+
+/// Bound the manager client process, preserving a capped diagnostic on failure.
+/// Killing a timed-out client does not undo a manager operation already accepted.
+fn command_output_until(
+    command: &mut std::process::Command,
+    deadline: std::time::Instant,
+) -> Result<std::process::Output> {
+    use std::io::{Read, Seek};
+    anyhow::ensure!(
+        std::time::Instant::now() < deadline,
+        "service command deadline expired"
+    );
+    let mut stderr = tempfile::tempfile()?;
+    let process = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr.try_clone()?)
+        .spawn()?;
+    let mut child = kunobi_daemon::Candidate::new(process);
+    let status = kunobi_daemon::readiness::wait_until(deadline, |_| child.try_wait())?
+        .context("service manager command timed out; startup remains unverified")?;
+    stderr.rewind()?;
+    let mut diagnostic = Vec::new();
+    stderr.take(16_384).read_to_end(&mut diagnostic)?;
+    Ok(std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr: diagnostic,
+    })
 }
 
 // ── Uninstall ────────────────────────────────────────────────────
@@ -1011,6 +1089,69 @@ mod tests {
         } else if cfg!(target_os = "linux") {
             fs::write(path, format!("ExecStart={} daemon run\n", exe.display())).unwrap();
         }
+    }
+
+    #[test]
+    fn login_service_configuration_does_not_claim_another_cache_instance() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("cache");
+        let configured = root.path().join("runtime");
+        let file = root.path().join("config.toml");
+        let text = format!(
+            "[cache]\nruntime_dir = {:?}\n",
+            configured.to_str().unwrap()
+        );
+        std::fs::write(&file, text).unwrap();
+        assert!(
+            configured_instance_matches(&store.join("daemon.sock"), store.clone(), []).unwrap()
+        );
+        assert!(
+            !configured_instance_matches(&configured.join("daemon.sock"), store.clone(), [])
+                .unwrap()
+        );
+        assert!(
+            configured_instance_matches(
+                &configured.join("daemon.sock"),
+                store.clone(),
+                [file.clone()]
+            )
+            .unwrap()
+        );
+        assert!(
+            !configured_instance_matches(&store.join("daemon.sock"), store.clone(), [file.clone()])
+                .unwrap()
+        );
+        std::fs::write(&file, "malformed = [").unwrap();
+        assert!(configured_instance_matches(&store.join("daemon.sock"), store, [file]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manager_command_deadline_bounds_wait_and_caps_diagnostics() {
+        use std::{
+            process::Command,
+            time::{Duration, Instant},
+        };
+        let error = command_output_until(
+            Command::new("sh").args(["-c", "exec sleep 30"]),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        let output = command_output_until(
+            Command::new("sh").args(["-c", "head -c 20000 /dev/zero >&2; exit 3"]),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stderr.len(), 16_384);
+        assert!(output.stdout.is_empty());
+        assert!(
+            command_output_until(Command::new("sh").arg("-c"), Instant::now())
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
     }
 
     #[test]

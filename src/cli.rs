@@ -4506,21 +4506,6 @@ fn daemon_footnote_needed(daemon_optional: bool, results: &[(&str, bool)]) -> bo
 /// unknown, and gets said so rather than guessed: telling someone their binary is
 /// stale on the strength of an unreadable mtime sends them to reinstall a kache
 /// that was fine.
-/// Whether leftover lock files are abandoned rather than in use.
-///
-/// Split out because the mistake it guards against is a boolean one: any of the
-/// three conditions weakening turns "no daemon owns these" into a claim about a
-/// daemon that is running, and `doctor` then tells someone to restart a healthy
-/// one to clean up files it is still using. Counts rather than booleans, so the
-/// call site hands over raw observations and keeps no logic of its own.
-fn stale_locks_are_abandoned(
-    lock_files: usize,
-    daemon_live: bool,
-    daemon_processes: usize,
-) -> bool {
-    lock_files > 0 && !daemon_live && daemon_processes == 0
-}
-
 /// Whether `doctor` should replace a daemon left over from before an upgrade.
 ///
 /// The one-line answer to the bug this all started from: only under `--fix`.
@@ -5050,105 +5035,11 @@ pub fn doctor(
         });
     }
 
-    // 10. Lingering live kache daemon processes — if the socket isn't reachable
-    //     but `kache daemon run` processes exist, something got stuck.
-    //     `kache daemon restart` now force-recovers this automatically.
-    //
-    //     Liveness here is a bare socket connect, not a stats request. Asking the
-    //     daemon anything is what makes an outgoing one shut down and what could
-    //     spend the 8s restart wait a second time; connecting asks nothing, costs
-    //     nothing, and — unlike reusing check 8's answer — is true *now*, so a
-    //     daemon that died in between is not covered for (kunobi-ninja/kache#720).
-    if let Some(ref cfg) = config {
-        let reachable = crate::daemon::daemon_is_live(cfg);
-        let pids = crate::daemon::find_daemon_pids();
-        if !reachable && !pids.is_empty() {
-            let pids_str = pids
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            checks.push(Check {
-                label: "Daemon processes",
-                pass: false,
-                detail: format!(
-                    "{} live daemon process(es) (pid {pids_str}), socket unreachable",
-                    pids.len()
-                ),
-                fix: Some(
-                    "kache daemon restart  (recovers this cache's daemon and stale socket)".into(),
-                ),
-            });
-        } else if pids.len() > 1 {
-            let pids_str = pids
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            checks.push(Check {
-                label: "Daemon processes",
-                pass: false,
-                detail: format!(
-                    "{} daemon processes running (pid {pids_str}), expected 1",
-                    pids.len()
-                ),
-                fix: Some(
-                    "kache daemon restart  (keeps one daemon and removes stale processes)".into(),
-                ),
-            });
-        }
-    }
+    // Multiple cache instances may each own a daemon. Readiness above checks
+    // this instance; a machine-wide process count cannot diagnose its health.
 
-    // 11. Stale lock files — when no daemon is running, leftover lock files
-    //     are legacy cruft from an unclean shutdown. Harmless but worth
-    //     surfacing so users know `daemon restart` will tidy them up.
-    //
-    //     "In use" includes a daemon that holds the run lock but has not bound
-    //     its socket yet, which a socket probe alone reads as absent — that is
-    //     how a mid-upgrade handoff came to be reported as leftover cruft
-    //    .
-    if let Some(ref cfg) = config {
-        let sock = cfg.socket_path();
-        let mut stale_files = Vec::new();
-        for ext in ["lock", "run.lock"] {
-            let p = sock.with_extension(ext);
-            if p.exists() {
-                stale_files.push(p);
-            }
-        }
-        if stale_locks_are_abandoned(
-            stale_files.len(),
-            crate::daemon::daemon_is_live(cfg),
-            crate::daemon::find_daemon_pids().len(),
-        ) {
-            if fix {
-                for f in &stale_files {
-                    let _ = std::fs::remove_file(f);
-                }
-                checks.push(Check {
-                    label: "Stale locks",
-                    pass: true,
-                    detail: format!("removed {} legacy lock file(s)", stale_files.len()),
-                    fix: None,
-                });
-            } else {
-                let fix_hint = if cfg!(windows) {
-                    "kache doctor --fix  (removes stale lock files)"
-                } else {
-                    "kache daemon restart  (removes stale files and starts fresh)"
-                };
-                checks.push(Check {
-                    label: "Stale locks",
-                    pass: false,
-                    detail: format!(
-                        "{} legacy lock file(s) from a previous daemon",
-                        stale_files.len()
-                    ),
-                    fix: Some(fix_hint.into()),
-                });
-            }
-        }
-    }
+    // Startup and ownership locks are persistent. Never unlink their inodes,
+    // even while idle: another process may already have opened the same file.
 
     // 12. Service plist exe mismatch (macOS/Linux) — if the registered
     //     service points to a binary that no longer exists or differs from
@@ -7273,20 +7164,6 @@ mod tests {
         // through the equality arm.
         let (pass, detail, _) = daemon_version_check(None, Some(0), "0.14.0", 0);
         assert!(!pass, "{detail}");
-    }
-
-    /// Lock files are only cruft when nothing owns them. Each condition is
-    /// load-bearing on its own: weaken any one and doctor tells someone to
-    /// restart a healthy daemon to clean up files it is still using.
-    #[test]
-    fn stale_locks_are_abandoned_needs_every_condition() {
-        assert!(stale_locks_are_abandoned(1, false, 0));
-        assert!(stale_locks_are_abandoned(2, false, 0));
-
-        assert!(!stale_locks_are_abandoned(0, false, 0), "no lock files");
-        assert!(!stale_locks_are_abandoned(1, true, 0), "daemon serving");
-        assert!(!stale_locks_are_abandoned(1, false, 1), "daemon process");
-        assert!(!stale_locks_are_abandoned(0, true, 2), "none of them");
     }
 
     /// The behaviour this whole change exists for: a plain `doctor` run reports
@@ -12724,16 +12601,15 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         }
     } else if service_installed {
         // Service is installed (from a previous run) but daemon isn't reachable.
-        // Prefer `launchctl kickstart` / `systemctl restart` over a manual spawn
-        // so the service manager clears any stale state (lockfiles, half-dead
-        // processes) and owns the new process.
+        // The shared coordinator drains this instance and uses its installed
+        // manager only when that manager owns the configured runtime path.
         println!("  \x1b[33m→\x1b[0m Background cache: needs restart");
         if !check
             && prompt_yes_no("Restart daemon?", true, yes)?
             && let Some(ref cfg) = config
         {
             match crate::daemon::restart(cfg)? {
-                true => println!("    \x1b[32m✓\x1b[0m daemon restarted"),
+                true => println!("    \x1b[32m✓\x1b[0m Background cache: running"),
                 false => {
                     println!("    \x1b[31m✗\x1b[0m daemon did not restart — see `kache doctor`");
                     daemon_step_failed = true;
@@ -12744,7 +12620,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         println!("  \x1b[33m→\x1b[0m Background cache: not running");
         if !check && prompt_yes_no("Start daemon now?", true, yes)? {
             match crate::daemon::start_daemon_background()? {
-                true => println!("    \x1b[32m✓\x1b[0m daemon started"),
+                true => println!("    \x1b[32m✓\x1b[0m Background cache: running"),
                 false => {
                     println!("    \x1b[31m✗\x1b[0m daemon did not start within timeout");
                     daemon_step_failed = true;

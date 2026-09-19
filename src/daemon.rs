@@ -1,8 +1,13 @@
 use crate::transport::prelude::*;
-use crate::transport::{ListenerOptions, TokioListener, TokioStream, socket_name};
+use crate::transport::{TokioListener, TokioStream, socket_name};
 use anyhow::{Context, Result};
 use kache_core::timeline::PrefetchOrigin;
 use kache_core::{PrefetchDisposition, PrefetchPlan};
+use kunobi_daemon::Lifecycle;
+#[path = "daemon_lifecycle.rs"]
+mod lifecycle_client;
+#[path = "daemon_control.rs"]
+mod lifecycle_control;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -121,7 +126,6 @@ fn key_cache_periodic_refresh_disabled(refresh_secs: u64) -> bool {
     refresh_secs == 0
 }
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(8);
-const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Read timeout for a stats round trip. Generous: a busy daemon may be holding
 /// the index lock when the request lands.
@@ -175,10 +179,13 @@ struct DaemonCoordState {
     build_epoch: u64,
     phase: DaemonPhase,
     updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_version: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
 struct DaemonCoordFile {
+    control_version: Option<u32>,
     path: PathBuf,
     pid: u32,
     build_epoch: u64,
@@ -188,6 +195,7 @@ impl DaemonCoordFile {
     fn for_socket(socket_path: &Path) -> Self {
         Self {
             path: daemon_state_path(socket_path),
+            control_version: None,
             pid: std::process::id(),
             build_epoch: build_epoch(),
         }
@@ -199,6 +207,7 @@ impl DaemonCoordFile {
             build_epoch: self.build_epoch,
             phase,
             updated_at_ms: now_millis(),
+            control_version: self.control_version,
         };
         write_json_atomically(&self.path, &state)
     }
@@ -208,12 +217,25 @@ struct DaemonCoordGuard {
     path: PathBuf,
 }
 
-/// RAII guard that removes the Unix socket file on drop.
-/// Ensures the socket is cleaned up even if `server_main` exits early
-/// (panic, `?` bail, etc.), preventing a stale socket from blocking
-/// future daemon starts while the run lock is already released.
+/// Platform adapter for shared, inode-checked socket cleanup.
 struct SocketCleanupGuard {
-    path: PathBuf,
+    #[cfg(unix)]
+    _guard: kunobi_daemon::local::unix_socket::SocketGuard,
+}
+impl SocketCleanupGuard {
+    fn new(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                _guard: kunobi_daemon::local::unix_socket::SocketGuard::capture(path)?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            let _ = path;
+            Ok(Self {})
+        }
+    }
 }
 
 impl DaemonCoordGuard {
@@ -224,13 +246,13 @@ impl DaemonCoordGuard {
 
 impl Drop for DaemonCoordGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-impl Drop for SocketCleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Ok(bytes) = std::fs::read(&self.path)
+            && serde_json::from_slice::<DaemonCoordState>(&bytes).is_ok_and(|state| {
+                state.pid == std::process::id() && state.build_epoch == build_epoch()
+            })
+        {
+            let _ = kunobi_daemon::RecordSlot::new(&self.path).remove_if_matches(&bytes);
+        }
     }
 }
 
@@ -246,19 +268,10 @@ fn now_millis() -> u64 {
 }
 
 fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("state file has no parent directory"))?;
-    std::fs::create_dir_all(parent)?;
-
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("state file has no file name"))?
-        .to_string_lossy();
-    let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
-    let json = serde_json::to_vec(value)?;
-    std::fs::write(&tmp_path, json)?;
-    std::fs::rename(&tmp_path, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    kunobi_daemon::RecordSlot::new(path).replace(&serde_json::to_vec(value)?)?;
     Ok(())
 }
 
@@ -266,17 +279,6 @@ fn read_daemon_state(socket_path: &Path) -> Option<DaemonCoordState> {
     let path = daemon_state_path(socket_path);
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
-}
-
-/// Whether a daemon is serving or coming up right now, asking it nothing.
-///
-/// `doctor`'s liveness checks need an answer that is current and free of side
-/// effects, which a stats request is neither: it makes an older daemon schedule
-/// its own shutdown, and its answer goes stale within the same report. A socket
-/// connect plus the coordinator state file covers both a daemon that is serving
-/// and one that holds the run lock but has not bound its socket yet.
-pub fn daemon_is_live(config: &Config) -> bool {
-    crate::transport::is_reachable(&config.socket_path()) || starting_daemon_epoch(config).is_some()
 }
 
 /// Build epoch of a daemon that holds the run lock but has not bound its socket
@@ -326,77 +328,12 @@ pub(crate) fn client_epoch_is_newer(client_epoch: u64, daemon_epoch: u64) -> boo
 use crate::platform::is_process_alive as process_is_alive;
 
 fn wait_for_run_lock_release(socket_path: &Path, timeout: Duration) -> Result<bool> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if !daemon_run_lock_is_held(socket_path)? {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        std::thread::sleep(DAEMON_START_POLL_INTERVAL);
-    }
-}
-
-fn terminate_daemon_pid(pid: u32, socket_path: &Path) -> Result<bool> {
-    crate::platform::terminate_process(pid);
-
-    if wait_for_run_lock_release(socket_path, Duration::from_secs(1))? {
-        return Ok(true);
-    }
-
-    crate::platform::kill_process(pid);
-
-    wait_for_run_lock_release(socket_path, Duration::from_secs(1))
-}
-
-fn recover_unhealthy_daemon(socket_path: &Path, reason: &str) -> Result<bool> {
-    let run_lock_held = daemon_run_lock_is_held(socket_path)?;
-    if let Some(state) = read_daemon_state(socket_path) {
-        let state_recent = daemon_state_is_recent(&state);
-        if run_lock_held && process_is_alive(state.pid) {
-            tracing::info!(
-                socket = %socket_path.display(),
-                pid = state.pid,
-                ?state.phase,
-                heartbeat_fresh = state_recent,
-                reason,
-                "terminating unhealthy daemon coordinator"
-            );
-            if !terminate_daemon_pid(state.pid, socket_path)? {
-                tracing::warn!(
-                    socket = %socket_path.display(),
-                    pid = state.pid,
-                    heartbeat_fresh = state_recent,
-                    reason,
-                    "daemon process did not release run lock during recovery"
-                );
-                return Ok(false);
-            }
-        }
-    }
-
-    clean_stale_daemon_files(socket_path)
-}
-
-fn clean_stale_daemon_files(socket_path: &Path) -> Result<bool> {
-    let run_lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(daemon_run_lock_path(socket_path))
-        .context("opening daemon run lock for cleanup")?;
-    if run_lock.try_lock().is_err() {
-        // launchd may already have restarted the process we stopped. Keep its
-        // socket and coordinator intact; the caller can connect to it instead.
-        return Ok(false);
-    }
-    // Hold the lock through cleanup. Probing and releasing it first lets a
-    // service-manager restart bind a new socket just before we unlink it.
-    // Never unlink either lock file: waiters must keep sharing the same inode.
-    let _ = std::fs::remove_file(socket_path);
-    let _ = std::fs::remove_file(daemon_state_path(socket_path));
-    Ok(true)
+    Ok(
+        kunobi_daemon::readiness::wait_until(Instant::now() + timeout, |_| {
+            daemon_run_lock_is_held(socket_path).map(|held| (!held).then_some(()))
+        })?
+        .is_some(),
+    )
 }
 
 // ── Protocol types ───────────────────────────────────────────────
@@ -6187,21 +6124,12 @@ pub fn run_server(config: &Config, provenance: &crate::config::ConfigFileProvena
     let lock_path = socket_path.with_extension("run.lock");
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .context("opening daemon run lock file")?;
-
-    // Cross-platform exclusive lock: flock(2) on Unix, LockFileEx on Windows.
-    if lock_file.try_lock().is_err() {
+    let Some(_lock) =
+        kunobi_daemon::ProcessLock::try_acquire(&lock_path).context("acquiring daemon run lock")?
+    else {
         tracing::info!("another daemon holds the run lock, exiting");
         return Ok(());
-    }
-
-    // Hold lock_file (and thus the lock) for the daemon's entire lifetime.
-    let _lock = lock_file;
+    };
     let coord = DaemonCoordFile::for_socket(&socket_path);
     coord
         .write_phase(DaemonPhase::Starting)
@@ -6290,49 +6218,27 @@ async fn prewarm_local_hit_service(daemon: &Arc<Daemon>, budget: Duration) {
 async fn server_main(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
-    coord: DaemonCoordFile,
+    mut coord: DaemonCoordFile,
 ) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
 
-    // Stale socket detection: try connecting — if it succeeds, another daemon is running.
-    let probe_name = socket_name(&socket_path)?;
-    match TokioStream::connect(probe_name).await {
-        Ok(_) => {
-            // Exit cleanly (code 0) so launchd/systemd KeepAlive doesn't
-            // restart us in an infinite loop when the daemon is already up.
-            tracing::info!("another daemon is already running (socket is active), exiting cleanly",);
-            return Ok(());
-        }
-        Err(_) => {
-            // No daemon listening — clean up stale socket file if it exists (Unix only).
-            let _ = std::fs::remove_file(&socket_path);
-        }
-    }
+    let Some(listener) = crate::transport::bind_daemon_listener(&socket_path)? else {
+        tracing::info!("another daemon owns the endpoint");
+        return Ok(());
+    };
+    let _socket_guard = SocketCleanupGuard::new(&socket_path)?;
+
+    let lifecycle = Arc::new(Lifecycle::default());
+    let mut control = lifecycle_control::serve(config, Arc::clone(&lifecycle)).await?;
+    coord.control_version = Some(kunobi_daemon::wire::VERSION);
+    coord.write_phase(DaemonPhase::Starting)?;
 
     let daemon = Arc::new(Daemon::new_with_provenance(config.clone(), provenance));
     if config.local_hit_daemon {
         prewarm_local_hit_service(&daemon, LOCAL_HIT_PREWARM_BUDGET).await;
     }
 
-    let bind_name = socket_name(&socket_path)?;
-    let listener = ListenerOptions::new()
-        .name(bind_name)
-        .create_tokio()
-        .context("binding local IPC socket")?;
-    // The IPC socket drives destructive operations (Shutdown, GC, uploads),
-    // so it must never be reachable by other local users. Restrict the file
-    // mode regardless of umask, and see `require_self_peer` for the
-    // per-connection credential check on accepted sockets.
-    #[cfg(unix)]
-    crate::transport::restrict_socket_permissions(&socket_path)
-        .context("hardening local IPC socket permissions")?;
-    let _socket_guard = SocketCleanupGuard {
-        path: socket_path.clone(),
-    };
-    coord
-        .write_phase(DaemonPhase::Ready)
-        .context("publishing daemon ready state")?;
     tracing::info!("daemon listening on {}", socket_path.display());
 
     // Exclude cache dir from Time Machine / Spotlight (once, not per-crate).
@@ -6596,8 +6502,9 @@ async fn server_main(
         }
     });
 
-    // Shutdown flag: set by Shutdown request or OS signal
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    // Readiness is published only after application setup can enter the accept loop.
+    control.service.mark_ready();
+    coord.write_phase(DaemonPhase::Ready)?;
     let heartbeat_coord = coord.clone();
     let heartbeat_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(DAEMON_COORD_HEARTBEAT_INTERVAL);
@@ -6611,12 +6518,6 @@ async fn server_main(
         }
     });
 
-    // Explicit wakeup for the accept loop. A connection handler that sets
-    // `shutdown_flag` (a protocol `stop`, or the client-epoch staleness path)
-    // pokes this so the loop re-checks the flag immediately instead of waiting
-    // out the periodic idle tick — see issue #288.
-    let shutdown_notify = Arc::new(Notify::new());
-
     // Config watchdog: the daemon loads its config once at startup, so an edit
     // to the config file (e.g. `local_max_size`) would otherwise require a
     // manual `kache daemon stop`. Periodically re-fingerprint the active config
@@ -6625,21 +6526,21 @@ async fn server_main(
     // config. This watches only the file the daemon itself resolved — it sends
     // no per-client signal, so it can't thrash across projects.
     let config_provenance = provenance.clone();
-    let config_watch_flag = Arc::clone(&shutdown_flag);
-    let config_watch_notify = Arc::clone(&shutdown_notify);
+    let config_watch_lifecycle = Arc::clone(&lifecycle);
+
     let config_watch_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(DAEMON_CONFIG_WATCH_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
             interval.tick().await;
-            if config_watch_flag.load(Ordering::Relaxed) {
+            if !config_watch_lifecycle.accepting_calls() {
                 break;
             }
             if crate::config::config_file_has_changed(&config_provenance) {
                 tracing::info!("config file changed on disk, scheduling restart to reload it");
-                config_watch_flag.store(true, Ordering::Relaxed);
-                config_watch_notify.notify_one();
+                config_watch_lifecycle.start_drain();
+
                 break;
             }
         }
@@ -6654,8 +6555,7 @@ async fn server_main(
     accept_loop(
         &listener,
         &daemon,
-        &shutdown_flag,
-        &shutdown_notify,
+        &lifecycle,
         idle_timeout,
         CONNECTION_HANDLER_DRAIN_TIMEOUT,
         shutdown_signal(),
@@ -6693,6 +6593,7 @@ async fn server_main(
         crate::maintenance::run_at_shutdown(config.clone()).await;
     }
 
+    control.finish().await;
     // Socket file is cleaned up by `_socket_guard` (Drop).
     tracing::info!("daemon stopped");
     Ok(())
@@ -6737,7 +6638,7 @@ async fn drain_upload_pipeline(
 }
 
 /// Periodic wake interval for the accept loop. The loop is otherwise only woken
-/// by an incoming connection, an explicit `shutdown_notify`, or the OS shutdown
+/// by an incoming connection, a shared drain notification, or the OS shutdown
 /// signal; this tick guarantees the idle-timeout check still runs when the
 /// daemon is completely quiet.
 const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
@@ -6968,24 +6869,12 @@ impl Drop for DownloadingGuard {
     }
 }
 
-/// Accept connections until a shutdown is requested.
-///
-/// Shutdown can arrive three ways: a protocol `stop` (or the client-epoch
-/// staleness path) sets `shutdown_flag` from inside a connection handler, the
-/// OS sends a termination signal (`shutdown_signal`), or the idle timeout
-/// elapses. The flag-based paths run in spawned handler tasks, so the loop only
-/// observes the flag at the top of an iteration — it must therefore be woken to
-/// re-check it. `shutdown_notify` provides that wakeup: a handler calls
-/// `notify_one()` right after setting the flag, and `notify_one` stores a permit
-/// if the loop is not currently parked in `select!`, so the wakeup cannot be
-/// lost even though the `Notified` future is recreated each iteration. Without
-/// it a quiet `stop` would block until the next [`ACCEPT_LOOP_IDLE_TICK`]
-/// (issue #288).
+/// Accept until the shared lifecycle closes admission, an idle budget expires,
+/// or the OS requests shutdown. Per-request guards include response delivery.
 async fn accept_loop(
     listener: &TokioListener,
     daemon: &Arc<Daemon>,
-    shutdown_flag: &Arc<AtomicBool>,
-    shutdown_notify: &Arc<Notify>,
+    lifecycle: &Arc<Lifecycle>,
     idle_timeout: Option<Duration>,
     handler_drain_timeout: Duration,
     shutdown_signal: impl std::future::Future<Output = ()>,
@@ -7001,7 +6890,7 @@ async fn accept_loop(
     let conn_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
     loop {
-        if shutdown_flag.load(Ordering::Relaxed) {
+        if !lifecycle.accepting_calls() {
             tracing::info!("shutdown requested via protocol, draining...");
             break;
         }
@@ -7026,15 +6915,14 @@ async fn accept_loop(
                         let request_started_at = Instant::now();
                         last_activity = request_started_at;
                         let d = daemon.clone();
-                        let flag = shutdown_flag.clone();
-                        let notify = shutdown_notify.clone();
+                        let flag = lifecycle.clone();
+
                         let limiter = conn_limiter.clone();
                         handlers.spawn(async move {
                             if let Err(e) = handle_connection_after_queue(
                                 stream,
                                 &d,
                                 &flag,
-                                &notify,
                                 limiter,
                                 request_started_at,
                             )
@@ -7058,9 +6946,8 @@ async fn accept_loop(
                     }
                 }
             }
-            // Explicit wakeup when a handler set `shutdown_flag`; the empty body
-            // just bounces us back to the top-of-loop flag check, which breaks.
-            _ = shutdown_notify.notified() => {}
+            // Shared drain notification also wakes an otherwise idle listener.
+            _ = lifecycle.draining() => {}
             // Wake periodically to check idle timeout (select won't fire otherwise)
             _ = tokio::time::sleep(ACCEPT_LOOP_IDLE_TICK) => {}
             _ = &mut shutdown_signal => {
@@ -7077,8 +6964,15 @@ async fn accept_loop(
     // handlers to stop after their current response, then wait for those
     // responses under a deadline. This must happen before `server_main` drops
     // the runtime and starts draining uploads.
-    shutdown_flag.store(true, Ordering::Relaxed);
-    if drain_connection_handlers(&mut handlers, handler_drain_timeout).await {
+    lifecycle.start_drain();
+    let drain_deadline = tokio::time::Instant::now() + handler_drain_timeout;
+    let _ = lifecycle.drain_until(drain_deadline).await;
+    if drain_connection_handlers(
+        &mut handlers,
+        drain_deadline.saturating_duration_since(tokio::time::Instant::now()),
+    )
+    .await
+    {
         tracing::warn!(
             timeout_ms = handler_drain_timeout.as_millis() as u64,
             "connection handler drain timed out; aborted remaining handlers"
@@ -7529,15 +7423,19 @@ where
 /// Checking on both sides of the await covers handlers already parked between
 /// persistent requests when another connection initiates shutdown.
 async fn read_request_before_shutdown(
-    shutdown_flag: &AtomicBool,
+    lifecycle: &Arc<Lifecycle>,
     read: impl std::future::Future<Output = std::io::Result<Option<String>>>,
 ) -> std::io::Result<Option<String>> {
-    if shutdown_flag.load(Ordering::Relaxed) {
+    if !lifecycle.accepting_calls() {
         return Ok(None);
     }
 
-    let line = read.await?;
-    if shutdown_flag.load(Ordering::Relaxed) {
+    let line = tokio::select! {
+        biased;
+        _ = lifecycle.draining() => return Ok(None),
+        line = read => line?,
+    };
+    if !lifecycle.accepting_calls() {
         return Ok(None);
     }
     Ok(line)
@@ -7569,8 +7467,7 @@ where
 async fn handle_connection_after_queue(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
-    shutdown_flag: &AtomicBool,
-    shutdown_notify: &Notify,
+    lifecycle: &Arc<Lifecycle>,
     limiter: Arc<tokio::sync::Semaphore>,
     request_started_at: Instant,
 ) -> Result<()> {
@@ -7583,38 +7480,22 @@ async fn handle_connection_after_queue(
         return Ok(());
     }
     let _permit = limiter.acquire_owned().await.ok();
-    handle_connection_started_at(
-        stream,
-        daemon,
-        shutdown_flag,
-        shutdown_notify,
-        request_started_at,
-    )
-    .await
+    handle_connection_started_at(stream, daemon, lifecycle, request_started_at).await
 }
 
 #[cfg(test)]
 async fn handle_connection(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
-    shutdown_flag: &AtomicBool,
-    shutdown_notify: &Notify,
+    lifecycle: &Arc<Lifecycle>,
 ) -> Result<()> {
-    handle_connection_started_at(
-        stream,
-        daemon,
-        shutdown_flag,
-        shutdown_notify,
-        Instant::now(),
-    )
-    .await
+    handle_connection_started_at(stream, daemon, lifecycle, Instant::now()).await
 }
 
 async fn handle_connection_started_at(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
-    shutdown_flag: &AtomicBool,
-    shutdown_notify: &Notify,
+    lifecycle: &Arc<Lifecycle>,
     request_started_at: Instant,
 ) -> Result<()> {
     // Use borrow pattern: &TokioStream implements both AsyncRead and AsyncWrite.
@@ -7626,7 +7507,7 @@ async fn handle_connection_started_at(
 
     loop {
         let line = match read_request_before_shutdown(
-            shutdown_flag,
+            lifecycle,
             read_bounded_line(&mut reader, &mut frame),
         )
         .await
@@ -7639,6 +7520,9 @@ async fn handle_connection_started_at(
                 break;
             }
             Err(e) => return Err(e.into()),
+        };
+        let Some(_request) = lifecycle.begin() else {
+            break;
         };
         let start = Instant::now();
         let parsed = serde_json::from_str::<Request>(&line);
@@ -7698,10 +7582,10 @@ async fn handle_connection_started_at(
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
             Ok(Request::CompileFinished(req)) => daemon.handle_compile_finished(&req),
             Ok(Request::Shutdown) => {
-                shutdown_flag.store(true, Ordering::Relaxed);
+                lifecycle.start_drain();
                 // Wake the accept loop so it breaks now rather than on the next
                 // periodic tick (issue #288).
-                shutdown_notify.notify_one();
+
                 Response::ok()
             }
             Err(e) => {
@@ -7714,17 +7598,14 @@ async fn handle_connection_started_at(
         // If the client binary is newer than this daemon, schedule a graceful restart.
         // The daemon finishes processing in-flight work, then exits so launchd/systemd
         // restarts it with the updated binary.
-        if client_epoch_is_newer(client_epoch, daemon.build_epoch)
-            && !shutdown_flag.load(Ordering::Relaxed)
-        {
+        if client_epoch_is_newer(client_epoch, daemon.build_epoch) && lifecycle.accepting_calls() {
             tracing::info!(
                 daemon_epoch = daemon.build_epoch,
                 client_epoch,
                 "client binary is newer than daemon, scheduling restart"
             );
-            shutdown_flag.store(true, Ordering::Relaxed);
+            lifecycle.start_drain();
             // Wake the accept loop so the restart starts now (issue #288).
-            shutdown_notify.notify_one();
         }
 
         if !resp.ok {
@@ -7746,7 +7627,7 @@ async fn handle_connection_started_at(
         // Once shutdown starts, finish this response but do not wait for a
         // persistent client to send another request. In particular, the stop
         // handler must write its own acknowledgement before it exits.
-        if shutdown_flag.load(Ordering::Relaxed) {
+        if !lifecycle.accepting_calls() {
             break;
         }
     }
@@ -8228,18 +8109,26 @@ pub fn send_compile_finished(socket_path: &std::path::Path, pid: u32, started_at
 }
 
 /// Verify readiness without waiting for store locks, scans or maintenance.
-/// Older daemons reject this request; init then takes its normal restart path.
+/// Legacy daemons use their existing health request; an unsupported reply requires restart.
 pub fn send_health_request(config: &Config) -> Result<DaemonHealth> {
-    refresh_stale_response(
-        fetch_daemon_health(config)?,
-        build_epoch(),
-        |health| health.build_epoch,
-        || restart_daemon_for_stale_client(config),
-        || fetch_daemon_health(config),
-    )
+    let health = fetch_daemon_health(config)?;
+    anyhow::ensure!(
+        !client_epoch_is_newer(build_epoch(), health.build_epoch),
+        "daemon needs an upgrade"
+    );
+    Ok(health)
 }
 
 fn fetch_daemon_health(config: &Config) -> Result<DaemonHealth> {
+    if let Some(health) =
+        lifecycle_control::health(config, Instant::now() + Duration::from_secs(2))?
+    {
+        anyhow::ensure!(health.ready && !health.draining, "daemon is not ready");
+        return Ok(DaemonHealth {
+            version: health.build,
+            build_epoch: health.revision,
+        });
+    }
     let response = send_request_with_timeout(
         &config.socket_path(),
         &Request::Health,
@@ -8382,285 +8271,30 @@ fn fetch_stats(
 
 /// Send a shutdown request to the running daemon.
 ///
-/// If the socket is unreachable (stale daemon) but the run lock is still held,
-/// falls back to terminating the daemon process via its coordinator PID.
+/// Wait for ownership release after a verified drain acknowledgement. A timeout
+/// leaves unfinished work running and reports failure.
 pub fn send_shutdown_request(config: &Config) -> Result<()> {
-    let socket_path = config.socket_path();
-    match send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(5)) {
-        Ok(_) => {
-            eprintln!("daemon stopped");
-            Ok(())
-        }
-        Err(e) => {
-            // Socket unreachable — try to recover via coordinator state.
-            if let Some(state) = read_daemon_state(&socket_path)
-                && process_is_alive(state.pid)
-            {
-                tracing::info!(
-                    pid = state.pid,
-                    "socket unreachable, terminating daemon process"
-                );
-                crate::platform::terminate_process(state.pid);
-                if wait_for_run_lock_release(&socket_path, Duration::from_secs(3))? {
-                    let _ = std::fs::remove_file(&socket_path);
-                    eprintln!("daemon stopped (terminated stale process)");
-                    return Ok(());
-                }
-                // Graceful termination didn't work, escalate to force kill.
-                tracing::warn!(pid = state.pid, "daemon did not stop, force-killing");
-                crate::platform::kill_process(state.pid);
-                if wait_for_run_lock_release(&socket_path, Duration::from_secs(2))? {
-                    let _ = std::fs::remove_file(&socket_path);
-                    eprintln!("daemon stopped (killed stale process)");
-                    return Ok(());
-                }
-            }
-            Err(e).context("connecting to daemon socket")
-        }
-    }
-}
-
-/// Executable file name a real daemon process must be running.
-#[cfg(unix)]
-const DAEMON_EXE_NAME: &str = "kache";
-
-/// Does `ps -o comm=` output name the kache executable itself?
-///
-/// Command-line matching also finds shells that mention `kache daemon run`.
-/// Diagnostics should count only actual daemon executables. macOS reports a
-/// full path and Linux a bare name, so compare the final path component.
-#[cfg(unix)]
-fn comm_is_daemon_exe(comm: &str) -> bool {
-    let comm = comm.trim();
-    !comm.is_empty()
-        && Path::new(comm)
-            .file_name()
-            .is_some_and(|name| name == DAEMON_EXE_NAME)
-}
-
-/// Executable name behind a PID, via `ps -o comm=`. None if the process is
-/// gone or `ps` could not answer.
-#[cfg(unix)]
-fn process_comm(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Find PIDs of running `kache daemon run` processes via pgrep.
-///
-/// Returns only PIDs that are still alive at the moment of the check — stale
-/// pgrep output is filtered out with a `kill -0` probe — and only processes
-/// that are the kache executable itself, never something whose command line
-/// merely mentions it. See [`comm_is_daemon_exe`].
-pub fn find_daemon_pids() -> Vec<u32> {
-    let own_pid = std::process::id();
-
-    #[cfg(unix)]
+    let deadline = Instant::now() + Duration::from_secs(5);
+    if lifecycle_control::request(config, kunobi_daemon::wire::operation::DRAIN, deadline)?
+        .is_none()
     {
-        let output = match std::process::Command::new("pgrep")
-            .args(["-f", "kache daemon run"])
-            .output()
-        {
-            Ok(o) if o.status.success() => o,
-            _ => return Vec::new(),
-        };
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|l| l.trim().parse::<u32>().ok())
-            .filter(|&pid| pid != own_pid && process_is_alive(pid))
-            .filter(|&pid| process_comm(pid).is_some_and(|comm| comm_is_daemon_exe(&comm)))
-            .collect()
+        let response =
+            lifecycle_control::legacy_request(&config.socket_path(), &Request::Shutdown, deadline)?;
+        let response: Response = serde_json::from_str(&response)?;
+        anyhow::ensure!(response.ok, "daemon rejected shutdown");
     }
-
-    #[cfg(windows)]
-    {
-        // Preferred: Win32_Process gives the command line, so a sibling
-        // `kache.exe build` is not mistaken for a daemon. Falls back to
-        // tasklist when the query is unavailable — see below.
-        if let Some(processes) = windows_kache_processes() {
-            return processes
-                .into_iter()
-                .filter(|(pid, cmdline)| *pid != own_pid && cmdline_is_daemon_run(cmdline))
-                .map(|(pid, _)| pid)
-                .filter(|&pid| process_is_alive(pid))
-                .collect();
-        }
-
-        // Fallback: tasklist is available on all supported Windows versions but
-        // reports no command line, so this matches every kache.exe. That is the
-        // long-standing behaviour; keeping it means a missing or restricted
-        // PowerShell degrades recovery to what it always did rather than
-        // silently finding nothing and leaving a stuck daemon unrecoverable.
-        // /FI filters by image name, /FO CSV for parseable output, /NH skips header.
-        // CSV format: "kache.exe","1234","Console","1","12,345 K"
-        let output = match std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq kache.exe", "/FO", "CSV", "/NH"])
-            .output()
-        {
-            Ok(o) if o.status.success() => o,
-            _ => return Vec::new(),
-        };
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let fields: Vec<&str> = line.split(',').collect();
-                fields.get(1)?.trim_matches('"').parse::<u32>().ok()
-            })
-            .filter(|&pid| pid != own_pid && process_is_alive(pid))
-            .collect()
-    }
-}
-
-/// Does this command line belong to a `kache daemon run` process?
-///
-/// The Windows enumeration filters by image name, which — unlike the Unix
-/// `pgrep -f` path — says nothing about the subcommand, so without this an
-/// in-flight `kache.exe build` would be counted as a daemon. Matches `daemon` immediately followed by `run` as argument tokens,
-/// so `daemon status` and a bare `daemon` do not qualify.
-///
-/// Compiled on Windows and in every test build, so the Unix lanes still cover
-/// the logic even though only Windows calls it.
-#[cfg(any(windows, test))]
-fn cmdline_is_daemon_run(cmdline: &str) -> bool {
-    let mut rest = cmdline
-        .split_whitespace()
-        .skip_while(|token| *token != "daemon");
-    rest.next().is_some() && rest.next() == Some("run")
-}
-
-/// `(pid, command line)` for every running `kache.exe`, or None when the query
-/// is unavailable and the caller should fall back to tasklist.
-///
-/// Returns None rather than an empty vec when rows came back but no command
-/// line did: that means the query ran without the access needed to read
-/// command lines, and treating it as "no daemons" would break recovery.
-#[cfg(windows)]
-fn windows_kache_processes() -> Option<Vec<(u32, String)>> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-CimInstance Win32_Process -Filter \"Name='kache.exe'\" | \
-             ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut rows = Vec::new();
-    let mut saw_command_line = false;
-    for line in stdout.lines() {
-        let Some((pid, cmdline)) = line.trim().split_once('|') else {
-            continue;
-        };
-        let Ok(pid) = pid.trim().parse::<u32>() else {
-            continue;
-        };
-        let cmdline = cmdline.trim();
-        saw_command_line |= !cmdline.is_empty();
-        rows.push((pid, cmdline.to_string()));
-    }
-
-    if rows.is_empty() {
-        // No kache.exe at all — a real, trustworthy answer.
-        return Some(rows);
-    }
-    saw_command_line.then_some(rows)
-}
-
-/// Recover this cache's daemon while excluding concurrent manual starters.
-/// Service-manager restarts coordinate through the persistent run lock.
-pub fn force_recover(config: &Config) -> Result<()> {
-    let socket_path = config.socket_path();
-    std::fs::create_dir_all(socket_path.parent().unwrap())?;
-    let start_lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(socket_path.with_extension("lock"))
-        .context("opening daemon startup lock for recovery")?;
-    start_lock
-        .try_lock()
-        .context("another daemon startup or recovery is in progress")?;
     anyhow::ensure!(
-        recover_unhealthy_daemon(&socket_path, "explicit daemon recovery")?
-            || crate::transport::is_reachable(&socket_path),
-        "daemon run lock is held but no reachable or recoverable daemon was found"
+        wait_for_run_lock_release(&config.socket_path(), Duration::from_secs(35))?,
+        "daemon is still draining; ownership has not been released"
     );
+    eprintln!("daemon stopped");
     Ok(())
 }
 
-/// Explicit daemon restart for `kache daemon restart` and init recovery.
-///
-/// Three-tier recovery strategy:
-/// 1. Prefer the platform service manager (launchd/systemd) when installed —
-///    it owns the daemon lifecycle and `kickstart -k` cleans its own state.
-/// 2. If that doesn't yield a reachable daemon, recover the coordinator for
-///    this cache while preserving its lock files
-///    (covers the case where a process is alive outside the service manager's
-///    knowledge).
-/// 3. Finally, spawn a fresh daemon via `start_daemon_background`.
-///
-/// Returns `Ok(true)` if the daemon is reachable after restart.
+/// Drain and replace this cache's daemon through the shared exclusive coordinator.
+/// Returns true only after the replacement answers a compatible readiness probe.
 pub fn restart(config: &Config) -> Result<bool> {
-    let socket_path = config.socket_path();
-
-    // Tier 1: service manager. Check this socket's response; other cache
-    // directories may legitimately have their own daemon processes.
-    match crate::service::kickstart() {
-        Ok(true) => {
-            eprintln!("restarting daemon via service manager...");
-            if wait_for_socket_until(&socket_path, None, Duration::from_secs(10))? {
-                let responsive = fetch_daemon_health(config)
-                    .map(|health| !client_epoch_is_newer(build_epoch(), health.build_epoch))
-                    .unwrap_or(false);
-                if responsive {
-                    eprintln!("daemon restarted");
-                    return Ok(true);
-                }
-                tracing::warn!(
-                    responsive,
-                    "service kickstart reported success but daemon isn't healthy; attempting coordinator recovery"
-                );
-            } else {
-                tracing::warn!(
-                    "service kickstart completed but socket not ready; attempting coordinator recovery"
-                );
-            }
-        }
-        Ok(false) => {
-            // No service installed — fall through to manual path.
-        }
-        Err(e) => {
-            tracing::warn!("service kickstart failed: {e:#}; attempting coordinator recovery");
-        }
-    }
-
-    // Tier 2: best-effort graceful shutdown then force cleanup
-    let _ = send_shutdown_request(config);
-    force_recover(config)?;
-
-    // Tier 3: fresh spawn
-    match start_daemon_background()? {
-        true => {
-            eprintln!("daemon restarted");
-            Ok(true)
-        }
-        false => {
-            eprintln!("daemon did not start within timeout");
-            Ok(false)
-        }
-    }
+    lifecycle_client::ensure(config, true)
 }
 
 /// Best-effort restart for stale-daemon detection from stats polling.
@@ -8861,152 +8495,7 @@ pub fn start_daemon_background() -> Result<bool> {
 }
 
 fn start_daemon_background_inner() -> Result<bool> {
-    let config = Config::load()?;
-    let socket_path = config.socket_path();
-    let lock_path = socket_path.with_extension("lock");
-    let mut recovered_once = false;
-
-    for attempt in 0..2 {
-        std::fs::create_dir_all(socket_path.parent().unwrap())?;
-
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .context("opening daemon lock file")?;
-
-        let got_lock = lock_file.try_lock().is_ok();
-
-        if !got_lock {
-            tracing::debug!("daemon start already in progress, waiting for socket");
-            if wait_for_socket(&socket_path, None)? {
-                if recovered_once {
-                    tracing::info!(
-                        socket = %socket_path.display(),
-                        "daemon startup recovered after retry"
-                    );
-                }
-                return Ok(true);
-            }
-            if attempt == 0 {
-                tracing::info!(
-                    socket = %socket_path.display(),
-                    "daemon starter timed out without publishing a ready socket, retrying coordination"
-                );
-                std::thread::sleep(DAEMON_START_POLL_INTERVAL);
-                continue;
-            }
-            return Ok(false);
-        }
-
-        // We hold the lock. Check if daemon is already running.
-        if crate::transport::is_reachable(&socket_path) {
-            let my_epoch = build_epoch();
-            let is_stale = fetch_daemon_health(&config)
-                .map(|health| client_epoch_is_newer(my_epoch, health.build_epoch))
-                .unwrap_or(true);
-
-            if !is_stale {
-                tracing::debug!("daemon already running");
-                return Ok(true);
-            }
-
-            tracing::info!("stale daemon detected, requesting shutdown before restart");
-            let _ =
-                send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
-
-            if !wait_for_run_lock_release(&socket_path, Duration::from_secs(5))? {
-                tracing::info!(
-                    socket = %socket_path.display(),
-                    "stale daemon did not exit within timeout, attempting bounded recovery"
-                );
-                if attempt == 0
-                    && recover_unhealthy_daemon(
-                        &socket_path,
-                        "stale daemon did not exit after shutdown request",
-                    )?
-                {
-                    recovered_once = true;
-                    continue;
-                }
-                return Ok(false);
-            }
-        }
-
-        if daemon_run_lock_is_held(&socket_path)? {
-            tracing::debug!(
-                socket = %socket_path.display(),
-                "daemon run lock already held, waiting for socket"
-            );
-            if wait_for_socket(&socket_path, None)? {
-                return Ok(true);
-            }
-            if attempt == 0
-                && recover_unhealthy_daemon(
-                    &socket_path,
-                    "daemon run lock held but no ready socket became reachable",
-                )?
-            {
-                recovered_once = true;
-                continue;
-            }
-            return Ok(false);
-        }
-
-        let exe = std::env::current_exe().context("getting current executable path")?;
-        tracing::info!("auto-starting daemon");
-
-        let log_path = socket_path.with_extension("log");
-        rotate_daemon_log_if_large(&log_path);
-        let stderr_target = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map(std::process::Stdio::from)
-            .unwrap_or_else(|_| std::process::Stdio::null());
-
-        // Spawn with OUR std handles made non-inheritable for the duration
-        // (kunobi-ninja/kache#704). Redirecting the daemon's own stdio is not
-        // enough on Windows: `CreateProcess` with `bInheritHandles = TRUE` —
-        // which Rust's `Command` uses whenever it sets stdio — gives the child
-        // EVERY inheritable handle in this process, not only the redirected
-        // ones. So a daemon started from a `kache` invocation whose output is
-        // being captured would hold a duplicate of the caller's pipe write
-        // end, and the caller would wait for an EOF that cannot arrive until
-        // the daemon exits — which, with the idle timeout disabled by default
-        // (#662), is never. Any tool that captures kache's output hangs:
-        // build scripts, CI wrappers, IDE integrations, and the test harness
-        // where this was found.
-        let _warned = warn_if_remote_is_env_only(&config);
-
-        let mut child = spawn_detached_daemon(&exe, stderr_target)?;
-
-        let ready = wait_for_socket(&socket_path, Some(&mut child))?;
-        if ready {
-            if recovered_once {
-                tracing::info!(
-                    socket = %socket_path.display(),
-                    "daemon started successfully after recovery"
-                );
-            } else {
-                tracing::info!("daemon started successfully");
-            }
-            return Ok(true);
-        }
-        if attempt == 0
-            && recover_unhealthy_daemon(
-                &socket_path,
-                "daemon starter failed to publish a ready socket before timeout",
-            )?
-        {
-            recovered_once = true;
-            continue;
-        }
-        return Ok(false);
-    }
-
-    Ok(false)
+    lifecycle_client::ensure(&Config::load()?, false)
 }
 
 fn daemon_run_lock_path(socket_path: &Path) -> PathBuf {
@@ -9014,42 +8503,12 @@ fn daemon_run_lock_path(socket_path: &Path) -> PathBuf {
 }
 
 fn daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
-    let run_lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(daemon_run_lock_path(socket_path))
-        .context("opening daemon run lock probe file")?;
-
-    Ok(run_lock_file_is_held(&run_lock_file))
+    kunobi_daemon::ProcessLock::is_held(daemon_run_lock_path(socket_path))
+        .context("observing daemon run lock")
 }
 
-/// Like [`daemon_run_lock_is_held`], but never creates the lock file: a missing
-/// file reads as "not held".
-///
-/// For callers that only observe. `doctor` reports leftover lock files, so a
-/// probe that creates one on a host that has never run a daemon would hand it a
-/// finding it manufactured itself — and testing for the file first only narrows
-/// that race rather than closing it.
 fn existing_daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .open(daemon_run_lock_path(socket_path))
-    {
-        Ok(file) => Ok(run_lock_file_is_held(&file)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).context("opening daemon run lock probe file"),
-    }
-}
-
-/// Probe: if we can acquire the lock, no daemon holds it. Releases immediately.
-fn run_lock_file_is_held(file: &std::fs::File) -> bool {
-    if file.try_lock().is_ok() {
-        let _ = file.unlock();
-        false
-    } else {
-        true
-    }
+    daemon_run_lock_is_held(socket_path)
 }
 
 /// Environment variables that decide the daemon's REMOTE, stripped from an
@@ -9243,74 +8702,6 @@ impl Drop for NonInheritableStdio {
             }
         }
     }
-}
-
-fn wait_for_socket(socket_path: &Path, child: Option<&mut std::process::Child>) -> Result<bool> {
-    wait_for_socket_until(socket_path, child, DAEMON_START_TIMEOUT)
-}
-
-fn wait_for_socket_until(
-    socket_path: &Path,
-    mut child: Option<&mut std::process::Child>,
-    timeout: Duration,
-) -> Result<bool> {
-    let deadline = Instant::now() + timeout;
-
-    while Instant::now() < deadline {
-        if crate::transport::is_reachable(socket_path) {
-            return Ok(true);
-        }
-
-        if let Some(child_proc) = child.as_mut()
-            && let Some(status) = child_proc
-                .try_wait()
-                .context("checking daemon process status")?
-        {
-            if status.success() {
-                tracing::debug!(
-                    socket = %socket_path.display(),
-                    ?status,
-                    "daemon starter exited cleanly before socket became ready, continuing to wait"
-                );
-                child = None;
-                continue;
-            }
-            tracing::debug!(
-                socket = %socket_path.display(),
-                ?status,
-                "daemon exited before socket became ready"
-            );
-            return Ok(false);
-        }
-
-        std::thread::sleep(DAEMON_START_POLL_INTERVAL);
-    }
-
-    if crate::transport::is_reachable(socket_path) {
-        return Ok(true);
-    }
-
-    if let Some(child) = child.as_mut()
-        && child
-            .try_wait()
-            .context("checking daemon process status after timeout")?
-            .is_none()
-    {
-        tracing::debug!(
-            socket = %socket_path.display(),
-            timeout_ms = timeout.as_millis(),
-            "daemon did not start within timeout, terminating starter process"
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    tracing::debug!(
-        socket = %socket_path.display(),
-        timeout_ms = timeout.as_millis(),
-        "daemon did not start within timeout"
-    );
-    Ok(false)
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -9814,7 +9205,9 @@ mod tests {
     // Tests use the same cross-platform transport as production. On Unix
     // this resolves to UDS; on Windows (when tests are eventually enabled
     // there) it resolves to named pipes.
-    use crate::transport::{ListenerOptions, TokioListener, TokioStream, socket_name};
+    #[cfg(test)]
+    use crate::transport::ListenerOptions;
+    use crate::transport::{TokioListener, TokioStream, socket_name};
 
     /// A sibling of `socket_path` that no earlier bind in this process has
     /// used.
@@ -9882,56 +9275,6 @@ mod tests {
             .name(name)
             .create_sync()
             .expect("create_sync listener")
-    }
-
-    /// Spawn a child that exits immediately with success — a stand-in for a
-    /// daemon-starter process that returns before the socket is ready.
-    fn spawn_quick_exit_child() -> std::process::Child {
-        #[cfg(unix)]
-        {
-            std::process::Command::new("sh")
-                .args(["-c", "exit 0"])
-                .spawn()
-                .unwrap()
-        }
-        #[cfg(windows)]
-        {
-            std::process::Command::new("cmd")
-                .args(["/c", "exit", "0"])
-                .spawn()
-                .unwrap()
-        }
-    }
-
-    /// Spawn a child that blocks long enough (~30s) to be killed by the code
-    /// under test. `sleep` on Unix; PowerShell's `Start-Sleep` on Windows,
-    /// because `timeout` needs a console and ping request counts do not
-    /// guarantee any minimum duration.
-    fn spawn_blocking_child() -> std::process::Child {
-        #[cfg(unix)]
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .unwrap();
-        #[cfg(windows)]
-        let mut child = std::process::Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Start-Sleep -Seconds 30",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "blocking test child exited during setup"
-        );
-        child
     }
 
     /// Send one request, read one response, and deliberately keep the socket
@@ -10002,14 +9345,9 @@ mod tests {
         let server_daemon = daemon.clone();
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
-            handle_connection(
-                stream,
-                &server_daemon,
-                &AtomicBool::new(false),
-                &Notify::new(),
-            )
-            .await
-            .expect("handle_connection");
+            handle_connection(stream, &server_daemon, &Arc::new(Lifecycle::default()))
+                .await
+                .expect("handle_connection");
         });
 
         let resp = client_roundtrip(socket_path, req).await;
@@ -10017,12 +9355,6 @@ mod tests {
         resp
     }
 
-    /// Regression for #288 (handler side): a protocol `stop` must both set
-    /// `shutdown_flag` and leave a permit on `shutdown_notify`. The stored
-    /// permit is what makes the accept loop's `notified()` arm fire even when
-    /// the stop lands while the loop is not parked in `select!` — the
-    /// lost-wakeup guarantee the fix depends on. Without the `notify_one()`
-    /// call this test hangs on `notified()` and trips the timeout.
     /// #131: the in-flight registry upserts by pid, deregisters on finish,
     /// prunes dead/ancient entries, and snapshots with derived elapsed/ETA.
     #[test]
@@ -10216,15 +9548,14 @@ mod tests {
 
         let listener = bind_listener(&socket_path);
         let daemon = Arc::new(Daemon::new(config));
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let shutdown_notify = Arc::new(Notify::new());
+        let lifecycle = Arc::new(Lifecycle::default());
 
         let server_daemon = daemon.clone();
-        let server_flag = shutdown_flag.clone();
-        let server_notify = shutdown_notify.clone();
+        let server_flag = lifecycle.clone();
+
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
-            handle_connection(stream, &server_daemon, &server_flag, &server_notify)
+            handle_connection(stream, &server_daemon, &server_flag)
                 .await
                 .expect("handle_connection");
         });
@@ -10234,13 +9565,13 @@ mod tests {
 
         assert!(resp.ok, "stop request should return ok");
         assert!(
-            shutdown_flag.load(Ordering::Relaxed),
-            "stop request must set the shutdown flag"
+            !lifecycle.accepting_calls(),
+            "stop request must close admission"
         );
-        // A permit must already be stored, so `notified()` resolves immediately.
-        tokio::time::timeout(Duration::from_secs(1), shutdown_notify.notified())
+        // A later observer must also see the shared drain transition.
+        tokio::time::timeout(Duration::from_secs(1), lifecycle.draining())
             .await
-            .expect("stop request must leave a notify permit (issue #288)");
+            .expect("stop request must wake a later drain observer");
     }
 
     struct GatedHeadBackend {
@@ -10307,17 +9638,16 @@ mod tests {
         );
 
         let listener = bind_listener(&socket_path);
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let shutdown_notify = Arc::new(Notify::new());
+        let lifecycle = Arc::new(Lifecycle::default());
+
         let loop_daemon = daemon.clone();
-        let loop_flag = shutdown_flag.clone();
-        let loop_notify = shutdown_notify.clone();
+        let loop_flag = lifecycle.clone();
+
         let mut accept_task = tokio::spawn(async move {
             accept_loop(
                 &listener,
                 &loop_daemon,
                 &loop_flag,
-                &loop_notify,
                 None,
                 Duration::from_secs(2),
                 std::future::pending::<()>(),
@@ -10349,7 +9679,7 @@ mod tests {
             client_request_keep_open(&shutdown_socket, &Request::Shutdown).await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !shutdown_flag.load(Ordering::Relaxed) {
+            while lifecycle.accepting_calls() {
                 tokio::task::yield_now().await;
             }
         })
@@ -10432,8 +9762,7 @@ mod tests {
 
         let listener = bind_listener(&socket_path);
         let daemon = Arc::new(Daemon::new(config));
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let shutdown_notify = Arc::new(Notify::new());
+        let lifecycle = Arc::new(Lifecycle::default());
 
         // Client sends a one-shot `stop` once the loop is up.
         let client_socket = socket_path.clone();
@@ -10448,8 +9777,7 @@ mod tests {
             accept_loop(
                 &listener,
                 &daemon,
-                &shutdown_flag,
-                &shutdown_notify,
+                &lifecycle,
                 None,
                 Duration::from_secs(1),
                 std::future::pending::<()>(),
@@ -10462,7 +9790,7 @@ mod tests {
             "accept_loop did not break within 5s of a stop request (issue #288 regression)"
         );
         assert!(
-            shutdown_flag.load(Ordering::Relaxed),
+            !lifecycle.accepting_calls(),
             "shutdown flag should be set after the stop request"
         );
         let resp = client.await.expect("join client task");
@@ -10511,68 +9839,7 @@ mod tests {
         server.abort();
     }
 
-    /// Acquires the run lock, then spawns the blocking child and waits for it
-    /// on the same thread, releasing the lock only after the child has been
-    /// reaped. This mirrors the real daemon, whose death is what releases the
-    /// lock, and keeps the termination tests deterministic on slow runners: a
-    /// fixed hold duration could expire before recovery even sampled the lock
-    /// (seen as flakes on the loaded self-hosted Windows runner), and waiting
-    /// on the exact child avoids liveness polling and pid-reuse concerns.
-    /// Returns once the lock is held and the child is running.
-    fn spawn_blocking_child_holding_run_lock(
-        socket_path: &Path,
-    ) -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
-        let run_lock_path = socket_path.with_extension("run.lock");
-        let (tx, rx) = mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&run_lock_path)
-                .unwrap();
-            file.lock().unwrap();
-
-            let mut child = spawn_blocking_child();
-            tx.send(child.id()).unwrap();
-
-            let status = child.wait().unwrap();
-            let _ = file.unlock();
-            status
-        });
-        (rx.recv().unwrap(), handle)
-    }
-
-    /// Acquires the run lock and holds it until explicitly released via the
-    /// returned sender. The timeout is a hard test failure, never a silent
-    /// release that could let an assertion pass by accident.
-    fn hold_run_lock_until_released(
-        socket_path: &Path,
-    ) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
-        let run_lock_path = socket_path.with_extension("run.lock");
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&run_lock_path)
-                .unwrap();
-            file.lock().unwrap();
-            ready_tx.send(()).unwrap();
-
-            release_rx
-                .recv_timeout(Duration::from_secs(30))
-                .expect("test did not explicitly release the daemon run lock");
-            let _ = file.unlock();
-        });
-        ready_rx.recv().unwrap();
-        (release_tx, handle)
-    }
-
-    /// Helper: create a Config pointing at a tempdir.
-    fn test_config(dir: &Path) -> Config {
+    pub(super) fn test_config(dir: &Path) -> Config {
         Config {
             fallback: None,
             key_salt: None,
@@ -10749,7 +10016,11 @@ mod tests {
 
         let ready_socket = socket_path.clone();
         let ready = tokio::task::spawn_blocking(move || {
-            wait_for_socket_until(&ready_socket, None, Duration::from_secs(5))
+            kunobi_daemon::readiness::wait_until(
+                Instant::now() + Duration::from_secs(5),
+                |deadline| lifecycle_client::current_socket(&ready_socket, deadline),
+            )
+            .map(|proof| proof.is_some())
         })
         .await
         .unwrap()
@@ -10796,89 +10067,67 @@ mod tests {
     }
 
     #[test]
-    fn test_wait_for_socket_until_observes_late_socket() {
+    fn readiness_rejects_an_accepting_socket_that_does_not_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-        let socket_path_bg = socket_path.clone();
-
-        // The property under test is that the waiter survives the socket's
-        // absence and then observes it. The listener appears late, and stays
-        // up until the waiter has its answer: dropping it after a fixed
-        // window instead let a loaded runner miss the whole window between
-        // reachability probes (seen as flakes on the macOS runner). The
-        // recv_timeout is a hard failure bound, never a silent early drop.
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            let listener = bind_sync_listener(&socket_path_bg);
-            done_rx
-                .recv_timeout(Duration::from_secs(60))
-                .expect("test did not report a wait result");
-            drop(listener);
-        });
-
-        let ready = wait_for_socket_until(&socket_path, None, Duration::from_secs(30)).unwrap();
-
-        done_tx.send(()).unwrap();
-        handle.join().unwrap();
-        assert!(ready);
+        let socket = dir.path().join("daemon.sock");
+        let _listener = bind_sync_listener(&socket);
+        let start = Instant::now();
+        assert!(
+            lifecycle_client::current_socket(&socket, start + Duration::from_millis(100))
+                .unwrap()
+                .is_none()
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
-    fn test_wait_for_socket_until_times_out_cleanly() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("missing.sock");
-
-        let ready = wait_for_socket_until(&socket_path, None, Duration::from_millis(150)).unwrap();
-
-        assert!(!ready);
-    }
-
-    #[test]
-    fn test_wait_for_socket_until_ignores_clean_child_exit_if_socket_appears() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-        let socket_path_bg = socket_path.clone();
-
-        // Same race #734 fixed in the sibling test above, which this one kept:
-        // the socket existed only during [150ms, 350ms] while the waiter polls
-        // every DAEMON_START_POLL_INTERVAL (100ms) against a 1s deadline. On a
-        // loaded runner the background thread may not even bind before that
-        // deadline expires. This is the test that actually failed on macOS CI.
-        // recv_timeout is a hard failure bound, never a silent early drop.
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            let listener = bind_sync_listener(&socket_path_bg);
-            done_rx
-                .recv_timeout(Duration::from_secs(60))
-                .expect("main thread should signal before the bound");
-            drop(listener);
-        });
-
-        let mut child = spawn_quick_exit_child();
-
-        let ready =
-            wait_for_socket_until(&socket_path, Some(&mut child), Duration::from_secs(30)).unwrap();
-
-        done_tx.send(()).ok();
-        handle.join().unwrap();
-        assert!(ready);
-    }
-
-    #[test]
-    fn test_wait_for_socket_until_kills_stuck_child_after_timeout() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("missing.sock");
-        let mut child = spawn_blocking_child();
-
-        let ready =
-            wait_for_socket_until(&socket_path, Some(&mut child), Duration::from_millis(150))
-                .unwrap();
-
-        assert!(!ready);
-        let status = child.try_wait().unwrap();
-        assert!(status.is_some());
+    fn readiness_requires_a_successful_compatible_health_response() {
+        for (response, accepted) in [
+            (
+                Response {
+                    health: Some(DaemonHealth {
+                        version: VERSION.into(),
+                        build_epoch: build_epoch(),
+                    }),
+                    ..Response::ok()
+                },
+                true,
+            ),
+            (
+                Response {
+                    health: Some(DaemonHealth {
+                        version: "old".into(),
+                        build_epoch: 1,
+                    }),
+                    ..Response::ok()
+                },
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("daemon.sock");
+            let listener = bind_sync_listener(&socket);
+            let server = std::thread::spawn(move || {
+                use std::io::{BufRead, Write};
+                let mut peer = listener.accept().unwrap();
+                let mut request = String::new();
+                std::io::BufReader::new(&mut peer)
+                    .read_line(&mut request)
+                    .unwrap();
+                assert!(matches!(
+                    serde_json::from_str::<Request>(&request).unwrap(),
+                    Request::Health
+                ));
+                let mut response = serde_json::to_vec(&response).unwrap();
+                response.push(b'\n');
+                peer.write_all(&response).unwrap();
+            });
+            let proof =
+                lifecycle_client::current_socket(&socket, Instant::now() + Duration::from_secs(5))
+                    .unwrap();
+            server.join().unwrap();
+            assert_eq!(proof.is_some(), accepted);
+        }
     }
 
     #[test]
@@ -10974,10 +10223,12 @@ mod tests {
             build_epoch: build_epoch(),
             phase: DaemonPhase::Ready,
             updated_at_ms: now_millis(),
+            control_version: None,
         };
         assert!(daemon_state_is_recent(&fresh));
 
         let stale = DaemonCoordState {
+            control_version: None,
             pid: 1,
             build_epoch: build_epoch(),
             phase: DaemonPhase::Ready,
@@ -10992,6 +10243,7 @@ mod tests {
             build_epoch: build_epoch(),
             phase: DaemonPhase::Ready,
             updated_at_ms: now_millis() + DAEMON_COORD_STALE_AFTER.as_millis() as u64 * 2,
+            control_version: None,
         };
         assert!(!daemon_state_is_recent(&future));
     }
@@ -11012,27 +10264,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn comm_is_daemon_exe_accepts_only_the_kache_executable() {
-        // macOS reports a full path, Linux a bare name.
-        assert!(super::comm_is_daemon_exe("/Users/x/.cargo/bin/kache"));
-        assert!(super::comm_is_daemon_exe("kache"));
-        assert!(super::comm_is_daemon_exe("  /usr/local/bin/kache  "));
-        assert!(super::comm_is_daemon_exe("./target/debug/kache"));
-
-        // The shell or wrapper that launched the daemon carries
-        // "kache daemon run" in its own argv, so `pgrep -f` returns it.
-        assert!(!super::comm_is_daemon_exe("/bin/sh"));
-        assert!(!super::comm_is_daemon_exe("zsh"));
-        assert!(!super::comm_is_daemon_exe("vim"));
-        // Not a prefix or substring match.
-        assert!(!super::comm_is_daemon_exe("kache-wrapper"));
-        assert!(!super::comm_is_daemon_exe("mykache"));
-        assert!(!super::comm_is_daemon_exe(""));
-        assert!(!super::comm_is_daemon_exe("   "));
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn pid_alive_rejects_broadcast_pids() {
         // This prunes the in-flight compile map. `kill(0, 0)` and `kill(-1, 0)`
         // succeed whenever anything signalable exists, so without the guard
@@ -11044,172 +10275,6 @@ mod tests {
         assert!(
             !super::pid_alive(u32::MAX),
             "u32::MAX casts to the -1 broadcast"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn process_comm_reports_the_executable_behind_a_pid() {
-        // The executable check is only as good as this lookup: if it silently
-        // returned None or a wrong name, find_daemon_pids would quietly match
-        // nothing and doctor would miss running daemon processes.
-        // A test that only asserts "the bystander was excluded" cannot tell
-        // those apart, so pin the lookup itself against the running test
-        // process, whose executable name is known.
-        // The Nix build sandbox ships no `ps`, so there is nothing to pin
-        // there. The Test and mutation lanes all have one.
-        //
-        // Probe for the tool rather than asking `process_comm`, which is what
-        // this test pins: gating on its return would let a mutant that stubs
-        // it out turn this test into a silent skip.
-        if find_in_path("ps").is_none() {
-            return;
-        }
-        let comm =
-            super::process_comm(std::process::id()).expect("ps is present, so it must answer");
-        let name = std::path::Path::new(&comm)
-            .file_name()
-            .expect("comm has a file name")
-            .to_string_lossy()
-            .into_owned();
-        assert!(
-            name.starts_with("kache"),
-            "expected the test binary's own executable name, got {comm:?}"
-        );
-
-        // A PID that cannot exist has no executable to report.
-        assert_eq!(super::process_comm(0), None);
-    }
-
-    #[test]
-    fn cmdline_is_daemon_run_matches_only_the_daemon_subcommand() {
-        // Windows enumerates by image name only, so this is the sole thing
-        // separating a daemon from any other kache.exe.
-        assert!(super::cmdline_is_daemon_run(r"C:\bin\kache.exe daemon run"));
-        assert!(super::cmdline_is_daemon_run(
-            "kache.exe daemon run --foreground"
-        ));
-        assert!(super::cmdline_is_daemon_run(
-            r#""C:\Program Files\kache.exe" daemon run"#
-        ));
-
-        // Sibling CLI invocations must not count as daemon processes.
-        assert!(!super::cmdline_is_daemon_run("kache.exe build"));
-        assert!(!super::cmdline_is_daemon_run("kache.exe daemon status"));
-        assert!(!super::cmdline_is_daemon_run("kache.exe daemon stop"));
-        assert!(!super::cmdline_is_daemon_run("kache.exe daemon"));
-        assert!(!super::cmdline_is_daemon_run("kache.exe run"));
-        assert!(!super::cmdline_is_daemon_run(""));
-    }
-
-    /// Resolve an executable the way `Command::new(name)` would. Tests that
-    /// shell out need to know whether the tool exists at all before asserting
-    /// on its output — hardcoded paths like `/bin/sleep` do not exist under
-    /// Nix, where everything lives in the store.
-    #[cfg(unix)]
-    fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
-        std::env::split_paths(&std::env::var_os("PATH")?)
-            .map(|dir| dir.join(name))
-            .find(|candidate| candidate.is_file())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[ignore = "spawned by the daemon PID-discovery regression"]
-    fn fake_daemon_process_fixture() {
-        std::thread::sleep(Duration::from_secs(30));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn find_daemon_pids_finds_a_process_running_the_kache_executable() {
-        // The negative test below cannot tell "correctly excluded the
-        // bystander" from "found nothing at all", which is what a broken
-        // lookup or an over-strict filter would do — and finding nothing means
-        // diagnostics silently miss the daemon. Pin the positive side.
-        //
-        // A real `kache daemon run` cannot be arranged inside a unit test, so
-        // stand one up: any executable named `kache`, placed in a directory
-        // whose name puts "kache daemon run" into the command line that
-        // `pgrep -f` sees.
-        //
-        // Needs the same tools find_daemon_pids does. The Nix build sandbox
-        // has neither `pgrep` nor `ps`, and asserting there would only pin the
-        // sandbox, not the behaviour.
-        let (Some(_pgrep), Some(_ps)) = (find_in_path("pgrep"), find_in_path("ps")) else {
-            return;
-        };
-
-        // Reuse this test executable as the sleeping fixture. Keeping the
-        // temporary hard link beside it guarantees one filesystem and avoids
-        // Linux's copy-then-exec ETXTBSY race under coverage.
-        let current_exe = std::env::current_exe().expect("resolve test executable");
-        let dir = tempfile::tempdir_in(current_exe.parent().expect("test executable parent"))
-            .expect("create fake daemon directory");
-        let bin_dir = dir.path().join("kache daemon run");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        let fake = bin_dir.join("kache");
-        std::fs::hard_link(&current_exe, &fake).expect("hard-link test executable as kache");
-
-        let mut child = std::process::Command::new(&fake)
-            .args([
-                "--ignored",
-                "--exact",
-                "daemon::tests::fake_daemon_process_fixture",
-                "--test-threads=1",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn fake daemon");
-        let fake_pid = child.id();
-
-        // `Command::spawn` returns after fork, before the child necessarily
-        // completes exec and exposes the fake daemon argv to `pgrep -f`.
-        // Poll that transition instead of racing it once.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let found = loop {
-            let found = super::find_daemon_pids();
-            if found.contains(&fake_pid) || Instant::now() >= deadline {
-                break found;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-
-        child.kill().expect("kill fake daemon");
-        child.wait().expect("reap fake daemon");
-
-        assert!(
-            found.contains(&fake_pid),
-            "a process running an executable named kache should be found: \
-             {found:?} is missing {fake_pid}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn find_daemon_pids_ignores_processes_that_merely_mention_the_daemon() {
-        // A shell whose command line contains "kache daemon run" — exactly
-        // what a wrapper script looks like. `pgrep -f` matches it; the
-        // executable check must exclude it from diagnostics rather than counting
-        // everything this function returns.
-        //
-        // Safe by construction: find_daemon_pids only reads.
-        let mut decoy = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 20; : kache daemon run"])
-            .spawn()
-            .expect("spawn decoy");
-        let decoy_pid = decoy.id();
-
-        let found = super::find_daemon_pids();
-
-        decoy.kill().expect("kill decoy");
-        decoy.wait().expect("reap decoy");
-
-        assert!(
-            !found.contains(&decoy_pid),
-            "diagnostics counted a non-kache process: {found:?} \
-             contains decoy {decoy_pid}"
         );
     }
 
@@ -11266,46 +10331,7 @@ mod tests {
         );
     }
 
-    /// The liveness signal behind doctor's process and stale-lock checks: true
-    /// for a daemon that is serving *or* still binding its socket, and false when
-    /// nothing is there. A signal stuck on either answer silently disables both
-    /// checks, so both directions are pinned here.
-    #[test]
-    fn daemon_is_live_covers_serving_and_starting_daemons() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-        let socket_path = config.socket_path();
-        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
-
-        assert!(!daemon_is_live(&config), "nothing running");
-
-        // No socket yet, but the run lock is held and the coordinator says a
-        // daemon is on its way up.
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(daemon_run_lock_path(&socket_path))
-            .unwrap();
-        lock.try_lock().unwrap();
-        write_json_atomically(
-            &daemon_state_path(&socket_path),
-            &DaemonCoordState {
-                pid: std::process::id(),
-                build_epoch: 4242,
-                phase: DaemonPhase::Starting,
-                updated_at_ms: now_millis(),
-            },
-        )
-        .unwrap();
-        assert!(daemon_is_live(&config), "starting daemon");
-    }
-
-    /// `starting_daemon_epoch` is what lets `doctor` say "a daemon is coming up"
-    /// during the window where the socket is not yet bound. It must answer only
-    /// for a live starter that holds the run lock: a coordinator file survives an
-    /// unclean exit, and a recorded PID can be recycled by an unrelated process,
-    /// so neither the file nor a live PID proves anything on its own (#720).
+    /// A starting record is a waiting hint only while its owner holds the lock.
     #[test]
     fn starting_daemon_epoch_reports_only_a_live_starting_daemon() {
         let dir = tempfile::tempdir().unwrap();
@@ -11322,6 +10348,7 @@ mod tests {
             build_epoch: 4242,
             phase: DaemonPhase::Starting,
             updated_at_ms: now_millis(),
+            control_version: None,
         };
         write_json_atomically(&state_path, &state).unwrap();
 
@@ -11371,119 +10398,6 @@ mod tests {
         state.pid = dead_pid;
         write_json_atomically(&state_path, &state).unwrap();
         assert_eq!(starting_daemon_epoch(&config), None);
-    }
-
-    #[test]
-    fn test_recover_unhealthy_daemon_cleans_stale_socket_and_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-        std::fs::write(&socket_path, b"stale").unwrap();
-
-        // Use a reaped child rather than a made-up PID: `u32::MAX` casts to
-        // -1, and `kill(-1, ...)` signals every process the user owns.
-        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
-            .args(if cfg!(windows) {
-                vec!["/C", "exit"]
-            } else {
-                vec![]
-            })
-            .spawn()
-            .unwrap();
-        let dead_pid = child.id();
-        child.wait().unwrap();
-
-        let state = DaemonCoordState {
-            pid: dead_pid,
-            build_epoch: build_epoch(),
-            phase: DaemonPhase::Starting,
-            updated_at_ms: now_millis(),
-        };
-        write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
-
-        assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
-        assert!(!socket_path.exists());
-        assert!(read_daemon_state(&socket_path).is_none());
-    }
-
-    #[test]
-    fn test_recover_unhealthy_daemon_terminates_recent_recorded_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-        std::fs::write(&socket_path, b"stale").unwrap();
-
-        let (child_pid, child_handle) = spawn_blocking_child_holding_run_lock(&socket_path);
-
-        let state = DaemonCoordState {
-            pid: child_pid,
-            build_epoch: build_epoch(),
-            phase: DaemonPhase::Ready,
-            updated_at_ms: now_millis(),
-        };
-        write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
-
-        assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
-        assert_ne!(child_handle.join().unwrap().code(), Some(0));
-        assert!(!socket_path.exists());
-        assert!(read_daemon_state(&socket_path).is_none());
-    }
-
-    #[test]
-    fn test_recover_unhealthy_daemon_terminates_stale_recorded_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-        std::fs::write(&socket_path, b"stale").unwrap();
-
-        let (child_pid, child_handle) = spawn_blocking_child_holding_run_lock(&socket_path);
-
-        let state = DaemonCoordState {
-            pid: child_pid,
-            build_epoch: build_epoch(),
-            phase: DaemonPhase::Ready,
-            updated_at_ms: now_millis()
-                .saturating_sub(DAEMON_COORD_STALE_AFTER.as_millis() as u64 + 1),
-        };
-        write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
-
-        assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
-        assert_ne!(child_handle.join().unwrap().code(), Some(0));
-        assert!(!socket_path.exists());
-        assert!(read_daemon_state(&socket_path).is_none());
-    }
-
-    #[test]
-    fn test_recover_unhealthy_daemon_does_not_kill_pid_without_run_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-        std::fs::write(&socket_path, b"stale").unwrap();
-
-        let mut child = spawn_blocking_child();
-
-        let state = DaemonCoordState {
-            pid: child.id(),
-            build_epoch: build_epoch(),
-            phase: DaemonPhase::Ready,
-            updated_at_ms: now_millis(),
-        };
-        write_json_atomically(&daemon_state_path(&socket_path), &state).unwrap();
-
-        assert!(recover_unhealthy_daemon(&socket_path, "test").unwrap());
-        assert!(child.try_wait().unwrap().is_none());
-        let _ = child.kill();
-        let _ = child.wait();
-        assert!(!socket_path.exists());
-        assert!(read_daemon_state(&socket_path).is_none());
-    }
-
-    #[test]
-    fn test_recover_unhealthy_daemon_refuses_held_lock_without_state() {
-        // Branch: run lock held with no recoverable coordinator state.
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-        let (release_tx, run_lock_handle) = hold_run_lock_until_released(&socket_path);
-
-        assert!(!recover_unhealthy_daemon(&socket_path, "test").unwrap());
-        release_tx.send(()).unwrap();
-        run_lock_handle.join().unwrap();
     }
 
     #[test]
@@ -12584,7 +11498,7 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config.clone()));
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
-            handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
+            handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
                 .await
                 .expect("handle_connection");
         });
@@ -13025,30 +11939,6 @@ mod tests {
                 .unwrap()
                 .contains("no remote configured")
         );
-    }
-
-    // Unix-only by nature: it asserts that a leftover regular *file* at the
-    // socket path is not a connectable socket and can be removed. Windows uses
-    // named pipes, which leave no on-disk artifact at the path, so there is no
-    // equivalent stale-file scenario to test. (Stale daemon *state* cleanup is
-    // covered cross-platform by test_recover_unhealthy_daemon_cleans_*.)
-    #[cfg(unix)]
-    #[test]
-    fn test_stale_socket_cleanup() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-
-        // Create a file pretending to be a stale socket
-        std::fs::write(&socket_path, b"stale").unwrap();
-        assert!(socket_path.exists());
-
-        // Attempting to connect as a Unix socket should fail
-        let result = std::os::unix::net::UnixStream::connect(&socket_path);
-        assert!(result.is_err());
-
-        // After detection, it should be removable (simulating what server_main does)
-        std::fs::remove_file(&socket_path).unwrap();
-        assert!(!socket_path.exists());
     }
 
     #[test]
@@ -13716,7 +12606,7 @@ mod tests {
         let serving = daemon.clone();
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
-            handle_connection(stream, &serving, &AtomicBool::new(false), &Notify::new()).await
+            handle_connection(stream, &serving, &Arc::new(Lifecycle::default())).await
         });
         let result = tokio::time::timeout(
             Duration::from_secs(10),
@@ -13737,58 +12627,6 @@ mod tests {
             daemon.handle_request_sync(&Request::Health).health,
             Some(health)
         );
-    }
-
-    #[test]
-    fn recovery_preserves_lock_files_and_cleans_only_stale_endpoints() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-        let socket = config.socket_path();
-        let startup = std::fs::File::create(socket.with_extension("lock")).unwrap();
-        let run = std::fs::File::create(daemon_run_lock_path(&socket)).unwrap();
-        fs::write(&socket, "stale socket").unwrap();
-        fs::write(daemon_state_path(&socket), "stale state").unwrap();
-        force_recover(&config).unwrap();
-        assert!(!socket.exists());
-        assert!(!daemon_state_path(&socket).exists());
-        // Holding the original handles must still exclude new openers. Merely
-        // recreating a deleted lock pathname would break that exclusion.
-        startup.lock().unwrap();
-        run.lock().unwrap();
-        assert!(force_recover(&config).is_err());
-        assert!(daemon_run_lock_is_held(&socket).unwrap());
-        startup.unlock().unwrap();
-        assert!(force_recover(&config).is_err());
-    }
-
-    #[tokio::test]
-    async fn recovery_does_not_unlink_a_service_manager_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-        let socket = config.socket_path();
-        let run = std::fs::File::create(daemon_run_lock_path(&socket)).unwrap();
-        run.lock().unwrap();
-        let listener = bind_listener(&socket);
-        // Keep accepting while probes connect and disconnect. Windows named
-        // pipes do not queue a disconnected client for a later accept.
-        let server = tokio::spawn(async move {
-            loop {
-                drop(listener.accept().await.unwrap());
-            }
-        });
-        let result = tokio::task::spawn_blocking(move || {
-            // No recoverable old PID; this endpoint belongs to a new lock owner.
-            let state = daemon_state_path(&socket);
-            fs::write(&state, "replacement marker").unwrap();
-            assert!(!clean_stale_daemon_files(&socket).unwrap());
-            force_recover(&config).unwrap();
-            assert_eq!(fs::read_to_string(&state).unwrap(), "replacement marker");
-            assert!(crate::transport::is_reachable(&socket));
-        })
-        .await;
-        server.abort();
-        let _ = server.await;
-        result.unwrap();
     }
 
     #[test]
@@ -14292,8 +13130,7 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config.clone()));
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
-            let _ =
-                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new()).await;
+            let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
         });
 
         let sp = socket_path.clone();
@@ -14459,7 +13296,7 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config.clone()));
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
-            handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
+            handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
                 .await
                 .expect("handle_connection");
         });
@@ -14498,7 +13335,7 @@ mod tests {
             // probe, then opens a fresh connection for the GC request.
             for _ in 0..2 {
                 let stream = listener.accept().await.expect("accept");
-                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
+                handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
                     .await
                     .expect("handle_connection");
             }
@@ -14611,8 +13448,7 @@ mod tests {
         let server = tokio::spawn(async move {
             loop {
                 let stream = listener.accept().await.expect("accept");
-                let _ = handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
-                    .await;
+                let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
             }
         });
 
@@ -14652,8 +13488,7 @@ mod tests {
         let server = tokio::spawn(async move {
             loop {
                 let stream = listener.accept().await.expect("accept");
-                let _ = handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
-                    .await;
+                let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
             }
         });
 
@@ -14684,7 +13519,7 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config.clone()));
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
-            handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
+            handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
                 .await
                 .expect("handle_connection");
         });
@@ -17863,8 +16698,7 @@ mod tests {
             handle_connection_after_queue(
                 stream,
                 &server_daemon,
-                &AtomicBool::new(false),
-                &Notify::new(),
+                &Arc::new(Lifecycle::default()),
                 server_limiter,
                 request_started_at,
             )
@@ -19147,8 +17981,7 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config.clone()));
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
-            let _ =
-                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new()).await;
+            let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
         });
 
         let cfg = config.clone();
@@ -19190,8 +18023,7 @@ mod tests {
         daemon.set_upload_tx(tx);
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
-            let _ =
-                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new()).await;
+            let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
         });
 
         let cfg = config.clone();
@@ -19227,8 +18059,7 @@ mod tests {
         daemon.set_upload_tx(tx);
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.expect("accept");
-            let _ =
-                handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new()).await;
+            let _ = handle_connection(stream, &daemon, &Arc::new(Lifecycle::default())).await;
         });
 
         let cfg = config.clone();
@@ -20294,10 +19125,11 @@ mod tests {
 
     #[tokio::test]
     async fn downloading_guard_removes_key_via_runtime_when_lock_contended() {
+        let notify = Arc::new(Notify::new());
         // Branch: DownloadingGuard contended-drop runtime fallback. The
         // spawned removal must both clear the key and wake waiters parked on
         // the key's Notify (notify runs AFTER the removal).
-        let notify = Arc::new(Notify::new());
+
         let mut keys = HashMap::new();
         keys.insert("cache-key".to_string(), notify.clone());
         let map = Arc::new(RwLock::new(keys));
@@ -20627,9 +19459,10 @@ mod tests {
 
     #[tokio::test]
     async fn request_read_refuses_frames_across_both_shutdown_boundaries() {
-        let shutdown_flag = AtomicBool::new(true);
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.start_drain();
         let read_was_polled = AtomicBool::new(false);
-        let before_read = read_request_before_shutdown(&shutdown_flag, async {
+        let before_read = read_request_before_shutdown(&lifecycle, async {
             read_was_polled.store(true, Ordering::Relaxed);
             Ok::<_, std::io::Error>(Some("must-not-run".to_string()))
         })
@@ -20641,11 +19474,11 @@ mod tests {
             "a queued handler must not poll its request after shutdown"
         );
 
-        shutdown_flag.store(false, Ordering::Relaxed);
-        let completed_during_shutdown = read_request_before_shutdown(&shutdown_flag, async {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let completed_during_shutdown = read_request_before_shutdown(&lifecycle, async {
             // Models another connection initiating shutdown while this handler
             // is parked in its request read.
-            shutdown_flag.store(true, Ordering::Relaxed);
+            lifecycle.start_drain();
             Ok::<_, std::io::Error>(Some("late-frame".to_string()))
         })
         .await

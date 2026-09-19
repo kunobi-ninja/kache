@@ -1288,6 +1288,15 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
     };
     std::fs::create_dir_all(service_file.parent().unwrap()).unwrap();
     std::fs::write(service_file, "installed test service").unwrap();
+    // The installed manager owns the user-configured instance. A per-command
+    // cache override alone must not redirect that service to another cache.
+    let user_config = e.home.join(".config/kache/config.toml");
+    std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &user_config,
+        format!("[cache]\nlocal_store = {:?}\n", e.cache.to_str().unwrap()),
+    )
+    .unwrap();
     let bin = e.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let manager = bin.join(tool);

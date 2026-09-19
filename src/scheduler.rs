@@ -490,13 +490,24 @@ fn read_weight(weights_dir: &Path, crate_name: &str) -> Option<u64> {
 }
 
 fn write_weight(weights_dir: &Path, crate_name: &str, rss: u64) -> Result<bool> {
+    let _trace = crate::phase_trace::phase("scheduler_weight");
     fs::create_dir_all(weights_dir)?;
     let path = weight_path(weights_dir, crate_name);
-    crate::atomic::atomic_write_and_replace(&path, true, |tmp| {
-        let mut file = fs::File::create(tmp)?;
-        write!(file, "{rss}")?;
-        Ok(())
-    })
+    // A weight is a scheduling hint that the next compile of this crate
+    // rewrites, so it needs the atomic rename and nothing more. Flushing it
+    // (the file, then its directory) cost two fsyncs per compile, on a path
+    // the build script side runs nearly serially.
+    crate::atomic::atomic_write_and_replace_deferrable(
+        &path,
+        true,
+        |tmp| {
+            let mut file = fs::File::create(tmp)?;
+            write!(file, "{rss}")?;
+            Ok(())
+        },
+        |_| Ok(()),
+        false,
+    )
 }
 
 /// Interpret `getrusage` output as peak child RSS in bytes.

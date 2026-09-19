@@ -5344,7 +5344,7 @@ fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Resu
 
     // One entry per distinct relative name: the same header read twice, or
     // two units reading it, resolve identically.
-    let mut names: Vec<PathBuf> = Vec::new();
+    let mut names: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     for input in read_inputs {
         let absolute = absolutize_path(&cwd, input);
         // Two spellings could have reached this file, and the search order
@@ -5367,13 +5367,8 @@ fn digest_cc_include_shadowing(parsed: &CcArgs, read_inputs: &[PathBuf]) -> Resu
         if let Some(file_name) = absolute.file_name() {
             candidates.push(PathBuf::from(file_name));
         }
-        for candidate in candidates {
-            if !names.contains(&candidate) {
-                names.push(candidate);
-            }
-        }
+        names.extend(candidates);
     }
-    names.sort();
 
     let mut hasher = blake3::Hasher::new();
     let mut listings = CcDirectoryListings::default();

@@ -1,7 +1,7 @@
 //! Shared C/C++ memo inputs. Artifact keys and input validation stay compiler-owned.
 
 use crate::file_hash::{FileFingerprint, FileHashCache};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CcPreprocessMemoInput {
@@ -93,6 +93,10 @@ pub(crate) fn ensure_mapped_hash_schema(db: &Connection) -> rusqlite::Result<()>
     )
 }
 
+/// Headers looked up per statement. Far below SQLite's bound on bound
+/// parameters, and a round number of prepared-statement shapes to cache.
+const MEMO_LOOKUP_CHUNK: usize = 256;
+
 impl FileHashCache<'_> {
     /// Memoised mapped hashes for `contents` under the map set `maps`.
     pub fn get_cc_mapped_hashes(
@@ -101,15 +105,22 @@ impl FileHashCache<'_> {
         contents: &[&str],
     ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
         let mut found = std::collections::HashMap::new();
-        let mut stmt = self.db().prepare_cached(
-            "SELECT mapped FROM cc_mapped_hashes WHERE content = ?1 AND maps = ?2",
-        )?;
-        for content in contents {
-            if let Some(mapped) = stmt
-                .query_row(params![content, maps], |row| row.get::<_, String>(0))
-                .optional()?
-            {
-                found.insert((*content).to_string(), mapped);
+        // One statement per chunk instead of one per header: a translation
+        // unit reads a hundred or more, and the per-statement cost was most
+        // of this lookup.
+        for chunk in contents.chunks(MEMO_LOOKUP_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = self.db().prepare_cached(&format!(
+                "SELECT content, mapped FROM cc_mapped_hashes
+                 WHERE maps = ?1 AND content IN ({placeholders})"
+            ))?;
+            let args = std::iter::once(maps).chain(chunk.iter().copied());
+            let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (content, mapped) = row?;
+                found.insert(content, mapped);
             }
         }
         Ok(found)
@@ -122,15 +133,18 @@ impl FileHashCache<'_> {
         contents: &[&str],
     ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
         let mut found = std::collections::HashMap::new();
-        let mut stmt = self
-            .db()
-            .prepare_cached("SELECT construct FROM cc_asm_scans WHERE content = ?1")?;
-        for content in contents {
-            if let Some(construct) = stmt
-                .query_row(params![content], |row| row.get::<_, String>(0))
-                .optional()?
-            {
-                found.insert((*content).to_string(), construct);
+        for chunk in contents.chunks(MEMO_LOOKUP_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = self.db().prepare_cached(&format!(
+                "SELECT content, construct FROM cc_asm_scans WHERE content IN ({placeholders})"
+            ))?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+            for row in rows {
+                let (content, construct) = row?;
+                found.insert(content, construct);
             }
         }
         Ok(found)
@@ -475,6 +489,38 @@ mod tests {
             "m1"
         );
         assert_eq!(cache.get_cc_asm_scans(&["c3"]).unwrap()["c3"], ".incbin");
+    }
+
+    /// A lookup larger than one statement's chunk still finds every row,
+    /// and an empty lookup issues nothing.
+    #[test]
+    fn cc_memo_lookups_span_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let cache = FileHashCache::open(&path).unwrap();
+        let n = MEMO_LOOKUP_CHUNK * 2 + 3;
+        let pairs: Vec<(String, String)> = (0..n)
+            .map(|i| (format!("content-{i}"), format!("mapped-{i}")))
+            .collect();
+        cache.put_cc_mapped_hashes("maps", &pairs).unwrap();
+        cache.put_cc_asm_scans(&pairs).unwrap();
+        let mut wanted: Vec<&str> = pairs.iter().map(|(c, _)| c.as_str()).collect();
+        wanted.push("content-missing");
+        let mapped = cache.get_cc_mapped_hashes("maps", &wanted).unwrap();
+        assert_eq!(mapped.len(), n);
+        assert_eq!(
+            mapped[&format!("content-{}", n - 1)],
+            format!("mapped-{}", n - 1)
+        );
+        assert_eq!(mapped["content-0"], "mapped-0");
+        let scans = cache.get_cc_asm_scans(&wanted).unwrap();
+        assert_eq!(scans.len(), n);
+        assert_eq!(
+            scans[&format!("content-{}", MEMO_LOOKUP_CHUNK)],
+            format!("mapped-{}", MEMO_LOOKUP_CHUNK)
+        );
+        assert!(cache.get_cc_mapped_hashes("maps", &[]).unwrap().is_empty());
+        assert!(cache.get_cc_asm_scans(&[]).unwrap().is_empty());
     }
 
     #[test]

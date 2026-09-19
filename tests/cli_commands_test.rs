@@ -1246,6 +1246,11 @@ fn init_rejects_unavailable_daemon_replacement() {
     assert!(!output.status.success(), "{stdout}");
     assert!(!stdout.contains("Background cache: running"), "{stdout}");
     assert!(stdout.contains("Background cache setup failed"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("daemon did not start after recovery"),
+        "{stderr}"
+    );
 }
 
 /// A stale daemon must be replaced through the installed service manager.

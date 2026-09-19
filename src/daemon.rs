@@ -13230,24 +13230,34 @@ mod tests {
         assert!(force_recover(&config).is_err());
     }
 
-    #[test]
-    fn recovery_does_not_unlink_a_service_manager_replacement() {
-        use interprocess::local_socket::traits::Listener as _;
+    #[tokio::test]
+    async fn recovery_does_not_unlink_a_service_manager_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let socket = config.socket_path();
         let run = std::fs::File::create(daemon_run_lock_path(&socket)).unwrap();
         run.lock().unwrap();
-        let listener = bind_sync_listener(&socket);
-        // No recoverable old PID; this endpoint belongs to a new lock owner.
-        let state = daemon_state_path(&socket);
-        fs::write(&state, "replacement marker").unwrap();
-        assert!(!clean_stale_daemon_files(&socket).unwrap());
-        force_recover(&config).unwrap();
-        assert_eq!(fs::read_to_string(&state).unwrap(), "replacement marker");
-        drop(listener.accept().unwrap());
-        assert!(crate::transport::is_reachable(&socket));
-        drop(listener);
+        let listener = bind_listener(&socket);
+        // Keep accepting while probes connect and disconnect. Windows named
+        // pipes do not queue a disconnected client for a later accept.
+        let server = tokio::spawn(async move {
+            loop {
+                drop(listener.accept().await.unwrap());
+            }
+        });
+        let result = tokio::task::spawn_blocking(move || {
+            // No recoverable old PID; this endpoint belongs to a new lock owner.
+            let state = daemon_state_path(&socket);
+            fs::write(&state, "replacement marker").unwrap();
+            assert!(!clean_stale_daemon_files(&socket).unwrap());
+            force_recover(&config).unwrap();
+            assert_eq!(fs::read_to_string(&state).unwrap(), "replacement marker");
+            assert!(crate::transport::is_reachable(&socket));
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+        result.unwrap();
     }
 
     #[test]

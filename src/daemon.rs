@@ -12028,7 +12028,7 @@ mod tests {
 
         let daemon = Daemon::new(config.clone());
         let report = daemon
-            .run_gc(GcPolicy::Automatic { max_age_hours: 0 })
+            .run_gc(GcPolicy::Automatic { max_age_hours: 0 }, GcDriver::Periodic)
             .unwrap();
         assert_eq!(
             report.total.housekeeping,

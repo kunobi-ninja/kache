@@ -286,7 +286,7 @@ The default selects the latest session. `--all` selects every retained session;
 service through `KACHE_PLANNER_ENDPOINT` and its credentials. Upload failures
 print a warning without failing a completed build.
 
-Timeline schema 4 records the session, plan, candidate source, and zero-based
+Timeline schema 5 records the session, plan, candidate source, and zero-based
 rank for ordinary prefetch downloads. Transfers retain `completed`,
 `not_found`, `error`, and `import_error` outcomes. The origin stays with a
 download even if another build starts before it finishes. A local-hit unit
@@ -308,11 +308,29 @@ identity manifest.
 `kache stats` marks incomplete summaries as partial totals. Forced termination
 can prevent the final write.
 
-Upgrade the service before sending schema 4 records. The updated service also
-accepts schemas 1 through 3. Wrapper events before schema 20 have no demand
+Upgrade the service before sending schema 5 records. The updated service also
+accepts schemas 1 through 4. Wrapper events before schema 20 have no demand
 observations. Current demand transfers and older logs still require a unique
 key or time-window match; ambiguous transfers remain unattributed.
-Packed-prefetch transfers are not yet covered by this attribution.
+Packed prefetch records each catalog GET, pack GET and catalog LIST once.
+`accounting.operation` distinguishes GET from LIST; `request_count` counts
+backend invocations, excluding SDK retries and LIST pages. `requests_complete`
+states whether that count is known. LIST records include `list_result_count`
+when successful; response bytes remain unknown.
+
+For GETs, `compressed_bytes` counts the received object body, including pack
+headers and catalog metadata. `accounting.bytes_complete: false` means partial
+received bytes are unknown, so a complete GET-body precision ratio cannot be
+computed. A failed validation or import still retains a fully received body.
+Cancellation receipts preserve known bytes and use the `cancelled` outcome.
+
+Pack `accounting.entries` contains each validated frame's cache key, compressed
+payload bytes, immutable origin and outcome. `finished_at_ms` is the successful
+local import time; zero means no import. Entries imported beyond the candidate
+list have no candidate rank. Entry bytes are part of the physical pack body:
+do not add them to total downloaded bytes. Useful bytes require an actual
+wrapper hit in the same session and entry completion before first demand.
+LIST response sizes are excluded from this GET-body measure.
 
 For prefetch comparisons, keep cold builds and remote contents matched, label
 the control run, and measure the whole CI job. Timeline compiler timings alone

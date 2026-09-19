@@ -1871,6 +1871,11 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
     let mut unknown_format_downloads = 0usize;
 
     for t in transfers {
+        if t.accounting.as_ref().is_some_and(|accounting| {
+            accounting.operation == kache_core::timeline::PrefetchOperation::List
+        }) {
+            continue;
+        }
         match t.direction {
             TransferDirection::Upload => {
                 if t.ok {
@@ -1928,7 +1933,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                     } else {
                         t.elapsed_ms
                     };
-                } else if t.outcome != "not_found" {
+                } else if !matches!(t.outcome.as_str(), "not_found" | "cancelled") {
                     downloads_failed += 1;
                 }
             }
@@ -4258,6 +4263,7 @@ mod tests {
         ok: bool,
     ) -> TransferEvent {
         TransferEvent {
+            accounting: None,
             prefetch: None,
             outcome: String::new(),
             schema: 3,
@@ -5991,6 +5997,7 @@ mod tests {
         };
 
         let slow = TransferEvent {
+            accounting: None,
             prefetch: None,
             outcome: String::new(),
             schema: 3,
@@ -6571,6 +6578,31 @@ mod tests {
         assert_eq!(network.bytes_down, 0);
         missing.outcome = "error".to_string();
         assert_eq!(build_network_analysis(&[missing], 10).downloads_failed, 1);
+    }
+
+    #[test]
+    fn packed_list_and_cancellation_do_not_diagnose_download_failures() {
+        let mut list = test_transfer(
+            "catalog",
+            TransferDirection::Download,
+            "pack_catalog",
+            0,
+            5,
+            false,
+        );
+        list.accounting = Some(kache_core::timeline::PrefetchAccounting {
+            operation: kache_core::timeline::PrefetchOperation::List,
+            ..Default::default()
+        });
+        let mut cancelled =
+            test_transfer("pack", TransferDirection::Download, "pack", 100, 5, false);
+        cancelled.outcome = "cancelled".to_owned();
+        assert_eq!(
+            build_network_analysis(&[list.clone(), cancelled], 10).downloads_failed,
+            0
+        );
+        list.ok = true;
+        assert_eq!(build_network_analysis(&[list], 10).downloads_ok, 0);
     }
 
     #[test]

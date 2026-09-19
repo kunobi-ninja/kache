@@ -2610,9 +2610,15 @@ fn draw_recent_transfers(frame: &mut Frame, state: &mut AppState, area: Rect) {
         .skip(range.start)
         .take(range.len())
         .map(|evt| {
-            let (arrow, dir_style) = match evt.direction {
-                daemon::TransferDirection::Upload => ("↑", Style::default().fg(Color::Yellow)),
-                daemon::TransferDirection::Download => ("↓", Style::default().fg(Color::Blue)),
+            let (arrow, dir_style) = if evt.accounting.as_ref().is_some_and(|accounting| {
+                accounting.operation == kache_core::timeline::PrefetchOperation::List
+            }) {
+                ("L", Style::default().fg(Color::Blue))
+            } else {
+                match evt.direction {
+                    daemon::TransferDirection::Upload => ("↑", Style::default().fg(Color::Yellow)),
+                    daemon::TransferDirection::Download => ("↓", Style::default().fg(Color::Blue)),
+                }
             };
 
             let elapsed = if evt.elapsed_ms > 1000 {
@@ -2623,6 +2629,8 @@ fn draw_recent_transfers(frame: &mut Frame, state: &mut AppState, area: Rect) {
 
             let (status, status_style) = if evt.ok {
                 ("ok", Style::default().fg(Color::Green))
+            } else if evt.outcome == "cancelled" {
+                ("STOP", Style::default().fg(Color::Yellow))
             } else if evt.outcome == "not_found"
                 && evt.direction == daemon::TransferDirection::Download
             {
@@ -3718,6 +3726,23 @@ mod tests {
     }
 
     #[test]
+    fn packed_list_and_cancellation_have_distinct_transfer_labels() {
+        let mut state = populated_state();
+        let transfer = &mut state.stats_snapshot.recent_transfers[0];
+        transfer.direction = daemon::TransferDirection::Download;
+        transfer.ok = false;
+        transfer.outcome = "cancelled".to_owned();
+        transfer.accounting = Some(kache_core::timeline::PrefetchAccounting {
+            operation: kache_core::timeline::PrefetchOperation::List,
+            ..Default::default()
+        });
+        let screen = rendered_lines(&mut state, Tab::Transfer, 120, 40).join("\n");
+        assert!(screen.contains("STOP"), "{screen}");
+        assert!(!screen.contains("FAIL"), "{screen}");
+        assert!(!screen.contains('↓'), "LIST is not a download: {screen}");
+    }
+
+    #[test]
     fn not_found_transfers_render_as_misses() {
         let mut state = populated_state();
         let transfer = &mut state.stats_snapshot.recent_transfers[0];
@@ -3751,6 +3776,7 @@ mod tests {
         state.stats_snapshot.total_size = 3_500_000;
         state.stats_loaded = true;
         state.stats_snapshot.recent_transfers = vec![daemon::TransferEvent {
+            accounting: None,
             prefetch: None,
             outcome: String::new(),
             schema: 3,

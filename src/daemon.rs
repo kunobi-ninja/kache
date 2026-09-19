@@ -8070,6 +8070,7 @@ pub fn send_local_lookup(
     target_dir: Option<&Path>,
     workspace_root: Option<&Path>,
 ) -> Option<LocalLookupReply> {
+    crate::demand::record(key);
     let socket_path = config.socket_path();
     if !crate::transport::is_reachable(&socket_path) {
         return None;

@@ -719,12 +719,14 @@ mod tests {
     }
 
     #[test]
-    fn still_accepts_schema_one_clients() {
-        let json = record_json(1, "legacy");
-        let (record, decoded) =
-            decode_submission(Some("zstd"), &zstd(&json), DEFAULT_MAX_DECODED_BYTES).unwrap();
-        assert_eq!(record.schema, 1);
-        assert_eq!(decoded, json);
+    fn still_accepts_older_schema_clients() {
+        for schema in [1, 2] {
+            let json = record_json(schema, "legacy");
+            let (record, decoded) =
+                decode_submission(Some("zstd"), &zstd(&json), DEFAULT_MAX_DECODED_BYTES).unwrap();
+            assert_eq!(record.schema, schema);
+            assert_eq!(decoded, json);
+        }
     }
 
     #[test]

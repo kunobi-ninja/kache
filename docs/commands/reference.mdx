@@ -286,18 +286,25 @@ The default selects the latest session. `--all` selects every retained session;
 service through `KACHE_PLANNER_ENDPOINT` and its credentials. Upload failures
 print a warning without failing a completed build.
 
-Timeline schema 2 records the session, plan, candidate source, and zero-based
+Timeline schema 3 records the session, plan, candidate source, and zero-based
 rank for ordinary prefetch downloads. Transfers retain `completed`,
 `not_found`, `error`, and `import_error` outcomes. The origin stays with a
 download even if another build starts before it finishes. A local-hit unit
 and its prefetched transfer can therefore be joined by cache key inside the
 correct session.
 
-Upgrade the service before sending schema 2 records. The updated service also
-accepts schema 1. Current demand transfers and older logs still require a
-unique key or time-window match; ambiguous transfers remain unattributed.
-Packed-prefetch transfers and exact first-demand timing are not yet covered
-by this attribution.
+Each unit also carries `demands`, one observation per cache key looked up by
+the wrapper. `first_demand_at_ms` is the first lookup's Unix timestamp in
+milliseconds, including local hits. `remote_wait_ms` sums wall time blocked on
+the existing daemon remote-check calls, including failed calls, IPC and daemon
+admission. It does not estimate time saved. A stale predicted key and its
+replacement retain separate observations. Recording adds no network request.
+
+Upgrade the service before sending schema 3 records. The updated service also
+accepts schemas 1 and 2. Wrapper events before schema 20 have no demand
+observations. Current demand transfers and older logs still require a unique
+key or time-window match; ambiguous transfers remain unattributed.
+Packed-prefetch transfers are not yet covered by this attribution.
 
 For prefetch comparisons, keep cold builds and remote contents matched, label
 the control run, and measure the whole CI job. Timeline compiler timings alone

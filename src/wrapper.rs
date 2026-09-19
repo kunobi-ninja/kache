@@ -817,6 +817,7 @@ fn lookup_local_entry<'a>(
     fallback: Option<&'a Store>,
     cache_key: &str,
 ) -> Result<Option<(&'a Store, crate::store::EntryMeta)>> {
+    crate::demand::record(cache_key);
     let _trace = crate::phase_trace::phase("lookup");
     if let Some(meta) = primary.get(cache_key)? {
         return Ok(Some((primary, meta)));
@@ -6459,7 +6460,8 @@ fn log_event_details(
         compile_time_ms,
         size,
         cache_key: cache_key.to_string(),
-        schema: 19,
+        schema: 20,
+        demands: crate::demand::take(),
         session_id,
         key_ms,
         key_hash_hits: key_hash_stats.cache_hits,
@@ -10660,6 +10662,14 @@ exit 0
         }
 
         fn with_reply(socket_path: PathBuf, reply: serde_json::Value) -> Self {
+            Self::with_delayed_reply(socket_path, reply, std::time::Duration::ZERO)
+        }
+
+        fn with_delayed_reply(
+            socket_path: PathBuf,
+            reply: serde_json::Value,
+            delay: std::time::Duration,
+        ) -> Self {
             let body = format!("{reply}\n");
             if let Some(parent) = socket_path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
@@ -10701,6 +10711,7 @@ exit 0
                         continue;
                     }
                     requests_thread.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(delay);
                     let _ = stream.write_all(body.as_bytes());
                 }
             });
@@ -10759,6 +10770,58 @@ exit 0
             0,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn remote_demand_wait_includes_success_and_failed_reply() {
+        for ok in [true, false] {
+            let _ = crate::demand::take();
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(dir.path().join("cache"));
+            config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+            let store = Store::open(&config).unwrap();
+            let key = blake3::hash(b"remote-demand-wait").to_hex().to_string();
+            seed_cc_object_entry(&store, &key, dir.path());
+            let daemon = RemoteCheckReplyDaemon::with_delayed_reply(
+                config.socket_path(),
+                serde_json::json!({ "ok": ok, "found": true }),
+                std::time::Duration::from_millis(25),
+            );
+            wait_until_reachable(&config.socket_path());
+            let result = acquire_entry(
+                &config,
+                &store,
+                &key,
+                "foo.c",
+                NegativeReply::ContinueCompile,
+            );
+            assert_eq!(result.is_some(), ok);
+            let demands = crate::demand::take();
+            assert_eq!(demands.len(), 1);
+            assert_eq!(demands[0].cache_key, key);
+            assert!(demands[0].first_demand_at_ms > 0);
+            assert!(demands[0].remote_wait_ms >= 25);
+            assert_eq!(daemon.request_count(), 1);
+        }
+    }
+
+    #[test]
+    fn remote_disabled_does_not_create_a_demand_or_wait() {
+        let _ = crate::demand::take();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        assert!(
+            acquire_entry(
+                &config,
+                &store,
+                "key",
+                "foo.c",
+                NegativeReply::ContinueCompile
+            )
+            .is_none()
+        );
+        assert!(crate::demand::take().is_empty());
     }
 
     #[test]
@@ -12233,6 +12296,62 @@ exit 0
         );
     }
 
+    #[test]
+    fn local_daemon_fast_path_records_demand_before_reply() {
+        let _ = crate::demand::take();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        assert!(
+            crate::daemon::send_local_lookup(&config, "daemon-local-key", None, None).is_none()
+        );
+        let demands = crate::demand::take();
+        assert_eq!(demands.len(), 1);
+        assert_eq!(demands[0].cache_key, "daemon-local-key");
+        assert!(demands[0].first_demand_at_ms > 0);
+        assert_eq!(demands[0].remote_wait_ms, 0);
+    }
+
+    #[test]
+    fn local_hit_demand_reaches_event_without_remote_wait() {
+        let _ = crate::demand::take();
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        put_test_entry(&store, dir.path(), "local-demand-key");
+        let before = chrono::Utc::now().timestamp_millis() as u64;
+        assert!(
+            lookup_local_entry(&store, None, "local-demand-key")
+                .unwrap()
+                .is_some()
+        );
+        let after = chrono::Utc::now().timestamp_millis() as u64;
+        log_event_with_store_stats(
+            &config,
+            "/repo",
+            "foo",
+            EventResult::LocalHit,
+            10,
+            20,
+            30,
+            "local-demand-key",
+            0,
+            FileHashStats::default(),
+            0,
+            0,
+            0,
+            StorePutResult::default(),
+        );
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].schema, 20);
+        let demands = &events[0].demands;
+        assert_eq!(demands.len(), 1);
+        assert_eq!(demands[0].cache_key, "local-demand-key");
+        assert!((before..=after).contains(&demands[0].first_demand_at_ms));
+        assert_eq!(demands[0].remote_wait_ms, 0);
+        assert!(crate::demand::take().is_empty());
+    }
+
     /// Store stats and hash stats should be carried into the event JSONL entry
     /// because reports rely on these schema-9 fields.
     #[test]
@@ -12278,7 +12397,7 @@ exit 0
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 19);
+        assert_eq!(event.schema, 20);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);
@@ -12344,7 +12463,7 @@ exit 0
 
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         let event = &events[0];
-        assert_eq!(event.schema, 19);
+        assert_eq!(event.schema, 20);
         // Whatever other tests add is real time, far under the next band.
         for (name, value, floor, fed) in [
             ("startup_ms", event.startup_ms, before[0], STARTUP_MS),
@@ -12483,7 +12602,7 @@ exit 0
         let event = &events[0];
         assert_eq!(event.result, EventResult::Miss);
         assert_eq!(event.cache_key, "same-key");
-        assert_eq!(event.schema, 19);
+        assert_eq!(event.schema, 20);
         assert_eq!(
             event.lookup_rejection,
             "matching entry lacks dep-info required by this invocation"
@@ -12519,7 +12638,7 @@ exit 0
             0,
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
-        assert_eq!(events[0].schema, 19);
+        assert_eq!(events[0].schema, 20);
         assert_eq!(events[0].result, EventResult::LocalHit);
         assert!(
             events[0].verify_compare.is_empty(),
@@ -12544,7 +12663,7 @@ exit 0
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[1].schema, 19);
+        assert_eq!(events[1].schema, 20);
         assert_eq!(
             events[1].verify_compare,
             "content: libfoo.rlib (byte mismatch)"

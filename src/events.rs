@@ -46,6 +46,7 @@ pub struct BuildEvent {
     /// 16 = compile-and-compare verify on hits (`verify_compare`),
     /// 17 = wrapper phase timings: startup, dep-info pre-pass, scheduler wait.
     /// 19 = fallback attempt and recovery details.
+    /// 20 = per-key first-demand timestamps and remote-check wait.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -57,6 +58,10 @@ pub struct BuildEvent {
     /// session marker (never fails a build).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_id: String,
+    /// Observed at the first lookup, including locally consumed prefetches.
+    /// Recorded in memory, then appended with this event; no extra daemon call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub demands: Vec<kache_core::timeline::KeyDemand>,
     /// Cache key computation time (ms).
     #[serde(default)]
     pub key_ms: u64,
@@ -1426,6 +1431,7 @@ impl BuildEvent {
             root: "/work/tree".to_string(),
             version: "0.0.0".to_string(),
             session_id: String::new(),
+            demands: Vec::new(),
             result,
             elapsed_ms,
             compile_time_ms,
@@ -1515,6 +1521,7 @@ mod tests {
             root: "/work/tree".to_string(),
             version: "1.0.210".to_string(),
             session_id: String::new(),
+            demands: Vec::new(),
             result: EventResult::LocalHit,
             elapsed_ms: 2,
             compile_time_ms: 250,

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of [`BuildTimeline`]. A server rejects a record whose schema it
 /// does not know.
-pub const BUILD_TIMELINE_SCHEMA: u32 = 2;
+pub const BUILD_TIMELINE_SCHEMA: u32 = 3;
 
 /// One build session: its compiler invocations and the remote transfers that
 /// belong to it.
@@ -144,6 +144,17 @@ pub struct TimelineSummary {
     pub cancelled: bool,
 }
 
+/// One key requested by a wrapper, including unsuccessful predictions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct KeyDemand {
+    pub cache_key: String,
+    pub first_demand_at_ms: u64,
+    /// Wall time blocked on remote-check IPC, including daemon admission and
+    /// failed requests. It is not an estimate of time saved by prefetch.
+    #[serde(default)]
+    pub remote_wait_ms: u64,
+}
+
 /// One compiler invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TimelineUnit {
@@ -179,6 +190,9 @@ pub struct TimelineUnit {
     /// Schema of the wrapper event this unit came from.
     #[serde(default)]
     pub event_schema: u32,
+    /// Empty for wrapper events before schema 20, or invocations with no lookup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub demands: Vec<KeyDemand>,
 }
 
 /// One remote transfer attributed to the session.
@@ -288,6 +302,11 @@ mod tests {
                 cache_key: "k1".into(),
                 crate_name: "serde".into(),
                 result: "local_hit".into(),
+                demands: vec![KeyDemand {
+                    cache_key: "k1".into(),
+                    first_demand_at_ms: 1_050,
+                    remote_wait_ms: 0,
+                }],
                 started_at_ms: 1_000,
                 finished_at_ms: 1_200,
                 ..TimelineUnit::default()
@@ -302,6 +321,14 @@ mod tests {
                 ..TimelineTransfer::default()
             }],
         }
+    }
+
+    #[test]
+    fn legacy_unit_has_no_demand_observation() {
+        let unit: TimelineUnit = serde_json::from_str(
+            r#"{"cache_key":"k","crate_name":"crate","result":"local_hit","started_at_ms":100,"finished_at_ms":200}"#,
+        ).unwrap();
+        assert!(unit.demands.is_empty());
     }
 
     #[test]

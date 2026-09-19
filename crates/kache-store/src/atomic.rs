@@ -51,7 +51,14 @@ fn rename_backoff_ms(attempt: u32) -> u64 {
 }
 
 /// How many times a transient Windows state is waited out before giving up.
-const TRANSIENT_ATTEMPTS: u32 = 10;
+pub(crate) const TRANSIENT_ATTEMPTS: u32 = 10;
+
+/// Whether this error should be slept out and tried again. Split from the
+/// loop so a `true` match-guard mutant cannot hang: the `for` bound below
+/// still stops, and tests of this helper reject `true` / `||` directly.
+fn should_retry_transient(transient: bool, attempt: u32) -> bool {
+    transient && attempt + 1 < TRANSIENT_ATTEMPTS
+}
 
 /// Run a filesystem operation, waiting out a transient Windows sharing or
 /// delete-pending state.
@@ -61,33 +68,15 @@ const TRANSIENT_ATTEMPTS: u32 = 10;
 /// collides on the name. Windows keeps the directory entry until the last
 /// handle closes and fails anything touching that name meanwhile with
 /// ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION. Those clear on their own,
-/// so they are worth waiting out rather than reporting as a fault — see
-/// [`is_transient_rename_error`], which this shares so the code list stays in
-/// one place. Off Windows that predicate is always false, so `op` runs exactly
-/// once and this adds nothing.
-pub(crate) fn retry_transient_windows<T>(
-    op: impl FnMut() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    retry_transient(op, is_transient_rename_error)
-}
-
-/// The retry loop itself, with the "is this worth waiting out" decision passed
-/// in.
+/// so they are worth waiting out rather than reporting as a fault.
 ///
-/// Split from [`retry_transient_windows`] so the loop is reachable off Windows.
-/// With the classifier inlined, `is_transient_rename_error` is a compile-time
-/// `false` everywhere else, the retry arm is dead code on the Linux runner that
-/// scores mutants, and every mutation of the bound and the counter survives
-/// against a branch nothing can enter. The counter arithmetic and the budget
-/// are platform-independent; only the code list is not.
-/// Whether this error should be slept out and tried again. Split from the
-/// loop so a `true` match-guard mutant cannot hang: the `for` bound below
-/// still stops, and tests of this helper reject `true` / `||` directly.
-fn should_retry_transient(transient: bool, attempt: u32) -> bool {
-    transient && attempt + 1 < TRANSIENT_ATTEMPTS
-}
-
-fn retry_transient<T>(
+/// Production callers pass [`is_transient_rename_error`] as `is_transient`.
+/// Off Windows that predicate is always false, so `op` runs exactly once. It
+/// is a parameter so the loop is reachable off Windows: with it inlined, the
+/// retry arm is dead code on the Linux runner that scores mutants, and every
+/// mutation of the bound and the counter survives against a branch nothing
+/// can enter.
+pub(crate) fn retry_transient<T>(
     mut op: impl FnMut() -> std::io::Result<T>,
     is_transient: impl Fn(&std::io::Error) -> bool,
 ) -> std::io::Result<T> {
@@ -395,20 +384,26 @@ mod tests {
     /// Off Windows this is the whole behaviour, since no error classifies as
     /// transient there: the retry must never turn a real fault into a delay.
     #[test]
-    fn retry_transient_windows_does_not_retry_a_settled_outcome() {
+    fn retry_transient_does_not_retry_a_settled_outcome() {
         let mut calls = 0;
-        let value = retry_transient_windows(|| {
-            calls += 1;
-            Ok::<_, std::io::Error>(7)
-        })
+        let value = retry_transient(
+            || {
+                calls += 1;
+                Ok::<_, std::io::Error>(7)
+            },
+            is_transient_rename_error,
+        )
         .unwrap();
         assert_eq!((value, calls), (7, 1));
 
         let mut calls = 0;
-        let err = retry_transient_windows(|| {
-            calls += 1;
-            Err::<(), _>(std::io::Error::from_raw_os_error(2))
-        })
+        let err = retry_transient(
+            || {
+                calls += 1;
+                Err::<(), _>(std::io::Error::from_raw_os_error(2))
+            },
+            is_transient_rename_error,
+        )
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(2));
         assert_eq!(calls, 1, "a non-transient error must not be retried");
@@ -418,7 +413,7 @@ mod tests {
     /// outlast it and then return the eventual success.
     ///
     /// Drives [`retry_transient`] with an always-transient classifier: the
-    /// wrapper's real one is a compile-time `false` off Windows, which would
+    /// real one is a compile-time `false` off Windows, which would
     /// leave this asserting nothing on most runners.
     #[test]
     fn retry_transient_waits_out_a_transient_failure() {
@@ -483,15 +478,18 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
-    /// The wrapper wires the real classifier in, so it retries a Windows race
-    /// code there and settles at once everywhere else.
+    /// With the real classifier it retries a Windows race code there and
+    /// settles at once everywhere else.
     #[test]
-    fn retry_transient_windows_uses_the_windows_classifier() {
+    fn retry_transient_with_the_real_classifier_retries_only_on_windows() {
         let mut calls: u32 = 0;
-        let err = retry_transient_windows(|| {
-            calls += 1;
-            Err::<(), _>(std::io::Error::from_raw_os_error(5))
-        })
+        let err = retry_transient(
+            || {
+                calls += 1;
+                Err::<(), _>(std::io::Error::from_raw_os_error(5))
+            },
+            is_transient_rename_error,
+        )
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(5));
         #[cfg(windows)]

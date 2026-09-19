@@ -1933,7 +1933,7 @@ fn build_network_analysis(transfers: &[TransferEvent], top: usize) -> NetworkAna
                     } else {
                         t.elapsed_ms
                     };
-                } else if !matches!(t.outcome.as_str(), "not_found" | "cancelled") {
+                } else if !matches!(t.outcome.as_str(), "not_found" | "cancelled" | "skipped") {
                     downloads_failed += 1;
                 }
             }
@@ -6577,7 +6577,16 @@ mod tests {
         assert_eq!(network.downloads_ok, 0);
         assert_eq!(network.bytes_down, 0);
         missing.outcome = "error".to_string();
-        assert_eq!(build_network_analysis(&[missing], 10).downloads_failed, 1);
+        assert_eq!(
+            build_network_analysis(&[missing.clone()], 10).downloads_failed,
+            1
+        );
+        missing.outcome = "skipped".to_string();
+        missing.request_count = 0;
+        let skipped = build_network_analysis(&[missing], 10);
+        assert_eq!(skipped.downloads_failed, 0);
+        assert_eq!(skipped.downloads_ok, 0);
+        assert_eq!(skipped.bytes_down, 0);
     }
 
     #[test]

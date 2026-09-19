@@ -156,7 +156,7 @@ A live index above 8 GiB is never compacted automatically, because the rewrite w
 | `KACHE_PRESERVE_INCREMENTAL` | `cache.preserve_incremental` | `false` | Force eligible Cargo units onto isolated incremental state |
 | `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | Force listed rustc crate names onto that incremental path |
 | `KACHE_MODIFIED_INPUT_GUARD` | `cache.modified_input_guard` | `false` | Do not store a result when a keyed input changed at or after build start |
-| `KACHE_INPUT_PREDICTIONS` | `cache.input_predictions` | `false` | Remember each crate's source closure and derive the next key from it, skipping the dep-info pre-pass when every recorded input still checks out |
+| `KACHE_INPUT_PREDICTIONS` | `cache.input_predictions` | `true` | Remember each crate's source closure and derive the next key from it, skipping the dep-info pre-pass when every recorded input still checks out |
 | `KACHE_BUILD_SCRIPT_CACHE` | none | `true` (Unix) | Cache build-script runs: restore `OUT_DIR` and the script's output instead of running it when its binary, Cargo environment and declared `rerun-if-*` inputs match a recorded run. See [Build scripts](/how-it-works/build-scripts). |
 | `KACHE_FALLBACK` | `cache.fallback` | none | Wrapper used for ordinary Kache passthroughs |
 | none | `cache.exclude` | `[]` | Source-path globs that bypass Kache |

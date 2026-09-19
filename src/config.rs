@@ -326,15 +326,15 @@ pub struct Config {
     /// compiler reads). Off by default. Set via `KACHE_MODIFIED_INPUT_GUARD=1`/
     /// `=true` or `[cache] modified_input_guard`; env wins over the file.
     pub modified_input_guard: bool,
-    /// Opt-in input-set predictions: when on, each rustc invocation remembers
+    /// Input-set predictions: each eligible rustc invocation remembers
     /// the source closure its dep-info pre-pass discovered, and a later build
     /// of the same unit derives the key from that record instead of spawning
     /// the pre-pass (kunobi-ninja/kache#939). Every path and env value in the
     /// record is re-validated first, and any doubt runs the pre-pass;
     /// `KACHE_VERIFY_INPUT_PREDICTIONS=sampled|always` cross-checks records
-    /// against it and counts disagreements. Off by default until
-    /// kunobi-ninja/kache#1000 decides. Set via `KACHE_INPUT_PREDICTIONS=1`/
-    /// `=true` or `[cache] input_predictions`; env wins over the file.
+    /// against it and counts disagreements. Enabled by default; disable with
+    /// `KACHE_INPUT_PREDICTIONS=0` or `[cache] input_predictions = false`.
+    /// The environment overrides the file.
     pub input_predictions: bool,
     /// Make every `kache report` append its session line to
     /// `<cache dir>/telemetry/sessions.jsonl`, as `--record` does, and every
@@ -2185,7 +2185,7 @@ impl Config {
 
     /// Whether input-set predictions are recorded. Env wins over the file:
     /// `KACHE_INPUT_PREDICTIONS=1`/`=true`, else `[cache] input_predictions`,
-    /// else off.
+    /// else on.
     fn input_predictions_enabled(file_config: &Result<FileConfig>) -> bool {
         let ignore_env = Self::ignore_env_enabled(file_config);
         if let Ok(v) = env_or_ignored("KACHE_INPUT_PREDICTIONS", ignore_env) {
@@ -2196,7 +2196,7 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.input_predictions)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// Whether every `kache report` records its session. Env wins over the
@@ -3768,12 +3768,12 @@ pub(crate) mod tests {
         TestEnvGuard { key, previous }
     }
 
-    /// Resolution order for the recording flag: the environment overrides the
+    /// Resolution order for predictions: the environment overrides the
     /// file, the file is consulted when the environment is silent, and the
-    /// answer with neither is off. CI exports `KACHE_*` of its own, so the
+    /// answer with neither is on. CI exports `KACHE_*` of its own, so the
     /// variable is cleared explicitly rather than assumed absent.
     #[test]
-    fn input_predictions_resolve_env_over_file_and_default_off() {
+    fn input_predictions_resolve_env_over_file_and_default_on() {
         let _lock = config_path_lock();
         let file_says = |value: Option<bool>| -> Result<FileConfig> {
             Ok(FileConfig {
@@ -3788,9 +3788,15 @@ pub(crate) mod tests {
         {
             let _env = set_env_for_test("KACHE_INPUT_PREDICTIONS", None);
             assert!(
-                !Config::input_predictions_enabled(&file_says(None)),
-                "off unless something asks for it"
+                Config::input_predictions_enabled(&file_says(None)),
+                "on unless explicitly disabled"
             );
+            assert!(Config::input_predictions_enabled(
+                &Ok(FileConfig::default())
+            ));
+            assert!(Config::input_predictions_enabled(&Err(anyhow::anyhow!(
+                "no config file"
+            ))));
             assert!(Config::input_predictions_enabled(&file_says(Some(true))));
             assert!(!Config::input_predictions_enabled(&file_says(Some(false))));
         }

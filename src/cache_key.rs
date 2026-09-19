@@ -1388,15 +1388,6 @@ fn resolve_key_inputs(
     }
     if args.source_file.is_some() {
         let mut prediction = predicted_key_inputs(args, file_hasher);
-        // Whether "no record" means nobody built this unit here. A unit whose
-        // record is shared across target directories and whose discovery
-        // flight this process owns (or needs no flight) can be sure; a peer
-        // that waited for an owner and still finds nothing, or a unit whose
-        // record is target-directory-local (a proc-macro dependent, or a
-        // unit with an OUT_DIR, which the record identity keeps verbatim),
-        // may well find the entry under the key the pre-pass yields.
-        let mut certain_miss = rustc_shared_prediction_identity(args).is_some()
-            && std::env::var_os("OUT_DIR").is_none();
         // Whether this process holds the unit's discovery flight. Only the
         // holder may compile before keying: a peer that also found nothing
         // would compile the same unit a second time instead of waiting for
@@ -1408,7 +1399,6 @@ fn resolve_key_inputs(
         {
             let flight = crate::scheduler::join_discovery(cache_dir, &identity);
             owns_flight = flight.is_some();
-            certain_miss = certain_miss && owns_flight;
             *file_hasher.discovery_flight.borrow_mut() = flight;
             // The previous owner may have published while this process waited.
             prediction = predicted_key_inputs(args, file_hasher);
@@ -1447,17 +1437,9 @@ fn resolve_key_inputs(
                 let _ = LAST_KEY_USED_PREDICTION.try_with(|stash| stash.set(true));
                 return Ok(Some(dep_info));
             }
-            Err(Rejection::NoRecord)
-                if certain_miss && DEFER_DISCOVERY.with(std::cell::Cell::get) =>
-            {
-                crate::phase_trace::decision("prediction", "deferred");
-                tracing::trace!("[key:{}] inputs=deferred", crate_name);
-                return Err(anyhow::Error::new(DeferredDiscovery));
-            }
-            // No record here, or no records at all, but the store has never
-            // held this crate under any key: the miss is just as certain.
-            // This covers the units a record cannot vouch for (an OUT_DIR,
-            // a peer that waited) and builds with predictions off.
+            // A missing prediction only describes this checkout. Another
+            // checkout may have stored a portable entry, so compile first
+            // only when the store has never held this unit.
             Err(Rejection::NoRecord | Rejection::Disabled | Rejection::NotEligible)
                 if owns_flight
                     && DEFER_DISCOVERY.with(std::cell::Cell::get)
@@ -7223,8 +7205,8 @@ mod tests {
     #[test]
     fn discovery_defers_to_the_compile_and_takes_the_emitted_closure() {
         let _lock = key_test_lock();
-        // A unit with an OUT_DIR never defers. Cargo and nextest set kache's
-        // own OUT_DIR on the test process, so clear it for this unit.
+        // Exercise a unit without generated inputs. Cargo and nextest set
+        // kache's own OUT_DIR on the test process, so clear it for this unit.
         let out_dir = std::env::var_os("OUT_DIR");
         // SAFETY: the key-test lock serialises environment edits.
         unsafe { std::env::remove_var("OUT_DIR") };
@@ -7265,7 +7247,15 @@ mod tests {
             rustc_shared_prediction_identity(&args).is_some(),
             "a target directory gives the unit a shared record identity"
         );
-        let on = FileHasher::persistent(&db).with_input_predictions(true);
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE entries (cache_key TEXT PRIMARY KEY, crate_name TEXT NOT NULL);",
+            )
+            .unwrap();
+        let on = FileHasher::persistent(&db)
+            .with_input_predictions(true)
+            .with_prediction_flights(Some(dir.path().join("cache")));
 
         set_defer_discovery(true);
         let deferred = resolve_key_inputs(&args, &on, "x");

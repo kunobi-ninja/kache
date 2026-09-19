@@ -338,6 +338,7 @@ fn cargo_proxy_isolates_fingerprints_while_sharing_final_target_and_kache() {
     assert_eq!(events.len(), 3, "events: {events:#?}");
     assert_eq!(events[0]["result"], "miss");
     assert_ne!(events[1]["result"], "local_hit");
-    assert_eq!(events[2]["result"], "local_hit");
+    assert_eq!(events[2]["result"], "local_hit", "events: {events:#?}");
+    assert_eq!(events[2]["compiler_runs"], 0, "events: {events:#?}");
     assert_eq!(events[0]["cache_key"], events[2]["cache_key"]);
 }

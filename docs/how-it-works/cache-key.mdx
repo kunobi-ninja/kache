@@ -29,6 +29,11 @@ Incremental directory names and harmless local path spellings are excluded or no
 
 The live implementation is the authority. Use `kache why-miss` and trace logging to see the components for a particular build.
 
+Input predictions are enabled by default for eligible Rust units. Kache
+revalidates their recorded inputs and falls back to dependency discovery when
+the record cannot be used. Set `KACHE_INPUT_PREDICTIONS=0` or
+`[cache] input_predictions = false` to disable predictions.
+
 ### Clippy
 
 `cargo clippy` runs workspace crates through `clippy-driver`, which Cargo

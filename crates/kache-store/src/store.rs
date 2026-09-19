@@ -1433,6 +1433,10 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_entry_blobs_hash ON entry_blobs(hash);",
     )?;
+    // Answers "has this store ever held this crate" in one probe; a cold
+    // compile uses it to skip the dep-info pre-pass (see
+    // `FileHashCache::has_entry_for_crate`).
+    db.execute_batch("CREATE INDEX IF NOT EXISTS idx_entries_crate_name ON entries(crate_name);")?;
 
     // Post-eviction demand tracking (kunobi-ninja/kache#594).
     //

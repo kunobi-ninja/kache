@@ -5211,8 +5211,11 @@ fn apply_cc_prefix_maps_to_bytes(bytes: Vec<u8>, prefix_maps: &[CcPrefixMap]) ->
         match bytes[i..].iter().position(|byte| leading.contains(byte)) {
             Some(0) => {}
             Some(offset) => {
-                out.extend_from_slice(&bytes[i..i + offset]);
-                i += offset;
+                // The slice is taken from `next`, so a step that does not
+                // move forward fails here instead of looping.
+                let next = i + offset;
+                out.extend_from_slice(&bytes[i..next]);
+                i = next;
             }
             None => {
                 out.extend_from_slice(&bytes[i..]);

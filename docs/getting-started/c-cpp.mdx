@@ -76,6 +76,8 @@ export CC_KNOWN_WRAPPER_CUSTOM=kache
 
 The `cc` crate needs `CC_KNOWN_WRAPPER_CUSTOM` so it keeps the real compiler argument. PATH shims do not need that variable, because the compiler name stays `gcc`.
 
+Meson 1.13 and later recognise `kache cc` and `kache c++` in `CC` and `CXX`. Older versions treat `kache` as the compiler, which breaks projects that also build Rust; use the PATH shims there.
+
 For clang-cl driver mode:
 
 ```powershell

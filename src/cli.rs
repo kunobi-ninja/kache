@@ -871,7 +871,7 @@ pub fn stats(
     if !summaries.is_empty() {
         println!("Sessions (last {}):", summaries.len().min(5));
         for s in summaries.iter().rev().take(5) {
-            let cancelled = if s.cancelled { ", CANCELLED" } else { "" };
+            let status = summary_status_suffix(s.cancelled, s.incomplete);
             println!(
                 "  {} [{}] {}: {}/{} candidates downloaded ({}), {} used, {} demanded ({}){}",
                 s.ts.format("%m-%d %H:%M"),
@@ -887,11 +887,20 @@ pub fn stats(
                 s.used_keys,
                 s.demanded_keys,
                 s.closure_reason,
-                cancelled,
+                status,
             );
         }
     }
     Ok(())
+}
+
+fn summary_status_suffix(cancelled: bool, incomplete: bool) -> &'static str {
+    match (cancelled, incomplete) {
+        (false, false) => "",
+        (true, false) => ", CANCELLED",
+        (false, true) => ", INCOMPLETE (partial totals)",
+        (true, true) => ", CANCELLED, INCOMPLETE (partial totals)",
+    }
 }
 
 /// `kache stats` lines for the machine's shared index and GC record: what the
@@ -6673,6 +6682,20 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn shutdown_summary_status_distinguishes_partial_totals_from_cancellation() {
+        assert_eq!(summary_status_suffix(false, false), "");
+        assert_eq!(summary_status_suffix(true, false), ", CANCELLED");
+        assert_eq!(
+            summary_status_suffix(false, true),
+            ", INCOMPLETE (partial totals)"
+        );
+        assert_eq!(
+            summary_status_suffix(true, true),
+            ", CANCELLED, INCOMPLETE (partial totals)"
+        );
+    }
 
     // ── Build timeline push ─────────────────────────────────────────────────
 

@@ -1324,8 +1324,7 @@ pub struct PrefetchStatsSnapshot {
     pub keys_cancelled: u64,
     /// Candidates dropped un-downloaded because a plan budget was exhausted
     /// (kunobi-ninja/kache#616). Distinct from `keys_cancelled`, which is the
-    /// adaptive hit-rate cancel: this is "the plan was too big / too slow",
-    /// that one is "the plan looked wrong".
+    /// adaptive hit-rate cancellation or daemon shutdown.
     #[serde(default)]
     pub keys_over_budget: u64,
     /// Whether the daemon-lifetime adaptive cancel latch has fired.
@@ -1831,7 +1830,7 @@ pub(crate) struct PrefetchStats {
     /// PrefetchHit); this counter mainly captures joins on in-flight
     /// prefetch downloads.
     pub keys_used: std::sync::atomic::AtomicU64,
-    /// Keys dropped un-downloaded by an adaptive cancellation.
+    /// Known candidates dropped before GET by adaptive cancellation or shutdown.
     pub keys_cancelled: std::sync::atomic::AtomicU64,
     /// Keys dropped un-downloaded because a plan budget was exhausted (#616).
     pub keys_over_budget: std::sync::atomic::AtomicU64,
@@ -4826,7 +4825,6 @@ impl Daemon {
 
     fn stop_prefetch_admission(&self) {
         self.prefetch_stopping.store(true, Ordering::Release);
-        self.prefetch_cancel.send_replace(true);
     }
 
     fn cancel_prefetch_plan(&self, origin: &PrefetchOrigin) {
@@ -4918,6 +4916,9 @@ impl Daemon {
         plan_started_at: Instant,
     ) -> Response {
         if self.prefetch_stopping.load(Ordering::Acquire) {
+            if let Some(origin) = &req.origin {
+                self.cancel_prefetch_plan(origin);
+            }
             return Response::ok();
         }
         if !self.config.prefetch_enabled {
@@ -5086,6 +5087,10 @@ impl Daemon {
         self.spawn_prefetch_task(origin.clone(), async move {
             if daemon.prefetch_stopping.load(Ordering::Acquire) {
                 daemon.cancel_prefetch_plan(&origin);
+                daemon
+                    .prefetch_stats
+                    .keys_cancelled
+                    .fetch_add(keys_to_fetch.len() as u64, Ordering::Relaxed);
                 return;
             }
             if let Some(context) = pack_context.as_ref() {
@@ -5168,8 +5173,9 @@ impl Daemon {
                     }
                 }
 
-                // Check for adaptive cancellation
-                if *cancel_rx.borrow() {
+                // Check adaptive cancellation and shutdown independently:
+                // shutdown must not set the adaptive hit-rate latch.
+                if daemon.prefetch_stopping.load(Ordering::Acquire) || *cancel_rx.borrow() {
                     daemon.cancel_prefetch_plan(&origin);
                     tracing::info!("prefetch: remaining candidates cancelled");
                     // Nothing to drain: an un-started candidate holds no claim
@@ -5202,6 +5208,9 @@ impl Daemon {
                 let task = daemon.spawn_prefetch_task(origin.clone(), async move {
                     if d.prefetch_stopping.load(Ordering::Acquire) {
                         d.cancel_prefetch_plan(&origin);
+                        d.prefetch_stats
+                            .keys_cancelled
+                            .fetch_add(1, Ordering::Relaxed);
                         return;
                     }
                     let item_deadline =
@@ -5264,10 +5273,6 @@ impl Daemon {
                         }
                     };
                     let semaphore_wait_ms = semaphore_start.elapsed().as_millis() as u64;
-                    if d.prefetch_stopping.load(Ordering::Acquire) {
-                        d.cancel_prefetch_plan(&origin);
-                        return;
-                    }
                     // Claim LAST, once this task is ready to download right
                     // now (#613): the window where a key sits claimed but
                     // idle is what made demand park behind speculation, so it
@@ -5282,6 +5287,13 @@ impl Daemon {
                     // Released on every exit path below (including panic) by
                     // Drop, which also wakes anyone parked on this key.
                     let _dl_guard = DownloadingGuard::new(d.downloading.clone(), key.clone());
+                    if d.prefetch_stopping.load(Ordering::Acquire) {
+                        d.cancel_prefetch_plan(&origin);
+                        d.prefetch_stats
+                            .keys_cancelled
+                            .fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                     // Re-check under the claim: a leader that landed the entry
                     // between the check above and this claim would otherwise be
                     // followed by a destructive re-extraction over a directory
@@ -5489,6 +5501,10 @@ impl Daemon {
                 if let Some(task) = task {
                     in_flight.push(task);
                 } else {
+                    daemon
+                        .prefetch_stats
+                        .keys_cancelled
+                        .fetch_add(1 + keys_iter.count() as u64, Ordering::Relaxed);
                     break;
                 }
             }
@@ -5661,7 +5677,7 @@ impl Daemon {
                 .saturating_sub(plan.list_duration_ms_at_install),
         };
         let path = self.config.summary_log_path();
-        let shutdown = self.prefetch_stopping.load(Ordering::Acquire);
+        let shutdown = matches!(closure_reason, "shutdown" | "shutdown_timeout");
         let logged = if shutdown {
             crate::events::log_summary_durable(&path, &event)
         } else {
@@ -16017,6 +16033,10 @@ mod tests {
             .unwrap()
             .record_demand(&keys[0]);
         daemon.stop_prefetch_admission();
+        assert!(
+            !*daemon.prefetch_cancel.borrow(),
+            "shutdown is not adaptive cancellation"
+        );
         let draining = tokio::spawn({
             let daemon = daemon.clone();
             async move {
@@ -16051,6 +16071,10 @@ mod tests {
         assert_eq!(summary.downloaded_bytes, bytes);
         assert_eq!(summary.used_keys, 1);
         assert_eq!(summary.used_bytes, bytes);
+        assert_eq!(
+            daemon.prefetch_stats.keys_cancelled.load(Ordering::Relaxed),
+            1
+        );
         assert!(!daemon.maybe_publish_identity_manifest(Some("identity"), "session"));
         assert!(!daemon.finish_prefetch_shutdown(Duration::ZERO).await);
         assert_eq!(
@@ -16059,6 +16083,80 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_rejects_a_child_waiting_for_the_download_claim() {
+        let (_dir, daemon, backend, _started, _keys, _bytes) = shutdown_prefetch_fixture().await;
+        let claims = daemon.downloading.write().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while daemon.s3_semaphore.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child must reach the claim queue after taking its remote permit");
+        daemon.stop_prefetch_admission();
+        drop(claims);
+        // A rejected candidate cannot consume this permit. Letting a wrongly
+        // admitted GET finish makes the failure observable without a timeout.
+        backend.release_v3_get.add_permits(1);
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(2))
+                .await
+        );
+        assert_eq!(
+            backend.v3_gets.load(Ordering::SeqCst),
+            0,
+            "a child queued on its claim must not start GET after shutdown"
+        );
+        assert!(daemon.downloading.read().await.is_empty());
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].cancelled);
+        assert!(!summaries[0].incomplete);
+        assert_eq!(summaries[0].downloaded_keys, 0);
+        assert_eq!(
+            daemon.prefetch_stats.keys_cancelled.load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_marks_an_unstarted_request_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon.install_plan(
+            "session",
+            "plan",
+            "advisory",
+            ["key".into()].into_iter(),
+            None,
+        );
+        daemon.stop_prefetch_admission();
+        assert!(
+            daemon
+                .handle_prefetch(&PrefetchRequest {
+                    keys: vec![("key".into(), "serde".into())],
+                    warm_all: false,
+                    origin: Some(PrefetchOrigin {
+                        session_id: "session".into(),
+                        plan_id: "plan".into(),
+                        source: "advisory".into(),
+                        ..PrefetchOrigin::default()
+                    }),
+                    candidate_sources: HashMap::new(),
+                })
+                .await
+                .ok
+        );
+        assert!(!daemon.finish_prefetch_shutdown(Duration::ZERO).await);
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].cancelled);
+        assert!(!summaries[0].incomplete);
+        assert_eq!(summaries[0].downloaded_keys, 0);
     }
 
     #[tokio::test]

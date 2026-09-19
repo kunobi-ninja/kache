@@ -528,6 +528,95 @@ const STAGING_NAME_ATTEMPTS: u32 = 16;
 /// undercut the other.
 pub const STAGING_SWEEP_GRACE: Duration = Duration::from_secs(3600);
 
+/// How long a key lock file must sit unused before the sweep may unlink it.
+/// Every acquisition rewrites the file, so its mtime is the last claim of the
+/// key. Holding a key lock spans one compile and `BUILD_LOCK_TIMEOUT` is ten
+/// minutes; an hour, the staging and orphan-blob grace, leaves any claim that
+/// is still in flight far behind, and a key untouched that long is not being
+/// contended. The sweep also takes the lock before unlinking, so the grace
+/// only decides how eagerly idle files go, never whether a holder is safe.
+pub const KEY_LOCK_SWEEP_GRACE: Duration = Duration::from_secs(3600);
+
+/// Most key lock files one sweep unlinks. Each costs an open, a lock, two
+/// stats and an unlink under `gc.lock`, tens of microseconds on Linux and a
+/// few hundred on macOS and Windows, so a full batch stays within seconds.
+/// A store with 84k stale locks converges in five sweeps.
+pub const KEY_LOCK_SWEEP_CAP: usize = 20_000;
+
+/// What one [`Store::sweep_stale_key_locks`] pass saw and did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyLockSweepStats {
+    /// `<key>.lock` names found in `store/`.
+    pub seen: usize,
+    /// Lock files unlinked.
+    pub removed: usize,
+}
+
+impl KeyLockSweepStats {
+    /// Key lock files left in `store/` after the pass.
+    pub fn remaining(&self) -> usize {
+        self.seen.saturating_sub(self.removed)
+    }
+}
+
+/// The cache key a name in `store/` locks, or `None` for anything that is
+/// not `<valid key>.lock`: `gc.lock`, `durability.lock`, entry directories.
+fn key_of_lock_name(name: &str) -> Option<&str> {
+    name.strip_suffix(".lock")
+        .filter(|key| kache_format::is_valid_cache_key(key))
+}
+
+/// Old enough to unlink? A modification time ahead of `now` reads as young.
+fn key_lock_is_stale(
+    modified: std::time::SystemTime,
+    now: std::time::SystemTime,
+    min_age: Duration,
+) -> bool {
+    now.duration_since(modified).is_ok_and(|age| age >= min_age)
+}
+
+/// Unlink one key lock file if it is a regular file, stale, and not held.
+/// True when the file is gone. Any failure leaves it for a later sweep; on
+/// Windows that includes an unlink refused because another handle is open
+/// without delete sharing.
+///
+/// Staleness is judged twice. The listing's mtime keeps the sweep from ever
+/// locking a file in recent use, which a claimant would read as contention.
+/// The locked handle's mtime catches a claim that came and went in between.
+/// `after_open` runs between the open and the lock so tests can stage both
+/// that and a path replaced under the handle.
+fn remove_stale_lock_file(
+    path: &Path,
+    min_age: Duration,
+    now: std::time::SystemTime,
+    after_open: impl FnOnce(),
+) -> bool {
+    // A directory or symlink with a lock-shaped name is not ours to remove.
+    let listed_stale = fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.is_file() && metadata_is_stale(&meta, now, min_age));
+    if !listed_stale {
+        return false;
+    }
+    // No `create`: a name that vanished since the listing stays gone.
+    let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    after_open();
+    if !matches!(StoreLock::try_lock_file(&file), Ok(true)) {
+        return false;
+    }
+    let locked_stale = file
+        .metadata()
+        .is_ok_and(|meta| metadata_is_stale(&meta, now, min_age));
+    // Dropping `file` on any return releases the lock.
+    locked_stale && lock_file_is_at_path(&file, path) && fs::remove_file(path).is_ok()
+}
+
+fn metadata_is_stale(meta: &fs::Metadata, now: std::time::SystemTime, min_age: Duration) -> bool {
+    meta.modified()
+        .is_ok_and(|modified| key_lock_is_stale(modified, now, min_age))
+}
+
 /// Pick a staging path that does not exist yet, skipping past any stale
 /// leftover, and return it WITHOUT creating it.
 ///
@@ -925,6 +1014,21 @@ pub struct GcStats {
     /// write lock.
     #[serde(default)]
     pub evict_write_ms: u64,
+    /// What the run's housekeeping did. `None` for a run that did none, such
+    /// as the eviction after an upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub housekeeping: Option<HousekeepingStats>,
+}
+
+/// Counts from [`Store::sweep_housekeeping`], recorded with the GC run so
+/// growth in either structure shows up without a shell on the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HousekeepingStats {
+    pub key_locks_removed: usize,
+    /// Key lock files left in `store/`: live entries, recent claims, and
+    /// whatever the per-sweep cap deferred.
+    pub key_locks_remaining: usize,
+    pub predictions_pruned: usize,
 }
 
 /// Whether `err` carries SQLite write contention (`SQLITE_BUSY` or
@@ -1168,10 +1272,12 @@ pub fn lock_poll_interval(attempt: u32) -> Duration {
 
 /// Cross-process advisory lock held through an open file handle.
 ///
-/// Lock files deliberately persist after release. Unlinking an advisory lock
-/// file can split contenders across the unlinked inode and a newly-created
-/// inode, allowing two processes to both believe they hold the same lock. This
-/// trades one small persistent file per encountered key for stable ownership.
+/// Lock files persist after release. Unlinking an advisory lock file can split
+/// contenders across the unlinked inode and a newly-created inode, allowing
+/// two processes to both believe they hold the same lock. Only
+/// [`Store::sweep_stale_key_locks`] unlinks one, and only while holding it;
+/// every acquisition then checks that the path still names the file it
+/// locked, and starts over when it does not.
 pub struct StoreLock {
     file: fs::File,
 }
@@ -1181,6 +1287,41 @@ pub type KeyLock = StoreLock;
 
 /// Lock guard for store-wide GC. Dropping it releases the OS lock.
 pub type GcLock = StoreLock;
+
+/// How often one acquisition reopens a lock file that was unlinked under it.
+/// Each retry needs the sweep to unlink the same path again, and a file this
+/// process just created is younger than [`KEY_LOCK_SWEEP_GRACE`], so the
+/// second open already settles; the bound only keeps a broken filesystem
+/// from spinning.
+const LOCK_OPEN_ATTEMPTS: u32 = 4;
+
+/// Does `path` still name the file `handle` refers to?
+///
+/// No: the path is gone or names another file, so the next contender will
+/// lock something else and this handle excludes nobody. A handle with no
+/// identity to compare (a platform without one) counts as current; the sweep
+/// never unlinks there, see [`lock_file_is_at_path`].
+fn lock_is_current(
+    handle: std::io::Result<kache_fs::InodeId>,
+    at_path: std::io::Result<kache_fs::InodeId>,
+) -> bool {
+    match (handle, at_path) {
+        (Ok(handle), Ok(at_path)) => handle == at_path,
+        (Ok(_), Err(_)) => false,
+        (Err(_), _) => true,
+    }
+}
+
+/// The sweep's stricter form: both identities known and equal.
+fn lock_file_is_at_path(file: &fs::File, path: &Path) -> bool {
+    match (
+        kache_fs::handle_identity(file),
+        kache_fs::file_identity(path),
+    ) {
+        (Ok(handle), Ok(at_path)) => handle == at_path,
+        _ => false,
+    }
+}
 
 impl StoreLock {
     fn open(path: &Path) -> Result<fs::File> {
@@ -1205,19 +1346,58 @@ impl StoreLock {
         Ok(Self { file })
     }
 
+    /// Open, lock, then confirm the locked file is the one at `path`.
+    ///
+    /// `lock` returns false when the file is held elsewhere. `after_open`
+    /// runs between the open and the lock, where an unlink by the sweep does
+    /// its damage; production passes a no-op and tests stage the race there.
+    fn acquire_current(
+        path: &Path,
+        mut lock: impl FnMut(&fs::File) -> Result<bool>,
+        mut after_open: impl FnMut(),
+    ) -> Result<Option<Self>> {
+        for _ in 0..LOCK_OPEN_ATTEMPTS {
+            let file = Self::open(path)?;
+            after_open();
+            if !lock(&file)? {
+                return Ok(None);
+            }
+            if lock_is_current(
+                kache_fs::handle_identity(&file),
+                kache_fs::file_identity(path),
+            ) {
+                return Ok(Some(Self::finish(file)?));
+            }
+            // Closing the handle releases the lock on the unlinked file.
+        }
+        anyhow::bail!(
+            "lock file {} was replaced {LOCK_OPEN_ATTEMPTS} times while acquiring it",
+            path.display()
+        )
+    }
+
+    fn try_lock_file(file: &fs::File) -> Result<bool> {
+        match file.try_lock() {
+            Ok(()) => Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
+
     fn acquire(path: &Path) -> Result<Self> {
-        let file = Self::open(path)?;
-        file.lock()?;
-        Self::finish(file)
+        let lock = Self::acquire_current(
+            path,
+            |file| {
+                file.lock()?;
+                Ok(true)
+            },
+            || {},
+        )?;
+        lock.ok_or_else(|| anyhow::anyhow!("blocking lock on {} reported busy", path.display()))
     }
 
     pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
-        let file = Self::open(path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self::finish(file)?)),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
-        }
+        Self::acquire_current(path, Self::try_lock_file, || {})
     }
 
     fn wait_until_available(path: &Path, timeout: Duration) -> Result<bool> {
@@ -3657,6 +3837,80 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         stats
+    }
+
+    /// Unlink key lock files nobody needs: no entry row for the key, unused
+    /// for `min_age`, and not held. At most `cap` per call; the rest wait for
+    /// the next sweep. The caller holds `gc.lock`, so one sweeper runs at a
+    /// time.
+    ///
+    /// Each file is unlinked while this process holds its OS lock, and its
+    /// age is read from the locked handle, so a claim that slipped in before
+    /// the lock is seen. A contender that opened the file before the unlink
+    /// finds the path changed once it gets the lock and reopens
+    /// ([`StoreLock::acquire_current`]).
+    pub fn sweep_stale_key_locks(
+        &self,
+        min_age: Duration,
+        cap: usize,
+    ) -> Result<KeyLockSweepStats> {
+        self.sweep_stale_key_locks_at(min_age, cap, std::time::SystemTime::now())
+    }
+
+    fn sweep_stale_key_locks_at(
+        &self,
+        min_age: Duration,
+        cap: usize,
+        now: std::time::SystemTime,
+    ) -> Result<KeyLockSweepStats> {
+        let mut stats = KeyLockSweepStats::default();
+        let Ok(names) = fs::read_dir(self.config.store_dir()) else {
+            return Ok(stats);
+        };
+        let live: std::collections::HashSet<String> = self
+            .db
+            .prepare("SELECT cache_key FROM entries")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for name in names.flatten() {
+            let name = name.file_name();
+            let Some(key) = name.to_str().and_then(key_of_lock_name) else {
+                continue;
+            };
+            stats.seen += 1;
+            // Past the cap the walk only counts, which costs no stat.
+            if stats.removed >= cap || live.contains(key) {
+                continue;
+            }
+            if remove_stale_lock_file(&self.config.store_dir().join(&name), min_age, now, || {}) {
+                stats.removed += 1;
+            }
+        }
+        Ok(stats)
+    }
+
+    /// The per-key structures nothing else bounds: stale key lock files and
+    /// unused input predictions. The caller holds `gc.lock`. A pass that fails
+    /// is logged and counts as zero; the next sweep tries again.
+    pub fn sweep_housekeeping(&self) -> HousekeepingStats {
+        let locks = self
+            .sweep_stale_key_locks(KEY_LOCK_SWEEP_GRACE, KEY_LOCK_SWEEP_CAP)
+            .unwrap_or_else(|error| {
+                tracing::warn!("gc: key lock sweep failed: {error:#}");
+                KeyLockSweepStats::default()
+            });
+        let predictions_pruned = self
+            .file_hash_cache()
+            .prune_input_predictions()
+            .unwrap_or_else(|error| {
+                tracing::warn!("gc: input prediction pruning failed: {error}");
+                0
+            });
+        HousekeepingStats {
+            key_locks_removed: locks.removed,
+            key_locks_remaining: locks.remaining(),
+            predictions_pruned,
+        }
     }
 
     /// Cache dir this store was opened with (`blobs/`, `index.db`, `store/`).
@@ -14073,7 +14327,564 @@ mod tests {
         );
     }
 
+    const TWO_HOURS: Duration = Duration::from_secs(7200);
+
+    /// A key lock file last claimed `age` ago.
+    fn aged_key_lock(config: &Config, key: &str, age: Duration) -> PathBuf {
+        let path = config.store_dir().join(format!("{key}.lock"));
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        std::fs::write(&path, b"1").unwrap();
+        set_age(&path, age);
+        path
+    }
+
+    fn set_age(path: &Path, age: Duration) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    fn sweep_key_locks(store: &Store, cap: usize) -> KeyLockSweepStats {
+        store
+            .sweep_stale_key_locks(KEY_LOCK_SWEEP_GRACE, cap)
+            .unwrap()
+    }
+
+    #[test]
+    fn key_lock_sweep_constants_are_pinned() {
+        assert_eq!(KEY_LOCK_SWEEP_GRACE, Duration::from_secs(3600));
+        assert_eq!(KEY_LOCK_SWEEP_GRACE, STAGING_SWEEP_GRACE);
+        assert_eq!(KEY_LOCK_SWEEP_CAP, 20_000);
+        assert_eq!(LOCK_OPEN_ATTEMPTS, 4);
+        // The CI store that prompted the sweep: 84,496 stale locks.
+        assert_eq!(84_496usize.div_ceil(KEY_LOCK_SWEEP_CAP), 5);
+    }
+
+    #[test]
+    fn key_of_lock_name_accepts_only_a_valid_key_with_the_lock_suffix() {
+        let k = key(1);
+        assert_eq!(key_of_lock_name(&format!("{k}.lock")), Some(k.as_str()));
+        assert_eq!(key_of_lock_name(&k), None);
+        assert_eq!(key_of_lock_name("gc.lock"), None);
+        assert_eq!(key_of_lock_name("durability.lock"), None);
+        assert_eq!(key_of_lock_name(".lock"), None);
+        assert_eq!(key_of_lock_name(&format!("{k}.lock.tmp")), None);
+        assert_eq!(key_of_lock_name(&format!("{}.lock", &k[1..])), None);
+        assert_eq!(
+            key_of_lock_name(&format!("{}.lock", k.to_uppercase())),
+            None
+        );
+    }
+
+    #[test]
+    fn key_lock_staleness_boundary_is_inclusive_and_future_mtimes_are_young() {
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let grace = Duration::from_secs(3600);
+        assert!(!key_lock_is_stale(
+            now - Duration::from_secs(3599),
+            now,
+            grace
+        ));
+        assert!(key_lock_is_stale(now - grace, now, grace));
+        assert!(key_lock_is_stale(now - TWO_HOURS, now, grace));
+        assert!(!key_lock_is_stale(now + TWO_HOURS, now, grace));
+    }
+
+    #[test]
+    fn key_lock_sweep_stats_report_what_remains() {
+        let stats = KeyLockSweepStats {
+            seen: 10,
+            removed: 3,
+        };
+        assert_eq!(stats.remaining(), 7);
+        let none = KeyLockSweepStats {
+            seen: 0,
+            removed: 0,
+        };
+        assert_eq!(none.remaining(), 0);
+    }
+
+    #[test]
+    fn key_lock_sweep_removes_a_stale_lock_whose_key_has_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let stale = aged_key_lock(&config, &key(1), TWO_HOURS);
+
+        assert_eq!(
+            sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+            KeyLockSweepStats {
+                seen: 1,
+                removed: 1
+            }
+        );
+        assert!(!stale.exists());
+        // The key is claimable again, on a new file.
+        let lock = store.try_lock(&key(1)).unwrap();
+        assert!(lock.is_some());
+        assert!(stale.exists());
+    }
+
+    #[test]
+    fn key_lock_sweep_removes_the_lock_of_an_evicted_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let k = put_entry(&store, dir.path(), 1, "evicted", b"payload");
+        drop(store.try_lock(&k).unwrap().expect("claim the key"));
+        let lock_path = config.store_dir().join(format!("{k}.lock"));
+        set_age(&lock_path, TWO_HOURS);
+
+        // Kept while the entry is live.
+        assert_eq!(
+            sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+            KeyLockSweepStats {
+                seen: 1,
+                removed: 0
+            }
+        );
+        assert!(lock_path.exists());
+
+        store.remove_entry(&k).unwrap();
+        assert_eq!(
+            sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+            KeyLockSweepStats {
+                seen: 1,
+                removed: 1
+            }
+        );
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn key_lock_sweep_keeps_a_young_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let young = aged_key_lock(&config, &key(1), Duration::from_secs(3000));
+        let old = aged_key_lock(&config, &key(2), Duration::from_secs(4200));
+
+        assert_eq!(
+            sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+            KeyLockSweepStats {
+                seen: 2,
+                removed: 1
+            }
+        );
+        assert!(young.exists());
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn key_lock_sweep_never_removes_a_held_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let held = store.try_lock(&key(1)).unwrap().expect("claim the key");
+        let path = config.store_dir().join(format!("{}.lock", key(1)));
+        let before = kache_fs::file_identity(&path).unwrap();
+        // A compile that has been running for two hours.
+        set_age(&path, TWO_HOURS);
+
+        // Swept from another thread, as the daemon would from another process.
+        let stats = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let sweeper = Store::open(&config).unwrap();
+                    sweep_key_locks(&sweeper, KEY_LOCK_SWEEP_CAP)
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(
+            stats,
+            KeyLockSweepStats {
+                seen: 1,
+                removed: 0
+            }
+        );
+        assert_eq!(kache_fs::file_identity(&path).unwrap(), before);
+        assert!(
+            store.try_lock(&key(1)).unwrap().is_none(),
+            "the holder still excludes every other claimant"
+        );
+
+        drop(held);
+        set_age(&path, TWO_HOURS);
+        assert_eq!(sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP).removed, 1);
+    }
+
+    #[test]
+    fn key_lock_sweep_respects_the_cap_and_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        for seed in 0..7 {
+            aged_key_lock(&config, &key(seed), TWO_HOURS);
+        }
+
+        assert_eq!(
+            sweep_key_locks(&store, 3),
+            KeyLockSweepStats {
+                seen: 7,
+                removed: 3
+            }
+        );
+        assert_eq!(
+            sweep_key_locks(&store, 3),
+            KeyLockSweepStats {
+                seen: 4,
+                removed: 3
+            }
+        );
+        let last = sweep_key_locks(&store, 3);
+        assert_eq!(
+            last,
+            KeyLockSweepStats {
+                seen: 1,
+                removed: 1
+            }
+        );
+        assert_eq!(last.remaining(), 0);
+        assert_eq!(
+            sweep_key_locks(&store, 0),
+            KeyLockSweepStats::default(),
+            "nothing left"
+        );
+    }
+
+    #[test]
+    fn key_lock_sweep_with_a_zero_cap_only_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let stale = aged_key_lock(&config, &key(1), TWO_HOURS);
+        assert_eq!(
+            sweep_key_locks(&store, 0),
+            KeyLockSweepStats {
+                seen: 1,
+                removed: 0
+            }
+        );
+        assert!(stale.exists());
+    }
+
+    #[test]
+    fn key_lock_sweep_never_touches_gc_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        drop(store.try_gc_lock().unwrap());
+        let path = config.store_dir().join("gc.lock");
+        set_age(&path, TWO_HOURS);
+        assert_eq!(
+            sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+            KeyLockSweepStats::default()
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn key_lock_sweep_never_touches_durability_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        drop(store.try_durability_flush_lock().unwrap());
+        let path = config.store_dir().join("durability.lock");
+        set_age(&path, TWO_HOURS);
+        assert_eq!(
+            sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+            KeyLockSweepStats::default()
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn key_lock_sweep_never_touches_a_directory_named_like_a_key_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let path = config.store_dir().join(format!("{}.lock", key(1)));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("inside"), b"kept").unwrap();
+        assert_eq!(
+            sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+            KeyLockSweepStats {
+                seen: 1,
+                removed: 0
+            }
+        );
+        assert!(path.join("inside").exists());
+    }
+
+    #[test]
+    fn key_lock_sweep_never_touches_an_entry_directory_or_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let k = put_entry(&store, dir.path(), 1, "kept", b"payload");
+        // Not a key: too short, and a stray file beside the locks.
+        let short = config.store_dir().join("abc123.lock");
+        let stray = config.store_dir().join(format!("{}.lock.bak", key(2)));
+        for path in [&short, &stray] {
+            std::fs::write(path, b"1").unwrap();
+            set_age(path, TWO_HOURS);
+        }
+        assert_eq!(
+            sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+            KeyLockSweepStats::default()
+        );
+        assert!(store.entry_dir(&k).join("meta.json").exists());
+        assert!(short.exists());
+        assert!(stray.exists());
+    }
+
     #[cfg(unix)]
+    #[test]
+    fn key_lock_sweep_never_follows_a_symlink_named_like_a_key_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"kept").unwrap();
+        set_age(&target, TWO_HOURS);
+        let link = config.store_dir().join(format!("{}.lock", key(1)));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP).removed, 0);
+        // Nor once the link itself is old enough.
+        let later = std::time::SystemTime::now() + TWO_HOURS;
+        assert!(!remove_stale_lock_file(
+            &link,
+            KEY_LOCK_SWEEP_GRACE,
+            later,
+            || {}
+        ));
+        assert!(link.symlink_metadata().is_ok());
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn key_lock_sweep_on_a_store_with_no_directory_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        let _ = std::fs::remove_dir_all(config.store_dir());
+        assert_eq!(
+            sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+            KeyLockSweepStats::default()
+        );
+    }
+
+    #[test]
+    fn housekeeping_sweeps_key_locks_and_prunes_predictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        // Nothing to do, as on a fresh store with predictions off.
+        assert_eq!(store.sweep_housekeeping(), HousekeepingStats::default());
+
+        let stale = aged_key_lock(&config, &key(1), TWO_HOURS);
+        aged_key_lock(&config, &key(2), TWO_HOURS);
+        let young = aged_key_lock(&config, &key(3), Duration::ZERO);
+        let predictions = store.file_hash_cache();
+        for identity in ["unused", "live"] {
+            predictions
+                .put_input_prediction(identity, 1, None, "payload")
+                .unwrap();
+        }
+        store
+            .db
+            .execute(
+                "UPDATE input_predictions SET last_used = 1 WHERE identity = 'unused'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.sweep_housekeeping(),
+            HousekeepingStats {
+                key_locks_removed: 2,
+                key_locks_remaining: 1,
+                predictions_pruned: 1,
+            }
+        );
+        assert!(!stale.exists());
+        assert!(young.exists());
+        assert!(predictions.get_input_prediction("live").unwrap().is_some());
+        assert_eq!(predictions.get_input_prediction("unused").unwrap(), None);
+    }
+
+    #[test]
+    fn stale_lock_claimed_between_listing_and_lock_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let path = aged_key_lock(&config, &key(1), TWO_HOURS);
+        let now = std::time::SystemTime::now();
+        // A claimant takes and releases the key after the sweep's stat.
+        let removed = remove_stale_lock_file(&path, KEY_LOCK_SWEEP_GRACE, now, || {
+            drop(StoreLock::try_acquire(&path).unwrap().expect("claim"));
+        });
+        assert!(!removed);
+        assert!(path.exists());
+        // Left alone, the same file goes.
+        set_age(&path, TWO_HOURS);
+        assert!(remove_stale_lock_file(
+            &path,
+            KEY_LOCK_SWEEP_GRACE,
+            now,
+            || {}
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn stale_lock_replaced_under_the_sweep_keeps_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let path = aged_key_lock(&config, &key(1), TWO_HOURS);
+        let now = std::time::SystemTime::now();
+        let removed = remove_stale_lock_file(&path, KEY_LOCK_SWEEP_GRACE, now, || {
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, b"2").unwrap();
+        });
+        assert!(!removed);
+        assert_eq!(std::fs::read(&path).unwrap(), b"2");
+    }
+
+    #[test]
+    fn stale_lock_held_at_lock_time_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let path = aged_key_lock(&config, &key(1), TWO_HOURS);
+        let now = std::time::SystemTime::now() + TWO_HOURS + TWO_HOURS;
+        let mut held = None;
+        let removed = remove_stale_lock_file(&path, KEY_LOCK_SWEEP_GRACE, now, || {
+            held = StoreLock::try_acquire(&path).unwrap();
+        });
+        assert!(held.is_some());
+        assert!(!removed);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn lock_is_current_compares_identities_and_trusts_a_handle_without_one() {
+        let id = |ino| kache_fs::InodeId { dev: 1, ino };
+        let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(lock_is_current(Ok(id(7)), Ok(id(7))));
+        assert!(!lock_is_current(Ok(id(7)), Ok(id(8))));
+        assert!(!lock_is_current(Ok(id(7)), Err(missing())));
+        assert!(lock_is_current(Err(missing()), Ok(id(7))));
+        assert!(lock_is_current(Err(missing()), Err(missing())));
+    }
+
+    #[test]
+    fn lock_file_is_at_path_needs_the_same_file_at_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.lock");
+        let other = dir.path().join("b.lock");
+        std::fs::write(&path, b"1").unwrap();
+        std::fs::write(&other, b"1").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert!(lock_file_is_at_path(&file, &path));
+        assert!(!lock_file_is_at_path(&file, &other));
+        assert!(!lock_file_is_at_path(&file, &dir.path().join("missing")));
+    }
+
+    /// The race the sweep opens: the path is unlinked and recreated after a
+    /// claimant opened it and before the claimant locks it.
+    #[test]
+    fn acquire_reopens_when_the_lock_file_was_replaced_between_open_and_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.lock");
+        let mut opens = 0;
+        let lock = StoreLock::acquire_current(&path, StoreLock::try_lock_file, || {
+            opens += 1;
+            if opens == 1 {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::write(&path, b"another claimant").unwrap();
+            }
+        })
+        .unwrap()
+        .expect("lock acquired");
+        assert_eq!(opens, 2);
+        // The lock is on the file the path names now, so it excludes others.
+        assert_eq!(
+            kache_fs::handle_identity(&lock.file).unwrap(),
+            kache_fs::file_identity(&path).unwrap()
+        );
+        assert!(StoreLock::try_acquire(&path).unwrap().is_none());
+        drop(lock);
+        // Read after release: Windows refuses reads of a locked range.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            std::process::id().to_string()
+        );
+        assert!(StoreLock::try_acquire(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn acquire_reopens_when_the_lock_file_was_unlinked_between_open_and_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.lock");
+        let mut opens = 0;
+        let lock = StoreLock::acquire_current(&path, StoreLock::try_lock_file, || {
+            opens += 1;
+            if opens == 1 {
+                std::fs::remove_file(&path).unwrap();
+            }
+        })
+        .unwrap()
+        .expect("lock acquired");
+        assert_eq!(opens, 2);
+        assert!(path.exists());
+        assert!(StoreLock::try_acquire(&path).unwrap().is_none());
+        drop(lock);
+    }
+
+    #[test]
+    fn acquire_yields_to_the_claimant_holding_the_replacement_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.lock");
+        let mut winner = None;
+        let mut opens = 0;
+        let lock = StoreLock::acquire_current(&path, StoreLock::try_lock_file, || {
+            opens += 1;
+            if opens == 1 {
+                std::fs::remove_file(&path).unwrap();
+                winner = StoreLock::try_acquire(&path).unwrap();
+            }
+        })
+        .unwrap();
+        assert!(winner.is_some());
+        assert!(lock.is_none(), "only one claimant may hold the key");
+        assert_eq!(opens, 2);
+    }
+
+    #[test]
+    fn acquire_gives_up_after_a_bounded_number_of_replacements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.lock");
+        let mut opens = 0u32;
+        let result = StoreLock::acquire_current(&path, StoreLock::try_lock_file, || {
+            opens += 1;
+            std::fs::remove_file(&path).unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(opens, LOCK_OPEN_ATTEMPTS);
+    }
+
+    #[test]
+    fn blocking_acquire_checks_the_path_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gc.lock");
+        let lock = StoreLock::acquire(&path).unwrap();
+        assert_eq!(
+            kache_fs::handle_identity(&lock.file).unwrap(),
+            kache_fs::file_identity(&path).unwrap()
+        );
+        assert!(StoreLock::try_acquire(&path).unwrap().is_none());
+    }
+
     #[test]
     fn gc_lock_does_not_expire_live_holder_by_mtime() {
         // A live holder must not be considered stale just because the marker

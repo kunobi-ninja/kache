@@ -3226,6 +3226,19 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         println!("{}", describe_eviction(&evict_stats, over_limit));
     }
 
+    // Key lock files and input predictions grow with every distinct key and
+    // eviction removes neither (#1126).
+    let housekeeping = store.sweep_housekeeping();
+    combined.housekeeping = Some(housekeeping);
+    if verbose {
+        println!(
+            "Housekeeping: removed {} stale key locks ({} remain), {} unused input predictions.",
+            housekeeping.key_locks_removed,
+            housekeeping.key_locks_remaining,
+            housekeeping.predictions_pruned,
+        );
+    }
+
     combined.duration_ms = started.elapsed().as_millis() as u64;
     // Still under gc.lock, so the record cannot race another driver.
     // The auto-GC worker used to discard this outcome entirely. A failed write
@@ -6715,6 +6728,10 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
             Ok(_) => {}
             Err(error) => println!("Warning: could not prune C/C++ memos: {error}"),
         }
+        match memos.prune_input_predictions() {
+            Ok(removed) => println!("Repairing: removed {removed} unused input predictions"),
+            Err(error) => println!("Warning: could not prune input predictions: {error}"),
+        }
         match memos.compact_sparse_index() {
             Ok(Some((before, after))) => println!(
                 "Repairing: compacted index file from {} to {}",
@@ -7427,6 +7444,8 @@ mod tests {
             entries_busy_snapshot: 0,
             entries_recent_prefiltered: 0,
             evict_write_ms: 11,
+            // Set once by the driver, never summed over policies.
+            housekeeping: None,
         };
         let part = crate::store::GcStats {
             entries_evicted: 10,
@@ -7442,6 +7461,8 @@ mod tests {
             entries_busy_snapshot: 0,
             entries_recent_prefiltered: 0,
             evict_write_ms: 110,
+            // Set once by the driver, never summed over policies.
+            housekeeping: None,
         };
         add_gc_stats(&mut accumulated, &part);
         assert_eq!(accumulated.entries_evicted, 11);
@@ -7493,6 +7514,50 @@ mod tests {
             .collect();
         assert_eq!(records.len(), 1, "{log}");
         assert_eq!(records[0].source, "auto");
+    }
+
+    /// kunobi-ninja/kache#1126: the local sweep removes stale key locks and
+    /// records the housekeeping counts.
+    #[test]
+    fn local_gc_runs_store_housekeeping_and_records_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().to_path_buf(), None);
+
+        // Two stale key locks with no entry, one claimed just now.
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        let lock_path = |seed: u8| {
+            config
+                .store_dir()
+                .join(format!("{}.lock", blake3::hash(&[seed]).to_hex()))
+        };
+        for seed in [1, 2, 3] {
+            std::fs::write(lock_path(seed), b"1").unwrap();
+        }
+        for seed in [1, 2] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(lock_path(seed))
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+                .unwrap();
+        }
+
+        let stats = run_gc_local(&config, GcMode::Background).unwrap();
+        assert_eq!(
+            stats.housekeeping,
+            Some(crate::store::HousekeepingStats {
+                key_locks_removed: 2,
+                key_locks_remaining: 1,
+                predictions_pruned: 0,
+            })
+        );
+        assert!(!lock_path(1).exists());
+        assert!(!lock_path(2).exists());
+        assert!(lock_path(3).exists());
+        let recorded = crate::report::read_gc_stats(&config.cache_dir).expect("run recorded");
+        assert_eq!(recorded.key_locks_removed, Some(2));
+        assert_eq!(recorded.key_locks_remaining, Some(1));
+        assert_eq!(recorded.predictions_pruned, Some(0));
     }
 
     #[test]

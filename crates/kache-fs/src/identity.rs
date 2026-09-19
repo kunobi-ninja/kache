@@ -8,6 +8,33 @@ pub fn file_identity(path: &Path) -> io::Result<InodeId> {
     metadata_identity(path, &metadata, true).map(|(id, _)| id)
 }
 
+/// Identity of the file an open handle refers to, whatever its path names
+/// now. Compared with [`file_identity`] it tells whether the path was unlinked
+/// or replaced after the handle was opened.
+pub fn handle_identity(file: &fs::File) -> io::Result<InodeId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(InodeId {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        windows_handle_identity(file).map(|(id, _)| id)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file identity is unavailable",
+        ))
+    }
+}
+
 /// Identity of a directory. A symlink at the final component is rejected.
 pub fn directory_identity(path: &Path) -> io::Result<InodeId> {
     let metadata = fs::symlink_metadata(path)?;
@@ -54,10 +81,9 @@ pub(crate) fn metadata_identity(
 
 #[cfg(windows)]
 fn windows_metadata_identity(path: &Path, follow: bool) -> io::Result<(InodeId, u64)> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        GetFileInformationByHandle,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     };
     let flags = FILE_FLAG_BACKUP_SEMANTICS
         | if follow {
@@ -69,6 +95,15 @@ fn windows_metadata_identity(path: &Path, follow: bool) -> io::Result<(InodeId, 
         .read(true)
         .custom_flags(flags)
         .open(path)?;
+    windows_handle_identity(&file)
+}
+
+#[cfg(windows)]
+fn windows_handle_identity(file: &fs::File) -> io::Result<(InodeId, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: the handle and output buffer are valid for this call.
     let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
@@ -128,6 +163,36 @@ mod tests {
         assert!(directory_identity(&source).is_err());
         assert!(directory_identity(dir.path()).is_ok());
         assert!(file_identity(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn handle_identity_follows_the_file_not_the_path() {
+        let dir = TempDir::new("handle-identity");
+        let path = dir.write("lock", 16);
+        let other = dir.write("other", 16);
+        let handle = fs::File::open(&path).unwrap();
+        assert_eq!(
+            handle_identity(&handle).unwrap(),
+            file_identity(&path).unwrap()
+        );
+        assert_ne!(
+            handle_identity(&handle).unwrap(),
+            file_identity(&other).unwrap()
+        );
+
+        // Replace what the path names while the handle stays open: the
+        // handle keeps the old file's identity.
+        let moved = dir.path().join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"new").unwrap();
+        assert_eq!(
+            handle_identity(&handle).unwrap(),
+            file_identity(&moved).unwrap()
+        );
+        assert_ne!(
+            handle_identity(&handle).unwrap(),
+            file_identity(&path).unwrap()
+        );
     }
 
     #[cfg(unix)]

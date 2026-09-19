@@ -564,6 +564,29 @@ fn gc_metrics(gc: &crate::report::GcStatsPersisted, now: &str) -> Vec<Value> {
     ] {
         metrics.push(gauge(name, unit, vec![as_int(value, now, &[])]));
     }
+    // Reported only by a run that did the housekeeping, so an eviction after
+    // an upload does not read as "no lock files left".
+    for (name, unit, value) in [
+        (
+            "kache.cache.gc.last_run.key_locks_removed",
+            "{file}",
+            gc.key_locks_removed,
+        ),
+        (
+            "kache.cache.gc.last_run.key_locks_remaining",
+            "{file}",
+            gc.key_locks_remaining,
+        ),
+        (
+            "kache.cache.gc.last_run.predictions_pruned",
+            "{row}",
+            gc.predictions_pruned,
+        ),
+    ] {
+        if let Some(value) = value {
+            metrics.push(gauge(name, unit, vec![as_int(value as u64, now, &[])]));
+        }
+    }
 
     metrics
 }
@@ -883,6 +906,56 @@ mod tests {
         ]
         .into_iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        assert_eq!(got, want);
+    }
+
+    /// Housekeeping counts are gauges of the last run that did any; the
+    /// snapshot above has none and `gc_figures_are_last_run_gauges` pins that
+    /// it emits none.
+    #[test]
+    fn gc_housekeeping_counts_are_gauges_when_the_run_recorded_them() {
+        let mut machine = machine_snap();
+        let gc = machine.gc.as_mut().unwrap();
+        gc.key_locks_removed = Some(20_000);
+        gc.key_locks_remaining = Some(64_496);
+        gc.predictions_pruned = Some(0);
+        let body = with_machine(&machine);
+        let got: Vec<(String, String, String)> =
+            body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| {
+                    let name = m["name"].as_str().unwrap();
+                    name.contains("key_locks") || name.contains("predictions_pruned")
+                })
+                .map(|m| {
+                    (
+                        m["name"].as_str().unwrap().to_string(),
+                        m["unit"].as_str().unwrap().to_string(),
+                        m["gauge"]["dataPoints"][0]["asInt"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    )
+                })
+                .collect();
+        let want: Vec<(String, String, String)> = [
+            (
+                "kache.cache.gc.last_run.key_locks_removed",
+                "{file}",
+                "20000",
+            ),
+            (
+                "kache.cache.gc.last_run.key_locks_remaining",
+                "{file}",
+                "64496",
+            ),
+            ("kache.cache.gc.last_run.predictions_pruned", "{row}", "0"),
+        ]
+        .into_iter()
+        .map(|(name, unit, value)| (name.to_string(), unit.to_string(), value.to_string()))
         .collect();
         assert_eq!(got, want);
     }

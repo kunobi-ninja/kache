@@ -259,3 +259,186 @@ fn transient(error: &anyhow::Error) -> bool {
         })
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn driver(config: &Config) -> KacheReplacement<'_> {
+        KacheReplacement {
+            config,
+            force: true,
+            child: None,
+            executable: None,
+            stopping: false,
+            retiring_pid: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_startup_reaps_the_child_without_terminating_it() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read release"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let mut input = child.stdin.take().unwrap();
+        let mut replacement = driver(&config);
+        replacement.child = Some(child);
+        drop(replacement);
+        // Signal zero observes this owned child without signalling it.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        input.write_all(b"release\n").unwrap();
+        drop(input);
+        let reaped =
+            kunobi_daemon::readiness::wait_until(Instant::now() + Duration::from_secs(3), |_| {
+                Ok::<_, std::io::Error>((unsafe { libc::kill(pid, 0) } != 0).then_some(()))
+            })
+            .unwrap()
+            .is_some();
+        if !reaped {
+            // Clean the fixture even if the reaper regression is reintroduced.
+            unsafe {
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+        }
+        assert!(reaped, "abandoned startup left a zombie child");
+    }
+
+    #[test]
+    fn failed_ownership_probe_remains_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        std::fs::create_dir(daemon_run_lock_path(&config.socket_path())).unwrap();
+        assert!(
+            ensure(&config, true).is_err(),
+            "unreadable ownership is not a startup timeout"
+        );
+    }
+
+    #[test]
+    fn legacy_initializer_is_waited_for_without_claiming_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let _lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
+            .unwrap()
+            .unwrap();
+        let coord = DaemonCoordFile::for_socket(&config.socket_path());
+        coord.write_phase(DaemonPhase::Starting).unwrap();
+        assert!(matches!(
+            observe(&config, Instant::now() + Duration::from_secs(1)).unwrap(),
+            ObservedOwner::Pending
+        ));
+    }
+
+    #[test]
+    fn drain_waits_for_both_exclusive_lock_and_retiring_process() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let mut replacement = driver(&config);
+        replacement.stopping = true;
+        replacement.retiring_pid = Some(std::process::id());
+        let deadline = Some(Instant::now() + Duration::from_secs(1));
+        assert_eq!(
+            replacement.perform(Step::Drain, deadline).unwrap(),
+            Progress::Pending
+        );
+        replacement.retiring_pid = None;
+        let lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replacement.perform(Step::Drain, deadline).unwrap(),
+            Progress::Pending
+        );
+        drop(lock);
+        assert_eq!(
+            replacement.perform(Step::Drain, deadline).unwrap(),
+            Progress::Done
+        );
+    }
+
+    #[test]
+    fn drain_keeps_waiting_when_the_held_owner_has_not_bound_control_yet() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let _lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
+            .unwrap()
+            .unwrap();
+        let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
+        coord.control_version = Some(kunobi_daemon::wire::VERSION);
+        coord.write_phase(DaemonPhase::Starting).unwrap();
+        assert_eq!(
+            driver(&config)
+                .perform(Step::Drain, Some(Instant::now() + Duration::from_secs(1)))
+                .unwrap(),
+            Progress::Pending
+        );
+    }
+
+    #[test]
+    fn drain_does_not_hide_an_unsupported_control_protocol() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let _lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
+            .unwrap()
+            .unwrap();
+        let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
+        coord.control_version = Some(u32::MAX);
+        coord.write_phase(DaemonPhase::Ready).unwrap();
+        let error = driver(&config)
+            .perform(Step::Drain, Some(Instant::now() + Duration::from_secs(1)))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported lifecycle control version")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_requests_drain_before_waiting_for_cache_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
+            .unwrap()
+            .unwrap();
+        let lifecycle = Arc::new(Lifecycle::default());
+        let mut server = lifecycle_control::serve(&config, Arc::clone(&lifecycle))
+            .await
+            .unwrap();
+        server.service.mark_ready();
+        let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
+        coord.control_version = Some(kunobi_daemon::wire::VERSION);
+        coord.write_phase(DaemonPhase::Ready).unwrap();
+        let pending = lifecycle.begin().unwrap();
+        let progress = tokio::task::spawn_blocking(move || {
+            let mut driver = KacheReplacement {
+                config: &config,
+                force: true,
+                child: None,
+                executable: None,
+                stopping: false,
+                retiring_pid: None,
+            };
+            driver.perform(Step::Drain, Some(Instant::now() + Duration::from_secs(2)))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(progress, Progress::Pending);
+        assert!(
+            !lifecycle.accepting_calls(),
+            "replacement must request drain before waiting"
+        );
+        assert_eq!(lifecycle.snapshot().active, 1);
+        drop(pending);
+        drop(lock);
+        server.finish().await;
+    }
+}

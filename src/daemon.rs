@@ -6533,9 +6533,10 @@ async fn server_main(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
-            interval.tick().await;
-            if !config_watch_lifecycle.accepting_calls() {
-                break;
+            tokio::select! {
+                biased;
+                _ = config_watch_lifecycle.draining() => break,
+                _ = interval.tick() => {}
             }
             if crate::config::config_file_has_changed(&config_provenance) {
                 tracing::info!("config file changed on disk, scheduling restart to reload it");
@@ -7621,13 +7622,6 @@ async fn handle_connection_started_at(
         if let Err(e) = (&stream).write_all(resp_line.as_bytes()).await {
             // Client closed without reading (fire-and-forget mode) — not an error.
             tracing::debug!("response write failed (client likely closed): {e}");
-            break;
-        }
-
-        // Once shutdown starts, finish this response but do not wait for a
-        // persistent client to send another request. In particular, the stop
-        // handler must write its own acknowledgement before it exits.
-        if !lifecycle.accepting_calls() {
             break;
         }
     }
@@ -10249,6 +10243,32 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_cleanup_removes_only_this_process_and_build() {
+        let root = tempfile::tempdir().unwrap();
+        for (same_pid, same_build) in [(true, true), (false, true), (true, false), (false, false)] {
+            let mut coord = DaemonCoordFile::for_socket(&root.path().join("daemon.sock"));
+            if !same_pid {
+                coord.pid = std::process::id() + 1;
+            }
+            if !same_build {
+                coord.build_epoch = build_epoch().wrapping_add(1);
+            }
+            coord.write_phase(DaemonPhase::Ready).unwrap();
+            let bytes = std::fs::read(&coord.path).unwrap();
+            drop(DaemonCoordGuard::new(coord.path.clone()));
+            if same_pid && same_build {
+                assert!(!coord.path.exists(), "own record must be removed");
+            } else {
+                assert_eq!(
+                    std::fs::read(&coord.path).unwrap(),
+                    bytes,
+                    "replacement record must survive"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_daemon_coord_state_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
@@ -10276,6 +10296,18 @@ mod tests {
             !super::pid_alive(u32::MAX),
             "u32::MAX casts to the -1 broadcast"
         );
+    }
+
+    #[test]
+    fn shutdown_wait_requires_ownership_release() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("daemon.sock");
+        let lock = kunobi_daemon::ProcessLock::try_acquire(daemon_run_lock_path(&socket))
+            .unwrap()
+            .unwrap();
+        assert!(!wait_for_run_lock_release(&socket, Duration::from_millis(30)).unwrap());
+        drop(lock);
+        assert!(wait_for_run_lock_release(&socket, Duration::from_secs(1)).unwrap());
     }
 
     /// A missing run lock file means "nobody holds it", which is a different

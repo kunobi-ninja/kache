@@ -1356,6 +1356,13 @@ fn daemon_restart_preserves_another_cache_daemon() {
         .success();
     let before = std::fs::read(b.cache.join("daemon.state.json")).unwrap();
     let before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    a.cmd()
+        .args(["daemon", "start"])
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+        .assert()
+        .success();
+    let own_before: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(a.cache.join("daemon.state.json")).unwrap()).unwrap();
     let restart = a
         .cmd()
         .args(["daemon", "restart"])
@@ -1368,6 +1375,7 @@ fn daemon_restart_preserves_another_cache_daemon() {
         .output()
         .unwrap();
     let after = std::fs::read(b.cache.join("daemon.state.json"));
+    let own_after = std::fs::read(a.cache.join("daemon.state.json"));
     // Clean both fixtures before assertions so failures leave no background work.
     a.cmd().args(["daemon", "stop"]).output().unwrap();
     b.cmd().args(["daemon", "stop"]).output().unwrap();
@@ -1380,6 +1388,11 @@ fn daemon_restart_preserves_another_cache_daemon() {
     assert_eq!(other["daemon_running"], true, "{other}");
     let after: serde_json::Value = serde_json::from_slice(&after.unwrap()).unwrap();
     assert_eq!(before["pid"], after["pid"]);
+    let own_after: serde_json::Value = serde_json::from_slice(&own_after.unwrap()).unwrap();
+    assert_ne!(
+        own_before["pid"], own_after["pid"],
+        "explicit restart must replace a compatible owner"
+    );
 }
 
 /// PATH with a fake `systemctl` running `script` and a no-op `loginctl`

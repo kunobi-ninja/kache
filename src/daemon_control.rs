@@ -6,8 +6,12 @@ use kunobi_daemon::{
     control::ControlService,
     local::Duplex,
     transport::SplitIo,
-    wire::{self, capability, operation},
+    wire::{self, operation},
 };
+
+// Protocol masks: HEALTH | HEALTH_DETAILS | DRAIN, and required health details.
+const CONTROL_SUPPORTED: u64 = 0x13;
+const CONTROL_REQUIRED: u64 = 0x11;
 
 // Stable service-family UUID. Cache instance separation is independent of builds.
 const SERVICE_ID: [u8; 16] = [
@@ -31,8 +35,8 @@ fn offer(config: &Config) -> Result<wire::Hello> {
     let identity = ServiceIdentity::new(SERVICE_ID, "kache", "shared", instance)?;
     Ok(wire::Hello::new(
         &identity,
-        capability::HEALTH | capability::HEALTH_DETAILS | capability::DRAIN,
-        capability::HEALTH | capability::HEALTH_DETAILS,
+        CONTROL_SUPPORTED,
+        CONTROL_REQUIRED,
     ))
 }
 
@@ -84,6 +88,9 @@ pub(super) async fn serve(config: &Config, lifecycle: Arc<Lifecycle>) -> Result<
                     let offer = offer.clone();
                     connections.spawn(async move {
                         let _permit = permit;
+                        #[cfg(unix)]
+                        if crate::transport::require_self_peer(crate::transport::peer_euid(&stream)).is_err() { return; }
+                        #[cfg(windows)]
                         if authenticate(&stream).is_err() { return; }
                         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
                         let _ = handler.serve(&stream, &offer, deadline).await;
@@ -103,20 +110,14 @@ pub(super) async fn serve(config: &Config, lifecycle: Arc<Lifecycle>) -> Result<
     })
 }
 
+#[cfg(windows)]
 fn authenticate(stream: &TokioStream) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        crate::transport::require_self_peer(crate::transport::peer_euid(stream))
-    }
-    #[cfg(windows)]
-    {
-        use interprocess::local_socket::traits::StreamCommon as _;
-        let pid = stream
-            .peer_creds()?
-            .pid()
-            .ok_or(std::io::ErrorKind::PermissionDenied)?;
-        kunobi_daemon::local::windows::verify_process_user(pid)
-    }
+    use interprocess::local_socket::traits::StreamCommon as _;
+    let pid = stream
+        .peer_creds()?
+        .pid()
+        .ok_or(std::io::ErrorKind::PermissionDenied)?;
+    kunobi_daemon::local::windows::verify_process_user(pid)
 }
 
 /// None means no binary endpoint was advertised. Any binary failure is final;
@@ -147,7 +148,6 @@ pub(super) fn request(
         .context("negotiating lifecycle control")?;
     let request = wire::Control {
         operation,
-        request_id: 1,
         ..Default::default()
     };
     session
@@ -222,6 +222,26 @@ pub(super) fn legacy_request(path: &Path, request: &Request, deadline: Instant) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn control_negotiation_requires_typed_health_and_advertises_drain() {
+        use wire::capability;
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let local = offer(&config).unwrap();
+        assert_eq!(
+            local.supported,
+            capability::HEALTH | capability::HEALTH_DETAILS | capability::DRAIN
+        );
+        assert_eq!(
+            local.required,
+            capability::HEALTH | capability::HEALTH_DETAILS
+        );
+        let mut peer = local.clone();
+        peer.supported = capability::HEALTH;
+        peer.required = capability::HEALTH;
+        assert!(wire::negotiate(&local, &peer).is_err());
+    }
+
     async fn query(config: &Config, operation: u32) -> Result<Option<wire::Health>> {
         let config = config.clone();
         tokio::task::spawn_blocking(move || {
@@ -255,6 +275,13 @@ mod tests {
         );
         server.service.mark_ready();
         assert!(starter.await.unwrap().unwrap());
+        let health_config = config.clone();
+        let health = tokio::task::spawn_blocking(move || send_health_request(&health_config))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.version, VERSION);
+        assert_eq!(health.build_epoch, build_epoch());
         let pending = lifecycle.begin().unwrap();
         assert!(
             query(&config, operation::HEALTH)
@@ -279,6 +306,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dropping_control_server_releases_the_listener_and_handler() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let server = serve(&config, Arc::new(Lifecycle::default()))
+            .await
+            .unwrap();
+        let handler = Arc::downgrade(&server.service);
+        tokio::task::yield_now().await;
+        drop(server);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handler.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped control server leaked its listener task");
+        let mut replacement = serve(&config, Arc::new(Lifecycle::default()))
+            .await
+            .unwrap();
+        replacement.finish().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_exit_preserves_the_drain_acknowledgement() {
         let root = tempfile::tempdir().unwrap();
@@ -289,11 +339,16 @@ mod tests {
         coord.control_version = Some(wire::VERSION);
         coord.write_phase(DaemonPhase::Ready).unwrap();
         server.service.mark_ready();
+        let probe_config = config.clone();
         let client = tokio::spawn(async move { query(&config, operation::DRAIN).await });
         tokio::time::timeout(Duration::from_secs(3), lifecycle.draining())
             .await
             .unwrap();
         server.finish().await;
+        assert!(
+            query(&probe_config, operation::HEALTH).await.is_err(),
+            "finished server still accepts control requests"
+        );
         drop(server);
         let acknowledged = client.await.unwrap().unwrap().unwrap();
         assert!(acknowledged.draining);
@@ -311,12 +366,71 @@ mod tests {
         coord.pid = std::process::id().saturating_add(1);
         coord.write_phase(DaemonPhase::Starting).unwrap();
         assert!(query(&config, operation::DRAIN).await.is_err());
+        let probe_config = config.clone();
+        let failure = tokio::task::spawn_blocking(move || {
+            lifecycle_client::current(&probe_config, Instant::now() + Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .expect_err("identity mismatch must not become a retryable startup observation");
+        assert!(
+            failure
+                .to_string()
+                .contains("differs from advertised process")
+        );
         assert!(lifecycle.accepting_calls());
         let other = super::super::tests::test_config(&root.path().join("another-cache"));
         assert!(wire::negotiate(&offer(&config).unwrap(), &offer(&other).unwrap()).is_err());
         let mut foreign = offer(&config).unwrap();
         foreign.service_id[0] ^= 1;
         assert!(wire::negotiate(&offer(&config).unwrap(), &foreign).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_control_distinguishes_truncation_from_oversized_responses() {
+        use std::io::{BufRead, Write};
+        for (payload, expected) in [
+            (b"partial".to_vec(), std::io::ErrorKind::UnexpectedEof),
+            (vec![b'x'; 1 << 16], std::io::ErrorKind::InvalidData),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("legacy.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = String::new();
+                    std::io::BufReader::new(&stream)
+                        .read_line(&mut request)
+                        .unwrap();
+                    assert!(request.ends_with('\n'));
+                    stream.write_all(&payload).unwrap();
+                }
+            });
+            let error = legacy_request(
+                &socket,
+                &Request::Health,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                expected
+            );
+            let health =
+                lifecycle_client::current_socket(&socket, Instant::now() + Duration::from_secs(2));
+            match expected {
+                std::io::ErrorKind::InvalidData => {
+                    assert!(health.is_err(), "invalid frame is not retryable")
+                }
+                _ => assert!(
+                    health.unwrap().is_none(),
+                    "closed legacy peer may still be starting"
+                ),
+            }
+            server.join().unwrap();
+        }
     }
 
     #[cfg(unix)]

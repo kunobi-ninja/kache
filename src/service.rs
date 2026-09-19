@@ -546,7 +546,8 @@ fn configured_instance_matches(
 ///
 /// Returns `Ok(false)` if no service is installed on this platform.
 pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         let plist = plist_path();
         if !plist.exists() {
             return Ok(false);
@@ -563,7 +564,9 @@ pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
             anyhow::bail!("launchctl kickstart {target} failed: {stderr}");
         }
         Ok(true)
-    } else if cfg!(target_os = "linux") {
+    }
+    #[cfg(target_os = "linux")]
+    {
         let unit = unit_path();
         if !unit.exists() {
             return Ok(false);
@@ -578,7 +581,9 @@ pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
             anyhow::bail!("systemctl --user start {UNIT_NAME} failed: {stderr}");
         }
         Ok(true)
-    } else if cfg!(windows) {
+    }
+    #[cfg(windows)]
+    {
         let installed = command_output_until(
             std::process::Command::new("schtasks").args(["/query", "/tn", TASK_NAME]),
             deadline,
@@ -596,7 +601,10 @@ pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
             anyhow::bail!("schtasks /run {TASK_NAME} failed: {stderr}");
         }
         Ok(true)
-    } else {
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = deadline;
         Ok(false)
     }
 }
@@ -1082,6 +1090,25 @@ mod tests {
         } else if cfg!(target_os = "linux") {
             fs::write(path, format!("ExecStart={} daemon run\n", exe.display())).unwrap();
         }
+    }
+
+    #[test]
+    fn login_service_configuration_distinguishes_missing_from_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("cache");
+        let file = root.path().join("config.toml");
+        assert!(
+            configured_instance_matches(&store.join("daemon.sock"), store.clone(), [file.clone()])
+                .unwrap()
+        );
+        std::fs::create_dir(&file).unwrap();
+        let error =
+            configured_instance_matches(&store.join("daemon.sock"), store, [file]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reading login service configuration")
+        );
     }
 
     #[test]

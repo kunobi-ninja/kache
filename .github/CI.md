@@ -63,6 +63,16 @@ packaging validation do not require upstream release credentials.
 To publish a separately maintained distribution, configure its destinations
 and credentials and review the publication guards for that repository.
 
+## Windows release cache
+
+Windows release jobs restore a pinned Microsoft CRT and SDK prepared on
+`main` by `warm-windows-sysroot.yml`. The warmer runs when its workflow changes,
+weekly, or by manual dispatch. It runs only in `kunobi-ninja/kache`.
+
+The shared action checks the SDK layout and file digests before reuse. A
+cache miss downloads and prepares the SDK again. Release tags only restore;
+the default-branch warmer saves the cache so later tags can read it.
+
 ## Which jobs a pull request runs
 
 `Detect changes` classifies the files a pull request touches with

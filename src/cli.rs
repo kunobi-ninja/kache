@@ -3098,18 +3098,24 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     Ok(combined)
 }
 
-/// The detached worker the wrapper spawns under size pressure: sweep, wait
-/// `retry_delay` for entries pinned by live builds to age out, sweep again,
-/// then record where the store ended so the wrapper backs off while it stays
-/// over budget. A worker whose sweeps both lost `gc.lock` to another driver
-/// leaves the backoff to that driver's worker.
+/// The detached worker the wrapper spawns under size pressure when no daemon
+/// takes its hint: sweep, and if live builds pinned entries (or another
+/// driver held `gc.lock`), wait `retry_delay` for them to age out and sweep
+/// again. The worker exits afterwards, so this is its only later chance. It
+/// then records where the store ended so every automatic driver backs off
+/// while it stays over budget. A worker whose sweeps both lost `gc.lock`
+/// leaves the backoff to the driver that held it.
 pub fn run_auto_gc_worker(config: &Config, retry_delay: std::time::Duration) {
-    let first = run_gc_local(config, GcMode::Background);
-    std::thread::sleep(retry_delay);
-    let second = run_gc_local(config, GcMode::Background);
-    let swept = [first, second]
-        .iter()
-        .any(|run| run.as_ref().is_ok_and(|stats| !stats.skipped));
+    let first = auto_gc_worker_sweep(config);
+    let second = first
+        .as_ref()
+        .is_some_and(auto_gc_retry_wanted)
+        .then(|| {
+            std::thread::sleep(retry_delay);
+            auto_gc_worker_sweep(config)
+        })
+        .flatten();
+    let swept = [first, second].iter().flatten().any(|stats| !stats.skipped);
     if !swept {
         return;
     }
@@ -3117,6 +3123,25 @@ pub fn run_auto_gc_worker(config: &Config, retry_delay: std::time::Duration) {
         Ok(size) => crate::wrapper::record_auto_gc_outcome(config, size),
         Err(e) => tracing::debug!("auto-gc: store size after the sweep unknown: {e:#}"),
     }
+}
+
+/// One worker sweep, if the shared trigger still calls for it. The wrapper
+/// checked before spawning, but a daemon that acknowledged the hint too late
+/// may have swept since, and the first sweep may have cleared the pressure.
+fn auto_gc_worker_sweep(config: &Config) -> Option<crate::store::GcStats> {
+    let size = Store::open(config)
+        .and_then(|store| store.physical_size())
+        .ok()?;
+    if !crate::wrapper::auto_gc_sweep_due(config, size) {
+        return None;
+    }
+    run_gc_local(config, GcMode::Background).ok()
+}
+
+/// Whether a second worker sweep can do better than the first: only when the
+/// first left entries a live build pinned, or never got `gc.lock`.
+fn auto_gc_retry_wanted(first: &crate::store::GcStats) -> bool {
+    first.skipped || first.entries_pinned > 0
 }
 
 fn skipped_gc_stats() -> crate::store::GcStats {
@@ -7068,6 +7093,18 @@ mod tests {
         let line = cloned_targets_line(&disk).expect("cloned blocks need a summary");
         assert!(line.contains("3 B"), "{line}");
         assert!(line.contains("7 B"), "{line}");
+    }
+
+    #[test]
+    fn auto_gc_worker_retries_after_pins_or_a_lost_lock() {
+        let swept_clean = crate::store::GcStats::default();
+        assert!(!auto_gc_retry_wanted(&swept_clean));
+        assert!(auto_gc_retry_wanted(&skipped_gc_stats()));
+        let pinned = crate::store::GcStats {
+            entries_pinned: 1,
+            ..crate::store::GcStats::default()
+        };
+        assert!(auto_gc_retry_wanted(&pinned));
     }
 
     #[test]

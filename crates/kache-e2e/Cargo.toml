@@ -1,6 +1,6 @@
 [package]
 name = "kache-e2e"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/kunobi-ninja/kache"
@@ -39,4 +39,4 @@ toml = "1"
 warnings = "deny"
 
 [dev-dependencies]
-kache-fs = { version = "0.25.0", path = "../kache-fs", features = ["testing"] }
+kache-fs = { version = "0.26.0", path = "../kache-fs", features = ["testing"] }

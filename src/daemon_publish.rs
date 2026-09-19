@@ -311,11 +311,9 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
             );
         }
     }
-    // The wrapper measured everything up to the hand-off; add what the put
-    // cost here, so the phase totals still add up to the wrapper's overhead.
-    event.store_ms = event
-        .store_ms
-        .saturating_add(store_started.elapsed().as_millis() as u64);
+    // This work overlaps later compiles. Keep it out of the wrapper's
+    // synchronous store phase and report it separately.
+    event.daemon_store_ms = store_started.elapsed().as_millis() as u64;
     event.store_handed_off = true;
     // The put has its own copy (staged then published); the snapshots are
     // done. Drop the lock only after the files are gone: a peer that takes

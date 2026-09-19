@@ -10790,6 +10790,7 @@ mod tests {
             passthrough_reason: String::new(),
             store_error: String::new(),
             store_handed_off: false,
+            daemon_store_ms: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,

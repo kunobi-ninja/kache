@@ -47,6 +47,7 @@ pub struct BuildEvent {
     /// 17 = wrapper phase timings: startup, dep-info pre-pass, scheduler wait.
     /// 19 = fallback attempt and recovery details.
     /// 20 = per-key first-demand timestamps and remote-check wait.
+    /// 21 = daemon publication and its background store time.
     #[serde(default)]
     pub schema: u32,
     /// Build session this event belongs to (kunobi-ninja/kache#583 P0.5).
@@ -221,6 +222,9 @@ pub struct BuildEvent {
     /// (`daemon_publish`); the store fields above are the daemon's. Schema 20.
     #[serde(default, skip_serializing_if = "is_false")]
     pub store_handed_off: bool,
+    /// Background publication time; excluded from wrapper phase totals.
+    #[serde(default)]
+    pub daemon_store_ms: u64,
     /// Why an existing entry for this exact key was rejected before the
     /// compiler ran (kunobi-ninja/kache#655).
     ///
@@ -1499,6 +1503,7 @@ impl BuildEvent {
             passthrough_reason: String::new(),
             store_error: String::new(),
             store_handed_off: false,
+            daemon_store_ms: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,
@@ -1658,6 +1663,7 @@ mod tests {
             passthrough_reason: String::new(),
             store_error: String::new(),
             store_handed_off: false,
+            daemon_store_ms: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,

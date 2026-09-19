@@ -1513,6 +1513,74 @@ impl BuildEvent {
 mod tests {
     use super::*;
 
+    // Linux rejects fsync on a FIFO; macOS accepts it without an error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn summary_durability_reports_sync_failure_after_writing_and_releases_lock() {
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        const CHILD_LOG: &str = "KACHE_TEST_SUMMARY_SYNC_FAILURE_LOCK";
+        if let Some(path) = std::env::var_os(CHILD_LOG) {
+            let lock = open_log_lock(Path::new(&path)).unwrap();
+            lock.try_lock()
+                .expect("failed append must release its lock");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("summaries.jsonl");
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the CString is a valid, terminated path for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // Opening the reader without blocking lets append open its writer
+        // immediately. Each small line fits in an empty pipe and is drained
+        // before the next append; no reader thread or blocking read is needed.
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let event: BuildSummaryEvent =
+            serde_json::from_str(r#"{"ts":"2026-09-20T00:00:00Z","schema":2}"#).unwrap();
+        let expected = format!("{}\n", serde_json::to_string(&event).unwrap());
+        assert!(expected.len() <= 512, "must fit the minimum Unix PIPE_BUF");
+
+        log_summary(&path, &event).unwrap();
+        let mut received = String::new();
+        reader.read_to_string(&mut received).unwrap();
+        assert_eq!(received, expected);
+
+        let error = log_summary_durable(&path, &event).unwrap_err();
+        assert_eq!(error.to_string(), "flushing summary event to disk");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        received.clear();
+        reader.read_to_string(&mut received).unwrap();
+        assert_eq!(received, expected, "sync fails after the full append");
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "events::tests::summary_durability_reports_sync_failure_after_writing_and_releases_lock",
+            ])
+            .env(CHILD_LOG, &path)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "lock probe failed: {}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
     fn test_event(
         crate_name: &str,
         result: EventResult,

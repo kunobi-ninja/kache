@@ -90,7 +90,11 @@ On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CAC
 
 By default, GC keeps an entry when removing its last store name would reclaim zero bytes. This preserves a usable cache hit. It also means the registered store size can remain above `local_max_size` until the target output is removed. `kache gc` reports these entries as unreclaimable and separates store bytes removed from disk bytes reclaimed.
 
-When an automatic sweep leaves the store over budget, the next automatic sweep waits 10 minutes. Each further sweep that ends over budget doubles the wait, up to 2 hours. The wait ends early when the store grows by more than 10% of `local_max_size`, and resets once a sweep brings the store back under budget. The state lives in `auto-gc-backoff.json` in the cache dir. `kache gc` ignores it.
+Automatic eviction has one trigger. A sweep starts when the store is above 110% of `local_max_size` and evicts down to 90%. Three things can ask for one: a build that has just stored an entry (checked at most every 5 minutes), the daemon after an upload, and the daemon's 6-hour sweep. All three use the same trigger. `kache gc` still evicts from 100%.
+
+While a daemon is running, it does the sweeping. A build that finds the store over the trigger sends the daemon a hint and continues; it does not wait for the sweep, and it never starts a daemon for this. Hints that arrive during a sweep are dropped. With no daemon, or a daemon too old to know the hint, the build starts a detached `kache gc` as before. That worker sweeps a second time two minutes later only if the first sweep had to skip entries a running build was using.
+
+Every automatic sweep records where it left the store, whichever of the three started it. When an automatic sweep leaves the store over budget, the next automatic sweep waits 10 minutes. Each further sweep that ends over budget doubles the wait, up to 2 hours. The wait ends early when the store grows by more than 10% of `local_max_size`, and resets once a sweep brings the store back under budget. The wait applies to all three, so one sweep that cannot free enough holds the others back too. The 6-hour sweep still expires entries by `cache.gc_max_age_hours` and removes duplicates during a wait; only its size eviction is skipped. The state lives in `auto-gc-backoff.json` in the cache dir. `kache gc` ignores it.
 
 A sweep pauses for 150 ms after every 50 ms of index writes, and after each removal that finds a build holding the index write lock, so builds storing entries are not held up by it.
 

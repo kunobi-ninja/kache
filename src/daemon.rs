@@ -409,6 +409,11 @@ pub(crate) enum Request {
     /// Policy-v2 GC command. Older daemons reject this unknown variant before
     /// mutation, closing the capability-probe/replacement race.
     GcV2(GcRequest),
+    /// A wrapper saw the store over the automatic trigger. The daemon
+    /// acknowledges at once and sweeps in the background; hints that arrive
+    /// meanwhile coalesce. Older daemons reject the unknown variant, and the
+    /// wrapper then spawns its own worker.
+    GcHint,
     RemoteCheck(RemoteCheckRequest),
     Stats(StatsRequest),
     Health,
@@ -731,6 +736,15 @@ pub enum GcRequestMode {
     Legacy,
     Automatic,
     ExplicitAge,
+}
+
+/// Who started a daemon sweep. It decides only the size pass: a requested
+/// `kache gc` always runs it, the timer asks the shared trigger and backoff
+/// like every other automatic driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GcDriver {
+    Requested,
+    Periodic,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2335,6 +2349,8 @@ pub(crate) struct Daemon {
     /// When the last build request arrived. Index compaction waits for a
     /// gap here, because a build made of cache hits holds no compile permit.
     request_clock: Arc<crate::maintenance::RequestClock>,
+    /// Set while a hinted sweep is queued or running; further hints coalesce.
+    gc_hint_pending: AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2461,6 +2477,7 @@ impl Daemon {
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
+            gc_hint_pending: AtomicBool::new(false),
             config,
         }
     }
@@ -2923,6 +2940,12 @@ impl Daemon {
     pub fn handle_request_sync(&self, req: &Request) -> Response {
         match req {
             Request::Gc(gc) | Request::GcV2(gc) => self.handle_gc(gc),
+            Request::GcHint => {
+                if self.claim_gc_hint() {
+                    self.run_hinted_sweep();
+                }
+                Response::ok()
+            }
             Request::Stats(sr) => self.handle_stats(sr),
             Request::Health => self.handle_health(),
             Request::HashFiles(req) => self.handle_hash_files(req),
@@ -3401,7 +3424,7 @@ impl Daemon {
             Ok(policy) => policy,
             Err(e) => return Response::err(format!("invalid GC request: {e}")),
         };
-        match self.run_gc(policy) {
+        match self.run_gc(policy, GcDriver::Requested) {
             Ok(report) if report.total.skipped => Response::ok_gc_skipped(report.breakdown()),
             Ok(report) => Response::ok_gc(report.total.entries_evicted, report.breakdown()),
             Err(e) => Response::err(format!("gc failed: {e}")),
@@ -5698,50 +5721,108 @@ impl Daemon {
             .await
     }
 
-    /// After a successful upload, check if store exceeds max_size → LRU eviction.
+    /// After a successful upload: sweep if the store is under size pressure.
     fn maybe_evict_after_upload(&self) {
-        let _ = (|| -> Result<()> {
-            let Some((_gc_lock, size)) = self.with_store(|store| {
-                let Some(lock) = store.try_gc_lock()? else {
-                    return Ok(None);
-                };
-                // The size check is cheap; release the daemon's Store mutex
-                // before the long eviction scan and per-entry removals.
-                Ok(Some((lock, store.physical_size()?)))
-            })?
-            else {
-                tracing::debug!("gc.lock held by another GC; skipping upload-triggered eviction");
-                return Ok(());
-            };
-            // A store the last sweep could not bring under budget stays over
-            // it after every upload; sweeping again per upload frees nothing.
-            if size > self.config.max_size
-                && !crate::wrapper::auto_gc_backing_off(&self.config, size)
-            {
-                tracing::info!(
-                    "store size {} > max {}, running LRU eviction",
-                    size,
-                    self.config.max_size
-                );
-                // Under gc.lock like every driver, so the totals cannot race.
-                let store = Store::open(&self.config)?;
-                let started = Instant::now();
-                if let Ok(mut stats) = store.evict() {
-                    stats.duration_ms = started.elapsed().as_millis() as u64;
-                    if let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats) {
-                        tracing::warn!("recording upload-triggered GC run: {e:#}");
-                    }
-                    if let Ok(after) = store.physical_size() {
-                        crate::wrapper::record_auto_gc_outcome(&self.config, after);
-                    }
-                }
+        let _ = self.sweep_under_size_pressure();
+    }
+
+    /// Claim the hinted sweep. False while one is queued or running: that
+    /// sweep measures the store when it starts, so it covers this hint too.
+    fn claim_gc_hint(&self) -> bool {
+        !self.gc_hint_pending.swap(true, Ordering::SeqCst)
+    }
+
+    /// A wrapper's size-pressure hint: acknowledge now, sweep on the blocking
+    /// pool (#281). One sweep, where the wrapper's own worker sweeps twice:
+    /// that worker exits and has no later chance at entries a live build
+    /// pins, while the daemon sweeps again on the next hint or upload after
+    /// the backoff.
+    fn handle_gc_hint(self: &Arc<Self>) -> Response {
+        if self.claim_gc_hint() {
+            let daemon = Arc::clone(self);
+            tokio::task::spawn_blocking(move || daemon.run_hinted_sweep());
+        }
+        Response::ok()
+    }
+
+    fn run_hinted_sweep(&self) {
+        // Released on unwind too, or one panic would swallow every later hint.
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
             }
-            Ok(())
-        })();
+        }
+        let _release = Release(&self.gc_hint_pending);
+        if let Err(e) = self.sweep_under_size_pressure() {
+            tracing::warn!("hinted GC sweep failed: {e:#}");
+        }
+    }
+
+    /// The sweep behind the post-upload check and wrapper hints. Skips when
+    /// another driver holds `gc.lock`, the store is under the trigger, or the
+    /// backoff holds; each costs a lock attempt and one size query.
+    fn sweep_under_size_pressure(&self) -> Result<()> {
+        let Some((_gc_lock, size)) = self.with_store(|store| {
+            let Some(lock) = store.try_gc_lock()? else {
+                return Ok(None);
+            };
+            // The size check is cheap; release the daemon's Store mutex
+            // before the long eviction scan and per-entry removals.
+            Ok(Some((lock, store.physical_size()?)))
+        })?
+        else {
+            tracing::debug!("gc.lock held by another GC; skipping size-pressure eviction");
+            return Ok(());
+        };
+        if !crate::wrapper::auto_gc_sweep_due(&self.config, size) {
+            return Ok(());
+        }
+        // Under gc.lock like every driver, so the totals cannot race.
+        let store = Store::open(&self.config)?;
+        let stats = self.automatic_size_pass(&store, size)?;
+        if let Err(e) = crate::report::record_gc_run(&self.config, "daemon", &stats) {
+            tracing::warn!("recording size-pressure GC run: {e:#}");
+        }
+        Ok(())
+    }
+
+    /// The size pass of an automatic sweep the shared trigger found due.
+    /// Records where the store ended, so a sweep that could not clear the
+    /// pressure backs off every automatic driver. Caller holds `gc.lock`.
+    fn automatic_size_pass(&self, store: &Store, size: u64) -> Result<crate::store::GcStats> {
+        tracing::info!(
+            "store size {} over the automatic trigger (max {}), running LRU eviction",
+            size,
+            self.config.max_size
+        );
+        let started = Instant::now();
+        let mut stats = store.evict()?;
+        stats.duration_ms = started.elapsed().as_millis() as u64;
+        if let Ok(after) = store.physical_size() {
+            crate::wrapper::record_auto_gc_outcome(&self.config, after);
+        }
+        Ok(stats)
+    }
+
+    /// The size pass of a full sweep. A requested `kache gc` always runs it
+    /// and leaves the backoff alone. The timer runs it only when the shared
+    /// trigger says a sweep is due; its age and duplicate passes are not
+    /// size pressure and stay on schedule.
+    fn size_pass(&self, driver: GcDriver, store: &Store) -> Result<crate::store::GcStats> {
+        if driver == GcDriver::Requested {
+            return store.evict();
+        }
+        let size = store.physical_size()?;
+        if !crate::wrapper::auto_gc_sweep_due(&self.config, size) {
+            tracing::info!("periodic GC: size pass not due (under the trigger or backing off)");
+            return Ok(crate::store::GcStats::default());
+        }
+        self.automatic_size_pass(store, size)
     }
 
     /// Core GC logic with an explicit policy and per-policy result accounting.
-    fn run_gc(&self, policy: GcPolicy) -> Result<GcRunReport> {
+    fn run_gc(&self, policy: GcPolicy, driver: GcDriver) -> Result<GcRunReport> {
         let start = Instant::now();
         let mode = policy.mode();
         // Cross-process GC mutual exclusion (kunobi-ninja/kache#326): if another
@@ -5844,7 +5925,7 @@ impl Daemon {
                             crate::store::GcStats::default()
                         };
                         let duplicate_stats = store.evict_duplicate_entries().unwrap_or_default();
-                        let size_stats = store.evict()?;
+                        let size_stats = self.size_pass(driver, store)?;
                         (duplicate_stats, age_stats, size_stats)
                     }
                 };
@@ -6305,9 +6386,12 @@ async fn server_main(
             // the accept loop and in-flight RemoteCheck stay responsive (#281).
             let gc = gc_daemon.clone();
             match tokio::task::spawn_blocking(move || {
-                gc.run_gc(GcPolicy::Automatic {
-                    max_age_hours: gc.config.gc_max_age_hours,
-                })
+                gc.run_gc(
+                    GcPolicy::Automatic {
+                        max_age_hours: gc.config.gc_max_age_hours,
+                    },
+                    GcDriver::Periodic,
+                )
             })
             .await
             {
@@ -7492,6 +7576,7 @@ async fn handle_connection_started_at(
                 let d = Arc::clone(daemon);
                 offload(move || d.handle_gc(&req)).await
             }
+            Ok(Request::GcHint) => daemon.handle_gc_hint(),
             Ok(Request::RemoteCheck(req)) => {
                 daemon
                     .handle_remote_check_started_at(&req, request_started_at)
@@ -7739,6 +7824,31 @@ fn gc_outcome_from_response(resp: Response) -> Result<GcRequestOutcome> {
         skipped: resp.skipped,
         breakdown: resp.gc,
     })
+}
+
+/// How long a wrapper waits for the daemon to acknowledge a GC hint. The
+/// daemon answers before it sweeps, so this bounds a saturated daemon, never
+/// a sweep.
+const GC_HINT_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Tell a running daemon the store is under size pressure. True when the
+/// daemon took the hint and owns the sweep. False when no daemon listens, it
+/// predates the hint, or it did not answer in time; the caller then sweeps
+/// itself. Never starts a daemon: [`send_gc_request`] probes stats, starts
+/// one and waits out the whole sweep, none of which a compile may pay for.
+pub fn send_gc_hint(config: &Config) -> bool {
+    gc_hint_accepted(send_request_with_timeout(
+        &config.socket_path(),
+        &Request::GcHint,
+        GC_HINT_ACK_TIMEOUT,
+    ))
+}
+
+fn gc_hint_accepted(reply: Result<String>) -> bool {
+    reply
+        .ok()
+        .and_then(|line| serde_json::from_str::<Response>(&line).ok())
+        .is_some_and(|resp| resp.ok)
 }
 
 /// Send a GC request to the daemon. Auto-starts daemon if needed.
@@ -11700,7 +11810,10 @@ mod tests {
         let worker_daemon = Arc::clone(&daemon);
         let worker = std::thread::spawn(move || {
             done_tx
-                .send(worker_daemon.run_gc(GcPolicy::Automatic { max_age_hours: 0 }))
+                .send(worker_daemon.run_gc(
+                    GcPolicy::Automatic { max_age_hours: 0 },
+                    GcDriver::Requested,
+                ))
                 .unwrap();
         });
 
@@ -11863,9 +11976,12 @@ mod tests {
 
         let daemon = Daemon::new(config);
         let stats = daemon
-            .run_gc(GcPolicy::Automatic {
-                max_age_hours: daemon.config.gc_max_age_hours,
-            })
+            .run_gc(
+                GcPolicy::Automatic {
+                    max_age_hours: daemon.config.gc_max_age_hours,
+                },
+                GcDriver::Requested,
+            )
             .unwrap();
         assert!(
             stats.total.entries_evicted > 0,
@@ -11904,9 +12020,12 @@ mod tests {
 
         let daemon = Daemon::new(config);
         let stats = daemon
-            .run_gc(GcPolicy::Automatic {
-                max_age_hours: daemon.config.gc_max_age_hours,
-            })
+            .run_gc(
+                GcPolicy::Automatic {
+                    max_age_hours: daemon.config.gc_max_age_hours,
+                },
+                GcDriver::Requested,
+            )
             .unwrap();
         assert_eq!(stats.total.entries_evicted, 1);
         let store = Store::open(&daemon.config).unwrap();
@@ -11941,9 +12060,12 @@ mod tests {
 
         let daemon = Daemon::new(config);
         let stats = daemon
-            .run_gc(GcPolicy::Automatic {
-                max_age_hours: daemon.config.gc_max_age_hours,
-            })
+            .run_gc(
+                GcPolicy::Automatic {
+                    max_age_hours: daemon.config.gc_max_age_hours,
+                },
+                GcDriver::Requested,
+            )
             .unwrap();
         assert_eq!(stats.total.entries_evicted, 0);
         let store = Store::open(&daemon.config).unwrap();
@@ -12055,38 +12177,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn upload_triggered_eviction_skips_at_exact_size_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = test_config(dir.path());
-        config.max_size = 200;
-
-        let src_file = dir.path().join("exact.rlib");
-        std::fs::write(&src_file, vec![0u8; 200]).unwrap();
-        let store = Store::open(&config).unwrap();
-        store
-            .put(
-                "exact_limit_key",
-                "testcrate",
-                &["lib".into()],
-                &[],
-                "host",
-                "dev",
-                &[(src_file.clone(), "lib.rlib".into())],
-                "",
-                "",
-            )
-            .unwrap();
-        std::fs::remove_file(src_file).unwrap();
-        store.set_last_accessed_for_test("exact_limit_key", "-1 hour");
-        assert_eq!(store.physical_size().unwrap(), config.max_size);
-
-        Daemon::new(config).maybe_evict_after_upload();
-
-        assert!(store.contains("exact_limit_key"));
-        assert!(crate::report::read_gc_stats(dir.path()).is_none());
-    }
-
     /// Upload-triggered eviction is a GC driver too: without a record, the
     /// evictions it makes (and the ones it fails) never reach gc_stats.json.
     #[test]
@@ -12186,6 +12276,295 @@ mod tests {
             store.contains("next"),
             "the next upload must not sweep again during the backoff"
         );
+    }
+
+    /// The post-upload check used to start at 100% of `max_size` while the
+    /// wrapper waited for 110%, so the two alternated on a store in between.
+    #[test]
+    fn upload_triggered_eviction_starts_one_byte_above_the_shared_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 1100, false);
+        assert_eq!(store.physical_size().unwrap(), 1100);
+        assert!(!crate::wrapper::auto_gc_sweep_due(&config, 1100));
+
+        let daemon = Daemon::new(config.clone());
+        daemon.maybe_evict_after_upload();
+        assert!(store.contains("at_the_trigger"));
+        assert!(crate::report::read_gc_stats(dir.path()).is_none());
+
+        put_upload_evict_entry(&store, dir.path(), "x", 1, false);
+        assert_eq!(store.physical_size().unwrap(), 1101);
+        assert!(crate::wrapper::auto_gc_sweep_due(&config, 1101));
+        daemon.maybe_evict_after_upload();
+        assert!(!store.contains("at_the_trigger"));
+        assert!(crate::report::read_gc_stats(dir.path()).is_some());
+    }
+
+    #[test]
+    fn upload_triggered_eviction_clears_the_backoff_once_the_store_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        put_upload_evict_entry(&store, dir.path(), "evictable", 1200, false);
+        crate::wrapper::record_auto_gc_outcome(&config, 1200);
+        crate::wrapper::expire_auto_gc_backoff_for_test(dir.path());
+
+        Daemon::new(config).maybe_evict_after_upload();
+        assert!(!store.contains("evictable"));
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn gc_hints_coalesce_while_a_sweep_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(dir.path()));
+        assert!(daemon.claim_gc_hint());
+        assert!(!daemon.claim_gc_hint(), "a pending sweep covers this hint");
+        daemon.run_hinted_sweep();
+        assert!(
+            daemon.claim_gc_hint(),
+            "a finished sweep releases the claim"
+        );
+    }
+
+    #[test]
+    fn a_gc_hint_sweeps_under_size_pressure_and_honours_the_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        for i in 0..6 {
+            put_upload_evict_entry(&store, dir.path(), &format!("retained_{i}"), 200, true);
+        }
+        put_upload_evict_entry(&store, dir.path(), "evictable", 50, false);
+
+        let daemon = Daemon::new(config);
+        assert!(daemon.handle_request_sync(&Request::GcHint).ok);
+        assert!(!store.contains("evictable"));
+        assert_eq!(
+            crate::report::read_gc_stats(dir.path()).unwrap().source,
+            "daemon"
+        );
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
+            Some(600),
+            "a hinted sweep that leaves the store over budget records the backoff"
+        );
+
+        put_upload_evict_entry(&store, dir.path(), "next", 50, false);
+        assert!(daemon.handle_request_sync(&Request::GcHint).ok);
+        assert!(
+            store.contains("next"),
+            "a hint during the backoff is a no-op"
+        );
+
+        crate::wrapper::expire_auto_gc_backoff_for_test(dir.path());
+        assert!(daemon.handle_request_sync(&Request::GcHint).ok);
+        assert!(!store.contains("next"));
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
+            Some(1200)
+        );
+    }
+
+    #[test]
+    fn a_gc_hint_does_nothing_at_the_trigger_and_clears_the_backoff_once_the_store_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 1100, false);
+        let daemon = Daemon::new(config.clone());
+        assert!(daemon.handle_request_sync(&Request::GcHint).ok);
+        assert!(store.contains("at_the_trigger"));
+
+        put_upload_evict_entry(&store, dir.path(), "x", 1, false);
+        crate::wrapper::record_auto_gc_outcome(&config, 1101);
+        crate::wrapper::expire_auto_gc_backoff_for_test(dir.path());
+        assert!(daemon.handle_request_sync(&Request::GcHint).ok);
+        assert!(!store.contains("at_the_trigger"));
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn gc_hint_wire_name_and_ack_timeout_are_pinned() {
+        assert_eq!(
+            serde_json::to_string(&Request::GcHint).unwrap(),
+            "\"gc_hint\""
+        );
+        assert!(Request::GcHint.is_build_activity());
+        assert_eq!(GC_HINT_ACK_TIMEOUT, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_gc_hint_counts_as_accepted_only_on_an_ok_reply() {
+        assert!(gc_hint_accepted(Ok("{\"ok\":true}\n".into())));
+        // A daemon from before the hint rejects the unknown request.
+        assert!(!gc_hint_accepted(Ok(
+            "{\"ok\":false,\"error\":\"invalid request\"}\n".into()
+        )));
+        assert!(!gc_hint_accepted(Ok("not json".into())));
+        assert!(!gc_hint_accepted(Err(anyhow::anyhow!("timed out"))));
+    }
+
+    #[test]
+    fn send_gc_hint_reports_no_daemon_without_starting_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        assert!(!send_gc_hint(&config));
+        assert!(!crate::transport::is_reachable(&config.socket_path()));
+    }
+
+    /// The daemon acknowledges the hint before it sweeps, then sweeps off the
+    /// connection.
+    #[tokio::test]
+    async fn send_gc_hint_is_acknowledged_and_the_daemon_sweeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let socket_path = config.socket_path();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let store = Store::open(&config).unwrap();
+        put_upload_evict_entry(&store, dir.path(), "evictable", 1200, false);
+
+        let listener = bind_listener(&socket_path);
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            handle_connection(stream, &daemon, &AtomicBool::new(false), &Notify::new())
+                .await
+                .expect("handle_connection");
+        });
+
+        let cfg = config.clone();
+        let accepted = tokio::task::spawn_blocking(move || send_gc_hint(&cfg))
+            .await
+            .unwrap();
+        assert!(accepted);
+        // Bounded: if no hint ever reached the socket, `accept` would wait
+        // forever and the test would hang instead of failing.
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the daemon never received the hint")
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.contains("evictable") {
+            assert!(Instant::now() < deadline, "the hinted sweep never ran");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Entries for the periodic-sweep tests: a store over budget on retained
+    /// bytes, one entry past the age policy and one idle entry a size pass
+    /// would evict.
+    fn seed_periodic_gc_store(config: &Config, dir: &Path) -> Store {
+        let store = Store::open(config).unwrap();
+        for i in 0..6 {
+            put_upload_evict_entry(&store, dir, &format!("retained_{i}"), 200, true);
+        }
+        put_upload_evict_entry(&store, dir, "old", 50, false);
+        store.set_last_accessed_for_test("old", "-48 hours");
+        put_upload_evict_entry(&store, dir, "idle", 50, false);
+        store
+    }
+
+    /// Age eviction is retention policy, not size pressure: it stays on the
+    /// timer while the size pass waits out the shared backoff.
+    #[test]
+    fn periodic_gc_skips_its_size_pass_under_the_backoff_and_still_expires_by_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = seed_periodic_gc_store(&config, dir.path());
+        crate::wrapper::record_auto_gc_outcome(&config, store.physical_size().unwrap());
+
+        let daemon = Daemon::new(config);
+        let policy = GcPolicy::Automatic { max_age_hours: 24 };
+        let report = daemon.run_gc(policy, GcDriver::Periodic).unwrap();
+        assert_eq!(report.age.entries_evicted, 1);
+        assert_eq!(report.size.entries_evicted, 0);
+        assert!(!store.contains("old"));
+        assert!(
+            store.contains("idle"),
+            "the size pass waits out the backoff"
+        );
+
+        // `kache gc` ignores the backoff and leaves it as it found it.
+        let report = daemon.run_gc(policy, GcDriver::Requested).unwrap();
+        assert_eq!(report.size.entries_evicted, 1);
+        assert!(!store.contains("idle"));
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn periodic_gc_records_where_its_size_pass_left_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = seed_periodic_gc_store(&config, dir.path());
+
+        let daemon = Daemon::new(config.clone());
+        let policy = GcPolicy::Automatic { max_age_hours: 0 };
+        let report = daemon.run_gc(policy, GcDriver::Periodic).unwrap();
+        assert_eq!(report.size.entries_evicted, 2);
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
+            Some(600),
+            "the retained entries keep the store over budget"
+        );
+
+        crate::wrapper::expire_auto_gc_backoff_for_test(dir.path());
+        daemon.run_gc(policy, GcDriver::Periodic).unwrap();
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
+            Some(1200)
+        );
+
+        // Free the retained blobs: the next due sweep fits the store.
+        for i in 0..6 {
+            std::fs::remove_file(dir.path().join(format!("retained_{i}-target.rlib"))).unwrap();
+        }
+        crate::wrapper::expire_auto_gc_backoff_for_test(dir.path());
+        daemon.run_gc(policy, GcDriver::Periodic).unwrap();
+        assert!(store.physical_size().unwrap() <= 900);
+        assert_eq!(
+            crate::wrapper::auto_gc_backoff_interval_for_test(dir.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn periodic_gc_size_pass_starts_one_byte_above_the_shared_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 1000;
+        let store = Store::open(&config).unwrap();
+        put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 1100, false);
+
+        let daemon = Daemon::new(config);
+        let policy = GcPolicy::Automatic { max_age_hours: 0 };
+        let report = daemon.run_gc(policy, GcDriver::Periodic).unwrap();
+        assert_eq!(report.size.entries_evicted, 0);
+        assert!(store.contains("at_the_trigger"));
+
+        put_upload_evict_entry(&store, dir.path(), "x", 1, false);
+        let report = daemon.run_gc(policy, GcDriver::Periodic).unwrap();
+        assert!(report.size.entries_evicted >= 1);
+        assert!(!store.contains("at_the_trigger"));
     }
 
     #[test]
@@ -12351,9 +12730,12 @@ mod tests {
         let daemon = Daemon::new(config);
 
         let stats = daemon
-            .run_gc(GcPolicy::Automatic {
-                max_age_hours: daemon.config.gc_max_age_hours,
-            })
+            .run_gc(
+                GcPolicy::Automatic {
+                    max_age_hours: daemon.config.gc_max_age_hours,
+                },
+                GcDriver::Requested,
+            )
             .unwrap();
         assert_eq!(stats.total.entries_evicted, 0);
     }
@@ -12397,9 +12779,12 @@ mod tests {
 
         let daemon = Daemon::new(config.clone());
         let stats = daemon
-            .run_gc(GcPolicy::Automatic {
-                max_age_hours: daemon.config.gc_max_age_hours,
-            })
+            .run_gc(
+                GcPolicy::Automatic {
+                    max_age_hours: daemon.config.gc_max_age_hours,
+                },
+                GcDriver::Requested,
+            )
             .unwrap();
         assert_eq!(stats.total.entries_evicted, 0);
         assert!(!incremental_dir.exists());
@@ -12408,9 +12793,12 @@ mod tests {
         std::fs::write(incremental_dir.join("junk"), b"tmp2").unwrap();
 
         let stats = daemon
-            .run_gc(GcPolicy::Automatic {
-                max_age_hours: daemon.config.gc_max_age_hours,
-            })
+            .run_gc(
+                GcPolicy::Automatic {
+                    max_age_hours: daemon.config.gc_max_age_hours,
+                },
+                GcDriver::Requested,
+            )
             .unwrap();
         assert_eq!(stats.total.entries_evicted, 0);
         assert!(incremental_dir.exists());

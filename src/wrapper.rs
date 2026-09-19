@@ -288,6 +288,13 @@ pub(crate) fn warn_nonlocal_cache_fs_once(config: &Config) {
 // `kache gc` — the eviction itself never runs inside the compile hot path,
 // and `gc.lock` (kunobi-ninja/kache#326) serializes concurrent GC drivers so
 // racing wrappers cannot double-scan.
+//
+// Every automatic driver (this check, the daemon's post-upload check, its
+// hinted sweep and the size pass of its periodic sweep) asks
+// [`auto_gc_sweep_due`] whether to sweep and reports where the store ended
+// through [`record_auto_gc_outcome`], so they share one trigger and one
+// backoff (kunobi-ninja/kache#1127). With a daemon running the wrapper sweeps
+// nothing itself: it sends the daemon a hint.
 
 /// How often the wrapper is willing to re-run the store-size query. Between
 /// checks the hot-path cost is a single `stat()` on the stamp file.
@@ -308,7 +315,7 @@ fn auto_gc_backoff_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("auto-gc-backoff.json")
 }
 
-/// Size at which the wrapper spawns a background GC: `max_size` plus slack.
+/// Size above which an automatic sweep starts: `max_size` plus slack.
 fn auto_gc_threshold(max_size: u64) -> u64 {
     max_size.saturating_add(max_size / 100 * AUTO_GC_SLACK_PERCENT)
 }
@@ -390,7 +397,14 @@ pub(crate) fn auto_gc_backing_off(config: &Config, total: u64) -> bool {
     )
 }
 
-/// Called by the auto-GC worker after its sweeps: store the next backoff, or
+/// The start condition of every automatic sweep, whichever driver asks: the
+/// store is over the trigger and the last sweep left no backoff that still
+/// holds. `kache gc` does not ask.
+pub(crate) fn auto_gc_sweep_due(config: &Config, total: u64) -> bool {
+    total > auto_gc_threshold(config.max_size) && !auto_gc_backing_off(config, total)
+}
+
+/// Called by every automatic driver after a sweep: store the next backoff, or
 /// clear it once the store is back under the trigger.
 pub(crate) fn record_auto_gc_outcome(config: &Config, size_after: u64) {
     let path = auto_gc_backoff_path(&config.cache_dir);
@@ -415,6 +429,21 @@ pub(crate) fn record_auto_gc_outcome(config: &Config, size_after: u64) {
     {
         tracing::debug!("auto-gc: could not write {}: {e:#}", path.display());
     }
+}
+
+/// Test hook for the other drivers' tests: the recorded backoff interval.
+#[cfg(test)]
+pub(crate) fn auto_gc_backoff_interval_for_test(cache_dir: &Path) -> Option<u64> {
+    read_auto_gc_backoff(cache_dir).map(|backoff| backoff.interval_secs)
+}
+
+/// Test hook: move the recorded backoff into the past until it has expired.
+#[cfg(test)]
+pub(crate) fn expire_auto_gc_backoff_for_test(cache_dir: &Path) {
+    let mut backoff = read_auto_gc_backoff(cache_dir).expect("a recorded backoff");
+    backoff.since -= backoff.interval_secs;
+    let json = serde_json::to_vec(&backoff).unwrap();
+    std::fs::write(auto_gc_backoff_path(cache_dir), json).unwrap();
 }
 
 /// Throttle stamp for the auto-GC size check. Lives next to the store so all
@@ -453,8 +482,7 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
             return false;
         }
     };
-    let threshold = auto_gc_threshold(config.max_size);
-    if total <= threshold || auto_gc_backing_off(config, total) {
+    if !auto_gc_sweep_due(config, total) {
         let now_str = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
@@ -481,14 +509,41 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     true
 }
 
-/// Spawn a fully detached `kache gc` if [`auto_gc_wanted`] says so. Never
-/// waits on the child; stdio is null so it cannot pollute the compiler's
-/// output streams.
+/// After a store: if [`auto_gc_wanted`] says so, get a sweep started without
+/// waiting for it.
 fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
     let _trace = crate::phase_trace::phase("auto_gc_check");
+    run_auto_gc_check(
+        config,
+        store,
+        crate::daemon::send_gc_hint,
+        spawn_auto_gc_worker,
+    );
+}
+
+/// A running daemon owns automatic eviction, so it gets a hint and nothing is
+/// spawned. With no daemon, or one that does not know the hint, the detached
+/// worker sweeps. The throttle stamp covers both, so a build sends at most
+/// one hint per check interval.
+fn run_auto_gc_check(
+    config: &Config,
+    store: &Store,
+    hint_daemon: impl FnOnce(&Config) -> bool,
+    spawn_worker: impl FnOnce(&Config),
+) {
     if !auto_gc_wanted(config, store) {
         return;
     }
+    if hint_daemon(config) {
+        tracing::info!("auto-gc: handed the sweep to the daemon");
+        return;
+    }
+    spawn_worker(config);
+}
+
+/// Spawn a fully detached `kache gc`. Never waits on the child; stdio is null
+/// so it cannot pollute the compiler's output streams.
+fn spawn_auto_gc_worker(config: &Config) {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
@@ -7386,6 +7441,11 @@ mod tests {
             "a sweep that could not clear the pressure must not re-run at the next check"
         );
 
+        // The worker honours the backoff too: nothing to double yet.
+        crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
+        assert_eq!(auto_gc_backoff_interval_for_test(&cfg.cache_dir), Some(600));
+
+        expire_auto_gc_backoff_for_test(&cfg.cache_dir);
         crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
         assert_eq!(
             read_auto_gc_backoff(&cfg.cache_dir).unwrap().interval_secs,
@@ -7414,6 +7474,220 @@ mod tests {
         drop(gc_lock);
         crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
         assert!(read_auto_gc_backoff(&cfg.cache_dir).is_some());
+    }
+
+    /// Store an idle entry of exactly `size` bytes.
+    fn put_sized_entry(store: &Store, dir: &std::path::Path, key: &str, size: usize) {
+        let src = dir.join(format!("{key}.o"));
+        std::fs::write(&src, &key.as_bytes().repeat(size)[..size]).unwrap();
+        store
+            .put(
+                key,
+                "test-crate",
+                &[],
+                &[],
+                "host",
+                "dev",
+                &[(src.clone(), format!("{key}.o"))],
+                "",
+                "",
+            )
+            .unwrap();
+        // A source left behind can share the blob's blocks and retain it.
+        std::fs::remove_file(&src).unwrap();
+        store.set_last_accessed_for_test(key, "-1 hour");
+    }
+
+    /// Sweeps the recorder has seen, one line each.
+    fn recorded_gc_runs(cfg: &Config) -> usize {
+        std::fs::read_to_string(crate::report::gc_runs_log_path(&cfg.cache_dir))
+            .map_or(0, |log| log.lines().count())
+    }
+
+    #[test]
+    fn auto_gc_constants_are_pinned() {
+        assert_eq!(AUTO_GC_CHECK_INTERVAL.as_secs(), 300);
+        assert_eq!(AUTO_GC_SLACK_PERCENT, 10);
+        assert_eq!(AUTO_GC_MAX_BACKOFF.as_secs(), 7200);
+        // Start above 110% of max_size, stop at 90%.
+        assert_eq!(auto_gc_threshold(1000), 1100);
+        assert_eq!(kache_store::eviction::eviction_target(1000), 900);
+    }
+
+    #[test]
+    fn auto_gc_sweep_due_starts_above_the_trigger_and_honours_the_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1000;
+        assert!(!auto_gc_sweep_due(&cfg, 1099));
+        assert!(!auto_gc_sweep_due(&cfg, 1100));
+        assert!(auto_gc_sweep_due(&cfg, 1101));
+
+        record_auto_gc_outcome(&cfg, 1101);
+        assert!(!auto_gc_sweep_due(&cfg, 1101), "a held backoff defers");
+        assert!(!auto_gc_sweep_due(&cfg, 1201));
+        assert!(auto_gc_sweep_due(&cfg, 1202), "growth past the slack");
+        expire_auto_gc_backoff_for_test(&cfg.cache_dir);
+        assert!(auto_gc_sweep_due(&cfg, 1101));
+    }
+
+    #[test]
+    fn auto_gc_wanted_starts_one_byte_above_the_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1000;
+        let store = Store::open(&cfg).unwrap();
+        put_sized_entry(&store, dir.path(), "at-the-trigger", 1100);
+        assert_eq!(store.physical_size().unwrap(), 1100);
+        assert!(!auto_gc_wanted(&cfg, &store));
+
+        put_sized_entry(&store, dir.path(), "x", 1);
+        assert_eq!(store.physical_size().unwrap(), 1101);
+        expire_auto_gc_stamp(&cfg);
+        assert!(auto_gc_wanted(&cfg, &store));
+    }
+
+    #[test]
+    fn auto_gc_check_hints_a_reachable_daemon_and_spawns_no_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1024;
+        let store = Store::open(&cfg).unwrap();
+        put_test_entry(&store, dir.path(), "over-budget");
+        let daemon = RemoteCheckReplyDaemon::with_reply(
+            cfg.socket_path(),
+            serde_json::json!({ "ok": true }),
+        );
+        wait_until_reachable(&cfg.socket_path());
+
+        let spawned = AtomicUsize::new(0);
+        let spawn = |_: &Config| {
+            spawned.fetch_add(1, Ordering::SeqCst);
+        };
+        run_auto_gc_check(&cfg, &store, crate::daemon::send_gc_hint, spawn);
+        assert_eq!(daemon.request_count(), 1);
+        assert_eq!(spawned.load(Ordering::SeqCst), 0);
+
+        // A fresh stamp: the rest of the build sends nothing.
+        run_auto_gc_check(&cfg, &store, crate::daemon::send_gc_hint, spawn);
+        assert_eq!(daemon.request_count(), 1);
+        assert_eq!(spawned.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn auto_gc_check_spawns_the_worker_when_no_daemon_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1024;
+        let store = Store::open(&cfg).unwrap();
+        put_test_entry(&store, dir.path(), "over-budget");
+
+        let spawned = AtomicUsize::new(0);
+        let spawn = |_: &Config| {
+            spawned.fetch_add(1, Ordering::SeqCst);
+        };
+        run_auto_gc_check(&cfg, &store, crate::daemon::send_gc_hint, spawn);
+        assert_eq!(spawned.load(Ordering::SeqCst), 1);
+
+        run_auto_gc_check(&cfg, &store, crate::daemon::send_gc_hint, spawn);
+        assert_eq!(spawned.load(Ordering::SeqCst), 1, "fresh stamp");
+    }
+
+    /// A daemon from before the hint answers it with an error.
+    #[test]
+    fn auto_gc_check_spawns_the_worker_when_the_daemon_rejects_the_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1024;
+        let store = Store::open(&cfg).unwrap();
+        put_test_entry(&store, dir.path(), "over-budget");
+        let daemon = RemoteCheckReplyDaemon::with_reply(
+            cfg.socket_path(),
+            serde_json::json!({ "ok": false, "error": "invalid request: unknown variant" }),
+        );
+        wait_until_reachable(&cfg.socket_path());
+
+        let spawned = AtomicUsize::new(0);
+        run_auto_gc_check(&cfg, &store, crate::daemon::send_gc_hint, |_: &Config| {
+            spawned.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(daemon.request_count(), 1);
+        assert_eq!(spawned.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn auto_gc_check_does_nothing_under_the_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path().to_path_buf());
+        let store = Store::open(&cfg).unwrap();
+        put_test_entry(&store, dir.path(), "fits");
+        let called = AtomicUsize::new(0);
+        let hint = |_: &Config| {
+            called.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        let spawn = |_: &Config| {
+            called.fetch_add(1, Ordering::SeqCst);
+        };
+        run_auto_gc_check(&cfg, &store, hint, spawn);
+        assert_eq!(called.load(Ordering::SeqCst), 0);
+    }
+
+    /// Another driver's fruitless sweep holds the worker back as well.
+    #[test]
+    fn auto_gc_worker_waits_out_a_backoff_another_driver_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1024;
+        cfg.record_sessions = true;
+        let store = Store::open(&cfg).unwrap();
+        put_sized_entry(&store, dir.path(), "evictable", 4096);
+        record_auto_gc_outcome(&cfg, 4096);
+
+        crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
+        assert!(store.contains("evictable"));
+        assert_eq!(recorded_gc_runs(&cfg), 0);
+        assert_eq!(auto_gc_backoff_interval_for_test(&cfg.cache_dir), Some(600));
+
+        // Once it expires the worker sweeps, fits the store and clears it.
+        expire_auto_gc_backoff_for_test(&cfg.cache_dir);
+        crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
+        assert!(!store.contains("evictable"));
+        assert_eq!(
+            recorded_gc_runs(&cfg),
+            1,
+            "a store that fits needs no retry"
+        );
+        assert_eq!(auto_gc_backoff_interval_for_test(&cfg.cache_dir), None);
+    }
+
+    /// The second sweep exists for entries a live build pins. Entries a
+    /// target directory retains stay retained, so the worker sweeps once.
+    #[test]
+    fn auto_gc_worker_retries_only_for_pinned_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path().to_path_buf());
+        cfg.max_size = 1024;
+        cfg.record_sessions = true;
+        let store = Store::open(&cfg).unwrap();
+        put_retained_entry(&store, dir.path(), "retained");
+        crate::cli::run_auto_gc_worker(&cfg, std::time::Duration::ZERO);
+        assert_eq!(recorded_gc_runs(&cfg), 1);
+
+        let pinned_dir = tempfile::tempdir().unwrap();
+        let mut pinned_cfg = test_config(pinned_dir.path().to_path_buf());
+        pinned_cfg.max_size = 1024;
+        pinned_cfg.record_sessions = true;
+        let pinned_store = Store::open(&pinned_cfg).unwrap();
+        // Just stored: inside the idle grace, so eviction pins it.
+        put_test_entry(&pinned_store, pinned_dir.path(), "pinned");
+        crate::cli::run_auto_gc_worker(&pinned_cfg, std::time::Duration::ZERO);
+        assert_eq!(recorded_gc_runs(&pinned_cfg), 2);
+        assert_eq!(
+            auto_gc_backoff_interval_for_test(&pinned_cfg.cache_dir),
+            Some(600),
+            "two sweeps of one worker record one outcome"
+        );
     }
 
     /// The backoff is stored and read back across processes, so its clock

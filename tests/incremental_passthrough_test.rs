@@ -4,7 +4,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 fn kache_binary() -> &'static str {
@@ -100,18 +99,14 @@ fn run_fake_compiler(
     let fake_rustc = dir.path().join(compiler_name);
     let failing_fallback = dir.path().join("fallback");
     let fallback_marker = dir.path().join("fallback-used");
-    fs::write(
+    kache_fs::testutil::write_executable(
         &fake_rustc,
         "#!/bin/sh\n: > \"$ARGV_DUMP\"\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    @*) while IFS= read -r line || [ -n \"$line\" ]; do printf '%s\\n' \"$line\" >> \"$ARGV_DUMP\"; done < \"${arg#@}\";;\n    *) printf '%s\\n' \"$arg\" >> \"$ARGV_DUMP\";;\n  esac\ndone\nprintf '%s' \"${CARGO_INCREMENTAL-unset}\" > \"$INCREMENTAL_ENV_DUMP\"\nexit 0\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fake_rustc, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::write(
+    );
+    kache_fs::testutil::write_executable(
         &failing_fallback,
         "#!/bin/sh\necho used > \"$FALLBACK_MARKER\"\nexit 77\n",
-    )
-    .unwrap();
-    fs::set_permissions(&failing_fallback, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let source = dir.path().join("lib.rs");
     fs::write(&source, "pub fn answer() -> u8 { 42 }\n").unwrap();
@@ -233,12 +228,10 @@ fn assert_changed_response_transport_fails_closed(disabled: bool) {
     let dir = tempfile::tempdir().unwrap();
     let fake_rustc = dir.path().join("rustc");
     let compiler_marker = dir.path().join("compiler-ran");
-    fs::write(
+    kache_fs::testutil::write_executable(
         &fake_rustc,
         format!("#!/bin/sh\n: > \"{}\"\nexit 0\n", compiler_marker.display()),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_rustc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let source = dir.path().join("lib.rs");
     let out_dir = dir.path().join("target/debug/deps");
@@ -294,12 +287,10 @@ fn assert_unchanged_response_transport_failure_uses_original_argv() {
     let dir = tempfile::tempdir().unwrap();
     let fake_rustc = dir.path().join("rustc");
     let argv_dump = dir.path().join("argv.txt");
-    fs::write(
+    kache_fs::testutil::write_executable(
         &fake_rustc,
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGV_DUMP\"\nexit 0\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fake_rustc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let source = dir.path().join("lib.rs");
     let out_dir = dir.path().join("target/debug/deps");

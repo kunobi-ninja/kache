@@ -1924,12 +1924,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_real_reports_the_script_status_or_one_when_it_cannot_start() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = |name: &str, body: &str| {
             let path = dir.path().join(name);
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            kache_fs::testutil::write_executable(&path, body);
             path
         };
         assert_eq!(run_real(&script("three", "#!/bin/sh\nexit 3\n"), &[]), 3);
@@ -1968,14 +1966,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_launcher_is_not_installed_while_the_switch_is_off() {
-        use std::os::unix::fs::PermissionsExt;
         let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let unit = dir.path().join("debug/build/pkg-1");
         std::fs::create_dir_all(&unit).unwrap();
         let executable = unit.join("build_script_build-1");
-        std::fs::write(&executable, "#!/bin/sh\necho real\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho real\n");
         let args = RustcArgs::parse(
             &[
                 "rustc",
@@ -2339,13 +2335,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn launcher_preserves_binary_and_finds_it_from_the_hardlink() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let unit = dir.path().join("debug/build/pkg-1");
         std::fs::create_dir_all(&unit).unwrap();
         let executable = unit.join("build_script_build-1");
-        std::fs::write(&executable, "#!/bin/sh\necho real\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&executable, "#!/bin/sh\necho real\n");
         install(&executable).unwrap();
         let real = with_suffix(&executable, REAL_SUFFIX);
         assert_eq!(

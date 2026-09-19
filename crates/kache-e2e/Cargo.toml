@@ -37,3 +37,6 @@ toml = "1"
 
 [lints.rust]
 warnings = "deny"
+
+[dev-dependencies]
+kache-fs = { version = "0.25.0", path = "../kache-fs", features = ["testing"] }

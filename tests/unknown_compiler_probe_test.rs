@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -14,12 +13,10 @@ fn probe_recovers_when_wrapper_fork_bombs() {
     let dir = tempfile::tempdir().unwrap();
     let wrapper = dir.path().join("my-compiler");
 
-    fs::write(
+    kache_fs::testutil::write_executable(
         &wrapper,
         format!("#!/bin/sh\nexec {} \"$0\" \"$@\"\n", kache_binary()),
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let start = Instant::now();
     let _ = Command::new(kache_binary())
@@ -41,14 +38,12 @@ fn probe_recovers_when_wrapper_emits_8kb_then_hangs() {
     let dir = tempfile::tempdir().unwrap();
     let wrapper = dir.path().join("my-compiler-hang");
 
-    fs::write(
+    kache_fs::testutil::write_executable(
         &wrapper,
         "#!/bin/sh\n\
         head -c 9000 /dev/zero\n\
         sleep 60\n",
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let start = Instant::now();
     let _ = Command::new(kache_binary())
@@ -71,7 +66,7 @@ fn probe_recovers_when_wrapper_leaves_descendant_on_stdout() {
     let wrapper = dir.path().join("my-compiler-descendant");
     let pid_file = dir.path().join("descendant.pid");
 
-    fs::write(
+    kache_fs::testutil::write_executable(
         &wrapper,
         format!(
             "#!/bin/sh\n\
@@ -80,9 +75,7 @@ fn probe_recovers_when_wrapper_leaves_descendant_on_stdout() {
             exit 0\n",
             pid_file.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let start = Instant::now();
     let _ = Command::new(kache_binary())

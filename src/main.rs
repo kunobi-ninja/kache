@@ -1268,11 +1268,8 @@ mod tests {
 
     #[cfg(unix)]
     fn write_success_program(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-
         let shell = compiler::resolve_program_on_path("sh").expect("sh must be available on PATH");
-        std::fs::write(path, format!("#!{}\nexit 0\n", shell.display())).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(path, format!("#!{}\nexit 0\n", shell.display()));
     }
 
     #[cfg(unix)]
@@ -1530,21 +1527,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_compiler_directly_keeps_non_rustc_response_argv_verbatim() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let compiler = dir.path().join("fake-cc");
         let dump = dir.path().join("argv.txt");
         let response = dir.path().join("cc.args");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &compiler,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
                 dump.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::fs::write(&response, "-DNAME='two words'\n").unwrap();
 
         let direct = "direct argument with spaces".to_string();
@@ -1600,15 +1593,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_compiler_directly_rewrites_double_wrapper_rustc_response_file() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let outer = dir.path().join("workspace-wrapper");
         let inner = dir.path().join("rustc");
         let dump = dir.path().join("argv.txt");
         let response = dir.path().join("rustc.args");
         let incremental = dir.path().join("target/debug/incremental/unit");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &outer,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"{}\"\nshift\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    @*) cat \"${{arg#@}}\" >> \"{}\";;\n    *) printf '%s\\n' \"$arg\" >> \"{}\";;\n  esac\ndone\n",
@@ -1616,9 +1607,7 @@ mod tests {
                 dump.display(),
                 dump.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::fs::write(
             &response,
             format!(

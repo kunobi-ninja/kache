@@ -12901,15 +12901,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn successful_non_compile_execute_never_discovers_cache_artifacts() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("linker.sh");
         let source = dir.path().join("foo.c");
         let output = dir.path().join("foo.o");
         std::fs::write(&source, "int main(void) { return 0; }\n").unwrap();
-        std::fs::write(&script, "#!/bin/sh\nprintf object > \"$3\"\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&script, "#!/bin/sh\nprintf object > \"$3\"\n");
 
         let compiler = CcCompiler::new();
         let parsed = compiler
@@ -12935,15 +12932,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_compile_execute_never_discovers_leftover_artifacts() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("compiler.sh");
         let source = dir.path().join("foo.c");
         let object = dir.path().join("foo.o");
         std::fs::write(&source, "int answer(void) { return 42; }\n").unwrap();
-        std::fs::write(&script, "#!/bin/sh\nprintf object > \"$4\"\nexit 1\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(
+            &script,
+            "#!/bin/sh\nprintf object > \"$4\"\nexit 1\n",
+        );
 
         let compiler = CcCompiler::new();
         let parsed = compiler
@@ -14297,13 +14294,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_direct_capture_probe_rejects_a_driver_that_writes_no_object_and_remembers() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let memo = dir.path().join("probes");
         let script = |name: &str, body: &str| {
             let path = dir.path().join(name);
-            std::fs::write(&path, body).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            kache_fs::testutil::write_executable(&path, body);
             path.to_str().unwrap().to_string()
         };
         let silent = script("silent-cc", "#!/bin/sh\nexit 0\n");

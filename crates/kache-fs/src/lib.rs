@@ -544,6 +544,80 @@ pub mod testutil {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+
+    /// Write `contents` to `path` as an executable the caller is about to run.
+    ///
+    /// Do not write such a file with `std::fs::write` in a test. On Linux,
+    /// running a file that any process holds open for writing fails with
+    /// ETXTBSY. `std::fs::write` closes its descriptor, but a test binary
+    /// runs tests on many threads, and another thread can fork between the
+    /// open and the close. The child inherits the writable descriptor until
+    /// it execs, and a spawn of the script in that window fails. Under fork
+    /// pressure that was 19% of 4,000 scripts. Renaming a finished file into
+    /// place does not help: the inode is the same one the child holds.
+    ///
+    /// Here a child shell writes the file, so the writable descriptor never
+    /// exists in this process and no fork of it can inherit one: 0 of 4,000.
+    /// The spawn often happens inside the code under test, which is why the
+    /// fix is on the writing side and not a retry around the spawn.
+    ///
+    /// The shell uses builtins only (`read`, `printf`). Tests rewrite the
+    /// process-wide `PATH`, sometimes to directories with no `cat` in them,
+    /// and a writer that looked anything up there would fail at random. The
+    /// mode is set from here with `chmod(2)` by path, which opens nothing.
+    /// Contents must be text without NUL bytes, which a shell cannot carry.
+    #[cfg(unix)]
+    pub fn write_executable(path: &Path, contents: impl AsRef<[u8]>) {
+        let contents = contents.as_ref();
+        assert!(
+            !contents.contains(&0),
+            "write_executable carries text only: {}",
+            path.display()
+        );
+        write_executable_with(path, contents, |_| {});
+    }
+
+    /// [`write_executable`] with a hook on the writer's command, so a test
+    /// can take `PATH` away from it.
+    #[cfg(unix)]
+    pub(crate) fn write_executable_with(
+        path: &Path,
+        contents: &[u8],
+        configure: impl FnOnce(&mut std::process::Command),
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        const COPY_STDIN: &str = "while IFS= read -r line; do printf '%s\\n' \"$line\"; done > \"$0\"; \
+                                  printf '%s' \"$line\" >> \"$0\"";
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(COPY_STDIN)
+            .arg(path)
+            .stdin(Stdio::piped());
+        configure(&mut command);
+        let mut writer = command.spawn().expect("spawn the script writer");
+        writer
+            .stdin
+            .take()
+            .expect("script writer stdin")
+            .write_all(contents)
+            .expect("send the script to the writer");
+        let status = writer.wait().expect("wait for the script writer");
+        assert!(
+            status.success(),
+            "writing {} failed: {status}",
+            path.display()
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("mark the script executable");
+    }
+
+    /// Windows has no ETXTBSY and no mode bits, so a plain write is enough.
+    #[cfg(not(unix))]
+    pub fn write_executable(path: &Path, contents: impl AsRef<[u8]>) {
+        std::fs::write(path, contents).expect("write the script");
+    }
 }
 
 #[cfg(test)]
@@ -552,6 +626,65 @@ mod tests {
     use super::*;
 
     const BLOCK: usize = 64 * 1024;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_executable_writes_the_bytes_and_the_result_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("write-executable");
+        let script = dir.path().join("a script with spaces");
+        super::testutil::write_executable(&script, "#!/bin/sh\nprintf '%s' \"$1\"\nexit 7\n");
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            "#!/bin/sh\nprintf '%s' \"$1\"\nexit 7\n"
+        );
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        let out = std::process::Command::new(&script)
+            .arg("hi")
+            .output()
+            .unwrap();
+        assert_eq!(out.stdout, b"hi");
+        assert_eq!(out.status.code(), Some(7));
+
+        // Overwriting replaces the contents instead of appending.
+        super::testutil::write_executable(&script, b"#!/bin/sh\nexit 0\n");
+        assert_eq!(std::fs::read(&script).unwrap(), b"#!/bin/sh\nexit 0\n");
+
+        // Byte-exact for the shapes scripts take: no final newline, blank
+        // lines, leading and trailing blanks, backslashes, a leading dash.
+        for text in [
+            "",
+            "one line, no newline",
+            "\n\n  indented \\n kept\\\n-n not an option\n\ttab \n\nlast",
+            "%s %d are data\n",
+        ] {
+            super::testutil::write_executable(&script, text);
+            assert_eq!(std::fs::read_to_string(&script).unwrap(), text, "{text:?}");
+        }
+    }
+
+    /// Tests rewrite the process-wide PATH; the writer must not need it.
+    #[cfg(unix)]
+    #[test]
+    fn write_executable_needs_nothing_from_path() {
+        let dir = TempDir::new("write-executable-no-path");
+        let script = dir.path().join("script");
+        super::testutil::write_executable_with(&script, b"#!/bin/sh\nexit 3\n", |command| {
+            command.env("PATH", "/nonexistent");
+        });
+        assert_eq!(std::fs::read(&script).unwrap(), b"#!/bin/sh\nexit 3\n");
+        let status = std::process::Command::new(&script).status().unwrap();
+        assert_eq!(status.code(), Some(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "text only")]
+    fn write_executable_refuses_nul_bytes() {
+        let dir = TempDir::new("write-executable-nul");
+        super::testutil::write_executable(&dir.path().join("script"), b"a\0b");
+    }
 
     #[test]
     fn confidence_labels_remain_distinct_for_consumers() {

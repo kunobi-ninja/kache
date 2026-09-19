@@ -213,13 +213,21 @@ fn record_crt_placement_memo(memo_dir: &Path, driver: &Path, placed: &BTreeMap<S
 
 /// The `libraries:` line of `cc -print-search-dirs`, as directories that exist.
 fn driver_library_search_dirs(driver: &Path) -> Vec<PathBuf> {
-    let Ok(output) = Command::new(driver)
+    let output = match Command::new(driver)
         .arg("-print-search-dirs")
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .output()
-    else {
-        return Vec::new();
+    {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::debug!(
+                driver = %driver.display(),
+                %error,
+                "could not run the driver for -print-search-dirs"
+            );
+            return Vec::new();
+        }
     };
     if !output.status.success() {
         return Vec::new();
@@ -1858,8 +1866,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn windows_production_probe_uses_current_environment() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _lock = process_state_test_lock();
         const CHILD: &str = "KACHE_TEST_WINDOWS_PRODUCTION_PROBE_CHILD";
         if std::env::var_os(CHILD).is_some() {
@@ -1901,10 +1907,7 @@ mod tests {
         );
         for name in ["link.exe", "cl.exe"] {
             let path = directory.path().join(name);
-            std::fs::write(&path, &script).unwrap();
-            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(path, permissions).unwrap();
+            kache_fs::testutil::write_executable(&path, &script);
         }
         for (name, contents) in [
             ("libcmt.lib", b"crt".as_slice()),
@@ -1987,7 +1990,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn crt_placement_memo_follows_the_searched_directories() {
-        use std::os::unix::fs::PermissionsExt;
         let _lock = process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let lib = dir.path().join("lib");
@@ -1996,15 +1998,13 @@ mod tests {
             std::fs::write(lib.join(name), bytes).unwrap();
         }
         let driver = dir.path().join("cc");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &driver,
             format!(
                 "#!/bin/sh\ncase \"$1\" in\n  -print-search-dirs) echo \"libraries: ={lib}\" ;;\n  -print-file-name=*) n=\"${{1#-print-file-name=}}\"; if [ -f \"{lib}/$n\" ]; then echo \"{lib}/$n\"; else echo \"$n\"; fi ;;\nesac\n",
                 lib = lib.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let memo_dir = dir.path().join("probes");
         for name in CRT_SEARCH_ENV {
             // SAFETY: the process-state lock serialises environment edits.
@@ -3615,8 +3615,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_windows_tool_serves_and_fills_the_banner_memo() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _lock = process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let memo_dir = dir.path().join("memo");
@@ -3625,10 +3623,7 @@ mod tests {
         };
         let write_tool = |name: &str, banner: &str| {
             let path = dir.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\necho '{banner}'\n")).unwrap();
-            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&path, permissions).unwrap();
+            kache_fs::testutil::write_executable(&path, format!("#!/bin/sh\necho '{banner}'\n"));
             path
         };
         let environment: Vec<(OsString, OsString)> = vec![("KACHE_TEST_MEMO".into(), "1".into())];
@@ -3735,14 +3730,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn driver_library_search_dirs_keeps_absolute_directories_that_exist() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let lib = dir.path().join("lib");
         std::fs::create_dir(&lib).unwrap();
         let file = dir.path().join("not-a-dir");
         std::fs::write(&file, "").unwrap();
         let driver = dir.path().join("cc");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &driver,
             format!(
                 "#!/bin/sh\ncase \"$1\" in\n  -print-search-dirs) echo \"install: /x\"; echo \"libraries: ={lib}:.:{file}:{absent}\" ;;\nesac\n",
@@ -3750,17 +3744,13 @@ mod tests {
                 file = file.display(),
                 absent = dir.path().join("absent").display(),
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         assert_eq!(driver_library_search_dirs(&driver), vec![lib]);
         let silent = dir.path().join("silent");
-        std::fs::write(&silent, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&silent, "#!/bin/sh\nexit 0\n");
         assert!(driver_library_search_dirs(&silent).is_empty());
         let failing = dir.path().join("failing");
-        std::fs::write(&failing, "#!/bin/sh\necho 'libraries: =/'; exit 1\n").unwrap();
-        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&failing, "#!/bin/sh\necho 'libraries: =/'; exit 1\n");
         assert!(driver_library_search_dirs(&failing).is_empty());
         assert!(driver_library_search_dirs(&dir.path().join("absent")).is_empty());
     }

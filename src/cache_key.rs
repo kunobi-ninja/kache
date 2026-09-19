@@ -8429,16 +8429,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clippy_identity_follows_version_config_and_lint_arguments() {
-        use std::os::unix::fs::PermissionsExt;
         let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let driver = dir.path().join("clippy-driver");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &driver,
             "#!/bin/sh\necho 'clippy 0.1.98 (abc 2026-09-01)'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let workspace = dir.path().join("ws");
         let member = workspace.join("member");
         std::fs::create_dir_all(&member).unwrap();
@@ -13287,10 +13284,7 @@ fi\n\
 exec {} \"$@\"\n",
             shell_single_quote(&real_rustc)
         );
-        std::fs::write(&wrapper, script).unwrap();
-        let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&wrapper, perms).unwrap();
+        kache_fs::testutil::write_executable(&wrapper, script);
         wrapper
     }
 
@@ -14710,16 +14704,13 @@ pub fn value() -> (&'static str, u8) {
     #[cfg(unix)]
     #[test]
     fn clippy_identity_reads_the_process_environment() {
-        use std::os::unix::fs::PermissionsExt;
         let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let driver = dir.path().join("clippy-driver");
-        std::fs::write(
+        kache_fs::testutil::write_executable(
             &driver,
             "#!/bin/sh\necho 'clippy 0.1.98 (abc 2026-09-01)'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let member = dir.path().join("member");
         std::fs::create_dir_all(&member).unwrap();
         let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR");
@@ -14765,14 +14756,15 @@ pub fn value() -> (&'static str, u8) {
     #[cfg(unix)]
     #[test]
     fn linker_identity_is_the_first_version_line_of_the_configured_linker() {
-        use std::os::unix::fs::PermissionsExt;
         let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: the key test lock serialises environment edits.
         unsafe { std::env::set_var("KACHE_CACHE_DIR", dir.path()) };
         let linker = dir.path().join("my-ld");
-        std::fs::write(&linker, "#!/bin/sh\necho 'my-ld 9.9'\necho 'second line'\n").unwrap();
-        std::fs::set_permissions(&linker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(
+            &linker,
+            "#!/bin/sh\necho 'my-ld 9.9'\necho 'second line'\n",
+        );
         let parse = |argv: &[&str]| {
             RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
         };

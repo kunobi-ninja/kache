@@ -241,18 +241,14 @@ fn path_resolvable_unknown_subcommand_is_still_a_usage_error() {
 #[cfg(unix)]
 #[test]
 fn kani_compiler_passthrough_executes_every_time() {
-    use std::os::unix::fs::PermissionsExt;
-
     let e = env();
     let driver_dir = TempDir::new().unwrap();
     let driver = driver_dir.path().join("kani-compiler");
     let invocations = driver_dir.path().join("invocations.txt");
-    std::fs::write(
+    kache_fs::testutil::write_executable(
         &driver,
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$KANI_INVOCATIONS\"\nprintf 'kani:%s\\n' \"$*\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     for _ in 0..2 {
         e.cmd()
@@ -1204,12 +1200,10 @@ fn init_eof_does_not_accept_changes() {
 /// first, so service tests never reach the host's systemd.
 #[cfg(target_os = "linux")]
 fn fake_systemd_path(dir: &Path, script: &str) -> std::ffi::OsString {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).unwrap();
     for (name, body) in [("systemctl", script), ("loginctl", "exit 0")] {
         let tool = dir.join(name);
-        std::fs::write(&tool, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        kache_fs::testutil::write_executable(&tool, format!("#!/bin/sh\n{body}\n"));
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&path)))
@@ -2176,14 +2170,7 @@ fn create_wrapper_script(dir: &Path, name: &str) -> std::path::PathBuf {
         script_path
     } else {
         let script_path = dir.join(name);
-        std::fs::write(&script_path, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).unwrap();
-        }
+        kache_fs::testutil::write_executable(&script_path, "#!/bin/sh\nexec \"$@\"\n");
         script_path
     }
 }

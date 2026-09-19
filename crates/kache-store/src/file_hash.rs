@@ -3,7 +3,7 @@
 pub use crate::cc_memo::{CcPreprocessMemo, CcPreprocessMemoInput};
 pub use crate::index_compaction::{IndexCompaction, IndexPageStats, index_page_stats};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
 
 pub const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
@@ -155,14 +155,42 @@ impl<'db> FileHashCache<'db> {
 
     /// Return the stored schema and payload for `identity`, or `None` when absent.
     /// The caller validates the schema before interpreting the payload.
+    ///
+    /// A read is a use: it refreshes the row's `last_used` stamp, at most once
+    /// per [`INPUT_PREDICTION_TOUCH_INTERVAL_SECS`] so a build does not issue
+    /// one write per unit.
     pub fn get_input_prediction(&self, identity: &str) -> rusqlite::Result<Option<(u32, String)>> {
-        self.db()
+        self.get_input_prediction_at(identity, unix_now())
+    }
+
+    fn get_input_prediction_at(
+        &self,
+        identity: &str,
+        now: i64,
+    ) -> rusqlite::Result<Option<(u32, String)>> {
+        let row: Option<(u32, String, i64)> = self
+            .db()
             .query_row(
-                "SELECT schema, prediction_json FROM input_predictions WHERE identity = ?1",
+                "SELECT schema, prediction_json, last_used FROM input_predictions
+                 WHERE identity = ?1",
                 params![identity],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .optional()
+            .optional()?;
+        let Some((schema, json, last_used)) = row else {
+            return Ok(None);
+        };
+        // Best-effort: a stamp that cannot be written costs an early prune
+        // and a repeated pre-pass, never the hit.
+        if prediction_touch_due(last_used, now)
+            && let Err(error) = self.db().execute(
+                "UPDATE input_predictions SET last_used = ?2 WHERE identity = ?1",
+                params![identity, now],
+            )
+        {
+            tracing::debug!("input prediction touch failed: {error}");
+        }
+        Ok(Some((schema, json)))
     }
 
     pub fn put_input_prediction(
@@ -174,12 +202,88 @@ impl<'db> FileHashCache<'db> {
     ) -> rusqlite::Result<()> {
         self.db().execute(
             "INSERT OR REPLACE INTO input_predictions
-             (identity, schema, crate_name, prediction_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+             (identity, schema, crate_name, prediction_json, updated_at, last_used)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), unixepoch())",
             params![identity, schema, crate_name, prediction_json],
         )?;
         Ok(())
     }
+
+    /// Delete predictions no build has read or recorded for
+    /// [`INPUT_PREDICTION_RETENTION_SECS`]. Run from the GC sweep and
+    /// `doctor --repair`. Freed pages go to the freelist; index compaction
+    /// returns them to disk.
+    pub fn prune_input_predictions(&self) -> rusqlite::Result<usize> {
+        self.prune_input_predictions_at(unix_now())
+    }
+
+    fn prune_input_predictions_at(&self, now: i64) -> rusqlite::Result<usize> {
+        // Built here, not when a wrapper upgrades the table: indexing a large
+        // table takes the write lock for seconds, and this runs off the build.
+        self.db().execute_batch(
+            "CREATE INDEX IF NOT EXISTS input_predictions_last_used
+             ON input_predictions(last_used)",
+        )?;
+        self.db().execute(
+            "DELETE FROM input_predictions WHERE last_used < ?1",
+            params![prediction_prune_cutoff(now)],
+        )
+    }
+}
+
+/// A prediction hit refreshes `last_used` only when the stamp is this old.
+pub const INPUT_PREDICTION_TOUCH_INTERVAL_SECS: i64 = 86_400;
+
+/// How long an unused prediction is kept. The same window as the C/C++
+/// preprocess memos: long enough for a branch left alone for a few weeks,
+/// short enough that identities no build produces any more stop piling up.
+pub const INPUT_PREDICTION_RETENTION_SECS: i64 = 30 * 86_400;
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
+
+fn prediction_touch_due(last_used: i64, now: i64) -> bool {
+    now.saturating_sub(last_used) >= INPUT_PREDICTION_TOUCH_INTERVAL_SECS
+}
+
+fn prediction_prune_cutoff(now: i64) -> i64 {
+    now.saturating_sub(INPUT_PREDICTION_RETENTION_SECS)
+}
+
+fn input_predictions_have_last_used(db: &Connection) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('input_predictions') WHERE name = 'last_used')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Add `last_used` to a table created before the column existed.
+///
+/// The default is the migration time as a literal: SQLite refuses an
+/// expression default in `ADD COLUMN`, and a constant one is recorded in the
+/// schema without rewriting a row, so the upgrade costs the same on an empty
+/// table and a 200 MB one. Existing rows therefore read as used now, and the
+/// first prune of them comes a full retention window later. `updated_at` is
+/// not used as the starting stamp: it records the last write, and a
+/// prediction for a dependency that never changes is read daily and written
+/// once.
+fn ensure_input_predictions_last_used(db: &Connection, now: i64) -> rusqlite::Result<()> {
+    if input_predictions_have_last_used(db)? {
+        return Ok(());
+    }
+    // Recheck under the writer lock: many wrappers open the index at once,
+    // and a second ALTER fails with a duplicate column.
+    let tx = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    if !input_predictions_have_last_used(&tx)? {
+        tx.execute_batch(&format!(
+            "ALTER TABLE input_predictions ADD COLUMN last_used INTEGER NOT NULL DEFAULT {now}"
+        ))?;
+    }
+    tx.commit()
 }
 
 pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
@@ -200,7 +304,8 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
             schema          INTEGER NOT NULL,
             crate_name      TEXT,
             prediction_json TEXT NOT NULL,
-            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            last_used       INTEGER NOT NULL DEFAULT (unixepoch())
         );
         CREATE TABLE IF NOT EXISTS source_env_dep_uses (
             content_hash TEXT NOT NULL,
@@ -224,7 +329,7 @@ pub fn ensure_file_hash_cache_schema(db: &Connection) -> rusqlite::Result<()> {
             return Err(e);
         }
     }
-    Ok(())
+    ensure_input_predictions_last_used(db, unix_now())
 }
 
 impl FileFingerprint {
@@ -626,6 +731,256 @@ mod tests {
             cache.get_input_prediction("second").unwrap(),
             Some((42, "payload-b".into()))
         );
+    }
+
+    fn prediction_last_used(cache: &FileHashCache<'_>, identity: &str) -> i64 {
+        cache
+            .db()
+            .query_row(
+                "SELECT last_used FROM input_predictions WHERE identity = ?1",
+                params![identity],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn set_prediction_last_used(cache: &FileHashCache<'_>, identity: &str, last_used: i64) {
+        cache
+            .db()
+            .execute(
+                "UPDATE input_predictions SET last_used = ?2 WHERE identity = ?1",
+                params![identity, last_used],
+            )
+            .unwrap();
+    }
+
+    /// The table as every release before `last_used` created it.
+    fn create_legacy_input_predictions(db: &Connection) {
+        db.execute_batch(
+            "CREATE TABLE input_predictions (
+                identity        TEXT PRIMARY KEY,
+                schema          INTEGER NOT NULL,
+                crate_name      TEXT,
+                prediction_json TEXT NOT NULL,
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO input_predictions (identity, schema, crate_name, prediction_json, updated_at)
+            VALUES ('old-a', 3, 'alpha', 'payload-a', '2020-01-01 00:00:00'),
+                   ('old-b', 4, NULL, 'payload-b', '2020-01-02 00:00:00');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn input_prediction_windows_are_pinned() {
+        assert_eq!(INPUT_PREDICTION_TOUCH_INTERVAL_SECS, 86_400);
+        assert_eq!(INPUT_PREDICTION_RETENTION_SECS, 2_592_000);
+        assert!(!prediction_touch_due(1_000_000, 1_000_000 + 86_399));
+        assert!(prediction_touch_due(1_000_000, 1_000_000 + 86_400));
+        // A stamp ahead of the clock is never due, and never overflows.
+        assert!(!prediction_touch_due(2_000_000, 1_000_000));
+        assert!(!prediction_touch_due(i64::MAX, i64::MIN));
+        assert_eq!(prediction_prune_cutoff(3_000_000), 408_000);
+        assert_eq!(prediction_prune_cutoff(i64::MIN), i64::MIN);
+    }
+
+    #[test]
+    fn input_prediction_hit_refreshes_last_used_at_most_once_per_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        cache
+            .put_input_prediction("unit", 1, None, "payload")
+            .unwrap();
+        let now = 1_900_000_000;
+        set_prediction_last_used(&cache, "unit", now - 86_399);
+        assert_eq!(
+            cache.get_input_prediction_at("unit", now).unwrap(),
+            Some((1, "payload".into()))
+        );
+        assert_eq!(prediction_last_used(&cache, "unit"), now - 86_399);
+
+        set_prediction_last_used(&cache, "unit", now - 86_400);
+        assert_eq!(
+            cache.get_input_prediction_at("unit", now).unwrap(),
+            Some((1, "payload".into()))
+        );
+        assert_eq!(prediction_last_used(&cache, "unit"), now);
+
+        // A second hit inside the interval writes nothing.
+        cache.get_input_prediction_at("unit", now + 5).unwrap();
+        assert_eq!(prediction_last_used(&cache, "unit"), now);
+        // A miss touches nothing and other rows are left alone.
+        cache
+            .put_input_prediction("other", 1, None, "payload")
+            .unwrap();
+        set_prediction_last_used(&cache, "other", 7);
+        assert_eq!(cache.get_input_prediction_at("absent", now).unwrap(), None);
+        cache.get_input_prediction_at("unit", now + 86_400).unwrap();
+        assert_eq!(prediction_last_used(&cache, "other"), 7);
+    }
+
+    #[test]
+    fn input_prediction_read_and_record_stamp_the_wall_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let before = unix_now();
+        assert!(before > 1_700_000_000);
+        cache
+            .put_input_prediction("unit", 1, None, "payload")
+            .unwrap();
+        assert!(prediction_last_used(&cache, "unit") >= before);
+
+        set_prediction_last_used(&cache, "unit", 1);
+        cache.get_input_prediction("unit").unwrap();
+        assert!(prediction_last_used(&cache, "unit") >= before);
+
+        // Recording again replaces the row and restamps it.
+        set_prediction_last_used(&cache, "unit", 1);
+        cache
+            .put_input_prediction("unit", 2, None, "payload-2")
+            .unwrap();
+        assert!(prediction_last_used(&cache, "unit") >= before);
+    }
+
+    #[test]
+    fn prune_input_predictions_removes_only_rows_unused_past_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        // Empty table, as on every store with predictions off.
+        assert_eq!(cache.prune_input_predictions().unwrap(), 0);
+
+        let now = 1_900_000_000;
+        for identity in ["expired", "boundary", "fresh"] {
+            cache
+                .put_input_prediction(identity, 1, None, "payload")
+                .unwrap();
+        }
+        set_prediction_last_used(&cache, "expired", now - 2_592_001);
+        set_prediction_last_used(&cache, "boundary", now - 2_592_000);
+        set_prediction_last_used(&cache, "fresh", now);
+        assert_eq!(cache.prune_input_predictions_at(now).unwrap(), 1);
+        assert_eq!(cache.get_input_prediction_at("expired", now).unwrap(), None);
+        assert!(
+            cache
+                .get_input_prediction_at("boundary", now - 86_400)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_input_prediction_at("fresh", now)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(cache.prune_input_predictions_at(now).unwrap(), 0);
+
+        let indexed: bool = cache
+            .db()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index'
+                 AND name = 'input_predictions_last_used')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(indexed);
+    }
+
+    #[test]
+    fn prune_input_predictions_uses_the_wall_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        cache
+            .put_input_prediction("ancient", 1, None, "payload")
+            .unwrap();
+        cache
+            .put_input_prediction("live", 1, None, "payload")
+            .unwrap();
+        set_prediction_last_used(&cache, "ancient", 1);
+        assert_eq!(cache.prune_input_predictions().unwrap(), 1);
+        assert!(cache.get_input_prediction("live").unwrap().is_some());
+        assert_eq!(cache.get_input_prediction("ancient").unwrap(), None);
+    }
+
+    #[test]
+    fn schema_upgrade_adds_last_used_and_keeps_existing_predictions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let db = Connection::open(&db_path).unwrap();
+        create_legacy_input_predictions(&db);
+        assert!(!input_predictions_have_last_used(&db).unwrap());
+
+        ensure_input_predictions_last_used(&db, 1_700_000_000).unwrap();
+        assert!(input_predictions_have_last_used(&db).unwrap());
+        // A second upgrade changes nothing, including the recorded default.
+        ensure_input_predictions_last_used(&db, 1_700_000_999).unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        drop(db);
+
+        let cache = FileHashCache::open(&db_path).unwrap();
+        // Existing rows read as used at the upgrade, not at their last write.
+        assert_eq!(prediction_last_used(&cache, "old-a"), 1_700_000_000);
+        assert_eq!(prediction_last_used(&cache, "old-b"), 1_700_000_000);
+        assert_eq!(
+            cache
+                .get_input_prediction_at("old-a", 1_700_000_000)
+                .unwrap(),
+            Some((3, "payload-a".into()))
+        );
+        assert_eq!(
+            cache
+                .get_input_prediction_at("old-b", 1_700_000_000)
+                .unwrap(),
+            Some((4, "payload-b".into()))
+        );
+        // They outlive a prune until a full window after the upgrade.
+        assert_eq!(
+            cache
+                .prune_input_predictions_at(1_700_000_000 + 2_592_000)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            cache
+                .prune_input_predictions_at(1_700_000_000 + 2_592_001)
+                .unwrap(),
+            2
+        );
+        // A row recorded after the upgrade carries its own stamp.
+        cache
+            .put_input_prediction("new", 5, None, "payload-n")
+            .unwrap();
+        assert!(prediction_last_used(&cache, "new") > 1_700_000_999);
+    }
+
+    #[test]
+    fn schema_upgrade_survives_many_connections_opening_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        {
+            let db = Connection::open(&db_path).unwrap();
+            db.pragma_update(None, "journal_mode", "WAL").unwrap();
+            create_legacy_input_predictions(&db);
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let db_path = db_path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let db = Connection::open(&db_path).unwrap();
+                    db.pragma_update(None, "busy_timeout", "5000").unwrap();
+                    barrier.wait();
+                    ensure_input_predictions_last_used(&db, 1_700_000_000)
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+        let cache = FileHashCache::open(&db_path).unwrap();
+        assert_eq!(prediction_last_used(&cache, "old-a"), 1_700_000_000);
+        assert_eq!(prediction_last_used(&cache, "old-b"), 1_700_000_000);
     }
 
     #[test]

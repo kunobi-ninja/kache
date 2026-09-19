@@ -43,6 +43,16 @@ pub struct GcStatsPersisted {
     /// Time the run spent in its eviction writes, busy waits included.
     #[serde(default)]
     pub evict_write_ms: u64,
+    /// Stale key lock files the run unlinked. Absent, like the two below,
+    /// when the run did no housekeeping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_locks_removed: Option<usize>,
+    /// Key lock files left in `store/` after the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_locks_remaining: Option<usize>,
+    /// Input predictions deleted as unused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predictions_pruned: Option<usize>,
 }
 
 pub(crate) const GC_STATS_FILE: &str = "gc_stats.json";
@@ -96,6 +106,13 @@ pub struct GcRunRecord {
     /// Time spent in eviction writes, busy waits included.
     #[serde(default)]
     pub evict_write_ms: u64,
+    /// Housekeeping counts, as in `gc_stats.json`; absent when none ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_locks_removed: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_locks_remaining: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predictions_pruned: Option<usize>,
 }
 
 impl GcRunRecord {
@@ -116,6 +133,9 @@ impl GcRunRecord {
             entries_unreclaimable: stats.entries_unreclaimable,
             duration_ms: stats.duration_ms,
             evict_write_ms: stats.evict_write_ms,
+            key_locks_removed: stats.housekeeping.map(|h| h.key_locks_removed),
+            key_locks_remaining: stats.housekeeping.map(|h| h.key_locks_remaining),
+            predictions_pruned: stats.housekeeping.map(|h| h.predictions_pruned),
         }
     }
 }
@@ -163,6 +183,9 @@ pub(crate) fn write_last_gc_run(
         entries_busy_snapshot: stats.entries_busy_snapshot,
         entries_recent_prefiltered: stats.entries_recent_prefiltered,
         evict_write_ms: stats.evict_write_ms,
+        key_locks_removed: stats.housekeeping.map(|h| h.key_locks_removed),
+        key_locks_remaining: stats.housekeeping.map(|h| h.key_locks_remaining),
+        predictions_pruned: stats.housekeeping.map(|h| h.predictions_pruned),
     };
     let json = serde_json::to_string_pretty(&persisted)?;
     kache_store::atomic::atomic_replace(&cache_dir.join(GC_STATS_FILE), json.as_bytes())
@@ -3929,6 +3952,11 @@ mod tests {
             entries_busy_snapshot: 2,
             entries_recent_prefiltered: 4,
             evict_write_ms: 11,
+            housekeeping: Some(crate::store::HousekeepingStats {
+                key_locks_removed: 6,
+                key_locks_remaining: 7,
+                predictions_pruned: 8,
+            }),
             ..Default::default()
         };
 
@@ -3968,10 +3996,18 @@ mod tests {
                 entries_unreclaimable: 1,
                 duration_ms: 9,
                 evict_write_ms: 11,
+                key_locks_removed: Some(6),
+                key_locks_remaining: Some(7),
+                predictions_pruned: Some(8),
             }
         );
         assert_eq!(records[1].source, "manual");
         assert_eq!(records[1].entries_evicted, 0);
+        // A run with no housekeeping writes no counts, rather than zeros.
+        assert_eq!(records[1].key_locks_removed, None);
+        assert_eq!(records[1].key_locks_remaining, None);
+        assert_eq!(records[1].predictions_pruned, None);
+        assert!(!log.lines().nth(1).unwrap().contains("key_locks"), "{log}");
     }
 
     #[test]
@@ -4024,9 +4060,23 @@ mod tests {
             entries_failed: 5,
             entries_locked: 4,
             evict_write_ms: 12,
+            housekeeping: Some(crate::store::HousekeepingStats {
+                key_locks_removed: 20,
+                key_locks_remaining: 30,
+                predictions_pruned: 40,
+            }),
             ..Default::default()
         };
         write_last_gc_run(dir.path(), "daemon", &first).unwrap();
+        let without = read_gc_stats(dir.path()).unwrap();
+        assert_eq!(
+            (
+                without.key_locks_removed,
+                without.key_locks_remaining,
+                without.predictions_pruned
+            ),
+            (None, None, None)
+        );
         write_last_gc_run(dir.path(), "auto", &second).unwrap();
 
         let stats = read_gc_stats(dir.path()).unwrap();
@@ -4045,6 +4095,14 @@ mod tests {
             ("auto", 1, 50, 40, 4, 7, 6, 5, 4)
         );
         assert_eq!(stats.evict_write_ms, 12);
+        assert_eq!(
+            (
+                stats.key_locks_removed,
+                stats.key_locks_remaining,
+                stats.predictions_pruned
+            ),
+            (Some(20), Some(30), Some(40))
+        );
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join(GC_STATS_FILE)).unwrap())
                 .unwrap();

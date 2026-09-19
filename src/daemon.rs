@@ -5984,6 +5984,16 @@ impl Daemon {
         // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
         Self::clean_tool_version_caches(&self.config.cache_dir);
 
+        // Key lock files and input predictions grow with every distinct key
+        // and eviction removes neither (#1126). Still under gc.lock.
+        let housekeeping = gc_store.sweep_housekeeping();
+        tracing::info!(
+            key_locks_removed = housekeeping.key_locks_removed,
+            key_locks_remaining = housekeeping.key_locks_remaining,
+            predictions_pruned = housekeeping.predictions_pruned,
+            "gc: housekeeping"
+        );
+
         if incremental_cleaned > 0 {
             tracing::info!("cleaned {incremental_cleaned} registered incremental dirs");
         }
@@ -6030,6 +6040,7 @@ impl Daemon {
             evict_write_ms: dedup_stats.evict_write_ms
                 + evict_stats.evict_write_ms
                 + age_evict_stats.evict_write_ms,
+            housekeeping: Some(housekeeping),
         };
 
         tracing::info!(
@@ -11987,6 +11998,53 @@ mod tests {
             stats.total.entries_evicted > 0,
             "should have evicted at least 1 entry"
         );
+    }
+
+    /// kunobi-ninja/kache#1126: the daemon sweep removes stale key locks and
+    /// records the housekeeping counts.
+    #[test]
+    fn automatic_gc_runs_store_housekeeping_and_records_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        // Two stale key locks with no entry, one claimed just now.
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        let lock_path = |seed: u8| {
+            config
+                .store_dir()
+                .join(format!("{}.lock", blake3::hash(&[seed]).to_hex()))
+        };
+        for seed in [1, 2, 3] {
+            std::fs::write(lock_path(seed), b"1").unwrap();
+        }
+        for seed in [1, 2] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(lock_path(seed))
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+                .unwrap();
+        }
+
+        let daemon = Daemon::new(config.clone());
+        let report = daemon
+            .run_gc(GcPolicy::Automatic { max_age_hours: 0 })
+            .unwrap();
+        assert_eq!(
+            report.total.housekeeping,
+            Some(crate::store::HousekeepingStats {
+                key_locks_removed: 2,
+                key_locks_remaining: 1,
+                predictions_pruned: 0,
+            })
+        );
+        assert!(!lock_path(1).exists());
+        assert!(!lock_path(2).exists());
+        assert!(lock_path(3).exists());
+        let recorded = crate::report::read_gc_stats(&config.cache_dir).expect("run recorded");
+        assert_eq!(recorded.key_locks_removed, Some(2));
+        assert_eq!(recorded.key_locks_remaining, Some(1));
+        assert_eq!(recorded.predictions_pruned, Some(0));
     }
 
     /// kunobi-ninja/kache#711: automatic GC applies configured age retention

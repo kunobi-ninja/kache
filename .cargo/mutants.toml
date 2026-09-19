@@ -241,6 +241,7 @@ exclude_re = [
     "replace < with <= in (session_lock|advertised_login)",
     "crates/kache-fs/src/copy.rs:.*(native_reflink_macos|native_reflink_windows|native_reflink_unsupported|windows_cluster_size)",
     "crates/kache-fs/src/identity.rs:.*windows_metadata_identity",
+    "crates/kache-fs/src/identity.rs:.*windows_handle_identity",
     "crates/kache-fs/src/identity.rs:.*replace \\| with \\^ in windows_identity",
     "crates/kache-fs/src/lib.rs:.*testutil::",
     "replace run_config_editor",

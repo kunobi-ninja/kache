@@ -33,11 +33,22 @@ use auth::PlannerAuth;
 
 mod state;
 
+mod timelines;
+
 pub use state::{
     DEFAULT_DB_PATH, NamespaceState, PlannerStateFile, SeedPlan, SqlitePlannerRepository,
 };
+pub use timelines::{
+    DEFAULT_MAX_COMPRESSED_BYTES, DEFAULT_MAX_DECODED_BYTES, StoreOutcome, TimelineLimits,
+    TimelineStore,
+};
 
-type SharedPlannerDataSource = Arc<dyn PlannerDataSource + Send + Sync>;
+/// Everything a serving leader reads and writes.
+trait ServiceRepository: PlannerDataSource + TimelineStore + Send + Sync {}
+
+impl<T: PlannerDataSource + TimelineStore + Send + Sync> ServiceRepository for T {}
+
+type SharedRepository = Arc<dyn ServiceRepository>;
 
 const SERVICE_ACCOUNT_NAMESPACE_PATH: &str =
     "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
@@ -67,6 +78,7 @@ pub struct PlannerConfig {
     pub planner_name: String,
     pub db_path: PathBuf,
     pub seed_state_file: Option<PathBuf>,
+    pub timeline_limits: TimelineLimits,
     pub ha: HaConfig,
 }
 
@@ -93,8 +105,15 @@ struct AppState {
     auth: Option<PlannerAuth>,
     discovery: Option<KunobiAuthDiscovery>,
     planner_name: String,
-    repository: Arc<RwLock<Option<SharedPlannerDataSource>>>,
+    repository: Arc<RwLock<Option<SharedRepository>>>,
     ready: Arc<AtomicBool>,
+    timeline_limits: TimelineLimits,
+}
+
+impl AppState {
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -110,16 +129,14 @@ pub async fn app(mut config: PlannerConfig) -> Result<Router> {
     Ok(app_with_repository(config, repository))
 }
 
-fn app_with_repository(
-    config: PlannerConfig,
-    repository: Option<SharedPlannerDataSource>,
-) -> Router {
+fn app_with_repository(config: PlannerConfig, repository: Option<SharedRepository>) -> Router {
     let state = AppState {
         auth: PlannerAuth::from_settings(&config.auth),
         discovery: config.auth.discovery(),
         planner_name: normalize_name(config.planner_name),
         repository: Arc::new(RwLock::new(repository)),
         ready: Arc::new(AtomicBool::new(true)),
+        timeline_limits: config.timeline_limits,
     };
 
     router(state)
@@ -134,6 +151,7 @@ fn router(state: AppState) -> Router {
         // v1 is the only prefetch-plan contract (#619). Add a v2 handler only
         // when the intent or plan schema actually changes, and keep v1 serving.
         .route("/v1/prefetch-plan", post(prefetch_plan))
+        .route("/v1/build-timelines", post(timelines::submit_timeline))
         .with_state(state);
     // Where `kache login` finds the issuer and client id. Unauthenticated,
     // like the health endpoints: it carries no secret.
@@ -159,6 +177,7 @@ pub async fn serve(mut config: PlannerConfig) -> Result<()> {
         planner_name: planner_name.clone(),
         repository: Arc::new(RwLock::new(None)),
         ready: Arc::new(AtomicBool::new(false)),
+        timeline_limits: config.timeline_limits,
     };
     let app = router(state.clone());
     let (ha_done_tx, ha_done_rx) = watch::channel(false);
@@ -241,7 +260,7 @@ where
     AcquireFuture: Future<Output = Result<LeadershipLost>>,
     LeadershipLost: Future<Output = ()>,
     LoadRepository: FnOnce(PlannerConfig) -> LoadRepositoryFuture,
-    LoadRepositoryFuture: Future<Output = Result<Option<SharedPlannerDataSource>>>,
+    LoadRepositoryFuture: Future<Output = Result<Option<SharedRepository>>>,
 {
     let namespace = ha_namespace(&config.ha)?;
     let lease_name = normalize_name(config.ha.lease_name.clone());
@@ -286,7 +305,7 @@ fn parse_service_account_namespace(contents: &str) -> Result<String> {
     Ok(namespace.to_string())
 }
 
-async fn load_repository(config: &PlannerConfig) -> Result<Option<SharedPlannerDataSource>> {
+async fn load_repository(config: &PlannerConfig) -> Result<Option<SharedRepository>> {
     // Read and parse the seed BEFORE opening, because opening may move a
     // pre-SQLite store aside and that is only safe if the rows really do come
     // back. Seeding after the move meant a missing, unreadable or malformed
@@ -534,6 +553,19 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl TimelineStore for EmptyPlannerDataSource {
+        async fn store_timeline(
+            &self,
+            _server_id: String,
+            _received_at_ms: u64,
+            _record: kache_core::timeline::BuildTimeline,
+            _body: Vec<u8>,
+        ) -> Result<StoreOutcome> {
+            anyhow::bail!("the empty data source stores nothing")
+        }
+    }
+
     fn test_config(db_path: PathBuf) -> PlannerConfig {
         PlannerConfig {
             bind: "127.0.0.1:8080".parse().unwrap(),
@@ -541,11 +573,12 @@ mod tests {
             planner_name: "planner".to_string(),
             db_path,
             seed_state_file: None,
+            timeline_limits: TimelineLimits::default(),
             ha: HaConfig::default(),
         }
     }
 
-    fn test_app(token: Option<&str>, repository: Option<SharedPlannerDataSource>) -> Router {
+    fn test_app(token: Option<&str>, repository: Option<SharedRepository>) -> Router {
         let mut config = test_config(PathBuf::from(DEFAULT_DB_PATH));
         config.auth.token = token.map(str::to_string);
         app_with_repository(config, repository)
@@ -558,6 +591,7 @@ mod tests {
             planner_name: "planner".to_string(),
             repository: Arc::new(RwLock::new(None)),
             ready: Arc::new(AtomicBool::new(ready)),
+            timeline_limits: TimelineLimits::default(),
         })
     }
 
@@ -659,13 +693,14 @@ mod tests {
             planner_name: "planner".to_string(),
             repository: Arc::new(RwLock::new(None)),
             ready: Arc::new(AtomicBool::new(false)),
+            timeline_limits: TimelineLimits::default(),
         };
         let observed_state = state.clone();
         let acquisition = Arc::new(std::sync::Mutex::new(None));
         let acquisition_from_task = Arc::clone(&acquisition);
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let repository: SharedPlannerDataSource = Arc::new(EmptyPlannerDataSource);
+        let repository: SharedRepository = Arc::new(EmptyPlannerDataSource);
         let leader = tokio::spawn(run_leader(
             config,
             state,

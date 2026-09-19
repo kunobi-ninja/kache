@@ -5,9 +5,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use kache_core::timeline::BuildTimeline;
 use kache_core::{CandidateSource, PlannerDataSource, PrefetchCandidate};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+
+use crate::timelines::{StoreOutcome, TimelineStore};
 
 pub const DEFAULT_DB_PATH: &str = "/var/lib/kache/planner.db";
 
@@ -288,6 +291,40 @@ fn init_schema(db: &Connection) -> Result<()> {
     )
     .context("initializing planner db schema")?;
 
+    // Build timelines as clients submitted them. `body` is the decompressed
+    // JSON record; the other columns are copied out of it for lookups. Seeding
+    // never touches this table.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS build_timeline (
+            server_id         TEXT NOT NULL,
+            client_record_id  TEXT NOT NULL,
+            received_at_ms    INTEGER NOT NULL,
+            schema            INTEGER NOT NULL,
+            session_id        TEXT NOT NULL,
+            identity_key      TEXT,
+            lock_digest       TEXT,
+            repository        TEXT,
+            workflow          TEXT,
+            job               TEXT,
+            run_id            TEXT,
+            commit_sha        TEXT,
+            kache_version     TEXT NOT NULL,
+            started_at_ms     INTEGER NOT NULL,
+            finished_at_ms    INTEGER NOT NULL,
+            unit_count        INTEGER NOT NULL,
+            transfer_count    INTEGER NOT NULL,
+            body              BLOB NOT NULL,
+            PRIMARY KEY (server_id, client_record_id)
+        ) WITHOUT ROWID;
+
+        CREATE INDEX IF NOT EXISTS build_timeline_identity
+            ON build_timeline (identity_key, started_at_ms);
+
+        CREATE INDEX IF NOT EXISTS build_timeline_job
+            ON build_timeline (repository, workflow, job, started_at_ms);",
+    )
+    .context("initializing build timeline schema")?;
+
     // v0.16.1 shipped both tables without the metadata columns, and the planner
     // db survives an upgrade on a persistent volume, so CREATE TABLE IF NOT
     // EXISTS leaves those databases a column short and every later INSERT
@@ -321,6 +358,78 @@ fn add_missing_metadata_columns(db: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Store one submitted timeline, unless an earlier submission of the same
+/// record holds more units.
+fn store_timeline_row(
+    db: &Connection,
+    server_id: &str,
+    received_at_ms: u64,
+    record: &BuildTimeline,
+    body: &[u8],
+) -> Result<StoreOutcome> {
+    let tx = db.unchecked_transaction()?;
+    let unit_count = record.units.len() as u64;
+    let previous_units: Option<i64> = tx
+        .query_row(
+            "SELECT unit_count FROM build_timeline
+             WHERE server_id = ?1 AND client_record_id = ?2",
+            params![server_id, record.client_record_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("reading an earlier build timeline submission")?;
+
+    let outcome = timeline_store_outcome(
+        previous_units.and_then(|n| u64::try_from(n).ok()),
+        unit_count,
+    );
+    if outcome == StoreOutcome::Kept {
+        return Ok(outcome);
+    }
+
+    tx.execute(
+        "INSERT OR REPLACE INTO build_timeline (
+            server_id, client_record_id, received_at_ms, schema, session_id,
+            identity_key, lock_digest, repository, workflow, job, run_id, commit_sha,
+            kache_version, started_at_ms, finished_at_ms, unit_count, transfer_count, body
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        params![
+            server_id,
+            record.client_record_id,
+            to_sql_u64(Some(received_at_ms)),
+            record.schema,
+            record.session_id,
+            record.identity.identity_key,
+            record.identity.lock_digest,
+            record.context.repository,
+            record.context.workflow,
+            record.context.job,
+            record.context.run_id,
+            record.context.commit,
+            record.kache_version,
+            to_sql_u64(Some(record.started_at_ms)),
+            to_sql_u64(Some(record.finished_at_ms)),
+            to_sql_u64(Some(unit_count)),
+            to_sql_u64(Some(record.transfers.len() as u64)),
+            body,
+        ],
+    )
+    .context("storing build timeline")?;
+    tx.commit().context("committing build timeline")?;
+    Ok(outcome)
+}
+
+/// A resubmission replaces the stored record unless it has fewer units: once
+/// the client's event log rotates, a later push of the same session can be
+/// missing its first units.
+fn timeline_store_outcome(previous_units: Option<u64>, unit_count: u64) -> StoreOutcome {
+    match previous_units {
+        None => StoreOutcome::Inserted,
+        Some(previous) if unit_count < previous => StoreOutcome::Kept,
+        Some(_) => StoreOutcome::Replaced,
+    }
 }
 
 /// Rebuild a candidate from a projection row selecting, in order, `cache_key`,
@@ -415,6 +524,20 @@ fn upsert_crate_artifact(
     .context("upserting crate artifact projection")?;
 
     Ok(())
+}
+
+#[async_trait]
+impl TimelineStore for SqlitePlannerRepository {
+    async fn store_timeline(
+        &self,
+        server_id: String,
+        received_at_ms: u64,
+        record: BuildTimeline,
+        body: Vec<u8>,
+    ) -> Result<StoreOutcome> {
+        self.run(move |conn| store_timeline_row(conn, &server_id, received_at_ms, &record, &body))
+            .await
+    }
 }
 
 #[async_trait]
@@ -583,6 +706,178 @@ mod tests {
     /// is the normal case. That gap once let a non-idempotent schema statement
     /// reach production, where the planner exited 1 on boot and
     /// CrashLoopBackOffed ~3700 times over 13 days without becoming ready.
+    fn timeline(client_record_id: &str, units: usize) -> BuildTimeline {
+        BuildTimeline {
+            schema: kache_core::timeline::BUILD_TIMELINE_SCHEMA,
+            client_record_id: client_record_id.to_string(),
+            session_id: "session-1".to_string(),
+            kache_version: "0.23.1".to_string(),
+            started_at_ms: 1_000,
+            finished_at_ms: 9_000,
+            identity: kache_core::timeline::TimelineIdentity {
+                lock_digest: Some("aaaabbbbccccdddd".to_string()),
+                identity_key: Some(
+                    "id/aaaabbbbccccdddd/x86_64-unknown-linux-gnu/debug".to_string(),
+                ),
+                source: kache_core::timeline::IdentitySource::LockEnv,
+            },
+            context: kache_core::timeline::RunContext {
+                repository: Some("org/repo".to_string()),
+                workflow: Some("CI".to_string()),
+                job: Some("test".to_string()),
+                run_id: Some("42".to_string()),
+                commit: Some("abc123".to_string()),
+                ..Default::default()
+            },
+            units: (0..units)
+                .map(|i| kache_core::timeline::TimelineUnit {
+                    cache_key: format!("k{i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            transfers: vec![kache_core::timeline::TimelineTransfer::default(); 2],
+            ..BuildTimeline::default()
+        }
+    }
+
+    async fn stored_timeline_row(
+        repo: &SqlitePlannerRepository,
+        server_id: &str,
+        client_record_id: &str,
+    ) -> Option<(Vec<Option<String>>, Vec<i64>, Vec<u8>)> {
+        let server_id = server_id.to_string();
+        let client_record_id = client_record_id.to_string();
+        repo.run(move |conn| {
+            conn.query_row(
+                "SELECT session_id, identity_key, lock_digest, repository, workflow, job, run_id,
+                        commit_sha, kache_version, received_at_ms, schema, started_at_ms,
+                        finished_at_ms, unit_count, transfer_count, body
+                 FROM build_timeline WHERE server_id = ?1 AND client_record_id = ?2",
+                params![server_id, client_record_id],
+                |row| {
+                    let text = (0..9)
+                        .map(|i| row.get::<_, Option<String>>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let numbers = (9..15)
+                        .map(|i| row.get::<_, i64>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok((text, numbers, row.get::<_, Vec<u8>>(15)?))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn timeline_store_outcome_keeps_only_a_larger_earlier_record() {
+        assert_eq!(timeline_store_outcome(None, 0), StoreOutcome::Inserted);
+        assert_eq!(timeline_store_outcome(Some(5), 5), StoreOutcome::Replaced);
+        assert_eq!(timeline_store_outcome(Some(5), 6), StoreOutcome::Replaced);
+        assert_eq!(timeline_store_outcome(Some(5), 4), StoreOutcome::Kept);
+    }
+
+    #[tokio::test]
+    async fn stores_a_timeline_with_its_indexed_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+            .await
+            .unwrap();
+
+        let stored = repo
+            .store_timeline("edge-1".into(), 77, timeline("r1", 3), b"{json}".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(stored, StoreOutcome::Inserted);
+
+        let (text, numbers, body) = stored_timeline_row(&repo, "edge-1", "r1").await.unwrap();
+        assert_eq!(
+            text,
+            [
+                "session-1",
+                "id/aaaabbbbccccdddd/x86_64-unknown-linux-gnu/debug",
+                "aaaabbbbccccdddd",
+                "org/repo",
+                "CI",
+                "test",
+                "42",
+                "abc123",
+                "0.23.1",
+            ]
+            .map(|s| Some(s.to_string()))
+        );
+        assert_eq!(numbers, [77, 1, 1_000, 9_000, 3, 2]);
+        assert_eq!(body, b"{json}");
+        assert!(stored_timeline_row(&repo, "edge-2", "r1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resubmission_replaces_unless_it_lost_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqlitePlannerRepository::open(&dir.path().join("planner.db"), SeedPlan::None)
+            .await
+            .unwrap();
+
+        repo.store_timeline("edge-1".into(), 1, timeline("r1", 3), b"first".to_vec())
+            .await
+            .unwrap();
+        let replaced = repo
+            .store_timeline("edge-1".into(), 2, timeline("r1", 3), b"second".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(replaced, StoreOutcome::Replaced);
+        assert_eq!(
+            stored_timeline_row(&repo, "edge-1", "r1").await.unwrap().2,
+            b"second"
+        );
+
+        let kept = repo
+            .store_timeline("edge-1".into(), 3, timeline("r1", 2), b"rotated".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(kept, StoreOutcome::Kept);
+        let (_, numbers, body) = stored_timeline_row(&repo, "edge-1", "r1").await.unwrap();
+        assert_eq!(body, b"second");
+        assert_eq!(numbers[0], 2, "a kept record keeps its receive time");
+
+        // Another server holds its own copy of the same record.
+        let other = repo
+            .store_timeline("edge-2".into(), 4, timeline("r1", 1), b"edge-2".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(other, StoreOutcome::Inserted);
+    }
+
+    #[tokio::test]
+    async fn seeding_leaves_stored_timelines_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("planner.db");
+        let repo = SqlitePlannerRepository::open(&db_path, SeedPlan::None)
+            .await
+            .unwrap();
+        repo.store_timeline("edge-1".into(), 1, timeline("r1", 1), b"kept".to_vec())
+            .await
+            .unwrap();
+
+        repo.replace_with_state(PlannerStateFile::default())
+            .await
+            .unwrap();
+        drop(repo);
+
+        let reopened = SqlitePlannerRepository::open(&db_path, SeedPlan::None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_timeline_row(&reopened, "edge-1", "r1")
+                .await
+                .unwrap()
+                .2,
+            b"kept"
+        );
+    }
+
     #[tokio::test]
     async fn init_schema_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();

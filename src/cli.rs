@@ -488,6 +488,153 @@ pub(crate) fn record_session(config: &Config, report: &crate::report::BuildRepor
 /// `schema_version`). Uses the running daemon when reachable; otherwise the
 /// local store. Does not auto-start a daemon, so a finished bench dumps what
 /// is already on disk instead of an empty new process.
+/// Which sessions `kache telemetry push` sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimelineSelection {
+    /// The session that finished last: what a CI post-step wants.
+    Latest,
+    /// Every session still in the logs.
+    All,
+    /// One session by id.
+    Session(String),
+}
+
+/// Send build timeline records to the configured service.
+///
+/// Records are advisory, so this reports problems and returns `Ok`: a CI
+/// post-step must not fail a green job because a record did not land.
+pub fn telemetry_push(
+    config: &Config,
+    selection: &TimelineSelection,
+    labels: &[String],
+    dry_run: bool,
+) -> Result<()> {
+    let labels = parse_labels(labels)?;
+    let (records, events_seen, versions) = collect_timelines(config, selection, labels)?;
+    if records.is_empty() {
+        println!("{}", nothing_to_send(events_seen, &versions));
+        return Ok(());
+    }
+
+    if dry_run {
+        println!("{}", serde_json::to_string_pretty(&records)?);
+        return Ok(());
+    }
+
+    let Some(planner) = crate::config::Config::load_planner_config() else {
+        println!(
+            "no service configured; set KACHE_PLANNER_ENDPOINT to send {} record(s)",
+            records.len()
+        );
+        return Ok(());
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    for record in &records {
+        match rt.block_on(crate::timeline_client::push_timeline(&planner, record)) {
+            Ok(answer) => println!(
+                "sent session {} ({} units): {}",
+                record.session_id,
+                record.units.len(),
+                answer.stored
+            ),
+            Err(error) => eprintln!("warning: session {} not sent: {error:#}", record.session_id),
+        }
+    }
+    Ok(())
+}
+
+/// Why there was nothing to send.
+///
+/// Wrappers before kache 0.24 do not stamp a build session on their events, so
+/// their logs cannot be grouped into builds. Saying that beats reporting an
+/// empty log directory.
+fn nothing_to_send(events_seen: usize, versions: &std::collections::BTreeSet<String>) -> String {
+    if events_seen == 0 {
+        return "no builds in the event log".to_string();
+    }
+    let versions: Vec<&str> = versions.iter().map(String::as_str).collect();
+    format!(
+        "{events_seen} compile(s) in the log, none stamped with a build session: \
+         the wrapper that wrote them ({}) predates session ids. Upgrade kache on the builder.",
+        if versions.is_empty() {
+            "unknown version".to_string()
+        } else {
+            versions.join(", ")
+        }
+    )
+}
+
+/// Read the logs and build the records `selection` asks for, with what the log
+/// held in case it produced nothing.
+fn collect_timelines(
+    config: &Config,
+    selection: &TimelineSelection,
+    labels: std::collections::BTreeMap<String, String>,
+) -> Result<(
+    Vec<kache_core::timeline::BuildTimeline>,
+    usize,
+    std::collections::BTreeSet<String>,
+)> {
+    let events = events::read_events(&config.event_log_path())?;
+    let transfers = events::read_transfers(&config.transfer_log_path())?;
+    let summaries = events::read_summaries(&config.summary_log_path())?;
+    let env = crate::timeline::EnvSnapshot::from_env();
+    let records = crate::timeline::build_timelines(&crate::timeline::TimelineInputs {
+        events: &events,
+        transfers: &transfers,
+        summaries: &summaries,
+        env: &env,
+        labels,
+        log: kache_core::timeline::LogLimits {
+            event_log_max_size: config.event_log_max_size,
+            event_log_keep_lines: config.event_log_keep_lines as u64,
+        },
+        kache_version: crate::VERSION.to_string(),
+    });
+    let versions = events
+        .iter()
+        .filter(|event| !event.version.is_empty())
+        .map(|event| event.version.clone())
+        .collect();
+    Ok((select_timelines(records, selection), events.len(), versions))
+}
+
+/// Apply the selection to records the builder returned oldest first.
+fn select_timelines(
+    records: Vec<kache_core::timeline::BuildTimeline>,
+    selection: &TimelineSelection,
+) -> Vec<kache_core::timeline::BuildTimeline> {
+    match selection {
+        TimelineSelection::All => records,
+        TimelineSelection::Latest => records.into_iter().next_back().into_iter().collect(),
+        TimelineSelection::Session(wanted) => records
+            .into_iter()
+            .filter(|record| &record.session_id == wanted)
+            .collect(),
+    }
+}
+
+/// `--label key=value`, repeatable.
+fn parse_labels(labels: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    labels
+        .iter()
+        .map(|label| {
+            let (key, value) = label
+                .split_once('=')
+                .with_context(|| format!("label `{label}` is not key=value"))?;
+            let key = key.trim();
+            if key.is_empty() {
+                anyhow::bail!("label `{label}` has an empty key");
+            }
+            Ok((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
 pub fn telemetry_write(
     config: &Config,
     dir: &std::path::Path,
@@ -6594,6 +6741,107 @@ mod tests {
     use super::*;
     use std::fs;
 
+    // ── Build timeline push ─────────────────────────────────────────────────
+
+    fn timeline_record(
+        session_id: &str,
+        started_at_ms: u64,
+    ) -> kache_core::timeline::BuildTimeline {
+        kache_core::timeline::BuildTimeline {
+            schema: kache_core::timeline::BUILD_TIMELINE_SCHEMA,
+            client_record_id: format!("r-{session_id}"),
+            session_id: session_id.to_string(),
+            started_at_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_default_selection_is_the_last_build() {
+        let records = vec![timeline_record("old", 1), timeline_record("new", 2)];
+        let selected = select_timelines(records.clone(), &TimelineSelection::Latest);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|r| r.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+
+        assert_eq!(
+            select_timelines(records.clone(), &TimelineSelection::All).len(),
+            2
+        );
+        assert_eq!(
+            select_timelines(records, &TimelineSelection::Session("old".to_string()))
+                .iter()
+                .map(|r| r.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
+    }
+
+    #[test]
+    fn selecting_from_no_records_sends_nothing() {
+        for selection in [
+            TimelineSelection::Latest,
+            TimelineSelection::All,
+            TimelineSelection::Session("s".to_string()),
+        ] {
+            assert!(select_timelines(Vec::new(), &selection).is_empty());
+        }
+        assert!(
+            select_timelines(
+                vec![timeline_record("s1", 1)],
+                &TimelineSelection::Session("other".to_string())
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn labels_are_key_value_pairs() {
+        let parsed = parse_labels(&[
+            "phase=cold".to_string(),
+            " scenario = firefox ".to_string(),
+            "empty=".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed["phase"], "cold");
+        assert_eq!(parsed["scenario"], "firefox");
+        assert_eq!(parsed["empty"], "");
+
+        for bad in ["nope", "=value"] {
+            assert!(parse_labels(&[bad.to_string()]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_unstamped_log_says_the_wrapper_is_too_old() {
+        let versions = std::collections::BTreeSet::from(["0.23.1".to_string()]);
+        let message = nothing_to_send(12, &versions);
+        assert!(message.contains("12 compile(s)"), "{message}");
+        assert!(message.contains("0.23.1"), "{message}");
+        assert!(message.contains("Upgrade kache"), "{message}");
+
+        assert_eq!(
+            nothing_to_send(0, &Default::default()),
+            "no builds in the event log"
+        );
+        assert!(
+            nothing_to_send(3, &Default::default()).contains("unknown version"),
+            "a log with no version still explains itself"
+        );
+    }
+
+    #[test]
+    fn a_push_without_logs_reports_that_and_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        telemetry_push(&config, &TimelineSelection::Latest, &[], true)
+            .expect("an empty log directory is not an error");
+    }
+
     // ── List pager resolution ───────────────────────────────────────────────
 
     #[test]
@@ -9340,6 +9588,55 @@ mod tests {
 
         let lines = compared(CheckoutVerdict::Untraced, &[], vec![]);
         assert!(lines[0].contains("key salt or extra inputs"));
+    }
+
+    #[test]
+    fn telemetry_push_refuses_a_malformed_label_before_reading_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let err = telemetry_push(
+            &config,
+            &TimelineSelection::Latest,
+            &["no-equals-sign".to_string()],
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not key=value"),
+            "the label parse error must reach the caller: {err}"
+        );
+    }
+
+    #[test]
+    fn collect_timelines_reports_only_stamped_wrapper_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        std::fs::create_dir_all(&config.runtime_dir).unwrap();
+        // Neither event carries a session id, so no record is built and the
+        // version list is what `nothing_to_send` will name. An unstamped
+        // version must not appear as an empty entry.
+        let mut unstamped =
+            crate::events::BuildEvent::new_for_test("serde", crate::events::EventResult::LocalHit);
+        unstamped.version = String::new();
+        let mut stamped =
+            crate::events::BuildEvent::new_for_test("syn", crate::events::EventResult::LocalHit);
+        stamped.version = "0.23.0".to_string();
+        let log = config.event_log_path();
+        crate::events::log_event(&log, &unstamped).unwrap();
+        crate::events::log_event(&log, &stamped).unwrap();
+
+        let (records, seen, versions) = collect_timelines(
+            &config,
+            &TimelineSelection::All,
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(records.is_empty());
+        assert_eq!(seen, 2);
+        assert_eq!(
+            versions.into_iter().collect::<Vec<_>>(),
+            vec!["0.23.0".to_string()]
+        );
     }
 
     #[test]

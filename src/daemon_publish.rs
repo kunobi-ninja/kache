@@ -847,6 +847,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn handing_off_without_a_socket_declines_at_once() {
         let dir = tempfile::tempdir().unwrap();

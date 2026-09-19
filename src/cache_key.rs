@@ -7270,6 +7270,8 @@ mod tests {
             error.downcast_ref::<DeferredDiscovery>().is_some(),
             "{error:#}"
         );
+        // A broken handoff must fail instead of waiting on our own flight.
+        drop(on.take_discovery_flight());
 
         let emitted = dir.path().join("lib.d");
         std::fs::write(
@@ -8381,6 +8383,8 @@ mod tests {
         let deferred = compute_cache_key(&args, &hasher, &PathNormalizer::empty());
         set_defer_discovery(false);
         assert!(deferred.unwrap_err().is::<DeferredDiscovery>());
+        // Let a broken handoff reach the pre-pass and fail, not self-deadlock.
+        drop(hasher.take_discovery_flight());
 
         let closure = DepInfo {
             source_files: vec![source],

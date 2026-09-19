@@ -115,21 +115,9 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
         }
         let trace = root.join(phase);
         let _ = fs::remove_file(root.join("unit.o"));
-        let output = Command::new(kache_binary())
+        let output = cacheable_cc_command(&root)
             .args(["cc", "-c", "unit.c", "-o", "unit.o"])
-            .current_dir(&root)
-            .env("KACHE_CACHE_DIR", &cache)
-            .env("KACHE_RUNTIME_DIR", &cache)
-            .env("KACHE_CONFIG", &config)
-            .env("KACHE_HOST_CONFIG", "")
-            .env("KACHE_BASE_DIR", &root)
-            .env("KACHE_LOCAL_ONLY", "1")
-            .env("KACHE_DEFERRED_DISCOVERY", "1")
-            .env("KACHE_DAEMON_PUBLISH", "1")
             .env("KACHE_PHASE_TRACE_DIR", &trace)
-            .env_remove("OUT_DIR")
-            .env_remove("KACHE_ACTIVE")
-            .env_remove("KACHE_SOCKET_PATH")
             .output()
             .unwrap();
         assert!(
@@ -195,5 +183,95 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
                 .code(),
             Some(expected)
         );
+    }
+}
+
+fn cacheable_cc_command(root: &std::path::Path) -> Command {
+    let mut command = Command::new(kache_binary());
+    command
+        .current_dir(root)
+        .env("KACHE_CACHE_DIR", root.join("cache"))
+        .env("KACHE_RUNTIME_DIR", root.join("cache"))
+        .env("KACHE_CONFIG", root.join("kache.toml"))
+        .env("KACHE_HOST_CONFIG", "")
+        .env("KACHE_BASE_DIR", root)
+        .env("KACHE_LOCAL_ONLY", "1")
+        .env("KACHE_DEFERRED_DISCOVERY", "1")
+        .env("KACHE_DAEMON_PUBLISH", "1")
+        .env_remove("OUT_DIR")
+        .env_remove("KACHE_ACTIVE")
+        .env_remove("KACHE_SOCKET_PATH");
+    command
+}
+
+#[test]
+fn deferred_cc_does_not_publish_inputs_changed_during_the_compile() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(root.join("kache.toml"), "").unwrap();
+    fs::write(
+        root.join("unit.c"),
+        "#include \"value.h\"\nint value(void) { return VALUE; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("value.h"), "#define VALUE 42\n").unwrap();
+    fs::write(
+        root.join("main.c"),
+        "int value(void); int main(void) { return value(); }\n",
+    )
+    .unwrap();
+    let compiler = root.join("cc");
+    kache_fs::testutil::write_executable(
+        &compiler,
+        r#"#!/bin/sh
+for argument in "$@"; do
+    case "$argument" in -###|--version|-E) exec /usr/bin/cc "$@" ;; esac
+done
+/usr/bin/cc "$@"
+status=$?
+if [ "$status" = 0 ]; then
+    case " $* " in *" unit.c "*) printf '#define VALUE 17\n' > value.h ;; esac
+fi
+exit "$status"
+"#,
+    );
+    let output = cacheable_cc_command(&root)
+        .arg(&compiler)
+        .args(["-c", "unit.c", "-o", "unit.o"])
+        .env("KACHE_LOG", "kache=debug")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("value.h")).unwrap(),
+        "#define VALUE 17\n"
+    );
+    assert!(
+        Command::new("cc")
+            .args(["main.c", "unit.o", "-o", "check-value"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        Command::new(root.join("check-value"))
+            .status()
+            .unwrap()
+            .code(),
+        Some(42)
+    );
+    let db = rusqlite::Connection::open(root.join("cache/index.db")).unwrap();
+    for table in ["entries", "cc_preprocess_memos"] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "a changed input must not populate {table}");
     }
 }

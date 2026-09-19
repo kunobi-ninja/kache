@@ -387,6 +387,12 @@ pub struct Config {
     /// `KACHE_DEFERRED_DURABILITY=0` or `[cache] deferred_durability = false`
     /// flushes every entry inside the compile that stored it.
     pub deferred_durability: bool,
+    /// Hand a finished cc compile's store put to the daemon so the wrapper
+    /// returns as soon as the object is written (see `daemon_publish`). On
+    /// by default; `KACHE_DAEMON_PUBLISH=0` or `[cache] daemon_publish =
+    /// false` keeps every put in the wrapper. Without a reachable daemon the
+    /// wrapper stores on its own either way.
+    pub daemon_publish: bool,
     /// Opportunistic size-pressure GC (kunobi-ninja/kache#497): when on (the
     /// default), the compiler wrapper — after storing a new entry — performs a
     /// cheap, throttled store-size check and, if the store has grown past
@@ -710,6 +716,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) deferred_discovery: Option<bool>,
     /// Deferred store flush toggle. See [`Config::deferred_durability`].
     pub(crate) deferred_durability: Option<bool>,
+    /// Daemon hand-off toggle. See [`Config::daemon_publish`].
+    pub(crate) daemon_publish: Option<bool>,
     /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
     pub(crate) auto_gc: Option<bool>,
     /// Daemon index compaction toggle. See [`Config::index_auto_compact`].
@@ -1217,6 +1225,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ),
     ("KACHE_DEFERRED_DISCOVERY", "cache.deferred_discovery"),
     ("KACHE_DEFERRED_DURABILITY", "cache.deferred_durability"),
+    ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
     ("KACHE_INDEX_AUTO_COMPACT", "cache.index_auto_compact"),
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
@@ -1744,6 +1753,7 @@ impl Config {
         let shared_hardlink_restores = Self::shared_hardlink_restores_enabled(&file_config);
         let deferred_discovery = Self::deferred_discovery_enabled(&file_config);
         let deferred_durability = Self::deferred_durability_enabled(&file_config);
+        let daemon_publish = Self::daemon_publish_enabled(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
@@ -1802,6 +1812,7 @@ impl Config {
             shared_hardlink_restores,
             deferred_discovery,
             deferred_durability,
+            daemon_publish,
             auto_gc,
             index_auto_compact,
             gc_evict_shared,
@@ -2243,6 +2254,19 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.deferred_discovery)
+            .unwrap_or(true)
+    }
+
+    fn daemon_publish_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_DAEMON_PUBLISH", ignore_env) {
+            return !(v == "0" || v.eq_ignore_ascii_case("false"));
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.daemon_publish)
             .unwrap_or(true)
     }
 
@@ -5571,6 +5595,7 @@ remote_key_cache_refresh_secs = 900
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
                 deferred_durability: None,
+                daemon_publish: None,
                 auto_gc: None,
                 index_auto_compact: None,
                 gc_evict_shared: None,
@@ -6101,6 +6126,7 @@ remote_key_cache_refresh_secs = 900
             shared_hardlink_restores: false,
             deferred_discovery: true,
             deferred_durability: false,
+            daemon_publish: false,
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6165,6 +6191,7 @@ remote_key_cache_refresh_secs = 900
             shared_hardlink_restores: false,
             deferred_discovery: true,
             deferred_durability: false,
+            daemon_publish: false,
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6225,6 +6252,7 @@ remote_key_cache_refresh_secs = 900
             shared_hardlink_restores: false,
             deferred_discovery: true,
             deferred_durability: false,
+            daemon_publish: false,
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6304,6 +6332,7 @@ remote_key_cache_refresh_secs = 900
             shared_hardlink_restores: false,
             deferred_discovery: true,
             deferred_durability: false,
+            daemon_publish: false,
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6968,6 +6997,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
                 deferred_durability: None,
+                daemon_publish: None,
                 auto_gc: None,
                 index_auto_compact: None,
                 gc_evict_shared: None,

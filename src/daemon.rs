@@ -424,6 +424,8 @@ pub(crate) enum Request {
     BuildStarted(BuildStartedRequest),
     CompileStarted(CompileStartedRequest),
     CompileFinished(CompileFinishedRequest),
+    /// A wrapper hands the daemon a finished cc compile to store.
+    PublishCc(Box<crate::daemon_publish::PublishCcRequest>),
     Shutdown,
 }
 
@@ -1539,7 +1541,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl Response {
-    fn ok() -> Self {
+    pub(crate) fn ok() -> Self {
         Self {
             ok: true,
             evicted: None,
@@ -1691,7 +1693,7 @@ impl Response {
         }
     }
 
-    fn err(msg: impl Into<String>) -> Self {
+    pub(crate) fn err(msg: impl Into<String>) -> Self {
         Self {
             ok: false,
             evicted: None,
@@ -2299,6 +2301,8 @@ pub(crate) struct Daemon {
     upload_queue_closed: AtomicBool,
     /// Keys currently queued or in-flight for upload (dedup guard).
     pending_uploads: Arc<RwLock<HashSet<String>>>,
+    /// Finished cc compiles handed off by wrappers, waiting to be stored.
+    publish_queue: crate::daemon_publish::PublishQueue,
     /// Keys with an in-flight download, each mapped to the per-key [`Notify`]
     /// that wakes waiters when the leader's [`DownloadingGuard`] drops.
     /// Claiming is an atomic insert-if-absent (see [`claim_download`]).
@@ -2459,6 +2463,7 @@ impl Daemon {
             upload_tx: Mutex::new(None),
             upload_queue_closed: AtomicBool::new(false),
             pending_uploads: Arc::new(RwLock::new(HashSet::new())),
+            publish_queue: crate::daemon_publish::PublishQueue::new(),
             downloading: Arc::new(RwLock::new(HashMap::new())),
             warming_tx,
             prefetched_keys: Arc::new(RwLock::new(HashSet::new())),
@@ -2864,6 +2869,14 @@ impl Daemon {
     }
 
     /// Set the upload buffer sender (called during server setup).
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub(crate) fn publish_queue(&self) -> &crate::daemon_publish::PublishQueue {
+        &self.publish_queue
+    }
+
     pub fn set_upload_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<UploadJob>) {
         *self.upload_tx.lock().expect("upload queue mutex poisoned") = Some(tx);
         self.upload_queue_closed.store(false, Ordering::Relaxed);
@@ -2956,6 +2969,7 @@ impl Daemon {
             | Request::BatchRemoteCheck(_)
             | Request::LocalLookup(_)
             | Request::Prefetch(_)
+            | Request::PublishCc(_)
             | Request::BuildStarted(_) => {
                 // These require async — caller must use their async handlers
                 Response::err(
@@ -6354,6 +6368,20 @@ async fn server_main(
     }
     tracing::info!("started {} upload workers", num_workers);
 
+    // Publication of compiles handed off by cc wrappers: one blocking worker
+    // with its own store connection, fed by a bounded queue the handler
+    // fills only after it holds the key lock (see `daemon_publish`).
+    let (publish_tx, publish_rx) = tokio::sync::mpsc::channel::<crate::daemon_publish::PublishJob>(
+        crate::daemon_publish::PUBLISH_QUEUE_CAPACITY,
+    );
+    daemon.publish_queue().set_sender(publish_tx);
+    let publish_handle = {
+        let d = daemon.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::daemon_publish::run_publish_worker(d, publish_rx)
+        })
+    };
+
     // Periodic GC task: run immediately on startup, then every 6 hours
     let gc_daemon = daemon.clone();
     // Session-summary sweep (#583 P0.5): finalize an active prefetch plan
@@ -6601,7 +6629,17 @@ async fn server_main(
     // so awaiting it outside this deadline would make restart unbounded even
     // though every queued job is already durable on disk.
     daemon.close_upload_queue();
+    // Accepted hand-offs hold their key locks; give the worker the same
+    // budget to drain them. A job it never reaches is a lost store, not a
+    // lost build.
+    daemon.publish_queue().close();
     drop(daemon);
+    if tokio::time::timeout(Duration::from_secs(30), publish_handle)
+        .await
+        .is_err()
+    {
+        tracing::warn!("publish drain timeout; queued hand-offs were not stored");
+    }
     if drain_upload_pipeline(enqueue_handle, upload_handles, Duration::from_secs(30)).await {
         tracing::warn!("upload drain timeout, aborting remaining upload tasks");
     }
@@ -7565,6 +7603,7 @@ async fn handle_connection_started_at(
             Ok(Request::Stats(req)) => req.client_epoch,
             Ok(Request::BuildStarted(req)) => req.client_epoch,
             Ok(Request::LocalLookup(req)) => req.client_epoch,
+            Ok(Request::PublishCc(req)) => req.client_epoch,
             _ => 0,
         };
 
@@ -7613,6 +7652,7 @@ async fn handle_connection_started_at(
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
             Ok(Request::CompileFinished(req)) => daemon.handle_compile_finished(&req),
+            Ok(Request::PublishCc(req)) => daemon.handle_publish_cc(*req).await,
             Ok(Request::Shutdown) => {
                 shutdown_flag.store(true, Ordering::Relaxed);
                 // Wake the accept loop so it breaks now rather than on the next
@@ -8594,7 +8634,7 @@ fn send_request(socket_path: &Path, req: &Request) -> Result<String> {
 }
 
 /// Send a request to the daemon with a configurable read timeout.
-fn send_request_with_timeout(
+pub(crate) fn send_request_with_timeout(
     socket_path: &Path,
     req: &Request,
     read_timeout: std::time::Duration,
@@ -10503,6 +10543,7 @@ mod tests {
             shared_hardlink_restores: false,
             deferred_discovery: true,
             deferred_durability: false,
+            daemon_publish: false,
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,

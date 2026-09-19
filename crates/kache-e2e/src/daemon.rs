@@ -18,6 +18,24 @@ pub fn stop(kache_path: &Path, cache_dir: &Path) {
         .status();
 }
 
+/// Stop the daemon bound to `cache_dir` and wait until it has gone: its
+/// socket is removed when the process exits, after it has drained the work
+/// wrappers handed to it. `daemon stop` alone returns as soon as the request
+/// is acknowledged, which is too early for a runner that reads the store
+/// next. False when the daemon was still there after `timeout`.
+pub fn stop_and_wait(kache_path: &Path, cache_dir: &Path, timeout: std::time::Duration) -> bool {
+    stop(kache_path, cache_dir);
+    let socket = cache_dir.join("daemon.sock");
+    let deadline = std::time::Instant::now() + timeout;
+    while socket.exists() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    true
+}
+
 /// Best-effort: start a kache daemon bound to `cache_dir`.
 ///
 /// The wrapper falls back to no-daemon mode if this fails, so callers should

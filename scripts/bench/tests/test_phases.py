@@ -7,11 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-_spec = importlib.util.spec_from_file_location(
-    "trace_phases", Path(__file__).with_name("trace-phases.py")
-)
-trace = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(trace)
+from bench import phases as trace
 
 
 def span(name, ts, dur):

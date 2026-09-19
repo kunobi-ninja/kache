@@ -4,16 +4,13 @@
 import argparse
 import importlib.util
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-_spec = importlib.util.spec_from_file_location(
-    "perf_gate_local", Path(__file__).with_name("perf-gate-local.py")
-)
-local = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(local)
+from bench import gate_local as local
 
 
 class WorktreeTests(unittest.TestCase):
@@ -46,6 +43,25 @@ class WorktreeTests(unittest.TestCase):
                 with local.at_commit("abc123", "kache", "kache", "head") as tree:
                     self.assertTrue(str(tree).endswith("tree"))
         self.assertEqual(calls[-1][:2], ("worktree", "remove"))
+
+
+class StagingTests(unittest.TestCase):
+    def test_staged_entry_points_run_from_the_staging_directory(self):
+        """What the gate copies is enough for the scripts to run elsewhere."""
+        scripts = Path(local.__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = Path(tmp) / "instrument"
+            staging.mkdir()
+            local.copy_instrument_scripts(scripts, staging)
+            self.assertFalse((staging / "bench" / "tests").exists())
+            for name in ("bench-short.py", "perf-gate-report.py"):
+                completed = subprocess.run(
+                    [sys.executable, str(staging / name), "--help"],
+                    capture_output=True,
+                    text=True,
+                    cwd=tmp,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 class MeasureTests(unittest.TestCase):

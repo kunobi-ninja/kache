@@ -329,9 +329,7 @@ bench-pr:
 # Validate sample isolation, result admission and paired comparisons.
 [group('bench')]
 test-bench-short:
-  @python3 scripts/test-bench-short.py
-  @python3 scripts/test-perf-gate-local.py
-  @python3 scripts/test-trace-phases.py
+  @python3 -m unittest discover -s scripts/bench/tests -t scripts
 
 # Same cold/warm clone benchmark, but with sccache as the compiler cache.
 # Omit PROFILE to list sccache-backed profiles.

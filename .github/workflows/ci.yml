@@ -631,10 +631,8 @@ jobs:
       # fixtures. Real contention timings run separately on a quiet host.
       - name: Perf gate comparison tests
         run: |
-          python3 scripts/test-bench-short.py
+          python3 -m unittest discover -s scripts/bench/tests -t scripts
           python3 scripts/test-bench-contention.py
-          python3 scripts/test-perf-gate-local.py
-          python3 scripts/test-trace-phases.py
 
       # The path-to-job-group mapping Detect changes applies to pull requests.
       - name: Change detection tests

@@ -6,17 +6,14 @@ import copy
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-spec = importlib.util.spec_from_file_location(
-    "bench_short", Path(__file__).with_name("bench-short.py")
-)
-bench = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(bench)
+from bench import engine, report, short, stats
 
 
 def result(backend="kache", ms=10000):
@@ -33,7 +30,7 @@ def result(backend="kache", ms=10000):
         "cache_tool_version": backend + " 1.0",
         "verdict": {"ok": True},
         "warm_same_tree_verdict": {"ok": True},
-        **{p: copy.deepcopy(phase) for p in bench.PHASES},
+        **{p: copy.deepcopy(phase) for p in stats.PHASES},
     }
 
 
@@ -48,82 +45,82 @@ def record(arm, sample, ms=10000):
 
 class BenchTests(unittest.TestCase):
     def test_process_exit_and_timeout_cleanup(self):
-        bench.run_measurement([sys.executable, "-c", "pass"])
-        with self.assertRaises(bench.subprocess.CalledProcessError):
-            bench.run_measurement([sys.executable, "-c", "raise SystemExit(4)"])
+        engine.run_measurement([sys.executable, "-c", "pass"])
+        with self.assertRaises(subprocess.CalledProcessError):
+            engine.run_measurement([sys.executable, "-c", "raise SystemExit(4)"])
         process = MagicMock()
         process.pid = 1234
-        process.wait.side_effect = [bench.subprocess.TimeoutExpired("engine", 1200), 0]
+        process.wait.side_effect = [subprocess.TimeoutExpired("engine", 1200), 0]
         with (
-            patch.object(bench.subprocess, "Popen") as spawn,
-            patch.object(bench.os, "killpg") as kill,
+            patch.object(engine.subprocess, "Popen") as spawn,
+            patch.object(engine.os, "killpg") as kill,
         ):
             spawn.return_value.__enter__.return_value = process
-            with self.assertRaises(bench.subprocess.TimeoutExpired):
-                bench.run_measurement(["engine"])
-            kill.assert_called_once_with(1234, bench.signal.SIGKILL)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                engine.run_measurement(["engine"])
+            kill.assert_called_once_with(1234, engine.signal.SIGKILL)
 
     def test_refuses_invalid_measurements(self):
         for backend in ("kache", "sccache", "mbx"):
-            bench.validate(result(backend), backend)
-            for phase in bench.PHASES:
+            stats.validate(result(backend), backend)
+            for phase in stats.PHASES:
                 for value in (None, 0, -1, float("nan"), True):
                     r = result(backend)
                     r[phase]["wall_ms"] = value
                     with self.assertRaises(ValueError):
-                        bench.validate(r, backend)
-            for phase in bench.PHASES[1:]:
+                        stats.validate(r, backend)
+            for phase in stats.PHASES[1:]:
                 r = result(backend)
                 r[phase]["hits"] = r[phase]["cache_hits"] = 0
                 with self.assertRaises(ValueError):
-                    bench.validate(r, backend)
+                    stats.validate(r, backend)
         r = result()
         r["warm_same_tree_verdict"]["ok"] = False
         with self.assertRaises(ValueError):
-            bench.validate(r, "kache")
+            stats.validate(r, "kache")
         r = result()
         r["warm"]["invalid_reasons"] = ["store error"]
         with self.assertRaises(ValueError):
-            bench.validate(r, "kache")
+            stats.validate(r, "kache")
 
     def test_cold_reuse_does_not_inflate_samples(self):
-        summary = bench.summarize([record("kache", i) for i in range(6)])
+        summary = stats.summarize([record("kache", i) for i in range(6)])
         self.assertEqual([s["n"] for s in summary["statistics"]], [2, 6, 6])
 
     def test_paired_regression_and_noise(self):
         self.assertEqual(
-            bench.paired_change([10000] * 6, [12000] * 6)["outcome"], "regression"
+            stats.paired_change([10000] * 6, [12000] * 6)["outcome"], "regression"
         )
         self.assertEqual(
-            bench.paired_change([10000] * 6, [8000] * 6)["outcome"], "improvement"
+            stats.paired_change([10000] * 6, [8000] * 6)["outcome"], "improvement"
         )
         self.assertEqual(
-            bench.paired_change([10000] * 6, [9000, 12000] * 3)["outcome"],
+            stats.paired_change([10000] * 6, [9000, 12000] * 3)["outcome"],
             "inconclusive",
         )
         self.assertEqual(
-            bench.paired_change([10000], [15000])["outcome"], "inconclusive"
+            stats.paired_change([10000], [15000])["outcome"], "inconclusive"
         )
         self.assertEqual(
-            bench.paired_change([1000] * 6, [1100] * 6)["outcome"], "inconclusive"
+            stats.paired_change([1000] * 6, [1100] * 6)["outcome"], "inconclusive"
         )
 
     def test_pair_and_identity_validation(self):
         with self.assertRaises(ValueError):
-            bench.summarize([record("base", 0)])
+            stats.summarize([record("base", 0)])
         records = [record("base", 0), record("head", 0)]
         records[1]["result"]["git_ref"] = "different"
         with self.assertRaises(ValueError):
-            bench.summarize(records)
+            stats.summarize(records)
         records = [record("kache", 0), record("kache", 1)]
         records[1]["result"]["cache_tool_version"] = "changed"
         with self.assertRaises(ValueError):
-            bench.summarize(records)
+            stats.summarize(records)
 
     def test_count_regression_cannot_hide_in_faster_timing(self):
         records = [record("base", 0), record("head", 0, 5000)]
         records[1]["result"]["warm"]["misses"] = 1
-        self.assertIn("misses rose", bench.summarize(records)["failures"][0])
+        self.assertIn("misses rose", stats.summarize(records)["failures"][0])
 
     def test_tool_path_sees_through_mise_shims(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,19 +151,19 @@ class BenchTests(unittest.TestCase):
                 "os.environ",
                 {"PATH": os.pathsep.join(map(str, (shims, plain, bin_dir)))},
             ):
-                self.assertEqual(bench.tool_path("sccache"), str(real))
+                self.assertEqual(engine.tool_path("sccache"), str(real))
                 self.assertEqual(
-                    bench.tool_path("unknown"),
+                    engine.tool_path("unknown"),
                     str(shims / "unknown"),
                     "a shim mise cannot locate is kept as the shim itself",
                 )
                 self.assertEqual(
-                    bench.tool_path("kache"),
+                    engine.tool_path("kache"),
                     os.path.realpath(real),
                     "an ordinary symlink is followed as before",
                 )
                 self.assertEqual(
-                    bench.tool_path(str(root / "absent")),
+                    engine.tool_path(str(root / "absent")),
                     os.path.realpath(root / "absent"),
                     "a missing tool keeps its name so the failure names it",
                 )
@@ -247,10 +244,10 @@ class BenchTests(unittest.TestCase):
                 return {"statistics": [], "comparisons": [], "failures": []}
 
             with (
-                patch.object(bench, "run_measurement", invoke),
-                patch.object(bench, "run_contention", contention),
+                patch.object(short, "run_measurement", invoke),
+                patch.object(short, "run_contention", contention),
             ):
-                self.assertEqual(bench.run(args), 0)
+                self.assertEqual(short.run(args), 0)
             self.assertEqual(len(calls), 24)
             self.assertTrue(calls[0][calls[0].index("--kache") + 1].endswith("/base"))
             self.assertEqual(calls[4][calls[4].index("--cache-backend") + 1], "mbx")
@@ -306,17 +303,17 @@ class BenchTests(unittest.TestCase):
                             },
                         }
                     )
-        comparisons, failures = bench.contention_comparison(records)
+        comparisons, failures = stats.contention_comparison(records)
         self.assertEqual(len(comparisons), 2)
         self.assertEqual(len(failures), 2)
         for row in records:
             row["wall_ms"] = 10000
         records[-1]["events"]["results"]["miss"] = 1
         self.assertIn(
-            "miss count increased", bench.contention_comparison(records)[1][0]
+            "miss count increased", stats.contention_comparison(records)[1][0]
         )
         with self.assertRaisesRegex(ValueError, "incomplete"):
-            bench.contention_comparison(records[:-1])
+            stats.contention_comparison(records[:-1])
 
     def test_contention_driver_requires_all_tool_phase_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -349,15 +346,15 @@ class BenchTests(unittest.TestCase):
                 (output / "samples.json").write_text(json.dumps({"records": records}))
                 (output / "summary.json").write_text("[]")
 
-            with patch.object(bench.subprocess, "run", run):
-                self.assertEqual(bench.run_contention(args, arms)["failures"], [])
+            with patch.object(short.subprocess, "run", run):
+                self.assertEqual(short.run_contention(args, arms)["failures"], [])
                 self.assertIn("kache=/kache,1", calls[0])
                 self.assertIn("--sccache", calls[0])
                 self.assertIn("--mbx", calls[0])
                 self.assertEqual(calls[0][calls[0].index("--samples") + 1], "6")
                 records[-1] = records[0]
                 with self.assertRaisesRegex(ValueError, "incomplete contention"):
-                    bench.run_contention(args, arms)
+                    short.run_contention(args, arms)
 
     def test_a_missing_context_tool_skips_its_arm_and_a_named_one_does_not(self):
         """A laptop without sccache should still measure head against base.
@@ -366,21 +363,21 @@ class BenchTests(unittest.TestCase):
         because a bare `sccache` was not on PATH.
         """
         args = argparse.Namespace(sccache="sccache", mbx="mbx", base="/base")
-        with patch.object(bench.shutil, "which", return_value=None):
-            self.assertFalse(bench.wanted_arm(("sccache", "sccache", "sccache"), args))
-            self.assertFalse(bench.wanted_arm(("mbx", "mbx", "mbx"), args))
+        with patch.object(engine.shutil, "which", return_value=None):
+            self.assertFalse(short.wanted_arm(("sccache", "sccache", "sccache"), args))
+            self.assertFalse(short.wanted_arm(("mbx", "mbx", "mbx"), args))
             # The arms that decide the verdict are never skipped away.
-            self.assertTrue(bench.wanted_arm(("head", "kache", "/kache"), args))
-            self.assertTrue(bench.wanted_arm(("base", "kache", "/base"), args))
+            self.assertTrue(short.wanted_arm(("head", "kache", "/kache"), args))
+            self.assertTrue(short.wanted_arm(("base", "kache", "/base"), args))
 
         # Asking for a specific binary keeps the arm, so a wrong path is still
         # an error rather than a silently missing comparison.
         named = argparse.Namespace(sccache="/opt/sccache", mbx="mbx", base=None)
-        with patch.object(bench.shutil, "which", return_value=None):
-            self.assertTrue(bench.wanted_arm(("sccache", "sccache", "/opt/sccache"), named))
+        with patch.object(engine.shutil, "which", return_value=None):
+            self.assertTrue(short.wanted_arm(("sccache", "sccache", "/opt/sccache"), named))
 
-        with patch.object(bench.shutil, "which", return_value="/usr/bin/sccache"):
-            self.assertTrue(bench.wanted_arm(("sccache", "sccache", "sccache"), args))
+        with patch.object(engine.shutil, "which", return_value="/usr/bin/sccache"):
+            self.assertTrue(short.wanted_arm(("sccache", "sccache", "sccache"), args))
 
     def test_cold_every_one_measures_every_cold_build(self):
         """A change aimed at cold needs more than one cold measurement.
@@ -388,10 +385,10 @@ class BenchTests(unittest.TestCase):
         The default reuses a cold build for two samples out of three, so
         `--samples 3` yields three warm pairs and a single cold one.
         """
-        default = [bench.cold_is_reused(sample, 3) for sample in range(6)]
+        default = [short.cold_is_reused(sample, 3) for sample in range(6)]
         self.assertEqual(default, [False, True, True, False, True, True])
 
-        every = [bench.cold_is_reused(sample, 1) for sample in range(4)]
+        every = [short.cold_is_reused(sample, 1) for sample in range(4)]
         self.assertEqual(every, [False, False, False, False])
 
     def test_subprocess_failure_keeps_logs_and_fails(self):
@@ -412,11 +409,11 @@ class BenchTests(unittest.TestCase):
                 skip_contention=True,
             )
             with patch.object(
-                bench,
+                short,
                 "run_measurement",
-                side_effect=bench.subprocess.CalledProcessError(1, ["engine"]),
+                side_effect=subprocess.CalledProcessError(1, ["engine"]),
             ):
-                self.assertEqual(bench.run(args), 1)
+                self.assertEqual(short.run(args), 1)
             self.assertIn(
                 "INVALID MEASUREMENT", (args.output / "perf-gate.md").read_text()
             )
@@ -433,7 +430,7 @@ def subject(root, name, records, contention=None, error=None):
     (directory / "samples.json").write_text(json.dumps(payload))
     if error:
         return directory
-    summary = bench.summarize(records)
+    summary = stats.summarize(records)
     if contention:
         summary["contention"] = contention
     (directory / "summary.json").write_text(json.dumps(summary))
@@ -449,7 +446,7 @@ def paired(ms_base, ms_head, samples=1):
 
 
 class ReportTests(unittest.TestCase):
-    render = staticmethod(bench.perf_gate_report.render)
+    render = staticmethod(report.render)
 
     def test_head_against_base_leads_and_the_rest_folds_away(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -67,7 +67,8 @@ class ChangeTests(unittest.TestCase):
         self.assertEqual(
             self.groups(
                 "scripts/bench-short.py",
-                "scripts/test-bench-short.py",
+                "scripts/bench/short.py",
+                "scripts/bench/tests/test_short.py",
                 "scripts/perf-gate-report.py",
                 "scripts/install-bench-mbx.sh",
                 ".github/workflows/perf-gate.yml",
@@ -76,9 +77,7 @@ class ChangeTests(unittest.TestCase):
                 ".github/workflows/bench-firefox-windows.yml",
                 ".github/workflows/bench-sccache.yml",
                 "scripts/perf-gate-local.py",
-                "scripts/test-perf-gate-local.py",
                 "scripts/trace-phases.py",
-                "scripts/test-trace-phases.py",
             ),
             {"check": True, "tests": False, "e2e": False, "nix": False},
         )

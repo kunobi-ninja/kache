@@ -16,9 +16,9 @@
 //!   and waits for the commit, as it would for a wrapper that was still
 //!   storing.
 //! - The daemon answers `ok` only once the job is queued behind that lock.
-//!   Any other answer, a full queue, an old daemon that does not know the
-//!   request, or no answer within the wrapper's timeout, means the wrapper
-//!   publishes on its own, as it did before this module existed.
+//!   An atomic receipt resolves lost replies: the daemon renames pending
+//!   to accepted before enqueueing; the wrapper can cancel by removing pending.
+//!   A declined or cancelled request falls back to wrapper publication.
 //! - The daemon owns the handoff files from acceptance on and removes them
 //!   once the put has copied them. A daemon that dies with jobs queued loses
 //!   those stores, never a build: the compile has already produced its
@@ -175,9 +175,15 @@ impl Daemon {
         let Some(tx) = self.publish_queue().sender() else {
             return refused("queue closed");
         };
-        if tx.capacity() == 0 {
-            return refused("queue full");
-        }
+        // Reserve before claiming ownership: once the receipt is accepted,
+        // queue insertion must not fail because another handler took its slot.
+        let permit = match tx.try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => return refused("queue full"),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return refused("queue closed");
+            }
+        };
         let key = request.cache_key.clone();
         let daemon = Arc::clone(self);
         let claim =
@@ -199,6 +205,12 @@ impl Daemon {
                 .map(|file| (PathBuf::from(&file.path), file.store_name.clone()))
                 .collect::<Vec<_>>();
             let owned = snapshot_for_handoff(&config, &files)?;
+            // Rename and client cancellation race on the same pending file.
+            // Exactly one wins, even if the socket reply is lost.
+            if let Err(error) = accept_receipt(&request) {
+                remove_handoff_files(&owned);
+                return Err(error);
+            }
             remove_handoff_files(&request.files);
             let mut request = request;
             request.files = owned;
@@ -213,17 +225,8 @@ impl Daemon {
             Ok(Err(error)) => return refused(&format!("snapshot failed: {error:#}")),
             Err(error) => return refused(&format!("snapshot task failed: {error}")),
         };
-        match tx.try_send(job) {
-            Ok(()) => Response::ok(),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
-                discard_handoff_files(&job.request);
-                refused("queue full")
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => {
-                discard_handoff_files(&job.request);
-                refused("queue closed")
-            }
-        }
+        permit.send(job);
+        Response::ok()
     }
 }
 
@@ -414,17 +417,86 @@ pub(crate) fn hand_off_cc_publish(config: &Config, request: &PublishCcRequest) -
     if !socket.exists() {
         return Handoff::Declined("no daemon socket".to_string());
     }
-    match send_handoff(&socket, request, PUBLISH_HANDOFF_TIMEOUT) {
-        Ok(line) => match serde_json::from_str::<Response>(&line) {
-            Ok(response) if response.ok => Handoff::Accepted,
-            Ok(response) => Handoff::Declined(
-                response
-                    .error
-                    .unwrap_or_else(|| "daemon declined".to_string()),
-            ),
-            Err(error) => Handoff::Declined(format!("unreadable daemon reply: {error}")),
-        },
-        Err(error) => Handoff::Declined(format!("{error:#}")),
+    let receipt = match HandoffReceipt::new(request) {
+        Ok(receipt) => receipt,
+        Err(error) => return Handoff::Declined(format!("creating handoff receipt: {error:#}")),
+    };
+    let reply = send_handoff(&socket, request, PUBLISH_HANDOFF_TIMEOUT);
+    finish_handoff(&receipt, reply)
+}
+
+/// The wrapper owns the receipt directory until it has resolved the socket
+/// result. The daemon atomically renames pending to accepted before enqueueing.
+/// Removing pending cancels a late handler, so it cannot publish after fallback.
+struct HandoffReceipt {
+    pending: PathBuf,
+    accepted: PathBuf,
+}
+
+fn receipt_paths(request: &PublishCcRequest) -> Result<(PathBuf, PathBuf)> {
+    let parent = request
+        .files
+        .first()
+        .and_then(|file| Path::new(&file.path).parent())
+        .context("handoff has no snapshot directory")?;
+    Ok((parent.join("pending"), parent.join("accepted")))
+}
+
+impl HandoffReceipt {
+    fn new(request: &PublishCcRequest) -> Result<Self> {
+        let (pending, accepted) = receipt_paths(request)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending)?;
+        Ok(Self { pending, accepted })
+    }
+}
+
+impl Drop for HandoffReceipt {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.pending);
+        let _ = std::fs::remove_file(&self.accepted);
+        if let Some(parent) = self.pending.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+fn accept_receipt(request: &PublishCcRequest) -> Result<()> {
+    let (pending, accepted) = receipt_paths(request)?;
+    std::fs::rename(pending, accepted).context("handoff cancelled before acceptance")
+}
+
+fn finish_handoff(receipt: &HandoffReceipt, reply: Result<String>) -> Handoff {
+    match std::fs::remove_file(&receipt.pending) {
+        Ok(()) => {
+            let reason = match reply {
+                Ok(line) => match serde_json::from_str::<Response>(&line) {
+                    Ok(response) => response.error.unwrap_or_else(|| {
+                        "daemon replied without accepting the receipt".to_string()
+                    }),
+                    Err(error) => format!("unreadable daemon reply: {error}"),
+                },
+                Err(error) => format!("{error:#}"),
+            };
+            Handoff::Declined(reason)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The daemon won the rename, and owns both publication and event.
+            // The socket reply is no longer needed to establish ownership.
+            if receipt.accepted.exists() {
+                Handoff::Accepted
+            } else {
+                Handoff::Declined("handoff receipt disappeared".to_string())
+            }
+        }
+        Err(error) => {
+            // Cancellation could not be established. Leave this optional put
+            // to the daemon instead of racing it with a second publication.
+            tracing::debug!("could not cancel cc handoff receipt: {error}");
+            Handoff::Accepted
+        }
     }
 }
 
@@ -644,6 +716,7 @@ mod tests {
             tokio::task::spawn_blocking(move || run_publish_worker(d, rx))
         };
         let mut request = handoff_request(&config, &key("accepted"), dir.path());
+        let _request_receipt = HandoffReceipt::new(&request).unwrap();
         let header = dir.path().join("a.h");
         std::fs::write(&header, b"#define A 1\n").unwrap();
         let memo = CcMemoHandoff {
@@ -701,6 +774,7 @@ mod tests {
 
         // No sender yet: closed.
         let request = handoff_request(&config, &key("closed"), dir.path());
+        let _request_receipt = HandoffReceipt::new(&request).unwrap();
         let response = daemon.handle_publish_cc(request.clone()).await;
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("queue closed"));
@@ -714,8 +788,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         daemon.publish_queue().set_sender(tx);
         let first = handoff_request(&config, &key("first"), dir.path());
+        let _first_receipt = HandoffReceipt::new(&first).unwrap();
         assert!(daemon.handle_publish_cc(first.clone()).await.ok);
         let second = handoff_request(&config, &key("second"), dir.path());
+        let _second_receipt = HandoffReceipt::new(&second).unwrap();
         let response = daemon.handle_publish_cc(second.clone()).await;
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("queue full"));
@@ -737,6 +813,7 @@ mod tests {
 
         // A key a peer holds.
         let held = handoff_request(&config, &key("held"), dir.path());
+        let _held_receipt = HandoffReceipt::new(&held).unwrap();
         let _peer = match store.claim_build(&held.cache_key).unwrap() {
             BuildClaim::Acquired(lock) => lock,
             _ => panic!("fresh key"),
@@ -747,12 +824,14 @@ mod tests {
 
         // A file outside the handoff directory.
         let mut foreign = handoff_request(&config, &key("foreign"), dir.path());
+        let _foreign_receipt = HandoffReceipt::new(&foreign).unwrap();
         foreign.files[0].path = dir.path().join("a.o").to_string_lossy().into_owned();
         let response = daemon.handle_publish_cc(foreign).await;
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("outside"));
 
         let mut invalid = handoff_request(&config, &key("invalid"), dir.path());
+        let _invalid_receipt = HandoffReceipt::new(&invalid).unwrap();
         invalid.cache_key = "nope".to_string();
         assert!(!daemon.handle_publish_cc(invalid).await.ok);
     }
@@ -765,7 +844,13 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         daemon.publish_queue().set_sender(tx);
         let request = handoff_request(&config, &key("lost-reply"), dir.path());
+        let receipt = HandoffReceipt::new(&request).unwrap();
         assert!(daemon.handle_publish_cc(request.clone()).await.ok);
+        assert_eq!(
+            finish_handoff(&receipt, Err(anyhow::anyhow!("lost socket reply"))),
+            Handoff::Accepted,
+        );
+        drop(receipt);
         // The reply is lost. The client times out, removes its snapshots,
         // and a subsequent invocation stages different bytes under its PID.
         remove_handoff_files(&request.files);
@@ -781,9 +866,119 @@ mod tests {
         let store = Store::open(&config).unwrap();
         publish_one(&daemon, &config, &store, job);
         assert!(store.get(&request.cache_key).unwrap().is_some());
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].store_handed_off);
+        assert!(events[0].store_error.is_empty());
         assert_eq!(std::fs::read(&later[0].path).unwrap(), b"different object");
         remove_handoff_files(&later);
         assert_eq!(std::fs::read_dir(handoff_dir(&config)).unwrap().count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_wrapper_cancels_a_late_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        daemon.publish_queue().set_sender(tx);
+        let request = handoff_request(&config, &key("cancelled"), dir.path());
+        let receipt = HandoffReceipt::new(&request).unwrap();
+        assert_eq!(
+            finish_handoff(&receipt, Err(anyhow::anyhow!("timed out"))),
+            Handoff::Declined("timed out".to_string()),
+        );
+        let response = daemon.handle_publish_cc(request.clone()).await;
+        assert!(!response.ok);
+        assert!(response.error.unwrap().contains("cancelled"));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let store = Store::open(&config).unwrap();
+        assert!(matches!(
+            store.claim_build(&request.cache_key).unwrap(),
+            BuildClaim::Acquired(_)
+        ));
+        assert!(!config.event_log_path().exists());
+        assert_eq!(
+            std::fs::read(&request.files[0].path).unwrap(),
+            b"object bytes"
+        );
+        drop(receipt);
+        remove_handoff_files(&request.files);
+        assert_eq!(std::fs::read_dir(handoff_dir(&config)).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancellation_resolves_refused_invalid_and_unclaimed_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        for (reply, reason) in [
+            ("{\"ok\":false,\"error\":\"queue closed\"}", "queue closed"),
+            ("not json", "unreadable daemon reply"),
+            ("{\"ok\":true}", "without accepting the receipt"),
+        ] {
+            let request = handoff_request(&config, &key(reply), dir.path());
+            let receipt = HandoffReceipt::new(&request).unwrap();
+            assert!(
+                matches!(finish_handoff(&receipt, Ok(reply.to_string())), Handoff::Declined(message) if message.contains(reason))
+            );
+            assert!(!receipt.pending.exists());
+            assert!(!receipt.accepted.exists());
+            assert!(accept_receipt(&request).is_err());
+        }
+    }
+
+    #[test]
+    fn receipt_creation_never_cleans_up_an_existing_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let mut request = handoff_request(&config, &key("receipt-owner"), dir.path());
+        let receipt = HandoffReceipt::new(&request).unwrap();
+        assert!(HandoffReceipt::new(&request).is_err());
+        assert!(receipt.pending.exists());
+        accept_receipt(&request).unwrap();
+        assert_eq!(
+            finish_handoff(&receipt, Ok("{\"ok\":true}".into())),
+            Handoff::Accepted
+        );
+        let accepted = receipt.accepted.clone();
+        drop(receipt);
+        assert!(!accepted.exists());
+        request.files.clear();
+        assert!(HandoffReceipt::new(&request).is_err());
+    }
+
+    #[test]
+    fn vanished_receipt_declines_but_failed_cancellation_does_not_race_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let request = handoff_request(&config, &key("receipt-errors"), dir.path());
+        let receipt = HandoffReceipt::new(&request).unwrap();
+        std::fs::remove_file(&receipt.pending).unwrap();
+        assert_eq!(
+            finish_handoff(&receipt, Err(anyhow::anyhow!("socket error"))),
+            Handoff::Declined("handoff receipt disappeared".into())
+        );
+        std::fs::create_dir(&receipt.pending).unwrap();
+        assert_eq!(
+            finish_handoff(&receipt, Err(anyhow::anyhow!("socket error"))),
+            Handoff::Accepted
+        );
+    }
+
+    #[test]
+    fn receipt_protocol_does_not_reach_legacy_publish_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let request = handoff_request(&config, &key("protocol"), dir.path());
+        let value =
+            serde_json::to_value(crate::daemon::Request::PublishCc(Box::new(request))).unwrap();
+        assert!(value.get("publish_cc_v2").is_some());
+        assert!(serde_json::from_value::<crate::daemon::Request>(value.clone()).is_ok());
+        let legacy = serde_json::json!({"publish_cc": value["publish_cc_v2"]});
+        assert!(serde_json::from_value::<crate::daemon::Request>(legacy).is_err());
     }
 
     #[cfg(unix)]

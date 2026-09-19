@@ -425,6 +425,9 @@ pub(crate) enum Request {
     CompileStarted(CompileStartedRequest),
     CompileFinished(CompileFinishedRequest),
     /// A wrapper hands the daemon a finished cc compile to store.
+    /// Older handlers lack the atomic receipt; reject their protocol instead
+    /// of allowing an ambiguous timeout to publish and log twice.
+    #[serde(rename = "publish_cc_v2")]
     PublishCc(Box<crate::daemon_publish::PublishCcRequest>),
     Shutdown,
 }

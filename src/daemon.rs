@@ -1898,6 +1898,34 @@ impl PrefetchStats {
 
 const RECENT_TRANSFERS_CAP: usize = 50;
 
+const PREFETCH_CANCELLATION_CAP: usize = 128;
+
+#[derive(Default)]
+struct PrefetchCancellations {
+    origins: Vec<PrefetchOrigin>,
+    overflowed: bool,
+}
+
+// Drop never performs file I/O. Shutdown consumes these bounded records only
+// after every owned task has exited, before writing the final summary.
+struct PrefetchTaskGuard {
+    origin: Option<PrefetchOrigin>,
+    cancellations: Arc<Mutex<PrefetchCancellations>>,
+}
+
+impl Drop for PrefetchTaskGuard {
+    fn drop(&mut self) {
+        if let Some(origin) = self.origin.take() {
+            let mut queue = self.cancellations.lock().unwrap_or_else(|p| p.into_inner());
+            if queue.origins.len() == PREFETCH_CANCELLATION_CAP {
+                queue.overflowed = true;
+            } else {
+                queue.origins.push(origin);
+            }
+        }
+    }
+}
+
 // ── Active prefetch plan (per-session attribution, #583 P0.5) ───────────────
 
 /// Per-plan prefetch bookkeeping. One plan is active at a time (the daemon
@@ -2276,6 +2304,10 @@ pub(crate) struct Daemon {
     /// Reset to `false` on every plan install; the per-plan counters that
     /// drive it live in [`ActivePlan`] (#581).
     prefetch_cancel: tokio::sync::watch::Sender<bool>,
+    prefetch_stopping: AtomicBool,
+    /// Own both coordinators and their independently scheduled download tasks.
+    prefetch_tasks: Mutex<tokio::task::JoinSet<()>>,
+    prefetch_cancellations: Arc<Mutex<PrefetchCancellations>>,
     /// Phase-0 observability counters (#485). Telemetry only.
     prefetch_stats: PrefetchStats,
     /// DAEMON-WIDE cap on concurrent speculative prefetch downloads, sized by
@@ -2426,6 +2458,9 @@ impl Daemon {
             warming_tx,
             prefetched_keys: Arc::new(RwLock::new(HashSet::new())),
             prefetch_cancel,
+            prefetch_stopping: AtomicBool::new(false),
+            prefetch_tasks: Mutex::new(tokio::task::JoinSet::new()),
+            prefetch_cancellations: Arc::new(Mutex::new(PrefetchCancellations::default())),
             prefetch_stats: PrefetchStats::new(),
             prefetch_gate: Arc::new(tokio::sync::Semaphore::new(prefetch_concurrency_cap(
                 config.s3_concurrency,
@@ -4363,6 +4398,10 @@ impl Daemon {
                     .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
             })
             .await?;
+        anyhow::ensure!(
+            !self.prefetch_stopping.load(Ordering::Acquire),
+            "daemon stopping before packed prefetch request"
+        );
         self.prefetch_stats
             .pack_requests_total
             .fetch_add(1, Ordering::Relaxed);
@@ -4413,6 +4452,10 @@ impl Daemon {
                     .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
             })
             .await?;
+        anyhow::ensure!(
+            !self.prefetch_stopping.load(Ordering::Acquire),
+            "daemon stopping before packed prefetch request"
+        );
         self.prefetch_stats
             .pack_requests_total
             .fetch_add(1, Ordering::Relaxed);
@@ -4746,8 +4789,117 @@ impl Daemon {
         imported
     }
 
-    /// Handle a prefetch request: fire-and-forget background downloads.
-    /// Spawns a single coordinator task that processes keys with bounded concurrency.
+    /// Own each independently scheduled task; receivers let coordinators
+    /// enforce their concurrency cap without owning or detaching child handles.
+    fn spawn_prefetch_task(
+        &self,
+        origin: PrefetchOrigin,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        let mut tasks = self
+            .prefetch_tasks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        while tasks.try_join_next().is_some() {}
+        if self.prefetch_stopping.load(Ordering::Acquire) {
+            self.cancel_prefetch_plan(&origin);
+            return None;
+        }
+        let (completed, receiver) = tokio::sync::oneshot::channel();
+        let mut guard = PrefetchTaskGuard {
+            origin: Some(origin),
+            cancellations: self.prefetch_cancellations.clone(),
+        };
+        tasks.spawn(async move {
+            task.await;
+            guard.origin = None;
+            let _ = completed.send(());
+        });
+        Some(receiver)
+    }
+
+    fn stop_prefetch_admission(&self) {
+        self.prefetch_stopping.store(true, Ordering::Release);
+        self.prefetch_cancel.send_replace(true);
+    }
+
+    fn cancel_prefetch_plan(&self, origin: &PrefetchOrigin) {
+        let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(plan) = slot.as_mut()
+            && plan.session_id == origin.session_id
+            && plan.plan_id == origin.plan_id
+            && plan.plan_source == origin.source
+        {
+            plan.cancelled = true;
+        }
+    }
+
+    /// Stop admission, drain, then abort and join actual tasks before the
+    /// summary. Inline extraction and filesystem I/O cannot be preempted by
+    /// Tokio; the timeout bounds async waiting, not stalled synchronous I/O.
+    async fn finish_prefetch_shutdown(self: &Arc<Self>, timeout: Duration) -> bool {
+        self.stop_prefetch_admission();
+        let mut tasks = std::mem::take(
+            &mut *self
+                .prefetch_tasks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        let timed_out = tokio::time::timeout(timeout, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+
+        // Future per-operation cancellation records must also be flushed at
+        // this boundary: all producers have exited, and the summary is not yet taken.
+        let cancellations = std::mem::take(
+            &mut *self
+                .prefetch_cancellations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        for origin in &cancellations.origins {
+            self.cancel_prefetch_plan(origin);
+        }
+        let plan = self
+            .active_plan
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(mut plan) = plan {
+            let incomplete = timed_out
+                || cancellations.overflowed
+                || cancellations.origins.iter().any(|origin| {
+                    plan.session_id == origin.session_id
+                        && plan.plan_id == origin.plan_id
+                        && plan.plan_source == origin.source
+                });
+            plan.cancelled |= incomplete;
+            let daemon = self.clone();
+            let reason = if timed_out {
+                "shutdown_timeout"
+            } else {
+                "shutdown"
+            };
+            let writer = tokio::task::spawn_blocking(move || {
+                daemon.emit_plan_summary(plan, reason, incomplete);
+            });
+            // Timing out does not cancel a blocking fsync. The runtime's
+            // existing shutdown timeout remains the last resort for disk I/O.
+            if tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .is_err()
+            {
+                tracing::warn!("shutdown summary write is still blocked on local I/O");
+            }
+        }
+        timed_out
+    }
+
+    /// Handle a prefetch request through an owned background coordinator.
     pub async fn handle_prefetch(self: &Arc<Self>, req: &PrefetchRequest) -> Response {
         self.handle_prefetch_with_context(req, None, Instant::now())
             .await
@@ -4759,6 +4911,9 @@ impl Daemon {
         pack_context: Option<PackPrefetchContext>,
         plan_started_at: Instant,
     ) -> Response {
+        if self.prefetch_stopping.load(Ordering::Acquire) {
+            return Response::ok();
+        }
         if !self.config.prefetch_enabled {
             tracing::debug!("prefetch request ignored: speculative prefetch disabled");
             return Response::ok();
@@ -4922,7 +5077,11 @@ impl Daemon {
         let daemon = Arc::clone(self);
         let remote_config = (*remote).clone();
         let cancel_rx = self.prefetch_cancel.subscribe();
-        tokio::spawn(async move {
+        self.spawn_prefetch_task(origin.clone(), async move {
+            if daemon.prefetch_stopping.load(Ordering::Acquire) {
+                daemon.cancel_prefetch_plan(&origin);
+                return;
+            }
             if let Some(context) = pack_context.as_ref() {
                 let packed = daemon
                     .try_packed_prefetch(
@@ -5005,7 +5164,8 @@ impl Daemon {
 
                 // Check for adaptive cancellation
                 if *cancel_rx.borrow() {
-                    tracing::info!("prefetch: cancelled by adaptive hit-rate check");
+                    daemon.cancel_prefetch_plan(&origin);
+                    tracing::info!("prefetch: remaining candidates cancelled");
                     // Nothing to drain: an un-started candidate holds no claim
                     // (#613), so no waiter can be parked on one. Tasks already
                     // in flight keep their own `DownloadingGuard`, which wakes
@@ -5033,7 +5193,11 @@ impl Daemon {
                 let mut origin = origin.clone();
                 origin.candidate_rank = ranks.get(&key).copied();
                 origin.candidate_source = candidate_sources.get(&key).copied().unwrap_or_default();
-                in_flight.push(tokio::spawn(async move {
+                let task = daemon.spawn_prefetch_task(origin.clone(), async move {
+                    if d.prefetch_stopping.load(Ordering::Acquire) {
+                        d.cancel_prefetch_plan(&origin);
+                        return;
+                    }
                     let item_deadline =
                         RemoteDeadline::from_secs(d.config.remote_restore_timeout_secs)
                             .min(RemoteDeadline::from_instant(plan_deadline));
@@ -5094,6 +5258,10 @@ impl Daemon {
                         }
                     };
                     let semaphore_wait_ms = semaphore_start.elapsed().as_millis() as u64;
+                    if d.prefetch_stopping.load(Ordering::Acquire) {
+                        d.cancel_prefetch_plan(&origin);
+                        return;
+                    }
                     // Claim LAST, once this task is ready to download right
                     // now (#613): the window where a key sits claimed but
                     // idle is what made demand park behind speculation, so it
@@ -5311,7 +5479,12 @@ impl Daemon {
                             .await;
                         }
                     }
-                }));
+                });
+                if let Some(task) = task {
+                    in_flight.push(task);
+                } else {
+                    break;
+                }
             }
 
             // Drain remaining
@@ -5347,6 +5520,9 @@ impl Daemon {
         candidates: impl Iterator<Item = String>,
         identity_key: Option<String>,
     ) {
+        if self.prefetch_stopping.load(Ordering::Acquire) {
+            return;
+        }
         let _ = self.prefetch_cancel.send(false);
         let candidates: HashSet<String> = candidates.collect();
         let mut plan = ActivePlan::new(
@@ -5380,7 +5556,7 @@ impl Daemon {
             slot.replace(plan)
         };
         if let Some(prev) = prev {
-            self.emit_plan_summary(prev, "superseded");
+            self.emit_plan_summary(prev, "superseded", false);
         }
     }
 
@@ -5388,7 +5564,7 @@ impl Daemon {
     /// session still owns the exact identity needed to publish its completed
     /// events for the next cold build.
     fn ensure_active_session(&self, req: &BuildStartedRequest) {
-        if req.session_id.trim().is_empty() {
+        if req.session_id.trim().is_empty() || self.prefetch_stopping.load(Ordering::Acquire) {
             return;
         }
         let mut plan = ActivePlan::new(
@@ -5418,7 +5594,7 @@ impl Daemon {
             }
         };
         if let Some(prev) = prev {
-            self.emit_plan_summary(prev, "superseded");
+            self.emit_plan_summary(prev, "superseded", false);
         }
     }
 
@@ -5426,6 +5602,9 @@ impl Daemon {
     /// Called from the periodic sweep; cargo gives no positive end-of-build
     /// signal, so inactivity IS the end signal (#583 P0.5).
     pub(crate) fn finalize_inactive_plan(&self, inactivity_ms: u64) {
+        if self.prefetch_stopping.load(Ordering::Acquire) {
+            return;
+        }
         let prev = {
             let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
             match slot.as_ref() {
@@ -5436,18 +5615,19 @@ impl Daemon {
             }
         };
         if let Some(prev) = prev {
-            self.emit_plan_summary(prev, "inactivity");
+            self.emit_plan_summary(prev, "inactivity", false);
         }
     }
 
     /// Append the per-session summary to `summaries.jsonl`. Best-effort:
     /// telemetry must never fail the daemon.
-    fn emit_plan_summary(&self, plan: ActivePlan, closure_reason: &str) {
+    fn emit_plan_summary(&self, plan: ActivePlan, closure_reason: &str, incomplete: bool) {
         let used_bytes = plan.used_bytes();
         let downloaded_bytes: u64 = plan.downloaded.values().sum();
         let event = crate::events::BuildSummaryEvent {
             ts: chrono::Utc::now(),
-            schema: 1,
+            schema: 2,
+            incomplete,
             session_id: plan.session_id.clone(),
             root: String::new(),
             plan_source: plan.plan_source.to_string(),
@@ -5475,8 +5655,17 @@ impl Daemon {
                 .saturating_sub(plan.list_duration_ms_at_install),
         };
         let path = self.config.summary_log_path();
-        if let Err(e) = crate::events::log_summary(&path, &event) {
+        let shutdown = self.prefetch_stopping.load(Ordering::Acquire);
+        let logged = if shutdown {
+            crate::events::log_summary_durable(&path, &event)
+        } else {
+            crate::events::log_summary(&path, &event)
+        };
+        if let Err(e) = logged {
             tracing::debug!("failed to write build summary: {e}");
+        }
+        if shutdown {
+            return;
         }
         let _ = self.maybe_publish_identity_manifest(
             plan.identity_key.as_deref(),
@@ -5492,6 +5681,9 @@ impl Daemon {
         identity_key: Option<&str>,
         session_id: &str,
     ) -> bool {
+        if self.prefetch_stopping.load(Ordering::Acquire) {
+            return false;
+        }
         let Some((identity_key, session_id)) = identity_publish_context(
             identity_key,
             session_id,
@@ -6347,7 +6539,7 @@ async fn server_main(
     // 5-minute inactivity window is plenty; the summary lands in
     // `summaries.jsonl` where `kache report` joins it with per-crate events.
     let sweep_daemon = daemon.clone();
-    tokio::spawn(async move {
+    let sweep_handle = tokio::spawn(async move {
         const SESSION_INACTIVITY_MS: u64 = 300_000;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -6567,11 +6759,19 @@ async fn server_main(
     if let Some(h) = maintenance_handle {
         h.abort();
     }
-    if let Some(h) = cache_handle {
-        h.abort();
+    // Stop producers before draining the tasks and taking the final counters.
+    let producers = [Some(sweep_handle), cache_handle, manifest_handle];
+    for handle in producers.iter().flatten() {
+        handle.abort();
     }
-    if let Some(h) = manifest_handle {
-        h.abort();
+    for handle in producers.into_iter().flatten() {
+        let _ = handle.await;
+    }
+    if daemon
+        .finish_prefetch_shutdown(Duration::from_secs(5))
+        .await
+    {
+        tracing::warn!("prefetch drain timed out; remaining tasks aborted and joined");
     }
     heartbeat_handle.abort();
     config_watch_handle.abort();
@@ -6966,6 +7166,7 @@ async fn accept_loop(
     // responses under a deadline. This must happen before `server_main` drops
     // the runtime and starts draining uploads.
     lifecycle.start_drain();
+    daemon.stop_prefetch_admission();
     let drain_deadline = tokio::time::Instant::now() + handler_drain_timeout;
     let _ = lifecycle.drain_until(drain_deadline).await;
     if drain_connection_handlers(
@@ -15726,6 +15927,256 @@ mod tests {
         );
         plan.record_download_from(&origin, "key", 42);
         assert_eq!(plan.downloaded, HashMap::from([("key".to_string(), 42)]));
+    }
+
+    async fn shutdown_prefetch_fixture() -> (
+        tempfile::TempDir,
+        Arc<Daemon>,
+        Arc<BlockingV3Backend>,
+        tokio::sync::mpsc::UnboundedReceiver<u64>,
+        Vec<String>,
+        u64,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.s3_concurrency = 1;
+        let inner = test_remote_backend();
+        let keys = vec![
+            test_cache_key("shutdown-first"),
+            test_cache_key("shutdown-queued"),
+        ];
+        let mut first_bytes = 0;
+        for (index, key) in keys.iter().enumerate() {
+            let pack = build_entry_pack(key, "serde");
+            if index == 0 {
+                first_bytes = pack.len() as u64;
+            }
+            put_test_object(&inner, &test_pack_object_key(key, "serde"), &pack).await;
+        }
+        let (started, received) = tokio::sync::mpsc::unbounded_channel();
+        let backend = Arc::new(BlockingV3Backend {
+            inner,
+            v3_get_started: started,
+            release_v3_get: Arc::new(tokio::sync::Semaphore::new(0)),
+            v3_gets: AtomicU64::new(0),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        daemon.install_plan(
+            "session",
+            "plan",
+            "advisory",
+            keys.clone().into_iter(),
+            Some("identity".into()),
+        );
+        let origin = PrefetchOrigin {
+            session_id: "session".into(),
+            plan_id: "plan".into(),
+            source: "advisory".into(),
+            ..PrefetchOrigin::default()
+        };
+        assert!(
+            daemon
+                .handle_prefetch(&PrefetchRequest {
+                    keys: keys
+                        .iter()
+                        .cloned()
+                        .map(|key| (key, "serde".into()))
+                        .collect(),
+                    warm_all: false,
+                    origin: Some(origin),
+                    candidate_sources: HashMap::new(),
+                })
+                .await
+                .ok
+        );
+        (dir, daemon, backend, received, keys, first_bytes)
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_drains_started_child_before_summary_and_rejects_queued_work() {
+        let (_dir, daemon, backend, mut started, keys, bytes) = shutdown_prefetch_fixture().await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), started.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        daemon
+            .active_plan
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .record_demand(&keys[0]);
+        daemon.stop_prefetch_admission();
+        let draining = tokio::spawn({
+            let daemon = daemon.clone();
+            async move {
+                daemon
+                    .finish_prefetch_shutdown(Duration::from_secs(2))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!draining.is_finished());
+        assert!(
+            !daemon.config.summary_log_path().exists(),
+            "summary cannot precede an in-flight outcome"
+        );
+        backend.release_v3_get.add_permits(1);
+        assert!(!draining.await.unwrap());
+        assert_eq!(
+            backend.v3_gets.load(Ordering::SeqCst),
+            1,
+            "queued candidate must not start"
+        );
+        assert!(!daemon.entry_dir_for(&keys[1]).exists());
+        assert!(daemon.downloading.read().await.is_empty());
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.schema, 2);
+        assert_eq!(summary.closure_reason, "shutdown");
+        assert!(summary.cancelled);
+        assert!(!summary.incomplete);
+        assert_eq!(summary.downloaded_keys, 1);
+        assert_eq!(summary.downloaded_bytes, bytes);
+        assert_eq!(summary.used_keys, 1);
+        assert_eq!(summary.used_bytes, bytes);
+        assert!(!daemon.maybe_publish_identity_manifest(Some("identity"), "session"));
+        assert!(!daemon.finish_prefetch_shutdown(Duration::ZERO).await);
+        assert_eq!(
+            events::read_summaries(&daemon.config.summary_log_path())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_timeout_drops_and_joins_the_actual_download_child() {
+        let (_dir, daemon, backend, mut started, _keys, _bytes) = shutdown_prefetch_fixture().await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), started.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                daemon.finish_prefetch_shutdown(Duration::from_millis(5))
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            daemon.downloading.read().await.is_empty(),
+            "child Drop must release its download claim before the summary"
+        );
+        backend.release_v3_get.add_permits(1);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            backend.release_v3_get.available_permits(),
+            1,
+            "no detached child may consume a released gate after shutdown"
+        );
+        assert_eq!(backend.v3_gets.load(Ordering::SeqCst), 1);
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].closure_reason, "shutdown_timeout");
+        assert!(summaries[0].cancelled);
+        assert!(
+            summaries[0].incomplete,
+            "aborted body bytes/attempts are unknown, not known zero"
+        );
+        assert_eq!(summaries[0].downloaded_keys, 0);
+        assert!(
+            daemon
+                .prefetch_cancellations
+                .lock()
+                .unwrap()
+                .origins
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_finalizes_a_short_session_without_waiting_for_inactivity() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon.ensure_active_session(&BuildStartedRequest {
+            intent: kache_core::BuildIntent::default(),
+            client_epoch: 0,
+            session_id: "short-session".into(),
+        });
+        daemon.finalize_inactive_plan(300_000);
+        assert!(!daemon.config.summary_log_path().exists());
+        assert!(!daemon.finish_prefetch_shutdown(Duration::ZERO).await);
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].session_id, "short-session");
+        assert_eq!(summaries[0].closure_reason, "shutdown");
+        assert!(!summaries[0].incomplete);
+        assert!(!summaries[0].cancelled);
+        assert!(daemon.active_plan.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_registry_reaps_tasks_and_releases_panicked_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        let origin = PrefetchOrigin::default();
+        let panic = daemon
+            .spawn_prefetch_task(origin.clone(), async { panic!("test child panic") })
+            .unwrap();
+        assert!(panic.await.is_err());
+        for _ in 0..4 {
+            daemon
+                .spawn_prefetch_task(origin.clone(), async {})
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            daemon.prefetch_tasks.lock().unwrap().len(),
+            1,
+            "completed registrations must be reaped on admission"
+        );
+        daemon.stop_prefetch_admission();
+        let polled = Arc::new(AtomicBool::new(false));
+        let future_flag = polled.clone();
+        assert!(
+            daemon
+                .spawn_prefetch_task(origin, async move {
+                    future_flag.store(true, Ordering::Relaxed);
+                })
+                .is_none()
+        );
+        assert!(!daemon.finish_prefetch_shutdown(Duration::ZERO).await);
+        assert!(!polled.load(Ordering::Relaxed));
+        assert!(daemon.prefetch_tasks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shutdown_prefetch_drop_records_are_bounded_and_only_record_cancelled_tasks() {
+        let cancellations = Arc::new(Mutex::new(PrefetchCancellations::default()));
+        drop(PrefetchTaskGuard {
+            origin: None,
+            cancellations: cancellations.clone(),
+        });
+        assert!(cancellations.lock().unwrap().origins.is_empty());
+        for _ in 0..129 {
+            drop(PrefetchTaskGuard {
+                origin: Some(PrefetchOrigin::default()),
+                cancellations: cancellations.clone(),
+            });
+        }
+        let queue = cancellations.lock().unwrap();
+        assert_eq!(queue.origins.len(), 128);
+        assert!(queue.overflowed);
     }
 
     #[tokio::test]

@@ -409,6 +409,10 @@ impl std::fmt::Display for EventResult {
 pub struct BuildSummaryEvent {
     pub ts: DateTime<Utc>,
     pub schema: u32,
+    /// Shutdown could not observe every prefetch outcome. Completed counters
+    /// remain lower bounds; missing bytes and attempts must not be read as zero.
+    #[serde(default)]
+    pub incomplete: bool,
     #[serde(default)]
     pub session_id: String,
     #[serde(default)]
@@ -418,7 +422,7 @@ pub struct BuildSummaryEvent {
     pub plan_source: String,
     #[serde(default)]
     pub plan_id: String,
-    /// `inactivity` | `superseded` | `shutdown`.
+    /// `inactivity` | `superseded` | `shutdown` | `shutdown_timeout`.
     #[serde(default)]
     pub closure_reason: String,
     #[serde(default)]
@@ -444,7 +448,7 @@ pub struct BuildSummaryEvent {
     /// Distinct demanded keys that were plan candidates.
     #[serde(default)]
     pub demanded_candidate_keys: u64,
-    /// Whether adaptive cancellation fired for this plan.
+    /// Whether adaptive cancellation or shutdown stopped work for this plan.
     #[serde(default)]
     pub cancelled: bool,
     /// Key-cache LIST refreshes attributed to this session (delta of the
@@ -1054,6 +1058,17 @@ pub fn rotate_if_needed(event_log_path: &Path, max_size: u64, keep_lines: usize)
 /// Own file rather than `events.jsonl` so `read_events` never has to skip
 /// foreign lines; same locking discipline as the other logs.
 pub fn log_summary(summary_log_path: &Path, event: &BuildSummaryEvent) -> Result<()> {
+    append_summary(summary_log_path, event, false)
+}
+
+pub(crate) fn log_summary_durable(
+    summary_log_path: &Path,
+    event: &BuildSummaryEvent,
+) -> Result<()> {
+    append_summary(summary_log_path, event, true)
+}
+
+fn append_summary(summary_log_path: &Path, event: &BuildSummaryEvent, durable: bool) -> Result<()> {
     if let Some(parent) = summary_log_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1070,6 +1085,12 @@ pub fn log_summary(summary_log_path: &Path, event: &BuildSummaryEvent) -> Result
     bytes.push(b'\n');
     file.write_all(&bytes)
         .context("writing summary event to log")?;
+    if durable {
+        file.sync_all().context("flushing summary event to disk")?;
+        if let Some(parent) = summary_log_path.parent() {
+            crate::atomic::fsync_dir(parent).context("flushing summary directory")?;
+        }
+    }
     lock.unlock().context("unlocking summary log")?;
     Ok(())
 }

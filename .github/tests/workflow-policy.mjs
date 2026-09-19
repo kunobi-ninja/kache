@@ -370,6 +370,25 @@ eq(
   ctx.needs.authorize.outputs.eligible = "false";
   eq(evaluate(report, ctx), false, "perf report skipped when ineligible");
 }
+// Restoring is safe on PRs, but only a main push may replenish the Nix store.
+{
+  const cache = files["ci.yml"].jobs["nix-package"].steps.find((step) =>
+    step.uses?.startsWith("nix-community/cache-nix-action@"),
+  );
+  assert.ok(cache, "Nix package jobs restore the Nix store");
+  for (const [event, ref, allowed] of [
+    ["push", "refs/heads/main", true],
+    ["push", "refs/heads/feature", false],
+    ["push", "refs/tags/v0.26.0", false],
+    ["pull_request", "refs/pull/1/merge", false],
+    ["pull_request_target", "refs/heads/main", false],
+    ["workflow_dispatch", "refs/heads/main", false],
+  ]) {
+    const ctx = context("kunobi-ninja/kache", false, {}, event);
+    ctx.github.ref = ref;
+    eq(evaluate(cache.with.save, ctx), allowed, `Nix cache save: ${event} ${ref}`);
+  }
+}
 console.log(
   `${checks} workflow policy checks passed across ${routing.length} validation selectors.`,
 );

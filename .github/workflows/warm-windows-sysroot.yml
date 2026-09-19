@@ -1,0 +1,23 @@
+name: Warm Windows release sysroot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/warm-windows-sysroot.yml
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: warm-windows-sysroot
+  cancel-in-progress: false
+
+jobs:
+  warm:
+    if: github.repository == 'kunobi-ninja/kache'
+    # Default-branch caches are visible to future release tags.
+    uses: Zondax/_workflows/.github/workflows/_warm-windows-sysroot.yml@451103fbdc9c0672aa13fc53a71230e64f6b5c8a

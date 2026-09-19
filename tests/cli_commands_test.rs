@@ -1196,6 +1196,170 @@ fn init_eof_does_not_accept_changes() {
     assert!(!e.cache.join("daemon.sock").exists());
 }
 
+/// A retiring daemon answers once, then keeps its run lock without a socket.
+/// Init must not use that last response as proof that caching is running.
+#[cfg(unix)]
+#[test]
+fn init_rejects_unavailable_daemon_replacement() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let e = env();
+    let socket = e.cache.join("daemon.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let run_lock = std::fs::File::create(e.cache.join("daemon.run.lock")).unwrap();
+    run_lock.lock().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut request = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut request)
+            .unwrap();
+        assert!(request.contains("health"), "{request}");
+        // Remove the listener before replying so restart cannot mistake it
+        // for the replacement. No coordinator PID means recovery cannot kill
+        // this test process, which owns the old daemon's run lock.
+        drop(listener);
+        let response = serde_json::json!({
+            "ok": true, "health": { "version": "old", "build_epoch": 1 }
+        });
+        writeln!(stream, "{response}").unwrap();
+    });
+    let output = e
+        .cmd()
+        .args(["init", "--yes", "--no-service", "--no-shell"])
+        .env("KACHE_SOCKET_PATH", &socket)
+        .env("KACHE_LOG", "warn")
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    // Unblock accept if the CLI returned without sending a readiness request.
+    drop(UnixStream::connect(&socket));
+    server.join().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(!stdout.contains("Background cache: running"), "{stdout}");
+    assert!(stdout.contains("Background cache setup failed"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("daemon did not start after recovery"),
+        "{stderr}"
+    );
+}
+
+/// A stale daemon must be replaced through the installed service manager.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn init_upgrade_keeps_the_service_manager_in_charge() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    let e = env();
+    let socket = e.cache.join("daemon.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut request = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut request)
+            .unwrap();
+        assert!(request.contains("health"), "{request}");
+        drop(listener);
+        writeln!(
+            stream,
+            "{{\"ok\":true,\"health\":{{\"version\":\"old\",\"build_epoch\":1}}}}"
+        )
+        .unwrap();
+    });
+    let (tool, service_file) = if cfg!(target_os = "macos") {
+        (
+            "launchctl",
+            e.home.join("Library/LaunchAgents/ninja.kunobi.kache.plist"),
+        )
+    } else {
+        (
+            "systemctl",
+            e.home.join(".config/systemd/user/kache.service"),
+        )
+    };
+    std::fs::create_dir_all(service_file.parent().unwrap()).unwrap();
+    std::fs::write(service_file, "installed test service").unwrap();
+    let bin = e.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let manager = bin.join(tool);
+    std::fs::write(&manager, "#!/bin/sh\n\"$KACHE_TEST_BIN\" daemon run >/dev/null 2>&1 &\necho $! > \"$KACHE_TEST_SERVICE_PID\"\n").unwrap();
+    std::fs::set_permissions(manager, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let marker = e.home.join("service.pid");
+    let output = e
+        .cmd()
+        .args(["init", "--yes", "--no-service", "--no-shell"])
+        .env("PATH", path)
+        .env("KACHE_TEST_BIN", KACHE_BIN)
+        .env("KACHE_TEST_SERVICE_PID", &marker)
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .unwrap();
+    drop(std::os::unix::net::UnixStream::connect(&socket));
+    server.join().unwrap();
+    let state = std::fs::read(e.cache.join("daemon.state.json"));
+    e.cmd().args(["daemon", "stop"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Background cache: running"));
+    let pid: u32 = std::fs::read_to_string(marker)
+        .expect("upgrade bypassed service manager")
+        .trim()
+        .parse()
+        .unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&state.unwrap()).unwrap();
+    assert_eq!(state["pid"], pid);
+}
+
+#[test]
+fn daemon_restart_preserves_another_cache_daemon() {
+    let a = env();
+    let b = env();
+    b.cmd()
+        .args(["daemon", "start"])
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+        .assert()
+        .success();
+    let before = std::fs::read(b.cache.join("daemon.state.json")).unwrap();
+    let before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    let restart = a
+        .cmd()
+        .args(["daemon", "restart"])
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+        .output()
+        .unwrap();
+    let other = b
+        .cmd()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    let after = std::fs::read(b.cache.join("daemon.state.json"));
+    // Clean both fixtures before assertions so failures leave no background work.
+    a.cmd().args(["daemon", "stop"]).output().unwrap();
+    b.cmd().args(["daemon", "stop"]).output().unwrap();
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    let other: serde_json::Value = serde_json::from_slice(&other.stdout).unwrap();
+    assert_eq!(other["daemon_running"], true, "{other}");
+    let after: serde_json::Value = serde_json::from_slice(&after.unwrap()).unwrap();
+    assert_eq!(before["pid"], after["pid"]);
+}
+
 /// PATH with a fake `systemctl` running `script` and a no-op `loginctl`
 /// first, so service tests never reach the host's systemd.
 #[cfg(target_os = "linux")]

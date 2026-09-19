@@ -4891,8 +4891,7 @@ pub fn doctor(
                     pids.len()
                 ),
                 fix: Some(
-                    "kache daemon restart  (auto-kills lingering processes + cleans stale files)"
-                        .into(),
+                    "kache daemon restart  (recovers this cache's daemon and stale socket)".into(),
                 ),
             });
         } else if pids.len() > 1 {
@@ -12306,7 +12305,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     let config = crate::config::Config::load().ok();
     let is_daemon_reachable = |cfg: &Option<crate::config::Config>| {
         cfg.as_ref()
-            .is_some_and(|c| crate::daemon::send_stats_request(c, false, None, None).is_ok())
+            .is_some_and(|c| crate::daemon::send_health_request(c).is_ok())
     };
 
     let mut daemon_step_failed = false;
@@ -12328,7 +12327,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         // Prefer `launchctl kickstart` / `systemctl restart` over a manual spawn
         // so the service manager clears any stale state (lockfiles, half-dead
         // processes) and owns the new process.
-        println!("  \x1b[33m→\x1b[0m Background cache: stopped");
+        println!("  \x1b[33m→\x1b[0m Background cache: needs restart");
         if !check
             && prompt_yes_no("Restart daemon?", true, yes)?
             && let Some(ref cfg) = config

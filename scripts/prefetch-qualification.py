@@ -187,14 +187,15 @@ def drain(runtime):
 
 
 # Schema 4 adds TimelineSummary.incomplete to schema 3's ordinary transfer model.
-# Reviewed against lifecycle commit 0ac603f944ba546dfc78cb457462537c99a35739.
-SUPPORTED_TIMELINE_SCHEMAS = (3, 4)
+# Reviewed against lifecycle 0ac603f944ba546dfc78cb457462537c99a35739 and
+# packed/physical accounting 129a31ce4debb8c97d9698fe5ff6d48ed4387750.
+SUPPORTED_TIMELINE_SCHEMAS = (3, 4, 5)
 
 
 def lifecycle_evidence(records, raw_summaries=None):
     require(
         records and all(r["schema"] in SUPPORTED_TIMELINE_SCHEMAS for r in records),
-        "Only reviewed ordinary timeline schemas 3 and 4 are supported; packed schemas need an adapter",
+        "Only reviewed timeline schemas 3, 4 and 5 are supported",
     )
     summaries, problems, missing = {}, [], []
     known_summary_fields = {
@@ -215,7 +216,7 @@ def lifecycle_evidence(records, raw_summaries=None):
         session, schema = record["session_id"], record["schema"]
         summary = record.get("summary")
         if summary is None:
-            if schema == 4 and any(
+            if schema >= 4 and any(
                 t.get("prefetch", {}).get("session_id") == session
                 for t in record["transfers"]
                 if t.get("prefetch")
@@ -223,13 +224,13 @@ def lifecycle_evidence(records, raw_summaries=None):
                 missing.append(session)
                 problems.append(f"{session}: speculative session has no final summary")
             continue
-        allowed = known_summary_fields | ({"incomplete"} if schema == 4 else set())
+        allowed = known_summary_fields | ({"incomplete"} if schema >= 4 else set())
         require(
             not (set(summary) - allowed),
             "Unknown summary fields: review the schema adapter",
         )
         summaries[session] = summary
-        if schema == 4 and type(summary.get("incomplete")) is not bool:
+        if schema >= 4 and type(summary.get("incomplete")) is not bool:
             problems.append(
                 f"{session}: schema-4 summary lacks an explicit incomplete flag"
             )
@@ -241,7 +242,7 @@ def lifecycle_evidence(records, raw_summaries=None):
     for summary in raw_summaries or []:
         raw_schemas.append(summary["schema"])
         require(summary["schema"] in (1, 2), "Unknown raw summary schema")
-        if all(r["schema"] == 4 for r in records) and summary["schema"] != 2:
+        if all(r["schema"] >= 4 for r in records) and summary["schema"] != 2:
             problems.append(
                 "Schema-4 timeline contains a legacy raw summary without lifecycle evidence"
             )
@@ -267,10 +268,409 @@ def lifecycle_evidence(records, raw_summaries=None):
     }
 
 
-def summarize(records, enabled):
-    lifecycle = lifecycle_evidence(records)
+def plan_identity(origin):
+    return (
+        origin.get("session_id", ""),
+        origin.get("plan_id", ""),
+        origin.get("source", ""),
+    )
+
+
+def receipt_projection(transfer, raw=False):
+    """The exact fields copied by src/timeline.rs; multiplicity is significant."""
+    result = {
+        key: transfer.get(key, 0)
+        for key in (
+            "compressed_bytes",
+            "original_bytes",
+            "network_ms",
+            "semaphore_wait_ms",
+            "request_count",
+            "import_ms",
+        )
+    }
+    result.update(
+        {
+            key: transfer.get(key, "")
+            for key in ("cache_key", "crate_name", "direction", "outcome")
+        }
+    )
+    result.update(
+        ok=transfer["ok"],
+        prefetch=transfer.get("prefetch"),
+        accounting=transfer.get("accounting"),
+    )
+    for key in ("started_at", "finished_at"):
+        result[key + "_ms"] = transfer.get(key + ("_unix_ms" if raw else "_ms"), 0)
+    return result
+
+
+def reconcile_receipts(projected, raw_transfers):
+    projected = [receipt_projection(t) for t in projected]
+    if raw_transfers is None:
+        return projected, {
+            "complete": False,
+            "reason": "Raw transfer log was not supplied",
+            "get_complete": False,
+            "unprojected": [],
+            "projected_without_raw": [],
+        }
+    require(
+        all(t.get("schema") == 5 for t in raw_transfers),
+        "Schema-5 controls require raw transfer schema 5",
+    )
+    raw = [
+        receipt_projection(t, raw=True)
+        for t in raw_transfers
+        if t["direction"] == "download" and t.get("prefetch") is not None
+    ]
+    canonical = lambda t: json.dumps(t, sort_keys=True)
+    raw_count, projected_count = (
+        Counter(map(canonical, raw)),
+        Counter(map(canonical, projected)),
+    )
+    unprojected = [
+        json.loads(key)
+        for key, count in (raw_count - projected_count).items()
+        for _ in range(count)
+    ]
+    missing = [
+        json.loads(key)
+        for key, count in (projected_count - raw_count).items()
+        for _ in range(count)
+    ]
+    return raw, {
+        "complete": not unprojected and not missing,
+        "get_complete": not any(
+            (t.get("accounting") or {}).get("operation") != "list"
+            for t in unprojected + missing
+        ),
+        "unprojected": unprojected,
+        "projected_without_raw": missing,
+    }
+
+
+def summarize_accounted(
+    records,
+    projected,
+    demands,
+    consumed,
+    units,
+    enabled,
+    lifecycle,
+    raw_transfers,
+    raw_summaries,
+):
+    speculative = [
+        t
+        for t in projected
+        if t["direction"] == "download" and t.get("prefetch") is not None
+    ]
+    receipts, coverage = reconcile_receipts(speculative, raw_transfers)
+    require(
+        any(
+            (t.get("accounting") or {}).get("operation") == "get"
+            or (t.get("accounting") is None and bool(t.get("cache_key")))
+            for t in receipts + speculative
+        )
+        == enabled,
+        "Prefetch arm did not match observed transfers",
+    )
+    restored = any(
+        t["direction"] == "download" and t["ok"] and t.get("original_bytes", 0) > 0
+        for t in projected
+    ) or any(
+        entry["outcome"] == "completed"
+        and (entry["prefetch"]["session_id"], entry["cache_key"]) in consumed
+        for t in receipts
+        for entry in (t.get("accounting") or {}).get("entries", [])
+    )
+    require(restored, "No remote restoration: control is inconclusive")
+    groups, candidates = {}, []
+
+    def group_for(origin):
+        key = plan_identity(origin)
+        if key not in groups:
+            groups[key] = {
+                "session_id": key[0],
+                "plan_id": key[1],
+                "source": key[2],
+                "get_received_body_bytes": 0,
+                "get_receipts": 0,
+                "unknown_operations": 0,
+                "backend_count_problems": [],
+                "useful_payload_bytes": 0,
+                "get_backend_invocations": 0,
+                "list_backend_invocations": 0,
+                "list_result_count": 0,
+                "list_results_unknown": 0,
+                "list_response_bytes_unknown": 0,
+                "unclassified_received_bytes": 0,
+                "get_outcomes": Counter(),
+                "list_outcomes": Counter(),
+                "payload_bytes": Counter(),
+                "problems": [],
+            }
+        return groups[key]
+
+    accounting_fields = {
+        "operation",
+        "bytes_complete",
+        "requests_complete",
+        "list_result_count",
+        "entries",
+    }
+    entry_fields = {
+        "cache_key",
+        "crate_name",
+        "compressed_bytes",
+        "finished_at_ms",
+        "outcome",
+        "prefetch",
+    }
+    for receipt in receipts:
+        group = group_for(receipt["prefetch"])
+        accounting = receipt.get("accounting")
+        require(
+            type(receipt["compressed_bytes"]) is int
+            and receipt["compressed_bytes"] >= 0,
+            "Invalid physical received bytes",
+        )
+        if accounting is None:
+            group["unknown_operations"] += 1
+            group["problems"].append(
+                "Receipt lacks operation/byte completeness accounting"
+            )
+            if receipt["cache_key"]:
+                # Reviewed pre-followup schema-5 ordinary keyed downloads are GETs,
+                # but their counters do not establish full-body or call completeness.
+                accounting = {
+                    "operation": "get",
+                    "bytes_complete": False,
+                    "requests_complete": False,
+                    "entries": [],
+                }
+            else:
+                group["unclassified_received_bytes"] += receipt["compressed_bytes"]
+                continue
+        require(not (set(accounting) - accounting_fields), "Unknown accounting fields")
+        require(accounting["operation"] in ("get", "list"), "Unknown backend operation")
+        require(
+            type(accounting["bytes_complete"]) is bool
+            and type(accounting["requests_complete"]) is bool,
+            "Completeness flags must be explicit booleans",
+        )
+        require(
+            type(receipt["request_count"]) is int and receipt["request_count"] >= 0,
+            "Invalid backend invocation count",
+        )
+        operation = accounting["operation"]
+        group[operation + "_backend_invocations"] += receipt["request_count"]
+        group[operation + "_outcomes"][receipt["outcome"] or "unknown"] += 1
+        if not accounting["requests_complete"]:
+            group["backend_count_problems"].append(
+                "Backend invocation count is incomplete"
+            )
+            if operation == "get":
+                group["problems"].append("GET invocation count is incomplete")
+        entries = accounting.get("entries", [])
+        if operation == "list":
+            require(not entries, "LIST cannot carry imported payload entries")
+            count = accounting.get("list_result_count")
+            if count is None:
+                group["list_results_unknown"] += 1
+            else:
+                require(type(count) is int and count >= 0, "Invalid LIST result count")
+                group["list_result_count"] += count
+            if not accounting["bytes_complete"]:
+                group["list_response_bytes_unknown"] += 1
+            continue
+        group["get_receipts"] += 1
+        group["get_received_body_bytes"] += receipt["compressed_bytes"]
+        if not accounting["bytes_complete"]:
+            group["problems"].append("Partial GET body bytes are unknown")
+        require(
+            not entries or not receipt["cache_key"],
+            "Packed receipt must have an empty outer key",
+        )
+        require(
+            sum(entry["compressed_bytes"] for entry in entries)
+            <= receipt["compressed_bytes"],
+            "Nested payload exceeds physical GET body",
+        )
+        for entry in entries:
+            require(not (set(entry) - entry_fields), "Unknown packed entry fields")
+            require(
+                type(entry["compressed_bytes"]) is int
+                and entry["compressed_bytes"] >= 0,
+                "Invalid entry payload bytes",
+            )
+            if plan_identity(entry["prefetch"]) != plan_identity(receipt["prefetch"]):
+                group["problems"].append(
+                    "Entry origin differs from physical receipt plan"
+                )
+                continue
+            candidates.append((entry, receipt, group))
+        if not entries and receipt["cache_key"]:
+            candidates.append(
+                (
+                    {
+                        "cache_key": receipt["cache_key"],
+                        "compressed_bytes": receipt["compressed_bytes"],
+                        "finished_at_ms": receipt["finished_at_ms"],
+                        "outcome": receipt["outcome"],
+                        "prefetch": receipt["prefetch"],
+                    },
+                    receipt,
+                    group,
+                )
+            )
+
+    credited, payload_rows = set(), []
+    sessions = {record["session_id"] for record in records}
+    for entry, receipt, group in sorted(
+        candidates, key=lambda value: value[0]["finished_at_ms"]
+    ):
+        key = (entry["prefetch"]["session_id"], entry["cache_key"])
+        demand = demands.get(key)
+        finished = entry["finished_at_ms"]
+        if entry["outcome"] != "completed":
+            bucket = "failed"
+        elif finished <= 0:
+            bucket = "unknown_import_time"
+            group["problems"].append(
+                "Completed payload has no import completion timestamp"
+            )
+        elif not key[0] or key[0] not in sessions:
+            bucket = "unknown_demand"
+        elif demand is None:
+            bucket = "unused"
+        elif key not in consumed:
+            bucket = "demanded_unconsumed"
+        elif key in credited:
+            bucket = "duplicate"
+        elif finished < demand:
+            bucket = "useful_before_demand"
+            credited.add(key)
+            group["useful_payload_bytes"] += entry["compressed_bytes"]
+        elif finished == demand:
+            bucket = "equal_timestamp"
+            group["problems"].append(
+                "Equal-millisecond import/demand ordering is unknown"
+            )
+        else:
+            bucket = "late"
+        group["payload_bytes"][bucket] += entry["compressed_bytes"]
+        payload_rows.append(
+            {"entry": entry, "bucket": bucket, "first_demand_at_ms": demand}
+        )
+
+    # A normal closure is a snapshot, not a barrier against tasks or log writers.
+    summaries = raw_summaries if raw_summaries is not None else []
+    shutdown_groups = {
+        (s.get("session_id", ""), s.get("plan_id", ""), s.get("plan_source", ""))
+        for s in summaries
+        if s.get("schema") == 2
+        and s.get("closure_reason") == "shutdown"
+        and s.get("incomplete") is False
+    }
+    observed_sessions = {session for session, _ in demands}
+    shutdown_sessions = {key[0] for key in shutdown_groups}
+    shutdown_complete = observed_sessions <= shutdown_sessions
+    incomplete_groups = {
+        plan_identity(t["prefetch"])
+        for t in coverage["unprojected"] + coverage["projected_without_raw"]
+        if (t.get("accounting") or {}).get("operation") != "list"
+    }
+    for key, group in groups.items():
+        if (
+            group["get_receipts"] or group["unknown_operations"]
+        ) and key not in shutdown_groups:
+            group["problems"].append("Plan lacks a drained shutdown summary")
+        if key in incomplete_groups or raw_transfers is None:
+            group["problems"].append("Raw/projected GET receipt coverage is incomplete")
+        group["complete"] = not group["problems"] and not lifecycle["problems"]
+        size = group["get_received_body_bytes"]
+        group["get_body_byte_precision"] = (
+            group["useful_payload_bytes"] / size if size and group["complete"] else None
+        )
+        group["payload_bytes"] = dict(group["payload_bytes"])
+        group["get_outcomes"] = dict(group["get_outcomes"])
+        group["list_outcomes"] = dict(group["list_outcomes"])
+    physical = sum(group["get_received_body_bytes"] for group in groups.values())
+    useful = sum(group["useful_payload_bytes"] for group in groups.values())
+    complete = (
+        coverage["get_complete"]
+        and shutdown_complete
+        and all(group["complete"] for group in groups.values())
+    )
+    waits = Counter()
+    for record in records:
+        for unit in record["units"]:
+            for demand in unit.get("demands", []):
+                waits[(record["session_id"], demand["cache_key"])] += demand[
+                    "remote_wait_ms"
+                ]
+    return {
+        "scope": "GET-body bytes including catalog and pack overhead; LIST response bytes excluded",
+        "complete_precision_qualification": complete,
+        "backend_invocations_complete": raw_transfers is not None
+        and shutdown_complete
+        and not coverage["projected_without_raw"]
+        and not any(
+            g["backend_count_problems"] or g["unknown_operations"]
+            for g in groups.values()
+        ),
+        "lifecycle": lifecycle,
+        "shutdown_complete": shutdown_complete,
+        "receipt_coverage": coverage,
+        "plans": list(groups.values()),
+        "backend_totals": {
+            name: sum(group[name] for group in groups.values())
+            for name in (
+                "get_backend_invocations",
+                "list_backend_invocations",
+                "list_result_count",
+                "list_results_unknown",
+                "list_response_bytes_unknown",
+                "unclassified_received_bytes",
+            )
+        },
+        "demand_waits": [
+            {
+                "session_id": session,
+                "cache_key": key,
+                "first_demand_at_ms": demands[(session, key)],
+                "observed_remote_wait_ms": wait,
+            }
+            for (session, key), wait in sorted(waits.items())
+        ],
+        "recorded_received_prefetch_bytes": physical,
+        "recorded_useful_prefetch_bytes": useful,
+        "get_body_byte_precision": useful / physical if complete and physical else None,
+        "demanded_keys": len(demands),
+        "observed_remote_wait_ms": sum(
+            d["remote_wait_ms"] for u in units for d in u.get("demands", [])
+        ),
+        "unit_outcomes": dict(Counter(u["result"] for u in units)),
+        "payloads": payload_rows,
+        "backend_count_scope": "Backend invocations only; SDK retries and LIST pages excluded",
+    }
+
+
+def summarize(records, enabled, raw_transfers=None, raw_summaries=None):
+    lifecycle = lifecycle_evidence(records, raw_summaries)
+    require(len({r["schema"] for r in records}) == 1, "Mixed timeline schemas")
+    sessions = [r["session_id"] for r in records]
+    record_ids = [r.get("client_record_id") for r in records]
+    require(
+        all(record_ids)
+        and len(set(sessions)) == len(sessions)
+        and len(set(record_ids)) == len(record_ids),
+        "Duplicate timeline snapshots are not independent physical operations",
+    )
     require(not lifecycle["problems"], "; ".join(lifecycle["problems"]))
-    demands, consumed, units, transfers = {}, set(), [], {}
+    demands, consumed, units, transfers = {}, set(), [], []
     sessions = {record["session_id"] for record in records}
     allowed_transfer_fields = {
         "crate_name",
@@ -289,6 +689,8 @@ def summarize(records, enabled):
         "prefetch",
         "outcome",
     }
+    if records[0]["schema"] == 5:
+        allowed_transfer_fields.add("accounting")
     for record in records:
         session = record["session_id"]
         units.extend(record["units"])
@@ -315,23 +717,30 @@ def summarize(records, enabled):
                 not (set(transfer) - allowed_transfer_fields),
                 "Unknown transfer fields: update the schema adapter before qualification",
             )
-            # Record association may differ; count a repeated physical event once.
-            identity = json.dumps(
-                {k: v for k, v in transfer.items() if k != "attribution"},
-                sort_keys=True,
-            )
-            transfers[identity] = transfer
+            transfers.append(transfer)
     require(demands, "No exact demand records")
     require(consumed, "No cache artifact was consumed")
+    if records[0]["schema"] == 5:
+        return summarize_accounted(
+            records,
+            transfers,
+            demands,
+            consumed,
+            units,
+            enabled,
+            lifecycle,
+            raw_transfers,
+            raw_summaries,
+        )
     restored = [
         t
-        for t in transfers.values()
+        for t in transfers
         if t["direction"] == "download" and t["ok"] and t["original_bytes"] > 0
     ]
     require(restored, "No remote restoration: control is inconclusive")
     speculative = [
         t
-        for t in transfers.values()
+        for t in transfers
         if t["direction"] == "download" and t.get("prefetch") is not None
     ]
     require(
@@ -389,6 +798,35 @@ def summarize(records, enabled):
         "speculative_compressed_bytes": dict(totals),
         "speculative": rows,
     }
+
+
+def preserve_logs(runtime, output):
+    markers = []
+    for name in ("events.jsonl", "transfers.jsonl", "summaries.jsonl"):
+        if (runtime / name).exists():
+            shutil.copy2(runtime / name, output / name)
+        marker = runtime / (name + ".rotation")
+        if marker.exists():
+            shutil.copy2(marker, output / marker.name)
+            markers.append(marker.name)
+    dump(output / "retention.json", {"rotation_markers": markers})
+    require(
+        not markers, "Log rotation may have removed observations: " + ", ".join(markers)
+    )
+
+
+def artifact_problems(artifacts):
+    problems = []
+    for arm, artifact in artifacts.items():
+        if artifact.get("listing") != "alpha\nbeta\n" or "v0.23.5" not in artifact.get(
+            "version", ""
+        ):
+            problems.append(f"{arm}: artifact failed the pinned workload oracle")
+    if len({value.get("sha256") for value in artifacts.values()}) != 1:
+        problems.append("Consumer executable SHA256 values differ")
+    if len({value.get("version") for value in artifacts.values()}) != 1:
+        problems.append("Consumer executable versions differ")
+    return problems
 
 
 def measure(args):
@@ -506,9 +944,7 @@ prefix = "artifacts"
         start = time.monotonic()
         drain(runtime)
         dump(output / "drain.json", {"seconds": time.monotonic() - start})
-        for name in ("events.jsonl", "transfers.jsonl", "summaries.jsonl"):
-            if (runtime / name).exists():
-                shutil.copy2(runtime / name, output / name)
+        preserve_logs(runtime, output)
     runner.command("report", [binary, "report", "--format", "json", "--record"])
     timeline = runner.command(
         "timeline",
@@ -559,7 +995,15 @@ prefix = "artifacts"
                 tar.add(path, arcname=path.name)
     else:
         require(manifest["files"] == files(bundle), "Consumer mutated read-only seed")
-        dump(output / "admission.json", summarize(records, enabled))
+        raw_transfers = [
+            json.loads(line)
+            for line in (output / "transfers.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        dump(
+            output / "admission.json",
+            summarize(records, enabled, raw_transfers, raw_summaries),
+        )
     dump(output / "identity.json", manifest)
 
 
@@ -686,7 +1130,7 @@ def collect(args):
             if j["name"] == "seed"
         ]
         dump(args.output / "seed-run.json", seed_run)
-    identities, artifacts, lifecycles = {}, {}, {}
+    identities, artifacts, lifecycles, admissions, retention = {}, {}, {}, {}, {}
     for arm in ARMS:
         folder = args.results / ("prefetch-qualification-" + arm)
         for name, target in (("identity", identities), ("artifact", artifacts)):
@@ -701,8 +1145,23 @@ def collect(args):
             problems.extend(
                 f"{arm}: {problem}" for problem in lifecycles[arm]["problems"]
             )
-        if not (folder / "admission.json").exists():
+        else:
+            problems.append(f"{arm} lacks lifecycle evidence")
+        retention_path = folder / "retention.json"
+        if retention_path.exists():
+            retention[arm] = json.loads(retention_path.read_text())
+            problems.extend(
+                f"{arm}: retained rotation marker {marker}"
+                for marker in retention[arm]["rotation_markers"]
+            )
+        else:
+            problems.append(f"{arm} lacks retention evidence")
+        admission = folder / "admission.json"
+        if admission.exists():
+            admissions[arm] = json.loads(admission.read_text())
+        else:
             problems.append(f"{arm} did not pass telemetry admission")
+    problems.extend(artifact_problems(artifacts))
     require_same = {json.dumps(value, sort_keys=True) for value in identities.values()}
     if len(require_same) != 1:
         problems.append("Consumers did not share an identical immutable seed")
@@ -726,13 +1185,20 @@ def collect(args):
         args.output / "job-times.json",
         {
             "controls_valid": success,
-            "complete_precision_qualification": False,
+            "complete_precision_qualification": success
+            and len(admissions) == len(ARMS)
+            and all(
+                a.get("complete_precision_qualification") is True
+                for a in admissions.values()
+            ),
             "problems": problems,
             "consumers": durations,
             "pairs": pairs,
             "identities": identities,
             "artifacts": artifacts,
             "lifecycle": lifecycles,
+            "admissions": admissions,
+            "retention": retention,
             "run_id": os.environ["GITHUB_RUN_ID"],
             "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
             "producer": producer_jobs,

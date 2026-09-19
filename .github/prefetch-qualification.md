@@ -2,23 +2,23 @@
 
 This experiment compares automatic prefetch on and off for eza v0.23.5
 (`98442ab17c2c3738701b62a7e060b1431ae2d6ea`) with Rust 1.90.0 on the existing
-Linux benchmark runners. The backend is an isolated filesystem remote. It
-qualifies correctness and demand timeliness; it does not model R2 latency.
+Linux benchmark runners. The backend is an isolated filesystem remote. These
+results do not model R2 latency.
 
-A protected `main` push changing the qualification files creates one immutable
+A protected `main` push changing the qualification files creates an immutable
 seed containing the Kache binary and remote packs/indexes. Six fresh consumer
 jobs run in order: off-1, on-1, on-2, off-2, off-3, on-3. Each verifies the seed,
 uses empty cache/runtime/target/Cargo directories, preserves the real CI
 environment and sets the remote read-only. There is no explicit warming step.
 The only arm setting that changes is `prefetch_enabled`.
 
-The producer needs the demand telemetry changes from #618 merged first. Its
-workflow must run on a protected branch, as required by Kache's existing write
-policy. No production credentials, planner endpoint or storage are involved.
-A manual run on `main` must name an existing seed run; authorization checks its
-repository, workflow, push event, main ancestry and successful producer job.
-The seed's recorded binary revision is used by every arm, even when current
-main has advanced. Regenerate the seed to qualify a newer binary.
+Merge the #618 demand, lifecycle, packed and ordinary-receipt prerequisites
+before triggering complete precision qualification. The producer must run on
+a protected branch under Kache's existing write policy. No production
+credentials, planner endpoint or storage are involved. A manual run on `main`
+must name an existing seed run. Authorization checks its repository, workflow,
+push event, main ancestry and successful producer job. Every arm uses the seed's
+recorded binary revision; regenerate the seed to qualify a newer binary.
 
 After the workflow and prerequisites merge, its protected-main push seeds and
 runs all controls. To repeat an existing seed:
@@ -28,40 +28,61 @@ gh workflow run prefetch-qualification.yml --ref main -f seed_run_id=RUN_ID
 ```
 
 The final collector reads GitHub job start/end timestamps after all consumers
-finish. Those durations include checkout, tools, artifact staging, fetch,
-build, drain/export and artifact upload. Phase logs give narrower timings;
-none replaces total job time. Producer time is reported separately. The first
-step records wall time before checkout or tool installation. Runner resources
-and compiler versions are retained; concurrent unrelated pool jobs remain a
+finish. Durations include checkout, tools, artifact staging, fetch, build,
+drain/export and artifact upload. Phase logs give narrower timings; none
+replaces total job time. Producer time is reported separately. The first step
+records wall time before checkout or tool installation. Runner resources and
+compiler versions are retained. Unrelated jobs in the shared pool remain a
 source of noise. Three pairs are a qualification, not a statistical benchmark.
 
-Each artifact must list a deterministic fixture correctly and report the
-pinned eza version. Every arm needs schema-3 or schema-4 timelines with schema-20 demand
-records on every keyed unit and remote restores. On arms must exercise speculative transfers;
-off arms must have none. The report joins first demands by immutable session and key, including
-prefetched local hits. Useful credit requires consumption by a successful hit,
-and a key receives credit at most once. The denominator includes recorded
-compressed bytes from failed imports, duplicate and unscoped transfers. Completion before demand, equal timestamps, in-flight,
-late, unused and unknown-demand bytes are separate. Blocking milliseconds are observed wait,
-not estimated savings. Fallback plans may legitimately have empty plan IDs.
-Raw events, transfers, summaries, dry-run timelines and immutable seed identity
-are retained under `prefetch-qualification-*`; these names do not enter the
-existing `telemetry-otlp-v1*` ingestion path.
+Every executable must list a fixed fixture correctly and report the pinned eza
+version. The collector also requires identical executable SHA256 and version
+output across all six arms. The pinned input, fixed build timestamp, path
+remapping and matched compilers are intended to produce identical artifacts.
+A hash mismatch fails admission and requires investigation; semantic output
+alone does not override it.
 
-The schema-3/4 adapter covers ordinary logged transfers. Schema 4 explicitly
-adds the lifecycle `incomplete` flag, reviewed against commit
-`0ac603f944ba546dfc78cb457462537c99a35739`. After daemon drain, the harness
-retains `lifecycle.json` and raw schema-2 summaries. Incomplete outcomes,
-shutdown timeouts, or a missing final summary for a schema-4 speculative session
-fail admission. An off arm with no speculative plan needs no summary. Legacy
-schema-3 shutdown completeness remains unknown. Packed operations and
-partial physical transfer bytes may be missing, so `controls_valid` does not
-claim complete precision qualification. Packed schema support awaits the prefetch worker's final physical-operation
-and entry fields. New timeline schemas or transfer fields
-fail admission until their adapter and physical-byte accounting are reviewed.
+Schemas 3 and 4 retain the tested ordinary-transfer report. Schema 4 adds the
+lifecycle incomplete flag, reviewed against
+`0ac603f944ba546dfc78cb457462537c99a35739`. Schema 5 adds physical operation
+receipts and nested payload entries, reviewed against
+`129a31ce4debb8c97d9698fe5ff6d48ed4387750`. Unknown future schemas or fields fail
+admission. Every keyed compiler unit must carry exact first-demand observations.
 
-Review complete job pairs and raw demand evidence before accepting #618's
-real-CI control. A failed admission check is an inconclusive experiment, not
-proof of a performance regression. No whole-job speedup is claimed until the
-six actual jobs finish. This filesystem experiment cannot qualify R2 latency,
-planner recommendation quality, or a broader population of projects.
+The schema-5 report groups receipts by immutable session, plan ID and source.
+An empty fallback plan ID remains scoped to its session. Its denominator is
+received GET-body bytes, including catalog metadata and pack headers. Nested
+entry bytes describe payload attribution and are never added to that physical
+total. Fully received bodies remain in the denominator after failed validation
+or import. Useful payload requires successful cache consumption in the same
+session and import completion before the earliest demand. A key receives useful
+credit at most once across plans. Equal-millisecond ordering is unknown and
+prevents an exact point ratio for the affected plan.
+
+LIST result counts and backend invocation counts are reported separately.
+Unknown LIST response sizes do not invalidate GET-body precision. Background
+key-cache LISTs may appear in either arm and keep their original source.
+On/off admission tests candidate GET work, not the mere presence of a LIST.
+Counts describe backend invocations, excluding SDK retries and LIST pages.
+Observed blocking milliseconds are reported per demanded key and arm; they
+are not estimates of time saved.
+
+Raw transfer logs are reconciled against timeline projections as multisets.
+Identical physical operations both count. Duplicate timeline snapshots are
+rejected. Unprojected receipts remain visible under their original plan or
+unscoped source. Unknown partial GET bytes, missing accounting, unreconciled
+GET receipts or missing drained shutdown evidence deny complete precision.
+Inactivity and supersession summaries are snapshots, not shutdown barriers.
+
+After drain, the harness preserves lifecycle summaries and any log-rotation
+markers. Any marker for events, transfers or summaries fails admission, even
+when the current log is small. Raw events, transfers, summaries, dry-run
+timelines and verified identities use `prefetch-qualification-*` artifacts;
+these names do not enter the `telemetry-otlp-v1*` ingestion path.
+
+`controls_valid` records successful controls and artifact checks.
+`complete_precision_qualification` additionally requires complete schema-5
+GET-body evidence across all arms. Legacy reports cannot set that flag. Review
+both flags, complete job pairs and raw demand evidence before accepting #618.
+This experiment cannot establish R2 performance or planner recommendation
+quality, and no whole-job speedup is claimed before the actual jobs finish.

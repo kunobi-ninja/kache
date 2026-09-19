@@ -140,6 +140,7 @@ class Integrity(unittest.TestCase):
 def record():
     return {
         "schema": 3,
+        "client_record_id": "record",
         "session_id": "session",
         "units": [
             {
@@ -199,14 +200,16 @@ class Telemetry(unittest.TestCase):
                 q.summarize([rec], True)["speculative_compressed_bytes"], {expected: 30}
             )
 
-    def test_first_demand_wins_and_duplicate_transfer_is_not_double_counted(self):
+    def test_first_demand_wins_and_identical_physical_transfers_both_count(self):
         rec = record()
         rec["units"][0]["demands"].append(
             {"cache_key": "key", "first_demand_at_ms": 200, "remote_wait_ms": 0}
         )
         rec["transfers"].append(copy.deepcopy(rec["transfers"][0]))
         result = q.summarize([rec], True)
-        self.assertEqual(result["speculative_attempts"], 1)
+        self.assertEqual(result["speculative_attempts"], 2)
+        self.assertEqual(result["recorded_received_prefetch_bytes"], 60)
+        self.assertEqual(result["recorded_useful_prefetch_bytes"], 30)
         self.assertEqual(result["speculative"][0]["first_demand_at_ms"], 100)
 
     def test_origin_session_cannot_borrow_another_sessions_demand(self):
@@ -216,7 +219,12 @@ class Telemetry(unittest.TestCase):
         self.assertEqual(result["recorded_useful_prefetch_bytes"], 0)
         self.assertEqual(result["speculative_compressed_bytes"], {"unknown_demand": 30})
         other = copy.deepcopy(rec)
-        other.update(session_id="other-session", units=[], transfers=[])
+        other.update(
+            session_id="other-session",
+            client_record_id="other-record",
+            units=[],
+            transfers=[],
+        )
         result = q.summarize([rec, other], True)
         self.assertEqual(result["speculative_compressed_bytes"], {"unused": 30})
 
@@ -264,7 +272,7 @@ class Telemetry(unittest.TestCase):
             elif change == "wrong-key":
                 rec["units"][0]["demands"][0]["cache_key"] = "other"
             elif change == "new-schema":
-                rec["schema"] = 5
+                rec["schema"] = 6
             else:
                 rec["transfers"][0]["entries"] = []
             with self.assertRaises(ValueError):
@@ -356,6 +364,291 @@ class Lifecycle(unittest.TestCase):
             q.summarize([rec], True)
 
 
+class PackedAccounting(unittest.TestCase):
+    def inputs(self):
+        rec = record()
+        rec.update(
+            schema=5,
+            summary={
+                "incomplete": False,
+                "closure_reason": "shutdown",
+                "plan_id": "",
+                "plan_source": "fallback",
+            },
+        )
+        ordinary = rec["transfers"][0]
+        entry = {
+            key: copy.deepcopy(ordinary[key])
+            for key in (
+                "cache_key",
+                "compressed_bytes",
+                "finished_at_ms",
+                "outcome",
+                "prefetch",
+            )
+        }
+        entry["crate_name"] = "example"
+        pack = dict(
+            ordinary,
+            cache_key="",
+            compressed_bytes=100,
+            original_bytes=200,
+            accounting={
+                "operation": "get",
+                "bytes_complete": True,
+                "requests_complete": True,
+                "entries": [entry],
+            },
+            request_count=1,
+        )
+        catalog = dict(
+            pack,
+            compressed_bytes=10,
+            original_bytes=0,
+            finished_at_ms=20,
+            accounting=dict(pack["accounting"], entries=[]),
+        )
+        listing = dict(
+            pack,
+            compressed_bytes=0,
+            original_bytes=0,
+            finished_at_ms=5,
+            accounting={
+                "operation": "list",
+                "bytes_complete": False,
+                "requests_complete": True,
+                "list_result_count": 4,
+            },
+        )
+        rec["transfers"] = [listing, catalog, pack]
+        summary = dict(rec["summary"], schema=2, session_id="session")
+        return rec, [summary]
+
+    def raw(self, transfers):
+        raw = copy.deepcopy(transfers)
+        for transfer in raw:
+            transfer["schema"] = 5
+            for name in ("started_at", "finished_at"):
+                transfer[name + "_unix_ms"] = transfer.pop(name + "_ms")
+        return raw
+
+    def summarize(self, rec, summaries, raw=None):
+        return q.summarize(
+            [rec], True, self.raw(rec["transfers"]) if raw is None else raw, summaries
+        )
+
+    def test_physical_body_denominator_excludes_nested_double_count_and_list_size(self):
+        rec, summaries = self.inputs()
+        result = self.summarize(rec, summaries)
+        self.assertTrue(result["complete_precision_qualification"])
+        self.assertEqual(result["recorded_received_prefetch_bytes"], 110)
+        self.assertEqual(result["recorded_useful_prefetch_bytes"], 30)
+        self.assertEqual(result["get_body_byte_precision"], 30 / 110)
+        plan = result["plans"][0]
+        self.assertEqual(plan["get_backend_invocations"], 2)
+        self.assertEqual(plan["list_backend_invocations"], 1)
+        self.assertEqual(plan["list_result_count"], 4)
+        self.assertEqual(plan["list_response_bytes_unknown"], 1)
+        self.assertEqual(result["demand_waits"][0]["observed_remote_wait_ms"], 7)
+
+    def test_identical_physical_pack_operations_both_count_but_useful_key_once(self):
+        rec, summaries = self.inputs()
+        rec["transfers"].append(copy.deepcopy(rec["transfers"][-1]))
+        result = self.summarize(rec, summaries)
+        self.assertTrue(result["complete_precision_qualification"])
+        self.assertEqual(result["recorded_received_prefetch_bytes"], 210)
+        self.assertEqual(result["recorded_useful_prefetch_bytes"], 30)
+        self.assertEqual(result["plans"][0]["payload_bytes"]["duplicate"], 30)
+        self.assertEqual(result["plans"][0]["get_backend_invocations"], 3)
+
+    def test_per_plan_groups_do_not_borrow_denominator_or_credit_same_key_twice(self):
+        rec, summaries = self.inputs()
+        second = copy.deepcopy(rec["transfers"][-1])
+        second["prefetch"]["plan_id"] = "second"
+        second["accounting"]["entries"][0]["prefetch"]["plan_id"] = "second"
+        second["accounting"]["entries"][0]["finished_at_ms"] = 95
+        rec["transfers"].append(second)
+        summaries.append(dict(summaries[0], plan_id="second"))
+        result = self.summarize(rec, summaries)
+        by_plan = {p["plan_id"]: p for p in result["plans"]}
+        self.assertEqual(by_plan[""]["get_received_body_bytes"], 110)
+        self.assertEqual(by_plan["second"]["get_received_body_bytes"], 100)
+        self.assertEqual(by_plan["second"]["useful_payload_bytes"], 0)
+        self.assertTrue(result["complete_precision_qualification"])
+
+    def test_pre_followup_ordinary_schema5_receipt_stays_incomplete(self):
+        rec, summaries = self.inputs()
+        ordinary = record()["transfers"][0]
+        rec["transfers"] = [ordinary]
+        result = self.summarize(rec, summaries)
+        self.assertFalse(result["complete_precision_qualification"])
+        self.assertEqual(result["recorded_received_prefetch_bytes"], 30)
+        self.assertEqual(result["recorded_useful_prefetch_bytes"], 30)
+        self.assertIsNone(result["get_body_byte_precision"])
+
+    def test_partial_get_or_unknown_receipt_or_request_count_denies_completeness(self):
+        for change in ("partial", "missing", "requests"):
+            rec, summaries = self.inputs()
+            if change == "missing":
+                rec["transfers"][-1]["accounting"] = None
+            else:
+                rec["transfers"][-1]["accounting"][
+                    "bytes_complete" if change == "partial" else "requests_complete"
+                ] = False
+            result = self.summarize(rec, summaries)
+            self.assertFalse(result["complete_precision_qualification"])
+            self.assertIsNone(result["get_body_byte_precision"])
+            self.assertTrue(result["plans"][0]["problems"])
+
+    def test_received_failed_import_and_zero_byte_404_and_cancel_are_accounted(self):
+        rec, summaries = self.inputs()
+        base = rec["transfers"][-1]
+        for outcome, size, calls in (
+            ("import_error", 40, 1),
+            ("not_found", 0, 1),
+            ("cancelled", 0, 0),
+        ):
+            rec["transfers"].append(
+                dict(
+                    base,
+                    outcome=outcome,
+                    ok=False,
+                    compressed_bytes=size,
+                    request_count=calls,
+                    original_bytes=0,
+                    accounting=dict(base["accounting"], entries=[]),
+                )
+            )
+        result = self.summarize(rec, summaries)
+        self.assertTrue(result["complete_precision_qualification"])
+        self.assertEqual(result["recorded_received_prefetch_bytes"], 150)
+        self.assertEqual(result["plans"][0]["get_backend_invocations"], 4)
+        self.assertEqual(
+            result["plans"][0]["get_outcomes"],
+            {"completed": 2, "import_error": 1, "not_found": 1, "cancelled": 1},
+        )
+
+    def test_nested_origin_mismatch_or_normal_closure_denies_completeness(self):
+        for change in ("origin", "closure"):
+            rec, summaries = self.inputs()
+            if change == "origin":
+                rec["transfers"][-1]["accounting"]["entries"][0]["prefetch"][
+                    "plan_id"
+                ] = "other"
+            else:
+                summaries[0]["closure_reason"] = "inactivity"
+                rec["summary"]["closure_reason"] = "inactivity"
+            result = self.summarize(rec, summaries)
+            self.assertFalse(result["complete_precision_qualification"])
+
+    def test_unprojected_raw_receipt_is_retained_as_its_own_unknown_group(self):
+        rec, summaries = self.inputs()
+        raw = self.raw(rec["transfers"])
+        extra = copy.deepcopy(raw[1])
+        extra["prefetch"].update(session_id="", plan_id="", source="unscoped")
+        extra["compressed_bytes"] = 17
+        raw.append(extra)
+        result = self.summarize(rec, summaries, raw)
+        self.assertFalse(result["complete_precision_qualification"])
+        self.assertEqual(result["recorded_received_prefetch_bytes"], 127)
+        self.assertEqual(len(result["receipt_coverage"]["unprojected"]), 1)
+        self.assertEqual(result["plans"][1]["source"], "unscoped")
+        self.assertEqual(result["plans"][1]["useful_payload_bytes"], 0)
+
+    def test_reconciliation_is_a_multiset_and_duplicate_snapshots_are_rejected(self):
+        rec, summaries = self.inputs()
+        raw = self.raw(rec["transfers"])
+        rec["transfers"].append(copy.deepcopy(rec["transfers"][-1]))
+        result = self.summarize(rec, summaries, raw)
+        self.assertFalse(result["complete_precision_qualification"])
+        self.assertEqual(len(result["receipt_coverage"]["projected_without_raw"]), 1)
+        with self.assertRaises(ValueError):
+            q.summarize([rec, copy.deepcopy(rec)], True, raw, summaries)
+
+    def test_background_unscoped_list_is_separate_and_does_not_invalidate_get_precision(
+        self,
+    ):
+        rec, summaries = self.inputs()
+        raw = self.raw(rec["transfers"])
+        background = copy.deepcopy(raw[0])
+        background["prefetch"].update(session_id="", plan_id="", source="key_cache")
+        raw.append(background)
+        result = self.summarize(rec, summaries, raw)
+        self.assertTrue(result["complete_precision_qualification"])
+        self.assertFalse(result["receipt_coverage"]["complete"])
+        self.assertTrue(result["receipt_coverage"]["get_complete"])
+        self.assertEqual(result["plans"][1]["source"], "key_cache")
+        self.assertEqual(result["plans"][1]["list_backend_invocations"], 1)
+        self.assertEqual(result["recorded_received_prefetch_bytes"], 110)
+
+    def test_off_arm_accepts_common_background_list_but_no_candidate_get(self):
+        rec, summaries = self.inputs()
+        background = rec["transfers"][0]
+        background["prefetch"].update(session_id="", plan_id="", source="key_cache")
+        demand = record()["transfers"][0]
+        demand["prefetch"] = None
+        rec["transfers"] = [demand]
+        raw = self.raw([demand, background])
+        result = q.summarize([rec], False, raw, summaries)
+        self.assertTrue(result["complete_precision_qualification"])
+        self.assertEqual(result["recorded_received_prefetch_bytes"], 0)
+        self.assertEqual(result["backend_totals"]["list_backend_invocations"], 1)
+        self.assertIsNone(result["get_body_byte_precision"])
+
+    def test_nested_before_equal_after_and_unconsumed_use_entry_import_time(self):
+        for time, outcome, result_name, useful in (
+            (99, "completed", "local_hit", 30),
+            (100, "completed", "local_hit", 0),
+            (101, "completed", "local_hit", 0),
+            (0, "import_error", "local_hit", 0),
+        ):
+            rec, summaries = self.inputs()
+            entry = rec["transfers"][-1]["accounting"]["entries"][0]
+            entry.update(finished_at_ms=time, outcome=outcome)
+            rec["units"][0]["result"] = result_name
+            result = self.summarize(rec, summaries)
+            self.assertEqual(result["recorded_useful_prefetch_bytes"], useful)
+            if time == 100:
+                self.assertFalse(result["complete_precision_qualification"])
+                self.assertIsNone(result["get_body_byte_precision"])
+                self.assertEqual(
+                    result["plans"][0]["payload_bytes"]["equal_timestamp"], 30
+                )
+
+
+class RetentionAndArtifacts(unittest.TestCase):
+    def test_any_rotation_marker_is_preserved_and_rejected_after_drain(self):
+        for log in ("events.jsonl", "transfers.jsonl", "summaries.jsonl"):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runtime, output = root / "runtime", root / "output"
+                runtime.mkdir()
+                output.mkdir()
+                (runtime / log).write_text("small rotated remainder\n")
+                (runtime / (log + ".rotation")).write_text('{"generation":1}')
+                with self.assertRaisesRegex(ValueError, "rotation"):
+                    q.preserve_logs(runtime, output)
+                self.assertTrue((output / (log + ".rotation")).exists())
+                self.assertEqual(
+                    json.loads((output / "retention.json").read_text())[
+                        "rotation_markers"
+                    ],
+                    [log + ".rotation"],
+                )
+
+    def test_executable_hash_listing_and_version_mismatch_are_rejected(self):
+        good = {"sha256": "same", "listing": "alpha\nbeta\n", "version": "eza v0.23.5"}
+        artifacts = {arm: dict(good) for arm in q.ARMS}
+        self.assertEqual(q.artifact_problems(artifacts), [])
+        for field, value in (
+            ("sha256", "different"),
+            ("listing", "wrong"),
+            ("version", "v0.23.6"),
+        ):
+            artifacts["on-3"] = good | {field: value}
+            self.assertTrue(q.artifact_problems(artifacts))
+
+
 class Timing(unittest.TestCase):
     def jobs(self):
         return [
@@ -408,8 +701,17 @@ class Timing(unittest.TestCase):
                     folder / "identity.json",
                     {"files": {"kache": "binary-sha"}, "project": q.PROJECT},
                 )
-                q.dump(folder / "artifact.json", {"sha256": "artifact-sha"})
+                q.dump(
+                    folder / "artifact.json",
+                    {
+                        "sha256": "artifact-sha",
+                        "version": "v0.23.5",
+                        "listing": "alpha\nbeta\n",
+                    },
+                )
                 q.dump(folder / "admission.json", {"demanded_keys": 2})
+                q.dump(folder / "lifecycle.json", {"problems": []})
+                q.dump(folder / "retention.json", {"rotation_markers": []})
             with (
                 patch.object(q, "jobs", return_value=self.jobs()),
                 patch.dict(
@@ -420,6 +722,51 @@ class Timing(unittest.TestCase):
                 report = json.loads((args.output / "job-times.json").read_text())
                 self.assertTrue(report["controls_valid"])
                 self.assertEqual(report["run_attempt"], "2")
+                for name, contents in (
+                    ("lifecycle", {"problems": []}),
+                    ("retention", {"rotation_markers": []}),
+                ):
+                    evidence_path = (
+                        args.results / "prefetch-qualification-on-3" / (name + ".json")
+                    )
+                    evidence_path.unlink()
+                    with self.assertRaises(ValueError):
+                        q.collect(args)
+                    incomplete = json.loads(
+                        (args.output / "job-times.json").read_text()
+                    )
+                    self.assertFalse(incomplete["controls_valid"])
+                    self.assertFalse(incomplete["complete_precision_qualification"])
+                    self.assertIn(f"on-3 lacks {name} evidence", incomplete["problems"])
+                    q.dump(evidence_path, contents)
+                artifact_path = (
+                    args.results / "prefetch-qualification-on-3" / "artifact.json"
+                )
+                artifact = json.loads(artifact_path.read_text())
+                q.dump(artifact_path, artifact | {"sha256": "different"})
+                with self.assertRaises(ValueError):
+                    q.collect(args)
+                mismatch = json.loads((args.output / "job-times.json").read_text())
+                self.assertFalse(mismatch["controls_valid"])
+                self.assertIn(
+                    "Consumer executable SHA256 values differ", mismatch["problems"]
+                )
+                q.dump(artifact_path, artifact)
+                retention_path = (
+                    args.results / "prefetch-qualification-on-3" / "retention.json"
+                )
+                q.dump(
+                    retention_path, {"rotation_markers": ["transfers.jsonl.rotation"]}
+                )
+                with self.assertRaises(ValueError):
+                    q.collect(args)
+                rotated = json.loads((args.output / "job-times.json").read_text())
+                self.assertFalse(rotated["controls_valid"])
+                self.assertIn(
+                    "on-3: retained rotation marker transfers.jsonl.rotation",
+                    rotated["problems"],
+                )
+                q.dump(retention_path, {"rotation_markers": []})
                 self.assertEqual(
                     report["identities"]["off-1"]["files"]["kache"], "binary-sha"
                 )

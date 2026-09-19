@@ -1,6 +1,6 @@
 # kache-e2e fixture: rustc input-set predictions.
 #
-# With KACHE_INPUT_PREDICTIONS=1 the cold build records each unit's dep-info
+# With the default settings the cold build records each unit's dep-info
 # closure; the warm rebuild revalidates the record and derives the key
 # without spawning the dep-info pre-pass. max_dep_info_runs = 0 on warm
 # proves the spawn is gone while min_hits proves the hits stayed.
@@ -17,7 +17,6 @@ path = "source"
 
 [env]
 RUSTC_WRAPPER = "$KACHE"
-KACHE_INPUT_PREDICTIONS = "1"
 
 [commands]
 build = "cargo build"

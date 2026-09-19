@@ -1302,7 +1302,7 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
     let manager = bin.join(tool);
     kache_fs::testutil::write_executable(
         &manager,
-        "#!/bin/sh\n\"$KACHE_TEST_BIN\" daemon run >/dev/null 2>&1 &\necho $! > \"$KACHE_TEST_SERVICE_PID\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$KACHE_TEST_SERVICE_ARGS\"\n\"$KACHE_TEST_BIN\" daemon run >/dev/null 2>&1 &\necho $! > \"$KACHE_TEST_SERVICE_PID\"\n",
     );
     let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -1315,6 +1315,7 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         .env("PATH", path)
         .env("KACHE_TEST_BIN", KACHE_BIN)
         .env("KACHE_TEST_SERVICE_PID", &marker)
+        .env("KACHE_TEST_SERVICE_ARGS", e.home.join("service.args"))
         .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
         .timeout(std::time::Duration::from_secs(30))
         .output()
@@ -1332,6 +1333,16 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         .unwrap();
     let state: serde_json::Value = serde_json::from_slice(&state.unwrap()).unwrap();
     assert_eq!(state["pid"], pid);
+    let args = std::fs::read_to_string(e.home.join("service.args")).unwrap();
+    assert!(!args.lines().any(|arg| arg == "-k" || arg == "restart"));
+    if cfg!(target_os = "macos") {
+        assert_eq!(args.lines().next(), Some("kickstart"));
+    } else {
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["--user", "start", "kache.service"]
+        );
+    }
 }
 
 #[test]

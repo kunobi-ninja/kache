@@ -24,6 +24,7 @@ pub(super) fn ensure(config: &Config, force: bool) -> Result<bool> {
         child: None,
         executable: None,
         stopping: false,
+        retiring_pid: None,
     };
     match replacement::run(
         &lock,
@@ -117,6 +118,7 @@ struct KacheReplacement<'a> {
     child: Option<std::process::Child>,
     executable: Option<PathBuf>,
     stopping: bool,
+    retiring_pid: Option<u32>,
 }
 impl Driver for KacheReplacement<'_> {
     type Error = anyhow::Error;
@@ -150,8 +152,12 @@ impl Driver for KacheReplacement<'_> {
                             kunobi_daemon::wire::operation::DRAIN,
                             deadline,
                         ) {
-                            Ok(Some(_)) => {}
+                            Ok(Some(proof)) => self.retiring_pid = Some(proof.process_id),
                             Ok(None) => {
+                                // A legacy record is only a waiting hint. It never
+                                // authorizes signalling that PID.
+                                self.retiring_pid =
+                                    read_daemon_state(&socket).map(|state| state.pid);
                                 let _ = lifecycle_control::legacy_request(
                                     &socket,
                                     &Request::Shutdown,
@@ -164,7 +170,9 @@ impl Driver for KacheReplacement<'_> {
                     }
                     self.stopping = true;
                 }
-                if daemon_run_lock_is_held(&socket)? {
+                if daemon_run_lock_is_held(&socket)?
+                    || self.retiring_pid.is_some_and(process_is_alive)
+                {
                     return Ok(Progress::Pending);
                 }
             }

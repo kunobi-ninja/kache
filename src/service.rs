@@ -541,9 +541,8 @@ fn configured_instance_matches(
 
 // ── Kickstart ────────────────────────────────────────────────────
 
-/// Force-restart the installed service. Used by `kache daemon restart` and by
-/// `kache init` recovery when the service file is present but the daemon isn't
-/// reachable. The lifecycle coordinator drains the owner before this operation.
+/// Start the installed service after the coordinator has drained its old owner.
+/// Never terminate a process the manager may have started in the meantime.
 ///
 /// Returns `Ok(false)` if no service is installed on this platform.
 pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
@@ -554,9 +553,8 @@ pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
         }
         let uid = crate::platform::current_uid();
         let target = format!("gui/{uid}/{LABEL}");
-        // `kickstart -k` stops the service if running and starts it again.
         let out = command_output_until(
-            std::process::Command::new("launchctl").args(["kickstart", "-k", &target]),
+            std::process::Command::new("launchctl").args(["kickstart", &target]),
             deadline,
         )
         .context("running launchctl kickstart")?;
@@ -571,13 +569,13 @@ pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
             return Ok(false);
         }
         let out = command_output_until(
-            std::process::Command::new("systemctl").args(["--user", "restart", UNIT_NAME]),
+            std::process::Command::new("systemctl").args(["--user", "start", UNIT_NAME]),
             deadline,
         )
-        .context("running systemctl --user restart")?;
+        .context("running systemctl --user start")?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("systemctl --user restart {UNIT_NAME} failed: {stderr}");
+            anyhow::bail!("systemctl --user start {UNIT_NAME} failed: {stderr}");
         }
         Ok(true)
     } else if cfg!(windows) {
@@ -588,11 +586,6 @@ pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
         if !installed.status.success() {
             return Ok(false);
         }
-        // Stop running instance, then start fresh
-        let _ = command_output_until(
-            std::process::Command::new("schtasks").args(["/end", "/tn", TASK_NAME]),
-            deadline,
-        )?;
         let out = command_output_until(
             std::process::Command::new("schtasks").args(["/run", "/tn", TASK_NAME]),
             deadline,

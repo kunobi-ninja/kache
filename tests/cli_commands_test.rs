@@ -1254,7 +1254,7 @@ fn init_rejects_unavailable_daemon_replacement() {
 #[test]
 fn init_upgrade_keeps_the_service_manager_in_charge() {
     use std::io::{BufRead, Write};
-    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    use std::os::unix::net::UnixListener;
     let e = env();
     let socket = e.cache.join("daemon.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -1291,8 +1291,10 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
     let bin = e.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let manager = bin.join(tool);
-    std::fs::write(&manager, "#!/bin/sh\n\"$KACHE_TEST_BIN\" daemon run >/dev/null 2>&1 &\necho $! > \"$KACHE_TEST_SERVICE_PID\"\n").unwrap();
-    std::fs::set_permissions(manager, std::fs::Permissions::from_mode(0o755)).unwrap();
+    kache_fs::testutil::write_executable(
+        &manager,
+        "#!/bin/sh\n\"$KACHE_TEST_BIN\" daemon run >/dev/null 2>&1 &\necho $! > \"$KACHE_TEST_SERVICE_PID\"\n",
+    );
     let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     )))

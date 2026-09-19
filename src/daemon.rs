@@ -1715,7 +1715,8 @@ pub struct TransferEvent {
     /// Time spent reading response bodies across all GET requests (ms).
     #[serde(default)]
     pub body_ms: u64,
-    /// Number of GET requests issued for this transfer.
+    /// Backend invocation count; accounting specifies GET or LIST. Older
+    /// records report GET counts without completeness metadata.
     #[serde(default)]
     pub request_count: u32,
     /// Uncompressed size in bytes (0 for older log entries or failed transfers).
@@ -2997,7 +2998,16 @@ impl Daemon {
             .prefetch_receipt_writers
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        writers.retain(|writer| !writer.is_finished());
+        use futures::FutureExt as _;
+        writers.retain_mut(|writer| match std::pin::Pin::new(writer).now_or_never() {
+            None => true,
+            Some(result) => {
+                if result.is_err() {
+                    self.prefetch_receipt_failed.store(true, Ordering::Release);
+                }
+                false
+            }
+        });
         writers.push(writer);
     }
 
@@ -3010,12 +3020,11 @@ impl Daemon {
                 .unwrap_or_else(|p| p.into_inner()),
         );
         let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut complete = true;
             for writer in writers {
-                if writer.await.is_err() {
-                    return false;
-                }
+                complete &= writer.await.is_ok();
             }
-            true
+            complete
         })
         .await
         .unwrap_or(false);
@@ -4983,9 +4992,11 @@ impl Daemon {
                     // No await before every successfully imported entry has its
                     // exact availability boundary, including other packs in this batch.
                     let import_ms = import_start.elapsed().as_millis() as u64;
+                    // One shared batch import: charge its duration once, to
+                    // the first imported pack, rather than once per object.
+                    receipts[verified[0].2].event.import_ms = import_ms;
                     for (entry, _, pack_index, entry_index) in &verified {
                         let receipt = &mut receipts[*pack_index];
-                        receipt.event.import_ms = import_ms;
                         receipt.event.original_bytes += entry.original_bytes;
                         receipt.event.extract_ms += entry.extract_ms;
                         let logical = &mut receipt.accounting().entries[*entry_index];

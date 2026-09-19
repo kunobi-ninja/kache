@@ -91,7 +91,11 @@ pub(super) async fn serve(config: &Config, lifecycle: Arc<Lifecycle>) -> Result<
                         #[cfg(unix)]
                         if crate::transport::require_self_peer(crate::transport::peer_euid(&stream)).is_err() { return; }
                         #[cfg(windows)]
-                        if authenticate(&stream).is_err() { return; }
+                        {
+                            use interprocess::local_socket::traits::StreamCommon as _;
+                            let Some(pid) = stream.peer_creds().ok().and_then(|creds| creds.pid()) else { return; };
+                            if kunobi_daemon::local::windows::verify_process_user(pid).is_err() { return; }
+                        }
                         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
                         let _ = handler.serve(&stream, &offer, deadline).await;
                     });
@@ -108,16 +112,6 @@ pub(super) async fn serve(config: &Config, lifecycle: Arc<Lifecycle>) -> Result<
         stop,
         _socket: socket,
     })
-}
-
-#[cfg(windows)]
-fn authenticate(stream: &TokioStream) -> std::io::Result<()> {
-    use interprocess::local_socket::traits::StreamCommon as _;
-    let pid = stream
-        .peer_creds()?
-        .pid()
-        .ok_or(std::io::ErrorKind::PermissionDenied)?;
-    kunobi_daemon::local::windows::verify_process_user(pid)
 }
 
 /// None means no binary endpoint was advertised. Any binary failure is final;

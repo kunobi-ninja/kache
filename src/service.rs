@@ -588,25 +588,37 @@ pub fn kickstart(deadline: std::time::Instant) -> Result<bool> {
             std::process::Command::new("schtasks").args(["/query", "/tn", TASK_NAME]),
             deadline,
         )?;
-        if !installed.status.success() {
-            return Ok(false);
-        }
-        let out = command_output_until(
-            std::process::Command::new("schtasks").args(["/run", "/tn", TASK_NAME]),
-            deadline,
-        )
-        .context("running schtasks /run")?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("schtasks /run {TASK_NAME} failed: {stderr}");
-        }
-        Ok(true)
+        start_scheduled_task(installed, || {
+            command_output_until(
+                std::process::Command::new("schtasks").args(["/run", "/tn", TASK_NAME]),
+                deadline,
+            )
+            .context("running schtasks /run")
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = deadline;
         Ok(false)
     }
+}
+
+/// Interpret Task Scheduler results independently of the Windows command adapter.
+#[cfg(any(windows, test))]
+fn start_scheduled_task(
+    query: std::process::Output,
+    start: impl FnOnce() -> Result<std::process::Output>,
+) -> Result<bool> {
+    if !query.status.success() {
+        return Ok(false);
+    }
+    let started = start()?;
+    anyhow::ensure!(
+        started.status.success(),
+        "schtasks /run {TASK_NAME} failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    Ok(true)
 }
 
 /// Bound the manager client process, preserving a capped diagnostic on failure.
@@ -1090,6 +1102,27 @@ mod tests {
         } else if cfg!(target_os = "linux") {
             fs::write(path, format!("ExecStart={} daemon run\n", exe.display())).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_scheduler_start_distinguishes_absent_started_and_failed() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |success| std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
+            stdout: Vec::new(),
+            stderr: b"scheduler refused".to_vec(),
+        };
+        assert!(
+            !start_scheduled_task(output(false), || panic!("missing task must not start")).unwrap()
+        );
+        assert!(start_scheduled_task(output(true), || Ok(output(true))).unwrap());
+        let error = start_scheduled_task(output(true), || Ok(output(false))).unwrap_err();
+        assert!(error.to_string().contains("scheduler refused"));
+        assert!(
+            start_scheduled_task(output(true), || Err(anyhow::anyhow!("manager unavailable")))
+                .is_err()
+        );
     }
 
     #[test]

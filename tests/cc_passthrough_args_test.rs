@@ -125,7 +125,7 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
             .env("KACHE_BASE_DIR", &root)
             .env("KACHE_LOCAL_ONLY", "1")
             .env("KACHE_DEFERRED_DISCOVERY", "1")
-            .env("KACHE_DAEMON_PUBLISH", "0")
+            .env("KACHE_DAEMON_PUBLISH", "1")
             .env("KACHE_PHASE_TRACE_DIR", &trace)
             .env_remove("OUT_DIR")
             .env_remove("KACHE_ACTIVE")
@@ -165,6 +165,14 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
                 "{phase}: {name}"
             );
         }
+        assert!(
+            !spans.iter().any(|span| matches!(
+                span["name"].as_str(),
+                Some("handoff_snapshot" | "handoff_event")
+            )),
+            "a missing daemon must not add handoff staging work"
+        );
+        assert!(!cache.join("store/staging/handoff").exists());
         if phase == "cold" {
             assert!(
                 spans.iter().any(|span| span["name"] == "cc_capture"),

@@ -8986,7 +8986,7 @@ fn daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
 /// probe that creates one on a host that has never run a daemon would hand it a
 /// finding it manufactured itself — and testing for the file first only narrows
 /// that race rather than closing it.
-fn existing_daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
+pub(crate) fn existing_daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
     match std::fs::OpenOptions::new()
         .write(true)
         .open(daemon_run_lock_path(socket_path))

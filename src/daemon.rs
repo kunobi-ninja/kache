@@ -8415,7 +8415,9 @@ pub fn restart(config: &Config) -> Result<bool> {
         Ok(true) => {
             eprintln!("restarting daemon via service manager...");
             if wait_for_socket_until(&socket_path, None, Duration::from_secs(10))? {
-                let responsive = send_health_request(config).is_ok();
+                let responsive = fetch_daemon_health(config)
+                    .map(|health| !client_epoch_is_newer(build_epoch(), health.build_epoch))
+                    .unwrap_or(false);
                 if responsive {
                     eprintln!("daemon restarted");
                     return Ok(true);
@@ -8459,19 +8461,10 @@ pub fn restart(config: &Config) -> Result<bool> {
 /// This path is intentionally outside build hot paths, so a short bounded wait
 /// is acceptable to keep monitor/status output current.
 pub(crate) fn restart_daemon_for_stale_client(config: &Config) -> Result<bool> {
-    let socket_path = config.socket_path();
-
-    let _ = send_request_with_timeout(&socket_path, &Request::Shutdown, Duration::from_secs(2));
-
-    // Give the old daemon a brief chance to exit before spawning a fresh one.
-    for _ in 0..4 {
-        if !crate::transport::is_reachable(&socket_path) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    start_daemon_background()
+    // Keep service-managed daemons under their manager after an upgrade.
+    // A protocol shutdown followed by a direct spawn leaves launchd/systemd
+    // stopped after a successful exit and gives the replacement no supervisor.
+    restart(config)
 }
 
 /// Send a request to the daemon, return the response line.

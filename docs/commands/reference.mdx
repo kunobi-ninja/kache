@@ -323,6 +323,8 @@ headers and catalog metadata. `accounting.bytes_complete: false` means partial
 received bytes are unknown, so a complete GET-body precision ratio cannot be
 computed. A failed validation or import still retains a fully received body.
 Cancellation receipts preserve known bytes and use the `cancelled` outcome.
+A bounded logging queue marks the final summary incomplete if records overflow
+or cannot be written; such a run cannot establish full accounting coverage.
 
 Pack `accounting.entries` contains each validated frame's cache key, compressed
 payload bytes, immutable origin and outcome. `finished_at_ms` is the successful

@@ -1765,17 +1765,86 @@ fn unix_time_ms() -> u64 {
         .as_millis() as u64
 }
 
+const MAX_PREFETCH_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PREFETCH_RECEIPT_ENTRIES: usize = 4096;
+
+#[derive(Default)]
+struct PrefetchReceiptQueue {
+    events: Vec<TransferEvent>,
+    retained_bytes: usize,
+    entries: usize,
+    overflowed: bool,
+    writing: bool,
+}
+
+impl PrefetchReceiptQueue {
+    fn push(&mut self, event: TransferEvent) {
+        fn origin_bytes(origin: &PrefetchOrigin) -> usize {
+            origin.session_id.capacity() + origin.plan_id.capacity() + origin.source.capacity()
+        }
+        let mut bytes = std::mem::size_of::<TransferEvent>()
+            + event.crate_name.capacity()
+            + event.format.capacity()
+            + event.cache_key.capacity()
+            + event.object_key.capacity()
+            + event.outcome.capacity()
+            + event.prefetch.as_ref().map_or(0, origin_bytes);
+        let mut entries = 0;
+        if let Some(accounting) = &event.accounting {
+            entries = accounting.entries.len();
+            bytes += accounting.entries.capacity() * std::mem::size_of::<PackedEntryTransfer>();
+            for entry in &accounting.entries {
+                bytes += entry.cache_key.capacity()
+                    + entry.crate_name.capacity()
+                    + entry.outcome.capacity()
+                    + origin_bytes(&entry.prefetch);
+            }
+        }
+        if bytes > MAX_PREFETCH_RECEIPT_BYTES.saturating_sub(self.retained_bytes)
+            || entries > MAX_PREFETCH_RECEIPT_ENTRIES.saturating_sub(self.entries)
+        {
+            self.overflowed = true;
+            return;
+        }
+        self.retained_bytes += bytes;
+        self.entries += entries;
+        self.events.push(event);
+    }
+
+    fn drain(&mut self) -> Vec<TransferEvent> {
+        self.retained_bytes = 0;
+        self.entries = 0;
+        std::mem::take(&mut self.events)
+    }
+}
+
+/// A panic must release writer admission and make missing coverage visible.
+struct PrefetchReceiptWriter {
+    queue: Arc<Mutex<PrefetchReceiptQueue>>,
+    failed: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for PrefetchReceiptWriter {
+    fn drop(&mut self) {
+        if self.armed {
+            self.failed.store(true, Ordering::Release);
+            self.queue.lock().unwrap_or_else(|p| p.into_inner()).writing = false;
+        }
+    }
+}
+
 /// A receipt remains owned across decode/import awaits. Cancellation only
 /// queues it in memory; log I/O runs separately on the blocking pool.
 struct PrefetchReceipt {
     event: TransferEvent,
     started: Instant,
-    queue: Arc<Mutex<Vec<TransferEvent>>>,
+    queue: Arc<Mutex<PrefetchReceiptQueue>>,
 }
 
 impl PrefetchReceipt {
     fn new(
-        queue: Arc<Mutex<Vec<TransferEvent>>>,
+        queue: Arc<Mutex<PrefetchReceiptQueue>>,
         origin: PrefetchOrigin,
         object_key: &str,
         format: &str,
@@ -2405,9 +2474,9 @@ pub(crate) struct Daemon {
     /// Own both coordinators and their independently scheduled download tasks.
     prefetch_tasks: Mutex<tokio::task::JoinSet<()>>,
     prefetch_cancellations: Arc<Mutex<PrefetchCancellations>>,
-    prefetch_receipts: Arc<Mutex<Vec<TransferEvent>>>,
+    prefetch_receipts: Arc<Mutex<PrefetchReceiptQueue>>,
     prefetch_receipt_writers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    prefetch_receipt_failed: AtomicBool,
+    prefetch_receipt_failed: Arc<AtomicBool>,
     /// Phase-0 observability counters (#485). Telemetry only.
     prefetch_stats: PrefetchStats,
     /// DAEMON-WIDE cap on concurrent speculative prefetch downloads, sized by
@@ -2561,9 +2630,9 @@ impl Daemon {
             prefetch_stopping: AtomicBool::new(false),
             prefetch_tasks: Mutex::new(tokio::task::JoinSet::new()),
             prefetch_cancellations: Arc::new(Mutex::new(PrefetchCancellations::default())),
-            prefetch_receipts: Arc::new(Mutex::new(Vec::new())),
+            prefetch_receipts: Arc::new(Mutex::new(PrefetchReceiptQueue::default())),
             prefetch_receipt_writers: Mutex::new(Vec::new()),
-            prefetch_receipt_failed: AtomicBool::new(false),
+            prefetch_receipt_failed: Arc::new(AtomicBool::new(false)),
             prefetch_stats: PrefetchStats::new(),
             prefetch_gate: Arc::new(tokio::sync::Semaphore::new(prefetch_concurrency_cap(
                 config.s3_concurrency,
@@ -2967,31 +3036,52 @@ impl Daemon {
     /// Transfer ownership to a tracked writer before any await. Aborting a
     /// coordinator cannot discard a body receipt already queued by its guard.
     fn flush_prefetch_receipts(self: &Arc<Self>) {
-        let pending = std::mem::take(
-            &mut *self
-                .prefetch_receipts
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()),
-        );
-        if pending.is_empty() {
+        let mut queue = self
+            .prefetch_receipts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if queue.writing || queue.events.is_empty() {
             return;
         }
+        queue.writing = true;
+        let mut pending = queue.drain();
+        let guard = PrefetchReceiptWriter {
+            queue: self.prefetch_receipts.clone(),
+            failed: self.prefetch_receipt_failed.clone(),
+            armed: true,
+        };
+        // Admission and registration stay synchronous; shutdown first joins
+        // every producer, then takes the writer handles.
+        drop(queue);
         let daemon = self.clone();
         let writer = tokio::task::spawn_blocking(move || {
+            let mut guard = guard;
             let path = daemon.config.transfer_log_path();
-            for event in pending {
-                if let Err(error) = events::log_transfer(&path, &event) {
-                    daemon
-                        .prefetch_receipt_failed
-                        .store(true, Ordering::Release);
-                    tracing::warn!("failed to log prefetch receipt: {error}");
-                }
-                if let Ok(mut recent) = daemon.recent_transfers.lock() {
-                    if recent.len() >= RECENT_TRANSFERS_CAP {
-                        recent.pop_front();
+            loop {
+                for event in pending {
+                    if let Err(error) = events::log_transfer(&path, &event) {
+                        daemon
+                            .prefetch_receipt_failed
+                            .store(true, Ordering::Release);
+                        tracing::warn!("failed to log prefetch receipt: {error}");
                     }
-                    recent.push_back(event);
+                    if let Ok(mut recent) = daemon.recent_transfers.lock() {
+                        if recent.len() >= RECENT_TRANSFERS_CAP {
+                            recent.pop_front();
+                        }
+                        recent.push_back(event);
+                    }
                 }
+                let mut queue = daemon
+                    .prefetch_receipts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if queue.events.is_empty() {
+                    queue.writing = false;
+                    guard.armed = false;
+                    break;
+                }
+                pending = queue.drain();
             }
         });
         let mut writers = self
@@ -3028,7 +3118,13 @@ impl Daemon {
         })
         .await
         .unwrap_or(false);
-        finished && !self.prefetch_receipt_failed.load(Ordering::Acquire)
+        finished
+            && !self.prefetch_receipt_failed.load(Ordering::Acquire)
+            && !self
+                .prefetch_receipts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .overflowed
     }
 
     /// Set the upload buffer sender (called during server setup).
@@ -15065,6 +15161,129 @@ mod tests {
         tar.extend(std::iter::repeat_n(0, 512 - body.len()));
         tar.extend(std::iter::repeat_n(0, 1024));
         zstd::stream::encode_all(std::io::Cursor::new(tar), 3).unwrap()
+    }
+
+    #[test]
+    fn packed_receipt_queue_bounds_allocated_bytes_and_entries_independently() {
+        let mut queue = PrefetchReceiptQueue::default();
+        queue.push(TransferEvent {
+            object_key: String::with_capacity((2 << 20) - std::mem::size_of::<TransferEvent>()),
+            ..Default::default()
+        });
+        assert_eq!(queue.events.len(), 1, "exact byte boundary is admitted");
+        queue.push(TransferEvent::default());
+        assert_eq!(queue.events.len(), 1, "additional data exceeds byte bound");
+        assert!(queue.overflowed);
+        drop(queue.drain());
+        queue.push(TransferEvent::default());
+        assert_eq!(queue.events.len(), 1, "draining releases retained capacity");
+        assert!(
+            queue.overflowed,
+            "lost coverage remains visible after draining"
+        );
+
+        let mut queue = PrefetchReceiptQueue::default();
+        queue.push(TransferEvent {
+            accounting: Some(PrefetchAccounting {
+                entries: vec![PackedEntryTransfer::default(); 4096],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(queue.events.len(), 1, "exact entry boundary is admitted");
+        queue.push(TransferEvent {
+            accounting: Some(PrefetchAccounting {
+                entries: vec![PackedEntryTransfer::default()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(queue.events.len(), 1, "entry bound is independent of bytes");
+        assert!(queue.overflowed);
+    }
+
+    #[tokio::test]
+    async fn packed_receipts_use_one_writer_and_drain_while_disk_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        std::fs::create_dir_all(&daemon.config.runtime_dir).unwrap();
+        let lock_path = daemon.config.runtime_dir.join("transfers.jsonl.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        for index in 0..100 {
+            drop(PrefetchReceipt::new(
+                daemon.prefetch_receipts.clone(),
+                PrefetchOrigin::default(),
+                &format!("pack-{index}"),
+                "pack",
+                PrefetchOperation::Get,
+            ));
+            daemon.flush_prefetch_receipts();
+        }
+        assert_eq!(daemon.prefetch_receipt_writers.lock().unwrap().len(), 1);
+        assert_eq!(daemon.prefetch_receipts.lock().unwrap().events.len(), 99);
+        lock.unlock().unwrap();
+        assert!(daemon.finish_prefetch_receipts().await);
+        assert_eq!(
+            events::read_transfers(&daemon.config.transfer_log_path())
+                .unwrap()
+                .len(),
+            100
+        );
+        assert!(daemon.prefetch_receipts.lock().unwrap().events.is_empty());
+        assert!(!daemon.prefetch_receipts.lock().unwrap().writing);
+    }
+
+    #[tokio::test]
+    async fn packed_receipt_overflow_and_writer_panic_remain_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon
+            .prefetch_receipts
+            .lock()
+            .unwrap()
+            .push(TransferEvent {
+                object_key: String::with_capacity((2 << 20) + 1),
+                ..Default::default()
+            });
+        assert!(!daemon.finish_prefetch_receipts().await);
+        assert!(daemon.prefetch_receipts.lock().unwrap().events.is_empty());
+        daemon.prefetch_receipts.lock().unwrap().writing = true;
+        let guard = PrefetchReceiptWriter {
+            queue: daemon.prefetch_receipts.clone(),
+            failed: daemon.prefetch_receipt_failed.clone(),
+            armed: true,
+        };
+        assert!(
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                panic!("injected receipt writer failure");
+            })
+            .await
+            .is_err()
+        );
+        assert!(!daemon.prefetch_receipts.lock().unwrap().writing);
+        assert!(daemon.prefetch_receipt_failed.load(Ordering::Acquire));
+        drop(PrefetchReceipt::new(
+            daemon.prefetch_receipts.clone(),
+            PrefetchOrigin::default(),
+            "after-panic",
+            "pack",
+            PrefetchOperation::Get,
+        ));
+        assert!(!daemon.finish_prefetch_receipts().await);
+        assert_eq!(
+            events::read_transfers(&daemon.config.transfer_log_path())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

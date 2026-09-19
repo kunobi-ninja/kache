@@ -4463,8 +4463,9 @@ fn hand_off_cc_store(
                     // A peer holds or stored the key in the gap; it publishes.
                     let mut event = request.event;
                     event.elapsed_ms = handoff.start.elapsed().as_millis() as u64;
-                    event.store_error =
-                        format!("handed off to a peer after the daemon declined: {reason}");
+                    // An independent peer won the key. That is ordinary
+                    // contention, not a failed store. An accepted daemon job
+                    // is resolved by its receipt before reaching this branch.
                     write_event(config, &event);
                     print_progress(
                         handoff.crate_name,

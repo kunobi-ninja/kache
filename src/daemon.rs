@@ -1,6 +1,7 @@
 use crate::transport::prelude::*;
 use crate::transport::{ListenerOptions, TokioListener, TokioStream, socket_name};
 use anyhow::{Context, Result};
+use kache_core::timeline::PrefetchOrigin;
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1040,34 +1041,46 @@ pub struct PrefetchRequest {
     /// Still unbounded by key count, bytes, or time — see #616.
     #[serde(default)]
     pub warm_all: bool,
+    /// Set inside the daemon from the chosen plan, never accepted over IPC.
+    #[serde(skip)]
+    pub origin: Option<PrefetchOrigin>,
+    #[serde(skip)]
+    pub candidate_sources: HashMap<String, kache_core::CandidateSource>,
 }
 
 impl PrefetchRequest {
     pub fn from_plan(plan: PrefetchPlan) -> Self {
+        let mut candidate_sources = HashMap::new();
+        let keys = plan
+            .candidates
+            .into_iter()
+            // The planner is an untrusted boundary (a distinct endpoint
+            // from S3). cache_key/crate_name flow into local path joins and
+            // S3 object keys, so drop any candidate that isn't a well-formed
+            // key + safe crate name before it can become a traversal /
+            // prefix-escape primitive. Reject, don't sanitize.
+            .filter_map(|candidate| {
+                if !crate::cache_key::is_valid_cache_key(&candidate.cache_key)
+                    || !crate::cache_key::is_valid_crate_name(&candidate.crate_name)
+                {
+                    tracing::warn!(
+                        cache_key = key_prefix(&candidate.cache_key),
+                        cache_key_len = candidate.cache_key.len(),
+                        "prefetch: dropping planner candidate with invalid cache_key/crate_name"
+                    );
+                    return None;
+                }
+                candidate_sources
+                    .entry(candidate.cache_key.clone())
+                    .or_insert(candidate.source);
+                Some((candidate.cache_key, candidate.crate_name))
+            })
+            .collect();
         Self {
             warm_all: false,
-            keys: plan
-                .candidates
-                .into_iter()
-                // The planner is an untrusted boundary (a distinct endpoint
-                // from S3). cache_key/crate_name flow into local path joins and
-                // S3 object keys, so drop any candidate that isn't a well-formed
-                // key + safe crate name before it can become a traversal /
-                // prefix-escape primitive. Reject, don't sanitize.
-                .filter(|c| {
-                    let ok = crate::cache_key::is_valid_cache_key(&c.cache_key)
-                        && crate::cache_key::is_valid_crate_name(&c.crate_name);
-                    if !ok {
-                        tracing::warn!(
-                            cache_key = key_prefix(&c.cache_key),
-                            cache_key_len = c.cache_key.len(),
-                            "prefetch: dropping planner candidate with invalid cache_key/crate_name"
-                        );
-                    }
-                    ok
-                })
-                .map(|candidate| (candidate.cache_key, candidate.crate_name))
-                .collect(),
+            origin: None,
+            candidate_sources,
+            keys,
         }
     }
 }
@@ -1730,6 +1743,10 @@ pub struct TransferEvent {
     pub cache_key: String,
     #[serde(default)]
     pub object_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch: Option<PrefetchOrigin>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outcome: String,
     pub compressed_bytes: u64,
     /// Wall-clock start of the transfer stage, in Unix epoch milliseconds.
     /// Zero for transfer-event schemas older than v3.
@@ -1796,7 +1813,7 @@ pub struct TransferEvent {
 }
 
 const fn default_transfer_schema() -> u32 {
-    3
+    4
 }
 
 fn unix_time_ms() -> u64 {
@@ -2050,6 +2067,15 @@ impl ActivePlan {
         self.downloaded.insert(key.to_string(), compressed_bytes);
         if self.demanded.contains(key) {
             self.used.insert(key.to_string());
+        }
+    }
+
+    fn record_download_from(&mut self, origin: &PrefetchOrigin, key: &str, compressed_bytes: u64) {
+        if self.session_id == origin.session_id
+            && self.plan_id == origin.plan_id
+            && self.plan_source == origin.source
+        {
+            self.record_download(key, compressed_bytes);
         }
     }
 
@@ -3680,6 +3706,8 @@ impl Daemon {
                     .bytes_uploaded
                     .fetch_add(ul.transfer.compressed_bytes, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    prefetch: None,
+                    outcome: String::new(),
                     schema: default_transfer_schema(),
                     crate_name: job.crate_name.clone(),
                     direction: TransferDirection::Upload,
@@ -3726,6 +3754,8 @@ impl Daemon {
                     .uploads_failed
                     .fetch_add(1, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    prefetch: None,
+                    outcome: String::new(),
                     schema: default_transfer_schema(),
                     crate_name: job.crate_name.clone(),
                     direction: TransferDirection::Upload,
@@ -4232,6 +4262,8 @@ impl Daemon {
                     .bytes_downloaded
                     .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    prefetch: None,
+                    outcome: String::new(),
                     schema: default_transfer_schema(),
                     crate_name: cn.to_string(),
                     direction: TransferDirection::Download,
@@ -4287,6 +4319,8 @@ impl Daemon {
                     .downloads_failed
                     .fetch_add(1, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    prefetch: None,
+                    outcome: String::new(),
                     schema: default_transfer_schema(),
                     crate_name: cn.to_string(),
                     direction: TransferDirection::Download,
@@ -4934,6 +4968,19 @@ impl Daemon {
         // immediately before downloading it instead, so demand never queues
         // behind speculation.
 
+        let origin = req.origin.clone().unwrap_or_else(|| PrefetchOrigin {
+            source: "unscoped".to_string(),
+            ..PrefetchOrigin::default()
+        });
+        let candidate_sources = req.candidate_sources.clone();
+        let ranks: HashMap<String, u64> = req
+            .keys
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(rank, (key, _))| (key.clone(), rank as u64))
+            .collect();
+
         // Spawn a single coordinator task with bounded concurrency
         let daemon = Arc::clone(self);
         let remote_config = (*remote).clone();
@@ -5046,6 +5093,9 @@ impl Daemon {
                 let download_plan = crate::remote_plan::RemotePlanner::new(&d.config)
                     .plan(crate::remote_plan::RemoteWorkload::Prefetch);
                 let plan_deadline = deadline;
+                let mut origin = origin.clone();
+                origin.candidate_rank = ranks.get(&key).copied();
+                origin.candidate_source = candidate_sources.get(&key).copied().unwrap_or_default();
                 in_flight.push(tokio::spawn(async move {
                     let item_deadline =
                         RemoteDeadline::from_secs(d.config.remote_restore_timeout_secs)
@@ -5199,10 +5249,17 @@ impl Daemon {
                                 let mut plan =
                                     d.active_plan.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Some(p) = plan.as_mut() {
-                                    p.record_download(&key, dl.compressed_bytes);
+                                    p.record_download_from(&origin, &key, dl.compressed_bytes);
                                 }
                             }
                             d.push_transfer_event(TransferEvent {
+                                prefetch: Some(origin.clone()),
+                                outcome: if import_ok {
+                                    "completed"
+                                } else {
+                                    "import_error"
+                                }
+                                .to_string(),
                                 schema: default_transfer_schema(),
                                 crate_name: crate_name.clone(),
                                 direction: TransferDirection::Download,
@@ -5263,18 +5320,26 @@ impl Daemon {
                                 if d.negative_keys.record_miss(&knowledge) {
                                     d.key_cache.remove(&key).await;
                                 }
-                                return;
+                            } else {
+                                tracing::warn!("prefetch download failed for {}: {e}", key);
+                                breaker_permit.failure(
+                                    class,
+                                    &format!("prefetch download failed ({class:?}): {e:#}"),
+                                );
+                                d.transfer_counters
+                                    .downloads_failed
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
-                            breaker_permit.failure(
-                                class,
-                                &format!("prefetch download failed ({class:?}): {e:#}"),
-                            );
                             let elapsed_ms = start.elapsed().as_millis() as u64;
                             let finished_at_unix_ms = unix_time_ms();
-                            d.transfer_counters
-                                .downloads_failed
-                                .fetch_add(1, Ordering::Relaxed);
                             d.push_transfer_event(TransferEvent {
+                                prefetch: Some(origin.clone()),
+                                outcome: if class == RemoteErrorClass::Miss {
+                                    "not_found"
+                                } else {
+                                    "error"
+                                }
+                                .to_string(),
                                 schema: default_transfer_schema(),
                                 crate_name: crate_name.clone(),
                                 direction: TransferDirection::Download,
@@ -5290,7 +5355,9 @@ impl Daemon {
                                 head_ms: 0,
                                 request_ms: 0,
                                 body_ms: 0,
-                                request_count: 0,
+                                // A 404 proves one GET. Other failures may happen before
+                                // a GET or during extraction; their count is unknown.
+                                request_count: u32::from(class == RemoteErrorClass::Miss),
                                 original_bytes: 0,
                                 decompress_ms: 0,
                                 extract_ms: 0,
@@ -5305,7 +5372,6 @@ impl Daemon {
                                 timestamp: finished_at_unix_ms / 1_000,
                             })
                             .await;
-                            tracing::warn!("prefetch download failed for {}: {e}", key);
                         }
                     }
                 }));
@@ -5605,7 +5671,14 @@ impl Daemon {
                         // before artifact prefetch so lookahead cannot reduce
                         // the capacity available to the selected plan.
                         drop(identity_lookup.take());
-                        let prefetch_req = PrefetchRequest::from_plan(plan);
+                        let mut prefetch_req = PrefetchRequest::from_plan(plan);
+                        prefetch_req.origin = Some(PrefetchOrigin {
+                            session_id: req.session_id.clone(),
+                            plan_id: plan_id.clone().unwrap_or_default(),
+                            source: "advisory".to_string(),
+                            candidate_rank: None,
+                            candidate_source: kache_core::CandidateSource::Unknown,
+                        });
                         let candidate_count = prefetch_req.keys.len();
                         self.install_plan(
                             &req.session_id,
@@ -5709,7 +5782,14 @@ impl Daemon {
             .last_plan_candidates
             .store(fallback_plan.candidates.len() as u64, Ordering::Relaxed);
 
-        let prefetch_req = PrefetchRequest::from_plan(fallback_plan);
+        let mut prefetch_req = PrefetchRequest::from_plan(fallback_plan);
+        prefetch_req.origin = Some(PrefetchOrigin {
+            session_id: req.session_id.clone(),
+            plan_id: String::new(),
+            source: "fallback".to_string(),
+            candidate_rank: None,
+            candidate_source: kache_core::CandidateSource::Unknown,
+        });
         self.install_plan(
             &req.session_id,
             "",
@@ -7308,6 +7388,8 @@ async fn shard_prefetch_for_deps(
     let req = PrefetchRequest {
         keys: prefetch_keys,
         warm_all: false,
+        origin: None,
+        candidate_sources: HashMap::new(),
     };
     let manifest_key = crate::identity::manifest_lookup_keys(None)
         .into_iter()
@@ -7392,6 +7474,8 @@ async fn identity_manifest_prefetch_from(
     let req = PrefetchRequest {
         keys: prefetch_keys,
         warm_all: false,
+        origin: None,
+        candidate_sources: HashMap::new(),
     };
     let resp = daemon.handle_prefetch(&req).await;
     if !resp.ok {
@@ -10560,7 +10644,7 @@ mod tests {
     }
 
     fn assert_v3_transfer_timestamps(transfer: &TransferEvent) {
-        assert_eq!(transfer.schema, 3);
+        assert_eq!(transfer.schema, 4);
         assert!(
             transfer.started_at_unix_ms > 1_000_000_000_000,
             "transfer start must be Unix epoch milliseconds: {transfer:?}"
@@ -15080,6 +15164,8 @@ mod tests {
             &Request::Prefetch(PrefetchRequest {
                 keys: Vec::new(),
                 warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
             }),
         )
         .await;
@@ -15596,6 +15682,8 @@ mod tests {
                         (key_b.clone(), "tokio".into()),
                     ],
                     warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
                 },
                 Some(context),
                 Instant::now(),
@@ -15784,6 +15872,8 @@ mod tests {
                 &PrefetchRequest {
                     keys: vec![(key.clone(), "serde".into())],
                     warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
                 },
                 Some(context),
                 Instant::now(),
@@ -15868,6 +15958,8 @@ mod tests {
                     &PrefetchRequest {
                         keys: vec![(packed_key, "serde".into())],
                         warm_all: false,
+                        origin: None,
+                        candidate_sources: HashMap::new(),
                     },
                     Some(context),
                     Instant::now(),
@@ -15946,6 +16038,8 @@ mod tests {
                 &PrefetchRequest {
                     keys: vec![(key.clone(), "serde".into())],
                     warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
                 },
                 Some(context),
                 Instant::now(),
@@ -16041,6 +16135,8 @@ mod tests {
                 &PrefetchRequest {
                     keys: vec![(key.clone(), "serde".into())],
                     warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
                 },
                 Some(context),
                 Instant::now(),
@@ -16125,6 +16221,8 @@ mod tests {
                         (bad_key.clone(), "tokio".into()),
                     ],
                     warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
                 },
                 Some(context),
                 Instant::now(),
@@ -16551,6 +16649,8 @@ mod tests {
             .handle_prefetch(&PrefetchRequest {
                 keys: vec![(key.clone(), "serde".to_string())],
                 warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
             })
             .await;
 
@@ -16587,10 +16687,18 @@ mod tests {
             "inject mock backend"
         );
 
+        let already_local = test_cache_key("already-local");
+        std::fs::create_dir_all(config.store_dir().join(&already_local)).unwrap();
         let resp = daemon
             .handle_prefetch(&PrefetchRequest {
-                keys: vec![(key.to_string(), "serde".to_string())],
+                keys: vec![
+                    (already_local, "old".to_string()),
+                    (key.to_string(), "serde".to_string()),
+                    (key.to_string(), "serde".to_string()),
+                ],
                 warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
             })
             .await;
         assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
@@ -16625,6 +16733,9 @@ mod tests {
         }
         let transfer = transfer.expect("completed prefetch should record transfer timing");
         assert_v3_transfer_timestamps(&transfer);
+        assert_eq!(transfer.outcome, "completed");
+        assert_eq!(transfer.prefetch.as_ref().unwrap().source, "unscoped");
+        assert_eq!(transfer.prefetch.as_ref().unwrap().candidate_rank, Some(1));
         assert!(
             transfer.elapsed_ms >= transfer.import_lock_wait_ms + transfer.import_ms,
             "end-to-end elapsed must include lock wait and import execution: {transfer:?}"
@@ -16660,6 +16771,8 @@ mod tests {
             .handle_prefetch(&PrefetchRequest {
                 keys: vec![(key.to_string(), "serde".to_string())],
                 warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
             })
             .await;
         assert!(
@@ -16694,9 +16807,108 @@ mod tests {
             completed.is_ok(),
             "a garbage pack must record a failed download and a transfer event"
         );
-        assert_v3_transfer_timestamps(&latest_transfer(&daemon));
+        let transfer = latest_transfer(&daemon);
+        assert_v3_transfer_timestamps(&transfer);
+        assert_eq!(transfer.outcome, "error");
+        assert_eq!(transfer.request_count, 0);
         // Nothing was imported.
         assert!(!config.store_dir().join(key).join("meta.json").exists());
+    }
+
+    #[test]
+    fn plan_downloads_reject_a_different_origin() {
+        let origin = PrefetchOrigin {
+            session_id: "session".to_string(),
+            plan_id: "plan".to_string(),
+            source: "advisory".to_string(),
+            ..PrefetchOrigin::default()
+        };
+        for (session, plan_id, source) in [
+            ("other", "plan", "advisory"),
+            ("session", "other", "advisory"),
+            ("session", "plan", "fallback"),
+        ] {
+            let mut plan = ActivePlan::new(
+                session.to_string(),
+                plan_id.to_string(),
+                source,
+                HashSet::from(["key".to_string()]),
+                0,
+                0,
+            );
+            plan.record_download_from(&origin, "key", 42);
+            assert!(plan.downloaded.is_empty());
+        }
+        let mut plan = ActivePlan::new(
+            "session".to_string(),
+            "plan".to_string(),
+            "advisory",
+            HashSet::from(["key".to_string()]),
+            0,
+            0,
+        );
+        plan.record_download_from(&origin, "key", 42);
+        assert_eq!(plan.downloaded, HashMap::from([("key".to_string(), 42)]));
+    }
+
+    #[tokio::test]
+    async fn prefetch_not_found_keeps_its_origin_and_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let key = test_cache_key("prefetch-not-found");
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(test_remote_backend()).is_ok());
+        let origin = PrefetchOrigin {
+            session_id: "session-original".to_string(),
+            plan_id: "plan-original".to_string(),
+            source: "advisory".to_string(),
+            candidate_rank: None,
+            candidate_source: kache_core::CandidateSource::Unknown,
+        };
+        let response = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: vec![(key.clone(), "serde".to_string())],
+                warm_all: false,
+                origin: Some(origin.clone()),
+                candidate_sources: HashMap::from([(
+                    key.clone(),
+                    kache_core::CandidateSource::Manifest,
+                )]),
+            })
+            .await;
+        assert!(response.ok);
+        // Superseding the active session must not relabel an already queued task.
+        daemon.install_plan(
+            "session-next",
+            "plan-next",
+            "fallback",
+            std::iter::once(key.clone()),
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while daemon.recent_transfers.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("404 must produce a transfer record");
+        let transfer = latest_transfer(&daemon);
+        let mut expected = origin;
+        expected.candidate_rank = Some(0);
+        expected.candidate_source = kache_core::CandidateSource::Manifest;
+        assert_eq!(transfer.prefetch, Some(expected));
+        assert_eq!(transfer.outcome, "not_found");
+        assert!(!transfer.ok);
+        assert_eq!(transfer.request_count, 1);
+        assert_eq!(transfer.compressed_bytes, 0);
+        assert_eq!(
+            daemon
+                .transfer_counters
+                .downloads_failed
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[tokio::test]
@@ -16726,6 +16938,8 @@ mod tests {
             .handle_prefetch(&PrefetchRequest {
                 keys: vec![(key.clone(), "serde".into())],
                 warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
             })
             .await;
         assert!(
@@ -16788,6 +17002,7 @@ mod tests {
         );
         let transfer = latest_transfer(&daemon);
         assert!(!transfer.ok);
+        assert_eq!(transfer.outcome, "import_error");
         assert_eq!(transfer.compressed_bytes, pack.len() as u64);
         {
             let active_plan = daemon
@@ -17080,6 +17295,8 @@ mod tests {
                 ("key_b".into(), "tokio".into()),
             ],
             warm_all: false,
+            origin: None,
+            candidate_sources: HashMap::new(),
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -17087,6 +17304,44 @@ mod tests {
 
         assert!(json.contains("\"prefetch\""));
         assert!(json.contains("\"key_a\""));
+    }
+
+    #[test]
+    fn prefetch_origin_cannot_be_supplied_over_ipc() {
+        let request: PrefetchRequest = serde_json::from_value(serde_json::json!({
+            "keys": [], "origin": {"session_id": "other", "source": "advisory"},
+            "candidate_sources": {"key": "manifest"}
+        }))
+        .unwrap();
+        assert!(request.origin.is_none());
+        assert!(request.candidate_sources.is_empty());
+    }
+
+    #[test]
+    fn prefetch_candidate_source_uses_the_first_valid_candidate() {
+        let key = "b".repeat(64);
+        let invalid_key =
+            kache_core::PrefetchCandidate::new("not-a-cache-key".into(), "serde".into());
+        let mut invalid = kache_core::PrefetchCandidate::new(key.clone(), "../evil".into());
+        invalid.source = kache_core::CandidateSource::Shard;
+        let mut first = kache_core::PrefetchCandidate::new(key.clone(), "serde".into());
+        first.source = kache_core::CandidateSource::Manifest;
+        let mut duplicate = first.clone();
+        duplicate.source = kache_core::CandidateSource::History;
+        let request = PrefetchRequest::from_plan(PrefetchPlan {
+            plan_id: None,
+            planner: None,
+            disposition: PrefetchDisposition::Execute,
+            candidates: vec![invalid_key, invalid, first, duplicate],
+        });
+        assert_eq!(
+            request.keys,
+            vec![(key.clone(), "serde".into()), (key.clone(), "serde".into())]
+        );
+        assert_eq!(
+            request.candidate_sources,
+            HashMap::from([(key, kache_core::CandidateSource::Manifest)])
+        );
     }
 
     #[test]
@@ -17111,6 +17366,8 @@ mod tests {
         let req = Request::Prefetch(PrefetchRequest {
             keys: vec![],
             warm_all: false,
+            origin: None,
+            candidate_sources: HashMap::new(),
         });
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -17754,6 +18011,8 @@ mod tests {
         let req = PrefetchRequest {
             keys: vec![("k".into(), "mycrate".into())],
             warm_all: false,
+            origin: None,
+            candidate_sources: HashMap::new(),
         };
         let resp = daemon.handle_prefetch(&req).await;
         assert!(!resp.ok);
@@ -17816,6 +18075,8 @@ mod tests {
                     .map(|k| (k.clone(), "serde".to_string()))
                     .collect(),
                 warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
             })
             .await;
         assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
@@ -17891,6 +18152,8 @@ mod tests {
             .handle_prefetch(&PrefetchRequest {
                 keys: vec![(key.clone(), "serde".to_string())],
                 warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
             })
             .await;
         assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
@@ -17944,6 +18207,8 @@ mod tests {
             .handle_prefetch(&PrefetchRequest {
                 keys: Vec::new(),
                 warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
             })
             .await;
         assert!(
@@ -17998,6 +18263,8 @@ mod tests {
             .handle_prefetch(&PrefetchRequest {
                 keys: Vec::new(),
                 warm_all: true,
+                origin: None,
+                candidate_sources: HashMap::new(),
             })
             .await;
         assert!(resp.ok, "warm_all dispatch should be ok: {resp:?}");
@@ -18079,6 +18346,8 @@ mod tests {
                     (demanded_key.clone(), "serde".to_string()),
                 ],
                 warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
             })
             .await;
         assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
@@ -18794,6 +19063,8 @@ mod tests {
             &Request::Prefetch(PrefetchRequest {
                 keys: vec![("key1".into(), "mycrate".into())],
                 warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
             }),
         )
         .await;
@@ -19168,6 +19439,11 @@ mod tests {
             daemon.prefetch_stats.plans_advisory.load(Ordering::Relaxed),
             1
         );
+        wait_for_test_condition(|| !daemon.recent_transfers.lock().unwrap().is_empty()).await;
+        let origin = latest_transfer(&daemon).prefetch.unwrap();
+        assert_eq!(origin.session_id, "execute");
+        assert_eq!(origin.plan_id, "execute");
+        assert_eq!(origin.source, "advisory");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -19927,6 +20203,15 @@ mod tests {
         assert_eq!(
             daemon.prefetch_stats.plans_fallback.load(Ordering::Relaxed),
             1
+        );
+        wait_for_test_condition(|| !daemon.recent_transfers.lock().unwrap().is_empty()).await;
+        let origin = latest_transfer(&daemon).prefetch.unwrap();
+        assert_eq!(origin.session_id, "identity-first-fallback");
+        assert!(origin.plan_id.is_empty());
+        assert_eq!(origin.source, "fallback");
+        assert_eq!(
+            origin.candidate_source,
+            kache_core::CandidateSource::Manifest
         );
         let plan = daemon.active_plan.lock().unwrap();
         let plan = plan.as_ref().expect("fallback plan must be installed");

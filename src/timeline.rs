@@ -4,12 +4,11 @@
 //! environment: the wrapper and daemon are untouched, and `kache telemetry
 //! push` is the only caller.
 //!
-//! Two joins carry the weight. Events group into sessions by the wrapper's own
-//! `session_id`. Transfers carry no session id, so they are matched to a
-//! session by cache key first and by time second, and a transfer that could
-//! belong to two sessions is dropped rather than guessed at.
+//! Events group by the wrapper's session id. Prefetch transfers use the
+//! immutable session stamped by the daemon. Older transfers need a unique
+//! key or time-window match; ambiguous transfers are left unattributed.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use kache_core::timeline::{
@@ -137,13 +136,29 @@ pub(crate) fn build_timelines(inputs: &TimelineInputs<'_>) -> Vec<BuildTimeline>
         .map(|(id, session)| (id.clone(), session.started_at_ms, session.finished_at_ms))
         .collect();
     let summaries = summaries_by_session(inputs.summaries);
+    let key_sessions = sessions.iter().fold(
+        HashMap::<&str, HashSet<&str>>::new(),
+        |mut owners, (id, session)| {
+            for unit in &session.units {
+                if !unit.cache_key.is_empty() {
+                    owners.entry(&unit.cache_key).or_default().insert(id);
+                }
+            }
+            owners
+        },
+    );
+    let transfer_owners: Vec<_> = inputs
+        .transfers
+        .iter()
+        .map(|transfer| transfer_owner(transfer, &windows, &key_sessions))
+        .collect();
 
     let mut records: Vec<BuildTimeline> = sessions
         .into_iter()
         .map(|(session_id, session)| {
             let root = session.root().unwrap_or_default().to_string();
             let identity = identity_for_root(Path::new(&root), inputs.env);
-            let transfers = attribute_transfers(&session_id, &session, &windows, inputs.transfers);
+            let transfers = attribute_transfers(&session_id, inputs.transfers, &transfer_owners);
             let context = inputs.env.context(inputs.labels.clone());
             BuildTimeline {
                 schema: BUILD_TIMELINE_SCHEMA,
@@ -219,48 +234,57 @@ fn event_finished_ms(event: &BuildEvent) -> u64 {
     u64::try_from(event.ts.timestamp_millis()).unwrap_or(0)
 }
 
-/// Attach the transfers that belong to this session.
-///
-/// A cache key the session compiled is direct evidence. Failing that, a
-/// transfer inside this session's window and no other session's window is
-/// taken as this session's; one that could belong to two sessions is dropped,
-/// because a wrong parent would read as a prefetch that was never used.
+/// Assign each transfer once. An explicit session is authoritative; older
+/// logs need a unique key owner inside the time window, or a unique window.
+fn transfer_owner(
+    transfer: &TransferEvent,
+    windows: &[(String, u64, u64)],
+    key_sessions: &HashMap<&str, HashSet<&str>>,
+) -> Option<(String, TransferAttribution)> {
+    if transfer.started_at_unix_ms == 0 {
+        return None;
+    }
+    if let Some(origin) = &transfer.prefetch
+        && !origin.session_id.is_empty()
+    {
+        return Some((origin.session_id.clone(), TransferAttribution::Session));
+    }
+    let eligible: Vec<_> = windows
+        .iter()
+        .filter(|(_, start, finish)| in_window(transfer, *start, *finish))
+        .collect();
+    let keyed: Vec<_> = eligible
+        .iter()
+        .filter(|(id, _, _)| {
+            key_sessions
+                .get(transfer.cache_key.as_str())
+                .is_some_and(|owners| owners.contains(id.as_str()))
+        })
+        .collect();
+    if let [owner] = keyed.as_slice() {
+        return Some((owner.0.clone(), TransferAttribution::Key));
+    }
+    if keyed.is_empty()
+        && let [owner] = eligible.as_slice()
+    {
+        return Some((owner.0.clone(), TransferAttribution::Window));
+    }
+    None
+}
+
 fn attribute_transfers(
     session_id: &str,
-    session: &SessionEvents,
-    windows: &[(String, u64, u64)],
     transfers: &[TransferEvent],
+    owners: &[Option<(String, TransferAttribution)>],
 ) -> Vec<TimelineTransfer> {
-    let keys: std::collections::HashSet<&str> = session
-        .units
-        .iter()
-        .map(|unit| unit.cache_key.as_str())
-        .filter(|key| !key.is_empty())
-        .collect();
-
     let mut attributed: Vec<TimelineTransfer> = transfers
         .iter()
-        .filter(|transfer| transfer.started_at_unix_ms > 0)
-        .filter_map(|transfer| {
-            let attribution = if !transfer.cache_key.is_empty()
-                && keys.contains(transfer.cache_key.as_str())
-                && transfer.started_at_unix_ms
-                    <= session.finished_at_ms.saturating_add(TRANSFER_SLACK_MS)
-            {
-                TransferAttribution::Key
-            } else if in_window(transfer, session.started_at_ms, session.finished_at_ms)
-                && windows
-                    .iter()
-                    .filter(|(id, start, finish)| {
-                        id != session_id && in_window(transfer, *start, *finish)
-                    })
-                    .count()
-                    == 0
-            {
-                TransferAttribution::Window
-            } else {
+        .zip(owners)
+        .filter_map(|(transfer, owner)| {
+            let (owner_id, attribution) = owner.as_ref()?;
+            if owner_id != session_id {
                 return None;
-            };
+            }
             Some(TimelineTransfer {
                 cache_key: transfer.cache_key.clone(),
                 crate_name: transfer.crate_name.clone(),
@@ -277,7 +301,9 @@ fn attribute_transfers(
                 semaphore_wait_ms: transfer.semaphore_wait_ms,
                 request_count: transfer.request_count,
                 import_ms: transfer.import_ms,
-                attribution,
+                attribution: *attribution,
+                prefetch: transfer.prefetch.clone(),
+                outcome: transfer.outcome.clone(),
             })
         })
         .collect();
@@ -428,6 +454,8 @@ mod tests {
 
     fn transfer(key: &str, started: u64, finished: u64) -> TransferEvent {
         TransferEvent {
+            prefetch: None,
+            outcome: String::new(),
             schema: 3,
             crate_name: "serde".to_string(),
             direction: LoggedDirection::Download,
@@ -576,6 +604,95 @@ mod tests {
         let records = build_timelines(&inputs(&events, &keyed, &[], &EnvSnapshot::default()));
         assert_eq!(records[0].transfers.len(), 1);
         assert!(records[1].transfers.is_empty());
+    }
+
+    #[test]
+    fn explicit_origin_wins_over_shared_keys_and_time_windows() {
+        let events = [
+            event("s1", "serde", "k1", 500_000, 500),
+            event("s2", "serde", "k1", 500_200, 500),
+        ];
+        let origin = kache_core::timeline::PrefetchOrigin {
+            session_id: "s2".to_string(),
+            plan_id: "plan-2".to_string(),
+            source: "advisory".to_string(),
+            candidate_rank: Some(7),
+            candidate_source: kache_core::CandidateSource::Shard,
+        };
+        let mut downloaded = transfer("k1", 1, 2);
+        downloaded.prefetch = Some(origin.clone());
+        downloaded.outcome = "completed".to_string();
+        let records = build_timelines(&inputs(
+            &events,
+            &[downloaded.clone()],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        assert!(records[0].transfers.is_empty());
+        let attached = &records[1].transfers[0];
+        assert_eq!(attached.attribution, TransferAttribution::Session);
+        assert_eq!(attached.prefetch, Some(origin));
+        assert_eq!(attached.outcome, "completed");
+        assert_eq!(attached.compressed_bytes, 10);
+        assert_eq!(attached.finished_at_ms, 2);
+        assert_eq!(records[1].units[0].result, "local_hit");
+
+        // An owner outside the selected logs is not reassigned to a nearby build.
+        downloaded.prefetch.as_mut().unwrap().session_id = "missing".to_string();
+        let records = build_timelines(&inputs(
+            &events,
+            &[downloaded],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        assert!(records.iter().all(|record| record.transfers.is_empty()));
+    }
+
+    #[test]
+    fn empty_origin_session_uses_legacy_matching() {
+        let events = [event("s1", "serde", "k1", 5_000, 500)];
+        let mut downloaded = transfer("k1", 4_000, 4_100);
+        downloaded.prefetch = Some(kache_core::timeline::PrefetchOrigin::default());
+        let records = build_timelines(&inputs(
+            &events,
+            &[downloaded],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        assert_eq!(
+            records[0].transfers[0].attribution,
+            TransferAttribution::Key
+        );
+    }
+
+    #[test]
+    fn missing_keys_do_not_disambiguate_overlapping_sessions() {
+        let events = [
+            event("s1", "serde", "", 5_000, 500),
+            event("s2", "syn", "k2", 5_100, 500),
+        ];
+        let transfers = [transfer("", 4_500, 4_600)];
+        let records = build_timelines(&inputs(&events, &transfers, &[], &EnvSnapshot::default()));
+        assert!(records.iter().all(|record| record.transfers.is_empty()));
+    }
+
+    #[test]
+    fn same_key_in_two_sessions_does_not_duplicate_a_transfer() {
+        let events = [
+            event("s1", "serde", "k1", 5_000, 500),
+            event("s2", "serde", "k1", 5_200, 500),
+        ];
+        let transfers = [transfer("k1", 4_000, 4_100)];
+        let records = build_timelines(&inputs(&events, &transfers, &[], &EnvSnapshot::default()));
+        assert!(records.iter().all(|record| record.transfers.is_empty()));
+    }
+
+    #[test]
+    fn same_key_transfer_outside_the_session_window_is_not_reused() {
+        let events = [event("s1", "serde", "k1", 500_000, 500)];
+        let transfers = [transfer("k1", 1_000, 2_000)];
+        let records = build_timelines(&inputs(&events, &transfers, &[], &EnvSnapshot::default()));
+        assert!(records[0].transfers.is_empty());
     }
 
     #[test]

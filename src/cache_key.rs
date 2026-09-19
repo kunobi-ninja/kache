@@ -977,7 +977,7 @@ thread_local! {
     static DEFER_DISCOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A closure handed in by the wrapper after such a compile: the next key
     /// computation uses it instead of a record or a pre-pass.
-    static PROVIDED_DEP_INFO: std::cell::RefCell<Option<DepInfo>> = const { std::cell::RefCell::new(None) };
+    static PROVIDED_DEP_INFO: std::cell::RefCell<Option<(DepInfo, Option<String>)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The key stopped before discovering the closure: no record, and the wrapper
@@ -1004,7 +1004,11 @@ pub fn set_defer_discovery(allowed: bool) {
 
 /// Use `dep_info` for the next key computed on this thread.
 pub fn provide_dep_info(dep_info: DepInfo) {
-    PROVIDED_DEP_INFO.with(|cell| *cell.borrow_mut() = Some(dep_info));
+    // Rekeying clears the per-key stashes. Carry the tree observed before
+    // compilation with its emitted closure, so a changed tree still rejects
+    // that prediction rather than blessing old inputs with a new digest.
+    let tree = take_last_tree_digest();
+    PROVIDED_DEP_INFO.with(|cell| *cell.borrow_mut() = Some((dep_info, tree)));
 }
 
 /// The closure rustc wrote to `path` during the compile whose crate root is
@@ -1381,7 +1385,8 @@ fn resolve_key_inputs(
     file_hasher: &FileHasher<'_>,
     crate_name: &str,
 ) -> Result<Option<DepInfo>> {
-    if let Some(provided) = PROVIDED_DEP_INFO.with(|cell| cell.borrow_mut().take()) {
+    if let Some((provided, tree)) = PROVIDED_DEP_INFO.with(|cell| cell.borrow_mut().take()) {
+        let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = tree);
         crate::phase_trace::decision("prediction", "emitted");
         tracing::trace!("[key:{}] inputs=emitted-dep-info", crate_name);
         return Ok(Some(provided));
@@ -8331,6 +8336,78 @@ mod tests {
             crate_tree_digest(&hasher).is_none(),
             "no crate directory, no guard"
         );
+    }
+
+    #[test]
+    fn emitted_closure_keeps_the_precompile_tree_guard() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("registry/src/index/guarded-1.0.0");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        let source = package.join("src/lib.rs");
+        std::fs::write(&source, "pub fn v() {}\n").unwrap();
+        let macro_path = dir.path().join("libmacro.so");
+        std::fs::write(&macro_path, "macro artifact").unwrap();
+        let out = dir.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out).unwrap();
+        let _manifest =
+            crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(package.as_os_str()));
+        let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+        let args = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "guarded".to_string(),
+            "--crate-type=lib".to_string(),
+            "--emit=dep-info,metadata".to_string(),
+            source.display().to_string(),
+            "--out-dir".to_string(),
+            out.display().to_string(),
+            "--extern".to_string(),
+            format!("my_macro={}", macro_path.display()),
+        ])
+        .unwrap();
+        let db = dir.path().join("index.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE entries (cache_key TEXT PRIMARY KEY, crate_name TEXT NOT NULL);",
+            )
+            .unwrap();
+        let hasher = FileHasher::persistent(&db)
+            .with_input_predictions(true)
+            .with_prediction_flights(Some(dir.path().join("cache")));
+        let original_tree = crate_tree_digest(&hasher).unwrap();
+        set_defer_discovery(true);
+        let deferred = compute_cache_key(&args, &hasher, &PathNormalizer::empty());
+        set_defer_discovery(false);
+        assert!(deferred.unwrap_err().is::<DeferredDiscovery>());
+
+        let closure = DepInfo {
+            source_files: vec![source],
+            env_deps: Vec::new(),
+        };
+        // A macro input changed during compilation. Recording the newer tree
+        // would make the old emitted closure appear valid for those new files.
+        std::fs::write(package.join("macro-input.txt"), "changed").unwrap();
+        provide_dep_info(closure.clone());
+        compute_cache_key(&args, &hasher, &PathNormalizer::empty()).unwrap();
+        let tree = take_last_tree_digest();
+        assert_eq!(tree.as_deref(), Some(original_tree.as_str()));
+        assert!(take_last_tree_digest().is_none());
+        let identity = rustc_prediction_identity(&args).unwrap();
+        hasher.record_input_prediction(&identity, Some("guarded"), &closure, tree);
+        assert_eq!(
+            predicted_key_inputs(&args, &hasher),
+            Err(Rejection::TreeChanged)
+        );
+        std::fs::remove_file(package.join("macro-input.txt")).unwrap();
+        assert_eq!(predicted_key_inputs(&args, &hasher).unwrap().0, closure);
+        // An emitted closure without a prior guarded discovery must not
+        // inherit the preceding invocation's tree.
+        take_last_tree_digest();
+        provide_dep_info(closure);
+        compute_cache_key(&args, &hasher, &PathNormalizer::empty()).unwrap();
+        assert!(take_last_tree_digest().is_none());
     }
 
     /// A row this build cannot vouch for reads as absent. The cost of that is

@@ -1461,7 +1461,10 @@ fn resolve_key_inputs(
             Err(Rejection::NoRecord | Rejection::Disabled | Rejection::NotEligible)
                 if owns_flight
                     && DEFER_DISCOVERY.with(std::cell::Cell::get)
-                    && file_hasher.store_lacks_crate(crate_name) =>
+                    && file_hasher.store_lacks_unit(
+                        crate_name,
+                        args.get_codegen_opt("metadata").unwrap_or(""),
+                    ) =>
             {
                 crate::phase_trace::decision("prediction", "deferred-new-crate");
                 tracing::trace!("[key:{}] inputs=deferred(new crate)", crate_name);
@@ -4014,14 +4017,16 @@ impl<'db> FileHasher<'db> {
         self.cache.is_some()
     }
 
-    /// True only when the local store is known to hold no entry for
-    /// `crate_name`. No store, or a failed query, is "unknown": false.
-    fn store_lacks_crate(&self, crate_name: &str) -> bool {
+    /// True only when the local store is known to hold no entry for this
+    /// unit: `crate_name` under Cargo's `-C metadata` hash, or any unit of
+    /// that name when the hash is absent. No store, or a failed query, is
+    /// "unknown": false.
+    fn store_lacks_unit(&self, crate_name: &str, unit: &str) -> bool {
         let _trace = crate::phase_trace::phase("crate_presence");
         let Some(cache) = self.cache.as_ref() else {
             return false;
         };
-        match cache.has_entry_for_crate(crate_name) {
+        match cache.has_entry_for_unit(crate_name, unit) {
             Ok(present) => !present,
             Err(error) => {
                 tracing::debug!("crate presence lookup failed: {error}");
@@ -7452,6 +7457,65 @@ mod tests {
                 "an entry for the crate may match: predictions={predictions}"
             );
         }
+    }
+
+    /// Every build script is `build_script_build`; Cargo's `-C metadata` hash
+    /// is what tells them apart, and the presence probe must read it.
+    #[test]
+    fn a_unit_the_store_never_held_defers_even_when_its_name_is_taken() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE entries (cache_key TEXT PRIMARY KEY, crate_name TEXT NOT NULL,
+                                       unit_id TEXT NOT NULL DEFAULT '');
+                 INSERT INTO entries VALUES ('k', 'build_script_build', 'unit-a');",
+            )
+            .unwrap();
+        let parse = |unit: &str| {
+            RustcArgs::parse(
+                &[
+                    "rustc",
+                    "--crate-name",
+                    "build_script_build",
+                    "build.rs",
+                    "--edition",
+                    "2021",
+                    "--emit=dep-info,link",
+                    "-C",
+                    &format!("metadata={unit}"),
+                    "--out-dir",
+                    &dir.path().join("target/debug/build").display().to_string(),
+                ]
+                .iter()
+                .map(|a| (*a).to_string())
+                .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let deferred = |args: &RustcArgs| {
+            let hasher =
+                FileHasher::persistent(&db).with_prediction_flights(Some(dir.path().join("cache")));
+            set_defer_discovery(true);
+            let outcome = resolve_key_inputs(args, &hasher, "build_script_build");
+            set_defer_discovery(false);
+            outcome.is_err_and(|error| error.downcast_ref::<DeferredDiscovery>().is_some())
+        };
+        assert!(
+            deferred(&parse("unit-b")),
+            "another unit of the same name is absent"
+        );
+        assert!(!deferred(&parse("unit-a")), "this unit was stored");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("INSERT INTO entries VALUES ('k2', 'build_script_build', '');")
+            .unwrap();
+        assert!(
+            !deferred(&parse("unit-b")),
+            "a row that never learned its unit stands for every unit of the name"
+        );
     }
 
     /// The two gates in front of a record lookup, each refusing for its own

@@ -1433,10 +1433,16 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_entry_blobs_hash ON entry_blobs(hash);",
     )?;
-    // Answers "has this store ever held this crate" in one probe; a cold
+    // Answers "has this store ever held this unit" in one probe; a cold
     // compile uses it to skip the dep-info pre-pass (see
-    // `FileHashCache::has_entry_for_crate`).
-    db.execute_batch("CREATE INDEX IF NOT EXISTS idx_entries_crate_name ON entries(crate_name);")?;
+    // `FileHashCache::has_entry_for_unit`). `unit_id` is Cargo's `-C metadata`
+    // hash, recorded after the put by the rustc wrapper; a row without one
+    // stands for every unit of its crate name.
+    let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN unit_id TEXT NOT NULL DEFAULT ''");
+    db.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_entries_crate_name ON entries(crate_name);
+         CREATE INDEX IF NOT EXISTS idx_entries_crate_unit ON entries(crate_name, unit_id);",
+    )?;
 
     // Post-eviction demand tracking (kunobi-ninja/kache#594).
     //
@@ -1502,7 +1508,9 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 /// 4: `idx_entries_crate_name`, the crate-presence probe behind deferred
 ///    discovery (#1117 added the index without bumping the generation, so an
 ///    index from before it never gained the index and the probe scanned).
-const INDEX_SCHEMA_GENERATION: i64 = 4;
+/// 5: `entries.unit_id` and `idx_entries_crate_unit`, so the probe can tell
+///    two units of one crate name apart (every build script is one name).
+const INDEX_SCHEMA_GENERATION: i64 = 5;
 
 /// Replace `cache_key`'s rows in `entry_blobs` with one row per unique hash
 /// in `files`, `refs` counting per-file references (kunobi-ninja/kache#608).
@@ -3645,6 +3653,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(count as usize)
     }
 
+    /// Record which unit a freshly stored entry came from, by Cargo's
+    /// `-C metadata` hash. Every cache key folds that hash in, so a store
+    /// with no row for (crate name, unit) holds no key the unit can produce;
+    /// the crate-presence probe behind deferred discovery reads it.
+    pub fn record_entry_unit(&self, cache_key: &str, unit: &str) -> Result<()> {
+        if unit.is_empty() {
+            return Ok(());
+        }
+        self.db.execute(
+            "UPDATE entries SET unit_id = ?2 WHERE cache_key = ?1",
+            params![cache_key, unit],
+        )?;
+        Ok(())
+    }
+
     /// Remember an incremental compilation directory seen by the wrapper.
     pub fn remember_incremental_dir(&self, path: &Path) -> Result<()> {
         let path = path.to_string_lossy().into_owned();
@@ -5390,6 +5413,86 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+    }
+
+    /// An index stamped at generation 4 has no unit column; the next open
+    /// adds it, its index, and lets the wrapper record units from then on.
+    #[test]
+    fn index_from_generation_four_gains_the_unit_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = open_index_db(&path).unwrap();
+        db.execute_batch(
+            "DROP INDEX idx_entries_crate_unit;
+             ALTER TABLE entries DROP COLUMN unit_id;",
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 4_i64).unwrap();
+        drop(db);
+
+        let db = open_index_db(&path).unwrap();
+        let indexes: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_entries_crate_unit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 1);
+        db.execute(
+            "INSERT INTO entries (cache_key, crate_name, unit_id) VALUES ('k', 'c', 'u')",
+            [],
+        )
+        .unwrap();
+        let generation: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+    }
+
+    /// A put never learns its unit; the wrapper records it afterwards, and
+    /// an empty unit leaves the row alone.
+    #[test]
+    fn record_entry_unit_updates_only_that_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
+        store
+            .db
+            .execute_batch(
+                "INSERT INTO entries (cache_key, crate_name) VALUES ('a', 'x'), ('b', 'x');",
+            )
+            .unwrap();
+        store.record_entry_unit("a", "unit-a").unwrap();
+        store.record_entry_unit("b", "").unwrap();
+        let units: Vec<(String, String)> = store
+            .db
+            .prepare("SELECT cache_key, unit_id FROM entries ORDER BY cache_key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            units,
+            vec![
+                ("a".to_string(), "unit-a".to_string()),
+                ("b".to_string(), String::new())
+            ]
+        );
+        assert!(
+            store
+                .file_hash_cache()
+                .has_entry_for_unit("x", "unit-a")
+                .unwrap()
+        );
+        assert!(
+            store
+                .file_hash_cache()
+                .has_entry_for_unit("x", "unit-z")
+                .unwrap(),
+            "row b has no unit"
+        );
     }
 
     /// An index stamped before the env-use memo was versioned still carries

@@ -1,4 +1,5 @@
 mod args;
+mod blob_heal;
 mod build_script;
 use kache_store::atomic;
 mod build_intent;
@@ -28,6 +29,7 @@ use kache_store::link;
 mod cache_remote;
 mod link_probe;
 mod machine;
+mod maintenance;
 mod miss_chain;
 mod native_archive;
 mod native_link_key;

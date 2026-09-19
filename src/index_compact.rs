@@ -1,4 +1,4 @@
-//! Daemon-side compaction of `index.db`.
+//! Daemon-side compaction of `index.db`, a step of [`crate::maintenance`].
 //!
 //! The index keeps `auto_vacuum` off, so pages freed by a migration or a
 //! prune stay in the file until a VACUUM. The daemon runs that VACUUM when
@@ -6,15 +6,11 @@
 
 use crate::cache_key::{IndexCompaction, IndexPageStats};
 use crate::config::Config;
+use crate::maintenance::{Trigger, is_quiet, unix_now_secs};
 use crate::store::Store;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// No wrapper request for this long counts as quiet. Permits cover only the
-/// miss path; a build made of hits holds none but still sends requests.
-pub(crate) const QUIET_AFTER: Duration = Duration::from_secs(60);
 /// How long the index may stay over the threshold before a busy host
 /// compacts anyway.
 pub(crate) const FORCE_AFTER: Duration = Duration::from_secs(6 * 3600);
@@ -26,45 +22,6 @@ pub(crate) const FORCE_MAX_LIVE_BYTES: u64 = 1 << 30;
 /// lock for the whole rewrite, and a build that starts meanwhile waits on it.
 /// Above this the file is left to `kache doctor --repair`.
 pub(crate) const QUIET_MAX_LIVE_BYTES: u64 = 8 << 30;
-/// Delay before the first check, short enough that a daemon living for one
-/// CI job still gets one.
-const FIRST_CHECK_AFTER: Duration = Duration::from_secs(60);
-const CHECK_INTERVAL: Duration = Duration::from_secs(300);
-
-/// Monotonic record of the last wrapper request the daemon accepted.
-#[derive(Debug)]
-pub(crate) struct RequestClock {
-    origin: Instant,
-    last_ms: AtomicU64,
-}
-
-impl RequestClock {
-    /// Daemon start counts as a request.
-    pub(crate) fn new() -> Self {
-        Self {
-            origin: Instant::now(),
-            last_ms: AtomicU64::new(0),
-        }
-    }
-
-    fn ms_at(&self, at: Instant) -> u64 {
-        at.saturating_duration_since(self.origin).as_millis() as u64
-    }
-
-    pub(crate) fn touch(&self, at: Instant) {
-        self.last_ms.fetch_max(self.ms_at(at), Ordering::Relaxed);
-    }
-
-    fn idle_at(&self, now: Instant) -> Duration {
-        let last = self.last_ms.load(Ordering::Relaxed);
-        Duration::from_millis(self.ms_at(now).saturating_sub(last))
-    }
-
-    pub(crate) fn idle_for(&self) -> Duration {
-        self.idle_at(Instant::now())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     /// No compile permits held and no recent request.
@@ -142,7 +99,7 @@ pub(crate) fn decide(
     if !over_threshold {
         return Decision::NotNeeded;
     }
-    if permits == Some(0) && since_last_request >= QUIET_AFTER {
+    if is_quiet(permits, since_last_request) {
         if live_bytes <= QUIET_MAX_LIVE_BYTES {
             return Decision::Run(Mode::Quiet);
         }
@@ -179,13 +136,6 @@ pub(crate) fn decide_at_shutdown(
     )
 }
 
-/// What asked for the compaction.
-#[derive(Clone, Copy)]
-pub(crate) enum Trigger<'a> {
-    Periodic(&'a RequestClock),
-    Shutdown,
-}
-
 impl Trigger<'_> {
     fn decide(
         self,
@@ -194,10 +144,10 @@ impl Trigger<'_> {
         over_threshold_for: Duration,
     ) -> Decision {
         match self {
-            Trigger::Periodic(clock) => decide(
+            Trigger::Periodic(_) => decide(
                 stats.should_compact(),
                 permits,
-                clock.idle_for(),
+                self.idle_for(),
                 over_threshold_for,
                 stats.live_bytes(),
             ),
@@ -250,13 +200,6 @@ fn observe_over_threshold(cache_dir: &Path, now: u64) -> Duration {
 
 fn clear_state(cache_dir: &Path) {
     let _ = std::fs::remove_file(state_path(cache_dir));
-}
-
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,39 +338,10 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> Option<Outcome> {
     }
 }
 
-/// Check shortly after daemon start, then every few minutes. A check that
-/// finds nothing to do costs one index open and three PRAGMAs.
-pub(crate) fn spawn_periodic(
-    config: Config,
-    clock: Arc<RequestClock>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        tokio::time::sleep(FIRST_CHECK_AFTER).await;
-        let mut interval = tokio::time::interval(CHECK_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let config = config.clone();
-            let clock = clock.clone();
-            let task = tokio::task::spawn_blocking(move || run(&config, Trigger::Periodic(&clock)));
-            if let Err(error) = task.await {
-                tracing::warn!("index compaction task panicked: {error}");
-            }
-        }
-    })
-}
-
-/// The shutdown attempt: quiet mode only, so a contended index yields at once.
-pub(crate) async fn run_at_shutdown(config: Config) {
-    let task = tokio::task::spawn_blocking(move || run(&config, Trigger::Shutdown));
-    if let Err(error) = task.await {
-        tracing::warn!("index compaction task panicked: {error}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::maintenance::{QUIET_AFTER, RequestClock};
     #[cfg(unix)]
     use crate::store::StoreLock;
 
@@ -436,14 +350,9 @@ mod tests {
 
     #[test]
     fn thresholds_are_the_documented_ones() {
-        assert_eq!(QUIET_AFTER, Duration::from_secs(60));
         assert_eq!(FORCE_AFTER, Duration::from_secs(21_600));
         assert_eq!(FORCE_MAX_LIVE_BYTES, 1_073_741_824);
         assert_eq!(QUIET_MAX_LIVE_BYTES, 8_589_934_592);
-        assert_eq!(FIRST_CHECK_AFTER, Duration::from_secs(60));
-        assert_eq!(CHECK_INTERVAL, Duration::from_secs(300));
-        // 2026-01-01: a clock stuck at 0 would make every record look fresh.
-        assert!(unix_now_secs() > 1_767_225_600);
     }
 
     #[test]
@@ -606,23 +515,6 @@ mod tests {
     }
 
     #[test]
-    fn request_clock_measures_time_since_the_latest_request() {
-        let clock = RequestClock::new();
-        let t0 = clock.origin;
-        assert_eq!(clock.idle_at(t0), Duration::ZERO);
-        assert_eq!(clock.idle_at(t0 + 90 * SEC), 90 * SEC);
-
-        clock.touch(t0 + 30 * SEC);
-        assert_eq!(clock.idle_at(t0 + 90 * SEC), 60 * SEC);
-        // An older request must not move the mark back.
-        clock.touch(t0 + 10 * SEC);
-        assert_eq!(clock.idle_at(t0 + 90 * SEC), 60 * SEC);
-        // A reading from before the last request is zero, not a wraparound.
-        assert_eq!(clock.idle_at(t0 + 20 * SEC), Duration::ZERO);
-        assert!(clock.idle_for() < 30 * SEC);
-    }
-
-    #[test]
     fn modes_and_reasons_have_distinct_labels() {
         assert_eq!(Mode::Quiet.label(), "quiet");
         assert_eq!(Mode::Forced.label(), "forced");
@@ -760,12 +652,8 @@ mod tests {
             .len()
     }
 
-    /// A clock whose last request is long past.
     fn idle_clock() -> RequestClock {
-        RequestClock {
-            origin: Instant::now() - 2 * QUIET_AFTER,
-            last_ms: AtomicU64::new(0),
-        }
+        RequestClock::idle()
     }
 
     #[cfg(unix)]
@@ -893,7 +781,7 @@ mod tests {
     async fn shutdown_attempt_runs_off_the_async_workers_and_compacts() {
         let dir = tempfile::tempdir().unwrap();
         let config = sparse_store(dir.path());
-        run_at_shutdown(config.clone()).await;
+        crate::maintenance::run_at_shutdown(config.clone()).await;
         assert!(index_len(&config) < 8 << 20);
     }
 

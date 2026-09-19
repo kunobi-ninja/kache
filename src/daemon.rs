@@ -9787,7 +9787,10 @@ mod tests {
             !lifecycle.accepting_calls(),
             "shutdown flag should be set after the stop request"
         );
-        let resp = client.await.expect("join client task");
+        let resp = tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("accept loop never acknowledged shutdown")
+            .expect("join client task");
         assert!(resp.ok, "stop request should return ok");
     }
 
@@ -10074,8 +10077,8 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
-    #[test]
-    fn readiness_requires_a_successful_compatible_health_response() {
+    #[tokio::test]
+    async fn readiness_requires_a_successful_compatible_health_response() {
         for (response, accepted) in [
             (
                 Response {
@@ -10100,26 +10103,29 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let socket = dir.path().join("daemon.sock");
-            let listener = bind_sync_listener(&socket);
-            let server = std::thread::spawn(move || {
-                use std::io::{BufRead, Write};
-                let mut peer = listener.accept().unwrap();
+            let listener = bind_listener(&socket);
+            let server = tokio::spawn(async move {
+                let peer = listener.accept().await.unwrap();
                 let mut request = String::new();
-                std::io::BufReader::new(&mut peer)
-                    .read_line(&mut request)
-                    .unwrap();
+                BufReader::new(&peer).read_line(&mut request).await.unwrap();
                 assert!(matches!(
                     serde_json::from_str::<Request>(&request).unwrap(),
                     Request::Health
                 ));
                 let mut response = serde_json::to_vec(&response).unwrap();
                 response.push(b'\n');
-                peer.write_all(&response).unwrap();
+                (&peer).write_all(&response).await.unwrap();
             });
-            let proof =
+            let proof = tokio::task::spawn_blocking(move || {
                 lifecycle_client::current_socket(&socket, Instant::now() + Duration::from_secs(5))
-                    .unwrap();
-            server.join().unwrap();
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .expect("readiness probe never completed the health exchange")
+                .unwrap();
             assert_eq!(proof.is_some(), accepted);
         }
     }
@@ -13560,7 +13566,10 @@ mod tests {
         let result = tokio::task::spawn_blocking(move || send_shutdown_request(&cfg))
             .await
             .unwrap();
-        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("shutdown client never completed the exchange")
+            .unwrap();
         assert!(result.is_ok(), "shutdown request should round-trip ok");
     }
 

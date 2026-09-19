@@ -4852,6 +4852,18 @@ fn cc_preprocess_memo_key(
         let mapped = apply_cc_prefix_maps_to_bytes(arg.into_bytes(), prefix_maps);
         fold_cc_memo_field(&mut hasher, b"arg", &mapped);
     }
+    // The source's own bytes, so two units that spell their source the same
+    // way share nothing. Every tree-sitter grammar compiles `src/parser.c`
+    // from its crate directory with the same flags, and with that directory
+    // mapped to a sentinel their memos collided: each grammar found the
+    // previous one's record, failed to validate it, and then ran the
+    // preprocessor the memo exists to avoid. A source that cannot be read
+    // keys as such; its compile fails on its own.
+    for source in &parsed.sources {
+        let content = crate::cache_key::hash_file(&absolutize_path(&cwd, source))
+            .unwrap_or_else(|_| "unreadable".to_string());
+        fold_cc_memo_field(&mut hasher, b"source-content", content.as_bytes());
+    }
     // Targets only. The sources are the per-checkout roots this whole change
     // exists to keep out; the targets are the sentinels both trees share, and
     // they are what decides whether two mappings mean the same thing.
@@ -5187,9 +5199,26 @@ fn apply_cc_prefix_maps_to_bytes(bytes: Vec<u8>, prefix_maps: &[CcPrefixMap]) ->
     let mut maps: Vec<&CcPrefixMap> = prefix_maps.iter().filter(|m| !m.from.is_empty()).collect();
     maps.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
 
+    // A map can only start at a byte its `from` starts with, and every
+    // `from` is an absolute path. Skipping to those bytes in bulk keeps a
+    // 10 MB generated parser from costing sixty million prefix tests.
+    let mut leading: Vec<u8> = maps.iter().filter_map(|m| m.from.bytes().next()).collect();
+    leading.sort_unstable();
+    leading.dedup();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        match bytes[i..].iter().position(|byte| leading.contains(byte)) {
+            Some(0) => {}
+            Some(offset) => {
+                out.extend_from_slice(&bytes[i..i + offset]);
+                i += offset;
+            }
+            None => {
+                out.extend_from_slice(&bytes[i..]);
+                break;
+            }
+        }
         let matched = maps.iter().find(|m| {
             let from = m.from.as_bytes();
             bytes[i..].starts_with(from)
@@ -11458,6 +11487,75 @@ mod tests {
         assert!(
             cc_unmapped_path_candidates("relative/h.h", &half_empty).is_empty(),
             "an empty source must not strip a name down to a relative path"
+        );
+    }
+
+    /// Two grammars compile `src/parser.c` with the same flags from crate
+    /// directories that map to the same sentinel; only the bytes tell them
+    /// apart, and the memo key must too.
+    #[test]
+    fn cc_preprocess_memo_key_follows_the_source_content() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let compiler = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("parser.c");
+        let parsed = CcArgs::parse(&[
+            compiler,
+            "-c".to_string(),
+            source.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let key = || cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap();
+        std::fs::write(&source, "int grammar = 1;\n").unwrap();
+        let one = key();
+        assert_eq!(one, key(), "the same bytes key the same");
+        std::fs::write(&source, "int grammar = 2;\n").unwrap();
+        assert_ne!(one, key(), "different bytes must not share a memo");
+        std::fs::remove_file(&source).unwrap();
+        let missing = key();
+        assert_ne!(missing, one);
+        assert_eq!(missing, key(), "an unreadable source still keys, stably");
+    }
+
+    /// The bulk skip to candidate bytes must map exactly what the byte loop
+    /// mapped: prefixes at the start, adjacent, at the end, and absent.
+    #[test]
+    fn apply_cc_prefix_maps_to_bytes_skips_without_missing_a_prefix() {
+        let maps = vec![
+            CcPrefixMap {
+                from: "/work/one".to_string(),
+                to: "/kache/root".to_string(),
+            },
+            CcPrefixMap {
+                from: "/work/one/out".to_string(),
+                to: "/kache/out".to_string(),
+            },
+        ];
+        let cases: [(&[u8], &[u8]); 5] = [
+            (b"/work/one/a.h", b"/kache/root/a.h"),
+            (
+                b"x /work/one/out/y /work/one",
+                b"x /kache/out/y /kache/root",
+            ),
+            (b"no maps here / at all", b"no maps here / at all"),
+            (b"", b""),
+            (b"//work/one//work/one", b"//kache/root//kache/root"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                apply_cc_prefix_maps_to_bytes(input.to_vec(), &maps),
+                expected.to_vec(),
+                "{}",
+                String::from_utf8_lossy(input)
+            );
+        }
+        assert_eq!(
+            apply_cc_prefix_maps_to_bytes(b"/work/one".to_vec(), &[]),
+            b"/work/one".to_vec(),
+            "no maps, no change"
         );
     }
 

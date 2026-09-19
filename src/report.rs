@@ -912,6 +912,10 @@ pub struct CrateDetail {
     /// row is a miss that will recur on every build until the cause is fixed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub store_error: String,
+    #[serde(default)]
+    pub store_handed_off: bool,
+    #[serde(default)]
+    pub daemon_store_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1662,6 +1666,8 @@ fn to_crate_detail(e: &BuildEvent) -> CrateDetail {
         dep_info_runs: e.dep_info_runs,
         prediction_mismatches: e.prediction_mismatches,
         store_error: e.store_error.clone(),
+        store_handed_off: e.store_handed_off,
+        daemon_store_ms: e.daemon_store_ms,
     }
 }
 
@@ -4235,6 +4241,7 @@ mod tests {
             passthrough_reason: String::new(),
             store_error: String::new(),
             store_handed_off: false,
+            daemon_store_ms: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,
@@ -4287,6 +4294,22 @@ mod tests {
             ok,
             timestamp: Utc::now().timestamp() as u64,
         }
+    }
+
+    #[test]
+    fn report_preserves_daemon_publication_without_counting_it_as_wrapper_time() {
+        let mut event = test_event("foo.c", EventResult::Miss, 100, 90, 42, "key");
+        event.store_ms = 2;
+        event.store_handed_off = true;
+        event.daemon_store_ms = 50;
+        let detail = to_crate_detail(&event);
+        assert!(detail.store_handed_off);
+        assert_eq!(detail.daemon_store_ms, 50);
+        assert_eq!(detail.overhead_ms, 10);
+        let value = serde_json::to_value(detail).unwrap();
+        assert_eq!(value["store_handed_off"], true);
+        assert_eq!(value["daemon_store_ms"], 50);
+        assert_eq!(event.store_ms, 2);
     }
 
     fn write_test_events(dir: &std::path::Path) -> Config {

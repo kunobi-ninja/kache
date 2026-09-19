@@ -763,6 +763,12 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml', 'Cargo.lock') }}
+          # PRs can read the default branch cache; only main replenishes it.
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # `--all-systems` is the point: without it the check only evaluates the
       # runner's own system, which is how the x86_64-darwin breakage in #597
       # stayed invisible here. Evaluation is cross-system, so this costs
@@ -776,6 +782,11 @@ jobs:
       # any check added later.
       - name: Build flake checks
         run: nix flake check --keep-going --print-build-logs
+      - name: Report Nix store size
+        shell: bash
+        run: |
+          store_kib=$(du -sk /nix/store | cut -f1)
+          printf 'Uncompressed Nix store: %s KiB\n' "$store_kib" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # --- Copy-on-write filesystem coverage ---
   # Every hosted runner is ext4, where `try_reflink` always fails and the

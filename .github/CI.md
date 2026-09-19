@@ -92,3 +92,26 @@ cd .github/tests
 npm ci --ignore-scripts --no-audit --no-fund
 npm test
 ```
+
+## Nix cache
+
+The Nix package jobs restore the store with
+[nix-community/cache-nix-action](https://github.com/nix-community/cache-nix-action).
+It restores the Nix database and store together. No cache account or secret is
+needed. Pull requests only restore; successful pushes to `main` save the store.
+GitHub's branch scopes let PRs read the default branch's cache without letting
+PRs replace entries that `main` can restore.
+
+Keys separate operating systems, architectures, and the locked Nix, Rust, and
+Cargo dependencies. Source-only changes reuse the same immutable entry. They
+rebuild changed project outputs without uploading another full store; this
+limits competition with the other CI caches. Dependency changes start a fresh
+entry. Both flake evaluation and all native flake checks still run.
+
+The action logs the selected key, cache hit or miss, and restore/save sizes.
+Each successful job also reports the uncompressed Nix store size.
+Check those logs before attributing a faster run to caching. GitHub's cache
+quota and eviction policy apply; an evicted entry causes a normal cold build.
+
+Store GC is left disabled because `nix flake check` does not create permanent
+roots for its outputs. Collecting them before saving would lose those builds.

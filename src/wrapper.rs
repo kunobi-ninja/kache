@@ -2113,9 +2113,13 @@ fn run_cc_with_store(
         inputs_changed,
         peer_committed,
     );
+    // Without a live daemon, keep the ordinary staging and memo path.
+    // The lifetime lock works for both Unix sockets and Windows pipes.
+    let daemon_publish = config.daemon_publish
+        && crate::daemon::existing_daemon_run_lock_is_held(&config.socket_path()).unwrap_or(false);
     // A deferred compile's memo goes to the daemon with the entry; the
     // wrapper records it only if the hand-off does not happen (below).
-    let handoff_memo = (config.daemon_publish && store_candidate && deferred_compile)
+    let handoff_memo = (daemon_publish && store_candidate && deferred_compile)
         .then(|| compiler.captured_preprocess_memo())
         .flatten();
     if store_candidate && handoff_memo.is_none() {
@@ -2144,9 +2148,7 @@ fn run_cc_with_store(
         let _trace = crate::phase_trace::phase("store");
         let depinfo_anchor = cc_depinfo_rewrite_root(parsed);
         let target = parsed.cache_target_arch();
-        let staging_dir = config
-            .daemon_publish
-            .then(|| crate::daemon_publish::handoff_dir(config));
+        let staging_dir = daemon_publish.then(|| crate::daemon_publish::handoff_dir(config));
         match prepare_cc_store_files_in(
             &result.artifacts,
             depinfo_anchor.as_deref(),
@@ -2161,7 +2163,7 @@ fn run_cc_with_store(
                 // The put and everything after it are wall-clock time on a
                 // build script's serial C compiles. Hand them to the daemon
                 // when it will take them; it holds the key from then on.
-                if config.daemon_publish {
+                if daemon_publish {
                     let handoff = CcHandoff {
                         cache_key: &cache_key,
                         crate_name,

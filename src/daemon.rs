@@ -9342,7 +9342,10 @@ fn daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
         .context("observing daemon run lock")
 }
 
-fn existing_daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
+/// Observe the daemon run lock without creating it: a missing file reads as
+/// "not held", so a probe on a host that never ran a daemon leaves nothing
+/// behind for `doctor` to report.
+pub(crate) fn existing_daemon_run_lock_is_held(socket_path: &Path) -> Result<bool> {
     daemon_run_lock_is_held(socket_path)
 }
 

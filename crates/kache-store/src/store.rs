@@ -560,20 +560,91 @@ fn free_staging_path(mut name_for_nonce: impl FnMut(u64) -> PathBuf) -> std::io:
     ))
 }
 
-/// Classify a failed publish rename.
-///
-/// A destination that exists now, having been absent when the publish
-/// started, is a concurrent winner: it was published under the same digest,
-/// so it holds the same bytes and losing the race changes nothing. Anything
-/// else is a genuine publish failure and must surface. Split out from
-/// [`Store::publish_staged_blob`] because the race itself cannot be staged
-/// in a test, but the decision it feeds can.
-fn publish_rename_outcome(err: std::io::Error, blob_present: bool) -> Result<bool> {
-    if blob_present {
-        Ok(false)
-    } else {
-        Err(err).context("publishing staged blob")
+/// What occupies a blob's content-addressed path right after a publish
+/// rename onto it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishDest {
+    /// A regular file: a concurrent publisher won. Same digest, same bytes.
+    File,
+    /// Something that is not a regular file (a directory): no race explains it.
+    Obstructed,
+    /// Nothing readable: absent, or a Windows delete-pending name.
+    Vacant,
+}
+
+fn publish_dest_state(blob: &Path) -> PublishDest {
+    match fs::metadata(blob) {
+        Ok(meta) if meta.is_file() => PublishDest::File,
+        Ok(_) => PublishDest::Obstructed,
+        Err(_) => PublishDest::Vacant,
     }
+}
+
+/// How a publish rename settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishRename {
+    /// This call put the blob in place.
+    Published,
+    /// A concurrent publisher's identical blob is in place.
+    LostRace,
+    /// Not in place, and no fault found: left to the put's locked phase.
+    Deferred,
+}
+
+/// Settle one publish rename attempt (#1128).
+///
+/// A published blob is read-only, and on Windows a rename onto a read-only
+/// file fails with ERROR_ACCESS_DENIED, the same code a delete-pending name
+/// gives. The error alone cannot tell "a winner is there" from "a removed
+/// blob is going away", so the destination decides: a winner settles the
+/// publish at once, and only the other states are handed to the retry.
+fn publish_attempt_outcome(
+    renamed: std::io::Result<()>,
+    dest_state: impl FnOnce() -> PublishDest,
+) -> std::io::Result<PublishRename> {
+    match renamed {
+        Ok(()) => Ok(PublishRename::Published),
+        Err(_) if dest_state() == PublishDest::File => Ok(PublishRename::LostRace),
+        Err(e) => Err(e),
+    }
+}
+
+/// Settle a publish whose rename kept failing.
+///
+/// A transient error with the name vacant means the blob was removed after
+/// the last attempt found it in the way. That is a race between two healthy
+/// operations: the put's locked phase re-materializes the blob where no
+/// remover can interleave. Everything else is a real failure.
+fn publish_failure_outcome(
+    err: std::io::Error,
+    transient: bool,
+    dest: PublishDest,
+) -> Result<PublishRename> {
+    match (dest, transient) {
+        (PublishDest::File, _) => Ok(PublishRename::LostRace),
+        (PublishDest::Vacant, true) => Ok(PublishRename::Deferred),
+        _ => Err(err).context("publishing staged blob"),
+    }
+}
+
+/// Rename a staged blob into place on the shared transient-retry budget,
+/// re-reading the destination after every failure. The rename, the probe and
+/// the classifier are passed in so each interleaving can be driven in a test;
+/// production passes `fs::rename`, [`publish_dest_state`] and
+/// `is_transient_rename_error`.
+fn publish_rename(
+    mut rename: impl FnMut() -> std::io::Result<()>,
+    dest_state: impl Fn() -> PublishDest,
+    is_transient: impl Fn(&std::io::Error) -> bool,
+) -> Result<PublishRename> {
+    crate::atomic::retry_transient(
+        || publish_attempt_outcome(rename(), &dest_state),
+        &is_transient,
+    )
+    .or_else(|err| {
+        let transient = is_transient(&err);
+        publish_failure_outcome(err, transient, dest_state())
+    })
 }
 
 /// Whether `a` and `b` name the same inode (hardlinked). Used after a lost
@@ -3447,6 +3518,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// when the blob already exists the staged file is discarded and `Ok(false)`
     /// is returned. The staged bytes are exactly what was hashed, so a rename
     /// onto `blob_path(hash)` can never contradict the recorded digest.
+    ///
+    /// `Ok(false)` also covers a publish that lost to a concurrent removal
+    /// ([`PublishRename::Deferred`]): the blob is then absent, and the put's
+    /// locked phase re-materializes it before committing a reference.
     fn publish_staged_blob(
         &self,
         staged: &Path,
@@ -3455,23 +3530,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         size_bytes: u64,
     ) -> Result<bool> {
         let blob = self.blob_path(hash);
-        if blob.is_file() {
-            Self::discard_staged_blob(staged);
+        let outcome = Self::publish_staged_blob_with(
+            staged,
+            &blob,
+            || fs::rename(staged, &blob),
+            crate::atomic::is_transient_rename_error,
+        )?;
+        if outcome != PublishRename::Published {
             return Ok(false);
-        }
-        fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
-        // Wait out a delete-pending destination. A concurrent remove that drops
-        // this blob's last reference leaves the name occupied on Windows until
-        // its handle closes, and publishing into it meanwhile fails with
-        // ERROR_ACCESS_DENIED — a race between two healthy operations, reported
-        // as a failed put (kunobi-ninja/kache Test (Windows)). Retrying inside
-        // the publish keeps the staged file alive for the next attempt, which
-        // is why this is not `discard_staged_blob` then retry.
-        if let Err(e) = crate::atomic::retry_transient_windows(|| fs::rename(staged, &blob)) {
-            Self::discard_staged_blob(staged);
-            // Re-stat: only a publish that lost a race finds the destination
-            // occupied *now* having found it free above.
-            return publish_rename_outcome(e, blob.is_file());
         }
         if self.durable_writes() {
             let _ = crate::atomic::fsync_dir(blob.parent().unwrap());
@@ -3486,6 +3552,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         set_blob_readonly(&blob);
         Ok(true)
+    }
+
+    /// The rename half of [`Self::publish_staged_blob`], with the rename and
+    /// its transient classifier passed in so a test can stage the Windows
+    /// failures. The staged file is gone afterwards unless it became the blob.
+    fn publish_staged_blob_with(
+        staged: &Path,
+        blob: &Path,
+        rename: impl FnMut() -> std::io::Result<()>,
+        is_transient: impl Fn(&std::io::Error) -> bool,
+    ) -> Result<PublishRename> {
+        if blob.is_file() {
+            Self::discard_staged_blob(staged);
+            return Ok(PublishRename::LostRace);
+        }
+        fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
+        // This runs outside the SQLite write lock, so a concurrent remove can
+        // unlink the blob, and a concurrent put can publish it, at any point.
+        // `publish_rename` waits out the states that clear on their own and
+        // keeps the staged file alive between attempts.
+        let outcome = publish_rename(rename, || publish_dest_state(blob), is_transient);
+        if !matches!(outcome, Ok(PublishRename::Published)) {
+            tracing::debug!("{} not published by this put: {outcome:?}", blob.display());
+            Self::discard_staged_blob(staged);
+        }
+        outcome
     }
 
     /// Discard a staging snapshot (best effort; the staging sweep reclaims any
@@ -6439,29 +6531,284 @@ mod tests {
         );
     }
 
-    /// A failed publish rename is a lost race only when the destination is
-    /// there now, having been absent when the publish started: same digest
-    /// means same bytes, so the winner's blob is as good as ours. Every
-    /// other rename failure is real and must propagate.
+    /// One rename attempt: a winner in place is a lost race whatever the error
+    /// says, because Windows reports a read-only winner with the same code as
+    /// a delete-pending name (#1128). Anything else goes back to the retry.
     #[test]
-    fn publish_rename_outcome_distinguishes_a_lost_race_from_a_failure() {
-        let raced = publish_rename_outcome(
-            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "boom"),
-            true,
+    fn publish_attempt_outcome_lets_the_destination_decide() {
+        let denied = || Err(std::io::Error::from_raw_os_error(5));
+        assert_eq!(
+            publish_attempt_outcome(Ok(()), || unreachable!("a clean rename needs no probe"))
+                .unwrap(),
+            PublishRename::Published
         );
-        assert!(
-            !raced.expect("a lost race is benign"),
-            "losing the race must report `false`: we published nothing"
+        assert_eq!(
+            publish_attempt_outcome(denied(), || PublishDest::File).unwrap(),
+            PublishRename::LostRace
         );
+        for dest in [PublishDest::Vacant, PublishDest::Obstructed] {
+            let err = publish_attempt_outcome(denied(), || dest).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(5), "the rename error is kept");
+        }
+    }
 
-        let failed = publish_rename_outcome(
-            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "boom"),
-            false,
+    /// Every (destination, transient) pair a spent publish can end on.
+    #[test]
+    fn publish_failure_outcome_covers_every_interleaving() {
+        let settle = |transient, dest| {
+            publish_failure_outcome(std::io::Error::from_raw_os_error(5), transient, dest)
+        };
+        for transient in [true, false] {
+            assert_eq!(
+                settle(transient, PublishDest::File).unwrap(),
+                PublishRename::LostRace,
+                "a winner that landed after the last attempt still counts"
+            );
+            assert!(
+                settle(transient, PublishDest::Obstructed).is_err(),
+                "no race leaves a non-file at a blob path"
+            );
+        }
+        assert_eq!(
+            settle(true, PublishDest::Vacant).unwrap(),
+            PublishRename::Deferred,
+            "removed under the publisher: the locked phase publishes"
         );
-        assert!(
-            failed.is_err(),
-            "a rename failure with no destination in place is a real failure"
+        let err = settle(false, PublishDest::Vacant).unwrap_err();
+        assert!(format!("{err:#}").contains("publishing staged blob"));
+        assert_eq!(
+            err.root_cause().to_string(),
+            std::io::Error::from_raw_os_error(5).to_string()
         );
+    }
+
+    #[test]
+    fn publish_dest_state_tells_a_file_from_a_directory_from_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("blob");
+        fs::write(&file, b"x").unwrap();
+        assert_eq!(publish_dest_state(&file), PublishDest::File);
+        assert_eq!(publish_dest_state(dir.path()), PublishDest::Obstructed);
+        assert_eq!(
+            publish_dest_state(&dir.path().join("absent")),
+            PublishDest::Vacant
+        );
+    }
+
+    /// Drive `publish_rename` with a scripted rename and destination probe.
+    /// Rename attempt `n` succeeds when `rename_ok(n)`; otherwise it fails with
+    /// ERROR_ACCESS_DENIED and the probe reports `dest(n)`. Returns the outcome
+    /// and how many renames ran.
+    fn run_publish_rename(
+        rename_ok: impl Fn(u32) -> bool,
+        dest: impl Fn(u32) -> PublishDest,
+        transient: bool,
+    ) -> (Result<PublishRename>, u32) {
+        let calls = std::cell::Cell::new(0u32);
+        let outcome = publish_rename(
+            || {
+                let n = calls.get();
+                calls.set(n + 1);
+                if rename_ok(n) {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::from_raw_os_error(5))
+                }
+            },
+            || dest(calls.get() - 1),
+            |_| transient,
+        );
+        (outcome, calls.get())
+    }
+
+    #[test]
+    fn publish_rename_publishes_on_a_clean_rename() {
+        let (outcome, calls) = run_publish_rename(|_| true, |_| PublishDest::Vacant, true);
+        assert_eq!(outcome.unwrap(), PublishRename::Published);
+        assert_eq!(calls, 1);
+    }
+
+    /// The read-only winner: the rename fails with a "transient" code, but the
+    /// blob is there. No retry, no sleep.
+    #[test]
+    fn publish_rename_settles_at_once_on_a_present_winner() {
+        let (outcome, calls) = run_publish_rename(|_| false, |_| PublishDest::File, true);
+        assert_eq!(outcome.unwrap(), PublishRename::LostRace);
+        assert_eq!(calls, 1, "a present winner must not burn the retry budget");
+    }
+
+    /// The winner was removed between the failed rename and the probe: the
+    /// name is free, so the next attempt publishes.
+    #[test]
+    fn publish_rename_retries_into_a_name_a_remover_freed() {
+        let (outcome, calls) = run_publish_rename(|n| n == 1, |_| PublishDest::Vacant, true);
+        assert_eq!(outcome.unwrap(), PublishRename::Published);
+        assert_eq!(calls, 2);
+    }
+
+    /// A winner that appears while a delete-pending name is waited out.
+    #[test]
+    fn publish_rename_stops_retrying_once_a_winner_appears() {
+        let dest = |n: u32| {
+            if n < 2 {
+                PublishDest::Vacant
+            } else {
+                PublishDest::File
+            }
+        };
+        let (outcome, calls) = run_publish_rename(|_| false, dest, true);
+        assert_eq!(outcome.unwrap(), PublishRename::LostRace);
+        assert_eq!(calls, 3);
+    }
+
+    /// #1128: every attempt fails with ERROR_ACCESS_DENIED and the name is
+    /// vacant after the last one, because a remover took the winner. That is
+    /// not a failed put.
+    #[test]
+    fn publish_rename_defers_when_the_budget_ends_on_a_vacant_name() {
+        let (outcome, calls) = run_publish_rename(|_| false, |_| PublishDest::Vacant, true);
+        assert_eq!(outcome.unwrap(), PublishRename::Deferred);
+        assert_eq!(calls, crate::atomic::TRANSIENT_ATTEMPTS);
+    }
+
+    #[test]
+    fn publish_rename_fails_on_a_settled_error_or_an_obstructed_name() {
+        let (outcome, calls) = run_publish_rename(|_| false, |_| PublishDest::Vacant, false);
+        let err = outcome.unwrap_err();
+        assert!(format!("{err:#}").contains("publishing staged blob"));
+        assert_eq!(err.root_cause().to_string(), {
+            std::io::Error::from_raw_os_error(5).to_string()
+        });
+        assert_eq!(calls, 1, "a settled error is not retried");
+
+        let (outcome, calls) = run_publish_rename(|_| false, |_| PublishDest::Obstructed, true);
+        assert!(outcome.is_err(), "a directory at the blob path is a fault");
+        assert_eq!(calls, crate::atomic::TRANSIENT_ATTEMPTS);
+    }
+
+    /// The real rename onto a read-only winner, past the early `is_file`
+    /// check the way a lost race gets there. Unix replaces the identical
+    /// blob; Windows refuses with ERROR_ACCESS_DENIED. Either way one rename
+    /// settles it and the winner's bytes stay.
+    #[test]
+    fn publish_rename_onto_a_read_only_winner_settles_in_one_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        let staged = dir.path().join("staged");
+        fs::write(&blob, b"same-bytes").unwrap();
+        fs::write(&staged, b"same-bytes").unwrap();
+        set_blob_readonly(&blob);
+
+        let calls = std::cell::Cell::new(0u32);
+        let outcome = publish_rename(
+            || {
+                calls.set(calls.get() + 1);
+                fs::rename(&staged, &blob)
+            },
+            || publish_dest_state(&blob),
+            crate::atomic::is_transient_rename_error,
+        )
+        .unwrap();
+        assert_ne!(outcome, PublishRename::Deferred);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(fs::read(&blob).unwrap(), b"same-bytes");
+        unlink_blob(&blob);
+        unlink_blob(&staged);
+    }
+
+    /// The Windows fact #1128 rests on: renaming onto a read-only file is
+    /// refused with ERROR_ACCESS_DENIED, the code the retry treats as
+    /// transient. If this stops holding, revisit `publish_attempt_outcome`.
+    #[cfg(windows)]
+    #[test]
+    fn rename_onto_a_read_only_file_is_access_denied_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        let staged = dir.path().join("staged");
+        fs::write(&blob, b"winner").unwrap();
+        fs::write(&staged, b"loser").unwrap();
+        set_blob_readonly(&blob);
+
+        let err = fs::rename(&staged, &blob).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(5));
+        assert!(crate::atomic::is_transient_rename_error(&err));
+        assert_eq!(fs::read(&blob).unwrap(), b"winner");
+        unlink_blob(&blob);
+    }
+
+    /// A deferred publish leaves nothing behind and reports no error; the
+    /// put's locked phase then puts the blob in place from the source.
+    #[test]
+    fn deferred_publish_is_repaired_by_the_locked_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"removed-under-the-publisher").unwrap();
+        let (staged, _ingest) = store.stage_blob_from_source(&source, false).unwrap();
+        let hash = crate::file_hash::hash_file(&staged).unwrap();
+        let blob = store.blob_path(&hash);
+
+        let outcome = Store::publish_staged_blob_with(
+            &staged,
+            &blob,
+            || Err(std::io::Error::from_raw_os_error(5)),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(outcome, PublishRename::Deferred);
+        assert!(!staged.exists(), "a deferred publish discards its snapshot");
+        assert!(!blob.exists());
+
+        store
+            .rematerialize_and_verify(&source, &hash, "out.rlib", false)
+            .unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), b"removed-under-the-publisher");
+    }
+
+    #[test]
+    fn failed_publish_discards_its_snapshot_and_keeps_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"content").unwrap();
+        let (staged, _ingest) = store.stage_blob_from_source(&source, false).unwrap();
+        let blob = store.blob_path(&"f".repeat(64));
+
+        let err = Store::publish_staged_blob_with(
+            &staged,
+            &blob,
+            || Err(std::io::Error::other("disk on fire")),
+            |_| false,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("disk on fire"));
+        assert!(!staged.exists(), "a failed publish discards its snapshot");
+    }
+
+    #[test]
+    fn successful_publish_keeps_the_staged_bytes_as_the_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, b"published-bytes").unwrap();
+        let (staged, _ingest) = store.stage_blob_from_source(&source, false).unwrap();
+        let blob = store.blob_path(&"a".repeat(64));
+
+        let outcome = Store::publish_staged_blob_with(
+            &staged,
+            &blob,
+            || fs::rename(&staged, &blob),
+            |_| false,
+        )
+        .unwrap();
+        assert_eq!(outcome, PublishRename::Published);
+        assert_eq!(fs::read(&blob).unwrap(), b"published-bytes");
     }
 
     /// The grace both sweepers share (daemon GC and `doctor --repair`) must
@@ -12338,6 +12685,69 @@ mod tests {
         // All entries removed → the shared blob is fully reclaimed.
         let store = Store::open(&config).unwrap();
         assert_eq!(store.blob_stats().unwrap().total_blobs, 0);
+    }
+
+    /// #1128 without SQLite in the way: publishers race a remover on one
+    /// blob path, so the name cycles through present and read-only,
+    /// delete-pending and absent far more often than whole puts manage. No
+    /// lock orders them, so a publish may end with the blob gone again; what
+    /// it must never do is report that race as an error.
+    #[test]
+    fn publish_racing_an_unlink_never_errors() {
+        const PUBLISHERS: usize = 4;
+        const ROUNDS: usize = 400;
+        let dir = tempfile::tempdir().unwrap();
+        // No fsync per publish: the race is in the rename, and the flushes
+        // only spread the attempts out.
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+
+        let content = b"one blob, published and unlinked in a loop";
+        let source = dir.path().join("out.rlib");
+        fs::write(&source, content).unwrap();
+        let hash = crate::file_hash::hash_file(&source).unwrap();
+        let blob = store.blob_path(&hash);
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let remover = {
+            let blob = blob.clone();
+            let done = std::sync::Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    unlink_blob(&blob);
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let publishers: Vec<_> = (0..PUBLISHERS)
+            .map(|_| {
+                let store = Store::open(&config).unwrap();
+                let source = source.clone();
+                let hash = hash.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..ROUNDS {
+                        let (staged, ingest) =
+                            store.stage_blob_from_source(&source, false).unwrap();
+                        store
+                            .publish_staged_blob(&staged, ingest, &hash, content.len() as u64)
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for p in publishers {
+            p.join().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        remover.join().unwrap();
+
+        // With the remover stopped, the locked phase's repair always lands.
+        store
+            .rematerialize_and_verify(&source, &hash, "out.rlib", false)
+            .unwrap();
+        assert_eq!(fs::read(&blob).unwrap(), content);
     }
 
     /// kunobi-ninja/kache#670: a remover that deleted no row must not touch

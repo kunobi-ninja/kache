@@ -3739,7 +3739,11 @@ mod tests {
         let screen = rendered_lines(&mut state, Tab::Transfer, 120, 40).join("\n");
         assert!(screen.contains("STOP"), "{screen}");
         assert!(!screen.contains("FAIL"), "{screen}");
-        assert!(!screen.contains('↓'), "LIST is not a download: {screen}");
+        let row = screen.lines().find(|line| line.contains("serde")).unwrap();
+        assert!(
+            row.trim_start_matches('│').trim_start().starts_with("L "),
+            "LIST row: {row}"
+        );
     }
 
     #[test]

@@ -15257,23 +15257,25 @@ mod tests {
                 PrefetchOperation::Get,
             ));
             daemon.flush_prefetch_receipts();
+            if index == 0 {
+                daemon.install_plan(
+                    "writer-session",
+                    "writer-plan",
+                    "fallback",
+                    std::iter::empty(),
+                    None,
+                );
+                daemon.finalize_inactive_plan(0);
+                let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+                assert_eq!(summaries[0].closure_reason, "inactivity");
+                assert!(
+                    summaries[0].incomplete,
+                    "a blocked writer can still lose records"
+                );
+            }
         }
         assert_eq!(daemon.prefetch_receipt_writers.lock().unwrap().len(), 1);
         assert_eq!(daemon.prefetch_receipts.lock().unwrap().events.len(), 99);
-        daemon.install_plan(
-            "writer-session",
-            "writer-plan",
-            "fallback",
-            std::iter::empty(),
-            None,
-        );
-        daemon.finalize_inactive_plan(0);
-        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
-        assert_eq!(summaries[0].closure_reason, "inactivity");
-        assert!(
-            summaries[0].incomplete,
-            "a blocked writer can still lose records"
-        );
         lock.unlock().unwrap();
         assert!(daemon.finish_prefetch_receipts().await);
         assert_eq!(
@@ -15288,7 +15290,13 @@ mod tests {
 
     #[tokio::test]
     async fn packed_normal_summary_exposes_overflow_log_failure_and_pending_tasks() {
-        for loss in ["overflow", "log_failure", "task", "cancelled_task"] {
+        for loss in [
+            "overflow",
+            "log_failure",
+            "receipt",
+            "task",
+            "cancelled_task",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let daemon = Arc::new(Daemon::new(test_config(dir.path())));
             daemon.install_plan(
@@ -15317,6 +15325,15 @@ mod tests {
                         PrefetchOperation::Get,
                     ));
                     assert!(!daemon.finish_prefetch_receipts().await);
+                }
+                "receipt" => {
+                    drop(PrefetchReceipt::new(
+                        daemon.prefetch_receipts.clone(),
+                        PrefetchOrigin::default(),
+                        "queued-record",
+                        "pack",
+                        PrefetchOperation::Get,
+                    ));
                 }
                 "task" => {
                     daemon
@@ -15628,6 +15645,17 @@ mod tests {
                 .v3_requests_total
                 .load(Ordering::Relaxed),
             0
+        );
+        assert!(
+            daemon
+                .active_plan
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .downloaded
+                .is_empty(),
+            "a later plan cannot claim these pack imports"
         );
         assert!(
             !daemon

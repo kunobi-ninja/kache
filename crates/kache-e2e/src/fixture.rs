@@ -93,6 +93,12 @@ pub struct Fixture {
     #[serde(default)]
     pub negative_control_exempt: bool,
 
+    /// Run every phase with a kache daemon bound to the fixture's cache
+    /// directory, so the paths that hand work to it (`daemon_publish`) are
+    /// the ones exercised. Without this the wrapper does everything itself.
+    #[serde(default)]
+    pub daemon: bool,
+
     /// Assert that restored dep-info (`.d`) files are path-expanded.
     ///
     /// kache relativizes `.d` files on store (`<target>/...` → `./...`)

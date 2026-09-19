@@ -1,0 +1,67 @@
+# kache-e2e fixture: the C project of e2e-c-hello, built with a daemon
+# running so the miss path hands its store put to the daemon.
+#
+# On a cold C miss the wrapper compiles, keys, then offers the finished
+# object to the daemon and exits; the daemon claims the key and publishes
+# the entry (`daemon_publish`). Every later phase must find that entry:
+# a warm hit, a hit from a relocated checkout, and a miss once the
+# source changes. A daemon that stored under the wrong key, dropped the
+# snapshot, or never committed fails the warm phase here.
+
+name = "e2e-c-daemon-handoff"
+tags = ["suite:e2e", "lang:cc", "case:daemon"]
+daemon = true
+
+[source]
+kind = "fixture"
+path = "source"
+
+[env]
+CC = "$KACHE cc"
+
+[commands]
+build = "make"
+clean = "make clean"
+
+[verify]
+run = "./build/foo"
+expected_stdout_contains = ["hello from bar"]
+
+# The object a hit restores must be the daemon-published copy of what the
+# compiler produced, byte for byte.
+[diff]
+artifacts = ["build/foo.o"]
+
+[modify]
+file = "src/bar.h"
+find = "hello from bar"
+replace = "edited greeting"
+
+# Cold: the wrapper compiles once; the entry is the daemon's to write, and
+# it has to be there by the time the phase's report is taken.
+[assertions.cold]
+min_entries_after = 1
+max_compiler_runs = 1
+max_preprocessor_runs = 1
+max_probe_runs = 1
+
+# Warm: the daemon-published entry serves the hit; no compile, no
+# preprocessor, no probe.
+[assertions.warm]
+min_hits = 1
+max_compiler_runs = 0
+max_preprocessor_runs = 0
+max_probe_runs = 0
+
+[assertions.noop]
+should_not_recompile = false
+
+[assertions.relocate]
+min_hits = 1
+max_compiler_runs = 0
+max_preprocessor_runs = 1
+
+[assertions.relocate-modified]
+min_misses = 1
+max_compiler_runs = 1
+max_preprocessor_runs = 1

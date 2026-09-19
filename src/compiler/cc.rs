@@ -5737,6 +5737,17 @@ pub(crate) struct CcCapturedInputs {
     /// The object spells a checkout root the prefix maps did not rewrite,
     /// so its key is bound to this checkout (see `hash_cc_expansion`).
     path_bound: bool,
+    /// An input was written after the invocation started, as seen by the
+    /// hasher that fingerprinted the captured read set. The wrapper's
+    /// re-entry keys with a fresh hasher, so the bit travels here; an entry
+    /// or memo must not describe what the compiler may not have read.
+    inputs_changed: bool,
+}
+
+impl CcCapturedInputs {
+    pub(crate) fn inputs_changed(&self) -> bool {
+        self.inputs_changed
+    }
 }
 
 /// Memo hash prefix for a path-bound read set: the digest is portable, the
@@ -7083,11 +7094,13 @@ impl CcCompiler {
             let _trace = crate::phase_trace::phase("cc_capture");
             self.captured_inputs(parsed, &depfile, file_hasher)
         };
+        let inputs_changed = file_hasher.too_new();
         Ok((
             result,
             inputs.map(|fingerprints| CcCapturedInputs {
                 fingerprints,
                 path_bound,
+                inputs_changed,
             }),
         ))
     }

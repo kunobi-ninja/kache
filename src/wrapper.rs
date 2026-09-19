@@ -20,7 +20,7 @@ use crate::events::{self, BuildEvent, EventResult};
 use crate::incremental_policy::{AdaptiveUnit, Lease};
 use crate::link;
 use crate::scheduler::{self, FlightIdentity, MissGuard};
-use crate::store::{BuildClaim, EntryMeta, Store, StorePutResult};
+use crate::store::{BuildClaim, EntryMeta, KeyLock, Store, StorePutResult};
 
 mod remote;
 use remote::{NegativeReply, acquire_entry, compiler_remote_enabled, maybe_enqueue_upload};
@@ -511,7 +511,7 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
 
 /// After a store: if [`auto_gc_wanted`] says so, get a sweep started without
 /// waiting for it.
-fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
+pub(crate) fn maybe_spawn_auto_gc(config: &Config, store: &Store) {
     let _trace = crate::phase_trace::phase("auto_gc_check");
     run_auto_gc_check(
         config,
@@ -1714,8 +1714,12 @@ fn run_cc_inner(
         key_env_vars: &config.key_env_vars,
         extra_inputs_digest: None,
     };
+    let mut captured_inputs_changed = false;
     let discovery = match precompiled.as_mut().and_then(|pre| pre.inputs.take()) {
-        Some(inputs) => crate::compiler::cc::CcKeyDiscovery::Captured(inputs),
+        Some(inputs) => {
+            captured_inputs_changed = inputs.inputs_changed();
+            crate::compiler::cc::CcKeyDiscovery::Captured(inputs)
+        }
         // Compiling first forgoes the lookup a key would have allowed, so it
         // is only for a certain miss: nowhere but this store could hold the
         // entry, and no fallback wrapper is waiting to be asked.
@@ -2007,8 +2011,10 @@ fn run_cc_inner(
         Some(pre) => {
             // Inputs are fingerprinted after a deferred compile; one written
             // since this invocation started may not be what the compiler
-            // read, so neither the entry nor the memo may describe it.
-            let changed = file_hasher.too_new();
+            // read, so neither the entry nor the memo may describe it. The
+            // capture ran on the outer hasher; this one saw only what the
+            // key hashed afterwards, so both verdicts count.
+            let changed = captured_inputs_changed || file_hasher.too_new();
             if changed {
                 tracing::debug!(
                     "cc: {} read an input modified during the build; not storing it",
@@ -2088,45 +2094,74 @@ fn run_cc_inner(
         let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
         let target = parsed.cache_target_arch();
         match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
-            Ok(prepared) => match store.put_with_compile_time_independent(
-                &cache_key,
-                &crate_name,
-                &[], // crate_types: n/a for cc objects
-                &[], // features: n/a
-                &target,
-                "", // profile: n/a (opt level is in the key)
-                &prepared.files,
-                if crate::compiler::cc::cc_expansion_is_stdout(&parsed) {
+            Ok(prepared) => {
+                let stdout = if crate::compiler::cc::cc_expansion_is_stdout(&parsed) {
                     ""
                 } else {
                     &result.stdout
-                },
-                &result.stderr,
-                compile_time_ms,
-            ) {
-                Ok(result) => {
-                    store_put = result;
-                    // Store grew — throttled size check + detached background GC if over
-                    // budget (kunobi-ninja/kache#497). Never blocks the compile path.
-                    maybe_spawn_auto_gc(config, &store);
-                    flush_or_hand_off_durability(config, &store, &cache_key);
-                    maybe_enqueue_upload(
-                        config,
-                        &store,
-                        &cache_key,
-                        &crate_name,
+                };
+                // The put and everything after it are wall-clock time on a
+                // build script's serial C compiles. Hand them to the daemon
+                // when it will take them; it holds the key from then on.
+                if config.daemon_publish {
+                    let handoff = CcHandoff {
+                        cache_key: &cache_key,
+                        crate_name: &crate_name,
+                        target: &target,
+                        files: &prepared.files,
+                        stdout,
+                        stderr: &result.stderr,
+                        compile_time_ms,
                         publishes_to_remote,
-                    );
+                        event_root: &event_root,
+                        start,
+                        size: result.artifacts.total_size(),
+                        key_ms,
+                        lookup_ms,
+                        lookup_rejection: &lookup_rejection,
+                        store_start,
+                    };
+                    match hand_off_cc_store(config, &store, &mut _build_lock, &handoff) {
+                        CcHandoffOutcome::Done => return Ok(result.exit_code),
+                        CcHandoffOutcome::Publish => {}
+                    }
                 }
-                Err(e) => {
-                    store_error = store_error_for_event(&e);
-                    tracing::warn!(
-                        "failed to store cc cache entry for {}: {}",
-                        crate_name,
-                        store_error
-                    );
+                match store.put_with_compile_time_independent(
+                    &cache_key,
+                    &crate_name,
+                    &[], // crate_types: n/a for cc objects
+                    &[], // features: n/a
+                    &target,
+                    "", // profile: n/a (opt level is in the key)
+                    &prepared.files,
+                    stdout,
+                    &result.stderr,
+                    compile_time_ms,
+                ) {
+                    Ok(result) => {
+                        store_put = result;
+                        // Store grew — throttled size check + detached background GC if over
+                        // budget (kunobi-ninja/kache#497). Never blocks the compile path.
+                        maybe_spawn_auto_gc(config, &store);
+                        flush_or_hand_off_durability(config, &store, &cache_key);
+                        maybe_enqueue_upload(
+                            config,
+                            &store,
+                            &cache_key,
+                            &crate_name,
+                            publishes_to_remote,
+                        );
+                    }
+                    Err(e) => {
+                        store_error = store_error_for_event(&e);
+                        tracing::warn!(
+                            "failed to store cc cache entry for {}: {}",
+                            crate_name,
+                            store_error
+                        );
+                    }
                 }
-            },
+            }
             Err(e) => {
                 store_error = store_error_for_event(&e);
                 tracing::warn!(
@@ -4236,6 +4271,130 @@ struct PreparedCcStoreFiles {
 /// hashes it. This keeps a concurrent replacement of a compiler output from
 /// publishing different bytes under the hash chosen for the original path.
 /// Dep-info normalization happens while creating that private snapshot.
+/// What the daemon needs to store a finished cc compile and log its event.
+struct CcHandoff<'a> {
+    cache_key: &'a str,
+    crate_name: &'a str,
+    target: &'a str,
+    /// `(staged path, store name)`: the wrapper's private snapshots.
+    files: &'a [(PathBuf, String)],
+    stdout: &'a str,
+    stderr: &'a str,
+    compile_time_ms: u64,
+    publishes_to_remote: bool,
+    event_root: &'a str,
+    start: std::time::Instant,
+    size: u64,
+    key_ms: u64,
+    lookup_ms: u64,
+    lookup_rejection: &'a str,
+    store_start: std::time::Instant,
+}
+
+enum CcHandoffOutcome {
+    /// The daemon holds the key and will store the entry; the event is its.
+    Done,
+    /// Store here, with the key lock back in the caller's hands.
+    Publish,
+}
+
+/// Offer the compile to the daemon. On acceptance the wrapper is done: the
+/// daemon owns the snapshots, the key lock and the event. On any refusal
+/// the caller stores as before, with its lock re-taken; if a peer took the
+/// key in the meantime, that peer's entry is the one that counts and only
+/// the event is written here.
+fn hand_off_cc_store(
+    config: &Config,
+    store: &Store,
+    build_lock: &mut Option<KeyLock>,
+    handoff: &CcHandoff<'_>,
+) -> CcHandoffOutcome {
+    use crate::daemon_publish::{Handoff, PublishCcRequest};
+    let snapshots = match crate::daemon_publish::snapshot_for_handoff(config, handoff.files) {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            tracing::debug!("cc hand-off: could not snapshot outputs: {error:#}");
+            return CcHandoffOutcome::Publish;
+        }
+    };
+    let elapsed = handoff.start.elapsed().as_millis() as u64;
+    let event = build_event_details(
+        config,
+        handoff.event_root,
+        handoff.crate_name,
+        EventResult::Miss,
+        elapsed,
+        handoff.compile_time_ms,
+        handoff.size,
+        handoff.cache_key,
+        handoff.key_ms,
+        FileHashStats::default(),
+        handoff.lookup_ms,
+        0,
+        handoff.store_start.elapsed().as_millis() as u64,
+        StorePutResult::default(),
+        String::new(),
+        String::new(),
+        handoff.lookup_rejection.to_string(),
+        false,
+        None,
+        None,
+    );
+    let request = PublishCcRequest {
+        client_epoch: crate::daemon::build_epoch(),
+        cache_key: handoff.cache_key.to_string(),
+        crate_name: handoff.crate_name.to_string(),
+        target: handoff.target.to_string(),
+        files: snapshots,
+        stdout: handoff.stdout.to_string(),
+        stderr: handoff.stderr.to_string(),
+        compile_time_ms: handoff.compile_time_ms,
+        publishes_to_remote: handoff.publishes_to_remote,
+        event,
+    };
+    // The daemon takes the key itself before it answers; ours must be gone
+    // first, since a file lock cannot be shared across processes.
+    *build_lock = None;
+    match crate::daemon_publish::hand_off_cc_publish(config, &request) {
+        Handoff::Accepted => {
+            print_progress(handoff.crate_name, EventResult::Miss, elapsed, handoff.size);
+            CcHandoffOutcome::Done
+        }
+        Handoff::Declined(reason) => {
+            tracing::debug!("cc hand-off declined for {}: {reason}", handoff.crate_name);
+            crate::daemon_publish::remove_handoff_files(&request.files);
+            match store.claim_build(handoff.cache_key) {
+                Ok(BuildClaim::Acquired(lock)) => {
+                    *build_lock = Some(lock);
+                    CcHandoffOutcome::Publish
+                }
+                Ok(BuildClaim::Committed(_)) | Ok(BuildClaim::Contended) => {
+                    // A peer holds or stored the key in the gap; it publishes.
+                    let mut event = request.event;
+                    event.elapsed_ms = handoff.start.elapsed().as_millis() as u64;
+                    event.store_error =
+                        format!("handed off to a peer after the daemon declined: {reason}");
+                    write_event(config, &event);
+                    print_progress(
+                        handoff.crate_name,
+                        EventResult::Miss,
+                        event.elapsed_ms,
+                        handoff.size,
+                    );
+                    CcHandoffOutcome::Done
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "reclaiming {} after a declined hand-off failed: {error:#}; storing without a lock",
+                        handoff.crate_name
+                    );
+                    CcHandoffOutcome::Publish
+                }
+            }
+        }
+    }
+}
+
 fn prepare_cc_store_files(
     artifacts: &ArtifactSet,
     depinfo_anchor: Option<&Path>,
@@ -6434,7 +6593,7 @@ fn log_event_with_hash_stats(
 /// Hardening for shape, not secrecy: it does not redact. The reason is derived
 /// from filesystem and SQLite errors, so it can carry absolute paths, and a
 /// report shared outside the machine carries them too.
-fn store_error_for_event(error: &anyhow::Error) -> String {
+pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
     const MAX_CHARS: usize = 2048;
 
     let rendered = format!("{error:#}");
@@ -6628,6 +6787,74 @@ fn log_event_details(
     exit_code: Option<i32>,
     fallback_attempt: Option<crate::fallback::Attempt>,
 ) {
+    let event = build_event_details(
+        config,
+        root,
+        crate_name,
+        result,
+        elapsed_ms,
+        compile_time_ms,
+        size,
+        cache_key,
+        key_ms,
+        key_hash_stats,
+        lookup_ms,
+        restore_ms,
+        store_ms,
+        store_put,
+        passthrough_reason,
+        store_error,
+        lookup_rejection,
+        fallback,
+        exit_code,
+        fallback_attempt,
+    );
+    write_event(config, &event);
+}
+
+/// Append `event` to the event log and rotate the logs. Best-effort: nothing
+/// here may fail a build.
+pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
+    let _trace = crate::phase_trace::phase("event_log");
+    let _ = events::log_event(&config.event_log_path(), event);
+    let _ = events::rotate_if_needed(
+        &config.event_log_path(),
+        config.event_log_max_size,
+        config.event_log_keep_lines,
+    );
+    let _ = events::rotate_transfers_if_needed(
+        &config.transfer_log_path(),
+        config.event_log_max_size,
+        config.event_log_keep_lines,
+    );
+}
+
+/// The event for one invocation, built from its measurements and this
+/// process's counters. Written by [`write_event`], here or, for a compile
+/// handed to the daemon, there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_event_details(
+    config: &Config,
+    root: &str,
+    crate_name: &str,
+    result: EventResult,
+    elapsed_ms: u64,
+    compile_time_ms: u64,
+    size: u64,
+    cache_key: &str,
+    key_ms: u64,
+    key_hash_stats: FileHashStats,
+    lookup_ms: u64,
+    restore_ms: u64,
+    store_ms: u64,
+    store_put: StorePutResult,
+    passthrough_reason: String,
+    store_error: String,
+    lookup_rejection: String,
+    fallback: bool,
+    exit_code: Option<i32>,
+    fallback_attempt: Option<crate::fallback::Attempt>,
+) -> BuildEvent {
     // Session attribution (#583 P0.5): join or open the root's build session
     // and refresh the marker so the 5-minute window measures inactivity. Both
     // are best-effort; an empty id only means the marker was unusable.
@@ -6673,7 +6900,7 @@ fn log_event_details(
         (String::new(), Default::default())
     };
     let key_diff = explain_miss_diff(config, root, crate_name, result, cache_key, &key_fields);
-    let event = BuildEvent {
+    BuildEvent {
         ts: Utc::now(),
         crate_name: crate_name.to_string(),
         root: root.to_string(),
@@ -6726,6 +6953,7 @@ fn log_event_details(
         restore_copy_other_bytes: crate::opcounts::restore_copy_other_bytes(),
         passthrough_reason,
         store_error,
+        store_handed_off: false,
         lookup_rejection,
         verify_compare: crate::verify_compare::take_last_report(),
         fallback,
@@ -6737,19 +6965,7 @@ fn log_event_details(
         key_externs_recorded,
         unit_id,
         extern_units,
-    };
-    let _trace = crate::phase_trace::phase("event_log");
-    let _ = events::log_event(&config.event_log_path(), &event);
-    let _ = events::rotate_if_needed(
-        &config.event_log_path(),
-        config.event_log_max_size,
-        config.event_log_keep_lines,
-    );
-    let _ = events::rotate_transfers_if_needed(
-        &config.transfer_log_path(),
-        config.event_log_max_size,
-        config.event_log_keep_lines,
-    );
+    }
 }
 
 /// `[cache] explain_miss` (kunobi-ninja/kache#131): on a miss for a crate

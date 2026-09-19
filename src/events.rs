@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// A single build event logged by the wrapper.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BuildEvent {
     pub ts: DateTime<Utc>,
     pub crate_name: String,
@@ -217,6 +217,10 @@ pub struct BuildEvent {
     /// Empty on every normal outcome, so it costs nothing on the wire.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub store_error: String,
+    /// The store put ran in the daemon after the wrapper had returned
+    /// (`daemon_publish`); the store fields above are the daemon's. Schema 20.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub store_handed_off: bool,
     /// Why an existing entry for this exact key was rejected before the
     /// compiler ran (kunobi-ninja/kache#655).
     ///
@@ -1494,6 +1498,7 @@ impl BuildEvent {
             restore_copy_other_bytes: 0,
             passthrough_reason: String::new(),
             store_error: String::new(),
+            store_handed_off: false,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,
@@ -1652,6 +1657,7 @@ mod tests {
             restore_copy_other_bytes: 0,
             passthrough_reason: String::new(),
             store_error: String::new(),
+            store_handed_off: false,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,

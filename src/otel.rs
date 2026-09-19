@@ -437,6 +437,10 @@ pub(crate) struct MachineSnapshot {
     /// Bytes `index.db` holds in free pages, which compaction returns to the
     /// disk. Also inside `index_bytes`.
     pub index_free_bytes: Option<u64>,
+    /// Disagreement between `blobs` and `entry_blobs`. Unowned bytes are
+    /// inside `store_physical_bytes`, and no eviction can free them until the
+    /// daemon heals the blob index.
+    pub blob_drift: Option<crate::store::BlobRefcountDrift>,
     /// The largest rowid per index table. This counts writes, not rows: the
     /// tables written with `INSERT OR REPLACE` give a replaced row the next
     /// rowid, so it grows with every insert and every replacement, and a
@@ -454,6 +458,18 @@ fn machine_metrics(snap: &MachineSnapshot, now: &str) -> Vec<Value> {
             "kache.cache.store.physical_size",
             "By",
             vec![as_int(bytes, now, &[])],
+        ));
+    }
+    if let Some(drift) = &snap.blob_drift {
+        metrics.push(gauge(
+            "kache.cache.store.unowned.size",
+            "By",
+            vec![as_int(drift.unowned_bytes, now, &[])],
+        ));
+        metrics.push(gauge(
+            "kache.cache.store.refcount_drift",
+            "{blob}",
+            vec![as_int(drift.mismatched(), now, &[])],
         ));
     }
     if let Some(bytes) = snap.index_bytes {
@@ -713,6 +729,13 @@ mod tests {
             index_bytes: Some(29_074_419_712),
             wal_bytes: Some(1_073_741_824),
             index_free_bytes: Some(27_917_287_424),
+            blob_drift: Some(crate::store::BlobRefcountDrift {
+                unowned: 1_430,
+                unowned_bytes: 28_991_029_248,
+                too_high: 571,
+                too_high_bytes: 9_000_000_000,
+                ..Default::default()
+            }),
             rowid_high_water: vec![("entries", 2_085_333), ("cc_preprocess_memos", 874_517)],
             gc: Some(crate::report::GcStatsPersisted {
                 last_run: "2026-09-12T12:11:05+00:00".to_string(),
@@ -797,6 +820,12 @@ mod tests {
         let wal = metric(&body, "kache.cache.index.wal.size");
         assert_eq!(wal["unit"], "By");
         assert_eq!(wal["gauge"]["dataPoints"][0]["asInt"], "1073741824");
+        let unowned = metric(&body, "kache.cache.store.unowned.size");
+        assert_eq!(unowned["unit"], "By");
+        assert_eq!(unowned["gauge"]["dataPoints"][0]["asInt"], "28991029248");
+        let drift = metric(&body, "kache.cache.store.refcount_drift");
+        assert_eq!(drift["unit"], "{blob}");
+        assert_eq!(drift["gauge"]["dataPoints"][0]["asInt"], "2001");
         // Kartero drops attribute keys outside its allowlist; these are the
         // families it admits.
         for key in all_attr_keys(&body) {

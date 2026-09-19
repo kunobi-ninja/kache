@@ -139,6 +139,10 @@ const DAEMON_CONFIG_WATCH_INTERVAL: Duration = Duration::from_secs(15);
 const DAEMON_COORD_STALE_AFTER: Duration = Duration::from_secs(15);
 const VERSION: &str = crate::VERSION;
 const FILE_HASH_MEMORY_CACHE_CAP: usize = 4096;
+/// Age a blob file with no `blobs` row must reach before a daemon sweep
+/// unlinks it. A put renames its blobs into place before it inserts their
+/// rows, and an hour outlasts any put still in flight.
+pub(crate) const ORPHAN_BLOB_GRACE: Duration = Duration::from_secs(3600);
 
 /// Compute a "build epoch" from the executable's mtime.
 /// This changes every time `cargo build` produces a new binary,
@@ -2299,7 +2303,7 @@ pub(crate) struct Daemon {
     file_hash_cache: Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
     /// When the last build request arrived. Index compaction waits for a
     /// gap here, because a build made of cache hits holds no compile permit.
-    request_clock: Arc<crate::index_compact::RequestClock>,
+    request_clock: Arc<crate::maintenance::RequestClock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2425,7 +2429,7 @@ impl Daemon {
             transfer_counters: TransferCounters::new(),
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
-            request_clock: Arc::new(crate::index_compact::RequestClock::new()),
+            request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             config,
         }
     }
@@ -5819,11 +5823,11 @@ impl Daemon {
                 };
 
                 // Reclaim orphaned blob files (crash mid-put, or a meta-less
-                // remove_entry that couldn't decrement refcounts). A 1h grace
+                // remove_entry that couldn't decrement refcounts). The grace
                 // leaves blobs a concurrent build is materializing untouched; they
                 // get reclaimed on a later pass once settled.
                 let orphan_stats = store
-                    .sweep_orphan_blobs(std::time::Duration::from_secs(3600))
+                    .sweep_orphan_blobs(ORPHAN_BLOB_GRACE)
                     .unwrap_or_default();
                 // Same grace for put-phase staging snapshots abandoned by a
                 // crash between staging and publish (review finding #3).
@@ -6259,9 +6263,9 @@ async fn server_main(
         }
     });
 
-    let compact_handle = config.index_auto_compact.then(|| {
-        crate::index_compact::spawn_periodic(config.clone(), daemon.request_clock.clone())
-    });
+    let maintenance_handle = config
+        .index_auto_compact
+        .then(|| crate::maintenance::spawn_periodic(config.clone(), daemon.request_clock.clone()));
 
     // The remote key cache only serves speculative planning. Exact-key remote
     // checks and uploads do not depend on it, so disabling prefetch also avoids
@@ -6429,7 +6433,7 @@ async fn server_main(
     .await;
 
     gc_handle.abort();
-    if let Some(h) = compact_handle {
+    if let Some(h) = maintenance_handle {
         h.abort();
     }
     if let Some(h) = cache_handle {
@@ -6453,10 +6457,10 @@ async fn server_main(
     }
 
     // Handlers and uploads are done, so the index is as idle as this daemon
-    // will see it. Quiet mode only: a contended index yields at once, and a
-    // large live index is skipped, so shutdown stays short.
+    // will see it. Quiet rules only: a contended index yields at once, and a
+    // large store or live index is skipped, so shutdown stays short.
     if config.index_auto_compact {
-        crate::index_compact::run_at_shutdown(config.clone()).await;
+        crate::maintenance::run_at_shutdown(config.clone()).await;
     }
 
     // Socket file is cleaned up by `_socket_guard` (Drop).

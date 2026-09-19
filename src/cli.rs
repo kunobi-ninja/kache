@@ -398,6 +398,7 @@ pub(crate) fn machine_snapshot(config: &Config) -> crate::otel::MachineSnapshot 
         .ok()
         .map(|bytes| bytes.max(0) as u64);
     snap.index_free_bytes = index_free_bytes(&db);
+    snap.blob_drift = crate::store::blob_refcount_drift(&db).ok();
     for table in MACHINE_INDEX_TABLES {
         let top: rusqlite::Result<Option<i64>> =
             db.query_row(&rowid_high_water_sql(table), [], |row| row.get(0));
@@ -7279,6 +7280,27 @@ mod tests {
         assert_eq!(snap.index_bytes, Some(db_len + wal_len));
         assert_eq!(snap.store_physical_bytes, Some(7));
         assert_eq!(snap.index_free_bytes, Some(0), "a fresh index has no holes");
+        assert_eq!(
+            snap.blob_drift,
+            Some(crate::store::BlobRefcountDrift::default())
+        );
+        let db = rusqlite::Connection::open(config.index_db_path()).unwrap();
+        db.execute_batch(
+            "UPDATE blobs SET refcount = 5;
+             INSERT INTO blobs (hash, size, refcount) VALUES ('unowned', 4096, 1);",
+        )
+        .unwrap();
+        drop(db);
+        assert_eq!(
+            machine_snapshot(&config).blob_drift,
+            Some(crate::store::BlobRefcountDrift {
+                unowned: 1,
+                unowned_bytes: 4096,
+                too_high: 1,
+                too_high_bytes: 7,
+                ..Default::default()
+            })
+        );
         let tables: Vec<_> = snap
             .rowid_high_water
             .iter()
@@ -7383,6 +7405,7 @@ mod tests {
             index_bytes: Some(29_074_419_712),
             wal_bytes: Some(1_073_741_824),
             index_free_bytes: None,
+            blob_drift: None,
             rowid_high_water: vec![
                 ("entries", 2),
                 ("file_hashes", 13_286_285),

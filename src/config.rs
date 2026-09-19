@@ -400,12 +400,15 @@ pub struct Config {
     /// spawned process, serialized by `gc.lock`. Set via `KACHE_AUTO_GC=0`/
     /// `=false` or `[cache] auto_gc = false` to disable.
     pub auto_gc: bool,
-    /// Daemon-side index compaction: when on (the default), the daemon
+    /// Daemon-side index maintenance: when on (the default), the daemon
     /// VACUUMs `index.db` once free pages dominate the file, either while the
     /// machine is quiet or, for a small live index, after it has stayed over
-    /// the threshold for hours. Set via `KACHE_INDEX_AUTO_COMPACT=0`/`=false`
-    /// or `[cache] index_auto_compact = false` to disable. `kache doctor
-    /// --repair` compacts on demand either way.
+    /// the threshold for hours. The same switch covers the blob index heal
+    /// that runs before it on a quiet machine: both take the index write lock
+    /// unasked, which is the one reason to turn either off. Set via
+    /// `KACHE_INDEX_AUTO_COMPACT=0`/`=false` or `[cache] index_auto_compact =
+    /// false` to disable. `kache doctor --repair` does both on demand either
+    /// way.
     pub index_auto_compact: bool,
     /// Storage-layout advisories (kunobi-ninja/kache#551): when on (the
     /// default), a cache hit restored by COPY because the storage *layout*

@@ -391,9 +391,29 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let socket = root.path().join("legacy.sock");
             let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
             let server = std::thread::spawn(move || {
                 for _ in 0..2 {
-                    let (mut stream, _) = listener.accept().unwrap();
+                    let (mut stream, _) = kunobi_daemon::readiness::wait_until(
+                        Instant::now() + Duration::from_secs(5),
+                        |_| match listener.accept() {
+                            Ok(peer) => Ok(Some(peer)),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                Ok(None)
+                            }
+                            Err(error) => Err(error),
+                        },
+                    )
+                    .unwrap()
+                    .expect("legacy client never connected");
+                    // macOS can inherit the listener's nonblocking mode.
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
                     let mut request = String::new();
                     std::io::BufReader::new(&stream)
                         .read_line(&mut request)

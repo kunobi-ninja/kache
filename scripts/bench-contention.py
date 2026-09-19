@@ -59,6 +59,7 @@ TOTALS = (
     "lookup_ms",
     "store_ms",
     "startup_ms",
+    "daemon_store_ms",
     "prediction_mismatches",
 )
 
@@ -178,6 +179,7 @@ def aggregate_events(events):
         unit[event["result"]] += 1
     return {
         "results": dict(results),
+        "daemon_stores": sum(bool(e.get("store_handed_off")) for e in builds),
         "cache_errors": sum(
             bool(e.get("store_error") or e.get("lookup_rejection") or e.get("fallback"))
             for e in builds
@@ -337,6 +339,25 @@ def capture_kache_traces(dest):
     return [output.name]
 
 
+def stop_kache(binary, env, dest):
+    """Drain accepted publications before reading events or copying the cache."""
+    with (dest / "daemon-stop.log").open("w") as stream:
+        subprocess.run(
+            [str(binary), "daemon", "stop"],
+            env=env,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+            check=False,
+        )
+    socket = Path(env["KACHE_RUNTIME_DIR"]) / "daemon.sock"
+    deadline = time.monotonic() + 40
+    while socket.exists():
+        if time.monotonic() >= deadline:
+            raise ValueError(f"daemon did not drain; inspect {dest}")
+        time.sleep(0.05)
+
+
 def run_phase(
     args, binary, repos, store, runtime, scheduler, phase, dest, backend="kache"
 ):
@@ -358,9 +379,20 @@ def run_phase(
     sampler = Sampler()
     server = None
     server_log = None
+    kache_stopped = False
     control_env = job_environment(
         args, binary, repos[0], store, runtime, scheduler, backend, repos
     )
+    if backend == "kache" and getattr(args, "daemon", False):
+        with (dest / "daemon-start.log").open("w") as stream:
+            subprocess.run(
+                [str(binary), "daemon", "start"],
+                env=control_env,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+                check=True,
+            )
     if backend == "sccache":
         # Foreground server keeps compiler children in a process group we own.
         server_log = (dest / "server.log").open("w")
@@ -435,6 +467,8 @@ def run_phase(
         wall_ms = (time.monotonic() - started) * 1000
         after = machine()
         if backend == "kache":
+            stop_kache(binary, control_env, dest)
+            kache_stopped = True
             raw = event_window(events_path, offset, prefix, identity)
             (dest / "events.jsonl").write_text(raw)
             aggregate = aggregate_events(
@@ -467,16 +501,8 @@ def run_phase(
         sampler.stop.set()
         sampler.thread.join()
         # Daemon shutdown and statistics collection are outside the timed batch.
-        if backend == "kache":
-            with (dest / "daemon-stop.log").open("w") as stream:
-                subprocess.run(
-                    [str(binary), "daemon", "stop"],
-                    env=control_env,
-                    stdout=stream,
-                    stderr=subprocess.STDOUT,
-                    timeout=30,
-                    check=False,
-                )
+        if backend == "kache" and not kache_stopped:
+            stop_kache(binary, control_env, dest)
         if server is not None:
             try:
                 subprocess.run(
@@ -1003,6 +1029,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--keep-work", action="store_true")
     parser.add_argument(
+        "--daemon", action="store_true",
+        help="start Kache daemons before each timed batch and drain them afterward",
+    )
+    parser.add_argument(
         "--trace-phases",
         action="store_true",
         help="capture real Kache wrapper intervals; diagnostic runs include tracing overhead",
@@ -1043,6 +1073,7 @@ def main():
         "project": args.project,
         "workload": "contention",
         "diagnostic_phase_tracing": args.trace_phases,
+        "daemon": args.daemon,
         "order_seed": args.order_seed,
         "cargo_jobs": args.workload,
         "variant": "full-features"

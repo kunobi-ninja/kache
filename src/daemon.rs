@@ -5998,7 +5998,20 @@ pub fn run_server(config: &Config, provenance: &crate::config::ConfigFileProvena
         .enable_all()
         .build()?;
 
-    rt.block_on(server_main(config, provenance, coord))
+    run_daemon_runtime(rt, server_main(config, provenance, coord))
+}
+
+fn run_daemon_runtime(
+    runtime: tokio::runtime::Runtime,
+    server: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let result = runtime.block_on(server);
+    // The server has already drained handlers and durable uploads. Aborting
+    // GC or migration does not cancel its spawn_blocking work: dropping the
+    // runtime would wait forever and keep the daemon run lock held. This is
+    // the foreground daemon's exit path; the process ends after we return.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
 
 fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandle<()>> {
@@ -8018,14 +8031,12 @@ pub(crate) fn send_stats_request_options(
         STATS_READ_TIMEOUT,
     )?;
 
-    if client_epoch_is_newer(client_epoch, stats.build_epoch) {
-        tracing::info!(
-            daemon_epoch = stats.build_epoch,
-            client_epoch,
-            "stale daemon detected via stats request, restarting"
-        );
-        if restart_daemon_for_stale_client(config)?
-            && let Ok(fresh_stats) = fetch_stats(
+    refresh_stale_stats(
+        stats,
+        client_epoch,
+        || restart_daemon_for_stale_client(config),
+        || {
+            fetch_stats(
                 config,
                 include_entries,
                 include_summaries,
@@ -8033,12 +8044,31 @@ pub(crate) fn send_stats_request_options(
                 window,
                 STATS_REFETCH_TIMEOUT,
             )
-        {
-            return Ok(fresh_stats);
-        }
-    }
+        },
+    )
+}
 
-    Ok(stats)
+fn refresh_stale_stats(
+    stats: StatsResponse,
+    client_epoch: u64,
+    restart: impl FnOnce() -> Result<bool>,
+    refetch: impl FnOnce() -> Result<StatsResponse>,
+) -> Result<StatsResponse> {
+    if !client_epoch_is_newer(client_epoch, stats.build_epoch) {
+        return Ok(stats);
+    }
+    tracing::info!(
+        daemon_epoch = stats.build_epoch,
+        client_epoch,
+        "stale daemon detected via stats request, restarting"
+    );
+    anyhow::ensure!(restart()?, "replacement daemon did not become ready");
+    let fresh = refetch().context("reading replacement daemon stats")?;
+    anyhow::ensure!(
+        !client_epoch_is_newer(client_epoch, fresh.build_epoch),
+        "replacement daemon is still older than this client"
+    );
+    Ok(fresh)
 }
 
 /// One stats round trip: no auto-start, no restart, no retry.
@@ -13082,6 +13112,132 @@ mod tests {
         let resp = daemon.handle_request_sync(&req);
         assert!(resp.ok);
         assert!(resp.stats.is_some());
+    }
+
+    #[test]
+    fn daemon_runtime_exits_while_aborted_maintenance_is_blocked() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = run_daemon_runtime(runtime, async move {
+                let maintenance = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                maintenance.abort();
+                Err(anyhow::anyhow!("server result must survive shutdown"))
+            });
+            stopped_tx.send(result).unwrap();
+        });
+        // Keep the blocking job parked until shutdown reports completion.
+        // Release it even on failure so this regression never hangs the suite.
+        let result = stopped_rx.recv_timeout(Duration::from_secs(10));
+        release_tx.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            result
+                .expect("runtime waited for aborted maintenance")
+                .unwrap_err()
+                .to_string(),
+            "server result must survive shutdown"
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        run_daemon_runtime(runtime, async { Ok(()) }).unwrap();
+    }
+
+    fn stats_at_epoch(epoch: u64) -> StatsResponse {
+        serde_json::from_value(serde_json::json!({
+            "total_size": 0, "max_size": 0, "entry_count": 0,
+            "entries": null, "build_epoch": epoch,
+            "events": { "local_hits": 0, "remote_hits": 0, "misses": 0, "errors": 0,
+                        "total_elapsed_ms": 0 }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn stats_refresh_preserves_current_or_unknown_epoch_without_restart() {
+        for (client, daemon) in [(20, 20), (20, 21), (0, 10), (20, 0)] {
+            let stats = stats_at_epoch(daemon);
+            assert_eq!(
+                refresh_stale_stats(
+                    stats.clone(),
+                    client,
+                    || panic!("current daemon must not restart"),
+                    || panic!("current daemon must not refetch"),
+                )
+                .unwrap(),
+                stats
+            );
+        }
+    }
+
+    #[test]
+    fn stats_refresh_returns_only_the_replacement_response() {
+        let fresh = stats_at_epoch(20);
+        let mut restarted = false;
+        let result = refresh_stale_stats(
+            stats_at_epoch(10),
+            20,
+            || {
+                restarted = true;
+                Ok(true)
+            },
+            || Ok(fresh.clone()),
+        )
+        .unwrap();
+        assert!(restarted);
+        assert_eq!(result, fresh);
+    }
+
+    #[test]
+    fn stats_refresh_rejects_failed_restart_without_refetch() {
+        for restart in [Ok(false), Err(anyhow::anyhow!("spawn failed"))] {
+            let error = refresh_stale_stats(
+                stats_at_epoch(10),
+                20,
+                || restart,
+                || panic!("failed restart must not refetch"),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error.to_string().as_str(),
+                "replacement daemon did not become ready" | "spawn failed"
+            ));
+        }
+    }
+
+    #[test]
+    fn stats_refresh_rejects_missing_or_still_stale_replacement() {
+        let error = refresh_stale_stats(
+            stats_at_epoch(10),
+            20,
+            || Ok(true),
+            || Err(anyhow::anyhow!("socket closed")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "reading replacement daemon stats: socket closed"
+        );
+        let error = refresh_stale_stats(
+            stats_at_epoch(10),
+            20,
+            || Ok(true),
+            || Ok(stats_at_epoch(10)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "replacement daemon is still older than this client"
+        );
     }
 
     #[test]

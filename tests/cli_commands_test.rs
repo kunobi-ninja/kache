@@ -1200,6 +1200,58 @@ fn init_eof_does_not_accept_changes() {
     assert!(!e.cache.join("daemon.sock").exists());
 }
 
+/// A retiring daemon answers once, then keeps its run lock without a socket.
+/// Init must not use that last stats response as proof that caching is running.
+#[cfg(unix)]
+#[test]
+fn init_rejects_stale_stats_when_daemon_replacement_fails() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let e = env();
+    let socket = e.cache.join("daemon.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let run_lock = std::fs::File::create(e.cache.join("daemon.run.lock")).unwrap();
+    run_lock.lock().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut request = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut request)
+            .unwrap();
+        assert!(request.contains("stats"), "{request}");
+        // Remove the listener before replying so restart cannot mistake it
+        // for the replacement. No coordinator PID means recovery cannot kill
+        // this test process, which owns the old daemon's run lock.
+        drop(listener);
+        let response = serde_json::json!({
+            "ok": true, "stats": {
+                "total_size": 0, "max_size": 0, "entry_count": 0,
+                "entries": null, "build_epoch": 1,
+                "events": { "local_hits": 0, "remote_hits": 0, "misses": 0,
+                            "errors": 0, "total_elapsed_ms": 0 }
+            }
+        });
+        writeln!(stream, "{response}").unwrap();
+    });
+    let output = e
+        .cmd()
+        .args(["init", "--yes", "--no-service", "--no-shell"])
+        .env("KACHE_SOCKET_PATH", &socket)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    // Unblock accept if the CLI returned without sending a stats request.
+    drop(UnixStream::connect(&socket));
+    server.join().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(!stdout.contains("Background cache: running"), "{stdout}");
+    assert!(stdout.contains("Background cache setup failed"), "{stdout}");
+}
+
 /// PATH with a fake `systemctl` running `script` and a no-op `loginctl`
 /// first, so service tests never reach the host's systemd.
 #[cfg(target_os = "linux")]

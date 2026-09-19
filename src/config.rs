@@ -1148,6 +1148,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_WINDOWS_HARDLINK",
     "KACHE_SHARED_HARDLINK_RESTORES",
     "KACHE_DEFERRED_DISCOVERY",
+    "KACHE_DAEMON_PUBLISH",
     "KACHE_DEFERRED_DURABILITY",
     "KACHE_AUTO_GC",
     "KACHE_INDEX_AUTO_COMPACT",
@@ -2642,7 +2643,8 @@ impl Config {
     /// Return true when `source_path` matches one of `[cache].exclude`'s glob
     /// patterns from the active config file.
     pub fn source_excluded(source_path: &Path, roots: &[PathBuf]) -> bool {
-        ProjectRules::from_file_config(&Self::load_file_config()).source_excluded(source_path, roots)
+        ProjectRules::from_file_config(&Self::load_file_config())
+            .source_excluded(source_path, roots)
     }
 
     /// First matching user bypass rule for this invocation, or `None`.
@@ -2657,7 +2659,8 @@ impl Config {
     /// any single argument; `env` entries are `NAME=VALUE` for an exact value
     /// or a bare `NAME` for presence alone.
     pub fn user_bypass_reason(crate_name: &str, argv: &[String]) -> Option<String> {
-        ProjectRules::from_file_config(&Self::load_file_config()).user_bypass_reason(crate_name, argv)
+        ProjectRules::from_file_config(&Self::load_file_config())
+            .user_bypass_reason(crate_name, argv)
     }
 
     /// Pure core of [`Self::user_bypass_reason`], with the rule lists and env
@@ -5571,6 +5574,39 @@ remote_key_cache_refresh_secs = 900
             );
         }
         unsafe { std::env::remove_var("KACHE_DEFERRED_DISCOVERY") };
+    }
+
+    #[test]
+    fn daemon_publish_is_on_unless_switched_off() {
+        let _lock = config_path_lock();
+        let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
+        let off: Result<FileConfig> =
+            Ok(toml::from_str("[cache]\ndaemon_publish = false\n").unwrap());
+        let on: Result<FileConfig> =
+            Ok(toml::from_str("[cache]\ndaemon_publish = true\n").unwrap());
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe { std::env::remove_var("KACHE_DAEMON_PUBLISH") };
+        assert!(Config::daemon_publish_enabled(&none));
+        assert!(!Config::daemon_publish_enabled(&off));
+        assert!(Config::daemon_publish_enabled(&on));
+        for (value, expected) in [
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("", true),
+        ] {
+            unsafe { std::env::set_var("KACHE_DAEMON_PUBLISH", value) };
+            assert_eq!(Config::daemon_publish_enabled(&on), expected, "{value:?}");
+            assert_eq!(
+                Config::daemon_publish_enabled(&off),
+                expected,
+                "{value:?} overrides the file"
+            );
+        }
+        unsafe { std::env::remove_var("KACHE_DAEMON_PUBLISH") };
     }
 
     #[test]

@@ -59,6 +59,10 @@ pub struct Event {
     /// kache without the field still deserialize.
     #[serde(default)]
     pub probe_runs: u32,
+    #[serde(default)]
+    pub store_handed_off: bool,
+    #[serde(default)]
+    pub store_error: String,
     /// `category|detail` string on passthrough events (empty otherwise).
     /// The `not-a-compile` category marks probe/query invocations
     /// (`rustc -vV`, `--print`), which run even on a fresh no-op build;

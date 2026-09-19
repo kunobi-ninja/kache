@@ -23,7 +23,10 @@ use crate::scheduler::{self, FlightIdentity, MissGuard};
 use crate::store::{BuildClaim, EntryMeta, KeyLock, Store, StorePutResult};
 
 mod remote;
-use remote::{NegativeReply, acquire_entry, compiler_remote_enabled, maybe_enqueue_upload};
+use remote::{
+    NegativeReply, acquire_entry, compiler_remote_enabled, compiler_upload_enabled,
+    maybe_enqueue_upload,
+};
 
 mod hit;
 use hit::HitCompletion;
@@ -958,7 +961,10 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // User bypass rules (#222): declared per project, evaluated before any key
     // work, same fail-closed contract as `exclude` below — a match only ever
     // means "do not cache".
-    if let Some(reason) = config.project_rules.user_bypass_reason(&crate_name, &parsed.rest) {
+    if let Some(reason) = config
+        .project_rules
+        .user_bypass_reason(&crate_name, &parsed.rest)
+    {
         tracing::debug!("nvcc invocation bypassed by user rule: {reason}");
         return nvcc_passthrough_with_event(
             config,
@@ -1656,7 +1662,10 @@ fn run_cc_inner(
     // User bypass rules (#222): declared per project, evaluated before any key
     // work, same fail-closed contract as `exclude` below — a match only ever
     // means "do not cache".
-    if let Some(reason) = config.project_rules.user_bypass_reason(&crate_name, &parsed.rest) {
+    if let Some(reason) = config
+        .project_rules
+        .user_bypass_reason(&crate_name, &parsed.rest)
+    {
         tracing::debug!("cc invocation bypassed by user rule: {reason}");
         return cc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason);
     }
@@ -2204,6 +2213,11 @@ fn run_cc_inner(
                 );
             }
         }
+    }
+    // A skipped admission or failed snapshot never transfers the memo.
+    // Keep it for the next invocation even when no artifact was stored.
+    if store_candidate {
+        compiler.commit_preprocess_memo(&file_hasher);
     }
     let store_ms = store_start.elapsed().as_millis() as u64;
 
@@ -3222,7 +3236,9 @@ fn run_parsed_rustc(
     // User bypass rules (#222). Same fail-closed contract as `exclude`, and
     // gating the incremental fast path on it too: a bypassed unit must not
     // slip back into caching through the managed-incremental route.
-    let user_bypass = config.project_rules.user_bypass_reason(crate_name, &args.all_args);
+    let user_bypass = config
+        .project_rules
+        .user_bypass_reason(crate_name, &args.all_args);
     let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
 
     if incremental_fast_path_allowed(
@@ -4349,6 +4365,11 @@ fn hand_off_cc_store(
     handoff: CcHandoff<'_>,
 ) -> CcHandoffOutcome {
     use crate::daemon_publish::{Handoff, PublishCcRequest};
+    // Keep volume-local publication on the wrapper until the daemon can
+    // claim and write that same shard.
+    if !volume_cache_dirs_match(store.cache_dir(), &config.cache_dir) {
+        return CcHandoffOutcome::Publish;
+    }
     let snapshots = match crate::daemon_publish::snapshot_for_handoff(config, handoff.files) {
         Ok(snapshots) => snapshots,
         Err(error) => {
@@ -4390,7 +4411,7 @@ fn hand_off_cc_store(
         stdout: handoff.stdout.to_string(),
         stderr: handoff.stderr.to_string(),
         compile_time_ms: handoff.compile_time_ms,
-        publishes_to_remote: handoff.publishes_to_remote,
+        publishes_to_remote: compiler_upload_enabled(config, handoff.publishes_to_remote),
         event,
         memo: handoff.memo,
     };
@@ -11720,6 +11741,17 @@ exit 0
             compiler_remote_enabled(&config, true),
             "readonly is enforced inside send_upload_job, matching rustc"
         );
+    }
+
+    #[test]
+    fn daemon_handoff_preserves_the_wrappers_upload_policy() {
+        let mut config = test_config(PathBuf::from("cache"));
+        assert!(!compiler_upload_enabled(&config, true));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        assert!(compiler_upload_enabled(&config, true));
+        assert!(!compiler_upload_enabled(&config, false));
+        config.remote_readonly = true;
+        assert!(!compiler_upload_enabled(&config, true));
     }
 
     #[test]

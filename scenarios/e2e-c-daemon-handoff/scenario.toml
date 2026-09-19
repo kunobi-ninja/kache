@@ -40,6 +40,7 @@ replace = "edited greeting"
 # Cold: the wrapper compiles once; the entry is the daemon's to write, and
 # it has to be there by the time the phase's report is taken.
 [assertions.cold]
+min_daemon_stores = 1
 min_entries_after = 1
 max_compiler_runs = 1
 max_preprocessor_runs = 1

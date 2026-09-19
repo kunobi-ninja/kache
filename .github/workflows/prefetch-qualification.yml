@@ -1,0 +1,164 @@
+name: Prefetch cold CI qualification
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/prefetch-qualification*.yml
+      - scripts/prefetch-qualification*.py
+  workflow_dispatch:
+    inputs:
+      seed_run_id:
+        description: Completed trusted main-push run containing the immutable seed
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: prefetch-qualification
+  cancel-in-progress: false
+jobs:
+  authorize:
+    if: github.repository == 'kunobi-ninja/kache' && github.ref == 'refs/heads/main'
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    timeout-minutes: 5
+    outputs:
+      seed_run_id: ${{ steps.check.outputs.seed_run_id }}
+      seed_sha: ${{ steps.check.outputs.seed_sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Check qualification admission oracles
+        run: python3 scripts/prefetch-qualification-test.py
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED_RUN_ID: ${{ inputs.seed_run_id }}
+        run: python3 scripts/prefetch-qualification.py authorize --seed-run-id "$SEED_RUN_ID"
+  seed:
+    name: seed
+    needs: authorize
+    if: github.event_name == 'push' && github.ref_protected
+    runs-on: ${{ fromJSON(vars.BENCH_RUNNER_LINUX || '"kunobi-runners"') }}
+    timeout-minutes: 90
+    steps:
+      - name: Record first step before setup
+        run: |
+          mkdir -p "$RUNNER_TEMP/prefetch-seed-result"
+          date --utc --iso-8601=ns > "$RUNNER_TEMP/prefetch-seed-result/first-step.txt"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config \
+            cmake libssl-dev git curl ca-certificates python3
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: 2026.6.9
+          install_args: rust
+          cache: false
+          reshim: false
+      - name: Build the shared Kache binary
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/kache-producer-target
+          RUSTC_WRAPPER: ''
+          RUSTC_WORKSPACE_WRAPPER: ''
+        run: cargo build --release --locked --bin kache
+      - name: Install pinned workload toolchain
+        run: rustup toolchain install 1.90.0 --profile minimal
+      - name: Produce isolated immutable remote
+        run: |
+          python3 scripts/prefetch-qualification.py seed \
+            --root "$RUNNER_TEMP/prefetch-producer" \
+            --output "$RUNNER_TEMP/prefetch-seed-result" \
+            --binary "$RUNNER_TEMP/kache-producer-target/release/kache"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: prefetch-qualification-seed
+          path: ${{ runner.temp }}/prefetch-seed-result/seed.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: prefetch-qualification-producer
+          path: |
+            ${{ runner.temp }}/prefetch-seed-result
+            !${{ runner.temp }}/prefetch-seed-result/seed.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+  off-1:
+    needs: [authorize, seed]
+    if: >-
+      always() && needs.authorize.result == 'success' &&
+      (needs.seed.result == 'success' ||
+      (github.event_name == 'workflow_dispatch' && needs.seed.result == 'skipped'))
+    uses: ./.github/workflows/prefetch-qualification-consumer.yml
+    with:
+      arm: off-1
+      seed_run_id: ${{ needs.authorize.outputs.seed_run_id }}
+      seed_sha: ${{ needs.authorize.outputs.seed_sha }}
+  on-1:
+    needs: [authorize, off-1]
+    uses: ./.github/workflows/prefetch-qualification-consumer.yml
+    with:
+      arm: on-1
+      seed_run_id: ${{ needs.authorize.outputs.seed_run_id }}
+      seed_sha: ${{ needs.authorize.outputs.seed_sha }}
+  on-2:
+    needs: [authorize, on-1]
+    uses: ./.github/workflows/prefetch-qualification-consumer.yml
+    with:
+      arm: on-2
+      seed_run_id: ${{ needs.authorize.outputs.seed_run_id }}
+      seed_sha: ${{ needs.authorize.outputs.seed_sha }}
+  off-2:
+    needs: [authorize, on-2]
+    uses: ./.github/workflows/prefetch-qualification-consumer.yml
+    with:
+      arm: off-2
+      seed_run_id: ${{ needs.authorize.outputs.seed_run_id }}
+      seed_sha: ${{ needs.authorize.outputs.seed_sha }}
+  off-3:
+    needs: [authorize, off-2]
+    uses: ./.github/workflows/prefetch-qualification-consumer.yml
+    with:
+      arm: off-3
+      seed_run_id: ${{ needs.authorize.outputs.seed_run_id }}
+      seed_sha: ${{ needs.authorize.outputs.seed_sha }}
+  on-3:
+    needs: [authorize, off-3]
+    uses: ./.github/workflows/prefetch-qualification-consumer.yml
+    with:
+      arm: on-3
+      seed_run_id: ${{ needs.authorize.outputs.seed_run_id }}
+      seed_sha: ${{ needs.authorize.outputs.seed_sha }}
+  collect:
+    if: always() && needs.authorize.result == 'success'
+    needs: [authorize, off-1, on-1, on-2, off-2, off-3, on-3]
+    runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: prefetch-qualification-*-?
+          path: ${{ runner.temp }}/prefetch-results
+      - name: Collect complete GitHub job durations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED_RUN_ID: ${{ needs.authorize.outputs.seed_run_id }}
+        run: python3 scripts/prefetch-qualification.py collect --output "$RUNNER_TEMP/prefetch-timing" --results "$RUNNER_TEMP/prefetch-results" --seed-run-id "$SEED_RUN_ID"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: prefetch-qualification-job-times
+          path: ${{ runner.temp }}/prefetch-timing
+          if-no-files-found: error
+          retention-days: 14

@@ -37,8 +37,8 @@ CATEGORIES = (
     (
         "bench",
         (
-            r"^scripts/(bench-short|test-bench-short|perf-gate-report)\.py$",
-            r"^scripts/(perf-gate-local|test-perf-gate-local|trace-phases|test-trace-phases)\.py$",
+            r"^scripts/bench/",
+            r"^scripts/(bench-short|perf-gate-report|perf-gate-local|trace-phases)\.py$",
             r"^scripts/install-bench-mbx\.sh$",
             # Every `bench*.yml`: the benchmark is split across several
             # workflows now (the Firefox/Windows arms and the sccache

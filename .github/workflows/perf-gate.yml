@@ -316,7 +316,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/instrument"
           cp target/release/kache-scenario "$RUNNER_TEMP/instrument/kache-scenario"
           cp -R scenarios "$RUNNER_TEMP/instrument/scenarios"
+          # The entry points put scripts/bench on the path relative to their
+          # own location, so the package travels beside them (see
+          # INSTRUMENT_SCRIPTS in scripts/bench/gate_local.py).
           cp scripts/bench-short.py scripts/bench-contention.py scripts/perf-gate-report.py "$RUNNER_TEMP/instrument/"
+          cp -R scripts/bench "$RUNNER_TEMP/instrument/bench"
+          rm -rf "$RUNNER_TEMP/instrument/bench/tests"
 
       - name: Build kache from the merge base
         env:
@@ -419,7 +424,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: renderer
-          sparse-checkout: scripts/perf-gate-report.py
+          sparse-checkout: |
+            scripts/perf-gate-report.py
+            scripts/bench
           sparse-checkout-cone-mode: false
           persist-credentials: false
 

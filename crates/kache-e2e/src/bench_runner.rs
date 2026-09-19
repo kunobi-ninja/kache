@@ -482,7 +482,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
             &profile.name,
             Phase::WarmSameTree.name(),
         );
-        daemon::stop(&kache, &cache_dir);
+        daemon::drain(&kache, &cache_dir)?;
         let (report, raw) = capture_report(
             &kache,
             &cache_dir,
@@ -535,7 +535,7 @@ pub fn run_bench(config: BenchRunConfig) -> Result<()> {
         &profile.name,
         "warm",
     );
-    daemon::stop(&kache, &cache_dir);
+    daemon::drain(&kache, &cache_dir)?;
     let (warm, warm_raw) =
         capture_report(&kache, &cache_dir, &work_dir, Phase::Warm.name(), &clone_b)?;
     let warm_events = read_event_log(&event_log);
@@ -1641,7 +1641,7 @@ fn run_cold_phase(
     trace_keys: bool,
     sh: &Path,
 ) -> Result<(PhaseMetrics, serde_json::Value)> {
-    daemon::stop(kache, cache_dir);
+    daemon::drain(kache, cache_dir)?;
     if cache_dir.exists() {
         std::fs::remove_dir_all(cache_dir).context("clearing cache dir")?;
     }
@@ -1668,7 +1668,7 @@ fn run_cold_phase(
         &profile.name,
         "cold",
     );
-    daemon::stop(kache, cache_dir);
+    daemon::drain(kache, cache_dir)?;
     let (cold, cold_raw) = capture_report(kache, cache_dir, work_dir, Phase::Cold.name(), clone_a)?;
     // Read the raw event log *before* the caller's reset — it carries the
     // passthrough events `kache report` filters out of `all_events`.
@@ -1711,7 +1711,7 @@ fn retry_load_cold(
         "\n[bench] [retry] restoring cold-state cache from {}",
         snapshot.display()
     );
-    daemon::stop(kache, cache_dir);
+    daemon::drain(kache, cache_dir)?;
     source::snapshot_dir(&snapshot, cache_dir)?;
 
     let cold_raw: serde_json::Value = read_json(&report_cold)?;
@@ -1819,7 +1819,7 @@ fn run_pull_bench(
         &profile.name,
         "pull",
     );
-    daemon::stop(kache, cache_dir);
+    daemon::drain(kache, cache_dir)?;
 
     let (pull, pull_raw) = capture_report(kache, cache_dir, work_dir, Phase::Pull.name(), clone_a)?;
     let pull_events = read_event_log(event_log);

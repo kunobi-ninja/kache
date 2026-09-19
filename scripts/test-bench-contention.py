@@ -4,6 +4,7 @@
 import importlib.util
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -20,6 +21,28 @@ spec.loader.exec_module(bench)
 
 
 class ContentionTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "contention runner requires Linux")
+    def test_daemon_drain_waits_for_process_lock_without_a_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "daemon.run.lock"
+            bench.wait_for_daemon_lock(path, 0)
+            with subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl,sys; f=open(sys.argv[1], 'w'); "
+                 "fcntl.flock(f, fcntl.LOCK_EX); print('ready', flush=True); "
+                 "sys.stdin.readline()", str(path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            ) as child:
+                try:
+                    self.assertEqual(child.stdout.readline().strip(), "ready")
+                    with self.assertRaisesRegex(ValueError, "did not drain"):
+                        bench.wait_for_daemon_lock(path, 0)
+                finally:
+                    child.communicate("release\n", timeout=5)
+                self.assertEqual(child.returncode, 0)
+            bench.wait_for_daemon_lock(path, 0)
+            bench.wait_for_daemon_lock(path, 0)
+
     def test_storage_counts_hardlinks_once_and_does_not_follow_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

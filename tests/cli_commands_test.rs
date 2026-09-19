@@ -1201,10 +1201,10 @@ fn init_eof_does_not_accept_changes() {
 }
 
 /// A retiring daemon answers once, then keeps its run lock without a socket.
-/// Init must not use that last stats response as proof that caching is running.
+/// Init must not use that last response as proof that caching is running.
 #[cfg(unix)]
 #[test]
-fn init_rejects_stale_stats_when_daemon_replacement_fails() {
+fn init_rejects_unavailable_daemon_replacement() {
     use std::io::{BufRead, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     let e = env();
@@ -1221,18 +1221,13 @@ fn init_rejects_stale_stats_when_daemon_replacement_fails() {
         std::io::BufReader::new(&stream)
             .read_line(&mut request)
             .unwrap();
-        assert!(request.contains("stats"), "{request}");
+        assert!(request.contains("health"), "{request}");
         // Remove the listener before replying so restart cannot mistake it
         // for the replacement. No coordinator PID means recovery cannot kill
         // this test process, which owns the old daemon's run lock.
         drop(listener);
         let response = serde_json::json!({
-            "ok": true, "stats": {
-                "total_size": 0, "max_size": 0, "entry_count": 0,
-                "entries": null, "build_epoch": 1,
-                "events": { "local_hits": 0, "remote_hits": 0, "misses": 0,
-                            "errors": 0, "total_elapsed_ms": 0 }
-            }
+            "ok": true, "health": { "version": "old", "build_epoch": 1 }
         });
         writeln!(stream, "{response}").unwrap();
     });
@@ -1240,16 +1235,59 @@ fn init_rejects_stale_stats_when_daemon_replacement_fails() {
         .cmd()
         .args(["init", "--yes", "--no-service", "--no-shell"])
         .env("KACHE_SOCKET_PATH", &socket)
+        .env("KACHE_LOG", "warn")
         .timeout(std::time::Duration::from_secs(60))
         .output()
         .unwrap();
-    // Unblock accept if the CLI returned without sending a stats request.
+    // Unblock accept if the CLI returned without sending a readiness request.
     drop(UnixStream::connect(&socket));
     server.join().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success(), "{stdout}");
     assert!(!stdout.contains("Background cache: running"), "{stdout}");
     assert!(stdout.contains("Background cache setup failed"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("daemon did not start after recovery"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn daemon_restart_preserves_another_cache_daemon() {
+    let a = env();
+    let b = env();
+    b.cmd()
+        .args(["daemon", "start"])
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+        .assert()
+        .success();
+    let before = std::fs::read(b.cache.join("daemon.state.json")).unwrap();
+    let before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    let restart = a
+        .cmd()
+        .args(["daemon", "restart"])
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+        .output()
+        .unwrap();
+    let other = b
+        .cmd()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    let after = std::fs::read(b.cache.join("daemon.state.json"));
+    // Clean both fixtures before assertions so failures leave no background work.
+    a.cmd().args(["daemon", "stop"]).output().unwrap();
+    b.cmd().args(["daemon", "stop"]).output().unwrap();
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    let other: serde_json::Value = serde_json::from_slice(&other.stdout).unwrap();
+    assert_eq!(other["daemon_running"], true, "{other}");
+    let after: serde_json::Value = serde_json::from_slice(&after.unwrap()).unwrap();
+    assert_eq!(before["pid"], after["pid"]);
 }
 
 /// PATH with a fake `systemctl` running `script` and a no-op `loginctl`

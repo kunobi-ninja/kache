@@ -375,15 +375,24 @@ fn recover_unhealthy_daemon(socket_path: &Path, reason: &str) -> Result<bool> {
         }
     }
 
-    if daemon_run_lock_is_held(socket_path)? {
-        tracing::warn!(
-            socket = %socket_path.display(),
-            reason,
-            "daemon run lock still held and no recoverable coordinator state was found"
-        );
+    clean_stale_daemon_files(socket_path)
+}
+
+fn clean_stale_daemon_files(socket_path: &Path) -> Result<bool> {
+    let run_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(daemon_run_lock_path(socket_path))
+        .context("opening daemon run lock for cleanup")?;
+    if run_lock.try_lock().is_err() {
+        // launchd may already have restarted the process we stopped. Keep its
+        // socket and coordinator intact; the caller can connect to it instead.
         return Ok(false);
     }
-
+    // Hold the lock through cleanup. Probing and releasing it first lets a
+    // service-manager restart bind a new socket just before we unlink it.
+    // Never unlink either lock file: waiters must keep sharing the same inode.
     let _ = std::fs::remove_file(socket_path);
     let _ = std::fs::remove_file(daemon_state_path(socket_path));
     Ok(true)
@@ -402,6 +411,7 @@ pub(crate) enum Request {
     GcV2(GcRequest),
     RemoteCheck(RemoteCheckRequest),
     Stats(StatsRequest),
+    Health,
     BatchRemoteCheck(BatchRemoteCheckRequest),
     HashFiles(HashFilesRequest),
     LocalLookup(LocalLookupRequest),
@@ -418,7 +428,11 @@ impl Request {
     fn is_build_activity(&self) -> bool {
         !matches!(
             self,
-            Request::Stats(_) | Request::Gc(_) | Request::GcV2(_) | Request::Shutdown
+            Request::Health
+                | Request::Stats(_)
+                | Request::Gc(_)
+                | Request::GcV2(_)
+                | Request::Shutdown
         )
     }
 }
@@ -1141,6 +1155,12 @@ pub struct CompileFinishedRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonHealth {
+    pub version: String,
+    pub build_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatsResponse {
     pub total_size: u64,
     pub max_size: u64,
@@ -1487,6 +1507,8 @@ pub(crate) struct Response {
     pub prefetched: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<StatsResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<DaemonHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_results: Option<Vec<Response>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1512,6 +1534,7 @@ impl Response {
             found: None,
             prefetched: None,
             stats: None,
+            health: None,
             batch_results: None,
             hash_results: None,
             local_lookup: None,
@@ -1529,6 +1552,7 @@ impl Response {
             found: None,
             prefetched: None,
             stats: None,
+            health: None,
             batch_results: None,
             hash_results: None,
             local_lookup: None,
@@ -1553,6 +1577,7 @@ impl Response {
             found: None,
             prefetched: None,
             stats: None,
+            health: None,
             batch_results: None,
             hash_results: None,
             local_lookup: None,
@@ -1569,6 +1594,7 @@ impl Response {
             found: None,
             prefetched: None,
             stats: Some(stats),
+            health: None,
             batch_results: None,
             hash_results: None,
             local_lookup: None,
@@ -1585,6 +1611,7 @@ impl Response {
             found: None,
             prefetched: None,
             stats: None,
+            health: None,
             batch_results: Some(results),
             hash_results: None,
             local_lookup: None,
@@ -1601,6 +1628,7 @@ impl Response {
             found: None,
             prefetched: None,
             stats: None,
+            health: None,
             batch_results: None,
             hash_results: Some(results),
             local_lookup: None,
@@ -1617,6 +1645,7 @@ impl Response {
             found: Some(val),
             prefetched: None,
             stats: None,
+            health: None,
             batch_results: None,
             hash_results: None,
             local_lookup: None,
@@ -1633,6 +1662,7 @@ impl Response {
             found: Some(val),
             prefetched: Some(prefetched),
             stats: None,
+            health: None,
             batch_results: None,
             hash_results: None,
             local_lookup: None,
@@ -1656,6 +1686,7 @@ impl Response {
             found: None,
             prefetched: None,
             stats: None,
+            health: None,
             batch_results: None,
             hash_results: None,
             local_lookup: None,
@@ -2893,6 +2924,7 @@ impl Daemon {
         match req {
             Request::Gc(gc) | Request::GcV2(gc) => self.handle_gc(gc),
             Request::Stats(sr) => self.handle_stats(sr),
+            Request::Health => self.handle_health(),
             Request::HashFiles(req) => self.handle_hash_files(req),
             Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
             Request::CompileFinished(req) => self.handle_compile_finished(req),
@@ -2908,6 +2940,16 @@ impl Daemon {
                 )
             }
             Request::Shutdown => Response::ok(),
+        }
+    }
+
+    fn handle_health(&self) -> Response {
+        Response {
+            health: Some(DaemonHealth {
+                version: self.version.clone(),
+                build_epoch: self.build_epoch,
+            }),
+            ..Response::ok()
         }
     }
 
@@ -7456,6 +7498,7 @@ async fn handle_connection_started_at(
                     .await
             }
             Ok(Request::LocalLookup(req)) => daemon.handle_local_lookup(&req).await,
+            Ok(Request::Health) => daemon.handle_health(),
             Ok(Request::Stats(req)) => {
                 let d = Arc::clone(daemon);
                 offload(move || d.handle_stats(&req)).await
@@ -7978,6 +8021,33 @@ pub fn send_compile_finished(socket_path: &std::path::Path, pid: u32, started_at
     }
 }
 
+/// Verify readiness without waiting for store locks, scans or maintenance.
+/// Older daemons reject this request; init then takes its normal restart path.
+pub fn send_health_request(config: &Config) -> Result<DaemonHealth> {
+    refresh_stale_response(
+        fetch_daemon_health(config)?,
+        build_epoch(),
+        |health| health.build_epoch,
+        || restart_daemon_for_stale_client(config),
+        || fetch_daemon_health(config),
+    )
+}
+
+fn fetch_daemon_health(config: &Config) -> Result<DaemonHealth> {
+    let response = send_request_with_timeout(
+        &config.socket_path(),
+        &Request::Health,
+        Duration::from_secs(2),
+    )?;
+    parse_daemon_health(&response)
+}
+
+fn parse_daemon_health(response: &str) -> Result<DaemonHealth> {
+    let response: Response = serde_json::from_str(response)?;
+    anyhow::ensure!(response.ok, "daemon rejected readiness check");
+    response.health.context("daemon omitted readiness response")
+}
+
 /// Send a stats request to the daemon. No auto-start — stats are best-effort.
 /// Returns Err if daemon is unreachable.
 pub fn send_stats_request(
@@ -8031,9 +8101,10 @@ pub(crate) fn send_stats_request_options(
         STATS_READ_TIMEOUT,
     )?;
 
-    refresh_stale_stats(
+    refresh_stale_response(
         stats,
         client_epoch,
+        |stats| stats.build_epoch,
         || restart_daemon_for_stale_client(config),
         || {
             fetch_stats(
@@ -8048,24 +8119,25 @@ pub(crate) fn send_stats_request_options(
     )
 }
 
-fn refresh_stale_stats(
-    stats: StatsResponse,
+fn refresh_stale_response<T>(
+    stats: T,
     client_epoch: u64,
+    epoch: impl Fn(&T) -> u64,
     restart: impl FnOnce() -> Result<bool>,
-    refetch: impl FnOnce() -> Result<StatsResponse>,
-) -> Result<StatsResponse> {
-    if !client_epoch_is_newer(client_epoch, stats.build_epoch) {
+    refetch: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !client_epoch_is_newer(client_epoch, epoch(&stats)) {
         return Ok(stats);
     }
     tracing::info!(
-        daemon_epoch = stats.build_epoch,
+        daemon_epoch = epoch(&stats),
         client_epoch,
-        "stale daemon detected via stats request, restarting"
+        "stale daemon detected, restarting"
     );
     anyhow::ensure!(restart()?, "replacement daemon did not become ready");
-    let fresh = refetch().context("reading replacement daemon stats")?;
+    let fresh = refetch().context("reading replacement daemon response")?;
     anyhow::ensure!(
-        !client_epoch_is_newer(client_epoch, fresh.build_epoch),
+        !client_epoch_is_newer(client_epoch, epoch(&fresh)),
         "replacement daemon is still older than this client"
     );
     Ok(fresh)
@@ -8148,18 +8220,9 @@ const DAEMON_EXE_NAME: &str = "kache";
 
 /// Does `ps -o comm=` output name the kache executable itself?
 ///
-/// `pgrep -f` matches against the whole command line, so it also returns
-/// processes that merely *mention* `kache daemon run` — most importantly the
-/// shell or wrapper script that launched the daemon
-/// (`sh -c "kache daemon run"` carries the string in its own argv). Since
-/// `find_daemon_pids` feeds `force_recover`, which SIGTERMs then SIGKILLs
-/// every PID it returns, a command-line match means "nuclear recovery" can
-/// kill the user's script or interactive shell.
-///
-/// macOS reports a full path here and Linux a bare name, so compare on the
-/// file name. Deliberately strict: a renamed binary is missed and recovery
-/// falls through to wiping the stale coordination files, which is recoverable.
-/// Killing the wrong process is not.
+/// Command-line matching also finds shells that mention `kache daemon run`.
+/// Diagnostics should count only actual daemon executables. macOS reports a
+/// full path and Linux a bare name, so compare the final path component.
 #[cfg(unix)]
 fn comm_is_daemon_exe(comm: &str) -> bool {
     let comm = comm.trim();
@@ -8252,8 +8315,7 @@ pub fn find_daemon_pids() -> Vec<u32> {
 ///
 /// The Windows enumeration filters by image name, which — unlike the Unix
 /// `pgrep -f` path — says nothing about the subcommand, so without this an
-/// in-flight `kache.exe build` looks like a daemon to `force_recover` and gets
-/// killed. Matches `daemon` immediately followed by `run` as argument tokens,
+/// in-flight `kache.exe build` would be counted as a daemon. Matches `daemon` immediately followed by `run` as argument tokens,
 /// so `daemon status` and a bare `daemon` do not qualify.
 ///
 /// Compiled on Windows and in every test build, so the Unix lanes still cover
@@ -8310,41 +8372,25 @@ fn windows_kache_processes() -> Option<Vec<(u32, String)>> {
     saw_command_line.then_some(rows)
 }
 
-/// Nuclear recovery: kill any lingering `kache daemon run` processes, then
-/// wipe stale coordination files (socket, lock files, state json).
-///
-/// Used as the fallback when a regular restart can't produce a reachable
-/// daemon — typically because a zombie process still holds the run lock or
-/// stale lockfiles survived an unclean shutdown.
+/// Recover this cache's daemon while excluding concurrent manual starters.
+/// Service-manager restarts coordinate through the persistent run lock.
 pub fn force_recover(config: &Config) -> Result<()> {
     let socket_path = config.socket_path();
-    let pids = find_daemon_pids();
-
-    if !pids.is_empty() {
-        tracing::info!(?pids, "killing lingering kache daemon processes");
-        for &pid in &pids {
-            crate::platform::terminate_process(pid);
-        }
-        // Give the graceful terminate a moment to land.
-        std::thread::sleep(Duration::from_millis(500));
-        for &pid in &pids {
-            if process_is_alive(pid) {
-                tracing::warn!(pid, "graceful terminate did not land, force-killing");
-                crate::platform::kill_process(pid);
-            }
-        }
-        // Allow the OS a moment to reap zombies and release locks.
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
-    // Remove stale coordination files. Once processes are gone, OS has
-    // released their flocks; wiping these files starts the next daemon
-    // with a clean slate.
-    let _ = std::fs::remove_file(&socket_path);
-    let _ = std::fs::remove_file(daemon_state_path(&socket_path));
-    let _ = std::fs::remove_file(socket_path.with_extension("lock"));
-    let _ = std::fs::remove_file(socket_path.with_extension("run.lock"));
-
+    std::fs::create_dir_all(socket_path.parent().unwrap())?;
+    let start_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(socket_path.with_extension("lock"))
+        .context("opening daemon startup lock for recovery")?;
+    start_lock
+        .try_lock()
+        .context("another daemon startup or recovery is in progress")?;
+    anyhow::ensure!(
+        recover_unhealthy_daemon(&socket_path, "explicit daemon recovery")?
+            || crate::transport::is_reachable(&socket_path),
+        "daemon run lock is held but no reachable or recoverable daemon was found"
+    );
     Ok(())
 }
 
@@ -8353,8 +8399,8 @@ pub fn force_recover(config: &Config) -> Result<()> {
 /// Three-tier recovery strategy:
 /// 1. Prefer the platform service manager (launchd/systemd) when installed —
 ///    it owns the daemon lifecycle and `kickstart -k` cleans its own state.
-/// 2. If that doesn't yield a reachable daemon, do `force_recover` — kill
-///    lingering manually-spawned daemons and wipe stale coordination files
+/// 2. If that doesn't yield a reachable daemon, recover the coordinator for
+///    this cache while preserving its lock files
 ///    (covers the case where a process is alive outside the service manager's
 ///    knowledge).
 /// 3. Finally, spawn a fresh daemon via `start_daemon_background`.
@@ -8363,29 +8409,24 @@ pub fn force_recover(config: &Config) -> Result<()> {
 pub fn restart(config: &Config) -> Result<bool> {
     let socket_path = config.socket_path();
 
-    // Tier 1: service manager. Only trust it if the resulting daemon actually
-    // responds to a real request AND no lingering daemon processes remain.
-    // `launchctl kickstart -k` only controls the launchd-spawned process; a
-    // manually-spawned zombie can still hold the socket, making the "restart"
-    // a no-op that looks like success at the socket layer.
+    // Tier 1: service manager. Check this socket's response; other cache
+    // directories may legitimately have their own daemon processes.
     match crate::service::kickstart() {
         Ok(true) => {
             eprintln!("restarting daemon via service manager...");
             if wait_for_socket_until(&socket_path, None, Duration::from_secs(10))? {
-                let responsive = send_stats_request(config, false, None, None).is_ok();
-                let pids = find_daemon_pids();
-                if responsive && pids.len() <= 1 {
+                let responsive = send_health_request(config).is_ok();
+                if responsive {
                     eprintln!("daemon restarted");
                     return Ok(true);
                 }
                 tracing::warn!(
                     responsive,
-                    daemon_pids = ?pids,
-                    "service kickstart reported success but daemon isn't healthy; attempting nuclear recovery"
+                    "service kickstart reported success but daemon isn't healthy; attempting coordinator recovery"
                 );
             } else {
                 tracing::warn!(
-                    "service kickstart completed but socket not ready; attempting nuclear recovery"
+                    "service kickstart completed but socket not ready; attempting coordinator recovery"
                 );
             }
         }
@@ -8393,7 +8434,7 @@ pub fn restart(config: &Config) -> Result<bool> {
             // No service installed — fall through to manual path.
         }
         Err(e) => {
-            tracing::warn!("service kickstart failed: {e:#}; attempting nuclear recovery");
+            tracing::warn!("service kickstart failed: {e:#}; attempting coordinator recovery");
         }
     }
 
@@ -8613,6 +8654,14 @@ fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()>
 /// Returns `Ok(true)` if the daemon is accepting connections,
 /// `Ok(false)` if the timeout elapsed.
 pub fn start_daemon_background() -> Result<bool> {
+    let ready = start_daemon_background_inner()?;
+    if !ready {
+        tracing::warn!("daemon did not start after recovery");
+    }
+    Ok(ready)
+}
+
+fn start_daemon_background_inner() -> Result<bool> {
     let config = Config::load()?;
     let socket_path = config.socket_path();
     let lock_path = socket_path.with_extension("lock");
@@ -8655,23 +8704,9 @@ pub fn start_daemon_background() -> Result<bool> {
         // We hold the lock. Check if daemon is already running.
         if crate::transport::is_reachable(&socket_path) {
             let my_epoch = build_epoch();
-            let is_stale = send_request_with_timeout(
-                &socket_path,
-                &Request::Stats(StatsRequest {
-                    include_entries: false,
-                    include_summaries: false,
-                    sort_by: None,
-                    event_hours: None,
-                    event_secs: None,
-                    client_epoch: my_epoch,
-                }),
-                Duration::from_secs(2),
-            )
-            .ok()
-            .and_then(|s| serde_json::from_str::<Response>(&s).ok())
-            .and_then(|r| r.stats)
-            .map(|s| client_epoch_is_newer(my_epoch, s.build_epoch))
-            .unwrap_or(false);
+            let is_stale = fetch_daemon_health(&config)
+                .map(|health| client_epoch_is_newer(my_epoch, health.build_epoch))
+                .unwrap_or(true);
 
             if !is_stale {
                 tracing::debug!("daemon already running");
@@ -9041,7 +9076,7 @@ fn wait_for_socket_until(
                 child = None;
                 continue;
             }
-            tracing::warn!(
+            tracing::debug!(
                 socket = %socket_path.display(),
                 ?status,
                 "daemon exited before socket became ready"
@@ -9071,7 +9106,7 @@ fn wait_for_socket_until(
         let _ = child.wait();
     }
 
-    tracing::warn!(
+    tracing::debug!(
         socket = %socket_path.display(),
         timeout_ms = timeout.as_millis(),
         "daemon did not start within timeout"
@@ -10818,7 +10853,7 @@ mod tests {
     fn process_comm_reports_the_executable_behind_a_pid() {
         // The executable check is only as good as this lookup: if it silently
         // returned None or a wrong name, find_daemon_pids would quietly match
-        // nothing and force_recover would stop recovering anything at all.
+        // nothing and doctor would miss running daemon processes.
         // A test that only asserts "the bystander was excluded" cannot tell
         // those apart, so pin the lookup itself against the running test
         // process, whose executable name is known.
@@ -10859,7 +10894,7 @@ mod tests {
             r#""C:\Program Files\kache.exe" daemon run"#
         ));
 
-        // Sibling CLI invocations force_recover must not kill.
+        // Sibling CLI invocations must not count as daemon processes.
         assert!(!super::cmdline_is_daemon_run("kache.exe build"));
         assert!(!super::cmdline_is_daemon_run("kache.exe daemon status"));
         assert!(!super::cmdline_is_daemon_run("kache.exe daemon stop"));
@@ -10892,7 +10927,7 @@ mod tests {
         // The negative test below cannot tell "correctly excluded the
         // bystander" from "found nothing at all", which is what a broken
         // lookup or an over-strict filter would do — and finding nothing means
-        // force_recover silently stops recovering. So pin the positive side.
+        // diagnostics silently miss the daemon. Pin the positive side.
         //
         // A real `kache daemon run` cannot be arranged inside a unit test, so
         // stand one up: any executable named `kache`, placed in a directory
@@ -10957,7 +10992,7 @@ mod tests {
     fn find_daemon_pids_ignores_processes_that_merely_mention_the_daemon() {
         // A shell whose command line contains "kache daemon run" — exactly
         // what a wrapper script looks like. `pgrep -f` matches it; the
-        // executable check must drop it, because force_recover SIGKILLs
+        // executable check must exclude it from diagnostics rather than counting
         // everything this function returns.
         //
         // Safe by construction: find_daemon_pids only reads.
@@ -10974,7 +11009,7 @@ mod tests {
 
         assert!(
             !found.contains(&decoy_pid),
-            "force_recover would have killed a non-kache process: {found:?} \
+            "diagnostics counted a non-kache process: {found:?} \
              contains decoy {decoy_pid}"
         );
     }
@@ -13115,6 +13150,114 @@ mod tests {
     }
 
     #[test]
+    fn readiness_reply_requires_success_and_identity() {
+        for response in [
+            "",
+            r#"{"ok":false,"health":{"version":"v1","build_epoch":7}}"#,
+            r#"{"ok":true}"#,
+            r#"{"ok":true,"health":{"version":"v1"}}"#,
+        ] {
+            assert!(parse_daemon_health(response).is_err(), "{response}");
+        }
+        assert_eq!(
+            parse_daemon_health(r#"{"ok":true,"health":{"version":"v1","build_epoch":7}}"#)
+                .unwrap(),
+            DaemonHealth {
+                version: "v1".into(),
+                build_epoch: 7
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Health).unwrap(),
+            r#""health""#
+        );
+        assert!(!Request::Health.is_build_activity());
+    }
+
+    #[tokio::test]
+    async fn readiness_roundtrip_does_not_wait_for_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let busy = daemon.clone();
+        let maintenance = std::thread::spawn(move || {
+            let _guard = busy.store_lock().unwrap().lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let listener = bind_listener(&config.socket_path());
+        let serving = daemon.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            handle_connection(stream, &serving, &AtomicBool::new(false), &Notify::new()).await
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || send_health_request(&config)),
+        )
+        .await;
+        drop(release_tx);
+        maintenance.join().unwrap();
+        server.abort();
+        let _ = server.await;
+        let health = result
+            .expect("readiness waited for the store")
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.version, VERSION);
+        assert_eq!(health.build_epoch, build_epoch());
+        assert_eq!(
+            daemon.handle_request_sync(&Request::Health).health,
+            Some(health)
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_lock_files_and_cleans_only_stale_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket = config.socket_path();
+        let startup = std::fs::File::create(socket.with_extension("lock")).unwrap();
+        let run = std::fs::File::create(daemon_run_lock_path(&socket)).unwrap();
+        fs::write(&socket, "stale socket").unwrap();
+        fs::write(daemon_state_path(&socket), "stale state").unwrap();
+        force_recover(&config).unwrap();
+        assert!(!socket.exists());
+        assert!(!daemon_state_path(&socket).exists());
+        // Holding the original handles must still exclude new openers. Merely
+        // recreating a deleted lock pathname would break that exclusion.
+        startup.lock().unwrap();
+        run.lock().unwrap();
+        assert!(force_recover(&config).is_err());
+        assert!(daemon_run_lock_is_held(&socket).unwrap());
+        startup.unlock().unwrap();
+        assert!(force_recover(&config).is_err());
+    }
+
+    #[test]
+    fn recovery_does_not_unlink_a_service_manager_replacement() {
+        use interprocess::local_socket::traits::Listener as _;
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let socket = config.socket_path();
+        let run = std::fs::File::create(daemon_run_lock_path(&socket)).unwrap();
+        run.lock().unwrap();
+        let listener = bind_sync_listener(&socket);
+        // No recoverable old PID; this endpoint belongs to a new lock owner.
+        let state = daemon_state_path(&socket);
+        fs::write(&state, "replacement marker").unwrap();
+        assert!(!clean_stale_daemon_files(&socket).unwrap());
+        force_recover(&config).unwrap();
+        assert_eq!(fs::read_to_string(&state).unwrap(), "replacement marker");
+        drop(listener.accept().unwrap());
+        assert!(crate::transport::is_reachable(&socket));
+        drop(listener);
+    }
+
+    #[test]
     fn daemon_runtime_exits_while_aborted_maintenance_is_blocked() {
         let (release_tx, release_rx) = mpsc::channel();
         let (started_tx, started_rx) = mpsc::channel();
@@ -13167,9 +13310,10 @@ mod tests {
         for (client, daemon) in [(20, 20), (20, 21), (0, 10), (20, 0)] {
             let stats = stats_at_epoch(daemon);
             assert_eq!(
-                refresh_stale_stats(
+                refresh_stale_response(
                     stats.clone(),
                     client,
+                    |stats| stats.build_epoch,
                     || panic!("current daemon must not restart"),
                     || panic!("current daemon must not refetch"),
                 )
@@ -13183,9 +13327,10 @@ mod tests {
     fn stats_refresh_returns_only_the_replacement_response() {
         let fresh = stats_at_epoch(20);
         let mut restarted = false;
-        let result = refresh_stale_stats(
+        let result = refresh_stale_response(
             stats_at_epoch(10),
             20,
+            |stats| stats.build_epoch,
             || {
                 restarted = true;
                 Ok(true)
@@ -13200,9 +13345,10 @@ mod tests {
     #[test]
     fn stats_refresh_rejects_failed_restart_without_refetch() {
         for restart in [Ok(false), Err(anyhow::anyhow!("spawn failed"))] {
-            let error = refresh_stale_stats(
+            let error = refresh_stale_response(
                 stats_at_epoch(10),
                 20,
+                |stats| stats.build_epoch,
                 || restart,
                 || panic!("failed restart must not refetch"),
             )
@@ -13216,20 +13362,22 @@ mod tests {
 
     #[test]
     fn stats_refresh_rejects_missing_or_still_stale_replacement() {
-        let error = refresh_stale_stats(
+        let error = refresh_stale_response(
             stats_at_epoch(10),
             20,
+            |stats| stats.build_epoch,
             || Ok(true),
             || Err(anyhow::anyhow!("socket closed")),
         )
         .unwrap_err();
         assert_eq!(
             format!("{error:#}"),
-            "reading replacement daemon stats: socket closed"
+            "reading replacement daemon response: socket closed"
         );
-        let error = refresh_stale_stats(
+        let error = refresh_stale_response(
             stats_at_epoch(10),
             20,
+            |stats| stats.build_epoch,
             || Ok(true),
             || Ok(stats_at_epoch(10)),
         )

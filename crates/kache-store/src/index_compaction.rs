@@ -96,15 +96,20 @@ const BUSY_BEFORE_VACUUM: &str = "index is busy; retry compaction after builds f
 const BUSY_AFTER_VACUUM: &str = "index compacted but WAL is busy; retry repair after builds finish";
 const NO_SPACE: &str = "not enough free space to compact the index; its free pages remain reusable";
 
+/// Turn index contention into `when_busy`; every other error stays an error.
+fn busy_as<T>(result: rusqlite::Result<T>, when_busy: T) -> rusqlite::Result<T> {
+    match result {
+        Err(err) if is_busy(&err) => Ok(when_busy),
+        other => other,
+    }
+}
+
 /// TRUNCATE checkpoint; `Ok(false)` when another connection blocked it.
 fn checkpoint(db: &Connection) -> rusqlite::Result<bool> {
-    match db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-        row.get::<_, i64>(0)
-    }) {
-        Ok(busy) => Ok(busy == 0),
-        Err(err) if is_busy(&err) => Ok(false),
-        Err(err) => Err(err),
-    }
+    let ran = db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0).map(|busy| busy == 0)
+    });
+    busy_as(ran, false)
 }
 
 fn attempt(db: &Connection) -> anyhow::Result<Attempt> {
@@ -127,10 +132,8 @@ fn attempt(db: &Connection) -> anyhow::Result<Attempt> {
         return Ok(Attempt::BusyBeforeVacuum);
     }
     let before = std::fs::metadata(path)?.len();
-    match db.execute_batch("VACUUM") {
-        Ok(()) => {}
-        Err(err) if is_busy(&err) => return Ok(Attempt::BusyBeforeVacuum),
-        Err(err) => return Err(err.into()),
+    if !busy_as(db.execute_batch("VACUUM").map(|()| true), false)? {
+        return Ok(Attempt::BusyBeforeVacuum);
     }
     // The file shrinks only once the vacuumed pages leave the WAL.
     if !checkpoint(db)? {
@@ -145,9 +148,9 @@ impl FileHashCache<'_> {
         index_page_stats(self.db())
     }
 
-    /// VACUUM the index when its freelist is large. Blocks other connections
-    /// while it runs, so callers pick a quiet moment; a contended index
-    /// reports `Busy` instead of failing.
+    /// VACUUM the index when its freelist is large. Index reads continue
+    /// while it runs but writes wait, so callers pick a quiet moment; a
+    /// contended index reports `Busy` instead of failing.
     pub fn compact_index(&self) -> anyhow::Result<IndexCompaction> {
         Ok(match attempt(self.db())? {
             Attempt::Done(outcome) => outcome,
@@ -250,6 +253,15 @@ mod tests {
         assert!(!is_busy(&failure(rusqlite::ffi::SQLITE_IOERR)));
         assert!(!is_busy(&failure(rusqlite::ffi::SQLITE_FULL)));
         assert!(!is_busy(&rusqlite::Error::QueryReturnedNoRows));
+
+        assert_eq!(busy_as(Err(failure(rusqlite::ffi::SQLITE_BUSY)), 7), Ok(7));
+        assert_eq!(
+            busy_as(Err(failure(rusqlite::ffi::SQLITE_LOCKED)), 7),
+            Ok(7)
+        );
+        assert_eq!(busy_as(Ok(3), 7), Ok(3));
+        let io = busy_as(Err(failure(rusqlite::ffi::SQLITE_IOERR)), 7).unwrap_err();
+        assert_eq!(io.sqlite_error_code(), Some(ErrorCode::SystemIoFailure));
     }
 
     #[test]

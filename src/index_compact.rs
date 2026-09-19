@@ -29,7 +29,7 @@ pub(crate) const QUIET_MAX_LIVE_BYTES: u64 = 8 << 30;
 /// Delay before the first check, short enough that a daemon living for one
 /// CI job still gets one.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(60);
-const CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const CHECK_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Monotonic record of the last wrapper request the daemon accepted.
 #[derive(Debug)]
@@ -428,6 +428,7 @@ pub(crate) async fn run_at_shutdown(config: Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::store::StoreLock;
 
     const FORCE_CAP: u64 = 1024 * 1024 * 1024;
@@ -439,6 +440,10 @@ mod tests {
         assert_eq!(FORCE_AFTER, Duration::from_secs(21_600));
         assert_eq!(FORCE_MAX_LIVE_BYTES, 1_073_741_824);
         assert_eq!(QUIET_MAX_LIVE_BYTES, 8_589_934_592);
+        assert_eq!(FIRST_CHECK_AFTER, Duration::from_secs(60));
+        assert_eq!(CHECK_INTERVAL, Duration::from_secs(300));
+        // 2026-01-01: a clock stuck at 0 would make every record look fresh.
+        assert!(unix_now_secs() > 1_767_225_600);
     }
 
     #[test]
@@ -730,6 +735,7 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     /// A store whose index holds 80 MiB of dropped rows and little else.
+    #[cfg(unix)]
     fn sparse_store(dir: &Path) -> Config {
         let config = crate::test_support::test_config(dir.to_path_buf());
         let index_path = {
@@ -747,6 +753,7 @@ mod tests {
         config
     }
 
+    #[cfg(unix)]
     fn index_len(config: &Config) -> u64 {
         std::fs::metadata(config.cache_dir.join("index.db"))
             .unwrap()
@@ -761,6 +768,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn hold_permit(config: &Config) -> StoreLock {
         let permits = config.cache_dir.join("scheduler").join("permits");
         std::fs::create_dir_all(&permits).unwrap();

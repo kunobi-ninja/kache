@@ -1548,7 +1548,7 @@ pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as i64)
         .unwrap_or(0);
-    run_cc_inner(config, wrapper_args, start, invocation_start_ns, None)
+    run_cc_inner(config, wrapper_args, start, invocation_start_ns)
 }
 
 /// A C compile that already ran because its key was deferred: the key is
@@ -1574,7 +1574,6 @@ fn run_cc_inner(
     wrapper_args: &[String],
     start: std::time::Instant,
     invocation_start_ns: i64,
-    mut precompiled: Option<CcPrecompiled>,
 ) -> Result<i32> {
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
@@ -1692,6 +1691,49 @@ fn run_cc_inner(
             }
         };
 
+    let invocation = CcStoreInvocation {
+        compiler,
+        parsed,
+        store,
+        fallback_store,
+        crate_name,
+        event_root,
+        start,
+        invocation_start_ns,
+    };
+    run_cc_with_store(config, &invocation, None)
+}
+
+/// Reused after a compile-first miss, including the store connection and
+/// compiler policy that admitted the invocation before it ran.
+struct CcStoreInvocation {
+    compiler: CcCompiler,
+    parsed: crate::compiler::cc::CcArgs,
+    store: Store,
+    fallback_store: Option<Store>,
+    crate_name: String,
+    event_root: String,
+    start: std::time::Instant,
+    invocation_start_ns: i64,
+}
+
+fn run_cc_with_store(
+    config: &Config,
+    invocation: &CcStoreInvocation,
+    mut precompiled: Option<CcPrecompiled>,
+) -> Result<i32> {
+    let CcStoreInvocation {
+        compiler,
+        parsed,
+        store,
+        fallback_store,
+        crate_name,
+        event_root,
+        start,
+        invocation_start_ns,
+    } = invocation;
+    let start = *start;
+    let invocation_start_ns = *invocation_start_ns;
     // Compute the cache key (runs `cc -E -P` for the preprocessor
     // hash). On any failure — preprocessor error, missing compiler —
     // fall back to passthrough, which runs the real compiler and
@@ -1723,13 +1765,13 @@ fn run_cc_inner(
             && config.deferred_discovery
             && config.remote.is_none()
             && config.fallback.is_none()
-            && crate::compiler::cc::cc_direct_key_eligible(&parsed) =>
+            && crate::compiler::cc::cc_direct_key_eligible(parsed) =>
         {
             crate::compiler::cc::CcKeyDiscovery::Deferrable
         }
         None => crate::compiler::cc::CcKeyDiscovery::Expansion,
     };
-    let keyed = compiler.cache_key_with(&parsed, &key_ctx, discovery);
+    let keyed = compiler.cache_key_with(parsed, &key_ctx, discovery);
     let keyed = match keyed {
         Ok(crate::compiler::cc::CcKeyOutcome::Deferred(deferred)) => {
             // No memo describes this unit's read set. Hold the discovery
@@ -1743,7 +1785,7 @@ fn run_cc_inner(
             // taken at once keeps the answer already in hand.
             let keyed = if flight.waited {
                 compiler.cache_key_with(
-                    &parsed,
+                    parsed,
                     &key_ctx,
                     crate::compiler::cc::CcKeyDiscovery::Deferrable,
                 )
@@ -1753,18 +1795,7 @@ fn run_cc_inner(
             let flight = flight.lock;
             match keyed {
                 Ok(crate::compiler::cc::CcKeyOutcome::Deferred(_)) => {
-                    return cc_compile_before_key(
-                        config,
-                        wrapper_args,
-                        &compiler,
-                        &parsed,
-                        &file_hasher,
-                        &crate_name,
-                        &event_root,
-                        start,
-                        invocation_start_ns,
-                        flight,
-                    );
+                    return cc_compile_before_key(config, invocation, &file_hasher, flight);
                 }
                 other => other,
             }
@@ -1785,15 +1816,10 @@ fn run_cc_inner(
             let reason = format!("uncacheable|{e}");
             return if cc_key_error_skips_fallback(&e) {
                 cc_direct_passthrough_with_event(
-                    config,
-                    &parsed,
-                    &crate_name,
-                    &event_root,
-                    start,
-                    reason,
+                    config, parsed, crate_name, event_root, start, reason,
                 )
             } else {
-                cc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason)
+                cc_passthrough_with_event(config, parsed, crate_name, event_root, start, reason)
             };
         }
     };
@@ -1808,7 +1834,7 @@ fn run_cc_inner(
     let lookup = if precompiled.is_some() {
         None
     } else {
-        match lookup_local_entry(&store, fallback_store.as_ref(), &cache_key) {
+        match lookup_local_entry(store, fallback_store.as_ref(), &cache_key) {
             Ok(lookup) => {
                 drop(trace_lookup);
                 lookup
@@ -1821,9 +1847,9 @@ fn run_cc_inner(
                 );
                 return cc_passthrough_with_event(
                     config,
-                    &parsed,
-                    &crate_name,
-                    &event_root,
+                    parsed,
+                    crate_name,
+                    event_root,
                     start,
                     format!("store lookup failed: {e}"),
                 );
@@ -1838,7 +1864,7 @@ fn run_cc_inner(
             tracing::warn!("cc cache entry for {} has no files, evicting", crate_name);
             lookup_rejection = "matching entry has no cached artifacts".to_string();
             let _ = hit_store.remove_entry(&cache_key);
-        } else if let Some(reason) = cc_cache_entry_rejection_reason(&parsed, &meta) {
+        } else if let Some(reason) = cc_cache_entry_rejection_reason(parsed, &meta) {
             tracing::warn!(
                 "cc cache entry for {} lacks artifacts required by this invocation ({reason}), evicting",
                 crate_name,
@@ -1848,7 +1874,7 @@ fn run_cc_inner(
         } else {
             let restore_start = std::time::Instant::now();
             let trace_restore = crate::phase_trace::phase("restore");
-            let restored = restore_cc_from_cache(hit_store, &parsed, &meta);
+            let restored = restore_cc_from_cache(hit_store, parsed, &meta);
             drop(trace_restore);
             if let Err(e) = restored {
                 if e.downcast_ref::<PartialCcRestore>().is_some() {
@@ -1861,9 +1887,9 @@ fn run_cc_inner(
                 );
                 return cc_passthrough_with_event(
                     config,
-                    &parsed,
-                    &crate_name,
-                    &event_root,
+                    parsed,
+                    crate_name,
+                    event_root,
                     start,
                     format!("restore failed: {e}"),
                 );
@@ -1876,8 +1902,8 @@ fn run_cc_inner(
             );
             let trace_report = crate::phase_trace::phase("event_report");
             HitCompletion {
-                event_root: &event_root,
-                crate_name: &crate_name,
+                event_root,
+                crate_name,
                 result: EventResult::LocalHit,
                 cache_key: &cache_key,
                 start,
@@ -1899,13 +1925,13 @@ fn run_cc_inner(
     if precompiled.is_none()
         && let Some(exit) = cc_try_remote_hit(
             config,
-            &store,
-            &compiler,
-            &parsed,
+            store,
+            compiler,
+            parsed,
             &file_hasher,
             &cache_key,
-            &crate_name,
-            &event_root,
+            crate_name,
+            event_root,
             start,
             key_ms,
             lookup_ms,
@@ -1921,9 +1947,9 @@ fn run_cc_inner(
     if precompiled.is_none() && parsed.requires_compiler_output_semantics() {
         return cc_direct_passthrough_with_event(
             config,
-            &parsed,
-            &crate_name,
-            &event_root,
+            parsed,
+            crate_name,
+            event_root,
             start,
             "output appeared before compiler execution",
         );
@@ -1932,12 +1958,12 @@ fn run_cc_inner(
     let (miss_guard, scheduled_hit) = if precompiled.is_none() {
         admit_scheduler_miss(
             config,
-            &store,
+            store,
             &cache_key,
-            FlightIdentity::cc(&crate_name),
-            &crate_name,
+            FlightIdentity::cc(crate_name),
+            crate_name,
             false,
-            |meta| cc_scheduled_hit_ok(&parsed, meta),
+            |meta| cc_scheduled_hit_ok(parsed, meta),
         )
     } else {
         (MissGuard::empty(), None)
@@ -1959,7 +1985,7 @@ fn run_cc_inner(
                     .unwrap_or(false)
                     .then(|| store.get(&cache_key).ok().flatten())
                     .flatten()
-                    .filter(|meta| cc_scheduled_hit_ok(&parsed, meta));
+                    .filter(|meta| cc_scheduled_hit_ok(parsed, meta));
             }
             Err(e) => {
                 tracing::debug!("cc claim_build failed ({e:#}); compiling without a key lock");
@@ -1972,10 +1998,10 @@ fn run_cc_inner(
     // is stored.
     let peer_committed = cc_peer_committed_precompile(precompiled.is_some(), committed.is_some());
     if let Some(meta) = committed.filter(|meta| {
-        cc_restore_committed(precompiled.is_some(), cc_scheduled_hit_ok(&parsed, meta))
+        cc_restore_committed(precompiled.is_some(), cc_scheduled_hit_ok(parsed, meta))
     }) {
         let restore_start = std::time::Instant::now();
-        if let Err(e) = restore_cc_from_cache(&store, &parsed, &meta) {
+        if let Err(e) = restore_cc_from_cache(store, parsed, &meta) {
             if e.downcast_ref::<PartialCcRestore>().is_some() {
                 return Err(e);
             }
@@ -1986,17 +2012,17 @@ fn run_cc_inner(
             );
             return cc_passthrough_with_event(
                 config,
-                &parsed,
-                &crate_name,
-                &event_root,
+                parsed,
+                crate_name,
+                event_root,
                 start,
                 format!("restore failed: {e}"),
             );
         }
         let restore_ms = restore_start.elapsed().as_millis() as u64;
         HitCompletion {
-            event_root: &event_root,
-            crate_name: &crate_name,
+            event_root,
+            crate_name,
             result: EventResult::LocalHit,
             cache_key: &cache_key,
             start,
@@ -2030,7 +2056,7 @@ fn run_cc_inner(
         }
         None => {
             let compile_start = std::time::Instant::now();
-            let result = match compiler.execute(&parsed) {
+            let result = match compiler.execute(parsed) {
                 Ok(r) => r,
                 // A spawn-level failure (missing binary, ENOMEM, fork pressure
                 // under load) must not abort the build: fall back to
@@ -2040,15 +2066,15 @@ fn run_cc_inner(
                 Err(e) => {
                     return cc_passthrough_with_event(
                         config,
-                        &parsed,
-                        &crate_name,
-                        &event_root,
+                        parsed,
+                        crate_name,
+                        event_root,
                         start,
                         format!("compiler spawn failed: {e}"),
                     );
                 }
             };
-            miss_guard.record_compile_rss(&crate_name);
+            miss_guard.record_compile_rss(crate_name);
             let compile_time_ms = compile_start.elapsed().as_millis() as u64;
             replay_diagnostics(
                 &result.stdout,
@@ -2080,7 +2106,7 @@ fn run_cc_inner(
     if store_candidate && handoff_memo.is_none() {
         compiler.commit_preprocess_memo(&file_hasher);
     }
-    let publishes_to_remote = cc_publishes_to_remote(&parsed);
+    let publishes_to_remote = cc_publishes_to_remote(parsed);
     let admitted = store_admits_compile(config, compile_time_ms, publishes_to_remote);
     let store_decision = cc_store_decision(store_candidate, admitted);
     if store_decision.admission_skipped {
@@ -2093,7 +2119,7 @@ fn run_cc_inner(
     }
     if store_decision.should_store
         && cc_store_revalidates_include_dirs(parsed.mode)
-        && !compiler.include_dir_names_still_match(&parsed)
+        && !compiler.include_dir_names_still_match(parsed)
     {
         tracing::debug!(
             crate_name = %crate_name,
@@ -2101,7 +2127,7 @@ fn run_cc_inner(
         );
     } else if store_decision.should_store {
         let _trace = crate::phase_trace::phase("store");
-        let depinfo_anchor = cc_depinfo_rewrite_root(&parsed);
+        let depinfo_anchor = cc_depinfo_rewrite_root(parsed);
         let target = parsed.cache_target_arch();
         let staging_dir = config
             .daemon_publish
@@ -2112,7 +2138,7 @@ fn run_cc_inner(
             staging_dir.as_deref(),
         ) {
             Ok(prepared) => {
-                let stdout = if crate::compiler::cc::cc_expansion_is_stdout(&parsed) {
+                let stdout = if crate::compiler::cc::cc_expansion_is_stdout(parsed) {
                     ""
                 } else {
                     &result.stdout
@@ -2123,14 +2149,14 @@ fn run_cc_inner(
                 if config.daemon_publish {
                     let handoff = CcHandoff {
                         cache_key: &cache_key,
-                        crate_name: &crate_name,
+                        crate_name,
                         target: &target,
                         files: &prepared.files,
                         stdout,
                         stderr: &result.stderr,
                         compile_time_ms,
                         publishes_to_remote,
-                        event_root: &event_root,
+                        event_root,
                         start,
                         size: result.artifacts.total_size(),
                         key_ms,
@@ -2139,7 +2165,7 @@ fn run_cc_inner(
                         store_start,
                         memo: handoff_memo,
                     };
-                    match hand_off_cc_store(config, &store, &mut _build_lock, handoff) {
+                    match hand_off_cc_store(config, store, &mut _build_lock, handoff) {
                         CcHandoffOutcome::Accepted => {
                             compiler.discard_preprocess_memo();
                             return Ok(result.exit_code);
@@ -2155,7 +2181,7 @@ fn run_cc_inner(
                 }
                 match store.put_with_compile_time_independent(
                     &cache_key,
-                    &crate_name,
+                    crate_name,
                     &[], // crate_types: n/a for cc objects
                     &[], // features: n/a
                     &target,
@@ -2169,13 +2195,13 @@ fn run_cc_inner(
                         store_put = result;
                         // Store grew — throttled size check + detached background GC if over
                         // budget (kunobi-ninja/kache#497). Never blocks the compile path.
-                        maybe_spawn_auto_gc(config, &store);
-                        flush_or_hand_off_durability(config, &store, &cache_key);
+                        maybe_spawn_auto_gc(config, store);
+                        flush_or_hand_off_durability(config, store, &cache_key);
                         maybe_enqueue_upload(
                             config,
-                            &store,
+                            store,
                             &cache_key,
-                            &crate_name,
+                            crate_name,
                             publishes_to_remote,
                         );
                     }
@@ -2211,8 +2237,8 @@ fn run_cc_inner(
     let event_result = event_result_for_store_admission(store_candidate, admitted, store_put);
     log_event_with_store_and_lookup_outcome(
         config,
-        &event_root,
-        &crate_name,
+        event_root,
+        crate_name,
         event_result,
         elapsed,
         compile_time_ms,
@@ -2227,7 +2253,7 @@ fn run_cc_inner(
         store_error,
         lookup_rejection,
     );
-    print_progress(&crate_name, event_result, elapsed, size);
+    print_progress(crate_name, event_result, elapsed, size);
     Ok(result.exit_code)
 }
 
@@ -6241,19 +6267,21 @@ fn preserved_incremental_with_event(
 
 /// A deferred C compile: run the compiler with dependency capture, then key
 /// and store through the ordinary path with the result in hand.
-#[allow(clippy::too_many_arguments)]
 fn cc_compile_before_key(
     config: &Config,
-    wrapper_args: &[String],
-    compiler: &CcCompiler,
-    parsed: &crate::compiler::cc::CcArgs,
+    invocation: &CcStoreInvocation,
     file_hasher: &crate::cache_key::FileHasher<'_>,
-    crate_name: &str,
-    event_root: &str,
-    start: std::time::Instant,
-    invocation_start_ns: i64,
     flight: Option<crate::store::StoreLock>,
 ) -> Result<i32> {
+    let CcStoreInvocation {
+        compiler,
+        parsed,
+        crate_name,
+        event_root,
+        start,
+        ..
+    } = invocation;
+    let start = *start;
     tracing::debug!("no read-set memo for {crate_name}; compiling before keying");
     let compile_start = std::time::Instant::now();
     let (result, inputs) = match compiler.execute_capturing_inputs(parsed, file_hasher) {
@@ -6308,11 +6336,9 @@ fn cc_compile_before_key(
         );
     }
     CC_PRECOMPILED_EXIT.with(|cell| cell.set(Some(exit_code)));
-    let stored = run_cc_inner(
+    let stored = run_cc_with_store(
         config,
-        wrapper_args,
-        start,
-        invocation_start_ns,
+        invocation,
         Some(CcPrecompiled {
             result,
             compile_time_ms,

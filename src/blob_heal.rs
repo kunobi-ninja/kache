@@ -203,14 +203,15 @@ impl Outcome {
 
     /// A refusal is a warning. A repair, or a skip that waiting will not
     /// cure, is worth an info line. The rest repeats every check.
-    fn level(&self) -> tracing::Level {
-        match self {
-            Outcome::Failed { .. } => tracing::Level::WARN,
-            Outcome::Healed { .. } | Outcome::Skipped(SkipReason::TooManyEntries) => {
-                tracing::Level::INFO
-            }
-            _ => tracing::Level::DEBUG,
-        }
+    fn is_refusal(&self) -> bool {
+        matches!(self, Outcome::Failed { .. })
+    }
+
+    fn is_noteworthy(&self) -> bool {
+        matches!(
+            self,
+            Outcome::Healed { .. } | Outcome::Skipped(SkipReason::TooManyEntries)
+        )
     }
 }
 
@@ -278,12 +279,12 @@ fn attempt(config: &Config, trigger: Trigger<'_>, now: u64) -> anyhow::Result<Ou
 pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> Option<Outcome> {
     match attempt(config, trigger, unix_now_secs()) {
         Ok(outcome) => {
-            // `level` is tested directly; a match keeps this dispatch free of
-            // comparisons that only a log capture could check.
-            match outcome.level() {
-                tracing::Level::WARN => tracing::warn!("{}", outcome.describe()),
-                tracing::Level::INFO => tracing::info!("{}", outcome.describe()),
-                _ => tracing::debug!("{}", outcome.describe()),
+            if outcome.is_refusal() {
+                tracing::warn!("{}", outcome.describe());
+            } else if outcome.is_noteworthy() {
+                tracing::info!("{}", outcome.describe());
+            } else {
+                tracing::debug!("{}", outcome.describe());
             }
             Some(outcome)
         }
@@ -474,7 +475,6 @@ mod tests {
 
     #[test]
     fn only_refusals_warn_and_only_repairs_inform() {
-        use tracing::Level;
         let healed = Outcome::Healed {
             probe: BlobRefcountDrift::default(),
             repaired: BlobIndexDrift::default(),
@@ -484,12 +484,10 @@ mod tests {
         let failed = Outcome::Failed {
             reason: String::new(),
         };
-        assert_eq!(failed.level(), Level::WARN);
-        assert_eq!(healed.level(), Level::INFO);
-        assert_eq!(
-            Outcome::Skipped(SkipReason::TooManyEntries).level(),
-            Level::INFO
-        );
+        assert!(failed.is_refusal() && !failed.is_noteworthy());
+        assert!(healed.is_noteworthy() && !healed.is_refusal());
+        let too_many = Outcome::Skipped(SkipReason::TooManyEntries);
+        assert!(too_many.is_noteworthy() && !too_many.is_refusal());
         for quiet in [
             Outcome::NotNeeded,
             Outcome::IndexBusy,
@@ -498,7 +496,7 @@ mod tests {
             Outcome::Skipped(SkipReason::BackingOff),
             Outcome::Skipped(SkipReason::GcRunning),
         ] {
-            assert_eq!(quiet.level(), Level::DEBUG, "{quiet:?}");
+            assert!(!quiet.is_refusal() && !quiet.is_noteworthy(), "{quiet:?}");
         }
     }
 

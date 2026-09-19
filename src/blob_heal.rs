@@ -278,13 +278,12 @@ fn attempt(config: &Config, trigger: Trigger<'_>, now: u64) -> anyhow::Result<Ou
 pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> Option<Outcome> {
     match attempt(config, trigger, unix_now_secs()) {
         Ok(outcome) => {
-            let level = outcome.level();
-            if level == tracing::Level::WARN {
-                tracing::warn!("{}", outcome.describe());
-            } else if level == tracing::Level::INFO {
-                tracing::info!("{}", outcome.describe());
-            } else {
-                tracing::debug!("{}", outcome.describe());
+            // `level` is tested directly; a match keeps this dispatch free of
+            // comparisons that only a log capture could check.
+            match outcome.level() {
+                tracing::Level::WARN => tracing::warn!("{}", outcome.describe()),
+                tracing::Level::INFO => tracing::info!("{}", outcome.describe()),
+                _ => tracing::debug!("{}", outcome.describe()),
             }
             Some(outcome)
         }

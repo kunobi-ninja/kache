@@ -276,8 +276,8 @@ impl Scheduler {
         wait_timeout: Duration,
         poll_interval: Duration,
     ) -> Result<Self> {
-        let root = cache_dir.join("scheduler");
-        fs::create_dir_all(root.join("permits"))?;
+        let root = scheduler_root(cache_dir);
+        fs::create_dir_all(permits_dir(&root))?;
         fs::create_dir_all(root.join("flights"))?;
         fs::create_dir_all(root.join("weights"))?;
         Ok(Self {
@@ -297,7 +297,7 @@ impl Scheduler {
     }
 
     fn permit_path(&self, index: u32) -> PathBuf {
-        self.root.join("permits").join(index.to_string())
+        permits_dir(&self.root).join(index.to_string())
     }
 
     fn join_flight(&self, identity: &FlightIdentity) -> FlightJoin {
@@ -402,6 +402,59 @@ fn try_collect_slots(scheduler: &Scheduler, need: usize) -> Result<Option<Vec<St
         }
     }
     Ok(None)
+}
+
+fn scheduler_root(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("scheduler")
+}
+
+fn permits_dir(root: &Path) -> PathBuf {
+    root.join("permits")
+}
+
+/// Number of permit slots held by running compiles, without waiting.
+///
+/// Walks the slot files that exist rather than `0..pool_size`: a held slot
+/// always has a file, so this covers wrappers that see a different pool size
+/// (a container with a CPU limit), and it never creates a file. A cache whose
+/// scheduler was never used reports `Some(0)`. `None` means the slots could
+/// not be read; treat it as unknown, not as idle.
+///
+/// Each slot is tested with a shared try-lock that is released at once, so
+/// two probes never count each other and a compile polling for a slot loses
+/// at most one poll.
+pub fn permits_in_use(cache_dir: &Path) -> Option<u32> {
+    let root = scheduler_root(cache_dir);
+    let entries = match fs::read_dir(permits_dir(&root)) {
+        Ok(entries) => entries,
+        // Windows reports a file in place of `scheduler/` as not found too.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !root.is_file() => {
+            return Some(0);
+        }
+        Err(_) => return None,
+    };
+    let mut held = 0;
+    for entry in entries {
+        if slot_is_held(&entry.ok()?.path())? {
+            held += 1;
+        }
+    }
+    Some(held)
+}
+
+/// Whether another handle holds the exclusive lock on `path`. `None` when
+/// the file cannot be opened or probed.
+fn slot_is_held(path: &Path) -> Option<bool> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Some(false),
+        Err(std::fs::TryLockError::WouldBlock) => Some(true),
+        Err(std::fs::TryLockError::Error(_)) => None,
+    }
 }
 
 fn wait_for_lock(path: &Path, timeout: Duration, poll: Duration) -> Result<bool> {
@@ -1786,6 +1839,78 @@ mod tests {
             "the wait must be attributed to permit_wait_ms"
         );
         let _ = child.wait();
+    }
+
+    #[test]
+    fn permits_in_use_counts_held_slots() {
+        let dir = temp_cache();
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(0),
+            "a cache whose scheduler never ran is idle"
+        );
+        assert!(
+            !dir.path().join("scheduler").exists(),
+            "the probe must not create lease files"
+        );
+
+        let scheduler = test_scheduler(dir.path(), 4);
+        assert_eq!(permits_in_use(dir.path()), Some(0), "no slot files yet");
+
+        let single = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(permits_in_use(dir.path()), Some(1));
+        let double = scheduler.acquire_permit(2).unwrap();
+        assert_eq!(permits_in_use(dir.path()), Some(3));
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(3),
+            "probing must not disturb held slots"
+        );
+
+        drop(single);
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        drop(double);
+        assert_eq!(permits_in_use(dir.path()), Some(0));
+        assert!(
+            scheduler.acquire_permit(4).is_some(),
+            "the probe must leave every slot free"
+        );
+        let files = fs::read_dir(permits_dir(&scheduler.root)).unwrap().count();
+        assert_eq!(files, 4, "the probe must not add slot files");
+    }
+
+    #[test]
+    fn permits_in_use_is_unknown_when_the_slots_cannot_be_read() {
+        let dir = temp_cache();
+        fs::write(dir.path().join("scheduler"), b"not a directory").unwrap();
+        assert_eq!(permits_in_use(dir.path()), None);
+
+        let dir = temp_cache();
+        fs::create_dir_all(dir.path().join("scheduler")).unwrap();
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(0),
+            "discovery alone creates `scheduler/` without permits"
+        );
+        fs::write(dir.path().join("scheduler/permits"), b"not a directory").unwrap();
+        assert_eq!(permits_in_use(dir.path()), None);
+    }
+
+    #[test]
+    fn slot_is_held_separates_missing_from_unreadable() {
+        let dir = temp_cache();
+        assert_eq!(slot_is_held(&dir.path().join("absent")), Some(false));
+
+        let slot = dir.path().join("0");
+        let lock = StoreLock::try_acquire(&slot).unwrap().unwrap();
+        assert_eq!(slot_is_held(&slot), Some(true));
+        drop(lock);
+        assert_eq!(slot_is_held(&slot), Some(false));
+
+        // A path below a regular file fails to open with something other
+        // than "not found" on Unix.
+        #[cfg(unix)]
+        assert_eq!(slot_is_held(&slot.join("below")), None);
     }
 
     #[test]

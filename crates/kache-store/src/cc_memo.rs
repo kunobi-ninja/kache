@@ -174,47 +174,6 @@ impl FileHashCache<'_> {
         tx.commit()
     }
 
-    /// Compact only during explicit repair. Ordinary opens and GC leave free
-    /// SQLite pages available for reuse without blocking builds for VACUUM.
-    pub fn compact_sparse_index(&self) -> anyhow::Result<Option<(u64, u64)>> {
-        use anyhow::{Context, ensure};
-        let db = self.db();
-        let pages: u64 = db.pragma_query_value(None, "page_count", |row| {
-            row.get::<_, u32>(0).map(u64::from)
-        })?;
-        let free_pages: u64 = db.pragma_query_value(None, "freelist_count", |row| {
-            row.get::<_, u32>(0).map(u64::from)
-        })?;
-        let page_size: u64 =
-            db.pragma_query_value(None, "page_size", |row| row.get::<_, u32>(0).map(u64::from))?;
-        let size = pages.saturating_mul(page_size);
-        if !should_compact(pages, free_pages, page_size) {
-            return Ok(None);
-        }
-        let path = std::path::Path::new(db.path().context("index has no filesystem path")?);
-        let free = kache_fs::volume_usage(path)
-            .context("could not check free space for index compaction")?
-            .free;
-        ensure!(
-            free >= size.saturating_mul(2).saturating_add(64 << 20),
-            "not enough free space to compact the index; its free pages remain reusable"
-        );
-        let checkpoint = || -> rusqlite::Result<i64> {
-            db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
-        };
-        ensure!(
-            checkpoint()? == 0,
-            "index is busy; retry compaction after builds finish"
-        );
-        let before = std::fs::metadata(path)?.len();
-        db.execute_batch("VACUUM")?;
-        ensure!(
-            checkpoint()? == 0,
-            "index compacted but WAL is busy; retry repair after builds finish"
-        );
-        Ok(Some((before, std::fs::metadata(path)?.len())))
-    }
-
     pub fn get_cc_preprocess_memo(
         &self,
         memo_key: &str,
@@ -359,10 +318,6 @@ impl FileHashCache<'_> {
         tx.commit()?;
         Ok((memos, inputs))
     }
-}
-
-fn should_compact(pages: u64, free_pages: u64, page_size: u64) -> bool {
-    free_pages.saturating_mul(page_size) >= 64 << 20 && free_pages >= pages.div_ceil(4)
 }
 
 #[cfg(test)]
@@ -656,14 +611,6 @@ mod tests {
             pages * size,
             old_payload_bytes
         );
-    }
-
-    #[test]
-    fn index_compaction_requires_both_size_and_fraction() {
-        assert!(!should_compact(100_000, 25_000, 1));
-        assert!(!should_compact(1_000_000, 20_000, 4096));
-        assert!(should_compact(65_536, 16_384, 4096));
-        assert!(!should_compact(65_537, 16_384, 4096));
     }
 
     #[test]

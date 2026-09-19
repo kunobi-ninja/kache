@@ -72,6 +72,7 @@ input_predictions = true
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
 | `KACHE_GC_EVICT_SHARED` | `cache.gc_evict_shared` | `false` | Restore namespace-first GC for entries retained by build outputs |
+| `KACHE_INDEX_AUTO_COMPACT` | `cache.index_auto_compact` | `true` | Let the daemon compact `index.db` when free pages dominate it. See [Index compaction](#index-compaction). |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Skip local retention for faster compiles; `0` stores all eligible results |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
 | none | `cache.event_log_max_size` | `10MiB` | Rotate the event log after this size |
@@ -108,6 +109,22 @@ gc_evict_shared = true
 ```
 
 The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this option, GC can drop an entry even though target files still hold all its blocks. The registered store size falls, but disk usage does not. A later build must compile or download that entry again. Explicit `purge` and repair operations remain unconditional regardless of this setting.
+
+### Index compaction
+
+Deleting rows from `index.db` frees pages inside the file but does not shrink it. After a large prune or a schema migration, most of the file can be free pages. The daemon compacts the index with a SQLite `VACUUM` once free pages reach 64 MiB and a quarter of the file.
+
+A `VACUUM` blocks other index users while it runs, so the daemon picks its moment:
+
+- On a quiet machine: no compile holds a scheduler permit, the daemon has received no build request for 60 seconds, and the live part of the index is at most 8 GiB. Stats polling and an open `kache monitor` do not count as build requests. If anything else is using the index at that moment, the attempt stops at once and a later check retries.
+- At daemon shutdown, under the same permit rule, when the live part of the index is at most 1 GiB.
+- On a machine that is never quiet: after the index has stayed over the threshold for 6 hours, and only when the live part is at most 1 GiB. Index reads continue during the rewrite. Index writes wait for it, which at that size is a few seconds, inside the wrappers' normal index timeout. The 6 hours are counted across daemon restarts, in `index-compact.json` in the cache dir.
+
+The daemon checks 60 seconds after it starts and every 5 minutes after that. Compaction never overlaps a GC sweep. It needs free disk of about twice the live index size, not the file size: a 45 GB index with 1 GB live needs about 2 GB. Without that room the attempt is skipped and retried later. The free pages stay reusable in the meantime, so a skipped compaction costs disk space only.
+
+A live index above 8 GiB is never compacted automatically, because the rewrite would hold the index for too long. The daemon logs that it skipped it; run `kache doctor --repair` when no build is running.
+
+Set `cache.index_auto_compact = false` or `KACHE_INDEX_AUTO_COMPACT=0` to turn this off. `kache doctor --repair` compacts on demand either way.
 
 ## Compiler policy
 
@@ -301,7 +318,7 @@ That writes `metrics.otlp.json` and `schema_version` in the directory. `--scenar
 
 ### Machine telemetry
 
-On a host where several jobs share one cache, the payload reports `kache.cache.store.physical_size`: registered blob bytes, the figure GC compares with `kache.cache.store.max`. `kache.cache.store.size` is the sum of logical entry sizes and may differ. It also reports `kache.cache.index.size` (`index.db` plus `-wal`), `kache.cache.index.wal.size`, and `kache.cache.index.rowid_high_water` per table. Last-run GC gauges include duration, pinned and unreclaimable entries, failed evictions, stale WAL snapshot failures, and recently accessed entries skipped before reading their metadata. The shipper adds host identity. The index probe is read-only with a 25 ms lock timeout and omits unavailable figures. `kache stats --json` carries the index figures and GC summary as `index_bytes`, `index_wal_bytes`, `index_rowid_high_water` and `gc`.
+On a host where several jobs share one cache, the payload reports `kache.cache.store.physical_size`: registered blob bytes, the figure GC compares with `kache.cache.store.max`. `kache.cache.store.size` is the sum of logical entry sizes and may differ. It also reports `kache.cache.index.size` (`index.db` plus `-wal`), `kache.cache.index.wal.size`, `kache.cache.index.free.size` (the space `index.db` holds in free pages, which compaction returns to the disk), and `kache.cache.index.rowid_high_water` per table. Last-run GC gauges include duration, pinned and unreclaimable entries, failed evictions, stale WAL snapshot failures, and recently accessed entries skipped before reading their metadata. The shipper adds host identity. The index probe is read-only with a 25 ms lock timeout and omits unavailable figures. `kache stats --json` carries the index figures and GC summary as `index_bytes`, `index_wal_bytes`, `index_rowid_high_water` and `gc`.
 
 `rowid_high_water` reports the largest rowid in each table. Tables written with `INSERT OR REPLACE` (`file_hashes`, `input_predictions`, `eviction_tombstones`) allocate new rowids on replacement, so this value can grow without adding rows. C/C++ memos keep their IDs on update; their high-water value does not count refreshes. Use `kache.cache.index.size` to measure index bytes.
 

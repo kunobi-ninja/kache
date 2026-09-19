@@ -7,6 +7,7 @@ pub mod config;
 pub mod eviction;
 pub mod file_hash;
 pub mod filesystem;
+mod index_compaction;
 pub mod link;
 pub mod markers;
 pub mod opcounts;

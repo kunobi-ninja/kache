@@ -21,6 +21,7 @@ mod fallback_planner;
 mod heartbeat;
 mod identity;
 mod incremental_policy;
+mod index_compact;
 #[cfg(unix)]
 mod init_shell;
 use kache_store::link;

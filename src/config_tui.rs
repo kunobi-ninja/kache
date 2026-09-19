@@ -1938,6 +1938,7 @@ mod tests {
                 deferred_discovery: None,
                 deferred_durability: None,
                 auto_gc: None,
+                index_auto_compact: None,
                 gc_evict_shared: Some(true),
                 storage_layout_advice: None,
                 heartbeat_secs: None,

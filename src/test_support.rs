@@ -63,6 +63,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         deferred_discovery: true,
         deferred_durability: false,
         auto_gc: true,
+        index_auto_compact: true,
         gc_evict_shared: false,
         storage_layout_advice: true,
         heartbeat_secs: 30,

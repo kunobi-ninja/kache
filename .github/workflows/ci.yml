@@ -1432,9 +1432,10 @@ jobs:
     # The signing-runners allowlist pins THIS SHA. Bumping the pin without
     # updating that group's selected_workflows breaks releases SILENTLY — move
     # both in one change; the mirror's README has the one-liner.
-    uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@b43559c8bc0fc6fee5f22e48989e350df823d4db # v2
+    uses: kunobi-ninja/_workflows/.github/workflows/_release-rust.yml@f675b9a98c59e06177df7bc0cf4f7c06e71b183d
     with:
       binary_name: kache
+      cache_windows_sysroot: true
       # Build .deb assets (kache_<version>_{amd64,arm64}.deb) for the apt repo,
       # consumed by .github/workflows/package-publish.yml after release publish.
       # NOTE: requires the _workflows `build_deb` change merged AND the `v10` tag

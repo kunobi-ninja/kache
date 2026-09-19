@@ -43,29 +43,50 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
 /// polls a second is nothing, and a cargo slot is not held 100 ms for nothing.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// What [`join_discovery_flight`] found: the flight, and whether another
+/// process held it first. Only after a wait can the previous holder have
+/// published the read set this process looked for before joining, so a
+/// caller that took the flight at once need not look again.
+pub(crate) struct DiscoveryFlight {
+    pub(crate) lock: Option<StoreLock>,
+    pub(crate) waited: bool,
+}
+
 /// Coalesce dependency discovery before taking a compile flight, a permit or
 /// a cache-key lock. The holder keeps this guard through prediction publish.
 /// Errors and timeout leave the ordinary key/compile path available.
-pub(crate) fn join_discovery(cache_dir: &Path, identity: &str) -> Option<StoreLock> {
+pub(crate) fn join_discovery_flight(cache_dir: &Path, identity: &str) -> DiscoveryFlight {
     let _trace = crate::phase_trace::phase("discovery_flight_wait");
     let path = cache_dir
         .join("scheduler/discovery")
         .join(blake3::hash(identity.as_bytes()).to_hex().as_str());
-    acquire_discovery(&path, WAIT_TIMEOUT, POLL_INTERVAL).unwrap_or_else(|error| {
-        tracing::debug!("discovery flight unavailable: {error:#}");
-        None
-    })
+    match acquire_discovery(&path, WAIT_TIMEOUT, POLL_INTERVAL) {
+        Ok((lock, waited)) => DiscoveryFlight { lock, waited },
+        Err(error) => {
+            tracing::debug!("discovery flight unavailable: {error:#}");
+            DiscoveryFlight {
+                lock: None,
+                waited: false,
+            }
+        }
+    }
 }
 
-fn acquire_discovery(path: &Path, timeout: Duration, poll: Duration) -> Result<Option<StoreLock>> {
+/// Take the flight at `path`, waiting up to `timeout` for its holder. The
+/// flag says whether any wait happened.
+fn acquire_discovery(
+    path: &Path,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<(Option<StoreLock>, bool)> {
     let start = std::time::Instant::now();
     let mut attempt = 0;
     loop {
         if let Some(lock) = StoreLock::try_acquire(path)? {
-            return Ok(Some(lock));
+            return Ok((Some(lock), attempt > 0));
         }
         if start.elapsed() >= timeout {
-            return Ok(None);
+            return Ok((None, true));
         }
         // Back off from 1 ms up to `poll`: a waiter learns of the owner's
         // release within milliseconds instead of half a poll interval.
@@ -1928,40 +1949,50 @@ mod tests {
     fn discovery_flights_hold_until_publish_and_fail_open() {
         let dir = temp_cache();
         let path = dir.path().join("discovery/unit");
-        let owner = acquire_discovery(&path, Duration::ZERO, Duration::ZERO)
-            .unwrap()
-            .unwrap();
-        assert!(
-            acquire_discovery(&path, Duration::from_millis(20), Duration::from_millis(2))
-                .unwrap()
-                .is_none()
-        );
+        let (owner, waited) = acquire_discovery(&path, Duration::ZERO, Duration::ZERO).unwrap();
+        let owner = owner.unwrap();
+        assert!(!waited, "an unheld flight is taken without waiting");
+        let (lock, waited) =
+            acquire_discovery(&path, Duration::from_millis(20), Duration::from_millis(2)).unwrap();
+        assert!(lock.is_none());
+        assert!(waited, "a timed-out join waited");
         let waiter_path = path.clone();
         let waiter = std::thread::spawn(move || {
-            let guard = acquire_discovery(
+            let (guard, waited) = acquire_discovery(
                 &waiter_path,
                 Duration::from_secs(5),
                 Duration::from_millis(2),
             )
             .unwrap();
             assert!(guard.is_some());
+            assert!(waited, "a join that outlived the holder waited");
             assert_eq!(
                 fs::read(waiter_path.with_extension("published")).unwrap(),
                 b"ready"
             );
         });
+        // Let the waiter's first attempt find the flight held, so its join
+        // is a real wait rather than an immediate acquisition.
+        std::thread::sleep(Duration::from_millis(30));
         fs::write(path.with_extension("published"), b"ready").unwrap();
         drop(owner);
         waiter.join().unwrap();
         assert!(
             acquire_discovery(&path, Duration::ZERO, Duration::ZERO)
                 .unwrap()
+                .0
                 .is_some()
         );
         let bad = dir.path().join("not-a-directory");
         fs::write(&bad, b"file").unwrap();
-        assert!(join_discovery(&bad, "unit").is_none());
-        assert!(join_discovery(dir.path(), "different-unit").is_some());
+        let unavailable = join_discovery_flight(&bad, "unit");
+        assert!(unavailable.lock.is_none());
+        assert!(!unavailable.waited);
+        assert!(
+            join_discovery_flight(dir.path(), "different-unit")
+                .lock
+                .is_some()
+        );
     }
 
     #[test]

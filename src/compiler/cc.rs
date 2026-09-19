@@ -4078,7 +4078,7 @@ fn cc_arg_spec_for_token(arg: &str, dialect: Dialect) -> Option<&'static CcArgSp
 /// argument no row matches — the caller treats that as "unsupported
 /// flag, refuse to cache".
 fn classify_cc_flag(arg: &str, dialect: Dialect) -> Option<FlagClass> {
-    static CACHE: OnceLock<HashMap<&'static str, Regex>> = OnceLock::new();
+    static CACHE: OnceLock<crate::compiler::flags::RegexCache> = OnceLock::new();
     crate::compiler::flags::classify_against(
         arg,
         CC_FLAGS,
@@ -4316,6 +4316,22 @@ fn cl_debug_path_inputs(parsed: &CcArgs) -> Option<Vec<String>> {
     Some(out)
 }
 
+thread_local! {
+    /// The prefix maps of the last invocation keyed in this process. One
+    /// wrapper keys the same invocation up to three times (memo lookup, the
+    /// re-check after a discovery flight, the key after a deferred compile)
+    /// and the maps only depend on the arguments, the process environment
+    /// and the configured base dirs.
+    static PREFIX_MAPS_MEMO: std::cell::RefCell<Option<PrefixMapsMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct PrefixMapsMemo {
+    identity: Vec<String>,
+    base_dirs: Vec<String>,
+    maps: Vec<CcPrefixMap>,
+}
+
 /// Prefix maps that make C/C++ objects path-stable across worktrees.
 ///
 /// A `-g` compile bakes paths into DWARF (`DW_AT_comp_dir`) and
@@ -4329,6 +4345,44 @@ fn cl_debug_path_inputs(parsed: &CcArgs) -> Option<Vec<String>> {
 /// object directories do not share a useful project root. Distinct
 /// sentinels avoid collapsing unrelated paths to the same spelling.
 fn cc_prefix_maps(parsed: &CcArgs, configured_base_dirs: &[String]) -> Vec<CcPrefixMap> {
+    // Everything the uncached computation reads besides its arguments.
+    let env = |name: &str| {
+        std::env::var_os(name)
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let mut identity = Vec::with_capacity(parsed.rest.len() + 6);
+    identity.push(parsed.program.clone());
+    identity.extend(parsed.rest.iter().cloned());
+    identity.push(
+        std::env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    );
+    for name in ["KACHE_CC_PATH_NORMALIZE", "KACHE_BASE_DIR", "SDKROOT", "OUT_DIR"] {
+        identity.push(env(name));
+    }
+    let memoized = PREFIX_MAPS_MEMO.with(|memo| {
+        memo.borrow().as_ref().and_then(|last| {
+            (last.identity == identity && last.base_dirs == configured_base_dirs)
+                .then(|| last.maps.clone())
+        })
+    });
+    if let Some(maps) = memoized {
+        return maps;
+    }
+    let maps = cc_prefix_maps_uncached(parsed, configured_base_dirs);
+    PREFIX_MAPS_MEMO.with(|memo| {
+        *memo.borrow_mut() = Some(PrefixMapsMemo {
+            identity,
+            base_dirs: configured_base_dirs.to_vec(),
+            maps: maps.clone(),
+        });
+    });
+    maps
+}
+
+fn cc_prefix_maps_uncached(parsed: &CcArgs, configured_base_dirs: &[String]) -> Vec<CcPrefixMap> {
     // `KACHE_CC_PATH_NORMALIZE=0` disables cc path normalization entirely:
     // no maps → the key hashes raw paths AND `execute` injects no
     // `-ffile-prefix-map`. The conservative escape hatch — cc keys become
@@ -5704,6 +5758,9 @@ struct PendingCcPreprocessMemo {
     /// The maps the expansion and the inputs were hashed under. Revalidation
     /// at commit time has to use the same ones.
     prefix_maps: Vec<CcPrefixMap>,
+    /// The inputs came from a compile's own read set, fingerprinted after
+    /// it ran, rather than from a preprocess that preceded the compile.
+    captured: bool,
 }
 
 /// How the key learns what the translation unit reads.
@@ -6165,12 +6222,38 @@ impl CcCompiler {
         let Some(pending) = self.pending_preprocess_memo.borrow_mut().take() else {
             return;
         };
+        let _trace = crate::phase_trace::phase("memo_commit");
         file_hasher.cc_preprocess_memo_record_if_unchanged(
             &pending.memo_key,
             &pending.preprocessed_hash,
             &pending.fingerprints,
             &|path| cc_mapped_content_hash(path, &pending.prefix_maps),
         );
+    }
+
+    /// The memo a deferred compile would publish, for a daemon to record in
+    /// the wrapper's stead. The inputs were fingerprinted after the compile
+    /// under the too-new guard, so a file written since the invocation
+    /// started already kept the entry from being stored; nothing is left
+    /// to revalidate. Only meaningful when the memo came from a capture:
+    /// an expansion's inputs predate the compile and stay on the
+    /// revalidating [`Self::commit_preprocess_memo`] path.
+    pub(crate) fn captured_preprocess_memo(&self) -> Option<crate::daemon_publish::CcMemoHandoff> {
+        let pending = self.pending_preprocess_memo.borrow();
+        let pending = pending.as_ref()?;
+        if !pending.captured {
+            return None;
+        }
+        Some(crate::daemon_publish::CcMemoHandoff {
+            memo_key: pending.memo_key.clone(),
+            preprocessed_hash: pending.preprocessed_hash.clone(),
+            inputs: pending.fingerprints.clone(),
+        })
+    }
+
+    /// Forget the pending memo: a daemon took it.
+    pub(crate) fn discard_preprocess_memo(&self) {
+        self.pending_preprocess_memo.borrow_mut().take();
     }
 
     /// True when user include-dir names still match the digest folded into
@@ -6869,6 +6952,7 @@ impl CcCompiler {
                         preprocessed_hash: cc_memo_hash(&digest, captured.path_bound),
                         fingerprints: captured.fingerprints,
                         prefix_maps: prefix_maps.clone(),
+                        captured: true,
                     });
             }
             tracing::trace!(
@@ -6938,6 +7022,7 @@ impl CcCompiler {
                         preprocessed_hash: cc_memo_hash(&hash, preprocessed.path_bound),
                         fingerprints,
                         prefix_maps: prefix_maps.clone(),
+                        captured: false,
                     });
             }
             tracing::trace!(

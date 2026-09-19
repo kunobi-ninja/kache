@@ -78,6 +78,21 @@ pub(crate) struct PublishCcRequest {
     /// The build event the wrapper would have logged, with the store fields
     /// still empty. The daemon fills them in and writes it.
     pub event: BuildEvent,
+    /// The read-set memo of a deferred compile, recorded here instead of in
+    /// the wrapper: a hundred-row write transaction the next compile of the
+    /// build script would otherwise wait for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<CcMemoHandoff>,
+}
+
+/// A preprocess memo as the wrapper captured it: the fingerprints and
+/// content hashes of everything the compile read, under the key of its
+/// arguments.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct CcMemoHandoff {
+    pub memo_key: String,
+    pub preprocessed_hash: String,
+    pub inputs: Vec<crate::cache_key::CcPreprocessMemoInput>,
 }
 
 /// A job the handler accepted: the request plus the key lock it holds.
@@ -247,6 +262,15 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
             event.store_duplicate_blobs = put.duplicate_blobs;
             event.store_new_blobs = put.new_blobs;
             bytes_before.charge(&mut event);
+            if let Some(memo) = &request.memo
+                && let Err(error) = store.file_hash_cache().put_cc_preprocess_memo_inputs(
+                    &memo.memo_key,
+                    &memo.preprocessed_hash,
+                    &memo.inputs,
+                )
+            {
+                tracing::debug!("daemon could not record the cc memo: {error}");
+            }
             crate::wrapper::maybe_spawn_auto_gc(config, store);
             if request.publishes_to_remote && config.remote.is_some() {
                 enqueue_upload(daemon, config, &request);
@@ -393,6 +417,7 @@ pub(crate) fn snapshot_for_handoff(
     config: &Config,
     files: &[(PathBuf, String)],
 ) -> Result<Vec<HandoffFile>> {
+    let _trace = crate::phase_trace::phase("handoff_snapshot");
     let dir = handoff_dir(config);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating handoff directory {}", dir.display()))?;
@@ -405,13 +430,18 @@ pub(crate) fn snapshot_for_handoff(
                 index,
                 handoff_file_name(store_name)
             ));
-            std::fs::copy(source, &target).with_context(|| {
-                format!(
-                    "snapshotting {} for the daemon as {}",
-                    source.display(),
-                    target.display()
-                )
-            })?;
+            // The wrapper's private staging copy is already the snapshot;
+            // a link keeps it past the wrapper's cleanup without another
+            // copy. Across filesystems (or without link support) copy.
+            if std::fs::hard_link(source, &target).is_err() {
+                std::fs::copy(source, &target).with_context(|| {
+                    format!(
+                        "snapshotting {} for the daemon as {}",
+                        source.display(),
+                        target.display()
+                    )
+                })?;
+            }
             snapshots.push(HandoffFile {
                 path: target.to_string_lossy().into_owned(),
                 store_name: store_name.clone(),
@@ -529,6 +559,7 @@ mod tests {
             compile_time_ms: 7,
             publishes_to_remote: false,
             event: crate::events::BuildEvent::new_for_test("a.c", EventResult::Miss),
+            memo: None,
         }
     }
 
@@ -550,7 +581,20 @@ mod tests {
             let d = Arc::clone(&daemon);
             tokio::task::spawn_blocking(move || run_publish_worker(d, rx))
         };
-        let request = handoff_request(&config, &key("accepted"), dir.path());
+        let mut request = handoff_request(&config, &key("accepted"), dir.path());
+        let header = dir.path().join("a.h");
+        std::fs::write(&header, b"#define A 1\n").unwrap();
+        let memo = CcMemoHandoff {
+            memo_key: "m".repeat(64),
+            preprocessed_hash: "p".repeat(64),
+            inputs: vec![crate::cache_key::CcPreprocessMemoInput {
+                name: "a.h".to_string(),
+                fingerprint: crate::cache_key::FileFingerprint::from_path(&header).unwrap(),
+                content: "c".repeat(64),
+                mapped: "d".repeat(64),
+            }],
+        };
+        request.memo = Some(memo.clone());
         let snapshot = PathBuf::from(&request.files[0].path);
         let response = daemon.handle_publish_cc(request.clone()).await;
         assert!(response.ok, "{:?}", response.error);
@@ -565,6 +609,13 @@ mod tests {
         assert_eq!(meta.files.len(), 1);
         assert_eq!(meta.files[0].name, "a.o");
         assert_eq!(meta.stderr, "warning: w\n");
+        let recorded = store
+            .file_hash_cache()
+            .get_cc_preprocess_memo(&memo.memo_key)
+            .unwrap()
+            .expect("the memo is recorded with the entry");
+        assert_eq!(recorded.preprocessed_hash, memo.preprocessed_hash);
+        assert_eq!(recorded.inputs, memo.inputs);
         assert!(
             !snapshot.exists(),
             "the daemon removes the snapshot after the put"
@@ -659,6 +710,7 @@ mod tests {
             compile_time_ms: 1,
             publishes_to_remote: false,
             event: crate::events::BuildEvent::new_for_test("a.c", crate::events::EventResult::Miss),
+            memo: None,
         };
         let started = std::time::Instant::now();
         let outcome = hand_off_cc_publish(&config, &request);

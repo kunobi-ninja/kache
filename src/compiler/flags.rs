@@ -40,6 +40,7 @@
 
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// The *dialect* of flag spellings a compiler driver speaks.
 ///
@@ -150,16 +151,40 @@ pub struct FlagSpec {
 }
 
 /// Build a cache mapping each `Matcher::Regex` pattern in `table` to
-/// its compiled `^pattern$` form.
+/// its `^pattern$` form, compiled on first use.
 ///
 /// Called once per process per table via the caller's `OnceLock`. A
 /// malformed pattern panics with a diagnostic naming the row's
 /// `source`; the [`assert_table_regexes_compile`] test runs in CI to
 /// make production unwraps infallible.
-pub fn build_regex_cache(table: &'static [FlagSpec]) -> HashMap<&'static str, Regex> {
+pub fn build_regex_cache(table: &'static [FlagSpec]) -> RegexCache {
     let mut map = HashMap::with_capacity(table.len());
     for spec in table {
         if let Matcher::Regex(pat) = spec.matcher {
+            map.insert(
+                pat,
+                LazyRegex {
+                    source: spec.source,
+                    compiled: OnceLock::new(),
+                },
+            );
+        }
+    }
+    RegexCache { map }
+}
+
+/// One regex row, compiled the first time an argument reaches it. A table
+/// has a couple of dozen regex rows and a typical compile line reaches a
+/// handful; compiling them all cost every wrapper process a millisecond
+/// or two before it had classified anything.
+pub struct LazyRegex {
+    source: &'static str,
+    compiled: OnceLock<Regex>,
+}
+
+impl LazyRegex {
+    fn get(&self, pat: &str) -> &Regex {
+        self.compiled.get_or_init(|| {
             // Wrap in `(?:…)` before anchoring so a top-level
             // alternation in the row pattern (e.g. `-O[0-3sz]?|-Og`)
             // doesn't bind looser than the anchors. Without the
@@ -167,16 +192,32 @@ pub fn build_regex_cache(table: &'static [FlagSpec]) -> HashMap<&'static str, Re
             // `(^-O[0-3sz]?) | (-Og$)`, accepting `-Ofast` via the
             // first alternative. With it, both halves are anchored.
             let anchored = format!("^(?:{pat})$");
-            let re = Regex::new(&anchored).unwrap_or_else(|e| {
+            Regex::new(&anchored).unwrap_or_else(|e| {
                 panic!(
                     "compiler/flags: invalid regex `{pat}` from {}: {e}",
-                    spec.source
+                    self.source
                 )
-            });
-            map.insert(pat, re);
-        }
+            })
+        })
     }
-    map
+}
+
+/// The regex rows of one flag table, keyed by pattern.
+pub struct RegexCache {
+    map: HashMap<&'static str, LazyRegex>,
+}
+
+impl RegexCache {
+    /// Match `arg` against the row pattern `pat`. A pattern the table
+    /// does not carry is a debug-time bug (the table changed without
+    /// refreshing the cache), never a flag silently accepted.
+    fn is_match(&self, pat: &'static str, source: &str, arg: &str) -> bool {
+        self.map
+            .get(pat)
+            .unwrap_or_else(|| panic!("compiler/flags: regex `{pat}` ({source}) not in cache"))
+            .get(pat)
+            .is_match(arg)
+    }
 }
 
 /// Classify `arg` against `table`. Returns `None` when no row matches
@@ -192,7 +233,7 @@ pub fn build_regex_cache(table: &'static [FlagSpec]) -> HashMap<&'static str, Re
 pub fn classify_against(
     arg: &str,
     table: &'static [FlagSpec],
-    regex_cache: &HashMap<&'static str, Regex>,
+    regex_cache: &RegexCache,
     dialect: Dialect,
 ) -> Option<FlagClass> {
     // See the doc comment: `/x` is a flag only under the MSVC dialect;
@@ -210,19 +251,7 @@ pub fn classify_against(
         let matched = match &spec.matcher {
             Matcher::Exact(s) => arg == *s,
             Matcher::Prefix(s) => arg.starts_with(*s),
-            // The cache is populated lazily by `build_regex_cache`; a
-            // missing entry here means the table changed without
-            // refreshing the cache — debug-time bug, not a flag
-            // we should silently accept.
-            Matcher::Regex(pat) => regex_cache
-                .get(pat)
-                .map(|re| re.is_match(arg))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "compiler/flags: regex `{pat}` ({}) not in cache",
-                        spec.source
-                    )
-                }),
+            Matcher::Regex(pat) => regex_cache.is_match(pat, spec.source, arg),
         };
         if matched {
             return Some(spec.class);
@@ -259,7 +288,6 @@ pub fn assert_table_regexes_compile(table: &'static [FlagSpec]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
 
     static TEST_TABLE: &[FlagSpec] = &[
         FlagSpec {
@@ -288,8 +316,8 @@ mod tests {
         },
     ];
 
-    fn cache() -> &'static HashMap<&'static str, Regex> {
-        static CACHE: OnceLock<HashMap<&'static str, Regex>> = OnceLock::new();
+    fn cache() -> &'static RegexCache {
+        static CACHE: OnceLock<RegexCache> = OnceLock::new();
         CACHE.get_or_init(|| build_regex_cache(TEST_TABLE))
     }
 

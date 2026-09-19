@@ -190,13 +190,39 @@ impl Daemon {
             Ok(Err(error)) => return refused(&format!("claim failed: {error:#}")),
             Err(error) => return refused(&format!("claim task failed: {error}")),
         };
-        match tx.try_send(PublishJob {
-            request,
-            _lock: lock,
-        }) {
+        // Own separate links before acknowledging. A client may time out
+        // after acceptance and remove every path it sent us.
+        let claimed = tokio::task::spawn_blocking(move || {
+            let files = request
+                .files
+                .iter()
+                .map(|file| (PathBuf::from(&file.path), file.store_name.clone()))
+                .collect::<Vec<_>>();
+            let owned = snapshot_for_handoff(&config, &files)?;
+            remove_handoff_files(&request.files);
+            let mut request = request;
+            request.files = owned;
+            Ok::<_, anyhow::Error>(PublishJob {
+                request,
+                _lock: lock,
+            })
+        })
+        .await;
+        let job = match claimed {
+            Ok(Ok(job)) => job,
+            Ok(Err(error)) => return refused(&format!("snapshot failed: {error:#}")),
+            Err(error) => return refused(&format!("snapshot task failed: {error}")),
+        };
+        match tx.try_send(job) {
             Ok(()) => Response::ok(),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => refused("queue full"),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => refused("queue closed"),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => {
+                discard_handoff_files(&job.request);
+                refused("queue full")
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => {
+                discard_handoff_files(&job.request);
+                refused("queue closed")
+            }
         }
     }
 }
@@ -300,9 +326,7 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
 }
 
 fn discard_handoff_files(request: &PublishCcRequest) {
-    for file in &request.files {
-        let _ = std::fs::remove_file(&file.path);
-    }
+    remove_handoff_files(&request.files);
 }
 
 /// Queue the entry for upload the way the wrapper would have: a durable
@@ -388,14 +412,11 @@ pub(crate) enum Handoff {
 pub(crate) fn hand_off_cc_publish(config: &Config, request: &PublishCcRequest) -> Handoff {
     let _trace = crate::phase_trace::phase("store_handoff");
     let socket = config.socket_path();
+    #[cfg(unix)]
     if !socket.exists() {
         return Handoff::Declined("no daemon socket".to_string());
     }
-    match crate::daemon::send_request_with_timeout(
-        &socket,
-        &crate::daemon::Request::PublishCc(Box::new(request.clone())),
-        PUBLISH_HANDOFF_TIMEOUT,
-    ) {
+    match send_handoff(&socket, request, PUBLISH_HANDOFF_TIMEOUT) {
         Ok(line) => match serde_json::from_str::<Response>(&line) {
             Ok(response) if response.ok => Handoff::Accepted,
             Ok(response) => Handoff::Declined(
@@ -407,6 +428,58 @@ pub(crate) fn hand_off_cc_publish(config: &Config, request: &PublishCcRequest) -
         },
         Err(error) => Handoff::Declined(format!("{error:#}")),
     }
+}
+
+/// Bound connection, writes, and reads by the same deadline. The general
+/// daemon client only bounds reads and can spend seconds sending a memo to
+/// a stalled daemon.
+#[cfg(unix)]
+fn send_handoff(socket: &Path, request: &PublishCcRequest, budget: Duration) -> Result<String> {
+    use interprocess::local_socket::{ConnectOptions, traits::Stream as _};
+    use std::io::{Read, Write};
+    let deadline = std::time::Instant::now() + budget;
+    let remaining = || -> std::io::Result<Duration> {
+        deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "cc handoff deadline"))
+    };
+    let mut line = serde_json::to_vec(&crate::daemon::Request::PublishCc(Box::new(
+        request.clone(),
+    )))?;
+    line.push(b'\n');
+    let mut stream = ConnectOptions::new()
+        .name(crate::transport::socket_name(socket)?)
+        .wait_mode(interprocess::ConnectWaitMode::Timeout(remaining()?))
+        .connect_sync()?;
+    let mut pending = line.as_slice();
+    while !pending.is_empty() {
+        stream.set_send_timeout(Some(remaining()?))?;
+        let written = stream.write(pending)?;
+        anyhow::ensure!(written != 0, "daemon closed during handoff write");
+        pending = &pending[written..];
+    }
+    let mut response = Vec::new();
+    loop {
+        stream.set_recv_timeout(Some(remaining()?))?;
+        let mut buffer = [0; 1024];
+        let read = stream.read(&mut buffer)?;
+        anyhow::ensure!(read != 0, "daemon closed before handoff reply");
+        response.extend_from_slice(&buffer[..read]);
+        anyhow::ensure!(response.len() <= 8192, "oversized handoff reply");
+        if response.contains(&b'\n') {
+            return Ok(String::from_utf8(response)?);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn send_handoff(socket: &Path, request: &PublishCcRequest, budget: Duration) -> Result<String> {
+    crate::daemon::send_request_with_timeout(
+        socket,
+        &crate::daemon::Request::PublishCc(Box::new(request.clone())),
+        budget,
+    )
 }
 
 /// Snapshot `files` (each `(source, store_name)`) into the handoff directory
@@ -421,40 +494,25 @@ pub(crate) fn snapshot_for_handoff(
     let dir = handoff_dir(config);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating handoff directory {}", dir.display()))?;
+    // Each request has its own directory. PID-based names can collide with
+    // a previous request still queued in the daemon, or with a reused PID.
+    let batch = tempfile::Builder::new().prefix("cc-").tempdir_in(&dir)?;
     let mut snapshots = Vec::with_capacity(files.len());
-    let result = (|| -> Result<()> {
-        for (index, (source, store_name)) in files.iter().enumerate() {
-            let target = dir.join(format!(
-                "{}-{}-{}",
-                std::process::id(),
-                index,
-                handoff_file_name(store_name)
-            ));
-            // The wrapper's private staging copy is already the snapshot;
-            // a link keeps it past the wrapper's cleanup without another
-            // copy. Across filesystems (or without link support) copy.
-            if std::fs::hard_link(source, &target).is_err() {
-                std::fs::copy(source, &target).with_context(|| {
-                    format!(
-                        "snapshotting {} for the daemon as {}",
-                        source.display(),
-                        target.display()
-                    )
-                })?;
-            }
-            snapshots.push(HandoffFile {
-                path: target.to_string_lossy().into_owned(),
-                store_name: store_name.clone(),
-            });
+    for (index, (source, store_name)) in files.iter().enumerate() {
+        let target = batch
+            .path()
+            .join(format!("{index}-{}", handoff_file_name(store_name)));
+        // Inputs are private staging files, never compiler-owned outputs.
+        if std::fs::hard_link(source, &target).is_err() {
+            std::fs::copy(source, &target)
+                .with_context(|| format!("snapshotting {} for the daemon", source.display()))?;
         }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        for snapshot in &snapshots {
-            let _ = std::fs::remove_file(&snapshot.path);
-        }
-        return Err(error);
+        snapshots.push(HandoffFile {
+            path: target.to_string_lossy().into_owned(),
+            store_name: store_name.clone(),
+        });
     }
+    let _ = batch.keep();
     Ok(snapshots)
 }
 
@@ -475,6 +533,11 @@ fn handoff_file_name(store_name: &str) -> String {
 pub(crate) fn remove_handoff_files(files: &[HandoffFile]) {
     for file in files {
         let _ = std::fs::remove_file(&file.path);
+        if let Some(parent) = Path::new(&file.path).parent() {
+            // Only empty request directories are removed; other snapshots
+            // in the batch keep the directory alive until their turn.
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 }
 
@@ -514,7 +577,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap()
-                .ends_with("-0-a.o")
+                .ends_with("0-a.o")
         );
 
         let missing = dir.path().join("missing.o");
@@ -530,9 +593,10 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(handoff_dir(&config))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name != path.file_name().unwrap())
+            .filter(|name| name != path.parent().unwrap().file_name().unwrap())
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert_eq!(std::fs::read(path).unwrap(), b"object");
         remove_handoff_files(&snapshots);
         assert!(!path.exists());
     }
@@ -693,6 +757,94 @@ mod tests {
         let mut invalid = handoff_request(&config, &key("invalid"), dir.path());
         invalid.cache_key = "nope".to_string();
         assert!(!daemon.handle_publish_cc(invalid).await.ok);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_cleanup_after_a_lost_reply_cannot_remove_queued_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        daemon.publish_queue().set_sender(tx);
+        let request = handoff_request(&config, &key("lost-reply"), dir.path());
+        assert!(daemon.handle_publish_cc(request.clone()).await.ok);
+        // The reply is lost. The client times out, removes its snapshots,
+        // and a subsequent invocation stages different bytes under its PID.
+        remove_handoff_files(&request.files);
+        let replacement = dir.path().join("replacement.o");
+        std::fs::write(&replacement, b"different object").unwrap();
+        let later = snapshot_for_handoff(&config, &[(replacement, "a.o".into())]).unwrap();
+        let job = rx.recv().await.unwrap();
+        assert_ne!(job.request.files, request.files);
+        assert_eq!(
+            std::fs::read(&job.request.files[0].path).unwrap(),
+            b"object bytes"
+        );
+        let store = Store::open(&config).unwrap();
+        publish_one(&daemon, &config, &store, job);
+        assert!(store.get(&request.cache_key).unwrap().is_some());
+        assert_eq!(std::fs::read(&later[0].path).unwrap(), b"different object");
+        remove_handoff_files(&later);
+        assert_eq!(std::fs::read_dir(handoff_dir(&config)).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_budget_covers_a_daemon_that_never_reads_the_request() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let socket = dir.path().join("stalled.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        let mut request = handoff_request(&config, &key("stalled"), dir.path());
+        request.stderr = "x".repeat(1024 * 1024);
+        let start = std::time::Instant::now();
+        assert!(send_handoff(&socket, &request, Duration::from_millis(500)).is_err());
+        let elapsed = start.elapsed();
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+        assert!(elapsed < Duration::from_secs(2), "handoff took {elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_waits_for_a_complete_reply_and_rejects_eof() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        for reply in [b"{\"ok\":true}\n".as_slice(), b""] {
+            let socket = dir.path().join("reply.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                std::io::BufReader::new(&stream)
+                    .read_line(&mut request)
+                    .unwrap();
+                assert!(request.contains("publish_cc"));
+                stream.write_all(reply).unwrap();
+            });
+            let request = handoff_request(&config, &key("reply"), dir.path());
+            let result = send_handoff(&socket, &request, Duration::from_secs(1));
+            if reply.is_empty() {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("before handoff reply")
+                );
+            } else {
+                assert_eq!(result.unwrap(), "{\"ok\":true}\n");
+            }
+            server.join().unwrap();
+            std::fs::remove_file(socket).unwrap();
+        }
     }
 
     #[test]

@@ -360,6 +360,7 @@ Session and GC history are opt-in. `kache telemetry write` reads index rows and 
 | --- | --- | --- | --- |
 | `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `0` | Stop after idle seconds; `0` keeps it running |
 | `KACHE_LOCAL_HIT_DAEMON` | `cache.local_hit_daemon` | `false` | Experimental daemon-assisted local lookup with local fallback |
+| `KACHE_DAEMON_PUBLISH` | `cache.daemon_publish` | `true` | Let a running daemon store completed C/C++ compiles. The wrapper stores locally when the daemon cannot accept the work. |
 | `KACHE_HEARTBEAT_SECS` | `cache.heartbeat_secs` | `30` | Event heartbeat cadence for long miss compiles; `0` disables it |
 | `KACHE_EXPLAIN_MISS` | `cache.explain_miss` | `false` | Record changed key groups on repeat misses |
 | `KACHE_RECORD_SESSIONS` | `cache.record_sessions` | `false` | Make every `kache report` append its session line, as `--record` does, and every GC run append to `telemetry/gc-runs.jsonl` |

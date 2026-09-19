@@ -9,6 +9,10 @@ pub(super) fn compiler_remote_enabled(config: &Config, publishes_to_remote: bool
     publishes_to_remote && config.remote.is_some()
 }
 
+pub(super) fn compiler_upload_enabled(config: &Config, publishes_to_remote: bool) -> bool {
+    compiler_remote_enabled(config, publishes_to_remote) && !config.remote_readonly
+}
+
 pub(super) fn maybe_enqueue_upload(
     config: &Config,
     store: &Store,

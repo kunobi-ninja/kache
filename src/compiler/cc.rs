@@ -4359,7 +4359,12 @@ fn cc_prefix_maps(parsed: &CcArgs, configured_base_dirs: &[String]) -> Vec<CcPre
             .map(|d| d.to_string_lossy().into_owned())
             .unwrap_or_default(),
     );
-    for name in ["KACHE_CC_PATH_NORMALIZE", "KACHE_BASE_DIR", "SDKROOT", "OUT_DIR"] {
+    for name in [
+        "KACHE_CC_PATH_NORMALIZE",
+        "KACHE_BASE_DIR",
+        "SDKROOT",
+        "OUT_DIR",
+    ] {
         identity.push(env(name));
     }
     let memoized = PREFIX_MAPS_MEMO.with(|memo| {

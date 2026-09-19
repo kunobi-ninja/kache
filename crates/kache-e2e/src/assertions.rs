@@ -266,6 +266,13 @@ pub fn apply_metric_assertions(
     // deterministic (counts, not timings) so they gate CI reliably —
     // `max_compiler_runs = 0` is the headline "the cache actually
     // skipped the compile" assertion.
+    if let Some(min) = spec.min_daemon_stores {
+        let stored = phase_events
+            .iter()
+            .filter(|event| event.store_handed_off && event.store_error.is_empty())
+            .count() as u64;
+        checks.push(AssertionCheck::min("min_daemon_stores", min, stored));
+    }
     if let Some(max) = spec.max_compiler_runs {
         let total: u32 = phase_events.iter().map(|e| e.compiler_runs).sum();
         checks.push(AssertionCheck::max("max_compiler_runs", max, total));
@@ -434,6 +441,29 @@ mod tests {
     }
 
     #[test]
+    fn daemon_store_assertion_rejects_fallback_and_failed_publications() {
+        let spec: MetricAssertions = toml::from_str("min_daemon_stores = 1").unwrap();
+        let event = |handed_off, error| {
+            serde_json::from_value::<Event>(serde_json::json!({
+                "crate_name": "foo.c", "result": "miss",
+                "store_handed_off": handed_off, "store_error": error
+            }))
+            .unwrap()
+        };
+        for (events, expected) in [
+            (vec![], false),
+            (vec![event(false, "")], false),
+            (vec![event(true, "disk full")], false),
+            (vec![event(true, "")], true),
+        ] {
+            let checks =
+                apply_metric_assertions(&spec, &summary(1, 0, 1, 0.0), &HashMap::new(), &events);
+            assert_eq!(checks.len(), 1);
+            assert_eq!(checks[0].passed, expected);
+        }
+    }
+
+    #[test]
     fn metric_assertions_only_evaluate_declared_constraints() {
         // Empty spec → no checks at all. Ensures fixtures that declare
         // [assertions.cold] = {} still parse and produce zero noise.
@@ -446,6 +476,7 @@ mod tests {
             min_hit_rate_pct: None,
             min_misses_per_crate: HashMap::new(),
             max_compiler_runs: None,
+            min_daemon_stores: None,
             max_preprocessor_runs: None,
             max_probe_runs: None,
             max_dep_info_runs: None,
@@ -468,6 +499,7 @@ mod tests {
             min_hit_rate_pct: None,
             min_misses_per_crate: HashMap::new(),
             max_compiler_runs: None,
+            min_daemon_stores: None,
             max_preprocessor_runs: None,
             max_probe_runs: None,
             max_dep_info_runs: None,
@@ -533,6 +565,7 @@ mod tests {
             min_hit_rate_pct: None,
             min_misses_per_crate: HashMap::new(),
             max_compiler_runs: None,
+            min_daemon_stores: None,
             max_preprocessor_runs: None,
             max_probe_runs: None,
             max_dep_info_runs: None,
@@ -553,6 +586,7 @@ mod tests {
             min_hit_rate_pct: None,
             min_misses_per_crate: HashMap::new(),
             max_compiler_runs: None,
+            min_daemon_stores: None,
             max_preprocessor_runs: None,
             max_probe_runs: None,
             max_dep_info_runs: None,
@@ -571,6 +605,8 @@ mod tests {
             compiler_runs,
             preprocessor_runs: 0,
             probe_runs: 0,
+            store_handed_off: false,
+            store_error: String::new(),
             dep_info_runs: 0,
             prediction_mismatches: 0,
             passthrough_reason: String::new(),

@@ -2623,6 +2623,10 @@ fn draw_recent_transfers(frame: &mut Frame, state: &mut AppState, area: Rect) {
 
             let (status, status_style) = if evt.ok {
                 ("ok", Style::default().fg(Color::Green))
+            } else if evt.outcome == "not_found"
+                && evt.direction == daemon::TransferDirection::Download
+            {
+                ("MISS", Style::default().fg(Color::Yellow))
             } else {
                 ("FAIL", Style::default().fg(Color::Red))
             };
@@ -3713,6 +3717,25 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn not_found_transfers_render_as_misses() {
+        let mut state = populated_state();
+        let transfer = &mut state.stats_snapshot.recent_transfers[0];
+        transfer.direction = daemon::TransferDirection::Download;
+        transfer.ok = false;
+        transfer.outcome = "not_found".to_string();
+        let screen = rendered_lines(&mut state, Tab::Transfer, 120, 40).join("\n");
+        assert!(screen.contains("MISS"), "{screen}");
+        assert!(!screen.contains("FAIL"), "{screen}");
+        state.stats_snapshot.recent_transfers[0].direction = daemon::TransferDirection::Upload;
+        let screen = rendered_lines(&mut state, Tab::Transfer, 120, 40).join("\n");
+        assert!(screen.contains("FAIL"), "{screen}");
+        state.stats_snapshot.recent_transfers[0].direction = daemon::TransferDirection::Download;
+        state.stats_snapshot.recent_transfers[0].outcome = "error".to_string();
+        let screen = rendered_lines(&mut state, Tab::Transfer, 120, 40).join("\n");
+        assert!(screen.contains("FAIL"), "{screen}");
+    }
+
     fn populated_state() -> AppState {
         let mut state = test_state();
         state.events = vec![
@@ -3728,6 +3751,8 @@ mod tests {
         state.stats_snapshot.total_size = 3_500_000;
         state.stats_loaded = true;
         state.stats_snapshot.recent_transfers = vec![daemon::TransferEvent {
+            prefetch: None,
+            outcome: String::new(),
             schema: 3,
             crate_name: "serde".to_string(),
             direction: daemon::TransferDirection::Upload,

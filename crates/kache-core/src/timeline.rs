@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of [`BuildTimeline`]. A server rejects a record whose schema it
 /// does not know.
-pub const BUILD_TIMELINE_SCHEMA: u32 = 1;
+pub const BUILD_TIMELINE_SCHEMA: u32 = 2;
 
 /// One build session: its compiler invocations and the remote transfers that
 /// belong to it.
@@ -204,6 +204,13 @@ pub struct TimelineTransfer {
     #[serde(default)]
     pub import_ms: u64,
     pub attribution: TransferAttribution,
+    /// Immutable origin captured when this candidate was scheduled. Absent
+    /// on demand downloads and logs older than transfer schema 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch: Option<PrefetchOrigin>,
+    /// `completed`, `not_found`, `error`, or `import_error`; empty for demand downloads, uploads, and old logs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outcome: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -214,10 +221,34 @@ pub enum TransferDirection {
     Download,
 }
 
-/// How a transfer, which carries no session id, was tied to the session.
+/// The plan that scheduled one speculative download. Kept with the task,
+/// so a later build cannot claim a download that was already in flight.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PrefetchOrigin {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    /// Planner-issued ID when available; empty for fallback and unscoped work.
+    pub plan_id: String,
+    /// `advisory`, `fallback`, or `unscoped` (startup or direct requests).
+    #[serde(default)]
+    pub source: String,
+    /// Zero-based order in the request list, before local-hit, in-flight,
+    /// and budget filtering. Planner requests validate their list first;
+    /// direct IPC requests can include rejected keys. None for keys added
+    /// by whole-remote warming.
+    #[serde(default)]
+    pub candidate_rank: Option<u64>,
+    #[serde(default)]
+    pub candidate_source: crate::CandidateSource,
+}
+
+/// How the client tied a transfer to this session.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferAttribution {
+    /// The download task carries this session's immutable plan origin.
+    Session,
     /// Same cache key as one of the session's units.
     Key,
     /// No key match; its time overlaps this session and no other.

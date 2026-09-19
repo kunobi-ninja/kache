@@ -182,7 +182,7 @@ pub(crate) fn decode_submission(
     let decoded = decode_bounded(body, max_decoded)?;
     let record: BuildTimeline = serde_json::from_slice(&decoded)
         .map_err(|error| Rejection::BadBody(format!("not a build timeline: {error}")))?;
-    if record.schema != BUILD_TIMELINE_SCHEMA {
+    if !(1..=BUILD_TIMELINE_SCHEMA).contains(&record.schema) {
         return Err(Rejection::BadBody(format!(
             "unsupported build timeline schema {}",
             record.schema
@@ -716,6 +716,15 @@ mod tests {
     fn limits_match_the_documented_sizes() {
         assert_eq!(DEFAULT_MAX_COMPRESSED_BYTES, 8_388_608);
         assert_eq!(DEFAULT_MAX_DECODED_BYTES, 33_554_432);
+    }
+
+    #[test]
+    fn still_accepts_schema_one_clients() {
+        let json = record_json(1, "legacy");
+        let (record, decoded) =
+            decode_submission(Some("zstd"), &zstd(&json), DEFAULT_MAX_DECODED_BYTES).unwrap();
+        assert_eq!(record.schema, 1);
+        assert_eq!(decoded, json);
     }
 
     #[test]

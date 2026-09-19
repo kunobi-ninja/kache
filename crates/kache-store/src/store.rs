@@ -1504,16 +1504,47 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    index from before it never gained the index and the probe scanned).
 const INDEX_SCHEMA_GENERATION: i64 = 4;
 
+/// Raise the refcount of every blob `cache_key` maps to at least the
+/// references all mappings hold on it. Run before giving this key's
+/// references back.
+///
+/// A mapping can exist for references nobody counted (an older backfill
+/// mapped legacy entries before their migration). Subtracting such a mapping
+/// from a count that only covers the other owners would take one of theirs,
+/// and the blob would be reclaimed while they still need it. Flooring first
+/// can only retain too much, which the blob-index reconcile corrects.
+fn floor_blob_refs_at_mappings(
+    conn: &rusqlite::Connection,
+    cache_key: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE blobs
+         SET refcount = MAX(refcount, (
+             SELECT SUM(refs) FROM entry_blobs WHERE hash = blobs.hash
+         ))
+         WHERE hash IN (
+             SELECT hash FROM entry_blobs WHERE cache_key = ?1
+         )",
+        params![cache_key],
+    )
+}
+
 /// Give back every blob reference `cache_key`'s current mapping holds, then
 /// drop the mapping. Blob rows released to zero are deleted so they do not
 /// read as index drift; their files stay for the orphan sweep, or for the
-/// caller's own re-reference. `MAX(0, ..)` keeps an already drifted row from
-/// going negative.
+/// caller's own re-reference. The floor below already keeps the subtraction
+/// at or above zero; `MAX(0, ..)` stays as a second guard.
 ///
 /// The mapping is the only record of what a generation holds once its
 /// meta.json has been replaced, so dropping it without this release strands
 /// the refcounts: no entry owns them and no eviction can reach them.
+///
+/// Call it before taking the new generation's references. A mapping can
+/// name a blob that has no row (nothing was ever counted for it); released
+/// afterwards, that mapping would consume the reference just taken and
+/// delete the new generation's row.
 fn release_entry_blob_refs(conn: &rusqlite::Connection, cache_key: &str) -> rusqlite::Result<()> {
+    floor_blob_refs_at_mappings(conn, cache_key)?;
     conn.execute(
         "UPDATE blobs
          SET refcount = MAX(0, refcount - COALESCE((
@@ -1539,16 +1570,10 @@ fn release_entry_blob_refs(conn: &rusqlite::Connection, cache_key: &str) -> rusq
     Ok(())
 }
 
-/// Delete an artifact file from an entry directory, clearing the read-only
-/// bit first (Windows refuses to delete a read-only file).
-fn remove_entry_artifact(path: &Path) -> std::io::Result<()> {
-    if let Ok(m) = fs::metadata(path) {
-        let mut perms = m.permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        perms.set_readonly(false);
-        let _ = fs::set_permissions(path, perms);
-    }
-    fs::remove_file(path)
+/// Whether any file `meta` lists still sits in the entry directory rather
+/// than in the blob store.
+fn has_unmigrated_artifacts(entry_dir: &Path, meta: &EntryMeta) -> bool {
+    meta.files.iter().any(|f| entry_dir.join(&f.name).exists())
 }
 
 /// Replace `cache_key`'s rows in `entry_blobs` with one row per unique hash
@@ -1556,17 +1581,17 @@ fn remove_entry_artifact(path: &Path) -> std::io::Result<()> {
 /// Must run inside the caller's registration transaction so the mapping
 /// commits atomically with the entry row and the blob refcounts it mirrors.
 ///
-/// Callers take the new generation's references first. A mapping already
-/// recorded for the key belongs to the generation being replaced, and its
-/// references are released here, so every publisher is net-neutral for the
-/// blobs both generations share (a re-download over a committed entry used
-/// to count them twice).
+/// A publisher that may be replacing a generation calls
+/// [`release_entry_blob_refs`] first, before it takes its own references.
 fn record_entry_blobs(
     conn: &rusqlite::Connection,
     cache_key: &str,
     files: &[CachedFile],
 ) -> rusqlite::Result<()> {
-    release_entry_blob_refs(conn, cache_key)?;
+    conn.execute(
+        "DELETE FROM entry_blobs WHERE cache_key = ?1",
+        params![cache_key],
+    )?;
     for file in files {
         conn.execute(
             "INSERT INTO entry_blobs (cache_key, hash, refs) VALUES (?1, ?2, 1)
@@ -2331,13 +2356,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // A prior generation of this cache_key may still hold blob
         // references, most commonly a stranded row whose removal was
         // refused (#276) and that this put is about to overwrite via
-        // INSERT OR REPLACE. `record_entry_blobs` below releases them in
-        // this same transaction, whatever the row's `committed` state: a
-        // committed-but-stranded row is exactly the shape that funnels back
-        // into put. Pre-#608 rows whose mapping the GC backfill hasn't
-        // materialized yet still slip through (there is nothing to
-        // decrement by); those remain `doctor --repair` / reconcile
-        // territory.
+        // INSERT OR REPLACE. Release them in this same transaction, before
+        // this generation's increments and whatever the row's `committed`
+        // state: a committed-but-stranded row is exactly the shape that
+        // funnels back into put. Pre-#608 rows whose mapping the GC
+        // backfill hasn't materialized yet still slip through (there is
+        // nothing to decrement by); those remain `doctor --repair` /
+        // reconcile territory.
+        release_entry_blob_refs(&tx, cache_key)?;
         for (file, (source, use_source_hardlink)) in meta.files.iter().zip(sources.iter()) {
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
@@ -2505,6 +2531,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let crate_type_str = meta.crate_types.join(",");
         let num_features = meta.features.len() as i64;
         let tx = self.db.unchecked_transaction()?;
+        // A second download of a committed key (two daemons, a retried
+        // prefetch) replaces a generation that already holds references.
+        release_entry_blob_refs(&tx, cache_key)?;
         for cached_file in &meta.files {
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
@@ -2794,6 +2823,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             if inserted == 0 {
                 continue;
             }
+            // No row owned this key, so a mapping still recorded for it is
+            // a leftover whose references nothing else will release.
+            release_entry_blob_refs(&tx, &entry.cache_key)?;
 
             let entry_dir = self.entry_dir(&entry.cache_key);
             for file in &meta.files {
@@ -3139,6 +3171,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             tx.commit()?;
             return Ok(None);
         }
+        // As in the batch import: a mapping without an entry row.
+        release_entry_blob_refs(&tx, cache_key)?;
 
         // One reference per *file*, not per unique hash: `remove_entry` decrements
         // once per `meta.files` element, so an entry listing the same hash twice
@@ -4430,7 +4464,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     params![key],
                     |row| row.get(0),
                 )?;
-                if still_wanted != 0 {
+                // An entry whose artifacts still sit beside meta.json has
+                // references nobody counted yet, and a mapping would claim
+                // they were. `migrate_entry_to_blobs` counts them and moves
+                // the artifacts out; a later pass maps the entry.
+                if still_wanted != 0 && !has_unmigrated_artifacts(&self.entry_dir(key), &meta) {
                     record_entry_blobs(&tx, key, &meta.files)?;
                     updated += 1;
                 }
@@ -4901,6 +4939,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if !still_ours {
             return Ok(RemovalAttempt::Done(None));
         }
+        // A mapping nobody counted must not spend another entry's reference
+        // and unlink a blob that entry still serves from.
+        floor_blob_refs_at_mappings(&tx, cache_key)?;
         tx.execute(
             "DELETE FROM entry_blobs WHERE cache_key = ?1",
             params![cache_key],
@@ -5155,22 +5196,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Migrate a single legacy entry's artifacts into the blob store.
     /// Returns `false`, touching nothing, when no committed row owns the key.
     ///
-    /// An artifact beside meta.json is not proof of a legacy entry. A remote
-    /// download extracts into the same directory before its import, and an
-    /// import keeps the extracted copy of an already present blob until after
-    /// its commit, so a daemon killed in either window leaves the same shape.
-    /// Counting a reference for those strands it: with no entry row, or with
-    /// a mapping that already accounts for the entry's references, nothing
-    /// ever gives the extra count back and eviction cannot free the blob.
+    /// An artifact beside meta.json is not proof of a legacy entry: a remote
+    /// download extracts into the same directory before its import, and a
+    /// daemon killed in that window leaves the same shape. Counting
+    /// references for it strands them, because no entry, and so no eviction,
+    /// ever gives them back.
+    ///
+    /// A committed entry with a leftover import artifact still gains a
+    /// reference it already held. That errs high only, and the daemon's
+    /// blob-index reconcile repairs it.
     fn migrate_entry_to_blobs(&self, meta: &EntryMeta) -> Result<bool> {
-        let entry_dir = self.entry_dir(&meta.cache_key);
-        // Immediate: the ownership reads below must not move before the
-        // writes that depend on them.
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
-        let committed: bool = tx.query_row(
+        let committed: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1 AND committed = 1)",
             params![meta.cache_key],
             |row| row.get(0),
@@ -5178,44 +5214,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if !committed {
             return Ok(false);
         }
-        let had_mapping: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM entry_blobs WHERE cache_key = ?1)",
-            params![meta.cache_key],
-            |row| row.get(0),
-        )?;
-        // Hashes this entry already holds its references to. A mapping with
-        // no blob row is a legacy entry the GC backfill reached first; its
-        // references are still to be counted. Read once, up front, so an
-        // entry listing one hash twice counts it twice.
-        let held: std::collections::HashSet<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT eb.hash FROM entry_blobs eb
-                 JOIN blobs b ON b.hash = eb.hash
-                 WHERE eb.cache_key = ?1",
-            )?;
-            stmt.query_map(params![meta.cache_key], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-
+        let entry_dir = self.entry_dir(&meta.cache_key);
         for cached_file in &meta.files {
             let artifact_path = entry_dir.join(&cached_file.name);
             if !artifact_path.exists() {
                 continue; // Already migrated
             }
             let blob = self.blob_path(&cached_file.hash);
-            if held.contains(&cached_file.hash) {
-                // Leftover copy from an import. Drop it only once the blob is
-                // in place; otherwise leave it and let lookup judge the entry.
-                if blob.is_file() {
-                    remove_entry_artifact(&artifact_path)?;
-                }
-                continue;
-            }
             let blob_dir = blob.parent().unwrap();
             fs::create_dir_all(blob_dir)?;
 
             // Check if blob already exists
-            let existing: Option<i64> = tx
+            let existing: Option<i64> = self
+                .db
                 .query_row(
                     "SELECT refcount FROM blobs WHERE hash = ?1",
                     params![cached_file.hash],
@@ -5224,14 +5235,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 .ok();
 
             if existing.is_some() {
-                // Blob exists: delete artifact, bump refcount
-                remove_entry_artifact(&artifact_path)?;
-                tx.execute(
+                // Blob exists — delete artifact, bump refcount
+                if let Ok(m) = fs::metadata(&artifact_path) {
+                    let mut perms = m.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&artifact_path, perms);
+                }
+                fs::remove_file(&artifact_path)?;
+                self.db.execute(
                     "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
                     params![cached_file.hash],
                 )?;
             } else {
-                // New blob: rename artifact into blob store
+                // New blob — rename artifact into blob store
                 if let Ok(m) = fs::metadata(&artifact_path) {
                     let mut perms = m.permissions();
                     if !perms.readonly() {
@@ -5240,24 +5256,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     }
                 }
                 fs::rename(&artifact_path, &blob)?;
-                let inserted = tx.execute(
+                self.db.execute(
                     "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
                     params![cached_file.hash, cached_file.size as i64],
                 )?;
-                if inserted == 0 {
-                    tx.execute(
+                if self.db.changes() == 0 {
+                    self.db.execute(
                         "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
                         params![cached_file.hash],
                     )?;
                 }
             }
         }
-        // The references counted above need their mapping in the same
-        // transaction, or they are the unowned refcounts this guards against.
-        if !had_mapping {
-            record_entry_blobs(&tx, &meta.cache_key, &meta.files)?;
-        }
-        tx.commit()?;
         Ok(true)
     }
 
@@ -9707,16 +9717,32 @@ mod tests {
                  WHERE NOT EXISTS (SELECT 1 FROM blobs b WHERE b.hash = e.hash)",
             )
             .unwrap();
-        let drifted: Vec<(String, i64, i64)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        let drifted: Vec<String> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
             .unwrap()
             .map(Result::unwrap)
             .filter(|(_, refcount, mapped)| refcount != mapped || *mapped == 0)
+            .map(|(hash, refcount, mapped)| {
+                // Too low is the dangerous direction: removing one entry
+                // reclaims a blob another still needs.
+                let direction = if refcount < mapped {
+                    "TOO LOW"
+                } else {
+                    "too high"
+                };
+                format!(
+                    "{direction}: {} refcount {refcount}, mapped refs {mapped}",
+                    &hash[..8.min(hash.len())]
+                )
+            })
             .collect();
-        assert!(
-            drifted.is_empty(),
-            "(hash, refcount, mapped refs) out of step: {drifted:?}"
-        );
+        assert!(drifted.is_empty(), "blob index drift: {drifted:#?}");
     }
 
     /// Put `key` with one output per `(store_name, content)` pair. Sources
@@ -9951,101 +9977,299 @@ mod tests {
         assert!(store.entry_dir("uncommitted").join("a.rlib").is_file());
     }
 
-    /// An import keeps the extracted copy of a blob that already existed
-    /// until after its commit. A crash, or a lookup, in that window finds a
-    /// committed entry with an artifact beside meta.json. The entry already
-    /// holds its reference, so migration only drops the copy.
-    #[test]
-    fn stray_artifact_in_a_registered_entry_adds_no_reference() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(test_config(dir.path())).unwrap();
-        put_outputs(&store, dir.path(), "other", "one", &[("a.rlib", b"blob A")]);
-        extract_download(&store, "stray", &[("a.rlib", b"blob A")]);
-        store.import_downloaded_entry("stray").unwrap();
-        let stray = store.entry_dir("stray").join("a.rlib");
-        std::fs::write(&stray, b"blob A").unwrap();
-
-        assert!(store.get("stray").unwrap().is_some());
-
-        assert!(!stray.exists(), "the extracted copy is dropped");
-        assert_eq!(blob_refcount(&store, &content_hash(b"blob A")), Some(2));
-        assert_blob_refs_match_mappings(&store);
-        assert!(store.blob_path(&content_hash(b"blob A")).is_file());
+    /// Register `key` as a committed legacy entry: artifacts beside
+    /// meta.json, an entry row, no blob rows and no mapping.
+    fn legacy_entry(store: &Store, key: &str, outputs: &[(&str, &[u8])]) -> EntryMeta {
+        let meta = extract_download(store, key, outputs);
+        store
+            .db
+            .execute(
+                "INSERT INTO entries (cache_key, crate_name, size, committed)
+                 VALUES (?1, 'c1', 1, 1)",
+                params![key],
+            )
+            .unwrap();
+        meta
     }
 
-    /// Same shape, but the blob file itself is gone. The copy is left alone
-    /// (lookup then judges the entry by its missing blob) and still adds no
-    /// reference.
+    /// Backfill must not map an entry whose artifacts are still in its
+    /// directory: those references were never counted, and a mapping would
+    /// claim they were.
     #[test]
-    fn stray_artifact_is_kept_while_its_blob_is_missing() {
+    fn backfill_skips_an_entry_with_unmigrated_artifacts() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(test_config(dir.path())).unwrap();
-        let meta = extract_download(&store, "stray_kept", &[("a.rlib", b"blob A")]);
-        store.import_downloaded_entry("stray_kept").unwrap();
-        let blob = store.blob_path(&content_hash(b"blob A"));
-        remove_entry_artifact(&blob).unwrap();
-        let stray = store.entry_dir("stray_kept").join("a.rlib");
-        std::fs::write(&stray, b"blob A").unwrap();
-
-        assert!(store.migrate_entry_to_blobs(&meta).unwrap());
-
-        assert!(stray.is_file());
-        assert!(!blob.exists());
-        assert_eq!(blob_refcount(&store, &content_hash(b"blob A")), Some(1));
-        assert_blob_refs_match_mappings(&store);
-    }
-
-    #[test]
-    fn remove_entry_artifact_deletes_a_read_only_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("artifact");
-        std::fs::write(&path, b"x").unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_readonly(true);
-        fs::set_permissions(&path, perms).unwrap();
-
-        remove_entry_artifact(&path).unwrap();
-
-        assert!(!path.exists());
-        assert!(
-            remove_entry_artifact(&path).is_err(),
-            "missing file is an error"
-        );
-    }
-
-    /// A legacy entry whose mapping the GC backfill wrote before migration
-    /// ran has mappings but no blob rows. Each file still needs its
-    /// reference, including a hash the entry lists twice.
-    #[test]
-    fn migration_counts_every_file_of_a_backfilled_legacy_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(test_config(dir.path())).unwrap();
-        let meta = extract_download(
+        let meta = legacy_entry(
             &store,
-            "legacy_backfilled",
+            "legacy_unmigrated",
+            &[("a.rlib", b"blob A"), ("b.rmeta", b"blob B")],
+        );
+        // One artifact left is enough.
+        fs::remove_file(store.entry_dir("legacy_unmigrated").join("a.rlib")).unwrap();
+
+        assert_eq!(store.backfill_entry_blobs().unwrap(), 0);
+        let mapped: i64 = store
+            .db
+            .query_row("SELECT COUNT(*) FROM entry_blobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mapped, 0);
+
+        // Migration counts the references; only then does backfill map them.
+        assert!(store.migrate_entry_to_blobs(&meta).unwrap());
+        assert_eq!(store.backfill_entry_blobs().unwrap(), 1);
+        assert_eq!(blob_refcount(&store, &content_hash(b"blob B")), Some(1));
+    }
+
+    /// A legacy artifact whose hash a modern entry already owns still needs
+    /// its own reference, including a hash listed twice. Backfill waits for
+    /// the migration, so the mapping never runs ahead of the count.
+    #[test]
+    fn migration_counts_a_legacy_hash_another_entry_already_owns() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
+        put_outputs(&store, dir.path(), "modern", "one", &[("a.rlib", b"twin")]);
+        let meta = legacy_entry(
+            &store,
+            "legacy_shared",
             &[
                 ("a.rlib", b"twin"),
                 ("b.rlib", b"twin"),
                 ("c.rmeta", b"solo"),
             ],
         );
+        assert_eq!(store.backfill_entry_blobs().unwrap(), 0);
+
+        assert!(store.migrate_entry_to_blobs(&meta).unwrap());
+        assert_eq!(store.backfill_entry_blobs().unwrap(), 1);
+
+        assert_eq!(blob_refcount(&store, &content_hash(b"twin")), Some(3));
+        assert_eq!(blob_refcount(&store, &content_hash(b"solo")), Some(1));
+        assert_blob_refs_match_mappings(&store);
+        store.remove_entry("legacy_shared").unwrap();
+        assert!(store.get("modern").unwrap().is_some());
+        assert_blob_refs_match_mappings(&store);
+    }
+
+    /// A mapping can name a blob that has no row (an older backfill mapped
+    /// legacy entries nothing had counted). Releasing it after the new
+    /// generation's increment would eat that increment and delete the row,
+    /// so every publisher releases first.
+    #[test]
+    fn republish_over_a_mapping_without_a_blob_row_keeps_the_new_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
+        let map = |key: &str, content: &[u8]| {
+            store
+                .db
+                .execute(
+                    "INSERT INTO entry_blobs (cache_key, hash, refs) VALUES (?1, ?2, 1)",
+                    params![key, content_hash(content)],
+                )
+                .unwrap();
+        };
+
+        map("via_import", b"import blob");
+        extract_download(&store, "via_import", &[("a.rlib", b"import blob")]);
+        store.import_downloaded_entry("via_import").unwrap();
+        assert_eq!(
+            blob_refcount(&store, &content_hash(b"import blob")),
+            Some(1)
+        );
+
+        map("via_put", b"put blob");
+        put_outputs(
+            &store,
+            dir.path(),
+            "via_put",
+            "one",
+            &[("a.rlib", b"put blob")],
+        );
+        assert_eq!(blob_refcount(&store, &content_hash(b"put blob")), Some(1));
+
+        assert_blob_refs_match_mappings(&store);
+    }
+
+    /// The batch import and the rebuild claim a key no entry row owned. A
+    /// mapping left behind for it holds counted references; they are
+    /// released, not dropped with the mapping.
+    #[test]
+    fn claiming_an_unowned_key_releases_its_leftover_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
+        let leftover = |key: &str| {
+            store
+                .db
+                .execute(
+                    "INSERT INTO blobs (hash, size, refcount) VALUES (?1, 1, 1)",
+                    params![format!("old-{key}")],
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "INSERT INTO entry_blobs (cache_key, hash, refs) VALUES (?1, ?2, 1)",
+                    params![key, format!("old-{key}")],
+                )
+                .unwrap();
+        };
+
+        let batch_key = "b".repeat(64);
+        leftover(&batch_key);
+        let verified = write_verified_fixture(&store, &batch_key, &batch_key, "lib.rlib", None);
+        assert_eq!(
+            store.import_verified_restored_entries(&[verified]).unwrap(),
+            1
+        );
+        assert_blob_refs_match_mappings(&store);
+
+        let rebuild_key = "c".repeat(64);
+        leftover(&rebuild_key);
+        let mut meta = read_meta(&store, &batch_key);
+        meta.cache_key = rebuild_key.clone();
+        let rebuild_dir = store.entry_dir(&rebuild_key);
+        fs::create_dir_all(&rebuild_dir).unwrap();
+        fs::write(
+            rebuild_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.rebuild_one_entry(&rebuild_key, &rebuild_dir).unwrap(),
+            Some(1)
+        );
+        assert_blob_refs_match_mappings(&store);
+        assert_eq!(blob_table_count(&store), 1, "both old-* rows are gone");
+    }
+
+    /// Entry `owner` holds the only counted reference to a blob; entry
+    /// `uncounted` has a committed row, the same file list and a mapping
+    /// whose reference nobody counted (what an older backfill left behind
+    /// for an un-migrated legacy entry). Returns the blob's hash.
+    fn owner_and_uncounted_mapping(store: &Store, dir: &Path) -> String {
+        put_outputs(store, dir, "owner", "one", &[("a.rlib", b"shared blob")]);
+        let mut meta = read_meta(store, "owner");
+        meta.cache_key = "uncounted".to_string();
+        let entry_dir = store.entry_dir("uncounted");
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
         store
             .db
             .execute(
                 "INSERT INTO entries (cache_key, crate_name, size, committed)
-                 VALUES ('legacy_backfilled', 'c1', 12, 1)",
+                 VALUES ('uncounted', 'c1', 1, 1)",
                 [],
             )
             .unwrap();
-        assert_eq!(store.backfill_entry_blobs().unwrap(), 1);
+        record_entry_blobs(&store.db, "uncounted", &meta.files).unwrap();
+        let hash = content_hash(b"shared blob");
+        assert_eq!(blob_refcount(store, &hash), Some(1));
+        hash
+    }
 
-        assert!(store.migrate_entry_to_blobs(&meta).unwrap());
+    fn mapped_refs(store: &Store, key: &str, hash: &str) -> Option<i64> {
+        store
+            .db
+            .query_row(
+                "SELECT refs FROM entry_blobs WHERE cache_key = ?1 AND hash = ?2",
+                params![key, hash],
+                |r| r.get(0),
+            )
+            .ok()
+    }
 
-        assert_eq!(blob_refcount(&store, &content_hash(b"twin")), Some(2));
-        assert_eq!(blob_refcount(&store, &content_hash(b"solo")), Some(1));
+    /// Replacing the uncounted generation through put must not spend the
+    /// owner's reference: the blob ends at the owner's one plus the new
+    /// generation's own, none of it taken from the owner.
+    #[test]
+    fn reput_over_an_uncounted_mapping_keeps_the_other_owners_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
+        let hash = owner_and_uncounted_mapping(&store, dir.path());
+
+        put_outputs(
+            &store,
+            dir.path(),
+            "uncounted",
+            "two",
+            &[("b.rlib", b"other blob")],
+        );
+
+        assert_eq!(
+            blob_refcount(&store, &hash),
+            Some(1),
+            "the owner's reference"
+        );
+        assert_eq!(mapped_refs(&store, "owner", &hash), Some(1));
+        assert_eq!(mapped_refs(&store, "uncounted", &hash), None);
+        assert!(store.blob_path(&hash).is_file());
         assert_blob_refs_match_mappings(&store);
-        store.remove_entry("legacy_backfilled").unwrap();
-        assert_eq!(blob_table_count(&store), 0);
+    }
+
+    #[test]
+    fn reimport_over_an_uncounted_mapping_keeps_the_other_owners_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
+        let hash = owner_and_uncounted_mapping(&store, dir.path());
+
+        extract_download(&store, "uncounted", &[("b.rlib", b"other blob")]);
+        store.import_downloaded_entry("uncounted").unwrap();
+
+        assert_eq!(
+            blob_refcount(&store, &hash),
+            Some(1),
+            "the owner's reference"
+        );
+        assert_eq!(mapped_refs(&store, "owner", &hash), Some(1));
+        assert_eq!(mapped_refs(&store, "uncounted", &hash), None);
+        assert_blob_refs_match_mappings(&store);
+    }
+
+    /// Evicting the uncounted entry must not reclaim the blob its other
+    /// owner still serves from.
+    #[test]
+    fn removing_an_uncounted_mapping_keeps_the_other_owners_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
+        let hash = owner_and_uncounted_mapping(&store, dir.path());
+
+        store.remove_entry("uncounted").unwrap();
+
+        assert_eq!(blob_refcount(&store, &hash), Some(1));
+        assert!(store.blob_path(&hash).is_file());
+        assert!(store.get("owner").unwrap().is_some());
+        assert_blob_refs_match_mappings(&store);
+    }
+
+    #[test]
+    fn floor_raises_only_this_keys_blobs_and_only_up_to_their_mappings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(test_config(dir.path())).unwrap();
+        store
+            .db
+            .execute_batch(
+                "INSERT INTO blobs (hash, size, refcount) VALUES
+                     ('low', 1, 1), ('exact', 1, 5), ('high', 1, 9), ('foreign', 1, 1);
+                 INSERT INTO entry_blobs (cache_key, hash, refs) VALUES
+                     ('k', 'low', 2), ('other', 'low', 1),
+                     ('k', 'exact', 2), ('other', 'exact', 3),
+                     ('k', 'high', 1),
+                     ('k', 'norow', 1),
+                     ('other', 'foreign', 4);",
+            )
+            .unwrap();
+
+        // Three rows match; 'norow' has none to raise.
+        assert_eq!(floor_blob_refs_at_mappings(&store.db, "k").unwrap(), 3);
+
+        assert_eq!(blob_refcount(&store, "low"), Some(3));
+        assert_eq!(blob_refcount(&store, "exact"), Some(5));
+        assert_eq!(blob_refcount(&store, "high"), Some(9), "never lowered");
+        assert_eq!(blob_refcount(&store, "norow"), None);
+        assert_eq!(blob_refcount(&store, "foreign"), Some(1), "not this key's");
     }
 
     #[test]
@@ -10056,10 +10280,12 @@ mod tests {
             .db
             .execute_batch(
                 "INSERT INTO blobs (hash, size, refcount) VALUES
-                     ('shared', 1, 5), ('last', 1, 2), ('drifted', 1, 1), ('idle', 1, 0);
+                     ('shared', 1, 5), ('last', 1, 2), ('drifted', 1, 1), ('idle', 1, 0),
+                     ('uncounted', 1, 1);
                  INSERT INTO entry_blobs (cache_key, hash, refs) VALUES
                      ('k', 'shared', 2), ('k', 'last', 2), ('k', 'drifted', 3),
-                     ('other', 'shared', 3);",
+                     ('k', 'norow', 1), ('k', 'uncounted', 1),
+                     ('other', 'shared', 3), ('other', 'uncounted', 1);",
             )
             .unwrap();
 
@@ -10067,6 +10293,12 @@ mod tests {
 
         assert_eq!(blob_refcount(&store, "shared"), Some(3));
         assert_eq!(blob_refcount(&store, "last"), None, "released to zero");
+        assert_eq!(blob_refcount(&store, "norow"), None, "nothing to release");
+        assert_eq!(
+            blob_refcount(&store, "uncounted"),
+            Some(1),
+            "the other owner's reference survives"
+        );
         assert_eq!(
             blob_refcount(&store, "drifted"),
             None,
@@ -10085,7 +10317,7 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(mapped, vec!["other".to_string()]);
+        assert_eq!(mapped, vec!["other".to_string(), "other".to_string()]);
     }
 
     /// An unreadable meta.json (EACCES, not NotFound) must refuse through the
@@ -13083,6 +13315,7 @@ mod tests {
 
         let stats = store.migrate_to_blobs(|_, _| {}).unwrap();
         assert_eq!(stats.entries_migrated, 2);
+        assert_eq!(store.backfill_entry_blobs().unwrap(), 2);
         assert_blob_refs_match_mappings(&store);
 
         // Refcount should be 2
@@ -13663,6 +13896,7 @@ mod tests {
         // Refcounts should be 1
         assert_eq!(blob_refcount(&store, &hash_a), Some(1));
         assert_eq!(blob_refcount(&store, &hash_b), Some(1));
+        assert_eq!(store.backfill_entry_blobs().unwrap(), 1);
         assert_blob_refs_match_mappings(&store);
 
         // Entry dir should only have meta.json

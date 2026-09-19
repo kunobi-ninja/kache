@@ -102,10 +102,14 @@ needed. Pull requests only restore; successful pushes to `main` save the store.
 GitHub's branch scopes let PRs read the default branch's cache without letting
 PRs replace entries that `main` can restore.
 
-Keys separate operating systems, architectures, and the locked Nix/Rust
-toolchain. Each commit gets a fresh entry and can restore the latest entry for
-that toolchain. Both flake evaluation and all native flake checks still run.
+Keys separate operating systems, architectures, and the locked Nix, Rust, and
+Cargo dependencies. Source-only changes reuse the same immutable entry. They
+rebuild changed project outputs without uploading another full store; this
+limits competition with the other CI caches. Dependency changes start a fresh
+entry. Both flake evaluation and all native flake checks still run.
+
 The action logs the selected key, cache hit or miss, and restore/save sizes.
+Each successful job also reports the uncompressed Nix store size.
 Check those logs before attributing a faster run to caching. GitHub's cache
 quota and eviction policy apply; an evicted entry causes a normal cold build.
 

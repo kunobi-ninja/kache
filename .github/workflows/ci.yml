@@ -766,8 +766,7 @@ jobs:
       - name: Restore Nix store
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
         with:
-          primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
-          restore-prefixes-first-match: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml') }}-
+          primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'rust-toolchain.toml', 'Cargo.lock') }}
           # PRs can read the default branch cache; only main replenishes it.
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # `--all-systems` is the point: without it the check only evaluates the
@@ -783,6 +782,11 @@ jobs:
       # any check added later.
       - name: Build flake checks
         run: nix flake check --keep-going --print-build-logs
+      - name: Report Nix store size
+        shell: bash
+        run: |
+          store_kib=$(du -sk /nix/store | cut -f1)
+          printf 'Uncompressed Nix store: %s KiB\n' "$store_kib" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # --- Copy-on-write filesystem coverage ---
   # Every hosted runner is ext4, where `try_reflink` always fails and the

@@ -1499,7 +1499,10 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 /// [`initialize_db`] has run. Bump it with any schema change.
 ///
 /// 3: the boolean env-use memo became the versioned `source_env_dep_uses`.
-const INDEX_SCHEMA_GENERATION: i64 = 3;
+/// 4: `idx_entries_crate_name`, the crate-presence probe behind deferred
+///    discovery (#1117 added the index without bumping the generation, so an
+///    index from before it never gained the index and the probe scanned).
+const INDEX_SCHEMA_GENERATION: i64 = 4;
 
 /// Replace `cache_key`'s rows in `entry_blobs` with one row per unique hash
 /// in `files`, `refs` counting per-file references (kunobi-ninja/kache#608).
@@ -5359,6 +5362,34 @@ mod tests {
             tables, 1,
             "the dropped table was recreated by the migration"
         );
+    }
+
+    /// An index stamped at generation 3 predates the crate-name index, and
+    /// the stamp alone must not keep it from gaining one.
+    #[test]
+    fn index_from_generation_three_gains_the_crate_name_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = open_index_db(&path).unwrap();
+        db.execute_batch("DROP INDEX idx_entries_crate_name;")
+            .unwrap();
+        db.pragma_update(None, "user_version", 3_i64).unwrap();
+        drop(db);
+
+        let db = open_index_db(&path).unwrap();
+        let indexes: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_entries_crate_name'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 1);
+        let generation: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(generation, INDEX_SCHEMA_GENERATION);
     }
 
     /// An index stamped before the env-use memo was versioned still carries

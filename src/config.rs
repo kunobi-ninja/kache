@@ -393,6 +393,11 @@ pub struct Config {
     /// false` keeps every put in the wrapper. Without a reachable daemon the
     /// wrapper stores on its own either way.
     pub daemon_publish: bool,
+    /// The project's `[cache] exclude` and `bypass_*` rule lists, read once
+    /// with the rest of the file. Every wrapper invocation consults them
+    /// before any key work; re-reading the file for each list cost a C
+    /// compile four config parses.
+    pub(crate) project_rules: ProjectRules,
     /// Opportunistic size-pressure GC (kunobi-ninja/kache#497): when on (the
     /// default), the compiler wrapper — after storing a new entry — performs a
     /// cheap, throttled store-size check and, if the store has grown past
@@ -1759,6 +1764,7 @@ impl Config {
         let deferred_discovery = Self::deferred_discovery_enabled(&file_config);
         let deferred_durability = Self::deferred_durability_enabled(&file_config);
         let daemon_publish = Self::daemon_publish_enabled(&file_config);
+        let project_rules = ProjectRules::from_file_config(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
         let gc_evict_shared = Self::gc_evict_shared_enabled(&file_config);
@@ -1819,6 +1825,7 @@ impl Config {
             deferred_discovery,
             deferred_durability,
             daemon_publish,
+            project_rules,
             auto_gc,
             index_auto_compact,
             gc_evict_shared,
@@ -2635,27 +2642,7 @@ impl Config {
     /// Return true when `source_path` matches one of `[cache].exclude`'s glob
     /// patterns from the active config file.
     pub fn source_excluded(source_path: &Path, roots: &[PathBuf]) -> bool {
-        let patterns = Self::load_exclude_patterns();
-        source_excluded_by_patterns(&patterns, source_path, roots)
-    }
-
-    fn load_exclude_patterns() -> Vec<String> {
-        Self::load_rule_list(|c| c.exclude)
-    }
-
-    /// Shared loader for the project-local rule lists: read the active config
-    /// file, take one list, trim, and drop empties so a stray blank entry can
-    /// never become a match-everything rule.
-    fn load_rule_list(pick: impl FnOnce(CacheFileConfig) -> Option<Vec<String>>) -> Vec<String> {
-        Self::load_file_config()
-            .ok()
-            .and_then(|c| c.cache)
-            .and_then(pick)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect()
+        ProjectRules::from_file_config(&Self::load_file_config()).source_excluded(source_path, roots)
     }
 
     /// First matching user bypass rule for this invocation, or `None`.
@@ -2670,14 +2657,7 @@ impl Config {
     /// any single argument; `env` entries are `NAME=VALUE` for an exact value
     /// or a bare `NAME` for presence alone.
     pub fn user_bypass_reason(crate_name: &str, argv: &[String]) -> Option<String> {
-        Self::user_bypass_reason_with(
-            crate_name,
-            argv,
-            &Self::load_rule_list(|c| c.bypass_crates),
-            &Self::load_rule_list(|c| c.bypass_argv),
-            &Self::load_rule_list(|c| c.bypass_env),
-            |name| std::env::var(name).ok(),
-        )
+        ProjectRules::from_file_config(&Self::load_file_config()).user_bypass_reason(crate_name, argv)
     }
 
     /// Pure core of [`Self::user_bypass_reason`], with the rule lists and env
@@ -2720,6 +2700,63 @@ impl Config {
             }
         }
         None
+    }
+}
+
+/// The per-project rule lists a wrapper checks before keying anything: glob
+/// patterns for sources that are never cached, and the user bypass rules
+/// (kunobi-ninja/kache#222) by crate name, argv substring and environment.
+/// All fail closed: a rule only ever declines caching.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ProjectRules {
+    pub(crate) exclude: Vec<String>,
+    pub(crate) bypass_crates: Vec<String>,
+    pub(crate) bypass_argv: Vec<String>,
+    pub(crate) bypass_env: Vec<String>,
+}
+
+impl ProjectRules {
+    /// Take the four lists from a parsed config file, trimmed, with empties
+    /// dropped: an empty argv rule substring-matches EVERY argument, so one
+    /// blank line in a config would silently disable the whole cache.
+    fn from_file_config(file_config: &Result<FileConfig>) -> Self {
+        let cache = file_config.as_ref().ok().and_then(|c| c.cache.as_ref());
+        let list = |pick: fn(&CacheFileConfig) -> Option<&Vec<String>>| -> Vec<String> {
+            cache
+                .and_then(pick)
+                .map(|rules| {
+                    rules
+                        .iter()
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            exclude: list(|c| c.exclude.as_ref()),
+            bypass_crates: list(|c| c.bypass_crates.as_ref()),
+            bypass_argv: list(|c| c.bypass_argv.as_ref()),
+            bypass_env: list(|c| c.bypass_env.as_ref()),
+        }
+    }
+
+    /// Return true when `source_path` matches one of the `exclude` globs.
+    pub(crate) fn source_excluded(&self, source_path: &Path, roots: &[PathBuf]) -> bool {
+        source_excluded_by_patterns(&self.exclude, source_path, roots)
+    }
+
+    /// First matching user bypass rule for this invocation, or `None`. See
+    /// [`Config::user_bypass_reason`].
+    pub(crate) fn user_bypass_reason(&self, crate_name: &str, argv: &[String]) -> Option<String> {
+        Config::user_bypass_reason_with(
+            crate_name,
+            argv,
+            &self.bypass_crates,
+            &self.bypass_argv,
+            &self.bypass_env,
+            |name| std::env::var(name).ok(),
+        )
     }
 }
 
@@ -6140,6 +6177,7 @@ remote_key_cache_refresh_secs = 900
             deferred_discovery: true,
             deferred_durability: false,
             daemon_publish: false,
+            project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6206,6 +6244,7 @@ remote_key_cache_refresh_secs = 900
             deferred_discovery: true,
             deferred_durability: false,
             daemon_publish: false,
+            project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6268,6 +6307,7 @@ remote_key_cache_refresh_secs = 900
             deferred_discovery: true,
             deferred_durability: false,
             daemon_publish: false,
+            project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,
@@ -6349,6 +6389,7 @@ remote_key_cache_refresh_secs = 900
             deferred_discovery: true,
             deferred_durability: false,
             daemon_publish: false,
+            project_rules: ProjectRules::default(),
             auto_gc: true,
             index_auto_compact: true,
             gc_evict_shared: false,

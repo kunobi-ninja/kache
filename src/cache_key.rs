@@ -1511,11 +1511,14 @@ fn resolve_key_inputs(
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
             && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
-            let flight = crate::scheduler::join_discovery(cache_dir, &identity);
-            owns_flight = flight.is_some();
-            *file_hasher.discovery_flight.borrow_mut() = flight;
-            // The previous owner may have published while this process waited.
-            prediction = predicted_key_inputs(args, file_hasher);
+            let flight = crate::scheduler::join_discovery_flight(cache_dir, &identity);
+            owns_flight = flight.lock.is_some();
+            *file_hasher.discovery_flight.borrow_mut() = flight.lock;
+            // The previous owner may have published while this process
+            // waited; a flight taken at once had no owner to publish.
+            if flight.waited {
+                prediction = predicted_key_inputs(args, file_hasher);
+            }
         }
         match prediction {
             Ok(dep_info) => {

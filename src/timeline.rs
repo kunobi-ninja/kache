@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use kache_core::timeline::{
-    BUILD_TIMELINE_SCHEMA, BuildTimeline, IdentitySource, LogLimits, RunContext, TimelineIdentity,
-    TimelineSummary, TimelineTransfer, TimelineUnit, TransferAttribution, TransferDirection,
+    BUILD_TIMELINE_SCHEMA, BuildTimeline, IdentitySource, LogLimits, PrefetchOperation, RunContext,
+    TimelineIdentity, TimelineSummary, TimelineTransfer, TimelineUnit, TransferAttribution,
+    TransferDirection,
 };
 
 use crate::daemon::{TransferDirection as LoggedDirection, TransferEvent};
@@ -160,6 +161,24 @@ pub(crate) fn build_timelines(inputs: &TimelineInputs<'_>) -> Vec<BuildTimeline>
             let identity = identity_for_root(Path::new(&root), inputs.env);
             let transfers = attribute_transfers(&session_id, inputs.transfers, &transfer_owners);
             let context = inputs.env.context(inputs.labels.clone());
+            let summary = {
+                let base = summaries.get(&session_id).map(summary_projection);
+                let has_prefetch = transfers.iter().any(|transfer| {
+                    transfer.prefetch.is_some()
+                        || transfer
+                            .accounting
+                            .as_ref()
+                            .is_some_and(|accounting| !accounting.entries.is_empty())
+                });
+                match (base, has_prefetch) {
+                    (None, false) => None,
+                    (base, _) => Some(overlay_prefetch_join(
+                        base.unwrap_or_default(),
+                        &session.units,
+                        &transfers,
+                    )),
+                }
+            };
             BuildTimeline {
                 schema: BUILD_TIMELINE_SCHEMA,
                 client_record_id: client_record_id(&session_id, &context, session.started_at_ms),
@@ -171,7 +190,7 @@ pub(crate) fn build_timelines(inputs: &TimelineInputs<'_>) -> Vec<BuildTimeline>
                 root_hash: short_hash(&root),
                 context,
                 log: inputs.log.clone(),
-                summary: summaries.get(&session_id).map(summary_projection),
+                summary,
                 units: session.units,
                 transfers,
             }
@@ -342,6 +361,136 @@ fn summaries_by_session(summaries: &[BuildSummaryEvent]) -> HashMap<String, &Bui
     latest
 }
 
+struct KeyConsumption {
+    first_demand_at_ms: u64,
+    consumed: bool,
+}
+
+fn overlay_prefetch_join(
+    mut summary: TimelineSummary,
+    units: &[TimelineUnit],
+    transfers: &[TimelineTransfer],
+) -> TimelineSummary {
+    let mut keys: HashMap<&str, KeyConsumption> = HashMap::new();
+    let mut remote_wait_ms: u64 = 0;
+    for unit in units {
+        remote_wait_ms = remote_wait_ms.saturating_add(
+            unit.demands
+                .iter()
+                .fold(0, |sum, demand| sum.saturating_add(demand.remote_wait_ms)),
+        );
+        if unit.cache_key.is_empty() {
+            continue;
+        }
+        let demand_ms = unit
+            .demands
+            .iter()
+            .filter(|demand| demand.cache_key == unit.cache_key)
+            .map(|demand| demand.first_demand_at_ms)
+            .min()
+            .unwrap_or(unit.started_at_ms);
+        let consumed = unit.result == "local_hit" || unit.result == "prefetch_hit";
+        keys.entry(&unit.cache_key)
+            .and_modify(|held| {
+                held.first_demand_at_ms = held.first_demand_at_ms.min(demand_ms);
+                held.consumed = held.consumed || consumed;
+            })
+            .or_insert(KeyConsumption {
+                first_demand_at_ms: demand_ms,
+                consumed,
+            });
+    }
+    summary.remote_wait_ms = remote_wait_ms;
+
+    let mut consumed_keys: u64 = 0;
+    let mut consumed_bytes: u64 = 0;
+    let mut useful_keys: u64 = 0;
+    let mut useful_bytes: u64 = 0;
+    let mut get_not_found: u64 = 0;
+    let mut get_errors: u64 = 0;
+    for transfer in transfers {
+        if transfer.direction != TransferDirection::Download {
+            continue;
+        }
+        for (cache_key, bytes, finished_at_ms, outcome) in prefetch_payloads(transfer) {
+            if outcome == "not_found" {
+                get_not_found += 1;
+            } else {
+                let packed = transfer
+                    .accounting
+                    .as_ref()
+                    .is_some_and(|accounting| !accounting.entries.is_empty());
+                let error = if packed {
+                    outcome == "error"
+                } else {
+                    !transfer.ok
+                        && outcome != "cancelled"
+                        && outcome != "skipped"
+                        && outcome != "not_found"
+                };
+                if error {
+                    get_errors += 1;
+                }
+            }
+            let Some(consumption) = keys.get(cache_key.as_str()) else {
+                continue;
+            };
+            if !consumption.consumed {
+                continue;
+            }
+            consumed_keys += 1;
+            consumed_bytes = consumed_bytes.saturating_add(bytes);
+            if finished_at_ms > 0 && finished_at_ms <= consumption.first_demand_at_ms {
+                useful_keys += 1;
+                useful_bytes = useful_bytes.saturating_add(bytes);
+            }
+        }
+    }
+    summary.consumed_prefetch_keys = consumed_keys;
+    summary.consumed_prefetch_bytes = consumed_bytes;
+    summary.useful_prefetch_keys = useful_keys;
+    summary.useful_prefetch_bytes = useful_bytes;
+    summary.get_not_found = get_not_found;
+    summary.get_errors = get_errors;
+    summary
+}
+
+fn prefetch_payloads(transfer: &TimelineTransfer) -> Vec<(String, u64, u64, &str)> {
+    if let Some(accounting) = &transfer.accounting {
+        if matches!(accounting.operation, PrefetchOperation::List) {
+            return Vec::new();
+        }
+        if !accounting.entries.is_empty() {
+            return accounting
+                .entries
+                .iter()
+                .map(|entry| {
+                    let finished = if entry.finished_at_ms == 0 {
+                        transfer.finished_at_ms
+                    } else {
+                        entry.finished_at_ms
+                    };
+                    (
+                        entry.cache_key.clone(),
+                        entry.compressed_bytes,
+                        finished,
+                        entry.outcome.as_str(),
+                    )
+                })
+                .collect();
+        }
+    }
+    if transfer.prefetch.is_none() {
+        return Vec::new();
+    }
+    vec![(
+        transfer.cache_key.clone(),
+        transfer.compressed_bytes,
+        transfer.finished_at_ms,
+        transfer.outcome.as_str(),
+    )]
+}
+
 fn summary_projection(summary: &&BuildSummaryEvent) -> TimelineSummary {
     TimelineSummary {
         incomplete: summary.incomplete,
@@ -357,6 +506,7 @@ fn summary_projection(summary: &&BuildSummaryEvent) -> TimelineSummary {
         demanded_keys: summary.demanded_keys,
         demanded_candidate_keys: summary.demanded_candidate_keys,
         cancelled: summary.cancelled,
+        ..TimelineSummary::default()
     }
 }
 
@@ -576,6 +726,165 @@ mod tests {
         assert_eq!(records[0].transfers.len(), 1);
         assert_eq!(records[0].transfers[0].compressed_bytes, 150);
         assert_eq!(records[0].transfers[0].accounting, expected);
+    }
+
+    #[test]
+    fn a_prefetch_that_lands_before_demand_is_useful() {
+        let mut observed = event("s1", "serde", "k1", 5_000, 500);
+        observed.demands = vec![kache_core::timeline::KeyDemand {
+            cache_key: "k1".to_string(),
+            first_demand_at_ms: 4_750,
+            remote_wait_ms: 12,
+        }];
+        let mut downloaded = transfer("k1", 1_000, 2_000);
+        downloaded.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            source: "advisory".into(),
+            ..Default::default()
+        });
+        downloaded.outcome = "completed".into();
+        downloaded.compressed_bytes = 80;
+        let records = build_timelines(&inputs(
+            &[observed],
+            &[downloaded],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.consumed_prefetch_keys, 1);
+        assert_eq!(summary.consumed_prefetch_bytes, 80);
+        assert_eq!(summary.useful_prefetch_keys, 1);
+        assert_eq!(summary.useful_prefetch_bytes, 80);
+        assert_eq!(summary.remote_wait_ms, 12);
+        assert_eq!(summary.get_errors, 0);
+    }
+
+    #[test]
+    fn a_prefetch_that_lands_after_demand_is_consumed_but_not_useful() {
+        let mut observed = event("s1", "serde", "k1", 5_000, 500);
+        observed.demands = vec![kache_core::timeline::KeyDemand {
+            cache_key: "k1".to_string(),
+            first_demand_at_ms: 1_500,
+            remote_wait_ms: 40,
+        }];
+        let mut downloaded = transfer("k1", 1_000, 2_000);
+        downloaded.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            source: "advisory".into(),
+            ..Default::default()
+        });
+        downloaded.compressed_bytes = 80;
+        let records = build_timelines(&inputs(
+            &[observed],
+            &[downloaded],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.consumed_prefetch_keys, 1);
+        assert_eq!(summary.consumed_prefetch_bytes, 80);
+        assert_eq!(summary.useful_prefetch_keys, 0);
+        assert_eq!(summary.useful_prefetch_bytes, 0);
+        assert_eq!(summary.remote_wait_ms, 40);
+    }
+
+    #[test]
+    fn packed_entry_bytes_are_joined_without_the_parent_get() {
+        let mut pack = transfer("", 1_000, 2_000);
+        pack.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            ..Default::default()
+        });
+        pack.compressed_bytes = 150;
+        pack.accounting = Some(kache_core::timeline::PrefetchAccounting {
+            bytes_complete: true,
+            requests_complete: true,
+            entries: vec![kache_core::timeline::PackedEntryTransfer {
+                cache_key: "k1".into(),
+                compressed_bytes: 100,
+                finished_at_ms: 1_900,
+                outcome: "completed".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let records = build_timelines(&inputs(
+            &[event("s1", "serde", "k1", 5_000, 100)],
+            &[pack],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.consumed_prefetch_keys, 1);
+        assert_eq!(summary.consumed_prefetch_bytes, 100);
+        assert_eq!(summary.useful_prefetch_keys, 1);
+        assert_eq!(summary.useful_prefetch_bytes, 100);
+    }
+
+    #[test]
+    fn a_prefetch_miss_is_not_consumed() {
+        let mut observed = event("s1", "serde", "k1", 5_000, 500);
+        observed.result = EventResult::Miss;
+        let mut downloaded = transfer("k1", 1_000, 2_000);
+        downloaded.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            source: "advisory".into(),
+            ..Default::default()
+        });
+        downloaded.ok = false;
+        downloaded.outcome = "error".into();
+        let records = build_timelines(&inputs(
+            &[observed],
+            &[downloaded],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.consumed_prefetch_keys, 0);
+        assert_eq!(summary.useful_prefetch_keys, 0);
+        assert_eq!(summary.get_errors, 1);
+        assert_eq!(summary.get_not_found, 0);
+    }
+
+    #[test]
+    fn daemon_used_keys_stay_the_recorded_lower_bound() {
+        let summary = crate::events::BuildSummaryEvent {
+            ts: chrono::Utc.timestamp_millis_opt(6_000).unwrap(),
+            schema: 1,
+            incomplete: false,
+            session_id: "s1".into(),
+            root: "/w".into(),
+            plan_source: "advisory".into(),
+            plan_id: "p1".into(),
+            closure_reason: "inactivity".into(),
+            started_at_ms: 1_000,
+            last_activity_ms: 5_000,
+            candidate_keys: 1,
+            downloaded_keys: 1,
+            downloaded_bytes: 80,
+            used_keys: 0,
+            used_bytes: 0,
+            demanded_keys: 0,
+            demanded_candidate_keys: 0,
+            cancelled: false,
+            list_requests: 0,
+            list_duration_ms: 0,
+        };
+        let mut downloaded = transfer("k1", 1_000, 2_000);
+        downloaded.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            source: "advisory".into(),
+            ..Default::default()
+        });
+        let records = build_timelines(&inputs(
+            &[event("s1", "serde", "k1", 5_000, 500)],
+            &[downloaded],
+            std::slice::from_ref(&summary),
+            &EnvSnapshot::default(),
+        ));
+        let joined = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(joined.used_keys, 0);
+        assert_eq!(joined.consumed_prefetch_keys, 1);
     }
 
     #[test]

@@ -11,6 +11,7 @@ import signal
 import stat
 import statistics
 import subprocess
+import sys
 import threading
 import time
 from collections import Counter
@@ -344,7 +345,7 @@ def run_phase(
     # Every Cargo command owns its checkout and target, including sequential runs.
     # Sequential/parallel comparisons therefore do not change artifact reuse.
     for repo in repos:
-        shutil.rmtree(repo / "target", ignore_errors=True)
+        remove_owned_tree(repo / "target")
     events_path = runtime / "events.jsonl"
     events_path.parent.mkdir(parents=True, exist_ok=True)
     events_path.touch(exist_ok=True)
@@ -840,6 +841,63 @@ def measure_storage(store, repos, backend):
     return result
 
 
+def remove_owned_tree(path):
+    """Delete a cache or work tree.
+
+    mbx 1.15 writes nested output directories without owner write. shutil.rmtree
+    then fails with EACCES; ignore_errors=True hides that and the next copytree
+    raises FileExistsError. Restore owner write/traverse on real directories we
+    own and retry. Never chmod files: they may be hard-linked into other trees.
+    Never follow symlinks.
+    """
+    path = Path(path)
+    if path.is_symlink():
+        path.unlink()
+        return
+    if not path.exists():
+        return
+
+    def restore_dir_and_retry(func, victim, exc):
+        error = exc if isinstance(exc, BaseException) else exc[1]
+        victim = Path(victim)
+        if victim.is_symlink():
+            raise error
+        try:
+            info = victim.lstat()
+        except FileNotFoundError:
+            return
+        directories = [victim.parent]
+        if stat.S_ISDIR(info.st_mode):
+            directories.insert(0, victim)
+        restored = False
+        for directory in directories:
+            if directory.is_symlink():
+                continue
+            try:
+                info = directory.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                continue
+            os.chmod(
+                directory,
+                stat.S_IMODE(info.st_mode) | stat.S_IWUSR | stat.S_IXUSR,
+            )
+            restored = True
+        if not restored:
+            raise error
+        func(victim)
+
+    kwargs = (
+        {"onexc": restore_dir_and_retry}
+        if sys.version_info >= (3, 12)
+        else {"onerror": restore_dir_and_retry}
+    )
+    shutil.rmtree(path, **kwargs)
+    if path.is_symlink() or path.exists():
+        raise FileExistsError(path)
+
+
 def run_batches(args, arms, mirror, work, data):
     workload = getattr(args, "workload", JOBS)
     for sample in range(args.samples):
@@ -849,7 +907,7 @@ def run_batches(args, arms, mirror, work, data):
             cell = work / f"{sample // args.cold_every:02d}-{arm}"
             cold = sample % args.cold_every == 0
             if cold:
-                shutil.rmtree(cell, ignore_errors=True)
+                remove_owned_tree(cell)
                 cell.mkdir()
                 for name, _ in workload:
                     subprocess.run(
@@ -871,7 +929,7 @@ def run_batches(args, arms, mirror, work, data):
             )
             for phase in ("cold", "warm") if cold else ("warm",):
                 if phase == "warm" and args.cold_every > 1:
-                    shutil.rmtree(store, ignore_errors=True)
+                    remove_owned_tree(store)
                     shutil.copytree(snapshot, store, symlinks=True)
                 print(
                     f"{args.project} sample {sample + 1}/{args.samples}: {arm} {phase}",
@@ -905,10 +963,10 @@ def run_batches(args, arms, mirror, work, data):
                 # Keep only one cold snapshot per arm between samples. Empty
                 # targets and active stores do not accumulate across arms.
                 for repo in repos:
-                    shutil.rmtree(repo / "target", ignore_errors=True)
-                shutil.rmtree(store, ignore_errors=True)
+                    remove_owned_tree(repo / "target")
+                remove_owned_tree(store)
                 if (sample + 1) % args.cold_every == 0 or sample + 1 == args.samples:
-                    shutil.rmtree(cell)
+                    remove_owned_tree(cell)
 
 
 def main():

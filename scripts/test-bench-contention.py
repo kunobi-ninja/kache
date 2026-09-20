@@ -3,6 +3,7 @@
 
 import importlib.util
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -522,6 +523,11 @@ sys.exit(int(os.environ.get("TEST_FAIL", "0")))
                         self.assertFalse(store.exists())
                         store.mkdir()
                         (store / "seed").write_text(store.parent.name)
+                        locked = store / "out"
+                        locked.mkdir()
+                        (locked / "obj").write_text("cached")
+                        (locked / "obj").chmod(0o444)
+                        locked.chmod(0o555)
                     else:
                         self.assertEqual(
                             (store / "seed").read_text(), store.parent.name
@@ -568,6 +574,60 @@ sys.exit(int(os.environ.get("TEST_FAIL", "0")))
                         expected,
                     )
                 self.assertEqual(list(work.iterdir()), [mirror])
+
+    def test_remove_owned_tree_deletes_nested_readonly_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "cache"
+            nested = root / "out" / "obj"
+            nested.mkdir(parents=True)
+            artifact = nested / "artifact"
+            artifact.write_bytes(b"cached")
+            artifact.chmod(0o444)
+            nested.chmod(0o555)
+            (root / "out").chmod(0o555)
+            bench.remove_owned_tree(root)
+            self.assertFalse(root.exists())
+
+    def test_remove_owned_tree_unlinks_symlinks_without_following_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            outside.mkdir()
+            secret = outside / "keep"
+            secret.write_text("keep")
+            secret.chmod(0o444)
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "link").symlink_to(outside, target_is_directory=True)
+            bench.remove_owned_tree(cache)
+            self.assertFalse(cache.exists())
+            self.assertEqual(secret.read_text(), "keep")
+            self.assertEqual(stat.S_IMODE(secret.stat().st_mode), 0o444)
+
+    def test_remove_owned_tree_does_not_chmod_hardlinked_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            cache.mkdir()
+            blob = cache / "blob"
+            blob.write_bytes(b"shared")
+            blob.chmod(0o444)
+            sibling = root / "sibling"
+            os.link(blob, sibling)
+            before = stat.S_IMODE(sibling.stat().st_mode)
+            bench.remove_owned_tree(cache)
+            self.assertFalse(cache.exists())
+            self.assertEqual(sibling.read_bytes(), b"shared")
+            self.assertEqual(stat.S_IMODE(sibling.stat().st_mode), before)
+
+    def test_remove_owned_tree_raises_when_the_path_cannot_be_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "cache"
+            cache.mkdir()
+            with patch.object(bench.shutil, "rmtree", lambda *args, **kwargs: None):
+                with self.assertRaises(FileExistsError):
+                    bench.remove_owned_tree(cache)
+            self.assertTrue(cache.exists())
 
     def test_short_eza_workload_retains_six_jobs_and_the_full_graph_is_explicit(self):
         short = bench.workload_for("eza")

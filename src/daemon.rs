@@ -17660,7 +17660,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_receipt_skipped_claim_records_no_backend_get() {
-        let (_dir, daemon, backend, mut started, keys, _bytes) = shutdown_prefetch_fixture().await;
+        let (_dir, daemon, backend, mut started, keys, _bytes) = shutdown_prefetch_fixture(2).await;
         daemon
             .downloading
             .write()
@@ -17784,7 +17784,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_receipt_keeps_received_body_when_cancelled_before_import() {
-        let (_dir, daemon, backend, mut started, keys, bytes) = shutdown_prefetch_fixture().await;
+        let (_dir, daemon, backend, mut started, keys, bytes) = shutdown_prefetch_fixture(2).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), started.recv())
                 .await

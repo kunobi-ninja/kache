@@ -65,7 +65,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/require-ci-green.sh "$(git rev-parse HEAD)" "Check (Linux)"
 
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
+        with:
+          install: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

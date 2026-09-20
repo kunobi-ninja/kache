@@ -80,8 +80,9 @@ jobs:
       # cargo-llvm-cov) plus rust, which it reads from rust-toolchain.toml:
       # channel, rustfmt and clippy.
       - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin the mise CLI. v2026.6.10 (2026-06-14) regressed binary
           # resolution ("mise ERROR cannot find binary path"), reddening every
           # run after its release — including unchanged code that passed hours
@@ -198,8 +199,9 @@ jobs:
         with:
           fetch-depth: 0
       - if: github.event_name == 'pull_request' && needs.changes.outputs.tests == 'true'
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: rust
           cache: false
@@ -280,8 +282,9 @@ jobs:
           # exact base used by this run, avoiding stale event SHAs.
           fetch-depth: 0
       - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: rust
           cache: false
@@ -352,8 +355,9 @@ jobs:
         with:
           fetch-depth: 0
       - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: rust
           cache: false
@@ -435,8 +439,9 @@ jobs:
           name: mutation-diff-plan
           path: tmp/mutants
       - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: rust
           cache: false
@@ -558,8 +563,9 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: rust
           cache: false
@@ -689,8 +695,9 @@ jobs:
       # cmake, sccache, llvm-cov) doesn't build on this job. Tool names must
       # match the mise.toml keys. cargo-deny ships prebuilt via the aqua backend
       # (no from-source compile).
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: rust github:casey/just aqua:EmbarkStudios/cargo-deny
@@ -716,8 +723,9 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: rust
@@ -832,8 +840,9 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: rust
@@ -1013,7 +1022,7 @@ jobs:
       # identifier is required.
       - name: Install tools via mise
         if: env.RUN_E2E == 'true'
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         env:
           # jdx/mise-action extracts into `$TMPDIR/mise` before moving
           # the binary. On the shared macOS host, parallel runner
@@ -1026,6 +1035,7 @@ jobs:
           TEMP: ${{ env.MISE_DL_TMPDIR }}
           TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
+          install: true
           # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: --force rust github:mozilla/sccache
@@ -1231,7 +1241,7 @@ jobs:
       # Same setup as the `e2e` job — see that block for the
       # `cache: false` + `reshim: false` rationale.
       - name: Install Rust via mise
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         env:
           # See the e2e job: isolate mise's download/extract scratch
           # without changing TMPDIR for the later Cargo test process.
@@ -1241,6 +1251,7 @@ jobs:
           TEMP: ${{ env.MISE_DL_TMPDIR }}
           TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
+          install: true
           # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: --force rust
@@ -1338,12 +1349,13 @@ jobs:
           echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
           echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
       - name: Install Rust via mise
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         env:
           TMPDIR: ${{ env.MISE_DL_TMPDIR }}
           TEMP: ${{ env.MISE_DL_TMPDIR }}
           TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
+          install: true
           # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: --force rust

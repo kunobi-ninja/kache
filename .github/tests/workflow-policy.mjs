@@ -396,6 +396,14 @@ eq(
     "CI prepares native tools via setup-runner",
   );
   assert.ok(
+    steps.some((step) => step.uses?.startsWith("zondax/actions/setup-mise@")),
+    "CI installs toolchains via setup-mise",
+  );
+  assert.ok(
+    !steps.some((step) => step.uses?.startsWith("jdx/mise-action@")),
+    "CI does not call jdx/mise-action directly",
+  );
+  assert.ok(
     !steps.some((step) => /ci-linux-tools|ci-windows-tools/.test(step.run || "")),
     "CI does not keep in-repo runner bootstrap scripts",
   );

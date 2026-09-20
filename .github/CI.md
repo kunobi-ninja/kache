@@ -4,7 +4,8 @@ Public repositories, including forks, run validation on GitHub-hosted Linux,
 macOS, and Windows runners. No runner variables or publication credentials
 are needed. Pull requests run the normal checks; pushes to `main` and `dev` do too.
 Jobs call `zondax/actions/setup-runner` so missing compilers and NASM are
-installed on the runner before the build.
+installed on the runner before the build, then `zondax/actions/setup-mise`
+for the pinned mise CLI and tool subset.
 
 ## Optional workloads
 

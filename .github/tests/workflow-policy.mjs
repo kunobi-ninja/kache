@@ -389,6 +389,17 @@ eq(
     eq(evaluate(cache.with.save, ctx), allowed, `Nix cache save: ${event} ${ref}`);
   }
 }
+{
+  const steps = Object.values(files["ci.yml"].jobs).flatMap((job) => job.steps || []);
+  assert.ok(
+    steps.some((step) => step.uses?.startsWith("zondax/actions/setup-runner@")),
+    "CI prepares native tools via setup-runner",
+  );
+  assert.ok(
+    !steps.some((step) => /ci-linux-tools|ci-windows-tools/.test(step.run || "")),
+    "CI does not keep in-repo runner bootstrap scripts",
+  );
+}
 for (const name of ["ci.yml", "service-image.yml"]) {
   eq(files[name].on.push.branches.includes("dev"), true, `${name}: validate dev pushes`);
 }

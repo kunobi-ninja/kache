@@ -305,8 +305,7 @@ prefetch tasks. A timeout aborts remaining tasks and sets `incomplete: true`;
 missing transfer outcomes then remain unknown. The summary records `shutdown`
 or `shutdown_timeout` as its closure reason. Shutdown does not publish an
 identity manifest.
-`kache stats` marks incomplete summaries as partial totals. Forced termination,
-including a restart that kills the old process before it finishes draining,
+`kache stats` marks incomplete summaries as partial totals. Forced termination
 can prevent the final write.
 
 Upgrade the service before sending schema 4 records. The updated service also

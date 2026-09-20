@@ -9919,6 +9919,19 @@ mod tests {
             "accept loop returned while an accepted response was still blocked"
         );
 
+        assert!(
+            daemon.prefetch_stopping.load(Ordering::Acquire),
+            "prefetch admission must close before waiting for an accepted response"
+        );
+        assert!(
+            daemon
+                .spawn_prefetch_task(PrefetchOrigin::default(), async {
+                    panic!("draining daemon admitted speculative work");
+                })
+                .is_none(),
+            "draining daemon must reject new speculative tasks"
+        );
+
         release_head.add_permits(1);
         let remote_response = tokio::time::timeout(Duration::from_secs(1), remote_client)
             .await
@@ -10230,6 +10243,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.daemon_idle_timeout_secs = 0;
+        config.prefetch_enabled = false;
+        config.remote = Some(crate::config::RemoteConfig {
+            prefix: "artifacts".into(),
+            backend: crate::config::RemoteBackendConfig::Filesystem(
+                crate::config::FilesystemRemoteConfig {
+                    root: dir.path().join("remote"),
+                    atomic_write_dir: dir.path().join("remote-staging"),
+                },
+            ),
+        });
         let socket_path = config.socket_path();
         let coord = DaemonCoordFile::for_socket(&socket_path);
         let server_config = config.clone();
@@ -10250,6 +10273,23 @@ mod tests {
         .unwrap();
         assert!(ready, "server_main must bind its configured socket");
 
+        assert_eq!(
+            read_daemon_state(&socket_path).unwrap().control_version,
+            Some(kunobi_daemon::wire::VERSION),
+            "stop must use the advertised binary DRAIN endpoint"
+        );
+        let response = client_roundtrip(
+            &socket_path,
+            &Request::BuildStarted(BuildStartedRequest {
+                intent: kache_core::BuildIntent::default(),
+                client_epoch: 0,
+                session_id: "binary-drain-session".into(),
+            }),
+        )
+        .await;
+        assert!(response.ok, "build session must be accepted: {response:?}");
+        assert!(!config.summary_log_path().exists());
+
         let shutdown_config = config.clone();
         tokio::task::spawn_blocking(move || send_shutdown_request(&shutdown_config))
             .await
@@ -10264,6 +10304,16 @@ mod tests {
             result.is_ok(),
             "server_main should exit cleanly: {result:?}"
         );
+        let summaries = events::read_summaries(&config.summary_log_path()).unwrap();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "shutdown must finalize the session once"
+        );
+        assert_eq!(summaries[0].session_id, "binary-drain-session");
+        assert_eq!(summaries[0].closure_reason, "shutdown");
+        assert!(!summaries[0].incomplete);
+        assert!(!summaries[0].cancelled);
         assert!(
             !socket_path.exists(),
             "server_main should remove its socket during shutdown"

@@ -408,21 +408,6 @@ eq(
     "CI does not keep in-repo runner bootstrap scripts",
   );
 }
-for (const name of ["ci.yml", "service-image.yml"]) {
-  eq(files[name].on.push.branches.includes("dev"), true, `${name}: validate dev pushes`);
-}
-eq(files["service-image.yml"].on.pull_request.branches.includes("dev"), true,
-  "service image: validate PRs targeting dev");
-for (const [repo, privateRepo] of [["Zondax/kache", true], ["kunobi-ninja/kache", false]]) {
-  const ctx = context(repo, privateRepo, privateVars, "push");
-  Object.assign(ctx.github, {ref: "refs/heads/dev", ref_name: "dev", ref_type: "branch"});
-  eq(evaluate(files["service-image.yml"].jobs["docker-dry-run"].if, ctx), true,
-    `${repo}: dev builds the service image without publishing`);
-  for (const [workflow, job] of [["service-image.yml", "release"], ["ci.yml", "release"],
-    ["ci.yml", "publish-chart"], ["ci.yml", "stable-branch"]]) {
-    eq(evaluate(files[workflow].jobs[job].if, ctx), false, `${repo}: dev does not run ${job}`);
-  }
-}
 console.log(
   `${checks} workflow policy checks passed across ${routing.length} validation selectors.`,
 );

@@ -15242,6 +15242,28 @@ mod tests {
         assert!(queue.overflowed);
     }
 
+    #[test]
+    fn packed_receipt_queue_drain_returns_queued_events_and_clears_the_queue() {
+        let mut queue = PrefetchReceiptQueue::default();
+        queue.push(TransferEvent {
+            object_key: "keep-me".into(),
+            ..TransferEvent::default()
+        });
+        assert!(queue.retained_bytes > 0);
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].object_key, "keep-me");
+        assert!(queue.events.is_empty());
+        assert_eq!(queue.retained_bytes, 0);
+        assert_eq!(queue.entries, 0);
+        queue.push(TransferEvent {
+            object_key: "after-drain".into(),
+            ..TransferEvent::default()
+        });
+        assert_eq!(queue.events.len(), 1);
+        assert_eq!(queue.events[0].object_key, "after-drain");
+    }
+
     fn packed_receipt_origin(session: usize, plan: usize, source: usize) -> PrefetchOrigin {
         PrefetchOrigin {
             session_id: String::with_capacity(session),

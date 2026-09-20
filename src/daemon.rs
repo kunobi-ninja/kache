@@ -1898,6 +1898,12 @@ impl PrefetchReceipt {
     }
 }
 
+fn finish_open_prefetch_receipt(receipt: &mut PrefetchReceipt, ok: bool) {
+    if receipt.event.finished_at_unix_ms == 0 {
+        receipt.finish(if ok { "completed" } else { "error" });
+    }
+}
+
 impl Drop for PrefetchReceipt {
     fn drop(&mut self) {
         if self.event.finished_at_unix_ms == 0 {
@@ -3276,9 +3282,7 @@ impl Daemon {
             result
         }
         .await;
-        if receipt.event.finished_at_unix_ms == 0 {
-            receipt.finish(if result.is_ok() { "completed" } else { "error" });
-        }
+        finish_open_prefetch_receipt(&mut receipt, result.is_ok());
         self.prefetch_stats.list_duration_ms_total.fetch_add(
             receipt.started.elapsed().as_millis() as u64,
             Ordering::Relaxed,
@@ -5959,7 +5963,7 @@ impl Daemon {
                                 blobs_skipped: dl.blobs_skipped,
                                 blobs_total: dl.blobs_total,
                                 ok: import_ok,
-                                timestamp: finished_at_unix_ms / 1_000,
+                                timestamp: 0,
                             };
                             if !import_ok {
                                 return;
@@ -7794,9 +7798,7 @@ async fn populate_key_cache(daemon: &Arc<Daemon>) -> Result<usize> {
         PrefetchOperation::List,
     );
     let result = populate_key_cache_observed(daemon, &mut receipt).await;
-    if receipt.event.finished_at_unix_ms == 0 {
-        receipt.finish(if result.is_ok() { "completed" } else { "error" });
-    }
+    finish_open_prefetch_receipt(&mut receipt, result.is_ok());
     drop(receipt);
     daemon.flush_prefetch_receipts();
     result
@@ -15512,6 +15514,88 @@ mod tests {
         assert_eq!(finished[0].timestamp, 1_700_000_000);
         assert_ne!(finished[0].timestamp, 123);
         assert_eq!(finished[0].outcome, "completed");
+    }
+
+    #[test]
+    fn finish_open_prefetch_receipt_stamps_unfinished_and_keeps_finished() {
+        let queue = Arc::new(Mutex::new(PrefetchReceiptQueue::default()));
+        let mut open_ok = PrefetchReceipt::new(
+            queue.clone(),
+            PrefetchOrigin::default(),
+            "open-ok",
+            "v3",
+            PrefetchOperation::List,
+        );
+        finish_open_prefetch_receipt(&mut open_ok, true);
+        assert_eq!(open_ok.event.outcome, "completed");
+        assert!(open_ok.event.ok);
+        assert_ne!(open_ok.event.finished_at_unix_ms, 0);
+
+        let mut open_err = PrefetchReceipt::new(
+            queue.clone(),
+            PrefetchOrigin::default(),
+            "open-err",
+            "v3",
+            PrefetchOperation::List,
+        );
+        finish_open_prefetch_receipt(&mut open_err, false);
+        assert_eq!(open_err.event.outcome, "error");
+        assert!(!open_err.event.ok);
+        assert_ne!(open_err.event.finished_at_unix_ms, 0);
+
+        let mut already = PrefetchReceipt::new(
+            queue,
+            PrefetchOrigin::default(),
+            "already",
+            "v3",
+            PrefetchOperation::List,
+        );
+        already.finish("completed");
+        already.event.finished_at_unix_ms = 1_700_000_000_123;
+        already.event.elapsed_ms = 41;
+        finish_open_prefetch_receipt(&mut already, false);
+        assert_eq!(already.event.outcome, "completed");
+        assert!(already.event.ok);
+        assert_eq!(already.event.finished_at_unix_ms, 1_700_000_000_123);
+        assert_eq!(already.event.elapsed_ms, 41);
+    }
+
+    #[test]
+    fn prefetch_backend_observer_received_sums_request_and_body_ms() {
+        let queue = Arc::new(Mutex::new(PrefetchReceiptQueue::default()));
+        let mut receipt = PrefetchReceipt::new(
+            queue,
+            PrefetchOrigin::default(),
+            "obj",
+            "v3",
+            PrefetchOperation::Get,
+        );
+        let stats = PrefetchStats::new();
+        let transfers = TransferCounters::new();
+        {
+            let mut observer = PrefetchBackendObserver {
+                receipt: &mut receipt,
+                stats: &stats,
+                transfers: &transfers,
+                network_started: None,
+            };
+            crate::remote_layout::DownloadObserver::received(
+                &mut observer,
+                Some(&crate::remote_backend::GetTransfer {
+                    bytes: 16,
+                    request_ms: 7,
+                    body_ms: 5,
+                }),
+            );
+        }
+        assert_eq!(receipt.event.compressed_bytes, 16);
+        assert_eq!(receipt.event.request_ms, 7);
+        assert_eq!(receipt.event.body_ms, 5);
+        assert_eq!(receipt.event.network_ms, 12);
+        assert!(receipt.accounting().bytes_complete);
+        assert_eq!(stats.v3_bytes_downloaded.load(Ordering::Relaxed), 16);
+        assert_eq!(stats.bytes_downloaded.load(Ordering::Relaxed), 16);
+        assert_eq!(transfers.bytes_downloaded.load(Ordering::Relaxed), 16);
     }
 
     #[test]

@@ -135,6 +135,36 @@ pub fn is_safe_artifact_name(name: &str) -> bool {
     )
 }
 
+/// A cached artifact's `name` as the local writers may commit it: one normal
+/// path component (`rustc` and `cc` outputs), or the build-script form
+/// `out/<relative>` that `build_script.rs` stores OUT_DIR contents under.
+///
+/// [`is_safe_artifact_name`] intentionally stays single-component: it guards
+/// the untrusted boundaries (remote import, restore), where a name is joined
+/// onto a directory and a separator-bearing name is always a bug. This is the
+/// corresponding predicate for the local writers, so `Store::put` and the
+/// index checks over committed metadata agree on what an entry may contain.
+/// Both reject everything `Path::join` could escape with: rooted paths, `..`,
+/// `.`, and the empty name — and `out/` is only accepted with a component
+/// after it. Every consumer of that form strips the prefix and re-validates
+/// the relative path (`build_script.rs::checked_relative`).
+pub fn is_safe_stored_artifact_name(name: &str) -> bool {
+    use std::path::Component;
+    let mut components = Path::new(name).components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    let tail: Vec<Component> = components.collect();
+    if !tail.iter().all(|c| matches!(c, Component::Normal(_))) {
+        return false;
+    }
+    if first == std::ffi::OsStr::new("out") {
+        !tail.is_empty()
+    } else {
+        tail.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +235,27 @@ mod tests {
         assert!(!is_safe_artifact_name("a/b"));
         assert!(!is_safe_artifact_name("./a"));
         assert!(!is_safe_artifact_name(".."));
+    }
+    /// The local writers store one normal component (`rustc`/`cc`), or the
+    /// build-script `out/<relative>` form (`build_script.rs`). Both are valid
+    /// committed metadata; everything `Path::join` could escape with is not.
+    #[test]
+    fn is_safe_stored_artifact_name_allows_only_the_out_prefix_beyond_one_component() {
+        assert!(is_safe_stored_artifact_name("libfoo-abc123.rlib"));
+        assert!(is_safe_stored_artifact_name("foo.d"));
+        assert!(is_safe_stored_artifact_name("out/asm.s"));
+        assert!(is_safe_stored_artifact_name("out/nested/asm.o"));
+        assert!(!is_safe_stored_artifact_name(""));
+        assert!(!is_safe_stored_artifact_name("/etc/passwd"));
+        assert!(!is_safe_stored_artifact_name("../escape"));
+        assert!(!is_safe_stored_artifact_name(".."));
+        assert!(!is_safe_stored_artifact_name("./a"));
+        assert!(!is_safe_stored_artifact_name("a/b"));
+        // A directory the writer never names: `out/` always carries a file.
+        assert!(!is_safe_stored_artifact_name("out"));
+        assert!(!is_safe_stored_artifact_name("out/"));
+        // The prefix does not license the traversal the strict predicate bans.
+        assert!(!is_safe_stored_artifact_name("out/../escape"));
     }
     /// kunobi-ninja/kache#325: the lookup gate is superset-tolerant, skips empty
     /// (pre-gate) entries, and rejects genuinely-missing kinds.

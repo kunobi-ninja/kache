@@ -11264,6 +11264,38 @@ mod tests {
     }
 
     #[test]
+    fn verify_accepts_build_script_out_dir_artifact_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = save_manifest_config(dir.path().join("cache"), None);
+        let store = Store::open(&config).unwrap();
+        let output = dir.path().join("asm.s");
+        std::fs::write(&output, b"asm bytes").unwrap();
+
+        // What a build-script run commits: OUT_DIR contents under `out/`
+        // (`build_script.rs`). `doctor --verify` must read this as valid
+        // metadata — flagging it reports corruption no repair can remove.
+        store
+            .put(
+                "buildscriptkey",
+                "build_script_run",
+                &["build-script".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "debug",
+                &[(output, "out/asm.s".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        drop(store);
+
+        let outcome = verify(&config, false, false).expect("verify must succeed");
+        assert_eq!(outcome.corrupted_entries, 0, "{outcome:?}");
+        assert_eq!(outcome.index_drift, 0, "{outcome:?}");
+        assert_eq!(outcome.unresolved_integrity_findings(), 0, "{outcome:?}");
+    }
+
+    #[test]
     fn verify_detects_checksum_mismatch_with_checksums_enabled() {
         let dir = tempfile::tempdir().unwrap();
         let config = save_manifest_config(dir.path().join("cache"), None);

@@ -2,45 +2,18 @@
 
 Public repositories, including forks, run validation on GitHub-hosted Linux,
 macOS, and Windows runners. No runner variables or publication credentials
-are needed. Pull requests run the normal checks; pushes to `main` do too.
-
-Private repositories use the same workflows with repository Actions variables.
-Set these before enabling Actions. Each value is JSON: a quoted runner label
-or an array of labels that all have to match.
-
-| Variable | Example JSON value |
-| --- | --- |
-| `CI_RUNNER_LINUX` | `"your-linux-scale-set"` |
-| `CI_RUNNER_MACOS` | `["self-hosted", "macOS", "ARM64", "ci"]` |
-| `CI_RUNNER_WINDOWS` | `["self-hosted", "Windows", "X64", "ci"]` |
-
-The examples are placeholders for labels provisioned in your organization.
-ARC scale sets use their installation name as a single label. Missing or
-invalid selectors fail workflow evaluation instead of selecting a paid
-GitHub-hosted runner. Public validation ignores these overrides and keeps
-the hosted defaults.
-
-Private runners need the tools and permissions used by the selected jobs.
-Linux checks include Docker Buildx, Nix, and a privileged loop-mounted btrfs
-filesystem test. Platform jobs check their compiler tools before testing.
-Use disposable runners for untrusted code and restrict runner-group access
-to the intended repositories. Labels and workflow conditions do not replace
-that access policy. Keep validation runners separate from signing privileges.
-
-See GitHub's [runner selection](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job)
-and [runner-group access](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access)
-documentation.
+are needed. Pull requests run the normal checks; pushes to `main` and `dev` do too.
 
 ## Optional workloads
 
 The official repository retains its existing benchmark and performance pools.
 Other repositories opt in after provisioning suitable runners:
 
-| Workload | Enable variable | Runner variables, using the JSON format above |
+| Workload | Enable variable | Runner variables (JSON selectors) |
 | --- | --- | --- |
 | PR performance measurements | `ENABLE_PERF_GATE=true` | `PERF_RUNNER_LINUX` |
 | Nightly/manual benchmarks | `ENABLE_BENCHMARKS=true` | `BENCH_RUNNER_LINUX`, `BENCH_RUNNER_LINUX_LARGE`, `BENCH_RUNNER_WINDOWS` |
-| Scheduled fuzzing | `ENABLE_SCHEDULED_JOBS=true` | Uses `CI_RUNNER_LINUX` in private repositories |
+| Scheduled fuzzing | `ENABLE_SCHEDULED_JOBS=true` | `CI_RUNNER_LINUX` |
 
 Only benchmark classes selected by the scenario need a matching runner.
 Large scenarios require up to 120 GB free disk; ordinary hosted runners are
@@ -77,7 +50,7 @@ the default-branch warmer saves the cache so later tags can read it.
 
 `Detect changes` classifies the files a pull request touches with
 `scripts/ci-changes.py` and turns on only the job groups that cover them.
-Pushes to `main` and tags always run everything.
+Pushes to `main`, `dev` and tags always run everything.
 
 | Files | Jobs |
 | --- | --- |

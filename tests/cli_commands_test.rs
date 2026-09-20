@@ -1504,7 +1504,11 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
     std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
     let original = "[build]\nrustc-wrapper = \"sccache\"\n[env]\nHOST_CC = \"custom-cc\"\n";
     std::fs::write(&cargo, original).unwrap();
-    std::fs::write(e.home.join(".bashrc"), "# user rc\n").unwrap();
+    std::fs::write(
+        e.home.join(".bashrc"),
+        "# user rc\nprintf 'user shell startup\\n'\n",
+    )
+    .unwrap();
     std::fs::write(e.home.join(".profile"), "# user profile\n").unwrap();
     let output = e
         .cmd()
@@ -1558,22 +1562,26 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
         before
     );
     assert_eq!(std::fs::read_to_string(&cargo).unwrap(), configured);
+    // System bashrc files can print a welcome banner before the user's rc.
+    // Capture the resolved compiler separately from shell startup output.
+    let resolved_cc = e.home.join("resolved-cc");
     let shell = std::process::Command::new("/bin/bash")
         .args([
             "--noprofile",
             "--rcfile",
             e.home.join(".bashrc").to_str().unwrap(),
             "-ic",
-            "command -v cc",
+            "command -v cc > \"$KACHE_TEST_CC_PATH\"",
         ])
         .env("HOME", &e.home)
         .env("PATH", "/usr/bin:/bin")
+        .env("KACHE_TEST_CC_PATH", &resolved_cc)
         .env_remove("BASH_ENV")
         .output()
         .unwrap();
     assert!(shell.status.success());
     assert_eq!(
-        String::from_utf8(shell.stdout).unwrap().trim(),
+        std::fs::read_to_string(resolved_cc).unwrap().trim(),
         e.home.join(".local/lib/kache/shims/cc").to_str().unwrap()
     );
 }

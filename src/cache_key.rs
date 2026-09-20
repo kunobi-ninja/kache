@@ -7301,6 +7301,8 @@ mod tests {
     /// and stays off for a unit predictions cannot describe.
     #[test]
     fn discovery_flight_identity_names_the_unit_with_or_without_predictions() {
+        // Identity helpers read cwd and environment, which other tests mutate.
+        let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("index.db");
         let parse = |args: &[&str]| {

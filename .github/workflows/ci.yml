@@ -79,8 +79,10 @@ jobs:
       # mise installs everything in mise.toml (just, helm, sccache,
       # cargo-llvm-cov) plus rust, which it reads from rust-toolchain.toml:
       # channel, rustfmt and clippy.
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin the mise CLI. v2026.6.10 (2026-06-14) regressed binary
           # resolution ("mise ERROR cannot find binary path"), reddening every
           # run after its release — including unchanged code that passed hours
@@ -173,6 +175,7 @@ jobs:
         # run artifacts and `gh release upload artifacts/*` chokes on directory
         # artifacts like this one. Coverage HTML is only useful on PR/branch runs.
         if: always() && github.ref_type != 'tag'
+        continue-on-error: true
         with:
           name: coverage-html
           path: tmp/llvm-cov/html
@@ -196,8 +199,9 @@ jobs:
         with:
           fetch-depth: 0
       - if: github.event_name == 'pull_request' && needs.changes.outputs.tests == 'true'
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: rust
           cache: false
@@ -277,8 +281,10 @@ jobs:
           # PR checkout is a synthetic merge commit. Its first parent is the
           # exact base used by this run, avoiding stale event SHAs.
           fetch-depth: 0
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: rust
           cache: false
@@ -317,9 +323,15 @@ jobs:
             --build-timeout 600 \
             --annotations github \
             --output tmp/mutants/core
+      - name: Print missed mutations
+        if: always()
+        run: |
+          report='tmp/mutants/core/mutants.out/missed.txt'
+          if [ -f "$report" ]; then cat "$report"; fi
       - name: Upload core mutation report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
         with:
           name: mutation-core-report
           path: tmp/mutants/core
@@ -342,8 +354,10 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: rust
           cache: false
@@ -388,9 +402,15 @@ jobs:
             --build-timeout 600 \
             --annotations github \
             --output tmp/mutants/service
+      - name: Print missed mutations
+        if: always()
+        run: |
+          report='tmp/mutants/service/mutants.out/missed.txt'
+          if [ -f "$report" ]; then cat "$report"; fi
       - name: Upload service mutation report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
         with:
           name: mutation-service-report
           path: tmp/mutants/service
@@ -418,8 +438,10 @@ jobs:
         with:
           name: mutation-diff-plan
           path: tmp/mutants
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: rust
           cache: false
@@ -461,9 +483,15 @@ jobs:
             --build-timeout 600 \
             --annotations github \
             --output 'tmp/mutants/diff-${{ matrix.display }}'
+      - name: Print missed mutations
+        if: always()
+        run: |
+          report='tmp/mutants/diff-${{ matrix.display }}/mutants.out/missed.txt'
+          if [ -f "$report" ]; then cat "$report"; fi
       - name: Upload changed-line mutation report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
         with:
           name: mutation-diff-report-${{ matrix.display }}
           path: tmp/mutants/diff-${{ matrix.display }}
@@ -534,8 +562,10 @@ jobs:
       RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: rust
           cache: false
@@ -665,8 +695,9 @@ jobs:
       # cmake, sccache, llvm-cov) doesn't build on this job. Tool names must
       # match the mise.toml keys. cargo-deny ships prebuilt via the aqua backend
       # (no from-source compile).
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: rust github:casey/just aqua:EmbarkStudios/cargo-deny
@@ -691,8 +722,10 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: rust
@@ -763,6 +796,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        timeout-minutes: 10
       - name: Restore Nix store
         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
         with:
@@ -805,8 +839,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin mise CLI — see the `check` job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: rust
@@ -816,6 +852,11 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y btrfs-progs
+          # Container runners also need kernel btrfs support and loop devices.
+          # Report missing host facilities before trying to mount the image.
+          uname -r
+          ls -l /dev/loop-control /dev/loop* || true
+          sudo losetup --find
           # Sparse: the image only occupies what the tests actually write.
           truncate -s 20G "$RUNNER_TEMP/cow.img"
           mkfs.btrfs -q "$RUNNER_TEMP/cow.img"
@@ -908,23 +949,22 @@ jobs:
         # Checkout never legitimately runs this long, so fail fast rather than
         # waiting out the whole job timeout.
         timeout-minutes: 10
+      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+        if: env.RUN_E2E == 'true'
+      - name: Keep E2E caches on the workspace filesystem
+        if: env.RUN_E2E == 'true' && runner.os == 'Linux'
+        # The active-reader fixture must exercise real hardlinks between its
+        # cache and target trees. /tmp can be a separate container mount.
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tmp/e2e-scratch"
+          echo "TMPDIR=$GITHUB_WORKSPACE/tmp/e2e-scratch" >> "$GITHUB_ENV"
       - name: Install cross gcc (riscv64 + armv7)
         if: env.RUN_E2E == 'true' && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-riscv64-linux-gnu gcc-arm-linux-gnueabihf
-      - name: Put hosted Windows tools on PATH
-        if: env.RUN_E2E == 'true' && (runner.os == 'Windows')
-        run: |
-          if ! command -v nasm >/dev/null 2>&1; then
-            nasm_dir="/c/Program Files/NASM"
-            if [ ! -x "$nasm_dir/nasm.exe" ]; then
-              echo "MISSING on hosted image: $nasm_dir/nasm.exe"
-              exit 1
-            fi
-            cygpath -w "$nasm_dir" >> "$GITHUB_PATH"
-          fi
-      # Fail fast with an explicit hosted-image checklist instead of an opaque
+
+      # Fail fast with an explicit build-tool checklist instead of an opaque
       # failure deep in the cargo build or a fixture's `make`.
       #   cc/c++/make  -> C/C++ fixtures (harness sets CC="$KACHE cc")
       #   clang/clang-cl -> fixtures that exercise clang-specific classification
@@ -938,7 +978,7 @@ jobs:
           missing=
           for t in cc c++ make nasm clang clang-cl; do
             if ! command -v "$t" >/dev/null 2>&1; then
-              echo "MISSING on hosted runner PATH: $t"
+              echo "MISSING on runner PATH: $t"
               missing=1
             fi
           done
@@ -982,7 +1022,7 @@ jobs:
       # identifier is required.
       - name: Install tools via mise
         if: env.RUN_E2E == 'true'
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         env:
           # jdx/mise-action extracts into `$TMPDIR/mise` before moving
           # the binary. On the shared macOS host, parallel runner
@@ -995,6 +1035,7 @@ jobs:
           TEMP: ${{ env.MISE_DL_TMPDIR }}
           TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
+          install: true
           # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: --force rust github:mozilla/sccache
@@ -1148,6 +1189,7 @@ jobs:
         # artifacts/*` would try to upload this directory as a release asset.
         if: env.RUN_E2E == 'true' && (always() && github.ref_type != 'tag')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
         with:
           name: e2e-results-${{ matrix.os }}
           path: tmp/e2e/
@@ -1199,7 +1241,7 @@ jobs:
       # Same setup as the `e2e` job — see that block for the
       # `cache: false` + `reshim: false` rationale.
       - name: Install Rust via mise
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         env:
           # See the e2e job: isolate mise's download/extract scratch
           # without changing TMPDIR for the later Cargo test process.
@@ -1209,6 +1251,7 @@ jobs:
           TEMP: ${{ env.MISE_DL_TMPDIR }}
           TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
+          install: true
           # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: --force rust
@@ -1269,16 +1312,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
-      - name: Put hosted Windows tools on PATH
-        run: |
-          if ! command -v nasm >/dev/null 2>&1; then
-            nasm_dir="/c/Program Files/NASM"
-            if [ ! -x "$nasm_dir/nasm.exe" ]; then
-              echo "MISSING on hosted image: $nasm_dir/nasm.exe"
-              exit 1
-            fi
-            cygpath -w "$nasm_dir" >> "$GITHUB_PATH"
-          fi
+      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
       # Fail fast if the runner is missing a build tool the dep graph needs
       # (ring → nasm, *-sys → cc). Mirrors the e2e job's check.
       - name: Verify Windows build toolchain
@@ -1286,7 +1320,7 @@ jobs:
           missing=
           for t in cc c++ make nasm; do
             if ! command -v "$t" >/dev/null 2>&1; then
-              echo "MISSING on hosted runner PATH: $t"
+              echo "MISSING on runner PATH: $t"
               missing=1
             fi
           done
@@ -1315,12 +1349,13 @@ jobs:
           echo "MISE_CACHE_DIR=$RUNNER_TEMP/mise-cache" >> "$GITHUB_ENV"
           echo "MISE_STATE_DIR=$RUNNER_TEMP/mise-state" >> "$GITHUB_ENV"
       - name: Install Rust via mise
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         env:
           TMPDIR: ${{ env.MISE_DL_TMPDIR }}
           TEMP: ${{ env.MISE_DL_TMPDIR }}
           TMP: ${{ env.MISE_DL_TMPDIR }}
         with:
+          install: true
           # Pin mise CLI — see the bootstrap job's note (v2026.6.10 regression).
           version: 2026.6.9
           install_args: --force rust

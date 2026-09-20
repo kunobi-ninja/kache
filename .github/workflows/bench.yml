@@ -358,8 +358,9 @@ jobs:
       - name: Install tools via mise
         id: mise
         continue-on-error: true
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
           install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || matrix.name == 'hk' || matrix.name == 'eza') && ' github:mozilla/sccache' || '' }}
@@ -368,8 +369,9 @@ jobs:
 
       - name: Install tools via mise (retry)
         if: steps.mise.outcome == 'failure'
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           version: 2026.6.9
           install_args: --force rust github:casey/just${{ (endsWith(matrix.name, '-sccache') || matrix.name == 'hk' || matrix.name == 'eza') && ' github:mozilla/sccache' || '' }}
           cache: false

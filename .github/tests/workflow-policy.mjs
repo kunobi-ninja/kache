@@ -389,6 +389,25 @@ eq(
     eq(evaluate(cache.with.save, ctx), allowed, `Nix cache save: ${event} ${ref}`);
   }
 }
+{
+  const steps = Object.values(files["ci.yml"].jobs).flatMap((job) => job.steps || []);
+  assert.ok(
+    steps.some((step) => step.uses?.startsWith("zondax/actions/setup-runner@")),
+    "CI prepares native tools via setup-runner",
+  );
+  assert.ok(
+    steps.some((step) => step.uses?.startsWith("zondax/actions/setup-mise@")),
+    "CI installs toolchains via setup-mise",
+  );
+  assert.ok(
+    !steps.some((step) => step.uses?.startsWith("jdx/mise-action@")),
+    "CI does not call jdx/mise-action directly",
+  );
+  assert.ok(
+    !steps.some((step) => /ci-linux-tools|ci-windows-tools/.test(step.run || "")),
+    "CI does not keep in-repo runner bootstrap scripts",
+  );
+}
 console.log(
   `${checks} workflow policy checks passed across ${routing.length} validation selectors.`,
 );

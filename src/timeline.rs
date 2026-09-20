@@ -343,6 +343,7 @@ fn summaries_by_session(summaries: &[BuildSummaryEvent]) -> HashMap<String, &Bui
 
 fn summary_projection(summary: &&BuildSummaryEvent) -> TimelineSummary {
     TimelineSummary {
+        incomplete: summary.incomplete,
         plan_id: summary.plan_id.clone(),
         plan_source: summary.plan_source.clone(),
         closure_reason: summary.closure_reason.clone(),
@@ -865,8 +866,9 @@ mod tests {
     fn the_newest_summary_for_the_session_is_attached() {
         let events = [event("s1", "serde", "k1", 5_000, 500)];
         let summary = |last_activity_ms, plan_id: &str| BuildSummaryEvent {
+            incomplete: plan_id == "new",
             ts: chrono::Utc.timestamp_millis_opt(1).unwrap(),
-            schema: 1,
+            schema: 2,
             session_id: "s1".to_string(),
             root: String::new(),
             plan_source: "advisory".to_string(),
@@ -888,6 +890,7 @@ mod tests {
         let summaries = [summary(10, "old"), summary(20, "new")];
         let records = build_timelines(&inputs(&events, &[], &summaries, &EnvSnapshot::default()));
         let attached = records[0].summary.as_ref().unwrap();
+        assert!(attached.incomplete);
         assert_eq!(attached.plan_id, "new");
         assert_eq!(attached.candidate_keys, 4);
 

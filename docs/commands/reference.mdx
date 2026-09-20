@@ -286,7 +286,7 @@ The default selects the latest session. `--all` selects every retained session;
 service through `KACHE_PLANNER_ENDPOINT` and its credentials. Upload failures
 print a warning without failing a completed build.
 
-Timeline schema 3 records the session, plan, candidate source, and zero-based
+Timeline schema 4 records the session, plan, candidate source, and zero-based
 rank for ordinary prefetch downloads. Transfers retain `completed`,
 `not_found`, `error`, and `import_error` outcomes. The origin stays with a
 download even if another build starts before it finishes. A local-hit unit
@@ -300,8 +300,16 @@ the existing daemon remote-check calls, including failed calls, IPC and daemon
 admission. It does not estimate time saved. A stale predicted key and its
 replacement retain separate observations. Recording adds no network request.
 
-Upgrade the service before sending schema 3 records. The updated service also
-accepts schemas 1 and 2. Wrapper events before schema 20 have no demand
+Graceful daemon shutdown writes the active session's local summary after draining
+prefetch tasks. A timeout aborts remaining tasks and sets `incomplete: true`;
+missing transfer outcomes then remain unknown. The summary records `shutdown`
+or `shutdown_timeout` as its closure reason. Shutdown does not publish an
+identity manifest.
+`kache stats` marks incomplete summaries as partial totals. Forced termination
+can prevent the final write.
+
+Upgrade the service before sending schema 4 records. The updated service also
+accepts schemas 1 through 3. Wrapper events before schema 20 have no demand
 observations. Current demand transfers and older logs still require a unique
 key or time-window match; ambiguous transfers remain unattributed.
 Packed-prefetch transfers are not yet covered by this attribution.

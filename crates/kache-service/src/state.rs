@@ -808,7 +808,7 @@ mod tests {
             ]
             .map(|s| Some(s.to_string()))
         );
-        assert_eq!(numbers, [77, 3, 1_000, 9_000, 3, 2]);
+        assert_eq!(numbers, [77, 4, 1_000, 9_000, 3, 2]);
         assert_eq!(body, b"{json}");
         assert!(stored_timeline_row(&repo, "edge-2", "r1").await.is_none());
     }

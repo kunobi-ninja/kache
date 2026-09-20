@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of [`BuildTimeline`]. A server rejects a record whose schema it
 /// does not know.
-pub const BUILD_TIMELINE_SCHEMA: u32 = 3;
+pub const BUILD_TIMELINE_SCHEMA: u32 = 4;
 
 /// One build session: its compiler invocations and the remote transfers that
 /// belong to it.
@@ -118,6 +118,9 @@ pub struct LogLimits {
 /// The daemon's per-session prefetch plan summary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TimelineSummary {
+    /// Some prefetch outcomes were unavailable when the session closed.
+    #[serde(default)]
+    pub incomplete: bool,
     #[serde(default)]
     pub plan_id: String,
     #[serde(default)]

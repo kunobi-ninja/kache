@@ -409,6 +409,10 @@ impl std::fmt::Display for EventResult {
 pub struct BuildSummaryEvent {
     pub ts: DateTime<Utc>,
     pub schema: u32,
+    /// Shutdown could not observe every prefetch outcome. Completed counters
+    /// remain lower bounds; missing bytes and attempts must not be read as zero.
+    #[serde(default)]
+    pub incomplete: bool,
     #[serde(default)]
     pub session_id: String,
     #[serde(default)]
@@ -418,7 +422,7 @@ pub struct BuildSummaryEvent {
     pub plan_source: String,
     #[serde(default)]
     pub plan_id: String,
-    /// `inactivity` | `superseded` | `shutdown`.
+    /// `inactivity` | `superseded` | `shutdown` | `shutdown_timeout`.
     #[serde(default)]
     pub closure_reason: String,
     #[serde(default)]
@@ -444,7 +448,7 @@ pub struct BuildSummaryEvent {
     /// Distinct demanded keys that were plan candidates.
     #[serde(default)]
     pub demanded_candidate_keys: u64,
-    /// Whether adaptive cancellation fired for this plan.
+    /// Whether adaptive cancellation or shutdown stopped work for this plan.
     #[serde(default)]
     pub cancelled: bool,
     /// Key-cache LIST refreshes attributed to this session (delta of the
@@ -1054,6 +1058,17 @@ pub fn rotate_if_needed(event_log_path: &Path, max_size: u64, keep_lines: usize)
 /// Own file rather than `events.jsonl` so `read_events` never has to skip
 /// foreign lines; same locking discipline as the other logs.
 pub fn log_summary(summary_log_path: &Path, event: &BuildSummaryEvent) -> Result<()> {
+    append_summary(summary_log_path, event, false)
+}
+
+pub(crate) fn log_summary_durable(
+    summary_log_path: &Path,
+    event: &BuildSummaryEvent,
+) -> Result<()> {
+    append_summary(summary_log_path, event, true)
+}
+
+fn append_summary(summary_log_path: &Path, event: &BuildSummaryEvent, durable: bool) -> Result<()> {
     if let Some(parent) = summary_log_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1070,6 +1085,12 @@ pub fn log_summary(summary_log_path: &Path, event: &BuildSummaryEvent) -> Result
     bytes.push(b'\n');
     file.write_all(&bytes)
         .context("writing summary event to log")?;
+    if durable {
+        file.sync_all().context("flushing summary event to disk")?;
+        if let Some(parent) = summary_log_path.parent() {
+            crate::atomic::fsync_dir(parent).context("flushing summary directory")?;
+        }
+    }
     lock.unlock().context("unlocking summary log")?;
     Ok(())
 }
@@ -1491,6 +1512,74 @@ impl BuildEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Linux rejects fsync on a FIFO; macOS accepts it without an error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn summary_durability_reports_sync_failure_after_writing_and_releases_lock() {
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        const CHILD_LOG: &str = "KACHE_TEST_SUMMARY_SYNC_FAILURE_LOCK";
+        if let Some(path) = std::env::var_os(CHILD_LOG) {
+            let lock = open_log_lock(Path::new(&path)).unwrap();
+            lock.try_lock()
+                .expect("failed append must release its lock");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("summaries.jsonl");
+        let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the CString is a valid, terminated path for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // Opening the reader without blocking lets append open its writer
+        // immediately. Each small line fits in an empty pipe and is drained
+        // before the next append; no reader thread or blocking read is needed.
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let event: BuildSummaryEvent =
+            serde_json::from_str(r#"{"ts":"2026-09-20T00:00:00Z","schema":2}"#).unwrap();
+        let expected = format!("{}\n", serde_json::to_string(&event).unwrap());
+        assert!(expected.len() <= 512, "must fit the minimum Unix PIPE_BUF");
+
+        log_summary(&path, &event).unwrap();
+        let mut received = String::new();
+        reader.read_to_string(&mut received).unwrap();
+        assert_eq!(received, expected);
+
+        let error = log_summary_durable(&path, &event).unwrap_err();
+        assert_eq!(error.to_string(), "flushing summary event to disk");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        received.clear();
+        reader.read_to_string(&mut received).unwrap();
+        assert_eq!(received, expected, "sync fails after the full append");
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "events::tests::summary_durability_reports_sync_failure_after_writing_and_releases_lock",
+            ])
+            .env(CHILD_LOG, &path)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "lock probe failed: {}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
 
     fn test_event(
         crate_name: &str,

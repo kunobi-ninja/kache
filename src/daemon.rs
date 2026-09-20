@@ -4827,6 +4827,12 @@ impl Daemon {
         self.prefetch_stopping.store(true, Ordering::Release);
     }
 
+    fn record_rejected_prefetch_candidates(&self, remaining: impl Iterator) {
+        self.prefetch_stats
+            .keys_cancelled
+            .fetch_add(1 + remaining.count() as u64, Ordering::Relaxed);
+    }
+
     fn cancel_prefetch_plan(&self, origin: &PrefetchOrigin) {
         let mut slot = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(plan) = slot.as_mut()
@@ -5501,10 +5507,7 @@ impl Daemon {
                 if let Some(task) = task {
                     in_flight.push(task);
                 } else {
-                    daemon
-                        .prefetch_stats
-                        .keys_cancelled
-                        .fetch_add(1 + keys_iter.count() as u64, Ordering::Relaxed);
+                    daemon.record_rejected_prefetch_candidates(keys_iter);
                     break;
                 }
             }
@@ -15951,7 +15954,9 @@ mod tests {
         assert_eq!(plan.downloaded, HashMap::from([("key".to_string(), 42)]));
     }
 
-    async fn shutdown_prefetch_fixture() -> (
+    async fn shutdown_prefetch_fixture(
+        key_count: usize,
+    ) -> (
         tempfile::TempDir,
         Arc<Daemon>,
         Arc<BlockingV3Backend>,
@@ -15964,10 +15969,9 @@ mod tests {
         config.remote = Some(test_remote_config());
         config.s3_concurrency = 1;
         let inner = test_remote_backend();
-        let keys = vec![
-            test_cache_key("shutdown-first"),
-            test_cache_key("shutdown-queued"),
-        ];
+        let keys: Vec<_> = (0..key_count)
+            .map(|index| test_cache_key(&format!("shutdown-{index}")))
+            .collect();
         let mut first_bytes = 0;
         for (index, key) in keys.iter().enumerate() {
             let pack = build_entry_pack(key, "serde");
@@ -16018,7 +16022,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_prefetch_drains_started_child_before_summary_and_rejects_queued_work() {
-        let (_dir, daemon, backend, mut started, keys, bytes) = shutdown_prefetch_fixture().await;
+        let (_dir, daemon, backend, mut started, keys, bytes) = shutdown_prefetch_fixture(2).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), started.recv())
                 .await
@@ -16087,7 +16091,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_prefetch_rejects_a_child_waiting_for_the_download_claim() {
-        let (_dir, daemon, backend, _started, _keys, _bytes) = shutdown_prefetch_fixture().await;
+        let (_dir, daemon, backend, _started, _keys, _bytes) = shutdown_prefetch_fixture(2).await;
         let claims = daemon.downloading.write().await;
         tokio::time::timeout(Duration::from_secs(2), async {
             while daemon.s3_semaphore.available_permits() != 0 {
@@ -16161,7 +16165,8 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_prefetch_timeout_drops_and_joins_the_actual_download_child() {
-        let (_dir, daemon, backend, mut started, _keys, _bytes) = shutdown_prefetch_fixture().await;
+        let (_dir, daemon, backend, mut started, _keys, _bytes) =
+            shutdown_prefetch_fixture(2).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), started.recv())
                 .await
@@ -16226,6 +16231,227 @@ mod tests {
         assert!(!summaries[0].incomplete);
         assert!(!summaries[0].cancelled);
         assert!(daemon.active_plan.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_marks_overflow_incomplete_without_timeout_or_matching_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon.install_plan("session", "plan", "advisory", std::iter::empty(), None);
+        // Fill the bounded drop queue with another plan's cancellations. The
+        // omitted origins are unknown, so they can still belong to this plan.
+        for _ in 0..129 {
+            drop(PrefetchTaskGuard {
+                origin: Some(PrefetchOrigin {
+                    session_id: "other-session".into(),
+                    plan_id: "other-plan".into(),
+                    source: "other-source".into(),
+                    ..PrefetchOrigin::default()
+                }),
+                cancellations: daemon.prefetch_cancellations.clone(),
+            });
+        }
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(1))
+                .await
+        );
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].closure_reason, "shutdown");
+        assert!(summaries[0].incomplete);
+        assert!(summaries[0].cancelled);
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_cancellation_requires_the_complete_plan_origin() {
+        for (session, plan, source, matches) in [
+            ("session", "plan", "advisory", true),
+            ("other-session", "plan", "advisory", false),
+            ("session", "other-plan", "advisory", false),
+            ("session", "plan", "fallback", false),
+            ("other-session", "other-plan", "fallback", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+            daemon.install_plan("session", "plan", "advisory", std::iter::empty(), None);
+            let completion = daemon
+                .spawn_prefetch_task(
+                    PrefetchOrigin {
+                        session_id: session.into(),
+                        plan_id: plan.into(),
+                        source: source.into(),
+                        ..PrefetchOrigin::default()
+                    },
+                    async { panic!("cancel this plan's task") },
+                )
+                .unwrap();
+            assert!(completion.await.is_err());
+            assert!(
+                !daemon
+                    .finish_prefetch_shutdown(Duration::from_secs(1))
+                    .await
+            );
+            let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+            assert_eq!(summaries.len(), 1);
+            let summary = &summaries[0];
+            assert_eq!(summary.session_id, "session");
+            assert_eq!(summary.plan_id, "plan");
+            assert_eq!(summary.plan_source, "advisory");
+            assert_eq!(summary.closure_reason, "shutdown");
+            assert_eq!(summary.incomplete, matches, "{session}/{plan}/{source}");
+            assert_eq!(summary.cancelled, matches, "{session}/{plan}/{source}");
+        }
+    }
+
+    #[test]
+    fn shutdown_prefetch_rejects_new_sessions_and_empty_session_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new(test_config(dir.path()));
+        for session in ["", " \t "] {
+            daemon.ensure_active_session(&BuildStartedRequest {
+                intent: kache_core::BuildIntent::default(),
+                client_epoch: 0,
+                session_id: session.into(),
+            });
+            assert!(daemon.active_plan.lock().unwrap().is_none());
+        }
+        daemon.stop_prefetch_admission();
+        daemon.ensure_active_session(&BuildStartedRequest {
+            intent: kache_core::BuildIntent::default(),
+            client_epoch: 0,
+            session_id: "too-late".into(),
+        });
+        assert!(daemon.active_plan.lock().unwrap().is_none());
+        assert!(!daemon.config.summary_log_path().exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_rejected_child_counts_current_and_remaining_candidates() {
+        for (remaining_count, expected_total) in [(0, 14), (3, 17)] {
+            let dir = tempfile::tempdir().unwrap();
+            let daemon = Daemon::new(test_config(dir.path()));
+            daemon
+                .prefetch_stats
+                .keys_cancelled
+                .store(13, Ordering::Relaxed);
+            daemon.stop_prefetch_admission();
+            let polled = Arc::new(AtomicBool::new(false));
+            let future_flag = polled.clone();
+            let admission = daemon.spawn_prefetch_task(PrefetchOrigin::default(), async move {
+                future_flag.store(true, Ordering::Relaxed);
+            });
+            assert!(admission.is_none());
+            let mut remaining =
+                (0..remaining_count).map(|i| (format!("key-{i}"), "serde".to_string()));
+            daemon.record_rejected_prefetch_candidates(remaining.by_ref());
+            assert!(
+                remaining.next().is_none(),
+                "rejection drains the pending candidates"
+            );
+            assert_eq!(
+                daemon.prefetch_stats.keys_cancelled.load(Ordering::Relaxed),
+                expected_total
+            );
+            assert!(!polled.load(Ordering::Relaxed));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_adaptive_cancel_rejects_queued_keys_before_shutdown() {
+        let (_dir, daemon, backend, mut started, keys, _bytes) = shutdown_prefetch_fixture(3).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), started.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(!daemon.prefetch_stopping.load(Ordering::Acquire));
+        daemon.prefetch_cancel.send(true).unwrap();
+        // Candidate two passed the guard before waiting for candidate one.
+        // Both may finish; candidate three must observe the adaptive latch.
+        // A wrongly admitted third GET can finish and expose its request.
+        backend.release_v3_get.add_permits(keys.len());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let pending = {
+                    let mut tasks = daemon.prefetch_tasks.lock().unwrap();
+                    while tasks.try_join_next().is_some() {}
+                    !tasks.is_empty()
+                };
+                if !pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prefetch coordinator and children must finish");
+        assert_eq!(backend.v3_gets.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            daemon.prefetch_stats.keys_cancelled.load(Ordering::Relaxed),
+            1
+        );
+        assert!(daemon.entry_dir_for(&keys[1]).exists());
+        assert!(!daemon.entry_dir_for(&keys[2]).exists());
+        assert!(!daemon.prefetch_stopping.load(Ordering::Acquire));
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(1))
+                .await
+        );
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].cancelled);
+        assert!(!summaries[0].incomplete);
+    }
+
+    #[tokio::test]
+    async fn shutdown_prefetch_inactivity_emits_once_then_leaves_shutdown_to_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon.install_plan("idle-session", "plan", "advisory", std::iter::empty(), None);
+        daemon.finalize_inactive_plan(u64::MAX);
+        assert!(!daemon.config.summary_log_path().exists());
+        daemon
+            .active_plan
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .last_activity_ms = 0;
+        daemon.finalize_inactive_plan(1);
+        assert!(daemon.active_plan.lock().unwrap().is_none());
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].session_id, "idle-session");
+        assert_eq!(summaries[0].closure_reason, "inactivity");
+        daemon.finalize_inactive_plan(0);
+        daemon.install_plan(
+            "last-session",
+            "last-plan",
+            "none",
+            std::iter::empty(),
+            None,
+        );
+        daemon.stop_prefetch_admission();
+        daemon.finalize_inactive_plan(0);
+        assert!(daemon.active_plan.lock().unwrap().is_some());
+        assert_eq!(
+            events::read_summaries(&daemon.config.summary_log_path())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(1))
+                .await
+        );
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[1].session_id, "last-session");
+        assert_eq!(summaries[1].closure_reason, "shutdown");
     }
 
     #[tokio::test]

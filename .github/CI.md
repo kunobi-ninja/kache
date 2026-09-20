@@ -2,10 +2,7 @@
 
 Public repositories, including forks, run validation on GitHub-hosted Linux,
 macOS, and Windows runners. No runner variables or publication credentials
-are needed. Pull requests run the normal checks; pushes to `main` and `dev` do too.
-Jobs call `zondax/actions/setup-runner` so missing compilers and NASM are
-installed on the runner before the build, then `zondax/actions/setup-mise`
-for the pinned mise CLI and tool subset.
+are needed. Pull requests run the normal checks; pushes to `main` do too.
 
 ## Optional workloads
 
@@ -53,7 +50,7 @@ the default-branch warmer saves the cache so later tags can read it.
 
 `Detect changes` classifies the files a pull request touches with
 `scripts/ci-changes.py` and turns on only the job groups that cover them.
-Pushes to `main`, `dev` and tags always run everything.
+Pushes to `main` and tags always run everything.
 
 | Files | Jobs |
 | --- | --- |

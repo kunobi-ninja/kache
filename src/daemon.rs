@@ -17331,7 +17331,9 @@ mod tests {
                 .recent_transfers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .back()
+                .iter()
+                .rev()
+                .find(|event| event.cache_key == key && event.outcome == "completed")
                 .cloned();
             if transfer.is_some() {
                 break;

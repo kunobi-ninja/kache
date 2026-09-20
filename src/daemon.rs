@@ -1904,6 +1904,11 @@ impl Drop for PrefetchReceipt {
     }
 }
 
+fn charge_packed_import(event: &mut TransferEvent, original_bytes: u64, extract_ms: u64) {
+    event.original_bytes += original_bytes;
+    event.extract_ms += extract_ms;
+}
+
 struct PackedAttribution<'a> {
     origin: &'a PrefetchOrigin,
     ranks: &'a HashMap<String, u64>,
@@ -5093,8 +5098,11 @@ impl Daemon {
                     receipts[verified[0].2].event.import_ms = import_ms;
                     for (entry, _, pack_index, entry_index) in &verified {
                         let receipt = &mut receipts[*pack_index];
-                        receipt.event.original_bytes += entry.original_bytes;
-                        receipt.event.extract_ms += entry.extract_ms;
+                        charge_packed_import(
+                            &mut receipt.event,
+                            entry.original_bytes,
+                            entry.extract_ms,
+                        );
                         let logical = &mut receipt.accounting().entries[*entry_index];
                         logical.finished_at_ms = completed_at_ms;
                         logical.outcome = "completed".to_owned();
@@ -15234,6 +15242,208 @@ mod tests {
         assert!(queue.overflowed);
     }
 
+    fn packed_receipt_origin(session: usize, plan: usize, source: usize) -> PrefetchOrigin {
+        PrefetchOrigin {
+            session_id: String::with_capacity(session),
+            plan_id: String::with_capacity(plan),
+            source: String::with_capacity(source),
+            ..PrefetchOrigin::default()
+        }
+    }
+
+    fn packed_receipt_retained_bytes(event: &TransferEvent) -> usize {
+        fn origin_bytes(origin: &PrefetchOrigin) -> usize {
+            origin.session_id.capacity() + origin.plan_id.capacity() + origin.source.capacity()
+        }
+        let mut bytes = std::mem::size_of::<TransferEvent>()
+            + event.crate_name.capacity()
+            + event.format.capacity()
+            + event.cache_key.capacity()
+            + event.object_key.capacity()
+            + event.outcome.capacity()
+            + event.prefetch.as_ref().map_or(0, origin_bytes);
+        if let Some(accounting) = &event.accounting {
+            bytes += accounting.entries.capacity() * std::mem::size_of::<PackedEntryTransfer>();
+            for entry in &accounting.entries {
+                bytes += entry.cache_key.capacity()
+                    + entry.crate_name.capacity()
+                    + entry.outcome.capacity()
+                    + origin_bytes(&entry.prefetch);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn packed_receipt_queue_counts_origin_and_nested_entry_allocations() {
+        let mut entries = Vec::with_capacity(8);
+        entries.push(PackedEntryTransfer {
+            cache_key: String::with_capacity(8),
+            crate_name: String::with_capacity(16),
+            outcome: String::with_capacity(32),
+            prefetch: packed_receipt_origin(8, 16, 32),
+            ..PackedEntryTransfer::default()
+        });
+        let event = TransferEvent {
+            crate_name: String::with_capacity(8),
+            format: String::with_capacity(16),
+            cache_key: String::with_capacity(32),
+            object_key: String::with_capacity(64),
+            outcome: String::with_capacity(4),
+            prefetch: Some(packed_receipt_origin(8, 16, 32)),
+            accounting: Some(PrefetchAccounting {
+                entries,
+                ..PrefetchAccounting::default()
+            }),
+            ..TransferEvent::default()
+        };
+        let expected = packed_receipt_retained_bytes(&event);
+        assert!(
+            expected > std::mem::size_of::<TransferEvent>(),
+            "origin and entry string allocations must contribute: {expected}"
+        );
+        let mut queue = PrefetchReceiptQueue::default();
+        queue.push(event);
+        assert_eq!(queue.events.len(), 1);
+        assert!(!queue.overflowed);
+        assert_eq!(queue.retained_bytes, expected);
+        assert_eq!(queue.entries, 1);
+    }
+
+    #[test]
+    fn packed_receipt_drop_stamps_unfinished_and_keeps_finished_times() {
+        let queue = Arc::new(Mutex::new(PrefetchReceiptQueue::default()));
+        drop(PrefetchReceipt::new(
+            queue.clone(),
+            PrefetchOrigin::default(),
+            "unfinished",
+            "pack",
+            PrefetchOperation::Get,
+        ));
+        let unfinished = queue.lock().unwrap().drain();
+        assert_eq!(unfinished.len(), 1);
+        assert_v3_transfer_timestamps(&unfinished[0]);
+        assert_eq!(unfinished[0].outcome, "cancelled");
+
+        let mut receipt = PrefetchReceipt::new(
+            queue.clone(),
+            PrefetchOrigin::default(),
+            "finished",
+            "pack",
+            PrefetchOperation::Get,
+        );
+        receipt.finish("completed");
+        receipt.event.finished_at_unix_ms = 1_700_000_000_123;
+        drop(receipt);
+        let finished = queue.lock().unwrap().drain();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].finished_at_unix_ms, 1_700_000_000_123);
+        assert_eq!(finished[0].timestamp, 1_700_000_000);
+        assert_ne!(finished[0].timestamp, 123);
+        assert_eq!(finished[0].outcome, "completed");
+    }
+
+    #[test]
+    fn charge_packed_import_accumulates_each_entry() {
+        let mut event = TransferEvent::default();
+        charge_packed_import(&mut event, 11, 7);
+        charge_packed_import(&mut event, 13, 5);
+        assert_eq!(event.original_bytes, 24);
+        assert_eq!(event.extract_ms, 12);
+    }
+
+    #[tokio::test]
+    async fn packed_receipts_require_every_writer_to_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        {
+            let mut writers = daemon.prefetch_receipt_writers.lock().unwrap();
+            writers.push(tokio::task::spawn_blocking(|| {}));
+            writers.push(tokio::task::spawn_blocking(|| {
+                panic!("injected writer join failure");
+            }));
+        }
+        assert!(!daemon.finish_prefetch_receipts().await);
+    }
+
+    #[tokio::test]
+    async fn packed_receipt_flush_retains_recent_history_below_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        for index in 0..2 {
+            drop(PrefetchReceipt::new(
+                daemon.prefetch_receipts.clone(),
+                PrefetchOrigin::default(),
+                &format!("recent-{index}"),
+                "pack",
+                PrefetchOperation::Get,
+            ));
+        }
+        assert!(daemon.finish_prefetch_receipts().await);
+        assert_eq!(daemon.recent_transfers.lock().unwrap().len(), 2);
+
+        for index in 0..51 {
+            drop(PrefetchReceipt::new(
+                daemon.prefetch_receipts.clone(),
+                PrefetchOrigin::default(),
+                &format!("capped-{index}"),
+                "pack",
+                PrefetchOperation::Get,
+            ));
+        }
+        assert!(daemon.finish_prefetch_receipts().await);
+        assert_eq!(daemon.recent_transfers.lock().unwrap().len(), 50);
+    }
+
+    #[tokio::test]
+    async fn packed_shutdown_timeout_marks_incomplete_when_receipts_are_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon.install_plan("session", "plan", "advisory", std::iter::empty(), None);
+        daemon
+            .spawn_prefetch_task(
+                PrefetchOrigin {
+                    session_id: "other-session".into(),
+                    plan_id: "other-plan".into(),
+                    source: "fallback".into(),
+                    ..PrefetchOrigin::default()
+                },
+                std::future::pending(),
+            )
+            .unwrap();
+        assert!(daemon.finish_prefetch_shutdown(Duration::ZERO).await);
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].closure_reason, "shutdown_timeout");
+        assert!(summaries[0].incomplete);
+        assert!(summaries[0].cancelled);
+    }
+
+    #[tokio::test]
+    async fn packed_shutdown_incomplete_receipts_mark_incomplete_without_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon.install_plan("session", "plan", "advisory", std::iter::empty(), None);
+        daemon
+            .prefetch_receipts
+            .lock()
+            .unwrap()
+            .push(TransferEvent {
+                object_key: String::with_capacity((2 << 20) + 1),
+                ..TransferEvent::default()
+            });
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(1))
+                .await
+        );
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].closure_reason, "shutdown");
+        assert!(summaries[0].incomplete);
+        assert!(summaries[0].cancelled);
+    }
+
     #[tokio::test]
     async fn packed_receipts_use_one_writer_and_drain_while_disk_is_blocked() {
         let dir = tempfile::tempdir().unwrap();
@@ -15475,6 +15685,7 @@ mod tests {
             assert_eq!(event.request_count, u32::from(!queued));
             assert_eq!(event.compressed_bytes, 0);
             assert_eq!(event.outcome, "cancelled");
+            assert_v3_transfer_timestamps(event);
             assert_eq!(event.accounting.as_ref().unwrap().bytes_complete, queued);
             assert!(event.accounting.as_ref().unwrap().requests_complete);
         }
@@ -15684,12 +15895,14 @@ mod tests {
         assert_eq!(pack.compressed_bytes, built.bytes.len() as u64);
         assert_eq!(pack.outcome, "completed");
         assert!(pack.ok);
+        assert_v3_transfer_timestamps(pack);
+        assert!(pack.original_bytes > 0);
         let accounting = pack.accounting.as_ref().unwrap();
         assert!(accounting.bytes_complete && accounting.requests_complete);
         assert_eq!(accounting.entries.len(), 2);
-        for (key, bytes, rank) in [
-            (&key_a, payload_bytes[0], Some(0)),
-            (&key_b, payload_bytes[1], None),
+        for (key, bytes, rank, crate_name) in [
+            (&key_a, payload_bytes[0], Some(0), "serde"),
+            (&key_b, payload_bytes[1], None, "tokio"),
         ] {
             let entry = accounting
                 .entries
@@ -15697,6 +15910,7 @@ mod tests {
                 .find(|entry| &entry.cache_key == key)
                 .unwrap();
             assert_eq!(entry.compressed_bytes, bytes);
+            assert_eq!(entry.crate_name, crate_name);
             assert_eq!(entry.outcome, "completed");
             assert!(entry.finished_at_ms >= pack.started_at_unix_ms);
             assert!(entry.finished_at_ms <= pack.finished_at_unix_ms);
@@ -16276,6 +16490,202 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(2))
+                .await
+        );
+        let transfers = events::read_transfers(&daemon.config.transfer_log_path()).unwrap();
+        let pack = transfers
+            .iter()
+            .find(|event| event.format == "pack")
+            .unwrap();
+        assert_eq!(pack.outcome, "import_error");
+        assert!(!pack.ok);
+        let accounting = pack.accounting.as_ref().unwrap();
+        let good = accounting
+            .entries
+            .iter()
+            .find(|entry| entry.cache_key == good_key)
+            .unwrap();
+        assert_eq!(good.crate_name, "serde");
+        assert_eq!(good.outcome, "completed");
+        let bad = accounting
+            .entries
+            .iter()
+            .find(|entry| entry.cache_key == bad_key)
+            .unwrap();
+        assert_eq!(bad.crate_name, "tokio");
+        assert_eq!(bad.outcome, "validation_error");
+    }
+
+    #[tokio::test]
+    async fn packed_receipt_keeps_cancelled_entries_when_claim_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let remote = config.remote.clone().unwrap();
+        let backend = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let context = PackPrefetchContext::from_deps(
+            crate::identity::host_target_triple(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let key = test_cache_key("cancelled-packed-claim");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        seed_packed_catalog(
+            &backend,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest,
+                payload,
+            }],
+            None,
+        )
+        .await;
+        let v3 = daemon.v3_remote().await.unwrap().clone();
+        let candidates = vec![(key.clone(), "serde".into(), daemon.entry_dir_for(&key))];
+        let claim = daemon.downloading.write().await;
+        let worker = daemon.clone();
+        let task = tokio::spawn(async move {
+            let origin = PrefetchOrigin::default();
+            let ranks = HashMap::new();
+            let sources = HashMap::new();
+            worker
+                .try_packed_prefetch(
+                    &context,
+                    &v3,
+                    &remote,
+                    &candidates,
+                    0,
+                    &PackedAttribution {
+                        origin: &origin,
+                        ranks: &ranks,
+                        sources: &sources,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while daemon
+                .transfer_counters
+                .downloads_completed
+                .load(Ordering::Relaxed)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pack body should decode before the claim waits");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(claim);
+        assert!(daemon.finish_prefetch_receipts().await);
+        let transfers = events::read_transfers(&daemon.config.transfer_log_path()).unwrap();
+        let pack = transfers
+            .iter()
+            .find(|event| event.format == "pack")
+            .unwrap();
+        assert_eq!(pack.outcome, "cancelled");
+        let entry = pack
+            .accounting
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|entry| entry.cache_key == key)
+            .unwrap();
+        assert_eq!(entry.crate_name, "serde");
+        assert_eq!(entry.outcome, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn packed_import_error_marks_the_pack_failed_without_entry_validation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        std::fs::write(config.store_dir().join("blobs"), b"not a directory").unwrap();
+        let backend = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let context = PackPrefetchContext::from_deps(
+            crate::identity::host_target_triple(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let key = test_cache_key("packed-import-error");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        seed_packed_catalog(
+            &backend,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest,
+                payload,
+            }],
+            None,
+        )
+        .await;
+        let response = daemon
+            .handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(key.clone(), "serde".into())],
+                    warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
+                },
+                Some(context),
+                Instant::now(),
+            )
+            .await;
+        assert!(response.ok);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if daemon
+                    .prefetch_stats
+                    .pack_validation_failures
+                    .load(Ordering::Relaxed)
+                    >= 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("packed import failure should be counted");
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(2))
+                .await
+        );
+        let transfers = events::read_transfers(&daemon.config.transfer_log_path()).unwrap();
+        let pack = transfers
+            .iter()
+            .find(|event| event.format == "pack")
+            .unwrap();
+        assert_eq!(pack.outcome, "import_error");
+        assert!(!pack.ok);
+        let entry = pack
+            .accounting
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|entry| entry.cache_key == key)
+            .unwrap();
+        assert_eq!(entry.crate_name, "serde");
+        assert_eq!(entry.outcome, "import_error");
     }
 
     #[tokio::test]

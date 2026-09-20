@@ -3050,6 +3050,12 @@ impl Daemon {
         }
         queue.writing = true;
         let mut pending = queue.drain();
+        if !queue.events.is_empty() {
+            // drain() takes the queue. A dummy return would spin the writer.
+            queue.writing = false;
+            self.prefetch_receipt_failed.store(true, Ordering::Release);
+            return;
+        }
         let guard = PrefetchReceiptWriter {
             queue: self.prefetch_receipts.clone(),
             failed: self.prefetch_receipt_failed.clone(),
@@ -3087,6 +3093,14 @@ impl Daemon {
                     break;
                 }
                 pending = queue.drain();
+                if !queue.events.is_empty() {
+                    daemon
+                        .prefetch_receipt_failed
+                        .store(true, Ordering::Release);
+                    queue.writing = false;
+                    guard.armed = false;
+                    break;
+                }
             }
         });
         let mut writers = self

@@ -1771,6 +1771,7 @@ const MAX_PREFETCH_RECEIPT_ENTRIES: usize = 4096;
 #[derive(Default)]
 struct PrefetchReceiptQueue {
     events: Vec<TransferEvent>,
+    active_receipts: usize,
     retained_bytes: usize,
     entries: usize,
     overflowed: bool,
@@ -1850,7 +1851,7 @@ impl PrefetchReceipt {
         format: &str,
         operation: PrefetchOperation,
     ) -> Self {
-        Self {
+        let receipt = Self {
             event: TransferEvent {
                 schema: default_transfer_schema(),
                 prefetch: Some(origin),
@@ -1869,7 +1870,13 @@ impl PrefetchReceipt {
             },
             started: Instant::now(),
             queue,
-        }
+        };
+        receipt
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active_receipts += 1;
+        receipt
     }
 
     fn accounting(&mut self) -> &mut PrefetchAccounting {
@@ -1887,6 +1894,13 @@ impl PrefetchReceipt {
         self.event.outcome = outcome.to_owned();
         self.event.ok = outcome == "completed";
         self.event.finished_at_unix_ms = unix_time_ms();
+        self.event.elapsed_ms = self.started.elapsed().as_millis() as u64;
+    }
+}
+
+fn finish_open_prefetch_receipt(receipt: &mut PrefetchReceipt, ok: bool) {
+    if receipt.event.finished_at_unix_ms == 0 {
+        receipt.finish(if ok { "completed" } else { "error" });
     }
 }
 
@@ -1894,13 +1908,69 @@ impl Drop for PrefetchReceipt {
     fn drop(&mut self) {
         if self.event.finished_at_unix_ms == 0 {
             self.event.finished_at_unix_ms = unix_time_ms();
+            self.event.elapsed_ms = self.started.elapsed().as_millis() as u64;
         }
         self.event.timestamp = self.event.finished_at_unix_ms / 1_000;
-        self.event.elapsed_ms = self.started.elapsed().as_millis() as u64;
-        self.queue
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(std::mem::take(&mut self.event));
+        let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        queue.active_receipts -= 1;
+        queue.push(std::mem::take(&mut self.event));
+    }
+}
+
+struct PrefetchBackendObserver<'a> {
+    receipt: &'a mut PrefetchReceipt,
+    stats: &'a PrefetchStats,
+    transfers: &'a TransferCounters,
+    network_started: Option<Instant>,
+}
+
+impl crate::remote_layout::DownloadObserver for PrefetchBackendObserver<'_> {
+    fn started(&mut self, object_key: &str) {
+        self.receipt.event.object_key = object_key.to_owned();
+        self.receipt.event.request_count = 1;
+        self.receipt.accounting().bytes_complete = false;
+        self.stats.v3_requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn received(&mut self, transfer: Option<&crate::remote_backend::GetTransfer>) {
+        self.receipt.accounting().bytes_complete = true;
+        if let Some(transfer) = transfer {
+            self.receipt.event.compressed_bytes = transfer.bytes;
+            self.receipt.event.request_ms = transfer.request_ms;
+            self.receipt.event.body_ms = transfer.body_ms;
+            self.receipt.event.network_ms = transfer.request_ms + transfer.body_ms;
+            self.stats
+                .v3_bytes_downloaded
+                .fetch_add(transfer.bytes, Ordering::Relaxed);
+            self.stats
+                .bytes_downloaded
+                .fetch_add(transfer.bytes, Ordering::Relaxed);
+            self.transfers
+                .bytes_downloaded
+                .fetch_add(transfer.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+impl crate::remote_layout::ListObserver for PrefetchBackendObserver<'_> {
+    fn started(&mut self, prefix: &str) {
+        self.network_started = Some(Instant::now());
+        self.receipt.event.object_key = prefix.to_owned();
+        self.receipt.event.request_count += 1;
+        self.receipt.accounting().list_result_count = None;
+        self.stats
+            .list_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn completed(&mut self, result_count: usize) {
+        self.receipt.accounting().list_result_count = Some(result_count as u64);
+        self.receipt.event.network_ms = self
+            .network_started
+            .expect("LIST start precedes completion")
+            .elapsed()
+            .as_millis() as u64;
+        self.receipt.finish("completed");
     }
 }
 
@@ -3137,13 +3207,94 @@ impl Daemon {
         })
         .await
         .unwrap_or(false);
+        let queue = self
+            .prefetch_receipts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         finished
             && !self.prefetch_receipt_failed.load(Ordering::Acquire)
-            && !self
-                .prefetch_receipts
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .overflowed
+            && !queue.overflowed
+            && !queue.writing
+            && queue.events.is_empty()
+            && queue.active_receipts == 0
+    }
+
+    fn background_prefetch_origin(&self) -> PrefetchOrigin {
+        let plan = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+        plan.as_ref().map_or_else(
+            || PrefetchOrigin {
+                source: "unscoped".into(),
+                ..Default::default()
+            },
+            |plan| PrefetchOrigin {
+                session_id: plan.session_id.clone(),
+                plan_id: plan.plan_id.clone(),
+                source: if plan.plan_id.is_empty() {
+                    "unscoped"
+                } else {
+                    plan.plan_source
+                }
+                .into(),
+                ..Default::default()
+            },
+        )
+    }
+
+    async fn list_warm_all_keys(
+        self: &Arc<Self>,
+        remote_cache: &dyn crate::cache_remote::CacheRemote,
+        origin: PrefetchOrigin,
+        deadline: RemoteDeadline,
+    ) -> Result<HashMap<String, String>> {
+        let mut receipt = PrefetchReceipt::new(
+            self.prefetch_receipts.clone(),
+            origin,
+            "",
+            "v3",
+            PrefetchOperation::List,
+        );
+        let result = async {
+            let semaphore = deadline
+                .run("warm-all LIST queue", async {
+                    self.s3_semaphore
+                        .acquire()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
+                })
+                .await?;
+            anyhow::ensure!(
+                !self.prefetch_stopping.load(Ordering::Acquire),
+                "daemon stopping before warm-all LIST"
+            );
+            receipt.event.semaphore_wait_ms = receipt.started.elapsed().as_millis() as u64;
+            let result = deadline
+                .run(
+                    "warm-all LIST",
+                    remote_cache.list_keys_observed(&mut PrefetchBackendObserver {
+                        receipt: &mut receipt,
+                        stats: &self.prefetch_stats,
+                        transfers: &self.transfer_counters,
+                        network_started: None,
+                    }),
+                )
+                .await;
+            drop(semaphore);
+            result
+        }
+        .await;
+        finish_open_prefetch_receipt(&mut receipt, result.is_ok());
+        self.prefetch_stats.list_duration_ms_total.fetch_add(
+            receipt.started.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        if result.is_err() {
+            self.prefetch_stats
+                .list_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        drop(receipt);
+        self.flush_prefetch_receipts();
+        result
     }
 
     /// Set the upload buffer sender (called during server setup).
@@ -5333,6 +5484,10 @@ impl Daemon {
             return Response::err("no remote configured");
         };
 
+        let origin = req.origin.clone().unwrap_or_else(|| PrefetchOrigin {
+            source: "unscoped".to_string(),
+            ..PrefetchOrigin::default()
+        });
         let init_deadline = RemoteDeadline::from_secs(self.config.remote_restore_timeout_secs);
         let v3_remote = match init_deadline
             .run("prefetch backend initialization", self.v3_remote())
@@ -5381,24 +5536,9 @@ impl Daemon {
                 .remote_breaker
                 .try_acquire(RemoteOperation::WarmAllList)
             {
-                let result = match deadline
-                    .run("warm-all LIST queue", async {
-                        self.s3_semaphore
-                            .acquire()
-                            .await
-                            .map_err(|_| anyhow::anyhow!("remote semaphore closed"))
-                    })
-                    .await
-                {
-                    Ok(semaphore) => {
-                        let result = deadline
-                            .run("warm-all LIST", remote_cache.list_keys())
-                            .await;
-                        drop(semaphore);
-                        result
-                    }
-                    Err(error) => Err(error),
-                };
+                let result = self
+                    .list_warm_all_keys(remote_cache.as_ref(), origin.clone(), deadline)
+                    .await;
                 match result {
                     Ok(keys) => {
                         breaker.success();
@@ -5471,10 +5611,6 @@ impl Daemon {
         // immediately before downloading it instead, so demand never queues
         // behind speculation.
 
-        let origin = req.origin.clone().unwrap_or_else(|| PrefetchOrigin {
-            source: "unscoped".to_string(),
-            ..PrefetchOrigin::default()
-        });
         let candidate_sources = req.candidate_sources.clone();
         let ranks: HashMap<String, u64> = req
             .keys
@@ -5604,6 +5740,7 @@ impl Daemon {
                 while in_flight.len() >= max_concurrent {
                     use futures::StreamExt;
                     in_flight.next().await;
+                    daemon.flush_prefetch_receipts();
                 }
 
                 let sem = daemon.s3_semaphore.clone();
@@ -5644,6 +5781,15 @@ impl Daemon {
                             .fetch_add(1, Ordering::Relaxed);
                         return;
                     };
+                    let mut receipt = PrefetchReceipt::new(
+                        d.prefetch_receipts.clone(),
+                        origin.clone(),
+                        "",
+                        download_plan.transfer_format(),
+                        PrefetchOperation::Get,
+                    );
+                    receipt.event.cache_key = key.clone();
+                    receipt.event.crate_name = crate_name.clone();
                     // Daemon-wide speculative gate FIRST, then the shared S3
                     // permit: bounds prefetch across ALL coordinators so the
                     // interactive reserve holds even when startup prefetch
@@ -5662,6 +5808,7 @@ impl Daemon {
                         Err(error) => {
                             let class = classify_remote_error(&error);
                             breaker_permit.failure(class, &format!("{error:#}"));
+                            receipt.finish("error");
                             return;
                         }
                     };
@@ -5679,6 +5826,7 @@ impl Daemon {
                             drop(gate);
                             let class = classify_remote_error(&error);
                             breaker_permit.failure(class, &format!("{error:#}"));
+                            receipt.finish("error");
                             return;
                         }
                     };
@@ -5692,6 +5840,7 @@ impl Daemon {
                     // drop the candidate rather than joining the wait.
                     if claim_download(&d.downloading, &key).await.is_some() {
                         tracing::debug!("prefetch: {} already claimed, skipping", key_prefix(&key));
+                        receipt.finish("skipped");
                         return;
                     }
                     // Released on every exit path below (including panic) by
@@ -5709,23 +5858,29 @@ impl Daemon {
                     // followed by a destructive re-extraction over a directory
                     // a wrapper may already be hardlinking out of.
                     if entry_dir.exists() {
+                        receipt.finish("skipped");
                         return;
                     }
                     let blobs_dir = d.config.store_dir().join("blobs");
-                    let started_at_unix_ms = unix_time_ms();
-                    let start = Instant::now();
-                    d.prefetch_stats
-                        .v3_requests_total
-                        .fetch_add(1, Ordering::Relaxed);
+                    let started_at_unix_ms = receipt.event.started_at_unix_ms;
+                    let start = receipt.started;
+                    receipt.event.semaphore_wait_ms = semaphore_wait_ms;
+                    let mut observer = PrefetchBackendObserver {
+                        receipt: &mut receipt,
+                        stats: &d.prefetch_stats,
+                        transfers: &d.transfer_counters,
+                        network_started: None,
+                    };
                     let download_result = item_deadline
                         .run(
                             "prefetch GET and extraction",
-                            remote_cache.download_entry(
+                            remote_cache.download_entry_observed(
                                 &key,
                                 &crate_name,
                                 &entry_dir,
                                 &blobs_dir,
                                 item_deadline.at(),
+                                &mut observer,
                             ),
                         )
                         .await;
@@ -5763,19 +5918,6 @@ impl Daemon {
                                     .downloads_failed
                                     .fetch_add(1, Ordering::Relaxed);
                             }
-                            // The pack crossed the wire even when local
-                            // publication failed, so preserve byte telemetry.
-                            d.transfer_counters
-                                .bytes_downloaded
-                                .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
-                            // Phase-0 telemetry: the prefetch-attributed subset
-                            // of the transfer counters above.
-                            d.prefetch_stats
-                                .bytes_downloaded
-                                .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
-                            d.prefetch_stats
-                                .v3_bytes_downloaded
-                                .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                             // Per-plan attribution (#583 P0.5): byte-accurate
                             // downloaded set for the session summary.
                             if import_ok {
@@ -5785,8 +5927,8 @@ impl Daemon {
                                     p.record_download_from(&origin, &key, dl.compressed_bytes);
                                 }
                             }
-                            d.push_transfer_event(TransferEvent {
-                                accounting: None,
+                            receipt.event = TransferEvent {
+                                accounting: receipt.event.accounting.take(),
                                 prefetch: Some(origin.clone()),
                                 outcome: if import_ok {
                                     "completed"
@@ -5821,9 +5963,8 @@ impl Daemon {
                                 blobs_skipped: dl.blobs_skipped,
                                 blobs_total: dl.blobs_total,
                                 ok: import_ok,
-                                timestamp: finished_at_unix_ms / 1_000,
-                            })
-                            .await;
+                                timestamp: 0,
+                            };
                             if !import_ok {
                                 return;
                             }
@@ -5849,6 +5990,11 @@ impl Daemon {
                         }
                         Err(e) => {
                             let class = classify_remote_error(&e);
+                            receipt.finish(if class == RemoteErrorClass::Miss {
+                                "not_found"
+                            } else {
+                                "error"
+                            });
                             if class == RemoteErrorClass::Miss {
                                 breaker_permit.success();
                                 if d.negative_keys.record_miss(&knowledge) {
@@ -5864,49 +6010,6 @@ impl Daemon {
                                     .downloads_failed
                                     .fetch_add(1, Ordering::Relaxed);
                             }
-                            let elapsed_ms = start.elapsed().as_millis() as u64;
-                            let finished_at_unix_ms = unix_time_ms();
-                            d.push_transfer_event(TransferEvent {
-                                accounting: None,
-                                prefetch: Some(origin.clone()),
-                                outcome: if class == RemoteErrorClass::Miss {
-                                    "not_found"
-                                } else {
-                                    "error"
-                                }
-                                .to_string(),
-                                schema: default_transfer_schema(),
-                                crate_name: crate_name.clone(),
-                                direction: TransferDirection::Download,
-                                format: download_plan.transfer_format().to_string(),
-                                cache_key: key.clone(),
-                                object_key: String::new(),
-                                compressed_bytes: 0,
-                                started_at_unix_ms,
-                                finished_at_unix_ms,
-                                elapsed_ms,
-                                network_ms: 0,
-                                semaphore_wait_ms,
-                                head_ms: 0,
-                                request_ms: 0,
-                                body_ms: 0,
-                                // A 404 proves one GET. Other failures may happen before
-                                // a GET or during extraction; their count is unknown.
-                                request_count: u32::from(class == RemoteErrorClass::Miss),
-                                original_bytes: 0,
-                                decompress_ms: 0,
-                                extract_ms: 0,
-                                disk_io_ms: 0,
-                                import_lock_wait_ms: 0,
-                                import_ms: 0,
-                                compression_ms: 0,
-                                head_checks_ms: 0,
-                                blobs_skipped: 0,
-                                blobs_total: 0,
-                                ok: false,
-                                timestamp: finished_at_unix_ms / 1_000,
-                            })
-                            .await;
                         }
                     }
                 });
@@ -5920,7 +6023,9 @@ impl Daemon {
 
             // Drain remaining
             use futures::StreamExt;
-            while in_flight.next().await.is_some() {}
+            while in_flight.next().await.is_some() {
+                daemon.flush_prefetch_receipts();
+            }
             let wall_ms = plan_started_at.elapsed().as_millis() as u64;
             daemon
                 .prefetch_stats
@@ -6066,7 +6171,10 @@ impl Daemon {
                 .prefetch_receipts
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            queue.overflowed || queue.writing || !queue.events.is_empty()
+            queue.overflowed
+                || queue.writing
+                || !queue.events.is_empty()
+                || queue.active_receipts > 0
         };
         let cancelled = {
             let cancellations = self
@@ -7681,7 +7789,25 @@ async fn drain_connection_handlers(
 }
 
 /// Populate the key cache by listing every key in the remote.
-async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
+async fn populate_key_cache(daemon: &Arc<Daemon>) -> Result<usize> {
+    let mut receipt = PrefetchReceipt::new(
+        daemon.prefetch_receipts.clone(),
+        daemon.background_prefetch_origin(),
+        "",
+        "v3",
+        PrefetchOperation::List,
+    );
+    let result = populate_key_cache_observed(daemon, &mut receipt).await;
+    finish_open_prefetch_receipt(&mut receipt, result.is_ok());
+    drop(receipt);
+    daemon.flush_prefetch_receipts();
+    result
+}
+
+async fn populate_key_cache_observed(
+    daemon: &Daemon,
+    receipt: &mut PrefetchReceipt,
+) -> Result<usize> {
     daemon
         .config
         .remote
@@ -7710,10 +7836,6 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
     let key_cache_revision = daemon.key_cache.refresh_revision();
 
     let list_start = Instant::now();
-    daemon
-        .prefetch_stats
-        .list_requests_total
-        .fetch_add(1, Ordering::Relaxed);
     let semaphore = match deadline
         .run("index LIST queue", async {
             daemon
@@ -7731,7 +7853,22 @@ async fn populate_key_cache(daemon: &Daemon) -> Result<usize> {
             return Err(error);
         }
     };
-    let list_result = deadline.run("index LIST", remote_cache.list_keys()).await;
+    anyhow::ensure!(
+        !daemon.prefetch_stopping.load(Ordering::Acquire),
+        "daemon stopping before index LIST"
+    );
+    receipt.event.semaphore_wait_ms = list_start.elapsed().as_millis() as u64;
+    let list_result = deadline
+        .run(
+            "index LIST",
+            remote_cache.list_keys_observed(&mut PrefetchBackendObserver {
+                receipt,
+                stats: &daemon.prefetch_stats,
+                transfers: &daemon.transfer_counters,
+                network_started: None,
+            }),
+        )
+        .await;
     drop(semaphore);
     let keys = match list_result {
         Ok(keys) => keys,
@@ -15380,6 +15517,88 @@ mod tests {
     }
 
     #[test]
+    fn finish_open_prefetch_receipt_stamps_unfinished_and_keeps_finished() {
+        let queue = Arc::new(Mutex::new(PrefetchReceiptQueue::default()));
+        let mut open_ok = PrefetchReceipt::new(
+            queue.clone(),
+            PrefetchOrigin::default(),
+            "open-ok",
+            "v3",
+            PrefetchOperation::List,
+        );
+        finish_open_prefetch_receipt(&mut open_ok, true);
+        assert_eq!(open_ok.event.outcome, "completed");
+        assert!(open_ok.event.ok);
+        assert_ne!(open_ok.event.finished_at_unix_ms, 0);
+
+        let mut open_err = PrefetchReceipt::new(
+            queue.clone(),
+            PrefetchOrigin::default(),
+            "open-err",
+            "v3",
+            PrefetchOperation::List,
+        );
+        finish_open_prefetch_receipt(&mut open_err, false);
+        assert_eq!(open_err.event.outcome, "error");
+        assert!(!open_err.event.ok);
+        assert_ne!(open_err.event.finished_at_unix_ms, 0);
+
+        let mut already = PrefetchReceipt::new(
+            queue,
+            PrefetchOrigin::default(),
+            "already",
+            "v3",
+            PrefetchOperation::List,
+        );
+        already.finish("completed");
+        already.event.finished_at_unix_ms = 1_700_000_000_123;
+        already.event.elapsed_ms = 41;
+        finish_open_prefetch_receipt(&mut already, false);
+        assert_eq!(already.event.outcome, "completed");
+        assert!(already.event.ok);
+        assert_eq!(already.event.finished_at_unix_ms, 1_700_000_000_123);
+        assert_eq!(already.event.elapsed_ms, 41);
+    }
+
+    #[test]
+    fn prefetch_backend_observer_received_sums_request_and_body_ms() {
+        let queue = Arc::new(Mutex::new(PrefetchReceiptQueue::default()));
+        let mut receipt = PrefetchReceipt::new(
+            queue,
+            PrefetchOrigin::default(),
+            "obj",
+            "v3",
+            PrefetchOperation::Get,
+        );
+        let stats = PrefetchStats::new();
+        let transfers = TransferCounters::new();
+        {
+            let mut observer = PrefetchBackendObserver {
+                receipt: &mut receipt,
+                stats: &stats,
+                transfers: &transfers,
+                network_started: None,
+            };
+            crate::remote_layout::DownloadObserver::received(
+                &mut observer,
+                Some(&crate::remote_backend::GetTransfer {
+                    bytes: 16,
+                    request_ms: 7,
+                    body_ms: 5,
+                }),
+            );
+        }
+        assert_eq!(receipt.event.compressed_bytes, 16);
+        assert_eq!(receipt.event.request_ms, 7);
+        assert_eq!(receipt.event.body_ms, 5);
+        assert_eq!(receipt.event.network_ms, 12);
+        assert!(receipt.accounting().bytes_complete);
+        assert_eq!(stats.v3_bytes_downloaded.load(Ordering::Relaxed), 16);
+        assert_eq!(stats.bytes_downloaded.load(Ordering::Relaxed), 16);
+        assert_eq!(transfers.bytes_downloaded.load(Ordering::Relaxed), 16);
+    }
+
+    #[test]
     fn charge_packed_import_accumulates_each_entry() {
         let mut event = TransferEvent::default();
         charge_packed_import(&mut event, 11, 7);
@@ -17196,7 +17415,9 @@ mod tests {
                 .recent_transfers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .back()
+                .iter()
+                .rev()
+                .find(|event| event.cache_key == key && event.outcome == "completed")
                 .cloned();
             if transfer.is_some() {
                 break;
@@ -17282,7 +17503,23 @@ mod tests {
         let transfer = latest_transfer(&daemon);
         assert_v3_transfer_timestamps(&transfer);
         assert_eq!(transfer.outcome, "error");
-        assert_eq!(transfer.request_count, 0);
+        assert_eq!(transfer.request_count, 1);
+        assert_eq!(transfer.compressed_bytes, 16);
+        assert!(transfer.accounting.as_ref().unwrap().bytes_complete);
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .v3_requests_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .v3_bytes_downloaded
+                .load(Ordering::Relaxed),
+            16
+        );
         // Nothing was imported.
         assert!(!config.store_dir().join(key).join("meta.json").exists());
     }
@@ -17494,6 +17731,50 @@ mod tests {
             daemon.prefetch_stats.keys_cancelled.load(Ordering::Relaxed),
             2
         );
+        let transfer = latest_transfer(&daemon);
+        assert_eq!(transfer.request_count, 0);
+        assert_eq!(transfer.outcome, "cancelled");
+        assert!(transfer.accounting.as_ref().unwrap().bytes_complete);
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .v3_requests_total
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_receipt_skipped_claim_records_no_backend_get() {
+        let (_dir, daemon, backend, mut started, keys, _bytes) = shutdown_prefetch_fixture(2).await;
+        daemon
+            .downloading
+            .write()
+            .await
+            .insert(keys[0].clone(), Arc::new(Notify::new()));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), started.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        backend.release_v3_get.add_permits(1);
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(2))
+                .await
+        );
+        let transfers = daemon.recent_transfers.lock().unwrap();
+        let skipped = transfers
+            .iter()
+            .find(|event| event.cache_key == keys[0])
+            .expect("claimed candidate receipt");
+        assert_eq!(skipped.outcome, "skipped");
+        assert!(!skipped.ok);
+        assert_eq!(skipped.request_count, 0);
+        assert_eq!(skipped.compressed_bytes, 0);
+        assert!(skipped.accounting.as_ref().unwrap().bytes_complete);
+        assert_eq!(backend.v3_gets.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -17562,6 +17843,12 @@ mod tests {
             "no detached child may consume a released gate after shutdown"
         );
         assert_eq!(backend.v3_gets.load(Ordering::SeqCst), 1);
+        let transfer = latest_transfer(&daemon);
+        assert_eq!(transfer.request_count, 1);
+        assert_eq!(transfer.outcome, "cancelled");
+        assert_eq!(transfer.compressed_bytes, 0);
+        assert!(!transfer.accounting.as_ref().unwrap().bytes_complete);
+        assert!(transfer.accounting.as_ref().unwrap().requests_complete);
         let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].closure_reason, "shutdown_timeout");
@@ -17579,6 +17866,60 @@ mod tests {
                 .origins
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn prefetch_receipt_keeps_received_body_when_cancelled_before_import() {
+        let (_dir, daemon, backend, mut started, keys, bytes) = shutdown_prefetch_fixture(2).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), started.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let index = daemon.key_cache.index.write().await;
+        backend.release_v3_get.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while daemon
+                .prefetch_stats
+                .v3_bytes_downloaded
+                .load(Ordering::Relaxed)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            daemon
+                .finish_prefetch_shutdown(Duration::from_millis(5))
+                .await
+        );
+        drop(index);
+        let transfer = latest_transfer(&daemon);
+        assert_eq!(transfer.cache_key, keys[0]);
+        assert_eq!(transfer.outcome, "cancelled");
+        assert_eq!(transfer.request_count, 1);
+        assert_eq!(transfer.compressed_bytes, bytes);
+        assert!(transfer.accounting.as_ref().unwrap().bytes_complete);
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .v3_bytes_downloaded
+                .load(Ordering::Relaxed),
+            bytes
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .bytes_downloaded
+                .load(Ordering::Relaxed),
+            bytes
+        );
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries[0].downloaded_keys, 0);
+        assert!(summaries[0].incomplete);
     }
 
     #[tokio::test]
@@ -17929,6 +18270,8 @@ mod tests {
         assert!(!transfer.ok);
         assert_eq!(transfer.request_count, 1);
         assert_eq!(transfer.compressed_bytes, 0);
+        assert!(transfer.accounting.as_ref().unwrap().bytes_complete);
+        assert!(transfer.accounting.as_ref().unwrap().requests_complete);
         assert_eq!(
             daemon
                 .transfer_counters
@@ -18064,7 +18407,7 @@ mod tests {
         let client = test_remote_backend();
         put_test_object(&client, &test_manifest_object_key(&key_a, "serde"), b"{}").await;
         put_test_object(&client, &test_manifest_object_key(&key_b, "tokio"), b"{}").await;
-        let daemon = Daemon::new(config);
+        let daemon = Arc::new(Daemon::new(config));
         assert!(
             daemon.remote_backend.set(client).is_ok(),
             "inject mock backend"
@@ -18076,6 +18419,171 @@ mod tests {
         assert_eq!(count, 2);
         // The cache now answers positively for a listed key.
         assert_eq!(daemon.key_cache.check(&key_a).await, Some(true));
+        assert!(daemon.finish_prefetch_receipts().await);
+        let transfer = latest_transfer(&daemon);
+        assert_eq!(
+            transfer.accounting.as_ref().unwrap().operation,
+            PrefetchOperation::List
+        );
+        assert_eq!(
+            transfer.accounting.as_ref().unwrap().list_result_count,
+            Some(2)
+        );
+        assert!(!transfer.accounting.as_ref().unwrap().bytes_complete);
+        assert_eq!(transfer.request_count, 1);
+        assert_eq!(transfer.outcome, "completed");
+        assert_eq!(transfer.prefetch.as_ref().unwrap().source, "unscoped");
+    }
+
+    #[tokio::test]
+    async fn index_list_receipt_snapshots_origin_and_counts_only_backend_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.s3_concurrency = 1;
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(test_remote_backend()).is_ok());
+        daemon.install_plan(
+            "old-session",
+            "old-plan",
+            "advisory",
+            std::iter::empty(),
+            None,
+        );
+        let permit = daemon.s3_semaphore.acquire().await.unwrap();
+        let listing = populate_key_cache(&daemon);
+        tokio::pin!(listing);
+        assert!(futures::poll!(listing.as_mut()).is_pending());
+        assert_eq!(daemon.prefetch_receipts.lock().unwrap().active_receipts, 1);
+        assert!(daemon.prefetch_receipts.lock().unwrap().events.is_empty());
+        assert!(daemon.prefetch_accounting_incomplete());
+        assert!(!daemon.finish_prefetch_receipts().await);
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .list_requests_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        daemon.install_plan(
+            "new-session",
+            "new-plan",
+            "fallback",
+            std::iter::empty(),
+            None,
+        );
+        assert!(events::read_summaries(&daemon.config.summary_log_path()).unwrap()[0].incomplete);
+        drop(permit);
+        assert_eq!(listing.await.unwrap(), 0);
+        assert!(daemon.finish_prefetch_receipts().await);
+        let transfer = latest_transfer(&daemon);
+        assert_eq!(
+            transfer.prefetch.as_ref().unwrap().session_id,
+            "old-session"
+        );
+        assert_eq!(transfer.prefetch.as_ref().unwrap().plan_id, "old-plan");
+        assert_eq!(transfer.prefetch.as_ref().unwrap().source, "advisory");
+        assert_eq!(transfer.request_count, 1);
+        assert_eq!(
+            transfer.accounting.as_ref().unwrap().list_result_count,
+            Some(0)
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .list_requests_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(daemon.prefetch_receipts.lock().unwrap().active_receipts, 0);
+        assert!(!daemon.finish_prefetch_shutdown(Duration::ZERO).await);
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[1].closure_reason, "shutdown");
+        assert!(!summaries[1].incomplete);
+    }
+
+    #[tokio::test]
+    async fn index_list_receipt_cancelled_in_queue_has_no_physical_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.s3_concurrency = 1;
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(test_remote_backend()).is_ok());
+        let permit = daemon.s3_semaphore.acquire().await.unwrap();
+        let mut listing = Box::pin(populate_key_cache(&daemon));
+        assert!(futures::poll!(listing.as_mut()).is_pending());
+        drop(listing);
+        drop(permit);
+        assert_eq!(daemon.prefetch_receipts.lock().unwrap().active_receipts, 0);
+        assert!(daemon.finish_prefetch_receipts().await);
+        let transfer = latest_transfer(&daemon);
+        assert_eq!(transfer.request_count, 0);
+        assert_eq!(transfer.outcome, "cancelled");
+        assert_eq!(
+            transfer.accounting.as_ref().unwrap().list_result_count,
+            None
+        );
+        assert!(!transfer.accounting.as_ref().unwrap().bytes_complete);
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .list_requests_total
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn index_list_receipt_keeps_backend_completion_when_bookkeeping_is_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = test_remote_backend();
+        put_test_object(
+            &backend,
+            &test_manifest_object_key(&test_cache_key("listed"), "serde"),
+            b"{}",
+        )
+        .await;
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend).is_ok());
+        let index = daemon.key_cache.index.write().await;
+        let producer = tokio::spawn({
+            let daemon = daemon.clone();
+            async move { populate_key_cache(&daemon).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while daemon
+                .prefetch_stats
+                .list_keys_total
+                .load(Ordering::Relaxed)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let returned_at = unix_time_ms();
+        assert_eq!(daemon.prefetch_receipts.lock().unwrap().active_receipts, 1);
+        assert!(!producer.is_finished());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        producer.abort();
+        assert!(producer.await.unwrap_err().is_cancelled());
+        drop(index);
+        assert!(daemon.finish_prefetch_receipts().await);
+        let transfer = latest_transfer(&daemon);
+        assert_eq!(transfer.outcome, "completed");
+        assert!(transfer.ok);
+        assert_eq!(transfer.request_count, 1);
+        assert!(transfer.finished_at_unix_ms <= returned_at);
+        assert_eq!(
+            transfer.accounting.as_ref().unwrap().list_result_count,
+            Some(1)
+        );
+        assert!(!transfer.accounting.as_ref().unwrap().bytes_complete);
     }
 
     #[tokio::test]

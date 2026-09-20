@@ -8,7 +8,7 @@ description: Start, stop, install, update, and troubleshoot the daemon
 ```bash
 kache daemon             # status
 kache daemon start       # background process; waits for readiness
-kache daemon stop        # graceful drain, bounded to 30 seconds
+kache daemon stop        # requests drain and waits for ownership release
 kache daemon restart     # service-manager restart or manual replacement
 kache daemon run         # foreground process
 kache daemon log         # follow logs
@@ -37,6 +37,27 @@ On current macOS releases, the first connection to a LAN cache endpoint may ask 
 The daemon records the running binary's build epoch. A newer client asks an older daemon to drain and exit. The service manager restarts installed services; otherwise later background work starts a fresh daemon.
 
 The daemon also fingerprints the active config file and restarts after it changes. Environment is fixed at process start, so changing an export requires a daemon started from the new environment. An installed service uses its stored environment.
+
+## Shared lifecycle
+
+Kache uses `kunobi-daemon` for process locks, verified readiness, request drain,
+and exclusive replacement. The old daemon releases its cache resources before
+the replacement starts. A startup timeout cannot report “Background cache:
+running” or authorize killing unfinished work.
+
+An installed service owns only its configured runtime directory. A command using
+another cache instance starts that instance independently. Lock files remain on
+disk after shutdown; deleting them can split ownership between two processes.
+
+New daemons advertise a separate Protobuf control endpoint. It authenticates the
+OS peer and checks the Kache service identity and cache-instance identity. Older
+daemons retain the bounded legacy health/shutdown exchange. Failed binary
+negotiation never falls back to that legacy exchange.
+
+Kache retains cache compatibility, upload persistence, service installation and
+compiler fallback policy. Accepted upload intents survive shutdown in the spool;
+the shared crate neither owns nor cancels those jobs. Consumers also decide how
+to export the shared lifecycle observations.
 
 ## Idle shutdown
 

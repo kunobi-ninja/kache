@@ -1288,12 +1288,21 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
     };
     std::fs::create_dir_all(service_file.parent().unwrap()).unwrap();
     std::fs::write(service_file, "installed test service").unwrap();
+    // The installed manager owns the user-configured instance. A per-command
+    // cache override alone must not redirect that service to another cache.
+    let user_config = e.home.join(".config/kache/config.toml");
+    std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &user_config,
+        format!("[cache]\nlocal_store = {:?}\n", e.cache.to_str().unwrap()),
+    )
+    .unwrap();
     let bin = e.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let manager = bin.join(tool);
     kache_fs::testutil::write_executable(
         &manager,
-        "#!/bin/sh\n\"$KACHE_TEST_BIN\" daemon run >/dev/null 2>&1 &\necho $! > \"$KACHE_TEST_SERVICE_PID\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$KACHE_TEST_SERVICE_ARGS\"\n\"$KACHE_TEST_BIN\" daemon run >/dev/null 2>&1 &\necho $! > \"$KACHE_TEST_SERVICE_PID\"\n",
     );
     let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -1306,6 +1315,7 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         .env("PATH", path)
         .env("KACHE_TEST_BIN", KACHE_BIN)
         .env("KACHE_TEST_SERVICE_PID", &marker)
+        .env("KACHE_TEST_SERVICE_ARGS", e.home.join("service.args"))
         .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
         .timeout(std::time::Duration::from_secs(30))
         .output()
@@ -1323,6 +1333,16 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         .unwrap();
     let state: serde_json::Value = serde_json::from_slice(&state.unwrap()).unwrap();
     assert_eq!(state["pid"], pid);
+    let args = std::fs::read_to_string(e.home.join("service.args")).unwrap();
+    assert!(!args.lines().any(|arg| arg == "-k" || arg == "restart"));
+    if cfg!(target_os = "macos") {
+        assert_eq!(args.lines().next(), Some("kickstart"));
+    } else {
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["--user", "start", "kache.service"]
+        );
+    }
 }
 
 #[test]
@@ -1336,6 +1356,13 @@ fn daemon_restart_preserves_another_cache_daemon() {
         .success();
     let before = std::fs::read(b.cache.join("daemon.state.json")).unwrap();
     let before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    a.cmd()
+        .args(["daemon", "start"])
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+        .assert()
+        .success();
+    let own_before: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(a.cache.join("daemon.state.json")).unwrap()).unwrap();
     let restart = a
         .cmd()
         .args(["daemon", "restart"])
@@ -1348,6 +1375,7 @@ fn daemon_restart_preserves_another_cache_daemon() {
         .output()
         .unwrap();
     let after = std::fs::read(b.cache.join("daemon.state.json"));
+    let own_after = std::fs::read(a.cache.join("daemon.state.json"));
     // Clean both fixtures before assertions so failures leave no background work.
     a.cmd().args(["daemon", "stop"]).output().unwrap();
     b.cmd().args(["daemon", "stop"]).output().unwrap();
@@ -1360,6 +1388,11 @@ fn daemon_restart_preserves_another_cache_daemon() {
     assert_eq!(other["daemon_running"], true, "{other}");
     let after: serde_json::Value = serde_json::from_slice(&after.unwrap()).unwrap();
     assert_eq!(before["pid"], after["pid"]);
+    let own_after: serde_json::Value = serde_json::from_slice(&own_after.unwrap()).unwrap();
+    assert_ne!(
+        own_before["pid"], own_after["pid"],
+        "explicit restart must replace a compatible owner"
+    );
 }
 
 /// PATH with a fake `systemctl` running `script` and a no-op `loginctl`

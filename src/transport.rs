@@ -17,8 +17,10 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+#[cfg(test)]
+pub use interprocess::local_socket::ListenerOptions;
 pub use interprocess::local_socket::tokio::Stream as TokioStream;
-pub use interprocess::local_socket::{ListenerOptions, Name, Stream as SyncStream};
+pub use interprocess::local_socket::{Name, Stream as SyncStream};
 // TokioListener is the type produced by `ListenerOptions::new().create_tokio()`.
 // Re-exported so the daemon's `accept_loop` and its tests can name it explicitly.
 pub use interprocess::local_socket::tokio::Listener as TokioListener;
@@ -28,6 +30,36 @@ pub use interprocess::local_socket::tokio::Listener as TokioListener;
 pub mod prelude {
     pub use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
     pub use interprocess::local_socket::traits::{Listener as _, Stream as _};
+}
+
+/// Bind through shared ownership and disable the transport's unchecked unlink.
+pub fn bind_daemon_listener(path: &Path) -> Result<Option<TokioListener>> {
+    use interprocess::local_socket::traits::tokio::Listener as _;
+    #[cfg(unix)]
+    let mut listener: TokioListener = {
+        use kunobi_daemon::local::unix_socket::{self, Bound};
+        let bound = unix_socket::acquire(path)
+            .map_err(|error| anyhow::anyhow!("acquiring daemon socket: {error:?}"))?;
+        let Bound::Won(listener) = bound else {
+            return Ok(None);
+        };
+        let fd: std::os::fd::OwnedFd = listener.into();
+        interprocess::os::unix::uds_local_socket::tokio::Listener::try_from(fd)?.into()
+    };
+    #[cfg(windows)]
+    let mut listener = {
+        use kunobi_daemon::local::windows_socket::{self, Bound};
+        let hash = blake3::hash(path.as_os_str().as_encoded_bytes());
+        let name = format!("kache-daemon-{}", &hash.to_hex()[..16]);
+        let bound = windows_socket::acquire(Path::new(&name))
+            .map_err(|error| anyhow::anyhow!("acquiring daemon pipe: {error:?}"))?;
+        let Bound::Won(listener) = bound else {
+            return Ok(None);
+        };
+        listener
+    };
+    listener.do_not_reclaim_name_on_drop();
+    Ok(Some(listener))
 }
 
 /// Build the platform-appropriate IPC name for a path.

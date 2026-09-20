@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use crate::config::RemoteConfig;
 use crate::remote::{self, BuildManifest, DownloadResult, Shard};
 use crate::remote_backend::{GetObject, RemoteBackend};
-use crate::remote_layout::{RemoteLayout, RemoteUploadResult};
+use crate::remote_layout::{DownloadObserver, ListObserver, RemoteLayout, RemoteUploadResult};
 
 #[async_trait]
 pub trait CacheRemote: Send + Sync {
@@ -30,6 +30,16 @@ pub trait CacheRemote: Send + Sync {
         deadline: Option<Instant>,
     ) -> Result<DownloadResult>;
 
+    async fn download_entry_observed(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        entry_dir: &Path,
+        blobs_dir: &Path,
+        deadline: Option<Instant>,
+        observer: &mut dyn DownloadObserver,
+    ) -> Result<DownloadResult>;
+
     async fn upload_entry(
         &self,
         cache_key: &str,
@@ -41,6 +51,11 @@ pub trait CacheRemote: Send + Sync {
     ) -> Result<RemoteUploadResult>;
 
     async fn list_keys(&self) -> Result<HashMap<String, String>>;
+
+    async fn list_keys_observed(
+        &self,
+        observer: &mut dyn ListObserver,
+    ) -> Result<HashMap<String, String>>;
 
     async fn list_keys_for_crates(
         &self,
@@ -102,6 +117,27 @@ impl CacheRemote for V3Remote {
             .await
     }
 
+    async fn download_entry_observed(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        entry_dir: &Path,
+        blobs_dir: &Path,
+        deadline: Option<Instant>,
+        observer: &mut dyn DownloadObserver,
+    ) -> Result<DownloadResult> {
+        self.layout()
+            .download_entry_observed(
+                cache_key,
+                crate_name,
+                entry_dir,
+                blobs_dir,
+                deadline,
+                Some(observer),
+            )
+            .await
+    }
+
     async fn upload_entry(
         &self,
         cache_key: &str,
@@ -125,6 +161,13 @@ impl CacheRemote for V3Remote {
 
     async fn list_keys(&self) -> Result<HashMap<String, String>> {
         self.layout().list_keys().await
+    }
+
+    async fn list_keys_observed(
+        &self,
+        observer: &mut dyn ListObserver,
+    ) -> Result<HashMap<String, String>> {
+        self.layout().list_keys_observed(Some(observer)).await
     }
 
     async fn list_keys_for_crates(

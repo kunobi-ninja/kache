@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::config::RemoteConfig;
 use crate::remote::{DownloadResult, UploadResult};
-use crate::remote_backend::RemoteBackend;
+use crate::remote_backend::{GetTransfer, RemoteBackend};
 use crate::store::{EntryMeta, VerifiedRestoredEntry};
 
 const V3_ROOT: &str = "v3";
@@ -58,6 +58,20 @@ pub struct RemoteUploadResult {
     pub transfer: UploadResult,
 }
 
+/// Observes the backend boundary while the caller retains ownership across
+/// extraction and import. A missing completion leaves body bytes unknown.
+pub trait DownloadObserver: Send {
+    fn started(&mut self, object_key: &str);
+    fn received(&mut self, transfer: Option<&GetTransfer>);
+}
+
+/// One start/completion pair per backend LIST, including each crate prefix.
+/// Result counts describe returned object keys before layout filtering.
+pub trait ListObserver: Send {
+    fn started(&mut self, prefix: &str);
+    fn completed(&mut self, result_count: usize);
+}
+
 /// A packed-prefetch entry validated while its artifact bytes were streamed
 /// to disk. The store can batch-register this without hashing the artifacts a
 /// second time.
@@ -90,8 +104,21 @@ impl<'a> RemoteLayout<'a> {
         cache_key: &str,
         crate_name: &str,
         entry_dir: &Path,
+        blobs_dir: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<DownloadResult> {
+        self.download_entry_observed(cache_key, crate_name, entry_dir, blobs_dir, deadline, None)
+            .await
+    }
+
+    pub async fn download_entry_observed(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        entry_dir: &Path,
         _blobs_dir: &Path,
         deadline: Option<Instant>,
+        mut observer: Option<&mut dyn DownloadObserver>,
     ) -> Result<DownloadResult> {
         let object_key = v3_pack_key(&self.remote.prefix, cache_key, crate_name);
 
@@ -113,19 +140,27 @@ impl<'a> RemoteLayout<'a> {
         // likely-present keys go straight to GET, and a stale key-cache
         // positive degrades to a miss, not an error.
         let fetched = crate::remote_resilience::RemoteDeadline::from_instant(deadline)
-            .run(
-                "remote object GET",
+            .run("remote object GET", async {
+                if let Some(observer) = observer.as_deref_mut() {
+                    observer.started(&object_key);
+                }
                 self.backend
-                    .get_into(&object_key, Some(MAX_COMPRESSED_BYTES), &mut spool),
-            )
+                    .get_into(&object_key, Some(MAX_COMPRESSED_BYTES), &mut spool)
+                    .await
+            })
             .await
-            .context("downloading v3 pack")?
-            .ok_or_else(|| {
-                anyhow::Error::new(EntryNotFound).context(format!(
-                    "v3 pack not found: {}",
-                    self.backend.describe(&object_key)
-                ))
-            })?;
+            .context("downloading v3 pack")?;
+        // Record the received body before the spool conversion yields or
+        // decoding rejects it. Both can happen after the transport completed.
+        if let Some(observer) = observer {
+            observer.received(fetched.as_ref());
+        }
+        let fetched = fetched.ok_or_else(|| {
+            anyhow::Error::new(EntryNotFound).context(format!(
+                "v3 pack not found: {}",
+                self.backend.describe(&object_key)
+            ))
+        })?;
         let request_ms = fetched.request_ms;
         let body_ms = fetched.body_ms;
         let compressed_len = fetched.bytes;
@@ -232,15 +267,28 @@ impl<'a> RemoteLayout<'a> {
     }
 
     pub async fn list_keys(&self) -> Result<HashMap<String, String>> {
+        self.list_keys_observed(None).await
+    }
+
+    pub async fn list_keys_observed(
+        &self,
+        mut observer: Option<&mut dyn ListObserver>,
+    ) -> Result<HashMap<String, String>> {
         let manifest_prefix = crate::config::join_remote_key(
             &self.remote.prefix,
             &format!("{V3_ROOT}/{V3_MANIFESTS}/"),
         );
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.started(&manifest_prefix);
+        }
         let objects = self
             .backend
             .list(&manifest_prefix)
             .await
             .context("listing v3 manifests")?;
+        if let Some(observer) = observer {
+            observer.completed(objects.len());
+        }
 
         let keys = objects
             .iter()
@@ -261,6 +309,14 @@ impl<'a> RemoteLayout<'a> {
         &self,
         crate_names: &HashSet<String>,
     ) -> Result<HashMap<String, String>> {
+        self.list_keys_for_crates_observed(crate_names, None).await
+    }
+
+    pub async fn list_keys_for_crates_observed(
+        &self,
+        crate_names: &HashSet<String>,
+        mut observer: Option<&mut dyn ListObserver>,
+    ) -> Result<HashMap<String, String>> {
         let mut keys = HashMap::new();
 
         for crate_name in crate_names {
@@ -268,11 +324,17 @@ impl<'a> RemoteLayout<'a> {
                 &self.remote.prefix,
                 &format!("{V3_ROOT}/{V3_MANIFESTS}/{crate_name}/"),
             );
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.started(&manifest_prefix);
+            }
             let objects = self
                 .backend
                 .list(&manifest_prefix)
                 .await
                 .with_context(|| format!("listing v3 manifests for crate {crate_name}"))?;
+            if let Some(observer) = observer.as_deref_mut() {
+                observer.completed(objects.len());
+            }
 
             keys.extend(objects.iter().filter_map(|key| {
                 let stripped = key.strip_prefix(&manifest_prefix)?;
@@ -693,19 +755,21 @@ fn copy_dir_all_until(src: &Path, dst: &Path, deadline: Option<Instant>) -> Resu
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        DeadlineReader, DeadlineWriter, HashingWriter, RemoteLayout, V3Manifest, blob_path,
-        copy_dir_all, create_entry_pack_zstd, extract_entry_pack, extract_verified_prefetch_entry,
-        is_rooted_path, v3_manifest_key, v3_pack_key,
+        DeadlineReader, DeadlineWriter, DownloadObserver, EntryNotFound, HashingWriter,
+        ListObserver, RemoteLayout, V3Manifest, blob_path, copy_dir_all, create_entry_pack_zstd,
+        extract_entry_pack, extract_verified_prefetch_entry, is_rooted_path, v3_manifest_key,
+        v3_pack_key,
     };
     use crate::config::{
         Config, DEFAULT_DAEMON_IDLE_TIMEOUT_SECS, DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
         DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS, DEFAULT_S3_POOL_IDLE_SECS, RemoteConfig,
     };
-    use crate::remote_backend::{GetObject, RemoteBackend, memory_backend};
+    use crate::remote_backend::{GetObject, GetTransfer, RemoteBackend, memory_backend};
     use crate::store::{CachedFile, EntryMeta, Store};
     use proptest::prelude::*;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::path::Path;
+    use std::time::Instant;
 
     #[test]
     fn v3_keys_follow_the_documented_layout() {
@@ -1354,7 +1418,195 @@ pub(crate) mod tests {
         RemoteConfig::test_s3("bucket", "artifacts")
     }
 
+    #[derive(Default)]
+    struct ObservedDownload {
+        starts: Vec<String>,
+        bodies: Vec<Option<(u64, u64, u64)>>,
+    }
+
+    impl DownloadObserver for ObservedDownload {
+        fn started(&mut self, key: &str) {
+            self.starts.push(key.to_owned());
+        }
+        fn received(&mut self, transfer: Option<&GetTransfer>) {
+            self.bodies
+                .push(transfer.map(|t| (t.bytes, t.request_ms, t.body_ms)));
+        }
+    }
+
+    #[derive(Default)]
+    struct ObservedLists(Vec<(String, Option<usize>)>);
+
+    impl ListObserver for ObservedLists {
+        fn started(&mut self, prefix: &str) {
+            self.0.push((prefix.to_owned(), None));
+        }
+        fn completed(&mut self, count: usize) {
+            self.0.last_mut().unwrap().1 = Some(count);
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_download_retains_received_bytes_on_decode_failure_and_distinguishes_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = test_remote();
+        let backend = memory_backend();
+        let layout = RemoteLayout::new(&backend, &remote);
+        let key = "a".repeat(64);
+        let object_key = v3_pack_key(&remote.prefix, &key, "serde");
+        backend
+            .put(&object_key, b"invalid archive".to_vec(), None)
+            .await
+            .unwrap();
+        let mut observed = ObservedDownload::default();
+        assert!(
+            layout
+                .download_entry_observed(
+                    &key,
+                    "serde",
+                    &dir.path().join("entry"),
+                    dir.path(),
+                    None,
+                    Some(&mut observed)
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(observed.starts, [object_key]);
+        assert_eq!(observed.bodies.len(), 1);
+        assert_eq!(observed.bodies[0].unwrap().0, 15);
+
+        let mut missing = ObservedDownload::default();
+        let error = layout
+            .download_entry_observed(
+                &"b".repeat(64),
+                "serde",
+                &dir.path().join("missing"),
+                dir.path(),
+                None,
+                Some(&mut missing),
+            )
+            .await
+            .err()
+            .expect("missing pack must return an error");
+        assert!(error.downcast_ref::<EntryNotFound>().is_some());
+        assert_eq!(missing.starts.len(), 1);
+        assert_eq!(missing.bodies, [None]);
+    }
+
+    #[tokio::test]
+    async fn observed_download_before_admission_has_no_backend_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = test_remote();
+        let backend = memory_backend();
+        let layout = RemoteLayout::new(&backend, &remote);
+        let mut observed = ObservedDownload::default();
+        assert!(
+            layout
+                .download_entry_observed(
+                    "key",
+                    "serde",
+                    &dir.path().join("entry"),
+                    dir.path(),
+                    Some(Instant::now() - std::time::Duration::from_secs(1)),
+                    Some(&mut observed)
+                )
+                .await
+                .is_err()
+        );
+        assert!(observed.starts.is_empty());
+        assert!(observed.bodies.is_empty());
+        let parent_file = dir.path().join("file");
+        std::fs::write(&parent_file, b"not a directory").unwrap();
+        assert!(
+            layout
+                .download_entry_observed(
+                    "key",
+                    "serde",
+                    &parent_file.join("entry"),
+                    dir.path(),
+                    None,
+                    Some(&mut observed)
+                )
+                .await
+                .is_err()
+        );
+        assert!(observed.starts.is_empty());
+        assert!(observed.bodies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn observed_lists_count_backend_results_before_filtering_and_each_crate_call() {
+        let remote = test_remote();
+        let backend = memory_backend();
+        let layout = RemoteLayout::new(&backend, &remote);
+        for object in [
+            v3_manifest_key(&remote.prefix, &"a".repeat(64), "serde"),
+            "artifacts/v3/manifests/serde/invalid-key.json".into(),
+            v3_manifest_key(&remote.prefix, &"b".repeat(64), "tokio"),
+        ] {
+            backend.put(&object, vec![], None).await.unwrap();
+        }
+        let mut all = ObservedLists::default();
+        assert_eq!(
+            layout
+                .list_keys_observed(Some(&mut all))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(all.0, [("artifacts/v3/manifests/".into(), Some(3))]);
+        let mut scoped = ObservedLists::default();
+        assert_eq!(
+            layout
+                .list_keys_for_crates_observed(
+                    &HashSet::from(["serde".into(), "tokio".into()]),
+                    Some(&mut scoped)
+                )
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        scoped.0.sort();
+        assert_eq!(
+            scoped.0,
+            [
+                ("artifacts/v3/manifests/serde/".into(), Some(2)),
+                ("artifacts/v3/manifests/tokio/".into(), Some(1))
+            ]
+        );
+    }
+
     struct FailingBackend;
+
+    #[tokio::test]
+    async fn observed_backend_errors_keep_started_attempts_without_fabricated_body_or_list_results()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = test_remote();
+        let layout = RemoteLayout::new(&FailingBackend, &remote);
+        let mut download = ObservedDownload::default();
+        assert!(
+            layout
+                .download_entry_observed(
+                    "key",
+                    "serde",
+                    &dir.path().join("entry"),
+                    dir.path(),
+                    None,
+                    Some(&mut download)
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(download.starts.len(), 1);
+        assert!(download.bodies.is_empty());
+        let mut list = ObservedLists::default();
+        assert!(layout.list_keys_observed(Some(&mut list)).await.is_err());
+        assert_eq!(list.0, [("artifacts/v3/manifests/".into(), None)]);
+    }
 
     #[async_trait::async_trait]
     impl RemoteBackend for FailingBackend {
@@ -1367,7 +1619,7 @@ pub(crate) mod tests {
             _key: &str,
             _max_bytes: Option<u64>,
         ) -> anyhow::Result<Option<GetObject>> {
-            unreachable!("unexpected get")
+            anyhow::bail!("permission denied")
         }
 
         async fn put(
@@ -1380,7 +1632,7 @@ pub(crate) mod tests {
         }
 
         async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
-            unreachable!("unexpected list")
+            anyhow::bail!("permission denied")
         }
 
         fn describe(&self, key: &str) -> String {

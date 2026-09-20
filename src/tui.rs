@@ -2631,6 +2631,8 @@ fn draw_recent_transfers(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 ("ok", Style::default().fg(Color::Green))
             } else if evt.outcome == "cancelled" {
                 ("STOP", Style::default().fg(Color::Yellow))
+            } else if evt.outcome == "skipped" {
+                ("SKIP", Style::default().fg(Color::Yellow))
             } else if evt.outcome == "not_found"
                 && evt.direction == daemon::TransferDirection::Download
             {
@@ -3763,6 +3765,11 @@ mod tests {
         state.stats_snapshot.recent_transfers[0].outcome = "error".to_string();
         let screen = rendered_lines(&mut state, Tab::Transfer, 120, 40).join("\n");
         assert!(screen.contains("FAIL"), "{screen}");
+        state.stats_snapshot.recent_transfers[0].outcome = "skipped".to_string();
+        state.stats_snapshot.recent_transfers[0].request_count = 0;
+        let screen = rendered_lines(&mut state, Tab::Transfer, 120, 40).join("\n");
+        assert!(screen.contains("SKIP"), "{screen}");
+        assert!(!screen.contains("FAIL"), "{screen}");
     }
 
     fn populated_state() -> AppState {

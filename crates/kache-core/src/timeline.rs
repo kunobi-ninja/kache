@@ -227,7 +227,8 @@ pub struct TimelineTransfer {
     /// on demand downloads and logs older than transfer schema 4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefetch: Option<PrefetchOrigin>,
-    /// `completed`, `not_found`, `error`, or `import_error`; empty for demand downloads, uploads, and old logs.
+    /// Operation/import outcome, including neutral `not_found`, `cancelled`,
+    /// and `skipped`; empty for demand downloads, uploads, and old logs.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub outcome: String,
 }

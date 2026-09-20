@@ -314,7 +314,10 @@ Upgrade the service before sending schema 5 records. The updated service also
 accepts schemas 1 through 4. Wrapper events before schema 20 have no demand
 observations. Current demand transfers and older logs still require a unique
 key or time-window match; ambiguous transfers remain unattributed.
-Packed prefetch records each catalog GET, pack GET and catalog LIST once.
+Prefetch records each ordinary entry GET, catalog GET, pack GET and LIST once.
+Background index and explicit warm-all LISTs retain the origin captured before
+their async work. A completed LIST stays completed if later local index work
+is cancelled; its result count and completion time describe the backend call.
 `accounting.operation` distinguishes GET from LIST; `request_count` counts
 backend invocations, excluding SDK retries and LIST pages. `requests_complete`
 states whether that count is known. LIST records include `list_result_count`
@@ -325,6 +328,11 @@ headers and catalog metadata. `accounting.bytes_complete: false` means partial
 received bytes are unknown, so a complete GET-body precision ratio cannot be
 computed. A failed validation or import still retains a fully received body.
 Cancellation receipts preserve known bytes and use the `cancelled` outcome.
+Work cancelled before a GET starts records zero backend attempts. A 404 records
+one attempt and known zero body bytes. Transport failures and interrupted bodies keep bytes unknown;
+fully received bodies remain known even if decoding or import later fails.
+`skipped` means another download or local entry made this candidate unnecessary;
+it made no backend GET and is neutral in reports.
 A bounded logging queue marks the final summary incomplete if records overflow
 or cannot be written; such a run cannot establish full accounting coverage.
 

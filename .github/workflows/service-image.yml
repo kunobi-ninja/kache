@@ -2,7 +2,7 @@ name: Service Image
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev]
     paths:
       - "crates/kache-service/**"
       - "packaging/docker/**"
@@ -10,7 +10,7 @@ on:
       - "Justfile"
       - ".github/workflows/service-image.yml"
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ["v*"]
     paths:
       - "crates/kache-service/**"
@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   docker-dry-run:
-    if: github.event_name == 'pull_request' || github.repository != 'kunobi-ninja/kache'
+    if: github.event_name == 'pull_request' || github.repository != 'kunobi-ninja/kache' || github.ref == 'refs/heads/dev'
     name: Build Service Image (Dry Run)
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     steps:
@@ -39,7 +39,7 @@ jobs:
         run: docker buildx bake -f packaging/docker-bake.hcl --set '*.cache-from=' service
 
   release:
-    if: github.repository == 'kunobi-ninja/kache' && github.event_name != 'pull_request'
+    if: github.repository == 'kunobi-ninja/kache' && github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     name: Build Service Image
     runs-on: ${{ fromJSON(!github.event.repository.private && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX) }}
     permissions:
@@ -65,7 +65,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/require-ci-green.sh "$(git rev-parse HEAD)" "Check (Linux)"
 
-      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
+        with:
+          install: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

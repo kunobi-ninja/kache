@@ -146,8 +146,9 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Install tools via mise
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
           # node@lts: Firefox's build needs Node.js (bundling / some codegen). It
@@ -394,8 +395,9 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Install tools via mise
-        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
+          install: true
           # Pin mise CLI — see ci.yml (v2026.6.10 regression).
           version: 2026.6.9
           # node@lts: Firefox's build needs Node.js (bundling / some codegen). It

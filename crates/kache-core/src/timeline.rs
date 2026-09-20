@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of [`BuildTimeline`]. A server rejects a record whose schema it
 /// does not know.
-pub const BUILD_TIMELINE_SCHEMA: u32 = 4;
+pub const BUILD_TIMELINE_SCHEMA: u32 = 5;
 
 /// One build session: its compiler invocations and the remote transfers that
 /// belong to it.
@@ -201,6 +201,8 @@ pub struct TimelineUnit {
 /// One remote transfer attributed to the session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TimelineTransfer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<PrefetchAccounting>,
     pub cache_key: String,
     #[serde(default)]
     pub crate_name: String,
@@ -236,6 +238,42 @@ pub enum TransferDirection {
     Upload,
     #[default]
     Download,
+}
+
+/// Accounting for one physical backend operation. Nested entries describe
+/// payload attribution; their bytes must not be added to the physical total.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PrefetchAccounting {
+    pub operation: PrefetchOperation,
+    /// True when compressed_bytes covers the complete received body. False
+    /// means partial transport bytes are unavailable (including LIST bodies).
+    pub bytes_complete: bool,
+    /// Counts calls to the backend, not SDK retries or LIST pages.
+    pub requests_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_result_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<PackedEntryTransfer>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefetchOperation {
+    #[default]
+    Get,
+    List,
+}
+
+/// One compressed entry frame within a physical pack body. A successful local
+/// import makes the entry available at finished_at_ms; zero means no import.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PackedEntryTransfer {
+    pub cache_key: String,
+    pub crate_name: String,
+    pub compressed_bytes: u64,
+    pub finished_at_ms: u64,
+    pub outcome: String,
+    pub prefetch: PrefetchOrigin,
 }
 
 /// The plan that scheduled one speculative download. Kept with the task,

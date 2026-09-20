@@ -287,6 +287,7 @@ fn attribute_transfers(
                 return None;
             }
             Some(TimelineTransfer {
+                accounting: transfer.accounting.clone(),
                 cache_key: transfer.cache_key.clone(),
                 crate_name: transfer.crate_name.clone(),
                 direction: match transfer.direction {
@@ -456,6 +457,7 @@ mod tests {
 
     fn transfer(key: &str, started: u64, finished: u64) -> TransferEvent {
         TransferEvent {
+            accounting: None,
             prefetch: None,
             outcome: String::new(),
             schema: 3,
@@ -542,6 +544,38 @@ mod tests {
         assert_eq!(first.units[0].started_at_ms, 4_500);
         assert_eq!(first.units[0].finished_at_ms, 5_000);
         assert_eq!(first.units[0].result, "local_hit");
+    }
+
+    #[test]
+    fn packed_accounting_survives_timeline_projection_without_duplicating_bytes() {
+        let mut pack = transfer("", 1_000, 2_000);
+        pack.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            ..Default::default()
+        });
+        pack.compressed_bytes = 150;
+        pack.accounting = Some(kache_core::timeline::PrefetchAccounting {
+            bytes_complete: true,
+            requests_complete: true,
+            entries: vec![kache_core::timeline::PackedEntryTransfer {
+                cache_key: "k1".into(),
+                compressed_bytes: 100,
+                finished_at_ms: 1_900,
+                outcome: "completed".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let expected = pack.accounting.clone();
+        let records = build_timelines(&inputs(
+            &[event("s1", "serde", "k1", 5_000, 100)],
+            &[pack],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        assert_eq!(records[0].transfers.len(), 1);
+        assert_eq!(records[0].transfers[0].compressed_bytes, 150);
+        assert_eq!(records[0].transfers[0].accounting, expected);
     }
 
     #[test]

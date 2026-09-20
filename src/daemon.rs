@@ -1,7 +1,9 @@
 use crate::transport::prelude::*;
 use crate::transport::{TokioListener, TokioStream, socket_name};
 use anyhow::{Context, Result};
-use kache_core::timeline::PrefetchOrigin;
+use kache_core::timeline::{
+    PackedEntryTransfer, PrefetchAccounting, PrefetchOperation, PrefetchOrigin,
+};
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 use kunobi_daemon::Lifecycle;
 #[path = "daemon_lifecycle.rs"]
@@ -1660,15 +1662,18 @@ impl Response {
 
 // ── Transfer tracking ────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferDirection {
     Upload,
+    #[default]
     Download,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TransferEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<PrefetchAccounting>,
     #[serde(default = "default_transfer_schema")]
     pub schema: u32,
     pub crate_name: String,
@@ -1710,7 +1715,8 @@ pub struct TransferEvent {
     /// Time spent reading response bodies across all GET requests (ms).
     #[serde(default)]
     pub body_ms: u64,
-    /// Number of GET requests issued for this transfer.
+    /// Backend invocation count; accounting specifies GET or LIST. Older
+    /// records report GET counts without completeness metadata.
     #[serde(default)]
     pub request_count: u32,
     /// Uncompressed size in bytes (0 for older log entries or failed transfers).
@@ -1749,7 +1755,7 @@ pub struct TransferEvent {
 }
 
 const fn default_transfer_schema() -> u32 {
-    4
+    5
 }
 
 fn unix_time_ms() -> u64 {
@@ -1757,6 +1763,166 @@ fn unix_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+const MAX_PREFETCH_RECEIPT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PREFETCH_RECEIPT_ENTRIES: usize = 4096;
+
+#[derive(Default)]
+struct PrefetchReceiptQueue {
+    events: Vec<TransferEvent>,
+    retained_bytes: usize,
+    entries: usize,
+    overflowed: bool,
+    writing: bool,
+}
+
+impl PrefetchReceiptQueue {
+    fn push(&mut self, event: TransferEvent) {
+        fn origin_bytes(origin: &PrefetchOrigin) -> usize {
+            origin.session_id.capacity() + origin.plan_id.capacity() + origin.source.capacity()
+        }
+        let mut bytes = std::mem::size_of::<TransferEvent>()
+            + event.crate_name.capacity()
+            + event.format.capacity()
+            + event.cache_key.capacity()
+            + event.object_key.capacity()
+            + event.outcome.capacity()
+            + event.prefetch.as_ref().map_or(0, origin_bytes);
+        let mut entries = 0;
+        if let Some(accounting) = &event.accounting {
+            entries = accounting.entries.len();
+            bytes += accounting.entries.capacity() * std::mem::size_of::<PackedEntryTransfer>();
+            for entry in &accounting.entries {
+                bytes += entry.cache_key.capacity()
+                    + entry.crate_name.capacity()
+                    + entry.outcome.capacity()
+                    + origin_bytes(&entry.prefetch);
+            }
+        }
+        if bytes > MAX_PREFETCH_RECEIPT_BYTES.saturating_sub(self.retained_bytes)
+            || entries > MAX_PREFETCH_RECEIPT_ENTRIES.saturating_sub(self.entries)
+        {
+            self.overflowed = true;
+            return;
+        }
+        self.retained_bytes += bytes;
+        self.entries += entries;
+        self.events.push(event);
+    }
+
+    fn drain(&mut self) -> Vec<TransferEvent> {
+        self.retained_bytes = 0;
+        self.entries = 0;
+        std::mem::take(&mut self.events)
+    }
+}
+
+/// A panic must release writer admission and make missing coverage visible.
+struct PrefetchReceiptWriter {
+    queue: Arc<Mutex<PrefetchReceiptQueue>>,
+    failed: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for PrefetchReceiptWriter {
+    fn drop(&mut self) {
+        if self.armed {
+            self.failed.store(true, Ordering::Release);
+            self.queue.lock().unwrap_or_else(|p| p.into_inner()).writing = false;
+        }
+    }
+}
+
+/// A receipt remains owned across decode/import awaits. Cancellation only
+/// queues it in memory; log I/O runs separately on the blocking pool.
+struct PrefetchReceipt {
+    event: TransferEvent,
+    started: Instant,
+    queue: Arc<Mutex<PrefetchReceiptQueue>>,
+}
+
+impl PrefetchReceipt {
+    fn new(
+        queue: Arc<Mutex<PrefetchReceiptQueue>>,
+        origin: PrefetchOrigin,
+        object_key: &str,
+        format: &str,
+        operation: PrefetchOperation,
+    ) -> Self {
+        Self {
+            event: TransferEvent {
+                schema: default_transfer_schema(),
+                prefetch: Some(origin),
+                object_key: object_key.to_owned(),
+                crate_name: format.to_owned(),
+                format: format.to_owned(),
+                outcome: "cancelled".to_owned(),
+                started_at_unix_ms: unix_time_ms(),
+                accounting: Some(PrefetchAccounting {
+                    operation,
+                    requests_complete: true,
+                    bytes_complete: operation == PrefetchOperation::Get,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            started: Instant::now(),
+            queue,
+        }
+    }
+
+    fn accounting(&mut self) -> &mut PrefetchAccounting {
+        self.event.accounting.as_mut().expect("receipt accounting")
+    }
+
+    fn received(&mut self, object: &crate::remote_backend::GetObject) {
+        self.event.compressed_bytes = object.body.len() as u64;
+        self.event.request_ms = object.request_ms;
+        self.event.body_ms = object.body_ms;
+        self.accounting().bytes_complete = true;
+    }
+
+    fn finish(&mut self, outcome: &str) {
+        self.event.outcome = outcome.to_owned();
+        self.event.ok = outcome == "completed";
+        self.event.finished_at_unix_ms = unix_time_ms();
+    }
+}
+
+impl Drop for PrefetchReceipt {
+    fn drop(&mut self) {
+        if self.event.finished_at_unix_ms == 0 {
+            self.event.finished_at_unix_ms = unix_time_ms();
+        }
+        self.event.timestamp = self.event.finished_at_unix_ms / 1_000;
+        self.event.elapsed_ms = self.started.elapsed().as_millis() as u64;
+        self.queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(std::mem::take(&mut self.event));
+    }
+}
+
+fn charge_packed_import(event: &mut TransferEvent, original_bytes: u64, extract_ms: u64) {
+    event.original_bytes += original_bytes;
+    event.extract_ms += extract_ms;
+}
+
+struct PackedAttribution<'a> {
+    origin: &'a PrefetchOrigin,
+    ranks: &'a HashMap<String, u64>,
+    sources: &'a HashMap<String, kache_core::CandidateSource>,
+}
+
+impl PackedAttribution<'_> {
+    fn for_key(&self, key: &str) -> PrefetchOrigin {
+        PrefetchOrigin {
+            candidate_rank: self.ranks.get(key).copied(),
+            candidate_source: self.sources.get(key).copied().unwrap_or_default(),
+            ..self.origin.clone()
+        }
+    }
 }
 
 pub(crate) struct TransferCounters {
@@ -2313,6 +2479,9 @@ pub(crate) struct Daemon {
     /// Own both coordinators and their independently scheduled download tasks.
     prefetch_tasks: Mutex<tokio::task::JoinSet<()>>,
     prefetch_cancellations: Arc<Mutex<PrefetchCancellations>>,
+    prefetch_receipts: Arc<Mutex<PrefetchReceiptQueue>>,
+    prefetch_receipt_writers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    prefetch_receipt_failed: Arc<AtomicBool>,
     /// Phase-0 observability counters (#485). Telemetry only.
     prefetch_stats: PrefetchStats,
     /// DAEMON-WIDE cap on concurrent speculative prefetch downloads, sized by
@@ -2466,6 +2635,9 @@ impl Daemon {
             prefetch_stopping: AtomicBool::new(false),
             prefetch_tasks: Mutex::new(tokio::task::JoinSet::new()),
             prefetch_cancellations: Arc::new(Mutex::new(PrefetchCancellations::default())),
+            prefetch_receipts: Arc::new(Mutex::new(PrefetchReceiptQueue::default())),
+            prefetch_receipt_writers: Mutex::new(Vec::new()),
+            prefetch_receipt_failed: Arc::new(AtomicBool::new(false)),
             prefetch_stats: PrefetchStats::new(),
             prefetch_gate: Arc::new(tokio::sync::Semaphore::new(prefetch_concurrency_cap(
                 config.s3_concurrency,
@@ -2864,6 +3036,114 @@ impl Daemon {
             }
             q.push_back(event);
         }
+    }
+
+    /// Transfer ownership to a tracked writer before any await. Aborting a
+    /// coordinator cannot discard a body receipt already queued by its guard.
+    fn flush_prefetch_receipts(self: &Arc<Self>) {
+        let mut queue = self
+            .prefetch_receipts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if queue.writing || queue.events.is_empty() {
+            return;
+        }
+        queue.writing = true;
+        let mut pending = queue.drain();
+        if !queue.events.is_empty() {
+            // drain() takes the queue. A dummy return would spin the writer.
+            queue.writing = false;
+            self.prefetch_receipt_failed.store(true, Ordering::Release);
+            return;
+        }
+        let guard = PrefetchReceiptWriter {
+            queue: self.prefetch_receipts.clone(),
+            failed: self.prefetch_receipt_failed.clone(),
+            armed: true,
+        };
+        // Admission and registration stay synchronous; shutdown first joins
+        // every producer, then takes the writer handles.
+        drop(queue);
+        let daemon = self.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            let mut guard = guard;
+            let path = daemon.config.transfer_log_path();
+            loop {
+                for event in pending {
+                    if let Err(error) = events::log_transfer(&path, &event) {
+                        daemon
+                            .prefetch_receipt_failed
+                            .store(true, Ordering::Release);
+                        tracing::warn!("failed to log prefetch receipt: {error}");
+                    }
+                    if let Ok(mut recent) = daemon.recent_transfers.lock() {
+                        if recent.len() >= RECENT_TRANSFERS_CAP {
+                            recent.pop_front();
+                        }
+                        recent.push_back(event);
+                    }
+                }
+                let mut queue = daemon
+                    .prefetch_receipts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if queue.events.is_empty() {
+                    queue.writing = false;
+                    guard.armed = false;
+                    break;
+                }
+                pending = queue.drain();
+                if !queue.events.is_empty() {
+                    daemon
+                        .prefetch_receipt_failed
+                        .store(true, Ordering::Release);
+                    queue.writing = false;
+                    guard.armed = false;
+                    break;
+                }
+            }
+        });
+        let mut writers = self
+            .prefetch_receipt_writers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        use futures::FutureExt as _;
+        writers.retain_mut(|writer| match std::pin::Pin::new(writer).now_or_never() {
+            None => true,
+            Some(result) => {
+                if result.is_err() {
+                    self.prefetch_receipt_failed.store(true, Ordering::Release);
+                }
+                false
+            }
+        });
+        writers.push(writer);
+    }
+
+    async fn finish_prefetch_receipts(self: &Arc<Self>) -> bool {
+        self.flush_prefetch_receipts();
+        let writers = std::mem::take(
+            &mut *self
+                .prefetch_receipt_writers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut complete = true;
+            for writer in writers {
+                complete &= writer.await.is_ok();
+            }
+            complete
+        })
+        .await
+        .unwrap_or(false);
+        finished
+            && !self.prefetch_receipt_failed.load(Ordering::Acquire)
+            && !self
+                .prefetch_receipts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .overflowed
     }
 
     /// Set the upload buffer sender (called during server setup).
@@ -3683,6 +3963,7 @@ impl Daemon {
                     .bytes_uploaded
                     .fetch_add(ul.transfer.compressed_bytes, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    accounting: None,
                     prefetch: None,
                     outcome: String::new(),
                     schema: default_transfer_schema(),
@@ -3731,6 +4012,7 @@ impl Daemon {
                     .uploads_failed
                     .fetch_add(1, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    accounting: None,
                     prefetch: None,
                     outcome: String::new(),
                     schema: default_transfer_schema(),
@@ -4239,6 +4521,7 @@ impl Daemon {
                     .bytes_downloaded
                     .fetch_add(dl.compressed_bytes, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    accounting: None,
                     prefetch: None,
                     outcome: String::new(),
                     schema: default_transfer_schema(),
@@ -4296,6 +4579,7 @@ impl Daemon {
                     .downloads_failed
                     .fetch_add(1, Ordering::Relaxed);
                 self.push_transfer_event(TransferEvent {
+                    accounting: None,
                     prefetch: None,
                     outcome: String::new(),
                     schema: default_transfer_schema(),
@@ -4380,6 +4664,7 @@ impl Daemon {
         &self,
         v3: &crate::cache_remote::V3Remote,
         prefix: &str,
+        receipt: &mut PrefetchReceipt,
     ) -> Result<Vec<String>> {
         let breaker = self
             .remote_breaker
@@ -4407,20 +4692,29 @@ impl Daemon {
             !self.prefetch_stopping.load(Ordering::Acquire),
             "daemon stopping before packed prefetch request"
         );
+        receipt.event.semaphore_wait_ms = receipt.started.elapsed().as_millis() as u64;
+        let network_start = Instant::now();
         self.prefetch_stats
             .pack_requests_total
             .fetch_add(1, Ordering::Relaxed);
         let result = deadline
-            .run("pack catalog LIST", v3.list_prefetch_objects(prefix))
+            .run("pack catalog LIST", async {
+                receipt.event.request_count = 1;
+                v3.list_prefetch_objects(prefix).await
+            })
             .await;
+        receipt.event.network_ms = network_start.elapsed().as_millis() as u64;
         drop(semaphore);
         drop(gate);
         match result {
             Ok(objects) => {
+                receipt.accounting().list_result_count = Some(objects.len() as u64);
+                receipt.finish("completed");
                 breaker.success();
                 Ok(objects)
             }
             Err(error) => {
+                receipt.finish("error");
                 let class = classify_remote_error(&error);
                 breaker.failure(class, &format!("packed-prefetch LIST failed: {error:#}"));
                 Err(error)
@@ -4434,6 +4728,7 @@ impl Daemon {
         key: &str,
         max_bytes: u64,
         stage: &'static str,
+        receipt: &mut PrefetchReceipt,
     ) -> Result<Option<crate::remote_backend::GetObject>> {
         let breaker = self
             .remote_breaker
@@ -4461,25 +4756,38 @@ impl Daemon {
             !self.prefetch_stopping.load(Ordering::Acquire),
             "daemon stopping before packed prefetch request"
         );
+        receipt.event.semaphore_wait_ms = receipt.started.elapsed().as_millis() as u64;
+        let network_start = Instant::now();
         self.prefetch_stats
             .pack_requests_total
             .fetch_add(1, Ordering::Relaxed);
         let result = deadline
-            .run(stage, v3.get_prefetch_object(key, max_bytes))
+            .run(stage, async {
+                receipt.event.request_count = 1;
+                receipt.accounting().bytes_complete = false;
+                v3.get_prefetch_object(key, max_bytes).await
+            })
             .await;
+        receipt.event.network_ms = network_start.elapsed().as_millis() as u64;
         drop(semaphore);
         drop(gate);
         match result {
             Ok(object) => {
                 breaker.success();
                 if let Some(object) = &object {
+                    receipt.received(object);
                     self.prefetch_stats
                         .pack_bytes_downloaded
                         .fetch_add(object.body.len() as u64, Ordering::Relaxed);
                 }
+                if object.is_none() {
+                    receipt.accounting().bytes_complete = true;
+                    receipt.finish("not_found");
+                }
                 Ok(object)
             }
             Err(error) => {
+                receipt.finish("error");
                 let class = classify_remote_error(&error);
                 breaker.failure(class, &format!("{stage} failed: {error:#}"));
                 Err(error)
@@ -4497,6 +4805,7 @@ impl Daemon {
         remote: &crate::config::RemoteConfig,
         candidates: &[(String, String, PathBuf)],
         bytes_at_plan_start: u64,
+        attribution: &PackedAttribution<'_>,
     ) -> HashSet<String> {
         let wanted = candidates
             .iter()
@@ -4511,12 +4820,20 @@ impl Daemon {
                     return imported;
                 }
             };
+        let mut list_receipt = PrefetchReceipt::new(
+            self.prefetch_receipts.clone(),
+            attribution.origin.clone(),
+            &catalog_prefix,
+            "pack_catalog",
+            PrefetchOperation::List,
+        );
         let objects = match self
-            .packed_prefetch_list(v3.as_ref(), &catalog_prefix)
+            .packed_prefetch_list(v3.as_ref(), &catalog_prefix, &mut list_receipt)
             .await
         {
             Ok(objects) => objects,
             Err(error) => {
+                list_receipt.finish("error");
                 tracing::debug!("packed-prefetch catalog discovery failed: {error:#}");
                 self.prefetch_stats
                     .pack_fallback_entries
@@ -4524,6 +4841,7 @@ impl Daemon {
                 return imported;
             }
         };
+        drop(list_receipt);
         let catalog_ref = match crate::remote_pack::latest_catalog_object(
             &remote.prefix,
             &context.selector,
@@ -4547,14 +4865,23 @@ impl Daemon {
                 return imported;
             }
         };
+        let mut catalog_receipt = PrefetchReceipt::new(
+            self.prefetch_receipts.clone(),
+            attribution.origin.clone(),
+            &catalog_ref.object_key,
+            "pack_catalog",
+            PrefetchOperation::Get,
+        );
         let Some(catalog_object) = self
             .packed_prefetch_get(
                 v3.as_ref(),
                 &catalog_ref.object_key,
                 crate::remote_pack::MAX_CATALOG_BYTES as u64,
                 "packed-prefetch catalog GET",
+                &mut catalog_receipt,
             )
             .await
+            .inspect_err(|_| catalog_receipt.finish("error"))
             .ok()
             .flatten()
         else {
@@ -4563,6 +4890,7 @@ impl Daemon {
                 .fetch_add(wanted.len() as u64, Ordering::Relaxed);
             return imported;
         };
+        catalog_receipt.event.outcome = "validation_error".to_owned();
         let now_ms = epoch_ms();
         let catalog = match crate::remote_pack::decode_catalog_for_selector(
             &catalog_object.body,
@@ -4602,6 +4930,8 @@ impl Daemon {
 
         // Parsing owns the catalog data. Release its download reservation
         // before scheduling pack GETs against the same memory budget.
+        catalog_receipt.finish("completed");
+        drop(catalog_receipt);
         drop(catalog_object);
         let selected = catalog
             .packs
@@ -4641,22 +4971,37 @@ impl Daemon {
             .map(|pack_ref| async move {
                 let pack_key =
                     crate::remote_pack::pack_object_key(&remote.prefix, &pack_ref.digest);
-                let object = match pack_key {
-                    Ok(key) => self
-                        .packed_prefetch_get(
-                            v3.as_ref(),
-                            &key,
-                            pack_ref.pack_bytes,
-                            "packed-prefetch pack GET",
-                        )
-                        .await
-                        .ok()
-                        .flatten(),
+                let key = match pack_key {
+                    Ok(key) => key,
                     Err(error) => {
                         tracing::warn!("packed-prefetch pack key rejected: {error:#}");
                         self.prefetch_stats
                             .pack_validation_failures
                             .fetch_add(1, Ordering::Relaxed);
+                        return (pack_ref, None);
+                    }
+                };
+                let mut receipt = PrefetchReceipt::new(
+                    self.prefetch_receipts.clone(),
+                    attribution.origin.clone(),
+                    &key,
+                    "pack",
+                    PrefetchOperation::Get,
+                );
+                let object = match self
+                    .packed_prefetch_get(
+                        v3.as_ref(),
+                        &key,
+                        pack_ref.pack_bytes,
+                        "packed-prefetch pack GET",
+                        &mut receipt,
+                    )
+                    .await
+                {
+                    Ok(Some(object)) => Some((object, receipt)),
+                    Ok(None) => None,
+                    Err(_) => {
+                        receipt.finish("error");
                         None
                     }
                 };
@@ -4665,12 +5010,16 @@ impl Daemon {
             .buffer_unordered(prefetch_concurrency_cap(self.config.s3_concurrency));
 
         let mut verified = Vec::new();
+        let mut receipts = Vec::new();
         // Consume each body as it arrives. Retaining completed bodies while
         // waiting for another GET can fill the budget and block that GET.
         while let Some((pack_ref, pack_object)) = fetched.next().await {
-            let Some(pack_object) = pack_object else {
+            let Some((pack_object, receipt)) = pack_object else {
                 continue;
             };
+            let pack_index = receipts.len();
+            receipts.push(receipt);
+            let receipt = &mut receipts[pack_index];
             let decoded = match crate::remote_pack::decode_catalog_pack(
                 &pack_object.body,
                 &pack_ref,
@@ -4678,6 +5027,7 @@ impl Daemon {
             ) {
                 Ok(decoded) => decoded,
                 Err(error) => {
+                    receipt.finish("validation_error");
                     tracing::warn!("packed-prefetch pack validation failed: {error:#}");
                     self.prefetch_stats
                         .pack_validation_failures
@@ -4697,8 +5047,19 @@ impl Daemon {
 
             for entry in decoded.entries {
                 let key = &entry.descriptor.cache_key;
+                let entry_index = receipt.accounting().entries.len();
+                receipt.accounting().entries.push(PackedEntryTransfer {
+                    cache_key: key.clone(),
+                    crate_name: entry.descriptor.crate_name.clone(),
+                    compressed_bytes: entry.payload.len() as u64,
+                    prefetch: attribution.for_key(key),
+                    outcome: "cancelled".to_owned(),
+                    ..Default::default()
+                });
                 let entry_dir = self.entry_dir_for(key);
                 if !try_claim_packed_download(&self.downloading, key, &entry_dir).await {
+                    receipt.accounting().entries[entry_index].outcome =
+                        "already_present_or_inflight".to_owned();
                     continue;
                 }
                 let guard = DownloadingGuard::new(self.downloading.clone(), key.clone());
@@ -4710,8 +5071,10 @@ impl Daemon {
                     &entry_dir,
                     None,
                 ) {
-                    Ok(extracted) => verified.push((extracted, guard, entry.payload.len() as u64)),
+                    Ok(extracted) => verified.push((extracted, guard, pack_index, entry_index)),
                     Err(error) => {
+                        receipt.accounting().entries[entry_index].outcome =
+                            "validation_error".to_owned();
                         tracing::warn!(
                             key = key_prefix(key),
                             "packed-prefetch entry validation failed: {error:#}"
@@ -4726,31 +5089,46 @@ impl Daemon {
 
         let batch = verified
             .iter()
-            .map(|(entry, _, _)| entry.restored.clone())
+            .map(|(entry, _, _, _)| entry.restored.clone())
             .collect::<Vec<_>>();
         if !batch.is_empty() {
             let import_start = Instant::now();
             match self.with_store(|store| store.import_verified_restored_entries(&batch)) {
                 Ok(_) => {
+                    let completed_at_ms = unix_time_ms();
                     let original_bytes = verified
                         .iter()
-                        .map(|(entry, _, _)| entry.original_bytes)
+                        .map(|(entry, _, _, _)| entry.original_bytes)
                         .sum::<u64>();
                     let extract_ms = verified
                         .iter()
-                        .map(|(entry, _, _)| entry.extract_ms)
+                        .map(|(entry, _, _, _)| entry.extract_ms)
                         .sum::<u64>();
-                    for (entry, _, payload_bytes) in &verified {
+                    // No await before every successfully imported entry has its
+                    // exact availability boundary, including other packs in this batch.
+                    let import_ms = import_start.elapsed().as_millis() as u64;
+                    // One shared batch import: charge its duration once, to
+                    // the first imported pack, rather than once per object.
+                    receipts[verified[0].2].event.import_ms = import_ms;
+                    for (entry, _, pack_index, entry_index) in &verified {
+                        let receipt = &mut receipts[*pack_index];
+                        charge_packed_import(
+                            &mut receipt.event,
+                            entry.original_bytes,
+                            entry.extract_ms,
+                        );
+                        let logical = &mut receipt.accounting().entries[*entry_index];
+                        logical.finished_at_ms = completed_at_ms;
+                        logical.outcome = "completed".to_owned();
                         let key = &entry.restored.cache_key;
                         imported.insert(key.clone());
-                        self.note_key_present(key, &entry.restored.meta.crate_name)
-                            .await;
-                        {
-                            let mut plan =
-                                self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
-                            if let Some(plan) = plan.as_mut() {
-                                plan.record_download(key, *payload_bytes);
-                            }
+                        let mut plan = self.active_plan.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(plan) = plan.as_mut() {
+                            plan.record_download_from(
+                                &logical.prefetch,
+                                key,
+                                logical.compressed_bytes,
+                            );
                         }
                     }
                     self.prefetch_stats
@@ -4769,11 +5147,30 @@ impl Daemon {
                     self.prefetch_stats
                         .pack_validation_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    for (entry, _, _) in &verified {
+                    for (entry, _, pack_index, entry_index) in &verified {
+                        receipts[*pack_index].accounting().entries[*entry_index].outcome =
+                            "import_error".to_owned();
                         let _ =
                             std::fs::remove_dir_all(self.entry_dir_for(&entry.restored.cache_key));
                     }
                 }
+            }
+        }
+        for receipt in &mut receipts {
+            // A body that failed whole-pack validation has no trustworthy entries.
+            if receipt.event.outcome == "validation_error" {
+                continue;
+            }
+            let failed = receipt.accounting().entries.iter().any(|entry| {
+                entry.outcome == "validation_error" || entry.outcome == "import_error"
+            });
+            receipt.finish(if failed { "import_error" } else { "completed" });
+        }
+        drop(receipts);
+        for (entry, _, _, _) in &verified {
+            if imported.contains(&entry.restored.cache_key) {
+                self.note_key_present(&entry.restored.cache_key, &entry.restored.meta.crate_name)
+                    .await;
             }
         }
         drop(verified);
@@ -4863,8 +5260,8 @@ impl Daemon {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
 
-        // Future per-operation cancellation records must also be flushed at
-        // this boundary: all producers have exited, and the summary is not yet taken.
+        // All producers have exited; persist receipts before the summary.
+        let receipts_complete = self.finish_prefetch_receipts().await;
         let cancellations = std::mem::take(
             &mut *self
                 .prefetch_cancellations
@@ -4880,7 +5277,8 @@ impl Daemon {
             .unwrap_or_else(|p| p.into_inner())
             .take();
         if let Some(mut plan) = plan {
-            let incomplete = timed_out
+            let incomplete = !receipts_complete
+                || timed_out
                 || cancellations.overflowed
                 || cancellations.origins.iter().any(|origin| {
                     plan.session_id == origin.session_id
@@ -5107,8 +5505,14 @@ impl Daemon {
                         &remote_config,
                         &keys_to_fetch,
                         bytes_at_plan_start,
+                        &PackedAttribution {
+                            origin: &origin,
+                            ranks: &ranks,
+                            sources: &candidate_sources,
+                        },
                     )
                     .await;
+                daemon.flush_prefetch_receipts();
                 keys_to_fetch.retain(|(key, _, _)| !packed.contains(key));
             }
 
@@ -5382,6 +5786,7 @@ impl Daemon {
                                 }
                             }
                             d.push_transfer_event(TransferEvent {
+                                accounting: None,
                                 prefetch: Some(origin.clone()),
                                 outcome: if import_ok {
                                     "completed"
@@ -5462,6 +5867,7 @@ impl Daemon {
                             let elapsed_ms = start.elapsed().as_millis() as u64;
                             let finished_at_unix_ms = unix_time_ms();
                             d.push_transfer_event(TransferEvent {
+                                accounting: None,
                                 prefetch: Some(origin.clone()),
                                 outcome: if class == RemoteErrorClass::Miss {
                                     "not_found"
@@ -5644,9 +6050,41 @@ impl Daemon {
         }
     }
 
+    /// Normal closure is a conservative snapshot, not a per-origin barrier.
+    /// Complete precision qualification requires the drained shutdown summary.
+    fn prefetch_accounting_incomplete(&self) -> bool {
+        let tasks_pending = {
+            let mut tasks = self
+                .prefetch_tasks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            while tasks.try_join_next().is_some() {}
+            !tasks.is_empty()
+        };
+        let receipts_pending = {
+            let queue = self
+                .prefetch_receipts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            queue.overflowed || queue.writing || !queue.events.is_empty()
+        };
+        let cancelled = {
+            let cancellations = self
+                .prefetch_cancellations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            cancellations.overflowed || !cancellations.origins.is_empty()
+        };
+        tasks_pending
+            || receipts_pending
+            || cancelled
+            || self.prefetch_receipt_failed.load(Ordering::Acquire)
+    }
+
     /// Append the per-session summary to `summaries.jsonl`. Best-effort:
     /// telemetry must never fail the daemon.
     fn emit_plan_summary(&self, plan: ActivePlan, closure_reason: &str, incomplete: bool) {
+        let incomplete = incomplete || self.prefetch_accounting_incomplete();
         let used_bytes = plan.used_bytes();
         let downloaded_bytes: u64 = plan.downloaded.values().sum();
         let event = crate::events::BuildSummaryEvent {
@@ -10148,7 +10586,7 @@ mod tests {
     }
 
     fn assert_v3_transfer_timestamps(transfer: &TransferEvent) {
-        assert_eq!(transfer.schema, 4);
+        assert_eq!(transfer.schema, 5);
         assert!(
             transfer.started_at_unix_ms > 1_000_000_000_000,
             "transfer start must be Unix epoch milliseconds: {transfer:?}"
@@ -14779,6 +15217,579 @@ mod tests {
         zstd::stream::encode_all(std::io::Cursor::new(tar), 3).unwrap()
     }
 
+    #[test]
+    fn packed_receipt_queue_bounds_allocated_bytes_and_entries_independently() {
+        let mut queue = PrefetchReceiptQueue::default();
+        queue.push(TransferEvent {
+            object_key: String::with_capacity((2 << 20) - std::mem::size_of::<TransferEvent>()),
+            ..Default::default()
+        });
+        assert_eq!(queue.events.len(), 1, "exact byte boundary is admitted");
+        queue.push(TransferEvent::default());
+        assert_eq!(queue.events.len(), 1, "additional data exceeds byte bound");
+        assert!(queue.overflowed);
+        drop(queue.drain());
+        queue.push(TransferEvent::default());
+        assert_eq!(queue.events.len(), 1, "draining releases retained capacity");
+        assert!(
+            queue.overflowed,
+            "lost coverage remains visible after draining"
+        );
+
+        let mut queue = PrefetchReceiptQueue::default();
+        queue.push(TransferEvent {
+            accounting: Some(PrefetchAccounting {
+                entries: vec![PackedEntryTransfer::default(); 4096],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(queue.events.len(), 1, "exact entry boundary is admitted");
+        queue.push(TransferEvent {
+            accounting: Some(PrefetchAccounting {
+                entries: vec![PackedEntryTransfer::default()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(queue.events.len(), 1, "entry bound is independent of bytes");
+        assert!(queue.overflowed);
+    }
+
+    #[test]
+    fn packed_receipt_queue_drain_returns_queued_events_and_clears_the_queue() {
+        let mut queue = PrefetchReceiptQueue::default();
+        queue.push(TransferEvent {
+            object_key: "keep-me".into(),
+            ..TransferEvent::default()
+        });
+        assert!(queue.retained_bytes > 0);
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].object_key, "keep-me");
+        assert!(queue.events.is_empty());
+        assert_eq!(queue.retained_bytes, 0);
+        assert_eq!(queue.entries, 0);
+        queue.push(TransferEvent {
+            object_key: "after-drain".into(),
+            ..TransferEvent::default()
+        });
+        assert_eq!(queue.events.len(), 1);
+        assert_eq!(queue.events[0].object_key, "after-drain");
+    }
+
+    fn packed_receipt_origin(session: usize, plan: usize, source: usize) -> PrefetchOrigin {
+        PrefetchOrigin {
+            session_id: String::with_capacity(session),
+            plan_id: String::with_capacity(plan),
+            source: String::with_capacity(source),
+            ..PrefetchOrigin::default()
+        }
+    }
+
+    fn packed_receipt_retained_bytes(event: &TransferEvent) -> usize {
+        fn origin_bytes(origin: &PrefetchOrigin) -> usize {
+            origin.session_id.capacity() + origin.plan_id.capacity() + origin.source.capacity()
+        }
+        let mut bytes = std::mem::size_of::<TransferEvent>()
+            + event.crate_name.capacity()
+            + event.format.capacity()
+            + event.cache_key.capacity()
+            + event.object_key.capacity()
+            + event.outcome.capacity()
+            + event.prefetch.as_ref().map_or(0, origin_bytes);
+        if let Some(accounting) = &event.accounting {
+            bytes += accounting.entries.capacity() * std::mem::size_of::<PackedEntryTransfer>();
+            for entry in &accounting.entries {
+                bytes += entry.cache_key.capacity()
+                    + entry.crate_name.capacity()
+                    + entry.outcome.capacity()
+                    + origin_bytes(&entry.prefetch);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn packed_receipt_queue_counts_origin_and_nested_entry_allocations() {
+        let mut entries = Vec::with_capacity(8);
+        entries.push(PackedEntryTransfer {
+            cache_key: String::with_capacity(8),
+            crate_name: String::with_capacity(16),
+            outcome: String::with_capacity(32),
+            prefetch: packed_receipt_origin(8, 16, 32),
+            ..PackedEntryTransfer::default()
+        });
+        let event = TransferEvent {
+            crate_name: String::with_capacity(8),
+            format: String::with_capacity(16),
+            cache_key: String::with_capacity(32),
+            object_key: String::with_capacity(64),
+            outcome: String::with_capacity(4),
+            prefetch: Some(packed_receipt_origin(8, 16, 32)),
+            accounting: Some(PrefetchAccounting {
+                entries,
+                ..PrefetchAccounting::default()
+            }),
+            ..TransferEvent::default()
+        };
+        let expected = packed_receipt_retained_bytes(&event);
+        assert!(
+            expected > std::mem::size_of::<TransferEvent>(),
+            "origin and entry string allocations must contribute: {expected}"
+        );
+        let mut queue = PrefetchReceiptQueue::default();
+        queue.push(event);
+        assert_eq!(queue.events.len(), 1);
+        assert!(!queue.overflowed);
+        assert_eq!(queue.retained_bytes, expected);
+        assert_eq!(queue.entries, 1);
+    }
+
+    #[test]
+    fn packed_receipt_drop_stamps_unfinished_and_keeps_finished_times() {
+        let queue = Arc::new(Mutex::new(PrefetchReceiptQueue::default()));
+        drop(PrefetchReceipt::new(
+            queue.clone(),
+            PrefetchOrigin::default(),
+            "unfinished",
+            "pack",
+            PrefetchOperation::Get,
+        ));
+        let unfinished = queue.lock().unwrap().drain();
+        assert_eq!(unfinished.len(), 1);
+        assert_v3_transfer_timestamps(&unfinished[0]);
+        assert_eq!(unfinished[0].outcome, "cancelled");
+
+        let mut receipt = PrefetchReceipt::new(
+            queue.clone(),
+            PrefetchOrigin::default(),
+            "finished",
+            "pack",
+            PrefetchOperation::Get,
+        );
+        receipt.finish("completed");
+        receipt.event.finished_at_unix_ms = 1_700_000_000_123;
+        drop(receipt);
+        let finished = queue.lock().unwrap().drain();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].finished_at_unix_ms, 1_700_000_000_123);
+        assert_eq!(finished[0].timestamp, 1_700_000_000);
+        assert_ne!(finished[0].timestamp, 123);
+        assert_eq!(finished[0].outcome, "completed");
+    }
+
+    #[test]
+    fn charge_packed_import_accumulates_each_entry() {
+        let mut event = TransferEvent::default();
+        charge_packed_import(&mut event, 11, 7);
+        charge_packed_import(&mut event, 13, 5);
+        assert_eq!(event.original_bytes, 24);
+        assert_eq!(event.extract_ms, 12);
+    }
+
+    #[tokio::test]
+    async fn packed_receipts_require_every_writer_to_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        {
+            let mut writers = daemon.prefetch_receipt_writers.lock().unwrap();
+            writers.push(tokio::task::spawn_blocking(|| {}));
+            writers.push(tokio::task::spawn_blocking(|| {
+                panic!("injected writer join failure");
+            }));
+        }
+        assert!(!daemon.finish_prefetch_receipts().await);
+    }
+
+    #[tokio::test]
+    async fn packed_receipt_flush_retains_recent_history_below_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        for index in 0..2 {
+            drop(PrefetchReceipt::new(
+                daemon.prefetch_receipts.clone(),
+                PrefetchOrigin::default(),
+                &format!("recent-{index}"),
+                "pack",
+                PrefetchOperation::Get,
+            ));
+        }
+        assert!(daemon.finish_prefetch_receipts().await);
+        assert_eq!(daemon.recent_transfers.lock().unwrap().len(), 2);
+
+        for index in 0..51 {
+            drop(PrefetchReceipt::new(
+                daemon.prefetch_receipts.clone(),
+                PrefetchOrigin::default(),
+                &format!("capped-{index}"),
+                "pack",
+                PrefetchOperation::Get,
+            ));
+        }
+        assert!(daemon.finish_prefetch_receipts().await);
+        assert_eq!(daemon.recent_transfers.lock().unwrap().len(), 50);
+    }
+
+    #[tokio::test]
+    async fn packed_shutdown_timeout_marks_incomplete_when_receipts_are_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon.install_plan("session", "plan", "advisory", std::iter::empty(), None);
+        daemon
+            .spawn_prefetch_task(
+                PrefetchOrigin {
+                    session_id: "other-session".into(),
+                    plan_id: "other-plan".into(),
+                    source: "fallback".into(),
+                    ..PrefetchOrigin::default()
+                },
+                std::future::pending(),
+            )
+            .unwrap();
+        assert!(daemon.finish_prefetch_shutdown(Duration::ZERO).await);
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].closure_reason, "shutdown_timeout");
+        assert!(summaries[0].incomplete);
+        assert!(summaries[0].cancelled);
+    }
+
+    #[tokio::test]
+    async fn packed_shutdown_incomplete_receipts_mark_incomplete_without_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon.install_plan("session", "plan", "advisory", std::iter::empty(), None);
+        daemon
+            .prefetch_receipts
+            .lock()
+            .unwrap()
+            .push(TransferEvent {
+                object_key: String::with_capacity((2 << 20) + 1),
+                ..TransferEvent::default()
+            });
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(1))
+                .await
+        );
+        let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].closure_reason, "shutdown");
+        assert!(summaries[0].incomplete);
+        assert!(summaries[0].cancelled);
+    }
+
+    #[tokio::test]
+    async fn packed_receipts_use_one_writer_and_drain_while_disk_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        std::fs::create_dir_all(&daemon.config.runtime_dir).unwrap();
+        let lock_path = daemon.config.runtime_dir.join("transfers.jsonl.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        for index in 0..100 {
+            drop(PrefetchReceipt::new(
+                daemon.prefetch_receipts.clone(),
+                PrefetchOrigin::default(),
+                &format!("pack-{index}"),
+                "pack",
+                PrefetchOperation::Get,
+            ));
+            daemon.flush_prefetch_receipts();
+            if index == 0 {
+                daemon.install_plan(
+                    "writer-session",
+                    "writer-plan",
+                    "fallback",
+                    std::iter::empty(),
+                    None,
+                );
+                daemon.finalize_inactive_plan(0);
+                let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+                assert_eq!(summaries[0].closure_reason, "inactivity");
+                assert!(
+                    summaries[0].incomplete,
+                    "a blocked writer can still lose records"
+                );
+            }
+        }
+        assert_eq!(daemon.prefetch_receipt_writers.lock().unwrap().len(), 1);
+        assert_eq!(daemon.prefetch_receipts.lock().unwrap().events.len(), 99);
+        lock.unlock().unwrap();
+        assert!(daemon.finish_prefetch_receipts().await);
+        assert_eq!(
+            events::read_transfers(&daemon.config.transfer_log_path())
+                .unwrap()
+                .len(),
+            100
+        );
+        assert!(daemon.prefetch_receipts.lock().unwrap().events.is_empty());
+        assert!(!daemon.prefetch_receipts.lock().unwrap().writing);
+    }
+
+    #[tokio::test]
+    async fn packed_normal_summary_exposes_overflow_log_failure_and_pending_tasks() {
+        for loss in [
+            "overflow",
+            "log_failure",
+            "receipt",
+            "task",
+            "cancelled_task",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+            daemon.install_plan(
+                "normal-session",
+                "normal-plan",
+                "fallback",
+                std::iter::empty(),
+                None,
+            );
+            match loss {
+                "overflow" => daemon
+                    .prefetch_receipts
+                    .lock()
+                    .unwrap()
+                    .push(TransferEvent {
+                        object_key: String::with_capacity((2 << 20) + 1),
+                        ..Default::default()
+                    }),
+                "log_failure" => {
+                    std::fs::create_dir_all(daemon.config.transfer_log_path()).unwrap();
+                    drop(PrefetchReceipt::new(
+                        daemon.prefetch_receipts.clone(),
+                        PrefetchOrigin::default(),
+                        "pack-key",
+                        "pack",
+                        PrefetchOperation::Get,
+                    ));
+                    assert!(!daemon.finish_prefetch_receipts().await);
+                }
+                "receipt" => {
+                    drop(PrefetchReceipt::new(
+                        daemon.prefetch_receipts.clone(),
+                        PrefetchOrigin::default(),
+                        "queued-record",
+                        "pack",
+                        PrefetchOperation::Get,
+                    ));
+                }
+                "task" => {
+                    daemon
+                        .spawn_prefetch_task(PrefetchOrigin::default(), std::future::pending())
+                        .unwrap();
+                }
+                "cancelled_task" => {
+                    let receiver = daemon
+                        .spawn_prefetch_task(PrefetchOrigin::default(), async {
+                            panic!("cancelled before normal closure")
+                        })
+                        .unwrap();
+                    assert!(receiver.await.is_err());
+                }
+                _ => unreachable!(),
+            }
+            daemon.finalize_inactive_plan(0);
+            let summaries = events::read_summaries(&daemon.config.summary_log_path()).unwrap();
+            assert_eq!(summaries.len(), 1);
+            assert_eq!(summaries[0].closure_reason, "inactivity");
+            assert!(
+                summaries[0].incomplete,
+                "lost or unfinished coverage: {loss}"
+            );
+            daemon.finish_prefetch_shutdown(Duration::ZERO).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn packed_receipt_overflow_and_writer_panic_remain_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        daemon
+            .prefetch_receipts
+            .lock()
+            .unwrap()
+            .push(TransferEvent {
+                object_key: String::with_capacity((2 << 20) + 1),
+                ..Default::default()
+            });
+        assert!(!daemon.finish_prefetch_receipts().await);
+        assert!(daemon.prefetch_receipts.lock().unwrap().events.is_empty());
+        daemon.prefetch_receipts.lock().unwrap().writing = true;
+        let guard = PrefetchReceiptWriter {
+            queue: daemon.prefetch_receipts.clone(),
+            failed: daemon.prefetch_receipt_failed.clone(),
+            armed: true,
+        };
+        assert!(
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                panic!("injected receipt writer failure");
+            })
+            .await
+            .is_err()
+        );
+        assert!(!daemon.prefetch_receipts.lock().unwrap().writing);
+        assert!(daemon.prefetch_receipt_failed.load(Ordering::Acquire));
+        drop(PrefetchReceipt::new(
+            daemon.prefetch_receipts.clone(),
+            PrefetchOrigin::default(),
+            "after-panic",
+            "pack",
+            PrefetchOperation::Get,
+        ));
+        assert!(!daemon.finish_prefetch_receipts().await);
+        assert_eq!(
+            events::read_transfers(&daemon.config.transfer_log_path())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn packed_receipt_distinguishes_queued_and_inflight_cancellation() {
+        for queued in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_config(dir.path());
+            config.remote = Some(test_remote_config());
+            let daemon = Arc::new(Daemon::new(config));
+            let started = Arc::new(Notify::new());
+            assert!(
+                daemon
+                    .remote_backend
+                    .set(Arc::new(BlockingPackBackend {
+                        inner: test_remote_backend(),
+                        pack_started: started.clone(),
+                        release_pack: Arc::new(tokio::sync::Semaphore::new(0)),
+                        v3_get_started: None,
+                    }))
+                    .is_ok()
+            );
+            let v3 = daemon.v3_remote().await.unwrap().clone();
+            let permit = if queued {
+                Some(
+                    daemon
+                        .prefetch_gate
+                        .clone()
+                        .acquire_many_owned(daemon.prefetch_gate.available_permits() as u32)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let backend_started = started.notified();
+            tokio::pin!(backend_started);
+            backend_started.as_mut().enable();
+            let (ready, entered) = tokio::sync::oneshot::channel();
+            let worker = daemon.clone();
+            let task = tokio::spawn(async move {
+                let key = "prefix/v4/prefetch/packs/test";
+                let mut receipt = PrefetchReceipt::new(
+                    worker.prefetch_receipts.clone(),
+                    PrefetchOrigin::default(),
+                    key,
+                    "pack",
+                    PrefetchOperation::Get,
+                );
+                ready.send(()).unwrap();
+                let _ = worker
+                    .packed_prefetch_get(&v3, key, 1024, "test GET", &mut receipt)
+                    .await;
+            });
+            entered.await.unwrap();
+            if !queued {
+                tokio::time::timeout(Duration::from_secs(2), backend_started)
+                    .await
+                    .unwrap();
+            }
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            drop(permit);
+            assert!(daemon.finish_prefetch_receipts().await);
+            let transfers = events::read_transfers(&daemon.config.transfer_log_path()).unwrap();
+            assert_eq!(transfers.len(), 1);
+            let event = &transfers[0];
+            assert_eq!(event.request_count, u32::from(!queued));
+            assert_eq!(event.compressed_bytes, 0);
+            assert_eq!(event.outcome, "cancelled");
+            assert_v3_transfer_timestamps(event);
+            assert_eq!(event.accounting.as_ref().unwrap().bytes_complete, queued);
+            assert!(event.accounting.as_ref().unwrap().requests_complete);
+        }
+    }
+
+    #[tokio::test]
+    async fn packed_receipt_log_failure_marks_accounting_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        std::fs::create_dir_all(daemon.config.transfer_log_path()).unwrap();
+        drop(PrefetchReceipt::new(
+            daemon.prefetch_receipts.clone(),
+            PrefetchOrigin::default(),
+            "pack-key",
+            "pack",
+            PrefetchOperation::Get,
+        ));
+        assert!(!daemon.finish_prefetch_receipts().await);
+        assert_eq!(daemon.recent_transfers.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn packed_receipt_survives_cancellation_after_body_before_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new(test_config(dir.path())));
+        let mut receipt = PrefetchReceipt::new(
+            daemon.prefetch_receipts.clone(),
+            PrefetchOrigin::default(),
+            "pack-key",
+            "pack",
+            PrefetchOperation::Get,
+        );
+        receipt.event.request_count = 1;
+        receipt.received(&crate::remote_backend::GetObject {
+            body: bytes::Bytes::from_static(b"received before cancellation"),
+            request_ms: 7,
+            body_ms: 11,
+        });
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _receipt = receipt;
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        received.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(daemon.finish_prefetch_receipts().await);
+        let transfers = events::read_transfers(&daemon.config.transfer_log_path()).unwrap();
+        assert_eq!(transfers.len(), 1);
+        let event = &transfers[0];
+        assert_eq!(event.compressed_bytes, 28);
+        assert_eq!(event.request_count, 1);
+        assert_eq!(event.request_ms, 7);
+        assert_eq!(event.body_ms, 11);
+        assert_eq!(event.outcome, "cancelled");
+        assert!(!event.ok);
+        assert!(event.accounting.as_ref().unwrap().bytes_complete);
+        assert!(event.accounting.as_ref().unwrap().entries.is_empty());
+        assert!(daemon.finish_prefetch_receipts().await);
+        assert_eq!(
+            events::read_transfers(&daemon.config.transfer_log_path())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn packed_prefetch_discovers_one_pack_and_batch_imports_all_entries() {
         let dir = tempfile::tempdir().unwrap();
@@ -14799,7 +15810,8 @@ mod tests {
         let key_b = test_cache_key("packed-batch-b");
         let (payload_a, meta_a) = build_entry_pack_with_meta(&key_a, "serde");
         let (payload_b, meta_b) = build_entry_pack_with_meta(&key_b, "tokio");
-        seed_packed_catalog(
+        let payload_bytes = [payload_a.len() as u64, payload_b.len() as u64];
+        let built = seed_packed_catalog(
             &backend,
             &context,
             vec![
@@ -14827,16 +15839,28 @@ mod tests {
             .await
             .insert(sentinel.clone());
 
+        daemon.install_plan(
+            "later-session",
+            "later-plan",
+            "fallback",
+            [key_a.clone(), key_b.clone()].into_iter(),
+            None,
+        );
         let response = daemon
             .handle_prefetch_with_context(
                 &PrefetchRequest {
-                    keys: vec![
-                        (key_a.clone(), "serde".into()),
-                        (key_b.clone(), "tokio".into()),
-                    ],
+                    keys: vec![(key_a.clone(), "serde".into())],
                     warm_all: false,
-                    origin: None,
-                    candidate_sources: HashMap::new(),
+                    origin: Some(PrefetchOrigin {
+                        session_id: "packed-session".into(),
+                        plan_id: "packed-plan".into(),
+                        source: "advisory".into(),
+                        ..Default::default()
+                    }),
+                    candidate_sources: HashMap::from([(
+                        key_a.clone(),
+                        kache_core::CandidateSource::Manifest,
+                    )]),
                 },
                 Some(context),
                 Instant::now(),
@@ -14868,6 +15892,79 @@ mod tests {
                 .v3_requests_total
                 .load(Ordering::Relaxed),
             0
+        );
+        assert!(
+            daemon
+                .active_plan
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .downloaded
+                .is_empty(),
+            "a later plan cannot claim these pack imports"
+        );
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(2))
+                .await
+        );
+        let transfers = events::read_transfers(&daemon.config.transfer_log_path()).unwrap();
+        assert_eq!(transfers.len(), 3, "one LIST, catalog GET and pack GET");
+        assert_eq!(
+            transfers
+                .iter()
+                .map(|event| event.request_count)
+                .sum::<u32>(),
+            3
+        );
+        let list = transfers
+            .iter()
+            .find(|event| event.accounting.as_ref().unwrap().operation == PrefetchOperation::List)
+            .unwrap();
+        assert_eq!(list.accounting.as_ref().unwrap().list_result_count, Some(1));
+        assert!(!list.accounting.as_ref().unwrap().bytes_complete);
+        let pack = transfers
+            .iter()
+            .find(|event| event.format == "pack")
+            .unwrap();
+        assert_eq!(pack.compressed_bytes, built.bytes.len() as u64);
+        assert_eq!(pack.outcome, "completed");
+        assert!(pack.ok);
+        assert_v3_transfer_timestamps(pack);
+        assert!(pack.original_bytes > 0);
+        let accounting = pack.accounting.as_ref().unwrap();
+        assert!(accounting.bytes_complete && accounting.requests_complete);
+        assert_eq!(accounting.entries.len(), 2);
+        for (key, bytes, rank, crate_name) in [
+            (&key_a, payload_bytes[0], Some(0), "serde"),
+            (&key_b, payload_bytes[1], None, "tokio"),
+        ] {
+            let entry = accounting
+                .entries
+                .iter()
+                .find(|entry| &entry.cache_key == key)
+                .unwrap();
+            assert_eq!(entry.compressed_bytes, bytes);
+            assert_eq!(entry.crate_name, crate_name);
+            assert_eq!(entry.outcome, "completed");
+            assert!(entry.finished_at_ms >= pack.started_at_unix_ms);
+            assert!(entry.finished_at_ms <= pack.finished_at_unix_ms);
+            assert_eq!(entry.prefetch.session_id, "packed-session");
+            assert_eq!(entry.prefetch.plan_id, "packed-plan");
+            assert_eq!(entry.prefetch.candidate_rank, rank);
+            assert_eq!(
+                entry.prefetch.candidate_source,
+                if rank.is_some() {
+                    kache_core::CandidateSource::Manifest
+                } else {
+                    kache_core::CandidateSource::Unknown
+                }
+            );
+        }
+        assert!(
+            pack.compressed_bytes > payload_bytes.iter().sum::<u64>(),
+            "header bytes remain in physical denominator"
         );
         let prefetched = daemon.prefetched_keys.read().await;
         assert!(prefetched.contains(&sentinel));
@@ -14955,7 +16052,18 @@ mod tests {
         let v3 = daemon.v3_remote().await.unwrap();
         let imported = tokio::time::timeout(
             Duration::from_secs(3),
-            daemon.try_packed_prefetch(&context, v3, &remote, &candidates, 0),
+            daemon.try_packed_prefetch(
+                &context,
+                v3,
+                &remote,
+                &candidates,
+                0,
+                &PackedAttribution {
+                    origin: &PrefetchOrigin::default(),
+                    ranks: &HashMap::new(),
+                    sources: &HashMap::new(),
+                },
+            ),
         )
         .await
         .expect("catalog and pack bodies must be released while the queue is draining");
@@ -15221,6 +16329,21 @@ mod tests {
                 .load(Ordering::Relaxed)
                 >= 1
         );
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(2))
+                .await
+        );
+        let transfers = events::read_transfers(&daemon.config.transfer_log_path()).unwrap();
+        let pack = transfers
+            .iter()
+            .find(|event| event.format == "pack")
+            .unwrap();
+        assert_eq!(pack.compressed_bytes, 22);
+        assert_eq!(pack.outcome, "validation_error");
+        assert!(!pack.ok);
+        assert!(pack.accounting.as_ref().unwrap().bytes_complete);
+        assert!(pack.accounting.as_ref().unwrap().entries.is_empty());
     }
 
     #[tokio::test]
@@ -15403,6 +16526,202 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(2))
+                .await
+        );
+        let transfers = events::read_transfers(&daemon.config.transfer_log_path()).unwrap();
+        let pack = transfers
+            .iter()
+            .find(|event| event.format == "pack")
+            .unwrap();
+        assert_eq!(pack.outcome, "import_error");
+        assert!(!pack.ok);
+        let accounting = pack.accounting.as_ref().unwrap();
+        let good = accounting
+            .entries
+            .iter()
+            .find(|entry| entry.cache_key == good_key)
+            .unwrap();
+        assert_eq!(good.crate_name, "serde");
+        assert_eq!(good.outcome, "completed");
+        let bad = accounting
+            .entries
+            .iter()
+            .find(|entry| entry.cache_key == bad_key)
+            .unwrap();
+        assert_eq!(bad.crate_name, "tokio");
+        assert_eq!(bad.outcome, "validation_error");
+    }
+
+    #[tokio::test]
+    async fn packed_receipt_keeps_cancelled_entries_when_claim_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let remote = config.remote.clone().unwrap();
+        let backend = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let context = PackPrefetchContext::from_deps(
+            crate::identity::host_target_triple(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let key = test_cache_key("cancelled-packed-claim");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        seed_packed_catalog(
+            &backend,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest,
+                payload,
+            }],
+            None,
+        )
+        .await;
+        let v3 = daemon.v3_remote().await.unwrap().clone();
+        let candidates = vec![(key.clone(), "serde".into(), daemon.entry_dir_for(&key))];
+        let claim = daemon.downloading.write().await;
+        let worker = daemon.clone();
+        let task = tokio::spawn(async move {
+            let origin = PrefetchOrigin::default();
+            let ranks = HashMap::new();
+            let sources = HashMap::new();
+            worker
+                .try_packed_prefetch(
+                    &context,
+                    &v3,
+                    &remote,
+                    &candidates,
+                    0,
+                    &PackedAttribution {
+                        origin: &origin,
+                        ranks: &ranks,
+                        sources: &sources,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while daemon
+                .transfer_counters
+                .downloads_completed
+                .load(Ordering::Relaxed)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pack body should decode before the claim waits");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(claim);
+        assert!(daemon.finish_prefetch_receipts().await);
+        let transfers = events::read_transfers(&daemon.config.transfer_log_path()).unwrap();
+        let pack = transfers
+            .iter()
+            .find(|event| event.format == "pack")
+            .unwrap();
+        assert_eq!(pack.outcome, "cancelled");
+        let entry = pack
+            .accounting
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|entry| entry.cache_key == key)
+            .unwrap();
+        assert_eq!(entry.crate_name, "serde");
+        assert_eq!(entry.outcome, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn packed_import_error_marks_the_pack_failed_without_entry_validation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        std::fs::create_dir_all(config.store_dir()).unwrap();
+        std::fs::write(config.store_dir().join("blobs"), b"not a directory").unwrap();
+        let backend = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let context = PackPrefetchContext::from_deps(
+            crate::identity::host_target_triple(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let key = test_cache_key("packed-import-error");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        seed_packed_catalog(
+            &backend,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest,
+                payload,
+            }],
+            None,
+        )
+        .await;
+        let response = daemon
+            .handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(key.clone(), "serde".into())],
+                    warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
+                },
+                Some(context),
+                Instant::now(),
+            )
+            .await;
+        assert!(response.ok);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if daemon
+                    .prefetch_stats
+                    .pack_validation_failures
+                    .load(Ordering::Relaxed)
+                    >= 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("packed import failure should be counted");
+        assert!(
+            !daemon
+                .finish_prefetch_shutdown(Duration::from_secs(2))
+                .await
+        );
+        let transfers = events::read_transfers(&daemon.config.transfer_log_path()).unwrap();
+        let pack = transfers
+            .iter()
+            .find(|event| event.format == "pack")
+            .unwrap();
+        assert_eq!(pack.outcome, "import_error");
+        assert!(!pack.ok);
+        let entry = pack
+            .accounting
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|entry| entry.cache_key == key)
+            .unwrap();
+        assert_eq!(entry.crate_name, "serde");
+        assert_eq!(entry.outcome, "import_error");
     }
 
     #[tokio::test]

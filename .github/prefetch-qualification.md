@@ -49,6 +49,9 @@ receipts and nested payload entries, reviewed against
 `129a31ce4debb8c97d9698fe5ff6d48ed4387750`. Unknown future schemas or fields fail
 admission. Every keyed compiler unit must carry exact first-demand observations.
 
+Demand and usefulness come from unit events and transfer receipts. The daemon's
+summary counters can omit local hits, so they cannot establish byte precision.
+
 The schema-5 report groups receipts by immutable session, plan ID and source.
 An empty fallback plan ID remains scoped to its session. Its denominator is
 received GET-body bytes, including catalog metadata and pack headers. Nested

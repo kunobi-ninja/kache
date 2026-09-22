@@ -2728,3 +2728,32 @@ fn why_miss_reports_a_path_only_root_across_checkouts() {
         "path_only"
     );
 }
+
+/// A runtime directory deep enough that its socket cannot fit in a Unix
+/// socket address must stop `daemon start` with a message that says so and
+/// how to fix it, not with a daemon that exits before readiness.
+#[cfg(unix)]
+#[test]
+fn daemon_start_refuses_a_socket_path_too_long_for_a_unix_socket() {
+    let home = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let deep = root.path().join("x".repeat(60)).join("y".repeat(60));
+    std::fs::create_dir_all(&deep).unwrap();
+
+    let output = kache(home.path(), &deep)
+        .args(["daemon", "start"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "daemon start must fail: {stderr}");
+    assert!(
+        stderr.contains("a Unix socket path can be at most"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("KACHE_SOCKET_PATH"), "{stderr}");
+    assert!(!stderr.contains("exited before readiness"), "{stderr}");
+    assert!(
+        !deep.join("daemon.state.json").exists(),
+        "no daemon may have started"
+    );
+}

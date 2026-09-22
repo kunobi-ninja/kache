@@ -612,6 +612,32 @@ fn init_logging(mode: LogMode) {
         .init();
 }
 
+/// How main reads argv, decided before any of it is parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryRoute {
+    /// kache started itself for a subcommand: parse the CLI whatever
+    /// argv[0] is. A self-spawn under a shim keeps the shim's name there.
+    SelfSpawn,
+    /// argv[0] names a compiler: kache runs behind a compiler-name shim.
+    Shim,
+    /// kache under its own name: argv[1..] picks wrapper or CLI mode.
+    Argv,
+}
+
+/// Route a process from argv and the [`platform::SELF_SPAWN_ENV`] value.
+fn entry_route(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> EntryRoute {
+    if platform::is_self_spawn(argv, self_spawn) {
+        return EntryRoute::SelfSpawn;
+    }
+    if argv
+        .first()
+        .is_some_and(|arg0| compiler::shim::invoked_as_compiler(arg0))
+    {
+        return EntryRoute::Shim;
+    }
+    EntryRoute::Argv
+}
+
 fn main() -> Result<()> {
     // First, before argv or config: `startup_ms` on every build event is
     // measured from here.
@@ -651,8 +677,19 @@ fn main() -> Result<()> {
     // symlink, so the compiler is our own argv[0] rather than argv[1]. Checked
     // BEFORE `detect_log_mode`, which only ever inspects argv[1..] and would
     // classify `gcc foo.c` as CLI mode and fail parsing `foo.c` as a
-    // subcommand.
-    let shim_args = compiler::shim::wrapper_args(detection_args);
+    // subcommand. A process kache started for its own subcommand can carry a
+    // shim's name in argv[0] too, so its marker is checked first.
+    let self_spawn = std::env::var_os(platform::SELF_SPAWN_ENV);
+    let shim_args = match entry_route(detection_args, self_spawn.as_deref()) {
+        EntryRoute::Shim => compiler::shim::wrapper_args(detection_args),
+        EntryRoute::SelfSpawn => {
+            // SAFETY: no thread has been spawned yet. Removing the marker
+            // keeps it out of every process this one starts.
+            unsafe { std::env::remove_var(platform::SELF_SPAWN_ENV) };
+            None
+        }
+        EntryRoute::Argv => None,
+    };
     if let Some(shim_args) = shim_args {
         init_logging(LogMode::Wrapper);
         let shim_args = shim_args.map_err(anyhow::Error::msg)?;
@@ -1371,6 +1408,63 @@ mod tests {
             }
             result => result,
         }
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// The auto-GC worker started from a wrapper behind a shim, on macOS where
+    /// `current_exe` is the shim path. Before the fix it routed to shim mode
+    /// and handed `gc` to the real compiler.
+    #[test]
+    fn a_self_spawned_gc_under_a_shim_path_routes_to_the_cli() {
+        let gc = Some(std::ffi::OsStr::new("gc"));
+        let args = argv(&["/x/shims/cc", "gc"]);
+        assert_eq!(entry_route(&args, gc), EntryRoute::SelfSpawn);
+        assert_eq!(
+            detect_log_mode_with_rustc(&args, None),
+            LogMode::Cli,
+            "the rest of argv must then parse as the gc subcommand"
+        );
+        // A Windows shim is a copy, so argv[0] stays the compiler's name.
+        let daemon = Some(std::ffi::OsStr::new("daemon"));
+        let args = argv(&["C:/shims/gcc.exe", "daemon", "run"]);
+        assert_eq!(entry_route(&args, daemon), EntryRoute::SelfSpawn);
+        assert_eq!(detect_log_mode_with_rustc(&args, None), LogMode::Cli);
+    }
+
+    /// The marker alone is not enough: a compile run under a leaked marker
+    /// still goes to the compiler.
+    #[test]
+    fn a_compile_through_a_shim_stays_a_compile() {
+        let gc = Some(std::ffi::OsStr::new("gc"));
+        let compile = argv(&["/x/shims/cc", "-c", "foo.c"]);
+        assert_eq!(entry_route(&compile, gc), EntryRoute::Shim);
+        assert_eq!(entry_route(&compile, None), EntryRoute::Shim);
+        // Without the marker, `cc gc` compiles a file named gc.
+        assert_eq!(
+            entry_route(&argv(&["/x/shims/cc", "gc"]), None),
+            EntryRoute::Shim
+        );
+    }
+
+    #[test]
+    fn kache_under_its_own_name_routes_on_the_rest_of_argv() {
+        assert_eq!(entry_route(&argv(&["kache", "gc"]), None), EntryRoute::Argv);
+        assert_eq!(
+            entry_route(&argv(&["kache", "cc", "-c", "foo.c"]), None),
+            EntryRoute::Argv
+        );
+        assert_eq!(entry_route(&[], None), EntryRoute::Argv);
+        // The self-spawn marker wins over any argv[0].
+        assert_eq!(
+            entry_route(
+                &argv(&["kache", "daemon", "run"]),
+                Some(std::ffi::OsStr::new("daemon"))
+            ),
+            EntryRoute::SelfSpawn
+        );
     }
 
     #[test]

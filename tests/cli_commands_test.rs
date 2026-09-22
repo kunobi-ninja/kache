@@ -1838,6 +1838,40 @@ fn unidentifiable_shims_stop_at_the_depth_bound_until_marked() {
         .stdout(predicates::str::contains("real cc: --version"));
 }
 
+/// The automatic GC worker started by a wrapper behind a shim. On macOS its
+/// executable is the shim path, and a Windows shim is a copy, so argv[0] can
+/// name a compiler. The self-spawn marker must still route it to `kache gc`;
+/// before the fix the real compiler got `gc` and GC never ran.
+#[cfg(unix)]
+#[test]
+fn a_self_spawned_gc_behind_a_shim_runs_gc() {
+    let e = env();
+    let root = TempDir::new().unwrap();
+    let shims = root.path().join("shims");
+    std::fs::create_dir_all(&shims).unwrap();
+    std::os::unix::fs::symlink(KACHE_BIN, shims.join("cc")).unwrap();
+    let path = shim_test_path(root.path(), &[&shims]);
+
+    kache_as(&shims.join("cc"), &e.home, &e.cache)
+        .env("PATH", &path)
+        .env("KACHE_AUTO_GC_WORKER", "1")
+        .env("KACHE_SELF_SPAWN", "gc")
+        .arg("gc")
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("real cc").not());
+
+    // The same argv without the marker is a compile of a file named `gc`.
+    kache_as(&shims.join("cc"), &e.home, &e.cache)
+        .env("PATH", &path)
+        .env("KACHE_AUTO_GC_WORKER", "1")
+        .arg("gc")
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .stdout(predicates::str::contains("real cc: gc"));
+}
+
 #[test]
 fn init_writes_config_to_custom_cargo_home() {
     // When $CARGO_HOME is set, init must write the wrapper config under it,

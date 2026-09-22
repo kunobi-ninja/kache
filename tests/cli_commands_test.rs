@@ -33,11 +33,12 @@ fn kache(home: &Path, cache_dir: &Path) -> Command {
 
 /// [`kache`], run through `program`: a compiler shim or a link to the binary.
 fn kache_as(program: &Path, home: &Path, cache_dir: &Path) -> Command {
-    let mut cmd = Command::from(hermetic_command(
-        program,
-        cache_dir,
-        Some(&cache_dir.join("config.toml")),
-    ));
+    Command::from(kache_process_as(program, home, cache_dir))
+}
+
+/// [`kache_as`] as a plain [`std::process::Command`].
+fn kache_process_as(program: &Path, home: &Path, cache_dir: &Path) -> std::process::Command {
+    let mut cmd = hermetic_command(program, cache_dir, Some(&cache_dir.join("config.toml")));
     cmd.env("KACHE_LOG", "off")
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
@@ -1769,6 +1770,50 @@ fn shim_test_path(root: &Path, dirs: &[&Path]) -> std::ffi::OsString {
     std::env::join_paths(path).unwrap()
 }
 
+/// Run a shim command that might loop, and assert on how it ended.
+///
+/// A loop that nothing stops is a chain of processes that each hold the
+/// output open, so waiting on pipes, or killing only the first process, would
+/// never return. The command runs in its own process group with its output in
+/// files, and the whole group is killed if it outlives the timeout.
+#[cfg(unix)]
+fn run_shim_command(mut cmd: std::process::Command) -> assert_cmd::assert::Assert {
+    use assert_cmd::assert::OutputAssertExt;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let out = TempDir::new().unwrap();
+    let stdout = out.path().join("stdout");
+    let stderr = out.path().join("stderr");
+    cmd.process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap());
+    let mut child = cmd.spawn().unwrap();
+    let timeout = Duration::from_secs(60);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // The child is not reaped yet, so its pid still names the group.
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            child.wait().unwrap();
+            panic!(
+                "still running after {timeout:?}, killed its process group. stderr:\n{}",
+                std::fs::read_to_string(&stderr).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::process::Output {
+        status,
+        stdout: std::fs::read(&stdout).unwrap(),
+        stderr: std::fs::read(&stderr).unwrap(),
+    }
+    .assert()
+}
+
 /// Two kache installs, each with a shim farm on PATH, must both reach the
 /// real compiler. Before the fix each resolved the other's shim as the real
 /// `cc`, and the two ran each other without end.
@@ -1792,48 +1837,65 @@ fn two_kache_installs_on_path_do_not_run_each_other() {
     let path = shim_test_path(root, &[&shims_a, &shims_b]);
 
     for shim in [&shims_a, &shims_b] {
-        kache_as(&shim.join("cc"), &e.home, &e.cache)
-            .env("PATH", &path)
-            .arg("--version")
-            .timeout(std::time::Duration::from_secs(60))
-            .assert()
+        let mut cmd = kache_process_as(&shim.join("cc"), &e.home, &e.cache);
+        cmd.env("PATH", &path).arg("--version");
+        run_shim_command(cmd)
             .success()
             .stdout(predicates::str::contains("real cc: --version"));
     }
 }
 
-/// Shims kache cannot identify, copies with a compiler's name and no marker,
-/// still loop. The wrapper depth bound must stop that loop with an error
-/// that names the fix, and the marker must then break it.
+/// Shims kache cannot identify still loop: here a copy of kache named `cc`,
+/// and a script named `cc` that runs another copy. The wrapper depth bound
+/// must stop that loop with an error that names the fix, and the marker must
+/// then break it. The script gives up after 32 rounds, so a broken bound
+/// fails the test instead of starting processes until the timeout.
 #[cfg(unix)]
 #[test]
 fn unidentifiable_shims_stop_at_the_depth_bound_until_marked() {
+    use std::os::unix::fs::PermissionsExt;
     let e = env();
     let root = tempfile::Builder::new()
         .tempdir_in(Path::new(KACHE_BIN).parent().unwrap())
         .unwrap();
     let root = root.path();
-    let copies_a = root.join("copies-a");
-    let copies_b = root.join("copies-b");
-    second_kache_binary(&copies_a.join("cc"));
-    second_kache_binary(&copies_b.join("cc"));
-    let path = shim_test_path(root, &[&copies_a, &copies_b]);
+    let copies = root.join("copies");
+    second_kache_binary(&copies.join("cc"));
+    // Off PATH, so only the script reaches it.
+    let hidden = root.join("hidden/cc");
+    second_kache_binary(&hidden);
+    let scripts = root.join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    let script = scripts.join("cc");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             n=$(cat '{rounds}' 2>/dev/null || echo 0)\n\
+             n=$((n + 1))\n\
+             echo \"$n\" > '{rounds}'\n\
+             if [ \"$n\" -gt 32 ]; then echo 'shim test: gave up after 32 rounds' >&2; exit 97; fi\n\
+             exec '{hidden}' \"$@\"\n",
+            rounds = root.join("rounds").display(),
+            hidden = hidden.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = shim_test_path(root, &[&copies, &scripts]);
+    let run = || {
+        let mut cmd = kache_process_as(&copies.join("cc"), &e.home, &e.cache);
+        cmd.env("PATH", &path).arg("--version");
+        run_shim_command(cmd)
+    };
 
-    kache_as(&copies_a.join("cc"), &e.home, &e.cache)
-        .env("PATH", &path)
-        .arg("--version")
-        .timeout(std::time::Duration::from_secs(60))
-        .assert()
+    run()
         .failure()
         .stderr(predicates::str::contains("loop"))
         .stderr(predicates::str::contains(".kache-shims"));
 
-    std::fs::write(copies_b.join(".kache-shims"), "").unwrap();
-    kache_as(&copies_a.join("cc"), &e.home, &e.cache)
-        .env("PATH", &path)
-        .arg("--version")
-        .timeout(std::time::Duration::from_secs(60))
-        .assert()
+    std::fs::write(scripts.join(".kache-shims"), "").unwrap();
+    run()
         .success()
         .stdout(predicates::str::contains("real cc: --version"));
 }

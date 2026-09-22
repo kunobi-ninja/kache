@@ -106,13 +106,34 @@ def environment(root, binary):
     return env
 
 
+# Variables that route a compile through Kache. Setup steps run without them so
+# that nothing creates the local store or the runtime directory before the cold
+# control is asserted: `cargo fetch` alone probes rustc through RUSTC_WRAPPER,
+# which is enough for the daemon to lay down its runtime directory.
+WRAPPER_ENV_KEYS = (
+    "RUSTC_WRAPPER",
+    "HOST_CC",
+    "HOST_CXX",
+    "CC_KNOWN_WRAPPER_CUSTOM",
+    "KACHE_CONFIG",
+    "KACHE_BASE_DIR",
+    "KACHE_INPUT_PREDICTIONS",
+    "KACHE_VERIFY_INPUT_PREDICTIONS",
+)
+
+
+def setup_environment(env):
+    """`env` with every Kache entry point removed, for pre-build steps."""
+    return {key: value for key, value in env.items() if key not in WRAPPER_ENV_KEYS}
+
+
 class Run:
     def __init__(self, root, output, env):
         self.root, self.output, self.env = root, output, env
         self.phases = []
         output.mkdir(parents=True, exist_ok=True)
 
-    def command(self, name, argv, cwd=None, timeout=3600):
+    def command(self, name, argv, cwd=None, timeout=3600, env=None):
         begin, start = time.time(), time.monotonic()
         code = None
         try:
@@ -123,7 +144,7 @@ class Run:
                 code = subprocess.run(
                     [str(x) for x in argv],
                     cwd=cwd or self.root,
-                    env=self.env,
+                    env=self.env if env is None else env,
                     stdout=out,
                     stderr=err,
                     timeout=timeout,
@@ -951,6 +972,7 @@ prefix = "artifacts"
         if Path(path).exists():
             resources[path] = Path(path).read_text()
     dump(output / "resources.json", resources)
+    setup = setup_environment(env)
     runner.command(
         "clone",
         [
@@ -963,10 +985,13 @@ prefix = "artifacts"
             "https://github.com/eza-community/eza.git",
             root / "source",
         ],
+        env=setup,
     )
     source = root / "source"
     require(
-        runner.command("source-revision", ["git", "rev-parse", "HEAD"], source).strip()
+        runner.command(
+            "source-revision", ["git", "rev-parse", "HEAD"], source, env=setup
+        ).strip()
         == PROJECT,
         "eza tag moved",
     )
@@ -974,13 +999,13 @@ prefix = "artifacts"
         require(
             digest(source / "Cargo.lock") == manifest["lock_sha256"], "Lockfile drift"
         )
-    compiler = runner.command("compiler", ["rustc", "-Vv"])
-    cc = runner.command("cc", ["cc", "--version"])
+    compiler = runner.command("compiler", ["rustc", "-Vv"], env=setup)
+    cc = runner.command("cc", ["cc", "--version"], env=setup)
     if not producer:
         require(
             compiler == manifest["compiler"] and cc == manifest["cc"], "Compiler drift"
         )
-    runner.command("fetch", ["cargo", "fetch", "--locked"], source)
+    runner.command("fetch", ["cargo", "fetch", "--locked"], source, env=setup)
     for path in (cache, runtime, source / "target"):
         require(not path.exists(), f"Cold control already contains {path.name}")
     fixture = root / "fixture"

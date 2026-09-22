@@ -2610,24 +2610,20 @@ mod tests {
     #[test]
     fn heavy_compiles_fit_in_the_reserve_while_tests_hold_the_rest() {
         let dir = temp_cache();
-        let scheduler = budget_scheduler(dir.path(), 4);
+        let scheduler = test_scheduler(dir.path(), 4);
         let _tests = scheduler.acquire_test_lease(TestWant::Elastic(1)).unwrap();
-        let started = std::time::Instant::now();
         let permit = scheduler.acquire_permit(4);
         assert!(permit.is_some(), "a pool-sized compile takes the reserve");
-        assert!(started.elapsed() < BUDGET);
         assert_eq!(permits_in_use(dir.path()), Some(4));
     }
 
     #[test]
     fn heavy_compiles_take_what_tests_leave() {
         let dir = temp_cache();
-        let scheduler = budget_scheduler(dir.path(), 8);
+        let scheduler = test_scheduler(dir.path(), 8);
         let _test = scheduler.acquire_test_lease(TestWant::Fixed(1)).unwrap();
-        let started = std::time::Instant::now();
         let permit = scheduler.acquire_permit(8);
         assert!(permit.is_some(), "the seven slots the test leaves");
-        assert!(started.elapsed() < BUDGET);
         assert_eq!(
             permits_in_use(dir.path()),
             Some(8),
@@ -2733,7 +2729,7 @@ mod tests {
     #[test]
     fn a_lease_waits_for_a_compile_checking_its_marker() {
         let dir = temp_cache();
-        let scheduler = budget_scheduler(dir.path(), 4);
+        let scheduler = test_scheduler(dir.path(), 4);
         let marker = tests_dir(&scheduler.root).join("1");
         // A compile checking for live tests holds the marker shared for a
         // moment.

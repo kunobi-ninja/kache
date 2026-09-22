@@ -252,7 +252,10 @@ impl Platform for MacOsPlatform {
 }
 
 /// Resolve paths before changing the child's cwd: cached macOS debug links
-/// use `-oso_prefix` to make OSO records relative to the binary's output dir.
+/// use `-oso_prefix` to make OSO records relative to Cargo's profile
+/// directory (see `macos_oso_prefix_root`), so dsymutil must run from that
+/// same root. A test binary in `<profile>/deps` records `deps/<obj>.o`,
+/// which only resolves from `<profile>` (kunobi-ninja/kache#1161).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Command> {
     let binary = std::path::absolute(binary)?;
@@ -260,13 +263,35 @@ fn debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Command> {
     let output_dir = binary
         .parent()
         .context("debug binary has no parent directory")?;
+    let oso_root = cargo_profile_dir(output_dir).unwrap_or_else(|| output_dir.to_path_buf());
     let mut command = Command::new("dsymutil");
     command
-        .current_dir(output_dir)
+        .current_dir(oso_root)
         .arg(&binary)
         .arg("-o")
         .arg(bundle_dir);
     Ok(command)
+}
+
+/// `out_dir`'s ancestor that is Cargo's profile directory, or `None` when
+/// this is not one of Cargo's link output directories.
+///
+/// Anchored on the directory names Cargo itself uses rather than on the
+/// depth below the target directory, because those differ: a binary and an
+/// example land in `<profile>/deps` and `<profile>/examples`, a build
+/// script in `<profile>/build/<pkg>-<hash>`. Only those two levels are
+/// examined, so a project that happens to live under a directory called
+/// `deps` cannot drag the prefix up to it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
+    let parent = out_dir.parent();
+    for cursor in [Some(out_dir), parent].into_iter().flatten() {
+        let name = cursor.file_name()?;
+        if name == "deps" || name == "examples" || name == "build" {
+            return cursor.parent().map(Path::to_path_buf);
+        }
+    }
+    None
 }
 
 /// Tar `bundle_dir`'s contents (paths relative to the bundle root, e.g.
@@ -616,7 +641,8 @@ pub(crate) mod tests {
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(
             command.get_current_dir(),
-            Some(cwd.join("target/debug/deps").as_path())
+            Some(cwd.join("target/debug").as_path()),
+            "dsymutil runs from the profile dir the OSO prefix stripped"
         );
         let args = command.get_args().collect::<Vec<_>>();
         assert_eq!(args.len(), 3);
@@ -666,6 +692,56 @@ pub(crate) mod tests {
             info.contains("DW_TAG_subprogram"),
             "bundle must contain function debug info: {info}"
         );
+    }
+
+    #[test]
+    fn debug_bundle_command_runs_outside_cargo_layout_from_the_output_dir() {
+        let command =
+            debug_bundle_command(Path::new("out/demo"), Path::new("out/demo.dSYM")).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(command.get_current_dir(), Some(cwd.join("out").as_path()));
+    }
+
+    /// kunobi-ninja/kache#1161: a Cargo test binary lives in `<profile>/deps`
+    /// and is linked with `-oso_prefix <profile>/`, so its debug map says
+    /// `deps/<obj>.o`. dsymutil must find those objects without warnings.
+    #[test]
+    fn macos_debug_bundle_resolves_profile_relative_oso_paths_for_deps_binaries() {
+        if std::env::consts::OS != "macos" {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().canonicalize().unwrap().join("debug");
+        let deps = profile.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let binary = compile_debug_c_binary(&deps).expect("macOS C compiler must work");
+        assert!(
+            Command::new("cc")
+                .arg(deps.join("hello.o"))
+                .arg(format!("-Wl,-oso_prefix,{}/", profile.display()))
+                .arg("-o")
+                .arg(&binary)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bundle = deps.join("hello-bin.dSYM");
+        let output = debug_bundle_command(&binary, &bundle)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("unable to open object file"),
+            "dsymutil must resolve deps/ OSO paths: {stderr}"
+        );
+        let dump = Command::new("dwarfdump")
+            .arg("--debug-info")
+            .arg(bundle.join("Contents/Resources/DWARF/hello-bin"))
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&dump.stdout).contains("DW_TAG_subprogram"));
     }
 
     /// Compile a tiny real `-g` binary with the system `cc` (fast: three

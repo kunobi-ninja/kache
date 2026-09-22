@@ -8,7 +8,7 @@
 use anyhow::Result;
 use std::borrow::Cow;
 #[cfg(any(test, target_os = "macos"))]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::args::RustcArgs;
 use crate::cache_key::compute_cache_key;
@@ -442,35 +442,18 @@ fn macos_oso_prefix_flag_inner(
 /// Falls back to the output directory whenever the invocation is not in
 /// Cargo's layout, where widening the prefix would reach outside the build.
 #[cfg(any(test, target_os = "macos"))]
+use super::platform::cargo_profile_dir;
+
+#[cfg(any(test, target_os = "macos"))]
 fn macos_oso_prefix_root(parsed: &RustcArgs) -> Option<PathBuf> {
     let out_dir = parsed.out_dir.as_ref()?;
     Some(cargo_profile_dir(out_dir).unwrap_or_else(|| out_dir.clone()))
 }
 
-/// `out_dir`'s ancestor that is Cargo's profile directory, or `None` when
-/// this is not one of Cargo's link output directories.
-///
-/// Anchored on the directory names Cargo itself uses rather than on the
-/// depth below the target directory, because those differ: a binary and an
-/// example land in `<profile>/deps` and `<profile>/examples`, a build
-/// script in `<profile>/build/<pkg>-<hash>`. Only those two levels are
-/// examined, so a project that happens to live under a directory called
-/// `deps` cannot drag the prefix up to it.
-#[cfg(any(test, target_os = "macos"))]
-fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
-    let parent = out_dir.parent();
-    for cursor in [Some(out_dir), parent].into_iter().flatten() {
-        let name = cursor.file_name()?;
-        if name == "deps" || name == "examples" || name == "build" {
-            return cursor.parent().map(Path::to_path_buf);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()

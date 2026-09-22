@@ -49,9 +49,7 @@ pub fn bind_daemon_listener(path: &Path) -> Result<Option<TokioListener>> {
     #[cfg(windows)]
     let mut listener = {
         use kunobi_daemon::local::windows_socket::{self, Bound};
-        let hash = blake3::hash(path.as_os_str().as_encoded_bytes());
-        let name = format!("kache-daemon-{}", &hash.to_hex()[..16]);
-        let bound = windows_socket::acquire(Path::new(&name))
+        let bound = windows_socket::acquire_tokio(Path::new(&*daemon_endpoint(path)))
             .map_err(|error| anyhow::anyhow!("acquiring daemon pipe: {error:?}"))?;
         let Bound::Won(listener) = bound else {
             return Ok(None);
@@ -60,6 +58,25 @@ pub fn bind_daemon_listener(path: &Path) -> Result<Option<TokioListener>> {
     };
     listener.do_not_reclaim_name_on_drop();
     Ok(Some(listener))
+}
+
+/// The kunobi-daemon endpoint for a daemon socket path.
+///
+/// This name is where kache processes meet. A daemon and the clients looking
+/// for it must derive the same value, so it is computed in exactly one place:
+/// a second copy that drifted would leave a running daemon unreachable after
+/// an upgrade. On Windows it is a hash of the path, because a named pipe lives
+/// in its own namespace rather than on the filesystem.
+pub fn daemon_endpoint(path: &Path) -> Box<kunobi_daemon::local::Endpoint> {
+    #[cfg(unix)]
+    {
+        path.into()
+    }
+    #[cfg(windows)]
+    {
+        let hash = blake3::hash(path.as_os_str().as_encoded_bytes());
+        format!("kache-daemon-{}", &hash.to_hex()[..16]).into_boxed_str()
+    }
 }
 
 /// Build the platform-appropriate IPC name for a path.
@@ -79,12 +96,7 @@ pub fn socket_name(path: &Path) -> Result<Name<'static>> {
     #[cfg(windows)]
     {
         use interprocess::local_socket::{GenericNamespaced, ToNsName};
-        // Derive a stable pipe name from the socket path so different
-        // cache dirs get different pipes.
-        let hash = blake3::hash(path.as_os_str().as_encoded_bytes());
-        let short = &hash.to_hex()[..16];
-        let pipe_name = format!("kache-daemon-{short}");
-        pipe_name
+        daemon_endpoint(path)
             .to_ns_name::<GenericNamespaced>()
             .with_context(|| format!("converting {} to named pipe name", path.display()))
             .map(|n| n.into_owned())

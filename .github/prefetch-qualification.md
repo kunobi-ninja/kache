@@ -47,7 +47,9 @@ lifecycle incomplete flag, reviewed against
 `0ac603f944ba546dfc78cb457462537c99a35739`. Schema 5 adds physical operation
 receipts and nested payload entries, reviewed against
 `129a31ce4debb8c97d9698fe5ff6d48ed4387750`. Schema 6 adds the wrapper-demand
-join from #1160 and #1162, reviewed against `src/timeline.rs`. Unknown future
+join from #1160 and #1162, reviewed against `src/timeline.rs`. Schema 7 marks
+each unit with the session's earliest delivery of its key: plan, candidate
+rank, GET start, import time and timing against first demand. Unknown future
 schemas or fields fail admission. Every keyed compiler unit must carry exact
 first-demand observations.
 
@@ -64,6 +66,13 @@ the same millisecond as first demand, where the harness calls that ordering
 unknown. On identical input the harness therefore credits no more keys than the
 join. What the harness does enforce is that useful never exceeds consumed, in
 keys or bytes, and that every join counter is a non-negative integer.
+
+Schema 7 adds `in_flight_prefetch_keys` and `in_flight_prefetch_bytes`, consumed
+deliveries whose GET was still running at first demand, and `get_cancelled`.
+Useful and in-flight deliveries are disjoint, so together they cannot exceed
+consumption. `unit_prefetch_outcomes` counts unit result against timing: a
+`local_hit/before_demand` is a prefetched local hit, and `in_flight` means the
+demand waited on the rest of a running GET instead of starting its own.
 
 The schema-5 report groups receipts by immutable session, plan ID and source.
 An empty fallback plan ID remains scoped to its session. Its denominator is
@@ -97,8 +106,9 @@ timelines and verified identities use `prefetch-qualification-*` artifacts;
 these names do not enter the `telemetry-otlp-v1*` ingestion path.
 
 `controls_valid` records successful controls and artifact checks.
-`complete_precision_qualification` additionally requires complete schema-5 or
-schema-6 GET-body evidence across all arms. Legacy reports cannot set that flag. Review
-both flags, complete job pairs and raw demand evidence before accepting #618.
+`complete_precision_qualification` additionally requires complete GET-body
+evidence from schema 5 or later across all arms. Legacy reports cannot set that
+flag. Review both flags, complete job pairs and raw demand evidence before
+accepting #618.
 This experiment cannot establish R2 performance or planner recommendation
 quality, and no whole-job speedup is claimed before the actual jobs finish.

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of [`BuildTimeline`]. A server rejects a record whose schema it
 /// does not know.
-pub const BUILD_TIMELINE_SCHEMA: u32 = 6;
+pub const BUILD_TIMELINE_SCHEMA: u32 = 7;
 
 /// One build session: its compiler invocations and the remote transfers that
 /// belong to it.
@@ -163,6 +163,15 @@ pub struct TimelineSummary {
     pub get_not_found: u64,
     #[serde(default)]
     pub get_errors: u64,
+    /// Consumed prefetch keys whose GET had started but not finished at first
+    /// demand. The demand waited on the rest of that download, not a new GET.
+    #[serde(default)]
+    pub in_flight_prefetch_keys: u64,
+    #[serde(default)]
+    pub in_flight_prefetch_bytes: u64,
+    /// Speculative GETs or packed entries whose receipt says `cancelled`.
+    #[serde(default)]
+    pub get_cancelled: u64,
 }
 
 /// One key requested by a wrapper, including unsuccessful predictions.
@@ -214,6 +223,50 @@ pub struct TimelineUnit {
     /// Empty for wrapper events before schema 20, or invocations with no lookup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub demands: Vec<KeyDemand>,
+    /// The session's earliest speculative delivery of this unit's key, joined
+    /// from transfer receipts when the record is assembled. A `local_hit`
+    /// with `before_demand` timing is a prefetched local hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch: Option<UnitPrefetch>,
+}
+
+/// A speculative download that delivered a unit's key in the same session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct UnitPrefetch {
+    /// Plan, source and candidate rank that scheduled the download.
+    pub origin: PrefetchOrigin,
+    /// When the GET started. A packed entry reports its pack's GET.
+    pub started_at_ms: u64,
+    /// When the entry finished importing into the local store.
+    pub delivered_at_ms: u64,
+    pub compressed_bytes: u64,
+    pub timing: PrefetchTiming,
+}
+
+/// Where a delivery fell relative to the key's first demand in the session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefetchTiming {
+    /// Imported at or before first demand.
+    #[default]
+    BeforeDemand,
+    /// Started before first demand and finished after it.
+    InFlight,
+    /// Started at or after first demand.
+    AfterDemand,
+}
+
+impl PrefetchTiming {
+    /// Classify one delivery against the key's first demand.
+    pub fn classify(started_at_ms: u64, delivered_at_ms: u64, first_demand_at_ms: u64) -> Self {
+        if delivered_at_ms <= first_demand_at_ms {
+            Self::BeforeDemand
+        } else if started_at_ms < first_demand_at_ms {
+            Self::InFlight
+        } else {
+            Self::AfterDemand
+        }
+    }
 }
 
 /// One remote transfer attributed to the session.
@@ -369,6 +422,19 @@ mod tests {
                 }],
                 started_at_ms: 1_000,
                 finished_at_ms: 1_200,
+                prefetch: Some(UnitPrefetch {
+                    origin: PrefetchOrigin {
+                        session_id: "fedcba9876543210".into(),
+                        plan_id: "p1".into(),
+                        source: "advisory".into(),
+                        candidate_rank: Some(3),
+                        ..PrefetchOrigin::default()
+                    },
+                    started_at_ms: 900,
+                    delivered_at_ms: 990,
+                    compressed_bytes: 64,
+                    timing: PrefetchTiming::BeforeDemand,
+                }),
                 ..TimelineUnit::default()
             }],
             transfers: vec![TimelineTransfer {
@@ -389,6 +455,33 @@ mod tests {
             r#"{"cache_key":"k","crate_name":"crate","result":"local_hit","started_at_ms":100,"finished_at_ms":200}"#,
         ).unwrap();
         assert!(unit.demands.is_empty());
+        assert!(unit.prefetch.is_none());
+    }
+
+    #[test]
+    fn prefetch_timing_splits_on_first_demand() {
+        let classify = PrefetchTiming::classify;
+        assert_eq!(classify(10, 99, 100), PrefetchTiming::BeforeDemand);
+        assert_eq!(classify(10, 100, 100), PrefetchTiming::BeforeDemand);
+        assert_eq!(classify(10, 101, 100), PrefetchTiming::InFlight);
+        assert_eq!(classify(99, 150, 100), PrefetchTiming::InFlight);
+        assert_eq!(classify(100, 150, 100), PrefetchTiming::AfterDemand);
+        assert_eq!(classify(120, 150, 100), PrefetchTiming::AfterDemand);
+    }
+
+    #[test]
+    fn unit_prefetch_serializes_timing_in_snake_case() {
+        let unit = TimelineUnit {
+            prefetch: Some(UnitPrefetch {
+                timing: PrefetchTiming::InFlight,
+                ..UnitPrefetch::default()
+            }),
+            ..TimelineUnit::default()
+        };
+        let json = serde_json::to_value(&unit).unwrap();
+        assert_eq!(json["prefetch"]["timing"], "in_flight");
+        let absent = serde_json::to_value(TimelineUnit::default()).unwrap();
+        assert!(absent.get("prefetch").is_none());
     }
 
     #[test]

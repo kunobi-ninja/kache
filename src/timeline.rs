@@ -12,9 +12,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use kache_core::timeline::{
-    BUILD_TIMELINE_SCHEMA, BuildTimeline, IdentitySource, LogLimits, PrefetchOperation, RunContext,
-    TimelineIdentity, TimelineSummary, TimelineTransfer, TimelineUnit, TransferAttribution,
-    TransferDirection,
+    BUILD_TIMELINE_SCHEMA, BuildTimeline, IdentitySource, LogLimits, PrefetchOperation,
+    PrefetchOrigin, PrefetchTiming, RunContext, TimelineIdentity, TimelineSummary,
+    TimelineTransfer, TimelineUnit, TransferAttribution, TransferDirection, UnitPrefetch,
 };
 
 use crate::daemon::{TransferDirection as LoggedDirection, TransferEvent};
@@ -156,7 +156,7 @@ pub(crate) fn build_timelines(inputs: &TimelineInputs<'_>) -> Vec<BuildTimeline>
 
     let mut records: Vec<BuildTimeline> = sessions
         .into_iter()
-        .map(|(session_id, session)| {
+        .map(|(session_id, mut session)| {
             let root = session.root().unwrap_or_default().to_string();
             let identity = identity_for_root(Path::new(&root), inputs.env);
             let transfers = attribute_transfers(&session_id, inputs.transfers, &transfer_owners);
@@ -174,7 +174,7 @@ pub(crate) fn build_timelines(inputs: &TimelineInputs<'_>) -> Vec<BuildTimeline>
                     (None, false) => None,
                     (base, _) => Some(overlay_prefetch_join(
                         base.unwrap_or_default(),
-                        &session.units,
+                        &mut session.units,
                         &transfers,
                     )),
                 }
@@ -239,6 +239,7 @@ fn group_sessions(events: &[BuildEvent]) -> BTreeMap<String, SessionEvents> {
             compiler_runs: event.compiler_runs,
             event_schema: event.schema,
             demands: event.demands.clone(),
+            prefetch: None,
         });
     }
     for session in sessions.values_mut() {
@@ -366,12 +367,24 @@ struct KeyConsumption {
     consumed: bool,
 }
 
-/// One delivered prefetch payload: the compressed bytes it brought and when
-/// its import finished.
-#[derive(Clone, Copy)]
+/// One delivered prefetch payload: the compressed bytes it brought, when its
+/// GET started, when its import finished, and the plan that scheduled it.
+#[derive(Clone)]
 struct Delivery {
     bytes: u64,
+    started_at_ms: u64,
     finished_at_ms: u64,
+    origin: PrefetchOrigin,
+}
+
+/// One speculative payload as its receipt reports it.
+struct Payload<'a> {
+    cache_key: String,
+    bytes: u64,
+    started_at_ms: u64,
+    finished_at_ms: u64,
+    outcome: &'a str,
+    origin: PrefetchOrigin,
 }
 
 /// Pick which delivery represents a key that arrived more than once in a
@@ -388,12 +401,12 @@ fn earliest_delivery(held: Delivery, candidate: Delivery) -> Delivery {
 
 fn overlay_prefetch_join(
     mut summary: TimelineSummary,
-    units: &[TimelineUnit],
+    units: &mut [TimelineUnit],
     transfers: &[TimelineTransfer],
 ) -> TimelineSummary {
-    let mut keys: HashMap<&str, KeyConsumption> = HashMap::new();
+    let mut keys: HashMap<String, KeyConsumption> = HashMap::new();
     let mut remote_wait_ms: u64 = 0;
-    for unit in units {
+    for unit in units.iter() {
         remote_wait_ms = remote_wait_ms.saturating_add(
             unit.demands
                 .iter()
@@ -410,7 +423,7 @@ fn overlay_prefetch_join(
             .min()
             .unwrap_or(unit.started_at_ms);
         let consumed = unit.result == "local_hit" || unit.result == "prefetch_hit";
-        keys.entry(&unit.cache_key)
+        keys.entry(unit.cache_key.clone())
             .and_modify(|held| {
                 held.first_demand_at_ms = held.first_demand_at_ms.min(demand_ms);
                 held.consumed = held.consumed || consumed;
@@ -428,35 +441,41 @@ fn overlay_prefetch_join(
     let mut delivered: HashMap<String, Delivery> = HashMap::new();
     let mut get_not_found: u64 = 0;
     let mut get_errors: u64 = 0;
+    let mut get_cancelled: u64 = 0;
     for transfer in transfers {
         if transfer.direction != TransferDirection::Download {
             continue;
         }
-        for (cache_key, bytes, finished_at_ms, outcome) in prefetch_payloads(transfer) {
+        for payload in prefetch_payloads(transfer) {
             let packed = transfer
                 .accounting
                 .as_ref()
                 .is_some_and(|accounting| !accounting.entries.is_empty());
-            if outcome == "not_found" {
+            if payload.outcome == "not_found" {
                 get_not_found += 1;
-            } else if payload_errored(outcome, packed, transfer.ok) {
+            } else if payload.outcome == "cancelled" {
+                get_cancelled += 1;
+            } else if payload_errored(payload.outcome, packed, transfer.ok) {
                 get_errors += 1;
             }
-            if !payload_delivered(outcome, packed, transfer.ok) {
+            if !payload_delivered(payload.outcome, packed, transfer.ok) {
                 continue;
             }
             // No import time means the entry never landed in the local store.
-            if finished_at_ms == 0 {
+            if payload.finished_at_ms == 0 {
                 continue;
             }
             let candidate = Delivery {
-                bytes,
-                finished_at_ms,
+                bytes: payload.bytes,
+                started_at_ms: payload.started_at_ms,
+                finished_at_ms: payload.finished_at_ms,
+                origin: payload.origin,
             };
-            delivered
-                .entry(cache_key)
-                .and_modify(|held| *held = earliest_delivery(*held, candidate))
-                .or_insert(candidate);
+            let chosen = match delivered.remove(&payload.cache_key) {
+                Some(held) => earliest_delivery(held, candidate),
+                None => candidate,
+            };
+            delivered.insert(payload.cache_key, chosen);
         }
     }
 
@@ -464,6 +483,8 @@ fn overlay_prefetch_join(
     let mut consumed_bytes: u64 = 0;
     let mut useful_keys: u64 = 0;
     let mut useful_bytes: u64 = 0;
+    let mut in_flight_keys: u64 = 0;
+    let mut in_flight_bytes: u64 = 0;
     for (cache_key, delivery) in &delivered {
         let Some(consumption) = keys.get(cache_key.as_str()) else {
             continue;
@@ -473,18 +494,57 @@ fn overlay_prefetch_join(
         }
         consumed_keys += 1;
         consumed_bytes = consumed_bytes.saturating_add(delivery.bytes);
-        if delivery.finished_at_ms <= consumption.first_demand_at_ms {
-            useful_keys += 1;
-            useful_bytes = useful_bytes.saturating_add(delivery.bytes);
+        match delivery_timing(delivery, consumption) {
+            PrefetchTiming::BeforeDemand => {
+                useful_keys += 1;
+                useful_bytes = useful_bytes.saturating_add(delivery.bytes);
+            }
+            PrefetchTiming::InFlight => {
+                in_flight_keys += 1;
+                in_flight_bytes = in_flight_bytes.saturating_add(delivery.bytes);
+            }
+            PrefetchTiming::AfterDemand => {}
         }
+    }
+    for unit in units.iter_mut() {
+        unit.prefetch = unit_prefetch(&unit.cache_key, &delivered, &keys);
     }
     summary.consumed_prefetch_keys = consumed_keys;
     summary.consumed_prefetch_bytes = consumed_bytes;
     summary.useful_prefetch_keys = useful_keys;
     summary.useful_prefetch_bytes = useful_bytes;
+    summary.in_flight_prefetch_keys = in_flight_keys;
+    summary.in_flight_prefetch_bytes = in_flight_bytes;
     summary.get_not_found = get_not_found;
     summary.get_errors = get_errors;
+    summary.get_cancelled = get_cancelled;
     summary
+}
+
+fn delivery_timing(delivery: &Delivery, consumption: &KeyConsumption) -> PrefetchTiming {
+    PrefetchTiming::classify(
+        delivery.started_at_ms,
+        delivery.finished_at_ms,
+        consumption.first_demand_at_ms,
+    )
+}
+
+/// The delivery a unit's key received this session, placed against the key's
+/// first demand. Units whose key no speculative GET delivered get none.
+fn unit_prefetch(
+    cache_key: &str,
+    delivered: &HashMap<String, Delivery>,
+    keys: &HashMap<String, KeyConsumption>,
+) -> Option<UnitPrefetch> {
+    let delivery = delivered.get(cache_key)?;
+    let consumption = keys.get(cache_key)?;
+    Some(UnitPrefetch {
+        origin: delivery.origin.clone(),
+        started_at_ms: delivery.started_at_ms,
+        delivered_at_ms: delivery.finished_at_ms,
+        compressed_bytes: delivery.bytes,
+        timing: delivery_timing(delivery, consumption),
+    })
 }
 
 /// Whether one payload counts as a failed GET. A packed entry carries its own
@@ -510,7 +570,7 @@ fn payload_delivered(outcome: &str, packed: bool, transfer_ok: bool) -> bool {
         && !payload_errored(outcome, packed, transfer_ok)
 }
 
-fn prefetch_payloads(transfer: &TimelineTransfer) -> Vec<(String, u64, u64, &str)> {
+fn prefetch_payloads(transfer: &TimelineTransfer) -> Vec<Payload<'_>> {
     if let Some(accounting) = &transfer.accounting {
         if matches!(accounting.operation, PrefetchOperation::List) {
             return Vec::new();
@@ -519,26 +579,28 @@ fn prefetch_payloads(transfer: &TimelineTransfer) -> Vec<(String, u64, u64, &str
             return accounting
                 .entries
                 .iter()
-                .map(|entry| {
-                    (
-                        entry.cache_key.clone(),
-                        entry.compressed_bytes,
-                        entry.finished_at_ms,
-                        entry.outcome.as_str(),
-                    )
+                .map(|entry| Payload {
+                    cache_key: entry.cache_key.clone(),
+                    bytes: entry.compressed_bytes,
+                    started_at_ms: transfer.started_at_ms,
+                    finished_at_ms: entry.finished_at_ms,
+                    outcome: entry.outcome.as_str(),
+                    origin: entry.prefetch.clone(),
                 })
                 .collect();
         }
     }
-    if transfer.prefetch.is_none() {
+    let Some(origin) = &transfer.prefetch else {
         return Vec::new();
-    }
-    vec![(
-        transfer.cache_key.clone(),
-        transfer.compressed_bytes,
-        transfer.finished_at_ms,
-        transfer.outcome.as_str(),
-    )]
+    };
+    vec![Payload {
+        cache_key: transfer.cache_key.clone(),
+        bytes: transfer.compressed_bytes,
+        started_at_ms: transfer.started_at_ms,
+        finished_at_ms: transfer.finished_at_ms,
+        outcome: transfer.outcome.as_str(),
+        origin: origin.clone(),
+    }]
 }
 
 fn summary_projection(summary: &&BuildSummaryEvent) -> TimelineSummary {
@@ -1067,25 +1129,240 @@ mod tests {
 
     #[test]
     fn the_earliest_delivery_wins_and_ties_keep_the_one_already_held() {
-        let held = Delivery {
-            bytes: 10,
-            finished_at_ms: 2_000,
+        let delivery = |bytes, finished_at_ms| Delivery {
+            bytes,
+            started_at_ms: 0,
+            finished_at_ms,
+            origin: PrefetchOrigin::default(),
         };
-        let earlier = Delivery {
-            bytes: 20,
-            finished_at_ms: 1_999,
-        };
-        let later = Delivery {
-            bytes: 30,
-            finished_at_ms: 2_001,
-        };
-        let tie = Delivery {
-            bytes: 40,
-            finished_at_ms: 2_000,
-        };
-        assert_eq!(earliest_delivery(held, earlier).bytes, 20);
-        assert_eq!(earliest_delivery(held, later).bytes, 10);
-        assert_eq!(earliest_delivery(held, tie).bytes, 10);
+        let held = || delivery(10, 2_000);
+        assert_eq!(earliest_delivery(held(), delivery(20, 1_999)).bytes, 20);
+        assert_eq!(earliest_delivery(held(), delivery(30, 2_001)).bytes, 10);
+        assert_eq!(earliest_delivery(held(), delivery(40, 2_000)).bytes, 10);
+    }
+
+    fn origin(plan_id: &str, rank: u64) -> PrefetchOrigin {
+        PrefetchOrigin {
+            session_id: "s1".into(),
+            plan_id: plan_id.into(),
+            source: "advisory".into(),
+            candidate_rank: Some(rank),
+            ..Default::default()
+        }
+    }
+
+    fn demanded(result: EventResult, first_demand_at_ms: u64) -> BuildEvent {
+        let mut observed = event("s1", "serde", "k1", 5_000, 500);
+        observed.result = result;
+        observed.demands = vec![kache_core::timeline::KeyDemand {
+            cache_key: "k1".to_string(),
+            first_demand_at_ms,
+            remote_wait_ms: 0,
+        }];
+        observed
+    }
+
+    fn prefetched(
+        key: &str,
+        started: u64,
+        finished: u64,
+        plan_id: &str,
+        rank: u64,
+    ) -> TransferEvent {
+        let mut downloaded = transfer(key, started, finished);
+        downloaded.prefetch = Some(origin(plan_id, rank));
+        downloaded.outcome = "completed".into();
+        downloaded.compressed_bytes = 80;
+        downloaded
+    }
+
+    #[test]
+    fn a_prefetched_local_hit_is_marked_on_its_unit() {
+        let records = build_timelines(&inputs(
+            &[demanded(EventResult::LocalHit, 4_750)],
+            &[prefetched("k1", 1_000, 2_000, "p1", 2)],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let unit = &records[0].units[0];
+        assert_eq!(unit.result, "local_hit");
+        assert_eq!(
+            unit.prefetch,
+            Some(UnitPrefetch {
+                origin: origin("p1", 2),
+                started_at_ms: 1_000,
+                delivered_at_ms: 2_000,
+                compressed_bytes: 80,
+                timing: PrefetchTiming::BeforeDemand,
+            })
+        );
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.useful_prefetch_keys, 1);
+        assert_eq!(summary.in_flight_prefetch_keys, 0);
+        assert_eq!(summary.in_flight_prefetch_bytes, 0);
+    }
+
+    #[test]
+    fn a_demand_that_joins_a_running_prefetch_is_in_flight() {
+        let records = build_timelines(&inputs(
+            &[demanded(EventResult::PrefetchHit, 1_500)],
+            &[prefetched("k1", 1_000, 2_000, "p1", 0)],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let unit = &records[0].units[0];
+        let prefetch = unit.prefetch.as_ref().expect("unit prefetch");
+        assert_eq!(prefetch.timing, PrefetchTiming::InFlight);
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.consumed_prefetch_keys, 1);
+        assert_eq!(summary.useful_prefetch_keys, 0);
+        assert_eq!(summary.useful_prefetch_bytes, 0);
+        assert_eq!(summary.in_flight_prefetch_keys, 1);
+        assert_eq!(summary.in_flight_prefetch_bytes, 80);
+    }
+
+    #[test]
+    fn a_prefetch_that_starts_after_demand_is_neither_useful_nor_in_flight() {
+        let records = build_timelines(&inputs(
+            &[demanded(EventResult::PrefetchHit, 900)],
+            &[prefetched("k1", 1_000, 2_000, "p1", 0)],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let prefetch = records[0].units[0]
+            .prefetch
+            .as_ref()
+            .expect("unit prefetch");
+        assert_eq!(prefetch.timing, PrefetchTiming::AfterDemand);
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.consumed_prefetch_keys, 1);
+        assert_eq!(summary.useful_prefetch_keys, 0);
+        assert_eq!(summary.in_flight_prefetch_keys, 0);
+    }
+
+    #[test]
+    fn a_remote_hit_shows_the_late_prefetch_without_counting_it_consumed() {
+        let records = build_timelines(&inputs(
+            &[demanded(EventResult::RemoteHit, 1_500)],
+            &[prefetched("k1", 1_000, 2_000, "p1", 0)],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let prefetch = records[0].units[0]
+            .prefetch
+            .as_ref()
+            .expect("unit prefetch");
+        assert_eq!(prefetch.timing, PrefetchTiming::InFlight);
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.consumed_prefetch_keys, 0);
+        assert_eq!(summary.in_flight_prefetch_keys, 0);
+    }
+
+    #[test]
+    fn only_units_whose_key_was_delivered_are_marked() {
+        let mut other = event("s1", "syn", "k2", 5_500, 500);
+        other.result = EventResult::LocalHit;
+        let records = build_timelines(&inputs(
+            &[demanded(EventResult::LocalHit, 4_750), other],
+            &[prefetched("k1", 1_000, 2_000, "p1", 0)],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let marked: Vec<_> = records[0]
+            .units
+            .iter()
+            .map(|unit| (unit.cache_key.as_str(), unit.prefetch.is_some()))
+            .collect();
+        assert_eq!(marked, [("k1", true), ("k2", false)]);
+    }
+
+    #[test]
+    fn a_unit_carries_the_earliest_delivery_and_its_plan() {
+        let records = build_timelines(&inputs(
+            &[demanded(EventResult::LocalHit, 4_750)],
+            &[
+                prefetched("k1", 3_000, 4_000, "late", 7),
+                prefetched("k1", 1_000, 2_000, "early", 1),
+            ],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let prefetch = records[0].units[0]
+            .prefetch
+            .as_ref()
+            .expect("unit prefetch");
+        assert_eq!(prefetch.origin, origin("early", 1));
+        assert_eq!(prefetch.started_at_ms, 1_000);
+    }
+
+    #[test]
+    fn a_packed_entry_takes_its_start_from_the_pack_and_its_plan_from_the_entry() {
+        let mut pack = transfer("", 1_000, 2_000);
+        pack.prefetch = Some(origin("pack", 0));
+        pack.accounting = Some(kache_core::timeline::PrefetchAccounting {
+            bytes_complete: true,
+            requests_complete: true,
+            entries: vec![kache_core::timeline::PackedEntryTransfer {
+                cache_key: "k1".into(),
+                compressed_bytes: 100,
+                finished_at_ms: 1_900,
+                outcome: "completed".into(),
+                prefetch: origin("entry", 4),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let records = build_timelines(&inputs(
+            &[demanded(EventResult::LocalHit, 4_750)],
+            &[pack],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let prefetch = records[0].units[0]
+            .prefetch
+            .as_ref()
+            .expect("unit prefetch");
+        assert_eq!(prefetch.origin, origin("entry", 4));
+        assert_eq!(prefetch.started_at_ms, 1_000);
+        assert_eq!(prefetch.delivered_at_ms, 1_900);
+        assert_eq!(prefetch.compressed_bytes, 100);
+    }
+
+    #[test]
+    fn cancelled_gets_are_counted_apart_from_errors() {
+        let mut plain = prefetched("k1", 1_000, 2_000, "p1", 0);
+        plain.ok = false;
+        plain.outcome = "cancelled".into();
+        let mut pack = transfer("", 1_000, 2_000);
+        pack.prefetch = Some(origin("p1", 0));
+        pack.accounting = Some(kache_core::timeline::PrefetchAccounting {
+            bytes_complete: false,
+            requests_complete: true,
+            entries: vec![
+                kache_core::timeline::PackedEntryTransfer {
+                    cache_key: "k2".into(),
+                    outcome: "cancelled".into(),
+                    ..Default::default()
+                },
+                kache_core::timeline::PackedEntryTransfer {
+                    cache_key: "k3".into(),
+                    outcome: "error".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let records = build_timelines(&inputs(
+            &[demanded(EventResult::Miss, 4_750)],
+            &[plain, pack],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.get_cancelled, 2);
+        assert_eq!(summary.get_errors, 1);
+        assert_eq!(summary.get_not_found, 0);
+        assert!(records[0].units[0].prefetch.is_none());
     }
 
     #[test]

@@ -296,6 +296,7 @@ class Telemetry(unittest.TestCase):
 
     def test_local_only_unit_with_remote_evidence_fails(self):
         for change in ({"result": "remote_hit"}, {"result": "prefetch_hit"},
+                       {"prefetch": {"timing": "before_demand"}},
                        {"demands": [{"cache_key": "script-run",
                                      "first_demand_at_ms": 100,
                                      "remote_wait_ms": 0}]}):
@@ -697,7 +698,7 @@ class JoinSchema6(PackedAccounting):
     def test_useful_cannot_exceed_consumed(self):
         for field in ("useful_prefetch_keys", "useful_prefetch_bytes"):
             rec, summaries = self.inputs(**{field: 99})
-            with self.assertRaisesRegex(ValueError, "exceeds consumed"):
+            with self.assertRaisesRegex(ValueError, "exceed consumed"):
                 self.summarize(rec, summaries)
 
     def test_join_counters_must_be_non_negative_integers(self):
@@ -715,6 +716,90 @@ class JoinSchema6(PackedAccounting):
     def test_schema5_records_report_no_join(self):
         rec, summaries = super().inputs()
         self.assertFalse(self.summarize(rec, summaries)["daemon_join"]["available"])
+
+
+class JoinSchema7(JoinSchema6):
+    """Schema 7: per-unit prefetch markers, in-flight and cancelled counters."""
+
+    JOIN = JoinSchema6.JOIN | {
+        "in_flight_prefetch_keys": 0,
+        "in_flight_prefetch_bytes": 0,
+        "get_cancelled": 2,
+    }
+    MARKER = {
+        "origin": {"session_id": "session", "plan_id": "", "source": "fallback"},
+        "started_at_ms": 10,
+        "delivered_at_ms": 90,
+        "compressed_bytes": 30,
+        "timing": "before_demand",
+    }
+
+    def inputs(self, **join):
+        rec, summaries = super().inputs(**join)
+        rec["schema"] = 7
+        rec["units"][0]["prefetch"] = copy.deepcopy(self.MARKER)
+        return rec, summaries
+
+    def test_schema7_reports_new_counters_and_unit_markers(self):
+        rec, summaries = self.inputs()
+        result = self.summarize(rec, summaries)
+        self.assertTrue(result["complete_precision_qualification"])
+        self.assertEqual(result["daemon_join"]["get_cancelled"], 2)
+        self.assertEqual(result["daemon_join"]["in_flight_prefetch_keys"], 0)
+        self.assertEqual(
+            result["unit_prefetch_outcomes"], {"local_hit/before_demand": 1}
+        )
+
+    def test_useful_and_in_flight_together_cannot_exceed_consumed(self):
+        for field in ("in_flight_prefetch_keys", "in_flight_prefetch_bytes"):
+            rec, summaries = self.inputs(**{field: 1})
+            with self.assertRaisesRegex(ValueError, "exceed consumed"):
+                self.summarize(rec, summaries)
+
+    def test_in_flight_within_consumption_is_accepted(self):
+        rec, summaries = self.inputs(
+            useful_prefetch_keys=0,
+            useful_prefetch_bytes=0,
+            in_flight_prefetch_keys=1,
+            in_flight_prefetch_bytes=30,
+        )
+        rec["units"][0]["prefetch"]["timing"] = "in_flight"
+        result = self.summarize(rec, summaries)
+        self.assertEqual(result["daemon_join"]["in_flight_prefetch_bytes"], 30)
+        self.assertEqual(result["unit_prefetch_outcomes"], {"local_hit/in_flight": 1})
+
+    def schema6(self):
+        rec, summaries = JoinSchema6.inputs(self)
+        for field in q.JOIN_SUMMARY_FIELDS_7:
+            del rec["summary"][field]
+        return rec, summaries
+
+    def test_schema6_inputs_are_valid_without_the_new_counters(self):
+        rec, summaries = self.schema6()
+        self.assertTrue(self.summarize(rec, summaries)["daemon_join"]["available"])
+
+    def test_schema7_counters_are_unknown_to_schema6(self):
+        rec, summaries = self.schema6()
+        rec["summary"]["get_cancelled"] = 0
+        with self.assertRaisesRegex(ValueError, "Unknown summary fields"):
+            self.summarize(rec, summaries)
+
+    def test_unit_markers_need_schema7(self):
+        rec, summaries = self.schema6()
+        rec["units"][0]["prefetch"] = copy.deepcopy(self.MARKER)
+        with self.assertRaisesRegex(ValueError, "needs schema 7"):
+            self.summarize(rec, summaries)
+
+    def test_unknown_unit_timing_fails(self):
+        rec, summaries = self.inputs()
+        rec["units"][0]["prefetch"]["timing"] = "eventually"
+        with self.assertRaisesRegex(ValueError, "Unknown unit prefetch timing"):
+            self.summarize(rec, summaries)
+
+    def test_schema7_counters_must_be_non_negative_integers(self):
+        rec, summaries = self.inputs(get_cancelled=-1)
+        with self.assertRaisesRegex(ValueError, "non-negative count"):
+            self.summarize(rec, summaries)
 
 
 class SetupEnvironment(unittest.TestCase):

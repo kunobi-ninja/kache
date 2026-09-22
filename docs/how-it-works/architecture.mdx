@@ -23,11 +23,13 @@ The second local check prevents duplicate work when another process fills the sa
 | Result | Compiler ran | Meaning |
 | --- | ---: | --- |
 | `local_hit` | No | Entry was already in the local store |
-| `prefetch_hit` | No | Background prefetch had placed the entry locally |
+| `prefetch_hit` | No | The remote lookup waited on a prefetch download already running for this key |
 | `remote_hit` | No | Exact remote lookup downloaded the entry |
 | `miss` | Yes | The key and at least one output blob were new |
 | `dup` | Yes | The key was new but all output blobs already existed |
 | `passthrough` | Yes | Policy declined to cache the invocation |
+
+An entry that prefetch imported before the compile asked for it logs `local_hit`. Build timelines mark such units with the prefetch delivery and its timing.
 
 A `dup` is compiled work. It often means two over-specific keys produced the same bytes.
 

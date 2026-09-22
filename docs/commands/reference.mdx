@@ -382,7 +382,7 @@ kache install-shims --from-path
 kache install-shims --force ~/.local/lib/kache/shims
 ```
 
-Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. A run that creates links also writes a `.kache-shims` marker, and Kache skips everything in a marked directory when it looks for the real compiler. See [C and C++](/docs/getting-started/c-cpp).
+Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. When the directory then holds only Kache links, the run also writes a `.kache-shims` marker, and Kache skips everything in a marked directory when it looks for the real compiler. A directory that also holds other files, such as a real compiler, is left unmarked. See [C and C++](/docs/getting-started/c-cpp).
 
 ## `kache completions`
 

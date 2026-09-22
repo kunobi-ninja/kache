@@ -12929,9 +12929,13 @@ fn install_shims_named_with_output(
             .with_context(|| format!("creating shim {}", link.display()))?;
         created.push(name.clone());
     }
-    // Mark only a directory this run put shims into. Marking one where every
-    // name was already taken would hide those files from every kache.
-    if !created.is_empty() {
+    // The marker hides every entry in the directory from every kache, so a
+    // directory that also holds a real compiler, or anything else, stays
+    // unmarked. The links in it are still recognized by what they point at.
+    let marked = crate::compiler::shim::holds_only_shims(dir, Some(&exe), &|path| {
+        std::fs::canonicalize(path).ok()
+    });
+    if marked {
         crate::compiler::shim::write_shim_marker(dir)
             .with_context(|| format!("marking shim directory {}", dir.display()))?;
     }
@@ -12953,6 +12957,13 @@ fn install_shims_named_with_output(
             "Skipped {} existing entr(ies): {} (use --force to replace)",
             skipped.len(),
             skipped.join(", ")
+        );
+    }
+    if !marked {
+        println!(
+            "Left {} without a {} marker: it holds files that are not kache links.",
+            dir.display(),
+            crate::compiler::shim::SHIM_DIR_MARKER
         );
     }
     println!();
@@ -13288,6 +13299,48 @@ mod shim_install_tests {
         }
         install_shims(&shims, false).unwrap();
         assert!(!crate::compiler::shim::has_shim_marker(&shims));
+    }
+
+    /// A run that skips a real compiler must not mark the directory even when
+    /// it created other links there. The marker would hide that compiler from
+    /// every kache, so a shim elsewhere on PATH would run a different one.
+    #[test]
+    fn install_next_to_a_real_compiler_does_not_mark_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        let clang = shims.join("clang");
+        std::fs::write(&clang, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&clang, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        install_shims(&shims, false).unwrap();
+
+        assert!(is_symlink(&shims.join("cc")), "free names are still linked");
+        assert!(!crate::compiler::shim::has_shim_marker(&shims));
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(
+            crate::compiler::shim::resolve_real_compiler_on(
+                "clang",
+                std::slice::from_ref(&shims),
+                Some(&exe)
+            ),
+            Some(clang),
+            "the real clang must stay visible to shim resolution"
+        );
+    }
+
+    /// A farm made before the marker existed gets it on a rerun, even though
+    /// every name is already taken, because every name is a kache link.
+    #[test]
+    fn reinstall_over_an_unmarked_farm_marks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        install_shims(&shims, false).unwrap();
+        std::fs::remove_file(shims.join(crate::compiler::shim::SHIM_DIR_MARKER)).unwrap();
+
+        install_shims(&shims, false).unwrap();
+
+        assert!(crate::compiler::shim::has_shim_marker(&shims));
     }
 
     /// An inspection failure that is NOT "missing" must surface rather than be

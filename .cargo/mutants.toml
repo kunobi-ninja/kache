@@ -134,13 +134,16 @@ gitignore = true
 # `render_key_divergence` (which fields count as diverged), and
 # `key_divergence_report` (reading both phase logs off disk).
 #
-# `install_shims`'s two `!x.is_empty()` guards decide only which summary line
-# prints ("Created N shim(s)" plus the optional created/skipped name lists).
+# In `install_shims_named_with_output`, `!verbose` and the summary guards
+# (`!created.is_empty()`, `!skipped.is_empty()`, `!marked`) decide only what
+# prints: the created and skipped name lists and the unmarked-directory note.
 # Nothing an in-process test can observe changes: the shim set it creates, the
 # entries it preserves, and the errors it reports are all asserted directly by
 # the tests around it. Same shape as the `run_gc_local` progress strings above.
-# The function's behaviour, its `--force` semantics, and its error
-# classification all stay in scope and are killed by those tests.
+# The pattern also matches the function's other `!` guards (`--force`, the
+# extra-name checks), which those tests kill. Whether the `.kache-shims`
+# marker is written is decided in `compiler::shim::holds_only_shims`, which
+# the pattern does not match, so that decision stays in scope.
 #
 # Replacing `Config::socket_path` with an empty `PathBuf` is not a survivor:
 # `test_config_socket_path` and the runtime-isolation tests reject it directly.

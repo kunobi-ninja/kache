@@ -640,10 +640,18 @@ fn entry_route(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> EntryRo
 }
 
 /// The test binary and its arguments when kache runs as a Cargo target
-/// runner (`kache test-runner <binary> <args>`).
+/// runner (`kache test-runner <binary> <args>`). Behind a compiler-name shim
+/// argv[1] is a compiler argument, so `cc test-runner` stays a compile.
 fn test_runner_args(raw_args: &[std::ffi::OsString]) -> Option<&[std::ffi::OsString]> {
     match raw_args.get(1) {
-        Some(arg) if arg == "test-runner" => Some(&raw_args[2..]),
+        Some(arg)
+            if arg == "test-runner"
+                && !raw_args.first().is_some_and(|arg0| {
+                    compiler::shim::invoked_as_compiler(&arg0.to_string_lossy())
+                }) =>
+        {
+            Some(&raw_args[2..])
+        }
         _ => None,
     }
 }
@@ -1889,6 +1897,11 @@ mod tests {
             None
         );
         assert_eq!(test_runner_args(&os(&["kache"])), None);
+        // A compile through a shim whose first input is named `test-runner`.
+        assert_eq!(
+            test_runner_args(&os(&["/x/shims/cc", "test-runner", "-o", "app"])),
+            None
+        );
     }
 
     #[test]

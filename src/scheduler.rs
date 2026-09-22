@@ -311,8 +311,13 @@ impl Scheduler {
     /// covers this process.
     ///
     /// A covered compile still joins the flight, so two nested builds of one
-    /// key share a compile. It takes no permit: the test above it holds
-    /// slots already, and waiting for more could wait on that test itself.
+    /// key share a compile. It takes no permit: the test's slots stand for
+    /// the work the test starts, and a nested build taking permits would
+    /// queue behind other compiles while those slots sat idle. That is a
+    /// throughput choice. A permit could not deadlock here: once it has
+    /// waited, a compile asks for no more slots than tests leave (see
+    /// [`compile_need`]). The cost is that a nested build can run more
+    /// compiles than its test holds slots.
     fn begin_miss(
         &self,
         identity: &FlightIdentity,

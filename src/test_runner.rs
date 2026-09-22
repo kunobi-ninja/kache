@@ -319,8 +319,13 @@ mod signals {
     }
 }
 
+// Named apart from the Unix module so the Linux mutation lane, which never
+// compiles it, can exclude it by name.
 #[cfg(windows)]
-mod signals {
+use windows_signals as signals;
+
+#[cfg(windows)]
+mod windows_signals {
     /// Leave Ctrl-C to the child, which shares the console and receives it
     /// itself. The runner then exits the way the child does.
     pub(super) fn forward_to(_child: u32) {

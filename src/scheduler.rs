@@ -390,25 +390,27 @@ impl Scheduler {
     fn acquire_permit(&self, weight: u32) -> Option<Permit> {
         let _trace = crate::phase_trace::phase("permit_wait");
         let started = std::time::Instant::now();
-        let slots = self.wait_for_permit(0..self.pool_size, || {
-            compile_need(weight, self.pool_size, || tests_held(&self.root))
+        let slots = self.wait_for_permit(0..self.pool_size, |waited| {
+            compile_need(weight, self.pool_size, waited, || tests_held(&self.root))
         });
         crate::opcounts::record_permit_wait(started.elapsed());
         slots.map(|slots| Permit { _slots: slots })
     }
 
-    /// Wait for `need()` free slots in `range`. The need is asked again on
-    /// every poll: a compile's need shrinks while tests hold slots.
+    /// Wait for `need(waited)` free slots in `range`. The need is asked again
+    /// on every poll, with `waited` false on the first: a compile's need
+    /// shrinks while tests hold slots.
     fn wait_for_permit(
         &self,
         range: Range<u32>,
-        need: impl Fn() -> u32,
+        need: impl Fn(bool) -> u32,
     ) -> Option<Vec<(u32, StoreLock)>> {
         let start = std::time::Instant::now();
         let mut attempt = 0;
+        let mut waited = false;
         loop {
             // A need of zero would never be met.
-            match try_collect_slots(self, range.clone(), need().max(1) as usize) {
+            match try_collect_slots(self, range.clone(), need(waited).max(1) as usize) {
                 Ok(Some(slots)) => return Some(slots),
                 Ok(None) => {}
                 Err(error) => {
@@ -425,6 +427,7 @@ impl Scheduler {
             let nap = crate::store::lock_poll_interval(attempt).min(self.poll_interval);
             std::thread::sleep(nap.min(self.wait_timeout.saturating_sub(start.elapsed())));
             attempt += 1;
+            waited = true;
         }
     }
 
@@ -444,7 +447,7 @@ impl Scheduler {
             return None;
         }
         let range = reserve_for(self.pool_size)..self.pool_size;
-        let mut slots = self.wait_for_permit(range.clone(), || need)?;
+        let mut slots = self.wait_for_permit(range.clone(), |_| need)?;
         if elastic {
             slots.extend(self.take_free_slots(range));
         }
@@ -505,15 +508,21 @@ pub(crate) fn test_need(want: u32, pool: u32) -> u32 {
 
 /// Slots a compile of `weight` asks for.
 ///
-/// A compile heavier than the reserve asks for no more than the slots tests
-/// leave, and never less than the reserve. A test may be waiting on this
-/// very compile, and tests never take reserve slots, so this is what keeps
-/// both moving. Only the heavy case calls `tests_held`, which counts the
-/// slots tests hold.
-pub(crate) fn compile_need(weight: u32, pool: u32, tests_held: impl FnOnce() -> u32) -> u32 {
+/// The first try asks for the whole weight. Once it has `waited`, a compile
+/// heavier than the reserve asks for no more than the slots tests leave,
+/// and never less than the reserve. A test may be waiting on this very
+/// compile, and tests never take reserve slots, so this is what keeps both
+/// moving. Only a heavy compile that has waited calls `tests_held`, which
+/// counts the slots tests hold.
+pub(crate) fn compile_need(
+    weight: u32,
+    pool: u32,
+    waited: bool,
+    tests_held: impl FnOnce() -> u32,
+) -> u32 {
     let need = weight.clamp(1, pool);
     let reserve = reserve_for(pool);
-    if need > reserve {
+    if waited && need > reserve {
         need.min(pool.saturating_sub(tests_held()).max(reserve))
     } else {
         need
@@ -2398,35 +2407,44 @@ mod tests {
             }
         };
         // Pool 8: reserve 2, test slots 2..8.
-        assert_eq!(compile_need(2, 8, held(6)), 2);
+        assert_eq!(compile_need(2, 8, true, held(6)), 2);
         assert_eq!(
             calls.get(),
             0,
             "a compile no heavier than the reserve never asks"
         );
-        assert_eq!(compile_need(1, 8, held(6)), 1);
+        assert_eq!(compile_need(1, 8, true, held(6)), 1);
         assert_eq!(calls.get(), 0);
         assert_eq!(
-            compile_need(3, 8, held(6)),
+            compile_need(3, 8, true, held(6)),
             2,
             "tests hold every test slot: the reserve"
         );
         assert_eq!(calls.get(), 1);
         assert_eq!(
-            compile_need(7, 8, held(1)),
+            compile_need(7, 8, true, held(1)),
             7,
             "one test slot held leaves seven"
         );
-        assert_eq!(compile_need(8, 8, held(1)), 7);
-        assert_eq!(compile_need(8, 8, held(4)), 4);
-        assert_eq!(compile_need(3, 8, held(0)), 3, "no tests, no cap");
+        assert_eq!(compile_need(8, 8, true, held(1)), 7);
+        assert_eq!(compile_need(8, 8, true, held(4)), 4);
+        assert_eq!(compile_need(3, 8, true, held(0)), 3, "no tests, no cap");
         assert_eq!(
-            compile_need(8, 8, held(u32::MAX)),
+            compile_need(8, 8, true, held(u32::MAX)),
             2,
             "unknown counts as every slot"
         );
-        assert_eq!(compile_need(20, 8, held(0)), 8, "clamped to the pool");
-        assert_eq!(compile_need(0, 8, held(0)), 1, "at least one slot");
+        assert_eq!(compile_need(20, 8, true, held(0)), 8, "clamped to the pool");
+        assert_eq!(compile_need(0, 8, true, held(0)), 1, "at least one slot");
+
+        let before = calls.get();
+        assert_eq!(
+            compile_need(8, 8, false, held(6)),
+            8,
+            "the first try asks for the whole weight"
+        );
+        assert_eq!(compile_need(1, 8, false, held(6)), 1);
+        assert_eq!(calls.get(), before, "without counting markers");
     }
 
     #[test]
@@ -2600,6 +2618,21 @@ mod tests {
             permits_in_use(dir.path()),
             Some(8),
             "one test slot and seven compile slots, not just the reserve"
+        );
+    }
+
+    #[test]
+    fn a_free_pool_gives_a_heavy_compile_its_whole_weight_at_once() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 4);
+        // An unreadable tests directory counts as every test slot held, so
+        // any capped ask would be the reserve alone.
+        fs::write(tests_dir(&scheduler.root), b"not a directory").unwrap();
+        let _permit = scheduler.acquire_permit(4).unwrap();
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(4),
+            "the first try takes the whole weight without asking about tests"
         );
     }
 

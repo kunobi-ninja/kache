@@ -276,6 +276,23 @@ fn exit_codes_pass_through_scheduled_and_plain() {
     );
 }
 
+/// `kache` exits at once, running nothing, when it sees the variables of a
+/// compiler probe or a build-script launch. The runner is dispatched before
+/// those checks, so a test inherits them and still runs.
+#[test]
+fn a_test_runs_under_the_probe_and_build_script_variables() {
+    let fixture = Fixture::new();
+    for (name, value) in [
+        ("KACHE_FAMILY_PROBE_ACTIVE", "1"),
+        ("KACHE_BUILD_SCRIPT_PATH", "/nonexistent/build-script-build"),
+    ] {
+        let mut command = fixture.runner(&fixture.probe(), "exit7");
+        command.env(name, value);
+        let output = run(command);
+        assert_eq!(output.status.code(), Some(7), "{name}: {output:?}");
+    }
+}
+
 #[test]
 fn a_missing_binary_fails_like_a_failed_test() {
     let fixture = Fixture::new();

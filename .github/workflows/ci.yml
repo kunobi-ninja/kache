@@ -79,7 +79,7 @@ jobs:
       # mise installs everything in mise.toml (just, helm, sccache,
       # cargo-llvm-cov) plus rust, which it reads from rust-toolchain.toml:
       # channel, rustfmt and clippy.
-      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
       - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
           install: true
@@ -281,7 +281,7 @@ jobs:
           # PR checkout is a synthetic merge commit. Its first parent is the
           # exact base used by this run, avoiding stale event SHAs.
           fetch-depth: 0
-      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
       - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
           install: true
@@ -354,7 +354,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
-      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
       - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
           install: true
@@ -438,7 +438,7 @@ jobs:
         with:
           name: mutation-diff-plan
           path: tmp/mutants
-      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
       - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
           install: true
@@ -562,7 +562,7 @@ jobs:
       RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
       - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
           install: true
@@ -722,7 +722,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
       - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
           install: true
@@ -839,7 +839,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
       - uses: zondax/actions/setup-mise@5ae8fbbddda413b9e5826114fe6ca8d03f8551e2 # v1.4.1
         with:
           install: true
@@ -949,7 +949,7 @@ jobs:
         # Checkout never legitimately runs this long, so fail fast rather than
         # waiting out the whole job timeout.
         timeout-minutes: 10
-      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
         if: env.RUN_E2E == 'true'
       - name: Keep E2E caches on the workspace filesystem
         if: env.RUN_E2E == 'true' && runner.os == 'Linux'
@@ -1312,7 +1312,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         timeout-minutes: 10
-      - uses: zondax/actions/setup-runner@59a5368e2dc863e870e942a23a29b8e54481cdd5 # v1.4.0
+      - uses: zondax/actions/setup-runner@8d9900cca4563d4356c5e76c1fa49913158196d4 # v1.5.2
       # Fail fast if the runner is missing a build tool the dep graph needs
       # (ring → nasm, *-sys → cc). Mirrors the e2e job's check.
       - name: Verify Windows build toolchain

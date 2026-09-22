@@ -10027,6 +10027,102 @@ mod tests {
         );
     }
 
+    /// Argv for an rlib, where a build-script archive does its damage: rustc
+    /// copies the archive into the rlib and every later link reads that copy.
+    fn rlib_base(source: &Path, extra: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = ["rustc", "--crate-name", "mylib", "--crate-type", "lib"]
+            .map(String::from)
+            .into();
+        args.push(source.to_string_lossy().into_owned());
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    }
+
+    /// A build script can name its archive with link modifiers:
+    /// `static:+whole-archive=foo` still reads `libfoo.a`, and
+    /// `static:+verbatim=foo.a` reads `foo.a`. Either is bundled like a plain
+    /// `static=foo`, so rebuilding the archive in place must change the key.
+    #[test]
+    fn native_static_lib_named_with_modifiers_is_content_keyed() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let libdir = dir.path().join("out");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let search = format!("native={}", libdir.display());
+
+        for (spec, file) in [
+            ("static:+whole-archive=foo", "libfoo.a"),
+            ("static:+verbatim=foo.a", "foo.a"),
+        ] {
+            let lib = libdir.join(file);
+            let flags = ["-L", search.as_str(), "-l", spec];
+            std::fs::write(&lib, b"v1 archive bytes").unwrap();
+            let k1 = key_of(&rlib_base(&source, &flags));
+            std::fs::write(&lib, b"v2 archive bytes - DIFFERENT").unwrap();
+            let k2 = key_of(&rlib_base(&source, &flags));
+            assert_ne!(k1, k2, "{spec}: a rebuilt archive must change the key");
+            std::fs::write(&lib, b"v1 archive bytes").unwrap();
+            let k3 = key_of(&rlib_base(&source, &flags));
+            assert_eq!(k1, k3, "{spec}: identical bytes must reproduce the key");
+            std::fs::remove_file(&lib).unwrap();
+        }
+    }
+
+    /// `static=foo:bar` makes rustc link `bar` wherever a `#[link]` attribute
+    /// names `foo`. Which archive that reads is not modelled, and keying it by
+    /// name could restore an rlib bundling an older archive, so the key fails.
+    #[test]
+    fn renamed_native_static_lib_is_not_cacheable() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let libdir = dir.path().join("out");
+        std::fs::create_dir_all(&libdir).unwrap();
+        std::fs::write(libdir.join("libfoo.a"), b"archive bytes").unwrap();
+        std::fs::write(libdir.join("libbar.a"), b"archive bytes").unwrap();
+        let search = format!("native={}", libdir.display());
+        let flags = ["-L", search.as_str(), "-l", "static=foo:bar"];
+
+        let parsed = RustcArgs::parse(&rlib_base(&source, &flags)).unwrap();
+        let error =
+            compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("is not cacheable"),
+            "a renamed static lib must fail the key: {error:#}"
+        );
+    }
+
+    /// A `dylib` lib is referenced, not copied into the rlib, so its bytes
+    /// stay out of the key while `static` specs with modifiers are hashed.
+    /// `+verbatim` names the file itself, so a `dylib` wrongly taken for a
+    /// `static` would be found and hashed.
+    #[test]
+    fn native_dylib_stays_name_only_for_an_rlib() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let libdir = dir.path().join("out");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let lib = libdir.join("libfoo.so");
+        let search = format!("native={}", libdir.display());
+
+        for spec in ["dylib=foo", "dylib:+verbatim=libfoo.so"] {
+            let flags = ["-L", search.as_str(), "-l", spec];
+            std::fs::write(&lib, b"so v1").unwrap();
+            let k1 = key_of(&rlib_base(&source, &flags));
+            std::fs::write(&lib, b"so v2 changed").unwrap();
+            let k2 = key_of(&rlib_base(&source, &flags));
+            assert_eq!(
+                k1, k2,
+                "{spec}: a dynamic lib's content must not key the rlib"
+            );
+        }
+    }
+
     /// Rustc's `-O` / `-g` shorthands must share keys with their exact `-C`
     /// equivalents rather than living in the unmodeled residual bucket.
     #[test]

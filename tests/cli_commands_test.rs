@@ -1791,12 +1791,10 @@ fn second_kache_binary(link: &Path) {
 /// real `cc` that prints its arguments, then the system directories.
 #[cfg(unix)]
 fn shim_test_path(root: &Path, dirs: &[&Path]) -> std::ffi::OsString {
-    use std::os::unix::fs::PermissionsExt;
     let real = root.join("real");
     std::fs::create_dir_all(&real).unwrap();
     let cc = real.join("cc");
-    std::fs::write(&cc, "#!/bin/sh\necho \"real cc: $*\"\n").unwrap();
-    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    kache_fs::testutil::write_executable(&cc, "#!/bin/sh\necho \"real cc: $*\"\n");
     let mut path: Vec<&Path> = dirs.to_vec();
     path.extend([real.as_path(), Path::new("/usr/bin"), Path::new("/bin")]);
     std::env::join_paths(path).unwrap()
@@ -1885,7 +1883,6 @@ fn two_kache_installs_on_path_do_not_run_each_other() {
 #[cfg(unix)]
 #[test]
 fn unidentifiable_shims_stop_at_the_depth_bound_until_marked() {
-    use std::os::unix::fs::PermissionsExt;
     let e = env();
     let root = tempfile::Builder::new()
         .tempdir_in(Path::new(KACHE_BIN).parent().unwrap())
@@ -1899,7 +1896,7 @@ fn unidentifiable_shims_stop_at_the_depth_bound_until_marked() {
     let scripts = root.join("scripts");
     std::fs::create_dir_all(&scripts).unwrap();
     let script = scripts.join("cc");
-    std::fs::write(
+    kache_fs::testutil::write_executable(
         &script,
         format!(
             "#!/bin/sh\n\
@@ -1911,9 +1908,7 @@ fn unidentifiable_shims_stop_at_the_depth_bound_until_marked() {
             rounds = root.join("rounds").display(),
             hidden = hidden.display(),
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let path = shim_test_path(root, &[&copies, &scripts]);
     let run = || {
         let mut cmd = kache_process_as(&copies.join("cc"), &e.home, &e.cache);

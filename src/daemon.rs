@@ -9433,70 +9433,18 @@ fn spawn_detached_daemon(
     // spawn and restore it after. The daemon's stdio is passed explicitly
     // above and is marked inheritable by the standard library itself, so it
     // is unaffected; what this removes is the *incidental* inheritance of the
-    // caller's pipes. Restoring matters because later children (rustc)
-    // legitimately inherit these handles.
+    // caller's pipes, which otherwise stay open in a long-lived daemon and keep
+    // cargo waiting for EOF (kunobi-ninja/kache#704). Restoring matters because
+    // later children (rustc) legitimately inherit these handles.
     #[cfg(windows)]
     let spawned = {
-        let _guard = NonInheritableStdio::acquire();
+        let _guard = kunobi_daemon::local::windows::StdioInheritGuard::suppress();
         command.spawn()
     };
     #[cfg(not(windows))]
     let spawned = command.spawn();
 
     spawned.context("spawning daemon process")
-}
-
-/// Clears `HANDLE_FLAG_INHERIT` on this process's standard handles and
-/// restores it on drop (kunobi-ninja/kache#704). Windows-only.
-#[cfg(windows)]
-struct NonInheritableStdio {
-    restore: Vec<windows_sys::Win32::Foundation::HANDLE>,
-}
-
-#[cfg(windows)]
-impl NonInheritableStdio {
-    fn acquire() -> Self {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
-
-        // `RawHandle` and `windows_sys`' `HANDLE` are both `*mut c_void`, so
-        // these coerce without a cast — and Windows CI runs clippy with
-        // `-D warnings`, where a redundant one is an error.
-        let handles: [HANDLE; 3] = [
-            std::io::stdin().as_raw_handle(),
-            std::io::stdout().as_raw_handle(),
-            std::io::stderr().as_raw_handle(),
-        ];
-        let mut restore = Vec::new();
-        for handle in handles {
-            // A std handle can be absent in a detached process, reported
-            // either as null or as INVALID_HANDLE_VALUE.
-            if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-                continue;
-            }
-            // Best-effort: a std handle can legitimately be absent (a detached
-            // process) or non-inheritable already. A failure here only means
-            // the leak this guards against may still be possible, never that
-            // the daemon fails to start.
-            let cleared = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
-            if cleared != 0 {
-                restore.push(handle);
-            }
-        }
-        Self { restore }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for NonInheritableStdio {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-        for handle in &self.restore {
-            unsafe {
-                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-            }
-        }
-    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────

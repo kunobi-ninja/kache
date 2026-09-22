@@ -990,7 +990,23 @@ mod tests {
         }
 
         let _lock = crate::config::config_path_lock();
-        let Some(real_cc) = crate::compiler::shim::resolve_real_compiler_from_env("cc") else {
+        // Leave out PATH directories whose `cc` is a kache shim installed on
+        // this machine. That kache is a different binary from the one under
+        // test, so it does not recognize this test's shim as kache and would
+        // run it as the compiler: the test would then measure the installed
+        // kache, not the probe.
+        let original_path = std::env::var_os("PATH").unwrap();
+        let host_dirs: Vec<std::path::PathBuf> = std::env::split_paths(&original_path)
+            .filter(|dir| !cc_is_an_installed_kache_shim(dir))
+            .collect();
+        let exe = std::env::current_exe().unwrap();
+        let Some(real_cc) = crate::compiler::shim::resolve_real_compiler(
+            "cc",
+            &host_dirs,
+            Some(&exe),
+            &|candidate| is_executable_file(candidate),
+            &|path| std::fs::canonicalize(path).ok(),
+        ) else {
             eprintln!("skipping: no real `cc` on PATH");
             return;
         };
@@ -1002,11 +1018,9 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let exe = std::env::current_exe().unwrap();
         symlink(&exe, dir.path().join("cc")).unwrap();
-        let original_path = std::env::var_os("PATH").unwrap();
         let mut dirs = vec![dir.path().to_path_buf()];
-        dirs.extend(std::env::split_paths(&original_path));
+        dirs.extend(host_dirs);
         let output = Command::new(exe)
             .args([
                 "--exact",
@@ -1022,6 +1036,45 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Whether `dir/cc` resolves to a kache binary: a shim farm left by
+    /// `kache install-shims` or a distro package.
+    #[cfg(unix)]
+    fn cc_is_an_installed_kache_shim(dir: &std::path::Path) -> bool {
+        std::fs::canonicalize(dir.join("cc"))
+            .ok()
+            .and_then(|real| {
+                real.file_name()
+                    .map(|name| name.to_string_lossy().starts_with("kache"))
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn is_executable_file(path: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_installed_kache_shim_is_recognized_and_a_real_compiler_is_not() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let kache = dir.path().join("kache");
+        std::fs::write(&kache, b"").unwrap();
+        let shims = dir.path().join("shims");
+        let toolchain = dir.path().join("toolchain");
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::create_dir_all(&toolchain).unwrap();
+        symlink(&kache, shims.join("cc")).unwrap();
+        std::fs::write(toolchain.join("cc"), b"").unwrap();
+
+        assert!(cc_is_an_installed_kache_shim(&shims));
+        assert!(!cc_is_an_installed_kache_shim(&toolchain));
+        assert!(!cc_is_an_installed_kache_shim(&dir.path().join("absent")));
     }
 
     #[test]

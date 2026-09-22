@@ -32,34 +32,19 @@ pub mod prelude {
     pub use interprocess::local_socket::traits::{Listener as _, Stream as _};
 }
 
-/// Longest path, in bytes, that fits in a Unix socket address here:
-/// `sockaddr_un.sun_path` less the NUL that terminates it.
-#[cfg(unix)]
-pub const MAX_SOCKET_PATH_BYTES: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
-    107
-} else {
-    103
-};
-
 /// Why the daemon cannot bind a local socket at `path`, or `None` when it can.
 ///
 /// A Unix socket address has a fixed-size path field, so a deep runtime
-/// directory makes the daemon fail to start. The OS error names neither the
-/// limit nor a way around it. Windows names a pipe after the path, which has
-/// no such limit.
+/// directory makes the daemon fail to start. kunobi-daemon reports the length
+/// and the limit; this adds the two kache settings that move the socket.
+/// Windows names a pipe after the path, which has no such limit.
 pub fn socket_path_problem(path: &Path) -> Option<String> {
     #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let bytes = path.as_os_str().as_bytes().len();
-        if bytes > MAX_SOCKET_PATH_BYTES {
-            return Some(format!(
-                "the daemon socket path is {bytes} bytes, but a Unix socket path can be at most \
-                 {MAX_SOCKET_PATH_BYTES} here: {}. Point KACHE_SOCKET_PATH at a shorter absolute \
-                 path, or set a shorter [cache] runtime_dir.",
-                path.display()
-            ));
-        }
+    if let Err(error) = kunobi_daemon::local::unix_socket::check_path(path) {
+        return Some(format!(
+            "{error}. Point KACHE_SOCKET_PATH at a shorter absolute path, or set a shorter \
+             [cache] runtime_dir."
+        ));
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -223,41 +208,30 @@ pub fn is_reachable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[cfg(unix)]
     #[test]
     fn a_socket_path_fits_up_to_the_platform_limit_and_not_one_byte_more() {
-        let fits = format!("/{}", "a".repeat(MAX_SOCKET_PATH_BYTES - 1));
-        assert_eq!(fits.len(), MAX_SOCKET_PATH_BYTES);
+        let max = kunobi_daemon::local::unix_socket::MAX_PATH_BYTES;
+        let fits = format!("/{}", "a".repeat(max - 1));
+        assert_eq!(fits.len(), max);
         assert_eq!(socket_path_problem(Path::new(&fits)), None);
 
         let too_long = format!("{fits}b");
         let problem = socket_path_problem(Path::new(&too_long)).expect("one byte over the limit");
-        assert!(
-            problem.contains(&format!(
-                "{} bytes, but a Unix socket path can be at most {MAX_SOCKET_PATH_BYTES}",
-                MAX_SOCKET_PATH_BYTES + 1
-            )),
-            "{problem}"
-        );
+        assert!(problem.contains(&format!("{} bytes", max + 1)), "{problem}");
         assert!(problem.contains("KACHE_SOCKET_PATH"), "{problem}");
         assert!(problem.contains("runtime_dir"), "{problem}");
     }
 
     #[cfg(unix)]
     #[test]
-    fn the_limit_matches_the_platform_socket_address() {
-        let expected = if cfg!(any(target_os = "linux", target_os = "android")) {
-            107
-        } else {
-            103
-        };
-        assert_eq!(MAX_SOCKET_PATH_BYTES, expected);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn binding_an_overlong_path_names_the_limit() {
-        let path = format!("/{}", "a".repeat(MAX_SOCKET_PATH_BYTES));
+        let path = format!(
+            "/{}",
+            "a".repeat(kunobi_daemon::local::unix_socket::MAX_PATH_BYTES)
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -267,8 +241,6 @@ mod tests {
         };
         assert!(error.to_string().contains("KACHE_SOCKET_PATH"), "{error:#}");
     }
-
-    use super::*;
 
     #[test]
     fn socket_name_builds_for_a_plausible_path() {

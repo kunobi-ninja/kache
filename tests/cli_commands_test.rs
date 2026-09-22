@@ -204,6 +204,38 @@ fn unknown_subcommand_is_a_usage_error() {
         .code(2);
 }
 
+/// `kache test-runner` hands back the test binary's exit code, with the
+/// scheduler on and off. Kept here rather than with the Unix-only runner
+/// tests so it runs on Windows too. The stand-in test binary is kache under
+/// a Cargo test binary name, given a subcommand that does not exist, so it
+/// exits 2. It is hard-linked: a copy is written through a descriptor that
+/// a fork on another test thread can hold, and running it then fails with
+/// ETXTBSY on Linux.
+#[test]
+fn test_runner_passes_the_exit_code_through() {
+    let e = env();
+    let dir = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let probe = dir.path().join(format!(
+        "probe-0123456789abcdef{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    std::fs::hard_link(KACHE_BIN, &probe)
+        .or_else(|_| std::fs::copy(KACHE_BIN, &probe).map(drop))
+        .unwrap();
+    for scheduler in ["1", "0"] {
+        e.cmd()
+            .arg("test-runner")
+            .arg(&probe)
+            .arg("definitely-not-a-command")
+            .env("KACHE_SCHEDULER", scheduler)
+            .env_remove("KACHE_TEST_LEASE")
+            .env_remove("RUST_TEST_THREADS")
+            .env_remove("NEXTEST_EXECUTION_MODE")
+            .assert()
+            .code(2);
+    }
+}
+
 #[test]
 fn interactive_commands_refuse_captured_non_tty_output() {
     let e = env();

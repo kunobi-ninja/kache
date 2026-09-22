@@ -25,6 +25,7 @@ pub(super) fn ensure(config: &Config, force: bool) -> Result<bool> {
         executable: None,
         stopping: false,
         retiring_pid: None,
+        log_start: None,
     };
     match replacement::run(
         &lock,
@@ -119,6 +120,9 @@ struct KacheReplacement<'a> {
     executable: Option<PathBuf>,
     stopping: bool,
     retiring_pid: Option<u32>,
+    /// The daemon log and its length when the candidate was started, so a
+    /// candidate that dies early can be reported with what it wrote.
+    log_start: Option<(PathBuf, u64)>,
 }
 impl Driver for KacheReplacement<'_> {
     type Error = anyhow::Error;
@@ -190,6 +194,8 @@ impl Driver for KacheReplacement<'_> {
                 } else {
                     let log = socket.with_extension("log");
                     rotate_daemon_log_if_large(&log);
+                    let written = std::fs::metadata(&log).map_or(0, |meta| meta.len());
+                    self.log_start = Some((log.clone(), written));
                     let stderr = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -209,7 +215,8 @@ impl Driver for KacheReplacement<'_> {
                 {
                     anyhow::ensure!(
                         exit.success(),
-                        "daemon candidate exited before readiness: {exit}"
+                        "{}",
+                        candidate_exit_message(exit, self.log_start.as_ref())
                     );
                     self.child = None; // A concurrent service owner may have won.
                 }
@@ -260,6 +267,49 @@ fn transient(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Enough of the daemon log to hold its fatal error, without flooding the terminal.
+const EXIT_LOG_TAIL_BYTES: u64 = 2048;
+
+/// What `kache daemon start` reports when the new daemon exits before it is
+/// ready. The exit status alone does not say why; the daemon writes its fatal
+/// error to its log, so the lines it wrote since it was started are included.
+fn candidate_exit_message(exit: impl std::fmt::Display, log: Option<&(PathBuf, u64)>) -> String {
+    let mut message = format!("daemon candidate exited before readiness: {exit}");
+    if let Some((path, start)) = log
+        && let Some(written) = written_since(path, *start)
+    {
+        message.push_str(&format!("\n{}:", path.display()));
+        for line in written.lines() {
+            message.push_str(&format!("\n  {line}"));
+        }
+    }
+    message
+}
+
+/// The text appended to `path` after `start` bytes, at most
+/// [`EXIT_LOG_TAIL_BYTES`] of it. A cut that lands mid-line drops that partial
+/// line. `None` when nothing was written or the log cannot be read.
+fn written_since(path: &Path, start: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len <= start {
+        return None;
+    }
+    let from = start.max(len - EXIT_LOG_TAIL_BYTES.min(len));
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if from > start
+        && let Some(newline) = text.find('\n')
+    {
+        text.drain(..=newline);
+    }
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,7 +322,91 @@ mod tests {
             executable: None,
             stopping: false,
             retiring_pid: None,
+            log_start: None,
         }
+    }
+
+    #[test]
+    fn only_what_the_candidate_wrote_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        std::fs::write(&log, "old run: fine\n").unwrap();
+        let start = std::fs::metadata(&log).unwrap().len();
+        assert_eq!(written_since(&log, start), None, "nothing written yet");
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        std::io::Write::write_all(&mut file, b"Error: acquiring daemon socket\n\n").unwrap();
+        assert_eq!(
+            written_since(&log, start).as_deref(),
+            Some("Error: acquiring daemon socket")
+        );
+        assert_eq!(written_since(&dir.path().join("absent.log"), 0), None);
+    }
+
+    #[test]
+    fn whitespace_alone_is_not_worth_reporting() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        std::fs::write(&log, "\n  \n").unwrap();
+        assert_eq!(written_since(&log, 0), None);
+    }
+
+    #[test]
+    fn a_long_log_keeps_its_last_whole_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        let line = "x".repeat(99);
+        let mut text = String::new();
+        for _ in 0..100 {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text.push_str("Error: the cause\n");
+        std::fs::write(&log, &text).unwrap();
+
+        let tail = written_since(&log, 0).unwrap();
+        assert!(tail.ends_with("Error: the cause"), "{tail}");
+        assert!(tail.len() as u64 <= EXIT_LOG_TAIL_BYTES);
+        // The cut landed mid-line; only whole lines remain.
+        assert!(tail.lines().all(|l| l == line || l == "Error: the cause"));
+        // Exactly the window, less the partial first line.
+        let window = &text[text.len() - EXIT_LOG_TAIL_BYTES as usize..];
+        let expected = window[window.find('\n').unwrap() + 1..].trim();
+        assert_eq!(tail, expected);
+    }
+
+    #[test]
+    fn a_log_shorter_than_the_window_is_read_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        std::fs::write(&log, "first line\nsecond line\n").unwrap();
+        assert_eq!(
+            written_since(&log, 0).as_deref(),
+            Some("first line\nsecond line")
+        );
+    }
+
+    #[test]
+    fn the_exit_message_carries_the_log_lines_when_there_are_any() {
+        assert_eq!(
+            candidate_exit_message("exit status: 1", None),
+            "daemon candidate exited before readiness: exit status: 1"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        std::fs::write(&log, "Error: one\ncaused by: two\n").unwrap();
+        assert_eq!(
+            candidate_exit_message("exit status: 1", Some(&(log.clone(), 0))),
+            format!(
+                "daemon candidate exited before readiness: exit status: 1\n{}:\n  Error: one\n  caused by: two",
+                log.display()
+            )
+        );
+        let len = std::fs::metadata(&log).unwrap().len();
+        assert_eq!(
+            candidate_exit_message("exit status: 1", Some(&(log, len))),
+            "daemon candidate exited before readiness: exit status: 1"
+        );
     }
 
     #[cfg(unix)]
@@ -425,6 +559,7 @@ mod tests {
                 executable: None,
                 stopping: false,
                 retiring_pid: None,
+                log_start: None,
             };
             driver.perform(Step::Drain, Some(Instant::now() + Duration::from_secs(2)))
         })

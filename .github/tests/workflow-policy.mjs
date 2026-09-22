@@ -110,6 +110,8 @@ const measurementJobs = new Set([
   "bench-firefox-windows.yml:bench-firefox-windows",
   "bench-firefox-windows.yml:bench-firefox-pull-windows",
   "perf-gate.yml:measure",
+  "prefetch-qualification.yml:seed",
+  "prefetch-qualification-consumer.yml:consume",
 ]);
 const routing = [];
 for (const [file, workflow] of Object.entries(files)) {
@@ -439,6 +441,57 @@ for (const [repo, privateRepo] of [
       `${repo}: extra lane does not run ${job}`,
     );
   }
+}
+// Isolated prefetch controls use the benchmark pool only behind canonical-main authorization.
+{
+  const qualification = files["prefetch-qualification.yml"].jobs;
+  const consumer = files["prefetch-qualification-consumer.yml"].jobs.consume;
+  for (const repository of publicRepos) {
+    for (const ref of ["refs/heads/main", "refs/heads/topic", "refs/pull/1/merge"]) {
+      const ctx = context(repository, false, {}, "workflow_dispatch");
+      ctx.github.ref = ref;
+      const allowed = repository === "kunobi-ninja/kache" && ref === "refs/heads/main";
+      eq(evaluate(qualification.authorize.if, ctx), allowed, "qualification authorization");
+      eq(evaluate(consumer.if, ctx), allowed, "qualification consumer guard");
+    }
+  }
+  eq(qualification.seed.needs, "authorize", "seed depends on trusted authorization");
+  for (const event of ["push", "workflow_dispatch", "pull_request"]) {
+    for (const protectedRef of [true, false]) {
+      const ctx = context("kunobi-ninja/kache", false, {}, event);
+      ctx.github.ref_protected = protectedRef;
+      eq(evaluate(qualification.seed.if, ctx), event === "push" && protectedRef,
+        "seed requires protected push");
+    }
+  }
+  for (const job of [qualification.seed, consumer]) {
+    eq(resolveRunner(job["runs-on"], context("kunobi-ninja/kache", false)),
+      "kunobi-runners", "qualification uses existing measurement pool");
+    eq(resolveRunner(job["runs-on"], context("kunobi-ninja/kache", false,
+      { BENCH_RUNNER_LINUX: '\"benchmark-override\"' })), "benchmark-override",
+      "qualification respects measurement runner override");
+  }
+  const order = ["off-1", "on-1", "on-2", "off-2", "off-3", "on-3"];
+  for (const [index, arm] of order.entries()) {
+    eq(qualification[arm].needs, ["authorize", index ? order[index - 1] : "seed"],
+      `${arm} follows explicit consumer order`);
+    eq(qualification[arm].with.arm, arm, `${arm} selects its declared setting`);
+  }
+  for (const [event, authorized, seed, allowed] of [
+    ["push", "success", "success", true],
+    ["push", "success", "skipped", false],
+    ["workflow_dispatch", "success", "skipped", true],
+    ["workflow_dispatch", "failure", "skipped", false],
+    ["push", "success", "failure", false],
+  ]) {
+    const ctx = context("kunobi-ninja/kache", false, {}, event);
+    ctx.needs = { authorize: { result: authorized }, seed: { result: seed } };
+    eq(evaluate(qualification["off-1"].if, ctx), allowed, "first consumer seed admission");
+  }
+  const ctx = context("kunobi-ninja/kache", false);
+  ctx.needs.authorize = { result: "success" };
+  eq(evaluate(qualification.collect.if, ctx, { success: false }), true,
+    "collector retains failed measurement timings");
 }
 console.log(
   `${checks} workflow policy checks passed across ${routing.length} validation selectors.`,

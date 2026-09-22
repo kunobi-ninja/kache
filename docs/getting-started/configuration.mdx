@@ -147,7 +147,7 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 
 ### Daemon index maintenance
 
-The daemon looks after `index.db` on its own. It checks 60 seconds after it starts, every 5 minutes after that, and once at shutdown. Each check runs two steps in order: it heals the blob index, then compacts the file. Both steps hold the index write lock while they work, so both wait for a quiet machine: no compile holds a scheduler permit and the daemon has received no build request for 60 seconds. Stats polling and an open `kache monitor` do not count as build requests. Neither step overlaps a GC sweep.
+The daemon looks after `index.db` on its own. It checks 60 seconds after it starts, every 5 minutes after that, and once at shutdown. Each check runs two steps in order: it heals the blob index, then compacts the file. Both steps hold the index write lock while they work, so both wait for a quiet machine: no compile, and no test binary run through the [test runner](#test-runner), holds a scheduler slot, and the daemon has received no build request for 60 seconds. Stats polling and an open `kache monitor` do not count as build requests. Neither step overlaps a GC sweep.
 
 Set `cache.index_auto_compact = false` or `KACHE_INDEX_AUTO_COMPACT=0` to turn both steps off. `kache doctor --repair` does the same work on demand either way.
 

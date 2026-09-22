@@ -673,7 +673,10 @@ fn permits_dir(root: &Path) -> PathBuf {
     root.join("permits")
 }
 
-/// Number of permit slots held by running compiles, without waiting.
+/// Number of permit slots held by running compiles and by test binaries run
+/// through `kache test-runner`, without waiting. Daemon maintenance waits
+/// for zero, so a leased test run defers it: the heal and the compaction
+/// hold the index write lock, which a build inside the test would wait on.
 ///
 /// Walks the slot files that exist rather than `0..pool_size`: a held slot
 /// always has a file, so this covers wrappers that see a different pool size

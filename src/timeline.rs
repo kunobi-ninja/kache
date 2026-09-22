@@ -366,6 +366,26 @@ struct KeyConsumption {
     consumed: bool,
 }
 
+/// One delivered prefetch payload: the compressed bytes it brought and when
+/// its import finished.
+#[derive(Clone, Copy)]
+struct Delivery {
+    bytes: u64,
+    finished_at_ms: u64,
+}
+
+/// Pick which delivery represents a key that arrived more than once in a
+/// session. A key can be imported, evicted by GC, then prefetched again, and
+/// both GETs deliver. The earliest import is the one that could have beaten
+/// the demand, so it is the one that decides whether the prefetch was useful.
+fn earliest_delivery(held: Delivery, candidate: Delivery) -> Delivery {
+    if candidate.finished_at_ms < held.finished_at_ms {
+        candidate
+    } else {
+        held
+    }
+}
+
 fn overlay_prefetch_join(
     mut summary: TimelineSummary,
     units: &[TimelineUnit],
@@ -402,10 +422,10 @@ fn overlay_prefetch_join(
     }
     summary.remote_wait_ms = remote_wait_ms;
 
-    let mut consumed_keys: u64 = 0;
-    let mut consumed_bytes: u64 = 0;
-    let mut useful_keys: u64 = 0;
-    let mut useful_bytes: u64 = 0;
+    // Collected per key, not per payload: `downloaded_keys`, `used_keys` and
+    // `used_bytes` all count a key once, so counting payloads here let
+    // consumed/downloaded precision exceed 1 for a key delivered twice.
+    let mut delivered: HashMap<String, Delivery> = HashMap::new();
     let mut get_not_found: u64 = 0;
     let mut get_errors: u64 = 0;
     for transfer in transfers {
@@ -429,18 +449,33 @@ fn overlay_prefetch_join(
             if finished_at_ms == 0 {
                 continue;
             }
-            let Some(consumption) = keys.get(cache_key.as_str()) else {
-                continue;
+            let candidate = Delivery {
+                bytes,
+                finished_at_ms,
             };
-            if !consumption.consumed {
-                continue;
-            }
-            consumed_keys += 1;
-            consumed_bytes = consumed_bytes.saturating_add(bytes);
-            if finished_at_ms <= consumption.first_demand_at_ms {
-                useful_keys += 1;
-                useful_bytes = useful_bytes.saturating_add(bytes);
-            }
+            delivered
+                .entry(cache_key)
+                .and_modify(|held| *held = earliest_delivery(*held, candidate))
+                .or_insert(candidate);
+        }
+    }
+
+    let mut consumed_keys: u64 = 0;
+    let mut consumed_bytes: u64 = 0;
+    let mut useful_keys: u64 = 0;
+    let mut useful_bytes: u64 = 0;
+    for (cache_key, delivery) in &delivered {
+        let Some(consumption) = keys.get(cache_key.as_str()) else {
+            continue;
+        };
+        if !consumption.consumed {
+            continue;
+        }
+        consumed_keys += 1;
+        consumed_bytes = consumed_bytes.saturating_add(delivery.bytes);
+        if delivery.finished_at_ms <= consumption.first_demand_at_ms {
+            useful_keys += 1;
+            useful_bytes = useful_bytes.saturating_add(delivery.bytes);
         }
     }
     summary.consumed_prefetch_keys = consumed_keys;
@@ -957,6 +992,100 @@ mod tests {
         assert_eq!(summary.consumed_prefetch_keys, 0);
         assert_eq!(summary.consumed_prefetch_bytes, 0);
         assert_eq!(summary.useful_prefetch_keys, 0);
+    }
+
+    #[test]
+    fn a_key_delivered_twice_counts_once() {
+        // Imported, evicted by GC, prefetched again: two real deliveries of
+        // one key. `downloaded_keys` counts it once, so this side must too.
+        let mut hit = event("s1", "serde", "k1", 6_000, 500);
+        hit.result = EventResult::LocalHit;
+        let origin = kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            source: "advisory".into(),
+            ..Default::default()
+        };
+        let mut first = transfer("k1", 1_000, 2_000);
+        first.prefetch = Some(origin.clone());
+        first.compressed_bytes = 80;
+        let mut second = transfer("k1", 7_000, 8_000);
+        second.prefetch = Some(origin);
+        second.compressed_bytes = 80;
+        let records = build_timelines(&inputs(
+            &[hit],
+            &[first, second],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        // Both transfers have to survive attribution, or a dedupe that never
+        // saw a second payload would pass for the wrong reason.
+        assert_eq!(records[0].transfers.len(), 2);
+        assert_eq!(summary.consumed_prefetch_keys, 1);
+        assert_eq!(summary.consumed_prefetch_bytes, 80);
+    }
+
+    #[test]
+    fn a_redelivered_key_is_judged_on_its_earliest_import() {
+        // The first import beat the demand; the post-eviction one did not.
+        // Scoring the late arrival would lose a genuinely useful prefetch.
+        let mut hit = event("s1", "serde", "k1", 6_000, 500);
+        hit.result = EventResult::LocalHit;
+        hit.demands = vec![kache_core::timeline::KeyDemand {
+            cache_key: "k1".to_string(),
+            first_demand_at_ms: 5_000,
+            remote_wait_ms: 0,
+        }];
+        let origin = kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            source: "advisory".into(),
+            ..Default::default()
+        };
+        let mut early = transfer("k1", 1_000, 2_000);
+        early.prefetch = Some(origin.clone());
+        early.compressed_bytes = 80;
+        let mut late = transfer("k1", 7_000, 8_000);
+        late.prefetch = Some(origin);
+        // Distinct bytes, so which delivery was picked is visible in the
+        // totals and not just in the key counts.
+        late.compressed_bytes = 99;
+        // Late first in the log: the earliest import has to win on its
+        // timestamp, not on the order the payloads happen to arrive in.
+        let records = build_timelines(&inputs(
+            &[hit],
+            &[late, early],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(records[0].transfers.len(), 2);
+        assert_eq!(summary.consumed_prefetch_keys, 1);
+        assert_eq!(summary.consumed_prefetch_bytes, 80);
+        assert_eq!(summary.useful_prefetch_keys, 1);
+        assert_eq!(summary.useful_prefetch_bytes, 80);
+    }
+
+    #[test]
+    fn the_earliest_delivery_wins_and_ties_keep_the_one_already_held() {
+        let held = Delivery {
+            bytes: 10,
+            finished_at_ms: 2_000,
+        };
+        let earlier = Delivery {
+            bytes: 20,
+            finished_at_ms: 1_999,
+        };
+        let later = Delivery {
+            bytes: 30,
+            finished_at_ms: 2_001,
+        };
+        let tie = Delivery {
+            bytes: 40,
+            finished_at_ms: 2_000,
+        };
+        assert_eq!(earliest_delivery(held, earlier).bytes, 20);
+        assert_eq!(earliest_delivery(held, later).bytes, 10);
+        assert_eq!(earliest_delivery(held, tie).bytes, 10);
     }
 
     #[test]

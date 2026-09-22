@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of [`BuildTimeline`]. A server rejects a record whose schema it
 /// does not know.
-pub const BUILD_TIMELINE_SCHEMA: u32 = 5;
+pub const BUILD_TIMELINE_SCHEMA: u32 = 6;
 
 /// One build session: its compiler invocations and the remote transfers that
 /// belong to it.
@@ -145,6 +145,24 @@ pub struct TimelineSummary {
     pub demanded_candidate_keys: u64,
     #[serde(default)]
     pub cancelled: bool,
+    /// Speculative GET keys that a wrapper then consumed as a local or
+    /// prefetch hit. Daemon `used_keys` can miss these.
+    #[serde(default)]
+    pub consumed_prefetch_keys: u64,
+    #[serde(default)]
+    pub consumed_prefetch_bytes: u64,
+    /// Consumed prefetch keys whose import finished at or before first demand.
+    #[serde(default)]
+    pub useful_prefetch_keys: u64,
+    #[serde(default)]
+    pub useful_prefetch_bytes: u64,
+    /// Sum of wrapper remote-check waits on this session's units.
+    #[serde(default)]
+    pub remote_wait_ms: u64,
+    #[serde(default)]
+    pub get_not_found: u64,
+    #[serde(default)]
+    pub get_errors: u64,
 }
 
 /// One key requested by a wrapper, including unsuccessful predictions.

@@ -7534,11 +7534,13 @@ mod tests {
             crate::platform::is_self_spawn(&argv, env(crate::platform::SELF_SPAWN_ENV)),
             "the child must route to the CLI despite its shim-named argv[0]"
         );
-        #[cfg(unix)]
-        assert!(
-            format!("{cmd:?}").ends_with(r#""kache" "gc""#),
-            "argv[0] must be kache: {cmd:?}"
-        );
+        // argv[0] has no getter. The worker must be `self_command` plus its
+        // own variable, and platform's tests check that command's argv[0]
+        // with a real child. Comparing the two Debug strings does not depend
+        // on how std formats them.
+        let mut expected = crate::platform::self_command(exe, "gc");
+        expected.env("KACHE_AUTO_GC_WORKER", "1");
+        assert_eq!(format!("{cmd:?}"), format!("{expected:?}"));
     }
 
     #[test]

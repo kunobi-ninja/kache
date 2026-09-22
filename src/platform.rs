@@ -358,16 +358,20 @@ mod tests {
         assert_eq!(marker, Some(std::ffi::OsStr::new("gc")));
     }
 
-    /// std has no getter for argv[0]. Its Debug output shows the program in
-    /// brackets when argv[0] differs from it.
+    /// std has no getter for argv[0], so a real child reports it: `sh -c`
+    /// with no further operands sets `$0` to its own argv[0].
     #[cfg(unix)]
     #[test]
     fn self_command_runs_as_kache_on_unix() {
-        let cmd = super::self_command(std::path::Path::new("/x/shims/cc"), "gc");
-        let debug = format!("{cmd:?}");
-        assert!(
-            debug.ends_with(r#"["/x/shims/cc"] "kache" "gc""#),
-            "argv[0] must be kache, not the shim: {debug}"
+        let output = super::self_command(std::path::Path::new("/bin/sh"), "-c")
+            .arg(r#"printf %s "$0""#)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "kache",
+            "argv[0] must be kache, not the path the program was started from"
         );
     }
 

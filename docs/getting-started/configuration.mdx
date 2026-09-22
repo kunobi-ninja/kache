@@ -104,7 +104,7 @@ cargo test --config "target.'cfg(all())'.runner = ['kache', 'test-runner']"
 What a scheduled test binary does:
 
 - It takes slots from the top of the pool. A quarter of the pool, at least one slot, is kept for compiles, so tests never lock a build out.
-- With no thread count set, it takes every free test slot, at least one, and runs with `RUST_TEST_THREADS` set to the number it holds. With `--test-threads` or `RUST_TEST_THREADS`, it takes that many slots and the setting is left alone. Under nextest's process-per-test mode, each test takes one slot.
+- With no thread count set, it takes every free test slot, at least one, and runs with `RUST_TEST_THREADS` set to the number it holds. The reserve stays free even when nothing else runs, so a lone `cargo test` gets fewer threads than without the runner: 12 on 16 CPUs, 3 on 4, 1 on 2. With `--test-threads` or `RUST_TEST_THREADS`, it takes that many slots and the setting is left alone. Under nextest's process-per-test mode, each test takes one slot.
 - On Unix, Kache records the binary's peak memory. A binary that used more than 512 MiB takes at least one slot per 512 MiB on its next run. Under nextest's process-per-test mode it records each test's peak instead, so a heavy test does not raise the others.
 - It waits up to 30 minutes for slots, then runs without them. Under nextest the wait is 2 minutes, because nextest counts it toward the test's timeouts.
 - Builds and test binaries started inside a test count against that test's slots and wait for none of their own. A nested `cargo build` can therefore run more compiles at once than its test holds slots.

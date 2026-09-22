@@ -1064,6 +1064,84 @@ mod tests {
         (parsed, argv)
     }
 
+    /// The link-time `-oso_prefix` and the store-time dsymutil cwd must agree,
+    /// or every OSO path resolves against the wrong directory and the cached
+    /// dSYM comes out empty (kunobi-ninja/kache#1161). Links with the flag
+    /// kache actually injects, in each of Cargo's output layouts, with a
+    /// dependency object in `deps/` standing in for an rlib member.
+    #[test]
+    fn macos_dsymutil_resolves_objects_under_the_injected_oso_prefix() {
+        use std::process::Command;
+        if std::env::consts::OS != "macos" {
+            return;
+        }
+        let cc = |args: &[&std::ffi::OsStr]| {
+            let status = Command::new("cc").args(args).status().unwrap();
+            assert!(status.success(), "cc {args:?} failed");
+        };
+        let compile = |dir: &Path, name: &str, body: &str| {
+            let source = dir.join(format!("{name}.c"));
+            let object = dir.join(format!("{name}.o"));
+            std::fs::write(&source, body).unwrap();
+            cc(&[
+                "-g".as_ref(),
+                "-c".as_ref(),
+                source.as_os_str(),
+                "-o".as_ref(),
+                object.as_os_str(),
+            ]);
+            object
+        };
+
+        for layout in ["deps", "examples", "build/foo-0123456789abcdef"] {
+            let dir = tempfile::tempdir().unwrap();
+            let profile = dir.path().canonicalize().unwrap().join("target/debug");
+            let deps = profile.join("deps");
+            let out_dir = profile.join(layout);
+            std::fs::create_dir_all(&deps).unwrap();
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let dep = compile(&deps, "depfn", "int depfn(void) { return 1; }\n");
+            let main = compile(
+                &out_dir,
+                "mainfn",
+                "int depfn(void);\nint main(void) { return depfn(); }\n",
+            );
+
+            let (parsed, argv) = debug_bin_args(&out_dir, &[]);
+            let flag = macos_oso_prefix_flag_inner(&parsed, &argv, true).unwrap();
+            let link_arg = flag.strip_prefix("-Clink-arg=").unwrap();
+            let binary = out_dir.join("foo");
+            cc(&[
+                main.as_os_str(),
+                dep.as_os_str(),
+                link_arg.as_ref(),
+                "-o".as_ref(),
+                binary.as_os_str(),
+            ]);
+
+            let bundle = out_dir.join("foo.dSYM");
+            let output = super::super::platform::debug_bundle_command(&binary, &bundle)
+                .unwrap()
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{layout}: {stderr}");
+            assert!(
+                !stderr.contains("unable to open object file"),
+                "{layout}: dsymutil ran outside the OSO prefix root: {stderr}"
+            );
+            let dump = Command::new("dwarfdump")
+                .arg("--debug-info")
+                .arg(&bundle)
+                .output()
+                .unwrap();
+            let info = String::from_utf8_lossy(&dump.stdout);
+            for unit in ["mainfn.c", "depfn.c"] {
+                assert!(info.contains(unit), "{layout}: dSYM lacks {unit}: {info}");
+            }
+        }
+    }
+
     #[test]
     fn oso_prefix_is_injected_for_cached_macos_debug_links() {
         let dir = tempfile::tempdir().unwrap();

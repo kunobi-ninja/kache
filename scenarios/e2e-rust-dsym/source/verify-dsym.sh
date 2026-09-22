@@ -7,30 +7,39 @@
 # restore path re-creates the same shape by unpacking the cached
 # `<bin>.dsym.tar`.
 #
-# Three assertions:
-#   1. the restored binary still runs (stdout contract),
-#   2. exactly one `.dSYM` bundle exists next to the deps binary,
-#   3. its DWARF UUID equals the binary's — UUID identity is the exact
+# For every bundle kache baked (the bin and its unit-test harness and the
+# integration test in deps/, the example in examples/):
+#   1. its DWARF UUID equals the binary's — UUID identity is the exact
 #      criterion lldb uses to adopt an adjacent bundle over the binary's
-#      stale N_OSO debug map, so a mismatch means broken debugging.
+#      stale N_OSO debug map, so a mismatch means broken debugging;
+#   2. it holds the target's own compile unit AND itoa's. dsymutil still
+#      writes a UUID-matched bundle when it cannot open a single object,
+#      so the UUID alone passed while every bundle was empty
+#      (kunobi-ninja/kache#1161). itoa's objects live in deps/ as rlib
+#      members, which is where that bug looked in the wrong directory.
 set -eu
 
 ./target/debug/rust-dsym
 
-bundle=""
-for candidate in target/debug/deps/rust_dsym-*.dSYM; do
-    [ -d "$candidate" ] || { echo "no .dSYM bundle in target/debug/deps"; exit 1; }
-    [ -z "$bundle" ] || { echo "more than one .dSYM bundle: $bundle and $candidate"; exit 1; }
-    bundle="$candidate"
+count=0
+for bundle in target/debug/deps/*.dSYM target/debug/examples/*.dSYM; do
+    [ -d "$bundle" ] || continue
+    count=$((count + 1))
+    binary="${bundle%.dSYM}"
+    binary_uuid=$(dwarfdump --uuid "$binary" | awk 'NR==1 {print $2}')
+    bundle_uuid=$(dwarfdump --uuid "$bundle" | awk 'NR==1 {print $2}')
+    [ -n "$binary_uuid" ] || { echo "dwarfdump produced no UUID for $binary"; exit 1; }
+    if [ "$binary_uuid" != "$bundle_uuid" ]; then
+        echo "UUID mismatch: binary $binary_uuid vs bundle $bundle_uuid"
+        exit 1
+    fi
+    info=$(dwarfdump --debug-info "$bundle")
+    echo "$info" | grep -qE 'DW_AT_name[[:space:]]+\("(src/main|examples/demo|tests/it)\.rs/@/' ||
+        { echo "no compile unit for the target's own source in $bundle"; exit 1; }
+    echo "$info" | grep -qE 'DW_AT_name[[:space:]]+\(".*/itoa-[^/]+/src/lib\.rs/@/' ||
+        { echo "no itoa compile unit in $bundle"; exit 1; }
 done
-
-binary="${bundle%.dSYM}"
-binary_uuid=$(dwarfdump --uuid "$binary" | awk 'NR==1 {print $2}')
-bundle_uuid=$(dwarfdump --uuid "$bundle" | awk 'NR==1 {print $2}')
-[ -n "$binary_uuid" ] || { echo "dwarfdump produced no UUID for $binary"; exit 1; }
-if [ "$binary_uuid" != "$bundle_uuid" ]; then
-    echo "UUID mismatch: binary $binary_uuid vs bundle $bundle_uuid"
-    exit 1
-fi
-echo "DSYM-UUID-MATCH $bundle_uuid"
-dwarfdump --uuid "$bundle"
+# bin + unit-test harness + integration test + example (cargo may also
+# uplift a copy of the example's bundle).
+[ "$count" -ge 4 ] || { echo "expected at least 4 .dSYM bundles, found $count"; exit 1; }
+echo "DSYM-DEBUG-INFO-OK $count"

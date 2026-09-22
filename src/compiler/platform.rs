@@ -257,7 +257,7 @@ impl Platform for MacOsPlatform {
 /// same root. A test binary in `<profile>/deps` records `deps/<obj>.o`,
 /// which only resolves from `<profile>` (kunobi-ninja/kache#1161).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Command> {
+pub(crate) fn debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<Command> {
     let binary = std::path::absolute(binary)?;
     let bundle_dir = std::path::absolute(bundle_dir)?;
     let output_dir = binary

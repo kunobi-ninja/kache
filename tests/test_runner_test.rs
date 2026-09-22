@@ -320,8 +320,10 @@ fn only_a_scheduled_test_sees_the_lease() {
     listing.arg("--list");
     assert_eq!(env_of(listing), "lease=unset threads=unset\n");
 
+    // The runner execs this at once, so it must not be written through a
+    // descriptor another thread's fork could still hold (ETXTBSY).
     let unhashed = fixture.path().join("demo");
-    fs::copy(fixture.probe(), &unhashed).unwrap();
+    kache_fs::testutil::write_executable(&unhashed, PROBE_SCRIPT);
     assert_eq!(
         env_of(fixture.runner(&unhashed, "env")),
         "lease=unset threads=unset\n"

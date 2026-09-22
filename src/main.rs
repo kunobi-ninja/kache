@@ -963,8 +963,48 @@ fn main() -> Result<()> {
 /// Environment breadcrumb a kache wrapper sets before spawning any
 /// child compiler. A kache process that sees it already set is running
 /// *inside* another kache — see [`run_wrapper_mode`]'s re-entrancy
-/// guard.
+/// guard. The value counts the wrappers above the child: the outermost
+/// writes `1` and each nested wrapper one more.
 const KACHE_ACTIVE_ENV: &str = "KACHE_ACTIVE";
+
+/// How many kache wrappers may sit above this one before the chain is
+/// taken to be a loop. Real nesting stays at one or two, such as a
+/// compiler or a script it runs calling a shimmed `cc`.
+const MAX_WRAPPERS_ABOVE: u32 = 8;
+
+/// How many kache wrappers sit above this process, from the value of
+/// [`KACHE_ACTIVE_ENV`]. `None` when it is the outermost. A value that is
+/// not a number counts as one: older kache versions always wrote `1`.
+fn wrappers_above(active: Option<&std::ffi::OsStr>) -> Option<u32> {
+    let active = active?;
+    Some(active.to_str().and_then(|v| v.parse().ok()).unwrap_or(1))
+}
+
+/// The [`KACHE_ACTIVE_ENV`] value a nested wrapper hands to its compiler.
+fn next_wrapper_depth(above: u32) -> u32 {
+    above.saturating_add(1)
+}
+
+/// Stop a chain of nested wrappers that only a loop could produce.
+///
+/// Shim resolution skips every PATH entry it can identify as kache, so a
+/// loop that still gets here runs through shims it cannot identify: a farm
+/// of copies with no marker. Nothing left on PATH is known to be the real
+/// compiler, so skipping ahead could pick the wrong one. Failing names the
+/// cause, where the loop would otherwise start processes without end.
+fn check_wrapper_depth(above: u32, compiler: Option<&str>) -> Result<()> {
+    if above < MAX_WRAPPERS_ABOVE {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "kache is running inside {above} other kache wrappers to run `{}`, so two \
+         compiler shims are running each other in a loop. Another kache install's shim \
+         directory is on PATH and holds copies that kache cannot tell apart from a \
+         compiler. Remove that directory from PATH, or create an empty `.kache-shims` \
+         file in it so every kache skips it.",
+        compiler.unwrap_or("?")
+    )
+}
 
 /// Run the requested compiler directly, with no caching: `args[0]` is
 /// the compiler, `args[1..]` its arguments.
@@ -1190,7 +1230,14 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // spawning any child, so a wrapper that already sees it set knows
     // it is nested. This runs before the `disabled` check below, so
     // the loop is broken even when caching is turned off.
-    if std::env::var_os(KACHE_ACTIVE_ENV).is_some() {
+    if let Some(above) = wrappers_above(std::env::var_os(KACHE_ACTIVE_ENV).as_deref()) {
+        // The compiler run here can itself be a kache shim that nothing
+        // identified. Counting the depth ends that loop at a fixed bound.
+        check_wrapper_depth(above, args.first().map(String::as_str))?;
+        // SAFETY: as below, no thread has been spawned yet.
+        unsafe {
+            std::env::set_var(KACHE_ACTIVE_ENV, next_wrapper_depth(above).to_string());
+        }
         let config = config::Config::load()?;
         // No preservation here: the outer kache already applied the
         // incremental policy, and `isolate_incremental_flags` is
@@ -1324,6 +1371,38 @@ mod tests {
             }
             result => result,
         }
+    }
+
+    #[test]
+    fn wrappers_above_reads_the_depth_and_treats_old_values_as_one() {
+        use std::ffi::OsStr;
+        assert_eq!(wrappers_above(None), None, "the outermost wrapper");
+        assert_eq!(wrappers_above(Some(OsStr::new("1"))), Some(1));
+        assert_eq!(wrappers_above(Some(OsStr::new("5"))), Some(5));
+        assert_eq!(wrappers_above(Some(OsStr::new(""))), Some(1));
+        assert_eq!(wrappers_above(Some(OsStr::new("yes"))), Some(1));
+    }
+
+    #[test]
+    fn a_nested_wrapper_hands_down_one_more_level() {
+        assert_eq!(next_wrapper_depth(1), 2);
+        assert_eq!(next_wrapper_depth(7), 8);
+        assert_eq!(next_wrapper_depth(u32::MAX), u32::MAX);
+    }
+
+    /// Pinned at the bound: one level short still runs, the bound itself
+    /// stops the chain with a message that says how to fix it.
+    #[test]
+    fn wrapper_depth_is_refused_at_the_bound() {
+        assert!(check_wrapper_depth(1, Some("cc")).is_ok());
+        assert!(check_wrapper_depth(MAX_WRAPPERS_ABOVE - 1, Some("cc")).is_ok());
+        let err = check_wrapper_depth(MAX_WRAPPERS_ABOVE, Some("/copies/cc"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/copies/cc"), "{err}");
+        assert!(err.contains("loop"), "{err}");
+        assert!(err.contains(".kache-shims"), "{err}");
+        assert!(check_wrapper_depth(MAX_WRAPPERS_ABOVE + 1, None).is_err());
     }
 
     #[test]

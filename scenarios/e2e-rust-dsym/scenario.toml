@@ -12,9 +12,11 @@
 #
 # The verify script (runs after EVERY phase, cold included — the store
 # path leaves the baked bundle next to the binary, so cold and warm
-# converge on the same shape) asserts the bundle exists in
-# target/debug/deps AND that its DWARF UUID matches the binary's —
-# UUID identity being what makes lldb adopt the bundle.
+# converge on the same shape) asserts every bundle's DWARF UUID matches
+# its binary (what makes lldb adopt it) and that it really holds debug
+# info for the target and its dependency. `--all-targets` covers the
+# three output layouts: bin and tests in deps/, the example in
+# examples/ (kunobi-ninja/kache#1161 left test and example bundles empty).
 #
 # macOS-only: dsymutil/dwarfdump and the debug-map problem itself are
 # Mach-O specific. Linux embeds DWARF (nothing to bundle) and Windows
@@ -38,12 +40,12 @@ KACHE_CACHE_EXECUTABLES = "1"
 
 [commands]
 # DEBUG build — dev profile debug=true is what emits the N_OSO debug map.
-build = "cargo build"
+build = "cargo build --all-targets"
 clean = "rm -rf target"
 
 [verify]
 run = "sh verify-dsym.sh"
-expected_stdout_contains = ["rust-dsym: 42", "DSYM-UUID-MATCH", "UUID:"]
+expected_stdout_contains = ["rust-dsym: 42", "DSYM-DEBUG-INFO-OK"]
 
 [assertions.cold]
 # Cold build populates the cache: at least the itoa rlib and the bin.

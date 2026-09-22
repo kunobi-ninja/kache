@@ -213,7 +213,9 @@ def drain(runtime):
 # Schema 6 adds the wrapper-demand join (#1160, #1162): per-key consumed and
 # useful prefetch counters plus GET failure counts. Reviewed against
 # src/timeline.rs `summarize`.
-SUPPORTED_TIMELINE_SCHEMAS = (3, 4, 5, 6)
+# Schema 7 marks each unit with the delivery of its key (plan, rank, timing
+# against first demand) and adds in-flight and cancelled counters to the join.
+SUPPORTED_TIMELINE_SCHEMAS = (3, 4, 5, 6, 7)
 
 # Units Kache keeps in the local store and never publishes to a remote
 # (src/build_script.rs, #1072). They carry a cache key but can never be
@@ -231,11 +233,29 @@ JOIN_SUMMARY_FIELDS = (
     "get_errors",
 )
 
+# TimelineSummary fields schema 7 adds to the join.
+JOIN_SUMMARY_FIELDS_7 = (
+    "in_flight_prefetch_keys",
+    "in_flight_prefetch_bytes",
+    "get_cancelled",
+)
+
+# Where a unit's prefetch delivery fell against first demand (schema 7).
+PREFETCH_TIMINGS = frozenset({"before_demand", "in_flight", "after_demand"})
+
+
+def join_fields(schema):
+    if schema >= 7:
+        return JOIN_SUMMARY_FIELDS + JOIN_SUMMARY_FIELDS_7
+    if schema >= 6:
+        return JOIN_SUMMARY_FIELDS
+    return ()
+
 
 def lifecycle_evidence(records, raw_summaries=None):
     require(
         records and all(r["schema"] in SUPPORTED_TIMELINE_SCHEMAS for r in records),
-        "Only reviewed timeline schemas 3, 4, 5 and 6 are supported",
+        "Only reviewed timeline schemas 3, 4, 5, 6 and 7 are supported",
     )
     summaries, problems, missing = {}, [], []
     known_summary_fields = {
@@ -265,29 +285,29 @@ def lifecycle_evidence(records, raw_summaries=None):
                 problems.append(f"{session}: speculative session has no final summary")
             continue
         allowed = known_summary_fields | ({"incomplete"} if schema >= 4 else set())
-        if schema >= 6:
-            allowed = allowed | set(JOIN_SUMMARY_FIELDS)
+        allowed = allowed | set(join_fields(schema))
         require(
             not (set(summary) - allowed),
             "Unknown summary fields: review the schema adapter",
         )
         if schema >= 6:
-            for field in JOIN_SUMMARY_FIELDS:
+            for field in join_fields(schema):
                 value = summary.get(field, 0)
                 require(
                     type(value) is int and value >= 0,
-                    f"{session}: schema-6 {field} must be a non-negative count",
+                    f"{session}: schema-{schema} {field} must be a non-negative count",
                 )
-            # Useful deliveries are the subset of consumed ones that landed at
-            # or before first demand, so neither total can exceed consumption.
-            if summary.get("useful_prefetch_keys", 0) > summary.get(
-                "consumed_prefetch_keys", 0
-            ) or summary.get("useful_prefetch_bytes", 0) > summary.get(
-                "consumed_prefetch_bytes", 0
-            ):
-                problems.append(
-                    f"{session}: useful prefetch exceeds consumed prefetch"
+            # Useful deliveries landed at or before first demand; in-flight
+            # ones were still downloading then. They are disjoint subsets of
+            # consumed deliveries, so together they cannot exceed consumption.
+            for unit in ("keys", "bytes"):
+                used = summary.get(f"useful_prefetch_{unit}", 0) + summary.get(
+                    f"in_flight_prefetch_{unit}", 0
                 )
+                if used > summary.get(f"consumed_prefetch_{unit}", 0):
+                    problems.append(
+                        f"{session}: useful and in-flight prefetch exceed consumed prefetch"
+                    )
         summaries[session] = summary
         if schema >= 4 and type(summary.get("incomplete")) is not bool:
             problems.append(
@@ -343,14 +363,15 @@ def join_evidence(records, lifecycle):
     """
     if not all(record["schema"] >= 6 for record in records):
         return {"available": False, "reason": "Timeline schema predates the join"}
+    fields = join_fields(min(record["schema"] for record in records))
     totals = Counter()
     for summary in lifecycle["summaries"].values():
-        for field in JOIN_SUMMARY_FIELDS:
+        for field in fields:
             totals[field] += summary.get(field, 0)
     consumed_bytes = totals["consumed_prefetch_bytes"]
     return {
         "available": True,
-        **{field: totals[field] for field in JOIN_SUMMARY_FIELDS},
+        **{field: totals[field] for field in fields},
         "useful_share_of_consumed_bytes": (
             totals["useful_prefetch_bytes"] / consumed_bytes
             if consumed_bytes
@@ -748,6 +769,15 @@ def summarize_accounted(
             d["remote_wait_ms"] for u in units for d in u.get("demands", [])
         ),
         "unit_outcomes": dict(Counter(u["result"] for u in units)),
+        # Schema 7: a local_hit with before_demand timing is a prefetched
+        # local hit; in_flight means the demand waited on a running GET.
+        "unit_prefetch_outcomes": dict(
+            Counter(
+                f"{u['result']}/{u['prefetch']['timing']}"
+                for u in units
+                if "prefetch" in u
+            )
+        ),
         "payloads": payload_rows,
         "backend_count_scope": "Backend invocations only; SDK retries and LIST pages excluded",
     }
@@ -796,10 +826,20 @@ def summarize(records, enabled, raw_transfers=None, raw_summaries=None):
                 # and a remote or prefetch outcome would be a telemetry defect.
                 require(
                     not observations
+                    and "prefetch" not in unit
                     and unit["result"] not in ("remote_hit", "prefetch_hit"),
                     "Local-only unit reports remote demand or outcome",
                 )
                 continue
+            if "prefetch" in unit:
+                require(
+                    record["schema"] >= 7,
+                    "Unit prefetch marker needs schema 7: review the schema adapter",
+                )
+                require(
+                    unit["prefetch"].get("timing") in PREFETCH_TIMINGS,
+                    "Unknown unit prefetch timing: review the schema adapter",
+                )
             if unit["cache_key"]:
                 require(
                     unit.get("event_schema", 0) >= 20 and observations,

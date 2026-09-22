@@ -425,6 +425,10 @@ fn overlay_prefetch_join(
             if !payload_delivered(outcome, packed, transfer.ok) {
                 continue;
             }
+            // No import time means the entry never landed in the local store.
+            if finished_at_ms == 0 {
+                continue;
+            }
             let Some(consumption) = keys.get(cache_key.as_str()) else {
                 continue;
             };
@@ -433,7 +437,7 @@ fn overlay_prefetch_join(
             }
             consumed_keys += 1;
             consumed_bytes = consumed_bytes.saturating_add(bytes);
-            if finished_at_ms > 0 && finished_at_ms <= consumption.first_demand_at_ms {
+            if finished_at_ms <= consumption.first_demand_at_ms {
                 useful_keys += 1;
                 useful_bytes = useful_bytes.saturating_add(bytes);
             }
@@ -481,15 +485,10 @@ fn prefetch_payloads(transfer: &TimelineTransfer) -> Vec<(String, u64, u64, &str
                 .entries
                 .iter()
                 .map(|entry| {
-                    let finished = if entry.finished_at_ms == 0 {
-                        transfer.finished_at_ms
-                    } else {
-                        entry.finished_at_ms
-                    };
                     (
                         entry.cache_key.clone(),
                         entry.compressed_bytes,
-                        finished,
+                        entry.finished_at_ms,
                         entry.outcome.as_str(),
                     )
                 })
@@ -860,6 +859,104 @@ mod tests {
         assert_eq!(summary.useful_prefetch_keys, 0);
         assert_eq!(summary.get_errors, 1);
         assert_eq!(summary.get_not_found, 0);
+    }
+
+    #[test]
+    fn a_unit_that_reports_prefetch_hit_consumes_its_key() {
+        let mut observed = event("s1", "serde", "k1", 5_000, 500);
+        observed.result = EventResult::PrefetchHit;
+        let mut downloaded = transfer("k1", 1_000, 2_000);
+        downloaded.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            source: "advisory".into(),
+            ..Default::default()
+        });
+        downloaded.compressed_bytes = 80;
+        let records = build_timelines(&inputs(
+            &[observed],
+            &[downloaded],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.consumed_prefetch_keys, 1);
+        assert_eq!(summary.consumed_prefetch_bytes, 80);
+    }
+
+    #[test]
+    fn one_unit_consuming_a_shared_key_is_enough() {
+        let missed = event("s1", "serde", "k1", 5_000, 500);
+        let mut missed = missed;
+        missed.result = EventResult::Miss;
+        let mut hit = event("s1", "serde_derive", "k1", 6_000, 500);
+        hit.result = EventResult::LocalHit;
+        let mut downloaded = transfer("k1", 1_000, 2_000);
+        downloaded.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            source: "advisory".into(),
+            ..Default::default()
+        });
+        downloaded.compressed_bytes = 80;
+        let records = build_timelines(&inputs(
+            &[missed, hit],
+            &[downloaded],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.consumed_prefetch_keys, 1);
+    }
+
+    #[test]
+    fn a_session_with_no_prefetch_at_all_gets_no_synthetic_summary() {
+        let mut demand = transfer("k1", 1_000, 2_000);
+        demand.accounting = Some(kache_core::timeline::PrefetchAccounting {
+            bytes_complete: true,
+            requests_complete: true,
+            entries: Vec::new(),
+            ..Default::default()
+        });
+        let records = build_timelines(&inputs(
+            &[event("s1", "serde", "k1", 5_000, 500)],
+            &[demand],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        // The transfer has to survive attribution, or this would pass for the
+        // wrong reason and the empty-entries check would go untested.
+        assert_eq!(records[0].transfers.len(), 1);
+        assert!(records[0].summary.is_none());
+    }
+
+    #[test]
+    fn a_packed_entry_that_never_imported_is_not_consumed() {
+        let mut pack = transfer("", 1_000, 2_000);
+        pack.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            ..Default::default()
+        });
+        pack.accounting = Some(kache_core::timeline::PrefetchAccounting {
+            bytes_complete: true,
+            requests_complete: true,
+            entries: vec![kache_core::timeline::PackedEntryTransfer {
+                cache_key: "k1".into(),
+                compressed_bytes: 100,
+                finished_at_ms: 0,
+                outcome: "completed".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let records = build_timelines(&inputs(
+            &[event("s1", "serde", "k1", 5_000, 100)],
+            &[pack],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.consumed_prefetch_keys, 0);
+        assert_eq!(summary.consumed_prefetch_bytes, 0);
+        assert_eq!(summary.useful_prefetch_keys, 0);
     }
 
     #[test]

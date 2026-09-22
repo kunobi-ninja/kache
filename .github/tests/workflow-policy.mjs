@@ -492,6 +492,17 @@ for (const [repo, privateRepo] of [
   ctx.needs.authorize = { result: "success" };
   eq(evaluate(qualification.collect.if, ctx, { success: false }), true,
     "collector retains failed measurement timings");
+  // Every arm must report the seed's exact `rustc -Vv`, so producer and
+  // consumers install the workload toolchain the same way.
+  const toolchain = (steps) =>
+    steps
+      .filter((step) =>
+        step.uses?.startsWith("jdx/mise-action@") || /rustup toolchain/.test(step.run || ""),
+      )
+      .map((step) => JSON.stringify({ uses: step.uses, with: step.with, run: step.run }));
+  const seedToolchain = toolchain(qualification.seed.steps);
+  eq(seedToolchain.length, 2, "seed installs mise and the pinned workload toolchain");
+  eq(toolchain(consumer.steps), seedToolchain, "consumers install the seed's toolchain");
 }
 console.log(
   `${checks} workflow policy checks passed across ${routing.length} validation selectors.`,

@@ -289,7 +289,33 @@ fn real_command(real: &Path, argv: &[std::ffi::OsString]) -> Command {
     let mut command = Command::new(real);
     command.args(argv);
     command.env_remove(SHIM_PATH_ENV);
+    if let Some(value) = zero_ar_date(
+        std::env::var_os(ZERO_AR_DATE_ENV),
+        cfg!(target_os = "macos"),
+    ) {
+        command.env(ZERO_AR_DATE_ENV, value);
+    }
     command
+}
+
+/// Apple `ar` and `libtool` write each member's mtime into the archive unless
+/// `ZERO_AR_DATE` is set. The `cc` crate sets it for its own archives, but a
+/// script driving `make` or CMake does not, so every rerun gives the archive
+/// new bytes and re-keys the crate that bundles it.
+const ZERO_AR_DATE_ENV: &str = "ZERO_AR_DATE";
+
+/// The `ZERO_AR_DATE` a build script runs with: whatever the user set, else
+/// `1` on an Apple host. Elsewhere the variable has no effect and is left
+/// alone.
+fn zero_ar_date(
+    inherited: Option<std::ffi::OsString>,
+    apple_host: bool,
+) -> Option<std::ffi::OsString> {
+    match inherited {
+        Some(value) => Some(value),
+        None if apple_host => Some("1".into()),
+        None => None,
+    }
 }
 
 fn run_real(real: &Path, argv: &[std::ffi::OsString]) -> i32 {
@@ -817,6 +843,13 @@ impl Run {
             };
             let state = input_state(&path, &excluded, &file_hasher, &mut budget, 0)?;
             fold(&mut hasher, "state", state.as_bytes());
+        }
+        // It changes the archives the script writes, so it is keyed where it
+        // is set. Other hosts keep their existing keys.
+        if cfg!(target_os = "macos") {
+            if let Some(value) = zero_ar_date(std::env::var_os(ZERO_AR_DATE_ENV), true) {
+                fold(&mut hasher, "zero_ar_date", value.as_encoded_bytes());
+            }
         }
         if !prediction.portable_out_dir {
             fold(
@@ -1508,6 +1541,25 @@ mod tests {
         unsafe { std::env::remove_var("TARGET") };
         assert_eq!(target_dir(Path::new("/t/debug/other/pkg-1/out")), None);
         assert_eq!(target_dir(Path::new("out")), None);
+    }
+
+    #[test]
+    fn zero_ar_date_defaults_on_apple_hosts_and_keeps_user_values() {
+        assert_eq!(zero_ar_date(None, true), Some("1".into()));
+        assert_eq!(zero_ar_date(None, false), None);
+        assert_eq!(zero_ar_date(Some("0".into()), true), Some("0".into()));
+        assert_eq!(zero_ar_date(Some("0".into()), false), Some("0".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_command_zeroes_archive_dates_on_macos() {
+        let command = real_command(Path::new("/bin/true"), &[]);
+        let value = command
+            .get_envs()
+            .find(|(name, _)| *name == ZERO_AR_DATE_ENV)
+            .and_then(|(_, value)| value);
+        assert!(value.is_some(), "build scripts must run with ZERO_AR_DATE");
     }
 
     #[test]

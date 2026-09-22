@@ -146,7 +146,11 @@ audit:
   set -euo pipefail
   # `--config` is a global option in cargo-deny 0.20 (it no longer parses
   # after the `check` subcommand).
-  for member in . crates/kache-core crates/kache-format crates/kache-fs crates/kache-store crates/kache-service crates/kache-e2e crates/kache-proofs fuzz; do
+  # Every workspace member, plus `fuzz`, which is a separate workspace.
+  members=()
+  while IFS= read -r member; do members+=("$member"); done \
+    < <("{{justfile_directory()}}/scripts/workspace-members.sh" dirs)
+  for member in "${members[@]}" fuzz; do
     echo "── cargo deny check ($member) ──"
     ( cd "{{justfile_directory()}}/$member" \
         && cargo deny --config "{{justfile_directory()}}/deny.toml" check )
@@ -405,32 +409,20 @@ helm-lint:
 # coverage once; the two `report` invocations then emit the formats
 # from that single test run. Unlike the collection command, the `report`
 # subcommand has no `--workspace` flag, so every workspace package is selected
-# explicitly. Kani-only packages currently add no runtime lines, but selecting
-# them ensures any future ordinary code enters the percentage automatically.
+# explicitly, read from `cargo metadata` so a new crate is never left out.
+# Kani-only packages currently add no runtime lines, but selecting them
+# ensures any future ordinary code enters the percentage automatically.
 # Collect and report coverage for the complete Cargo workspace.
 [group('coverage')]
 coverage:
+  #!/usr/bin/env bash
+  set -euo pipefail
   ./scripts/with-test-resources.sh cargo llvm-cov --all-features --workspace --no-report
-  cargo llvm-cov report \
-    --package kache \
-    --package kache-core \
-    --package kache-format \
-    --package kache-fs \
-    --package kache-store \
-    --package kache-e2e \
-    --package kache-proofs \
-    --package kache-service \
-    --html --output-dir tmp/llvm-cov
-  cargo llvm-cov report \
-    --package kache \
-    --package kache-core \
-    --package kache-format \
-    --package kache-fs \
-    --package kache-store \
-    --package kache-e2e \
-    --package kache-proofs \
-    --package kache-service \
-    --json --output-path tmp/llvm-cov/coverage.json
+  packages=()
+  while IFS= read -r package; do packages+=(--package "$package"); done \
+    < <(./scripts/workspace-members.sh packages)
+  cargo llvm-cov report "${packages[@]}" --html --output-dir tmp/llvm-cov
+  cargo llvm-cov report "${packages[@]}" --json --output-path tmp/llvm-cov/coverage.json
   just coverage-scope-check
 
 # Fail closed if a report omits any runtime-coverage-owned Cargo workspace

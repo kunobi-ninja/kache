@@ -272,7 +272,7 @@ class Telemetry(unittest.TestCase):
             elif change == "wrong-key":
                 rec["units"][0]["demands"][0]["cache_key"] = "other"
             elif change == "new-schema":
-                rec["schema"] = 6
+                rec["schema"] = 7
             else:
                 rec["transfers"][0]["entries"] = []
             with self.assertRaises(ValueError):
@@ -614,6 +614,70 @@ class PackedAccounting(unittest.TestCase):
                 self.assertEqual(
                     result["plans"][0]["payload_bytes"]["equal_timestamp"], 30
                 )
+
+
+class JoinSchema6(PackedAccounting):
+    """The schema-6 wrapper-demand join (#1160, #1162)."""
+
+    JOIN = {
+        "consumed_prefetch_keys": 1,
+        "consumed_prefetch_bytes": 30,
+        "useful_prefetch_keys": 1,
+        "useful_prefetch_bytes": 30,
+        "remote_wait_ms": 7,
+        "get_not_found": 0,
+        "get_errors": 0,
+    }
+
+    def inputs(self, **join):
+        rec, summaries = super().inputs()
+        rec["schema"] = 6
+        rec["summary"].update(self.JOIN | join)
+        return rec, summaries
+
+    def test_schema6_qualifies_and_reports_the_daemon_join(self):
+        rec, summaries = self.inputs()
+        result = self.summarize(rec, summaries)
+        self.assertTrue(result["complete_precision_qualification"])
+        join = result["daemon_join"]
+        self.assertTrue(join["available"])
+        self.assertEqual(join["useful_prefetch_bytes"], 30)
+        self.assertEqual(join["consumed_prefetch_keys"], 1)
+        self.assertEqual(join["useful_share_of_consumed_bytes"], 1.0)
+
+    def test_the_join_is_reported_beside_the_harness_own_derivation(self):
+        # Different byte bases: the join counts the per-key payload, the
+        # harness counts GET-body bytes including the catalog object.
+        rec, summaries = self.inputs()
+        result = self.summarize(rec, summaries)
+        self.assertEqual(result["recorded_received_prefetch_bytes"], 110)
+        self.assertEqual(result["daemon_join"]["consumed_prefetch_bytes"], 30)
+        self.assertNotEqual(
+            result["get_body_byte_precision"],
+            result["daemon_join"]["useful_share_of_consumed_bytes"],
+        )
+
+    def test_useful_cannot_exceed_consumed(self):
+        for field in ("useful_prefetch_keys", "useful_prefetch_bytes"):
+            rec, summaries = self.inputs(**{field: 99})
+            with self.assertRaisesRegex(ValueError, "exceeds consumed"):
+                self.summarize(rec, summaries)
+
+    def test_join_counters_must_be_non_negative_integers(self):
+        for value in (-1, "1", 1.5, None):
+            rec, summaries = self.inputs(get_errors=value)
+            with self.assertRaisesRegex(ValueError, "non-negative count"):
+                self.summarize(rec, summaries)
+
+    def test_unknown_schema6_summary_field_still_fails(self):
+        rec, summaries = self.inputs()
+        rec["summary"]["invented_counter"] = 1
+        with self.assertRaisesRegex(ValueError, "Unknown summary fields"):
+            self.summarize(rec, summaries)
+
+    def test_schema5_records_report_no_join(self):
+        rec, summaries = super().inputs()
+        self.assertFalse(self.summarize(rec, summaries)["daemon_join"]["available"])
 
 
 class RetentionAndArtifacts(unittest.TestCase):

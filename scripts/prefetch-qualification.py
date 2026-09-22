@@ -189,13 +189,27 @@ def drain(runtime):
 # Schema 4 adds TimelineSummary.incomplete to schema 3's ordinary transfer model.
 # Reviewed against lifecycle 0ac603f944ba546dfc78cb457462537c99a35739 and
 # packed/physical accounting 129a31ce4debb8c97d9698fe5ff6d48ed4387750.
-SUPPORTED_TIMELINE_SCHEMAS = (3, 4, 5)
+# Schema 6 adds the wrapper-demand join (#1160, #1162): per-key consumed and
+# useful prefetch counters plus GET failure counts. Reviewed against
+# src/timeline.rs `summarize`.
+SUPPORTED_TIMELINE_SCHEMAS = (3, 4, 5, 6)
+
+# TimelineSummary fields the schema-6 join adds.
+JOIN_SUMMARY_FIELDS = (
+    "consumed_prefetch_keys",
+    "consumed_prefetch_bytes",
+    "useful_prefetch_keys",
+    "useful_prefetch_bytes",
+    "remote_wait_ms",
+    "get_not_found",
+    "get_errors",
+)
 
 
 def lifecycle_evidence(records, raw_summaries=None):
     require(
         records and all(r["schema"] in SUPPORTED_TIMELINE_SCHEMAS for r in records),
-        "Only reviewed timeline schemas 3, 4 and 5 are supported",
+        "Only reviewed timeline schemas 3, 4, 5 and 6 are supported",
     )
     summaries, problems, missing = {}, [], []
     known_summary_fields = {
@@ -225,10 +239,29 @@ def lifecycle_evidence(records, raw_summaries=None):
                 problems.append(f"{session}: speculative session has no final summary")
             continue
         allowed = known_summary_fields | ({"incomplete"} if schema >= 4 else set())
+        if schema >= 6:
+            allowed = allowed | set(JOIN_SUMMARY_FIELDS)
         require(
             not (set(summary) - allowed),
             "Unknown summary fields: review the schema adapter",
         )
+        if schema >= 6:
+            for field in JOIN_SUMMARY_FIELDS:
+                value = summary.get(field, 0)
+                require(
+                    type(value) is int and value >= 0,
+                    f"{session}: schema-6 {field} must be a non-negative count",
+                )
+            # Useful deliveries are the subset of consumed ones that landed at
+            # or before first demand, so neither total can exceed consumption.
+            if summary.get("useful_prefetch_keys", 0) > summary.get(
+                "consumed_prefetch_keys", 0
+            ) or summary.get("useful_prefetch_bytes", 0) > summary.get(
+                "consumed_prefetch_bytes", 0
+            ):
+                problems.append(
+                    f"{session}: useful prefetch exceeds consumed prefetch"
+                )
         summaries[session] = summary
         if schema >= 4 and type(summary.get("incomplete")) is not bool:
             problems.append(
@@ -265,6 +298,40 @@ def lifecycle_evidence(records, raw_summaries=None):
         "legacy_shutdown_evidence_unknown": any(r["schema"] == 3 for r in records),
         "missing_summary_sessions": missing,
         "problems": problems,
+    }
+
+
+def join_evidence(records, lifecycle):
+    """Daemon-side schema-6 join counters, summed across this arm's sessions.
+
+    These are reported beside the harness's own derivation, not asserted equal
+    to it. Two differences are expected and are not defects:
+
+    - Byte base. `useful_payload_bytes` counts GET-body bytes, including
+      catalog and pack overhead. `useful_prefetch_bytes` counts the per-key
+      payload the join credited, so the harness denominator is the larger one.
+    - Tie-break. The join credits a delivery that finished at exactly the first
+      demand millisecond; the harness buckets that as `equal_timestamp` and
+      refuses to call the ordering known. On identical input the harness
+      therefore credits no more keys than the join does.
+    """
+    if not all(record["schema"] >= 6 for record in records):
+        return {"available": False, "reason": "Timeline schema predates the join"}
+    totals = Counter()
+    for summary in lifecycle["summaries"].values():
+        for field in JOIN_SUMMARY_FIELDS:
+            totals[field] += summary.get(field, 0)
+    consumed_bytes = totals["consumed_prefetch_bytes"]
+    return {
+        "available": True,
+        **{field: totals[field] for field in JOIN_SUMMARY_FIELDS},
+        "useful_share_of_consumed_bytes": (
+            totals["useful_prefetch_bytes"] / consumed_bytes
+            if consumed_bytes
+            else None
+        ),
+        "scope": "Per-key payload bytes the join credited; "
+        "not the GET-body base used by get_body_byte_precision",
     }
 
 
@@ -604,6 +671,7 @@ def summarize_accounted(
         and shutdown_complete
         and all(group["complete"] for group in groups.values())
     )
+    daemon_join = join_evidence(records, lifecycle)
     waits = Counter()
     for record in records:
         for unit in record["units"]:
@@ -648,6 +716,7 @@ def summarize_accounted(
         "recorded_received_prefetch_bytes": physical,
         "recorded_useful_prefetch_bytes": useful,
         "get_body_byte_precision": useful / physical if complete and physical else None,
+        "daemon_join": daemon_join,
         "demanded_keys": len(demands),
         "observed_remote_wait_ms": sum(
             d["remote_wait_ms"] for u in units for d in u.get("demands", [])
@@ -689,7 +758,7 @@ def summarize(records, enabled, raw_transfers=None, raw_summaries=None):
         "prefetch",
         "outcome",
     }
-    if records[0]["schema"] == 5:
+    if records[0]["schema"] >= 5:
         allowed_transfer_fields.add("accounting")
     for record in records:
         session = record["session_id"]
@@ -720,7 +789,7 @@ def summarize(records, enabled, raw_transfers=None, raw_summaries=None):
             transfers.append(transfer)
     require(demands, "No exact demand records")
     require(consumed, "No cache artifact was consumed")
-    if records[0]["schema"] == 5:
+    if records[0]["schema"] >= 5:
         return summarize_accounted(
             records,
             transfers,

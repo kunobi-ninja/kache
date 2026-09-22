@@ -46,11 +46,24 @@ Schemas 3 and 4 retain the tested ordinary-transfer report. Schema 4 adds the
 lifecycle incomplete flag, reviewed against
 `0ac603f944ba546dfc78cb457462537c99a35739`. Schema 5 adds physical operation
 receipts and nested payload entries, reviewed against
-`129a31ce4debb8c97d9698fe5ff6d48ed4387750`. Unknown future schemas or fields fail
-admission. Every keyed compiler unit must carry exact first-demand observations.
+`129a31ce4debb8c97d9698fe5ff6d48ed4387750`. Schema 6 adds the wrapper-demand
+join from #1160 and #1162, reviewed against `src/timeline.rs`. Unknown future
+schemas or fields fail admission. Every keyed compiler unit must carry exact
+first-demand observations.
 
 Demand and usefulness come from unit events and transfer receipts. The daemon's
-summary counters can omit local hits, so they cannot establish byte precision.
+`used_keys` can omit local hits, so it cannot establish byte precision.
+
+Schema 6 carries the daemon's own join under `daemon_join`: consumed and useful
+prefetch keys and bytes, summed remote wait, and GET 404 and error counts. The
+harness reports these beside its own derivation rather than asserting the two
+agree, because they do not share a base. The join counts the per-key payload it
+credited; the harness denominator is received GET-body bytes, which also carry
+catalog metadata and pack headers. The join credits a delivery that finished on
+the same millisecond as first demand, where the harness calls that ordering
+unknown. On identical input the harness therefore credits no more keys than the
+join. What the harness does enforce is that useful never exceeds consumed, in
+keys or bytes, and that every join counter is a non-negative integer.
 
 The schema-5 report groups receipts by immutable session, plan ID and source.
 An empty fallback plan ID remains scoped to its session. Its denominator is
@@ -84,8 +97,8 @@ timelines and verified identities use `prefetch-qualification-*` artifacts;
 these names do not enter the `telemetry-otlp-v1*` ingestion path.
 
 `controls_valid` records successful controls and artifact checks.
-`complete_precision_qualification` additionally requires complete schema-5
-GET-body evidence across all arms. Legacy reports cannot set that flag. Review
+`complete_precision_qualification` additionally requires complete schema-5 or
+schema-6 GET-body evidence across all arms. Legacy reports cannot set that flag. Review
 both flags, complete job pairs and raw demand evidence before accepting #618.
 This experiment cannot establish R2 performance or planner recommendation
 quality, and no whole-job speedup is claimed before the actual jobs finish.

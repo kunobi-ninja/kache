@@ -6,6 +6,16 @@ use kunobi_daemon::{
 };
 
 pub(super) fn ensure(config: &Config, force: bool) -> Result<bool> {
+    // Fail before starting a daemon that could never bind its sockets. The
+    // control endpoint's name is the longer of the two.
+    for socket in [
+        config.socket_path(),
+        super::lifecycle_control::endpoint(config),
+    ] {
+        if let Some(problem) = crate::transport::socket_path_problem(&socket) {
+            anyhow::bail!(problem);
+        }
+    }
     let deadline = Instant::now() + DAEMON_START_TIMEOUT;
     if !force && current(config, deadline)?.is_some() {
         return Ok(true);

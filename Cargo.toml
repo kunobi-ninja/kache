@@ -35,7 +35,7 @@ exclude = ["tmp"]
 resolver = "3"
 
 [dependencies]
-kunobi-daemon = { version = "0.2.1", features = ["wire-async", "local-async"] }
+kunobi-daemon = { version = "0.4.1", features = ["wire-async", "local-async"] }
 kache-format = { version = "0.26.3", path = "crates/kache-format" }
 kache-store = { version = "0.26.3", path = "crates/kache-store" }
 blake3 = "1"

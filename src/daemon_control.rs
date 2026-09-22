@@ -163,20 +163,10 @@ pub(super) fn health(config: &Config, deadline: Instant) -> Result<Option<wire::
     request(config, operation::HEALTH, deadline)
 }
 
-#[cfg(unix)]
-type Local = kunobi_daemon::local::unix::UnixDuplex;
-#[cfg(windows)]
-type Local = kunobi_daemon::local::windows::WindowsDuplex;
+type Local = kunobi_daemon::local::PlatformDuplex;
 
 fn connect(path: &Path, deadline: Instant) -> Result<Local> {
-    #[cfg(unix)]
-    let stream = Local::connect_once_until(path, deadline)?;
-    #[cfg(windows)]
-    let stream = {
-        let hash = blake3::hash(path.as_os_str().as_encoded_bytes());
-        let name = format!("kache-daemon-{}", &hash.to_hex()[..16]);
-        Local::connect_once(&name)?
-    };
+    let stream = Local::connect_once_until(&crate::transport::daemon_endpoint(path), deadline)?;
     stream
         .verify_peer_user()
         .context("authenticating lifecycle peer")?;

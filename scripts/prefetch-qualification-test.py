@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -678,6 +679,57 @@ class JoinSchema6(PackedAccounting):
     def test_schema5_records_report_no_join(self):
         rec, summaries = super().inputs()
         self.assertFalse(self.summarize(rec, summaries)["daemon_join"]["available"])
+
+
+class SetupEnvironment(unittest.TestCase):
+    """Pre-build steps must not create the state the cold control asserts."""
+
+    def env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            return q.environment(Path(tmp), Path(tmp) / "kache")
+
+    def test_setup_drops_every_kache_entry_point(self):
+        setup = q.setup_environment(self.env())
+        for key in q.WRAPPER_ENV_KEYS:
+            self.assertNotIn(key, setup)
+        # The empty host-config override stays: it suppresses any host config
+        # rather than pointing Kache at one.
+        self.assertEqual(
+            [k for k in setup if k.startswith("KACHE_")], ["KACHE_HOST_CONFIG"]
+        )
+        self.assertEqual(setup["KACHE_HOST_CONFIG"], "")
+
+    def test_setup_keeps_the_toolchain_and_cargo_pins(self):
+        env = self.env()
+        setup = q.setup_environment(env)
+        for key in (
+            "RUSTUP_TOOLCHAIN",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "CARGO_INCREMENTAL",
+            "SOURCE_DATE_EPOCH",
+        ):
+            self.assertEqual(setup[key], env[key])
+
+    def test_measurement_env_still_routes_through_kache(self):
+        env = self.env()
+        self.assertTrue(env["RUSTC_WRAPPER"].endswith("kache"))
+        self.assertIn("KACHE_CONFIG", env)
+
+    def test_command_uses_the_given_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runner = q.Run(root, root / "out", {"MARKER": "measurement"})
+            plain = runner.command(
+                "probe", [sys.executable, "-c", "import os;print(os.environ['MARKER'])"]
+            )
+            self.assertEqual(plain.strip(), "measurement")
+            overridden = runner.command(
+                "probe-setup",
+                [sys.executable, "-c", "import os;print(os.environ['MARKER'])"],
+                env={"MARKER": "setup"},
+            )
+            self.assertEqual(overridden.strip(), "setup")
 
 
 class RetentionAndArtifacts(unittest.TestCase):

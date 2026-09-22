@@ -720,13 +720,55 @@ mod tests {
 
     #[test]
     fn still_accepts_older_schema_clients() {
-        for schema in [1, 2] {
+        // Clients upgrade after the service, so every earlier schema stays valid.
+        for schema in 1..BUILD_TIMELINE_SCHEMA {
             let json = record_json(schema, "legacy");
             let (record, decoded) =
                 decode_submission(Some("zstd"), &zstd(&json), DEFAULT_MAX_DECODED_BYTES).unwrap();
             assert_eq!(record.schema, schema);
             assert_eq!(decoded, json);
         }
+    }
+
+    #[test]
+    fn keeps_a_units_prefetch_delivery_intact() {
+        // Schema 7 marks a unit with the prefetch that delivered its key. The
+        // service must decode it and store the submitted bytes unchanged.
+        use kache_core::timeline::{PrefetchOrigin, PrefetchTiming, TimelineUnit, UnitPrefetch};
+
+        let record = BuildTimeline {
+            schema: 7,
+            client_record_id: "r7".to_string(),
+            session_id: "s".to_string(),
+            units: vec![TimelineUnit {
+                cache_key: "k".to_string(),
+                result: "local_hit".to_string(),
+                prefetch: Some(UnitPrefetch {
+                    origin: PrefetchOrigin {
+                        session_id: "s".to_string(),
+                        plan_id: "p".to_string(),
+                        source: "advisory".to_string(),
+                        candidate_rank: Some(3),
+                        ..PrefetchOrigin::default()
+                    },
+                    started_at_ms: 10,
+                    delivered_at_ms: 20,
+                    compressed_bytes: 30,
+                    timing: PrefetchTiming::InFlight,
+                }),
+                ..TimelineUnit::default()
+            }],
+            ..BuildTimeline::default()
+        };
+        let json = serde_json::to_vec(&record).unwrap();
+        assert!(
+            String::from_utf8_lossy(&json).contains("\"in_flight\""),
+            "timing is sent in snake case"
+        );
+        let (decoded, stored) =
+            decode_submission(Some("zstd"), &zstd(&json), DEFAULT_MAX_DECODED_BYTES).unwrap();
+        assert_eq!(decoded, record);
+        assert_eq!(stored, json);
     }
 
     #[test]

@@ -846,3 +846,67 @@ fn a_rebuilt_whole_archive_lib_reaches_the_binary() {
         "the library must recompile against the rebuilt archive"
     );
 }
+
+/// `stamped`'s build script reports the `ZERO_AR_DATE` it runs with.
+#[cfg(target_os = "macos")]
+fn write_stamped_workspace(root: &Path) {
+    let write = |relative: &str, content: &str| {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"stamped\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    );
+    write(
+        "build.rs",
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let seen = std::env::var("ZERO_AR_DATE").unwrap_or_else(|_| "unset".to_string());
+    println!("cargo:warning=stamped saw ZERO_AR_DATE={seen}");
+}
+"#,
+    );
+    write("src/lib.rs", "");
+    let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+    for entry in walkdir(root) {
+        let _ = filetime::set_file_mtime(&entry, old);
+    }
+}
+
+/// Apple `ar` stamps each member with its mtime unless `ZERO_AR_DATE` is set,
+/// so a script that archives without it writes new bytes on every run. kache
+/// runs build scripts with `ZERO_AR_DATE=1` on macOS, keeps a value the user
+/// set, and does not restore a run recorded under another value.
+#[cfg(target_os = "macos")]
+#[test]
+fn build_scripts_run_with_zero_ar_date_on_macos() {
+    let fx = fixture_from(write_stamped_workspace);
+    for (name, value, seen) in [
+        ("default", None, "stamped saw ZERO_AR_DATE=1"),
+        ("user", Some("0"), "stamped saw ZERO_AR_DATE=0"),
+    ] {
+        let mut command = cargo(
+            "check",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &target(&fx, name),
+            &[],
+        );
+        match value {
+            Some(value) => command.env("ZERO_AR_DATE", value),
+            None => command.env_remove("ZERO_AR_DATE"),
+        };
+        let mark = event_count(&fx.cache);
+        let output = run(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(seen), "{name}: {stderr}");
+        assert_eq!(
+            results_for(&events_since(&fx.cache, mark), "build_script_run"),
+            vec!["miss"],
+            "{name}: a run recorded under another ZERO_AR_DATE is not restored"
+        );
+    }
+}

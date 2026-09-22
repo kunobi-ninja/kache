@@ -279,6 +279,42 @@ class Telemetry(unittest.TestCase):
             with self.assertRaises(ValueError):
                 q.summarize([rec], True)
 
+    def test_local_only_build_script_units_need_no_demand(self):
+        # Build-script runs stay in the local store (#1072): keyed, but never
+        # published, fetched or remote-checked, so they carry no demand.
+        rec = record()
+        rec["units"].append(
+            {
+                "cache_key": "script-run",
+                "crate_name": "build_script_run",
+                "result": "miss",
+                "event_schema": 20,
+            }
+        )
+        result = q.summarize([rec], True)
+        self.assertEqual(result["unit_outcomes"], {"local_hit": 1, "miss": 1})
+
+    def test_local_only_unit_with_remote_evidence_fails(self):
+        for change in ({"result": "remote_hit"}, {"result": "prefetch_hit"},
+                       {"demands": [{"cache_key": "script-run",
+                                     "first_demand_at_ms": 100,
+                                     "remote_wait_ms": 0}]}):
+            rec = record()
+            unit = {"cache_key": "script-run", "crate_name": "build_script_run",
+                    "result": "miss", "event_schema": 20}
+            rec["units"].append(unit | change)
+            with self.assertRaisesRegex(ValueError, "Local-only unit"):
+                q.summarize([rec], True)
+
+    def test_other_keyed_units_still_need_demands(self):
+        rec = record()
+        rec["units"].append(
+            {"cache_key": "lib", "crate_name": "serde", "result": "miss",
+             "event_schema": 20}
+        )
+        with self.assertRaisesRegex(ValueError, "schema-20 demands"):
+            q.summarize([rec], True)
+
     def test_invalid_or_unexercised_arms_fail(self):
         with self.assertRaises(ValueError):
             q.summarize([record()], False)

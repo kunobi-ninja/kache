@@ -215,6 +215,11 @@ def drain(runtime):
 # src/timeline.rs `summarize`.
 SUPPORTED_TIMELINE_SCHEMAS = (3, 4, 5, 6)
 
+# Units Kache keeps in the local store and never publishes to a remote
+# (src/build_script.rs, #1072). They carry a cache key but can never be
+# prefetched or checked against the remote.
+LOCAL_ONLY_UNITS = frozenset({"build_script_run"})
+
 # TimelineSummary fields the schema-6 join adds.
 JOIN_SUMMARY_FIELDS = (
     "consumed_prefetch_keys",
@@ -786,6 +791,15 @@ def summarize(records, enabled, raw_transfers=None, raw_summaries=None):
         units.extend(record["units"])
         for unit in record["units"]:
             observations = unit.get("demands", [])
+            if unit.get("crate_name") in LOCAL_ONLY_UNITS:
+                # Never published or fetched, so there is no demand to record,
+                # and a remote or prefetch outcome would be a telemetry defect.
+                require(
+                    not observations
+                    and unit["result"] not in ("remote_hit", "prefetch_hit"),
+                    "Local-only unit reports remote demand or outcome",
+                )
+                continue
             if unit["cache_key"]:
                 require(
                     unit.get("event_schema", 0) >= 20 and observations,

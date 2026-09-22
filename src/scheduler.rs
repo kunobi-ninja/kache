@@ -51,6 +51,9 @@ pub const RSS_BYTES_PER_SLOT: u64 = 512 * 1024 * 1024;
 pub const TEST_LEASE_ENV: &str = "KACHE_TEST_LEASE";
 
 pub(crate) const WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
+/// How long a test lease waits for its marker, never longer than its wait
+/// for slots.
+const MARKER_WAIT: Duration = Duration::from_secs(1);
 /// A waiter learns of the owner's publish within this; at 10 ms a hundred
 /// polls a second is nothing, and a cargo slot is not held 100 ms for nothing.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -63,13 +66,14 @@ pub(crate) fn join_discovery(cache_dir: &Path, identity: &str) -> Option<StoreLo
     let path = cache_dir
         .join("scheduler/discovery")
         .join(blake3::hash(identity.as_bytes()).to_hex().as_str());
-    acquire_discovery(&path, WAIT_TIMEOUT, POLL_INTERVAL).unwrap_or_else(|error| {
+    acquire_within(&path, WAIT_TIMEOUT, POLL_INTERVAL).unwrap_or_else(|error| {
         tracing::debug!("discovery flight unavailable: {error:#}");
         None
     })
 }
 
-fn acquire_discovery(path: &Path, timeout: Duration, poll: Duration) -> Result<Option<StoreLock>> {
+/// Lock `path`, retrying until `timeout`. `None` when it stayed busy.
+fn acquire_within(path: &Path, timeout: Duration, poll: Duration) -> Result<Option<StoreLock>> {
     let start = std::time::Instant::now();
     let mut attempt = 0;
     loop {
@@ -445,7 +449,10 @@ impl Scheduler {
         }
         let lowest = slots.iter().map(|(index, _)| *index).min()?;
         let path = tests_dir(&self.root).join(lowest.to_string());
-        let marker = match StoreLock::try_acquire(&path) {
+        // Only the holder of a slot locks its marker, so a busy one is a
+        // compile checking for live tests, which lets go at once.
+        let wait = MARKER_WAIT.min(self.wait_timeout);
+        let marker = match acquire_within(&path, wait, self.poll_interval) {
             Ok(Some(marker)) => marker,
             Ok(None) | Err(_) => {
                 tracing::debug!("test lease marker busy; running without a lease");
@@ -2144,17 +2151,17 @@ mod tests {
     fn discovery_flights_hold_until_publish_and_fail_open() {
         let dir = temp_cache();
         let path = dir.path().join("discovery/unit");
-        let owner = acquire_discovery(&path, Duration::ZERO, Duration::ZERO)
+        let owner = acquire_within(&path, Duration::ZERO, Duration::ZERO)
             .unwrap()
             .unwrap();
         assert!(
-            acquire_discovery(&path, Duration::from_millis(20), Duration::from_millis(2))
+            acquire_within(&path, Duration::from_millis(20), Duration::from_millis(2))
                 .unwrap()
                 .is_none()
         );
         let waiter_path = path.clone();
         let waiter = std::thread::spawn(move || {
-            let guard = acquire_discovery(
+            let guard = acquire_within(
                 &waiter_path,
                 Duration::from_secs(5),
                 Duration::from_millis(2),
@@ -2170,7 +2177,7 @@ mod tests {
         drop(owner);
         waiter.join().unwrap();
         assert!(
-            acquire_discovery(&path, Duration::ZERO, Duration::ZERO)
+            acquire_within(&path, Duration::ZERO, Duration::ZERO)
                 .unwrap()
                 .is_some()
         );
@@ -2600,7 +2607,7 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_marker_releases_the_slots() {
+    fn a_marker_that_stays_busy_releases_the_slots() {
         let dir = temp_cache();
         let scheduler = budget_scheduler(dir.path(), 4);
         let stuck = StoreLock::try_acquire(&tests_dir(&scheduler.root).join("1"))
@@ -2610,6 +2617,26 @@ mod tests {
         assert_eq!(permits_in_use(dir.path()), Some(0), "the slot was released");
         drop(stuck);
         assert!(scheduler.acquire_test_lease(TestWant::Fixed(1)).is_some());
+    }
+
+    #[test]
+    fn a_lease_waits_for_a_compile_checking_its_marker() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 4);
+        let marker = tests_dir(&scheduler.root).join("1");
+        // A compile checking for live tests holds the marker shared for a
+        // moment.
+        fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
+        let check = fs::File::create(&marker).unwrap();
+        check.lock_shared().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(check);
+        });
+        let lease = scheduler.acquire_test_lease(TestWant::Fixed(1));
+        release.join().unwrap();
+        let lease = lease.expect("the check lets go, so the lease must get its marker");
+        assert_eq!(lease.marker_path(), marker);
     }
 
     #[test]

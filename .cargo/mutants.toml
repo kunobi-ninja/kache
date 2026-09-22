@@ -345,7 +345,7 @@ exclude_re = [
     "replace \\+= with \\*= in StoreLock::wait_until_available",
     "replace \\+= with \\*= in Scheduler::wait_for_permit",
     "replace \\+= with \\*= in wait_for_lock",
-    "replace \\+= with \\*= in acquire_discovery",
+    "replace \\+= with \\*= in acquire_within",
     # Printing rustc's captured stdout/stderr is gated on `!is_empty()`, so
     # dropping the gate prints an empty string: a no-op.
     "delete ! in run_parsed_rustc",

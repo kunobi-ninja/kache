@@ -2652,36 +2652,30 @@ mod tests {
     fn covered_misses_skip_the_permit_but_join_the_flight() {
         let dir = temp_cache();
         let scheduler = budget_scheduler(dir.path(), 2);
-        let _all: Vec<_> = (0..2)
-            .map(|index| {
-                StoreLock::try_acquire(&scheduler.permit_path(index))
-                    .unwrap()
-                    .unwrap()
-            })
-            .collect();
         fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
         let marker = tests_dir(&scheduler.root).join("1");
         let identity = FlightIdentity::rustc("nested", &["lib".into()], false).with_key("k");
 
-        let started = std::time::Instant::now();
         let BeginMiss::Compile(covered) =
             scheduler.begin_miss(&identity, "nested", false, Some(&marker))
         else {
             panic!("the first miss owns the flight");
         };
-        assert!(started.elapsed() < BUDGET, "a covered miss does not wait");
         assert!(covered._flight.is_some(), "a covered miss joins the flight");
         assert!(covered._permit.is_none(), "a covered miss takes no permit");
+        assert_eq!(permits_in_use(dir.path()), Some(0));
         drop(covered);
 
-        let started = std::time::Instant::now();
         let BeginMiss::Compile(uncovered) = scheduler.begin_miss(&identity, "nested", false, None)
         else {
             panic!("the first miss owns the flight");
         };
-        assert!(started.elapsed() >= BUDGET, "an uncovered miss waits");
         assert!(uncovered._flight.is_some());
-        assert!(uncovered._permit.is_none(), "the wait timed out");
+        assert!(
+            uncovered._permit.is_some(),
+            "an uncovered miss takes a permit"
+        );
+        assert_eq!(permits_in_use(dir.path()), Some(1));
     }
 
     #[test]

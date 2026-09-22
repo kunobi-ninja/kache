@@ -413,24 +413,17 @@ fn overlay_prefetch_join(
             continue;
         }
         for (cache_key, bytes, finished_at_ms, outcome) in prefetch_payloads(transfer) {
+            let packed = transfer
+                .accounting
+                .as_ref()
+                .is_some_and(|accounting| !accounting.entries.is_empty());
             if outcome == "not_found" {
                 get_not_found += 1;
-            } else {
-                let packed = transfer
-                    .accounting
-                    .as_ref()
-                    .is_some_and(|accounting| !accounting.entries.is_empty());
-                let error = if packed {
-                    outcome == "error"
-                } else {
-                    !transfer.ok
-                        && outcome != "cancelled"
-                        && outcome != "skipped"
-                        && outcome != "not_found"
-                };
-                if error {
-                    get_errors += 1;
-                }
+            } else if payload_errored(outcome, packed, transfer.ok) {
+                get_errors += 1;
+            }
+            if !payload_delivered(outcome, packed, transfer.ok) {
+                continue;
             }
             let Some(consumption) = keys.get(cache_key.as_str()) else {
                 continue;
@@ -453,6 +446,29 @@ fn overlay_prefetch_join(
     summary.get_not_found = get_not_found;
     summary.get_errors = get_errors;
     summary
+}
+
+/// Whether one payload counts as a failed GET. A packed entry carries its own
+/// outcome; a plain GET reports failure on the transfer, and `cancelled` and
+/// `skipped` are neutral rather than errors.
+fn payload_errored(outcome: &str, packed: bool, transfer_ok: bool) -> bool {
+    if outcome == "not_found" {
+        return false;
+    }
+    if packed {
+        outcome == "error"
+    } else {
+        !transfer_ok && outcome != "cancelled" && outcome != "skipped"
+    }
+}
+
+/// Whether one payload actually put its entry in the local store. A GET that
+/// was not found, errored, was cancelled or was skipped delivered nothing,
+/// even when the same key later shows up as a local hit that an earlier build
+/// stored. Counting those would credit prefetch for work it never did.
+fn payload_delivered(outcome: &str, packed: bool, transfer_ok: bool) -> bool {
+    !matches!(outcome, "not_found" | "cancelled" | "skipped" | "error")
+        && !payload_errored(outcome, packed, transfer_ok)
 }
 
 fn prefetch_payloads(transfer: &TimelineTransfer) -> Vec<(String, u64, u64, &str)> {
@@ -844,6 +860,96 @@ mod tests {
         assert_eq!(summary.useful_prefetch_keys, 0);
         assert_eq!(summary.get_errors, 1);
         assert_eq!(summary.get_not_found, 0);
+    }
+
+    #[test]
+    fn a_prefetch_that_was_not_found_never_counts_as_delivered() {
+        let mut observed = event("s1", "serde", "k1", 5_000, 500);
+        observed.demands = vec![kache_core::timeline::KeyDemand {
+            cache_key: "k1".to_string(),
+            first_demand_at_ms: 4_750,
+            remote_wait_ms: 0,
+        }];
+        let mut missing = transfer("k1", 1_000, 2_000);
+        missing.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            source: "advisory".into(),
+            ..Default::default()
+        });
+        missing.outcome = "not_found".into();
+        missing.compressed_bytes = 0;
+        let records = build_timelines(&inputs(
+            &[observed],
+            &[missing],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.get_not_found, 1);
+        assert_eq!(summary.consumed_prefetch_keys, 0);
+        assert_eq!(summary.useful_prefetch_keys, 0);
+    }
+
+    #[test]
+    fn an_errored_prefetch_never_counts_as_delivered() {
+        let mut observed = event("s1", "serde", "k1", 5_000, 500);
+        observed.demands = vec![kache_core::timeline::KeyDemand {
+            cache_key: "k1".to_string(),
+            first_demand_at_ms: 4_750,
+            remote_wait_ms: 0,
+        }];
+        let mut failed = transfer("k1", 1_000, 2_000);
+        failed.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            source: "advisory".into(),
+            ..Default::default()
+        });
+        failed.ok = false;
+        failed.outcome = "error".into();
+        failed.compressed_bytes = 80;
+        let records = build_timelines(&inputs(
+            &[observed],
+            &[failed],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.get_errors, 1);
+        assert_eq!(summary.consumed_prefetch_keys, 0);
+        assert_eq!(summary.consumed_prefetch_bytes, 0);
+        assert_eq!(summary.useful_prefetch_keys, 0);
+        assert_eq!(summary.useful_prefetch_bytes, 0);
+    }
+
+    #[test]
+    fn a_packed_entry_that_errored_never_counts_as_delivered() {
+        let mut pack = transfer("", 1_000, 2_000);
+        pack.prefetch = Some(kache_core::timeline::PrefetchOrigin {
+            session_id: "s1".into(),
+            ..Default::default()
+        });
+        pack.accounting = Some(kache_core::timeline::PrefetchAccounting {
+            bytes_complete: true,
+            requests_complete: true,
+            entries: vec![kache_core::timeline::PackedEntryTransfer {
+                cache_key: "k1".into(),
+                compressed_bytes: 100,
+                finished_at_ms: 1_900,
+                outcome: "error".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let records = build_timelines(&inputs(
+            &[event("s1", "serde", "k1", 5_000, 100)],
+            &[pack],
+            &[],
+            &EnvSnapshot::default(),
+        ));
+        let summary = records[0].summary.as_ref().expect("join summary");
+        assert_eq!(summary.get_errors, 1);
+        assert_eq!(summary.consumed_prefetch_keys, 0);
+        assert_eq!(summary.useful_prefetch_keys, 0);
     }
 
     #[test]

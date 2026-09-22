@@ -851,7 +851,14 @@ fn admit_scheduler_miss(
     }
     let identity = identity.with_key(cache_key);
     loop {
-        match scheduler::begin_miss(&config.cache_dir, true, &identity, crate_name, is_link) {
+        match scheduler::begin_miss(
+            &config.cache_dir,
+            true,
+            &identity,
+            crate_name,
+            is_link,
+            config.test_lease.as_deref(),
+        ) {
             scheduler::BeginMiss::Recheck => {
                 if let Some(meta) = take_recheck_hit(store, cache_key, &entry_ok) {
                     return (MissGuard::empty(), Some(meta));
@@ -14518,7 +14525,7 @@ exit 0
         let crate_name = std::env::var("KACHE_TEST_FLIGHT_CRATE").expect("fixture crate name");
         let key = std::env::var("KACHE_TEST_FLIGHT_KEY").expect("fixture cache key");
         let identity = FlightIdentity::rustc(&crate_name, &["lib".into()], false).with_key(&key);
-        let guard = match scheduler::begin_miss(&root, true, &identity, &crate_name, false) {
+        let guard = match scheduler::begin_miss(&root, true, &identity, &crate_name, false, None) {
             scheduler::BeginMiss::Compile(guard) => guard,
             scheduler::BeginMiss::Recheck => panic!("fixture must own the flight"),
         };

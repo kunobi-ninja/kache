@@ -451,6 +451,11 @@ pub struct Config {
     /// `KACHE_SCHEDULER=0`/`false` or `[cache] scheduler = false` to disable.
     /// An unusable scheduler directory fails open and compiles without a permit.
     pub scheduler: bool,
+    /// Lease marker of the `kache test-runner` test this process runs under,
+    /// from `KACHE_TEST_LEASE`. A miss under a covering lease joins the
+    /// flight but takes no permit: the test holds slots already. Operational,
+    /// so `ignore_env` does not gate it.
+    pub test_lease: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1762,6 +1767,7 @@ impl Config {
             .unwrap_or(DEFAULT_HEARTBEAT_SECS);
         let explain_miss = Self::explain_miss_enabled(&file_config);
         let scheduler = Self::scheduler_enabled(&file_config);
+        let test_lease = std::env::var_os(crate::scheduler::TEST_LEASE_ENV).map(PathBuf::from);
         // A remote that cannot be resolved must NOT fail the build. `Config::load`
         // runs on the rustc-wrapper hot path (`run_wrapper_mode`), where returning
         // an error means the compiler never runs at all — a config typo would
@@ -1810,6 +1816,7 @@ impl Config {
             heartbeat_secs,
             explain_miss,
             scheduler,
+            test_lease,
             cache_executables,
             cache_cc_links,
             trust_codegen_backends,
@@ -6114,6 +6121,7 @@ remote_key_cache_refresh_secs = 900
             heartbeat_secs: 30,
             explain_miss: false,
             scheduler: true,
+            test_lease: None,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
@@ -6178,6 +6186,7 @@ remote_key_cache_refresh_secs = 900
             heartbeat_secs: 30,
             explain_miss: false,
             scheduler: true,
+            test_lease: None,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
@@ -6238,6 +6247,7 @@ remote_key_cache_refresh_secs = 900
             heartbeat_secs: 30,
             explain_miss: false,
             scheduler: true,
+            test_lease: None,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
@@ -6317,6 +6327,7 @@ remote_key_cache_refresh_secs = 900
             heartbeat_secs: 30,
             explain_miss: false,
             scheduler: true,
+            test_lease: None,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),
@@ -7386,6 +7397,25 @@ exclude = ["src/generated/**", "vendor/problem/**"]
         assert!(
             !Config::load().unwrap().scheduler,
             "ignore_env must keep [cache] scheduler = false"
+        );
+    }
+
+    #[test]
+    fn test_lease_comes_from_the_environment_even_with_ignore_env() {
+        let _guard = config_path_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("kache/config.toml");
+        let _env_guard = set_kache_config_for_test(&config_path);
+        let _missing = NamedEnvGuard::remove("KACHE_TEST_LEASE");
+        assert_eq!(Config::load().unwrap().test_lease, None);
+
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "[cache]\nignore_env = true\n").unwrap();
+        let _lease = NamedEnvGuard::set("KACHE_TEST_LEASE", "/cache/scheduler/tests/1");
+        assert_eq!(
+            Config::load().unwrap().test_lease,
+            Some(PathBuf::from("/cache/scheduler/tests/1")),
+            "the lease is operational, so ignore_env does not hide it"
         );
     }
 

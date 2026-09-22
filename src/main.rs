@@ -64,6 +64,7 @@ mod since;
 use kache_store::sharing;
 mod compiler_store;
 use compiler_store as store;
+mod test_runner;
 #[cfg(test)]
 mod test_support;
 mod timeline;
@@ -638,10 +639,26 @@ fn entry_route(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> EntryRo
     EntryRoute::Argv
 }
 
+/// The test binary and its arguments when kache runs as a Cargo target
+/// runner (`kache test-runner <binary> <args>`).
+fn test_runner_args(raw_args: &[std::ffi::OsString]) -> Option<&[std::ffi::OsString]> {
+    match raw_args.get(1) {
+        Some(arg) if arg == "test-runner" => Some(&raw_args[2..]),
+        _ => None,
+    }
+}
+
 fn main() -> Result<()> {
     // First, before argv or config: `startup_ms` on every build event is
     // measured from here.
     opcounts::mark_process_start();
+    // Cargo target runner. Checked before the probe and shim guards, which
+    // exit without running anything: a test must always run.
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(args) = test_runner_args(&raw_args) {
+        init_logging(LogMode::Wrapper);
+        std::process::exit(test_runner::run(args));
+    }
     if std::env::var_os("KACHE_FAMILY_PROBE_ACTIVE").is_some() {
         // Prevent unbounded recursion when a probed wrapper calls back into kache.
         return Ok(());
@@ -656,7 +673,6 @@ fn main() -> Result<()> {
     // Keep the original argv byte-preserving for `kache cargo`. Compiler
     // adapters still parse UTF-8 option syntax; a wrapper invocation with a
     // non-UTF-8 path is detected here and fails closed below.
-    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let env_args: Option<Vec<String>> = raw_args
         .iter()
         .cloned()
@@ -1848,6 +1864,31 @@ mod tests {
             "{argv}"
         );
         assert!(!argv.contains(&format!("-Cincremental={}\n", incremental.display())));
+    }
+
+    #[test]
+    fn test_runner_args_take_everything_after_the_subcommand() {
+        let os = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+        let argv = os(&[
+            "kache",
+            "test-runner",
+            "/t/probe-0123456789abcdef",
+            "--exact",
+        ]);
+        assert_eq!(
+            test_runner_args(&argv),
+            Some(&argv[2..]),
+            "the binary and its arguments"
+        );
+        let bare = os(&["kache", "test-runner"]);
+        assert_eq!(test_runner_args(&bare), Some(&bare[2..]));
+        assert_eq!(
+            test_runner_args(&os(&["kache", "rustc", "test-runner"])),
+            None
+        );
+        assert_eq!(test_runner_args(&os(&["kache"])), None);
     }
 
     #[test]

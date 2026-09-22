@@ -59,7 +59,8 @@ impl TestEnv {
 pub(crate) enum Plan {
     /// Run it unchanged.
     Exec,
-    /// Take a test lease first. `key` names the binary's RSS history.
+    /// Take a test lease first. `key` names the RSS history: the binary's,
+    /// or the test's under nextest's process-per-test mode.
     Schedule { key: String, want: TestWant },
 }
 
@@ -101,12 +102,16 @@ pub(crate) fn plan(args: &[OsString], env: &TestEnv, cache_dir: Option<&Path>) -
     if scheduler::lease_covers(env.lease.as_deref(), &root) {
         return Plan::Exec;
     }
-    let key = format!(
-        "test:{}:{stem}",
-        env.pkg_name.as_deref().unwrap_or_default()
-    );
+    let per_test = env.nextest_mode.as_deref() == Some("process-per-test");
+    let pkg = env.pkg_name.as_deref().unwrap_or_default();
+    // A process that runs one test keeps that test's history. A sample
+    // shared by the binary would give every test the last one's memory.
+    let key = match if per_test { exact_test(rest) } else { None } {
+        Some(test) => format!("test:{pkg}:{stem}:{test}"),
+        None => format!("test:{pkg}:{stem}"),
+    };
     let floor = scheduler::test_floor(cache_dir, &key);
-    let want = if env.nextest_mode.as_deref() == Some("process-per-test") {
+    let want = if per_test {
         TestWant::Fixed(floor)
     } else if let Some(threads) = declared_threads(rest, env.rust_test_threads.as_deref()) {
         TestWant::Fixed(threads.max(floor))
@@ -125,6 +130,14 @@ pub(crate) fn artifact_stem(program: &OsStr) -> Option<&str> {
     let (stem, hash) = name.rsplit_once('-')?;
     let hashed = hash.len() == 16 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     hashed.then_some(stem)
+}
+
+/// The one test nextest runs in this process: the argument after `--exact`.
+pub(crate) fn exact_test(args: &[OsString]) -> Option<&str> {
+    let at = args.iter().position(|arg| arg == "--exact")?;
+    args.get(at + 1)?
+        .to_str()
+        .filter(|test| !test.starts_with('-'))
 }
 
 /// Threads the binary was told to use: the first valid `--test-threads N`
@@ -508,6 +521,56 @@ mod tests {
             ..env()
         };
         assert_eq!(want(&[PROBE], &per_test), TestWant::Fixed(3));
+    }
+
+    #[test]
+    fn exact_test_is_the_argument_after_exact() {
+        assert_eq!(
+            exact_test(&os(&["--exact", "mod::t", "--nocapture"])),
+            Some("mod::t")
+        );
+        assert_eq!(exact_test(&os(&["--nocapture", "--exact", "t"])), Some("t"));
+        assert_eq!(exact_test(&os(&["--exact", "--nocapture"])), None);
+        assert_eq!(exact_test(&os(&["--exact"])), None);
+        assert_eq!(exact_test(&os(&["t", "--nocapture"])), None);
+    }
+
+    #[test]
+    fn per_test_runs_keep_their_own_rss_history() {
+        const SLOT: u64 = 512 * 1024 * 1024;
+        let cache = tempfile::tempdir().unwrap();
+        let per_test = TestEnv {
+            nextest_mode: Some("process-per-test".into()),
+            ..env()
+        };
+        let plan_of = |test: &str| {
+            plan(
+                &os(&[PROBE, "--exact", test, "--nocapture"]),
+                &per_test,
+                Some(cache.path()),
+            )
+        };
+        let Plan::Schedule { key: heavy, .. } = plan_of("heavy") else {
+            panic!("hashed binary must be scheduled");
+        };
+        assert_eq!(heavy, "test:demo:probe:heavy");
+        // The heavy test finished last and recorded its peak.
+        scheduler::write_test_weight(cache.path(), &heavy, 3 * SLOT);
+        assert_eq!(
+            plan_of("heavy"),
+            Plan::Schedule {
+                key: heavy.clone(),
+                want: TestWant::Fixed(3),
+            }
+        );
+        assert_eq!(
+            plan_of("light"),
+            Plan::Schedule {
+                key: "test:demo:probe:light".into(),
+                want: TestWant::Fixed(1),
+            },
+            "a light test does not ask for the heavy one's memory"
+        );
     }
 
     #[test]

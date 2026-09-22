@@ -220,7 +220,12 @@ fn run_scheduled(
     key: &str,
     want: TestWant,
 ) -> i32 {
-    let lease = scheduler::acquire_test_lease(cache_dir, want, wait_budget(env));
+    let lease = scheduler::acquire_test_lease(
+        cache_dir,
+        scheduler::default_pool_size(),
+        want,
+        wait_budget(env),
+    );
     let mut command = Command::new(&args[0]);
     command.args(&args[1..]);
     if let Some(lease) = &lease {

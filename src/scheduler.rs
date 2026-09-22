@@ -561,13 +561,19 @@ impl TestLease {
     }
 }
 
-/// Take test slots for a test binary, waiting at most `wait`.
+/// Take test slots for a test binary from a pool of `pool` slots, waiting at
+/// most `wait`. The runner passes [`default_pool_size`].
 ///
 /// `None` means run without a lease: the scheduler directory is unusable,
 /// the pool has no slots above the reserve, the wait timed out, or a
 /// marker could not be locked.
-pub fn acquire_test_lease(cache_dir: &Path, want: TestWant, wait: Duration) -> Option<TestLease> {
-    match Scheduler::open_with(cache_dir, default_pool_size(), wait, POLL_INTERVAL) {
+pub fn acquire_test_lease(
+    cache_dir: &Path,
+    pool: u32,
+    want: TestWant,
+    wait: Duration,
+) -> Option<TestLease> {
+    match Scheduler::open_with(cache_dir, pool, wait, POLL_INTERVAL) {
         Ok(scheduler) => scheduler.acquire_test_lease(want),
         Err(error) => {
             tracing::debug!("scheduler unusable ({error:#}); running without a lease");
@@ -2737,25 +2743,21 @@ mod tests {
     }
 
     #[test]
-    fn acquire_test_lease_fails_open_and_uses_the_machine_pool() {
+    fn acquire_test_lease_fails_open_and_uses_the_given_pool() {
         let dir = temp_cache();
         fs::write(dir.path().join("scheduler"), b"not a directory").unwrap();
-        assert!(acquire_test_lease(dir.path(), TestWant::Fixed(1), BUDGET).is_none());
+        assert!(acquire_test_lease(dir.path(), 4, TestWant::Fixed(1), BUDGET).is_none());
 
+        // A fixed pool, so this holds on a one-CPU host too.
         let dir = temp_cache();
-        let lease = acquire_test_lease(dir.path(), TestWant::Elastic(1), BUDGET);
-        let pool = default_pool_size();
-        assert_eq!(
-            lease.as_ref().map(TestLease::held),
-            (pool > 1).then(|| pool - reserve_for(pool))
-        );
-        if let Some(lease) = lease {
-            assert!(lease.marker_path().is_absolute());
-            assert!(lease_covers(
-                Some(lease.marker_path()),
-                &scheduler_root(dir.path())
-            ));
-        }
+        let lease = acquire_test_lease(dir.path(), 4, TestWant::Elastic(1), BUDGET)
+            .expect("a pool of 4 has three test slots");
+        assert_eq!(lease.held(), 3);
+        assert!(lease.marker_path().is_absolute());
+        assert!(lease_covers(
+            Some(lease.marker_path()),
+            &scheduler_root(dir.path())
+        ));
     }
 
     #[test]

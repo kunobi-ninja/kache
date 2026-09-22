@@ -191,6 +191,51 @@ fn wait_for_file(path: &Path, child: &mut Child) {
     }
 }
 
+/// Wait until the runner ignores SIGINT and SIGQUIT and catches SIGTERM and
+/// SIGHUP. It sets them up only after it spawns the test, so a test that is
+/// ready says nothing about the runner. Linux shows them in /proc; elsewhere
+/// a grace period stands in.
+fn wait_for_handlers(child: &mut Child) {
+    #[cfg(target_os = "linux")]
+    {
+        let status = format!("/proc/{}/status", child.id());
+        let bit = |signal: libc::c_int| 1u64 << (signal - 1);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let text = fs::read_to_string(&status).unwrap_or_default();
+            let mask = |field: &str| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(field))
+                    .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+                    .unwrap_or(0)
+            };
+            let ignored = mask("SigIgn:");
+            let caught = mask("SigCgt:");
+            if ignored & bit(libc::SIGINT) != 0
+                && ignored & bit(libc::SIGQUIT) != 0
+                && caught & bit(libc::SIGTERM) != 0
+                && caught & bit(libc::SIGHUP) != 0
+            {
+                return;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the runner exited before it handled signals"
+            );
+            if Instant::now() >= deadline {
+                kill_group(child);
+                panic!("the runner never set up its signal handlers:\n{text}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = child;
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// The permit pool size kache uses on this machine.
 fn pool() -> u32 {
     std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
@@ -341,7 +386,7 @@ fn termination_reaches_the_test_and_interrupts_do_not_kill_the_runner() {
         .spawn()
         .unwrap();
     wait_for_file(&fixture.path().join("ready"), &mut child);
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for_handlers(&mut child);
     let pid = child.id() as libc::pid_t;
 
     // SAFETY: signals the runner process only.

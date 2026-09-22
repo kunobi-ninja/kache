@@ -24,10 +24,11 @@
 //!
 //! Test binaries run through `kache test-runner` take slots too, but only
 //! above the compile reserve ([`reserve_for`]), so a compile always has a
-//! slot to wait for. A running test holds a marker under `scheduler/tests/`
-//! and passes its path to its children in [`TEST_LEASE_ENV`]. A compile or
-//! test runner started under that marker is covered by the test's slots and
-//! takes none of its own; see [`lease_covers`].
+//! slot to wait for. A running test holds a marker per slot under
+//! `scheduler/tests/` and passes the path of its lowest one to its children
+//! in [`TEST_LEASE_ENV`]. A compile or test runner started under that marker
+//! is covered by the test's slots and takes none of its own; see
+//! [`lease_covers`].
 
 use anyhow::Result;
 use std::fs;
@@ -390,7 +391,7 @@ impl Scheduler {
         let _trace = crate::phase_trace::phase("permit_wait");
         let started = std::time::Instant::now();
         let slots = self.wait_for_permit(0..self.pool_size, || {
-            compile_need(weight, self.pool_size, || tests_live(&self.root))
+            compile_need(weight, self.pool_size, || tests_held(&self.root))
         });
         crate::opcounts::record_permit_wait(started.elapsed());
         slots.map(|slots| Permit { _slots: slots })
@@ -447,23 +448,33 @@ impl Scheduler {
         if elastic {
             slots.extend(self.take_free_slots(range));
         }
+        // One marker per slot, so a compile can count the slots tests hold.
+        let markers = slots
+            .iter()
+            .map(|(index, _)| self.lock_marker(*index))
+            .collect::<Option<Vec<_>>>()?;
         let lowest = slots.iter().map(|(index, _)| *index).min()?;
         let path = tests_dir(&self.root).join(lowest.to_string());
-        // Only the holder of a slot locks its marker, so a busy one is a
-        // compile checking for live tests, which lets go at once.
-        let wait = MARKER_WAIT.min(self.wait_timeout);
-        let marker = match acquire_within(&path, wait, self.poll_interval) {
-            Ok(Some(marker)) => marker,
-            Ok(None) | Err(_) => {
-                tracing::debug!("test lease marker busy; running without a lease");
-                return None;
-            }
-        };
         Some(TestLease {
-            _marker: marker,
+            _markers: markers,
             marker_path: std::path::absolute(&path).unwrap_or(path),
             _slots: slots,
         })
+    }
+
+    /// Lock the marker of test slot `index`. Only the holder of a slot locks
+    /// its marker, so a busy one is a compile counting markers, which lets
+    /// go at once.
+    fn lock_marker(&self, index: u32) -> Option<StoreLock> {
+        let path = tests_dir(&self.root).join(index.to_string());
+        let wait = MARKER_WAIT.min(self.wait_timeout);
+        let marker = acquire_within(&path, wait, self.poll_interval)
+            .ok()
+            .flatten();
+        if marker.is_none() {
+            tracing::debug!("test lease marker busy; running without a lease");
+        }
+        marker
     }
 
     /// Lock every free slot in `range` without waiting. A slot this process
@@ -494,15 +505,16 @@ pub(crate) fn test_need(want: u32, pool: u32) -> u32 {
 
 /// Slots a compile of `weight` asks for.
 ///
-/// While a test holds slots, a compile heavier than the reserve asks for the
-/// reserve instead. The test may be waiting on this very compile, and it
-/// never takes reserve slots, so this is what keeps both moving. Only the
-/// heavy case calls `tests_live`.
-pub(crate) fn compile_need(weight: u32, pool: u32, tests_live: impl FnOnce() -> bool) -> u32 {
+/// A compile heavier than the reserve asks for no more than the slots tests
+/// leave, and never less than the reserve. A test may be waiting on this
+/// very compile, and tests never take reserve slots, so this is what keeps
+/// both moving. Only the heavy case calls `tests_held`, which counts the
+/// slots tests hold.
+pub(crate) fn compile_need(weight: u32, pool: u32, tests_held: impl FnOnce() -> u32) -> u32 {
     let need = weight.clamp(1, pool);
     let reserve = reserve_for(pool);
-    if need > reserve && tests_live() {
-        reserve
+    if need > reserve {
+        need.min(pool.saturating_sub(tests_held()).max(reserve))
     } else {
         need
     }
@@ -519,11 +531,11 @@ pub enum TestWant {
 
 /// Slots held by a running test binary.
 ///
-/// `_marker` is the file its children find through [`TEST_LEASE_ENV`]. It
-/// is declared first so it is released before the slots: whoever takes the
-/// lowest slot next can always lock the same marker.
+/// `_markers` holds one marker per slot. Its children find the lowest one
+/// through [`TEST_LEASE_ENV`]. They are declared first so they are released
+/// before the slots: whoever takes a slot next can always lock its marker.
 pub struct TestLease {
-    _marker: StoreLock,
+    _markers: Vec<StoreLock>,
     marker_path: PathBuf,
     _slots: Vec<(u32, StoreLock)>,
 }
@@ -543,7 +555,7 @@ impl TestLease {
 /// Take test slots for a test binary, waiting at most `wait`.
 ///
 /// `None` means run without a lease: the scheduler directory is unusable,
-/// the pool has no slots above the reserve, the wait timed out, or the
+/// the pool has no slots above the reserve, the wait timed out, or a
 /// marker could not be locked.
 pub fn acquire_test_lease(cache_dir: &Path, want: TestWant, wait: Duration) -> Option<TestLease> {
     match Scheduler::open_with(cache_dir, default_pool_size(), wait, POLL_INTERVAL) {
@@ -588,18 +600,24 @@ pub(crate) fn lease_covers(lease: Option<&Path>, root: &Path) -> bool {
     }
 }
 
-/// Whether any test lease marker is held. A directory that cannot be read
-/// counts as live, so a compile errs toward the smaller need.
-fn tests_live(root: &Path) -> bool {
+/// Slots test leases hold: the held markers, one per slot. A marker or
+/// directory that cannot be probed counts as every slot, so a compile errs
+/// toward the smaller need.
+fn tests_held(root: &Path) -> u32 {
     let entries = match fs::read_dir(tests_dir(root)) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(_) => return u32::MAX,
     };
-    entries.into_iter().any(|entry| match entry {
-        Ok(entry) => slot_is_held(&entry.path()) != Some(false),
-        Err(_) => true,
-    })
+    let mut held = 0;
+    for entry in entries {
+        match entry.ok().and_then(|entry| slot_is_held(&entry.path())) {
+            Some(true) => held += 1,
+            Some(false) => {}
+            None => return u32::MAX,
+        }
+    }
+    held
 }
 
 fn tests_dir(root: &Path) -> PathBuf {
@@ -2369,31 +2387,46 @@ mod tests {
     }
 
     #[test]
-    fn compile_need_caps_heavy_compiles_only_while_tests_run() {
+    fn compile_need_caps_heavy_compiles_at_what_tests_leave() {
         use std::cell::Cell;
         let calls = Cell::new(0);
-        let live = |answer: bool| {
+        let held = |answer: u32| {
             let calls = &calls;
             move || {
                 calls.set(calls.get() + 1);
                 answer
             }
         };
-        // Pool 8: reserve 2.
-        assert_eq!(compile_need(2, 8, live(true)), 2);
+        // Pool 8: reserve 2, test slots 2..8.
+        assert_eq!(compile_need(2, 8, held(6)), 2);
         assert_eq!(
             calls.get(),
             0,
             "a compile no heavier than the reserve never asks"
         );
-        assert_eq!(compile_need(1, 8, live(true)), 1);
+        assert_eq!(compile_need(1, 8, held(6)), 1);
         assert_eq!(calls.get(), 0);
-        assert_eq!(compile_need(3, 8, live(true)), 2, "capped at the reserve");
+        assert_eq!(
+            compile_need(3, 8, held(6)),
+            2,
+            "tests hold every test slot: the reserve"
+        );
         assert_eq!(calls.get(), 1);
-        assert_eq!(compile_need(3, 8, live(false)), 3, "no tests, no cap");
-        assert_eq!(calls.get(), 2);
-        assert_eq!(compile_need(20, 8, live(false)), 8, "clamped to the pool");
-        assert_eq!(compile_need(0, 8, live(false)), 1, "at least one slot");
+        assert_eq!(
+            compile_need(7, 8, held(1)),
+            7,
+            "one test slot held leaves seven"
+        );
+        assert_eq!(compile_need(8, 8, held(1)), 7);
+        assert_eq!(compile_need(8, 8, held(4)), 4);
+        assert_eq!(compile_need(3, 8, held(0)), 3, "no tests, no cap");
+        assert_eq!(
+            compile_need(8, 8, held(u32::MAX)),
+            2,
+            "unknown counts as every slot"
+        );
+        assert_eq!(compile_need(20, 8, held(0)), 8, "clamped to the pool");
+        assert_eq!(compile_need(0, 8, held(0)), 1, "at least one slot");
     }
 
     #[test]
@@ -2439,25 +2472,45 @@ mod tests {
     }
 
     #[test]
-    fn tests_live_sees_only_held_markers() {
+    fn tests_held_counts_held_markers() {
         let dir = temp_cache();
         let root = scheduler_root(dir.path());
-        assert!(!tests_live(&root), "no tests directory yet");
-        let marker = tests_dir(&root).join("1");
-        let held = StoreLock::try_acquire(&marker).unwrap().unwrap();
-        assert!(tests_live(&root));
-        drop(held);
-        assert!(!tests_live(&root), "a released marker is not live");
+        assert_eq!(tests_held(&root), 0, "no tests directory yet");
+        let one = StoreLock::try_acquire(&tests_dir(&root).join("1"))
+            .unwrap()
+            .unwrap();
+        let two = StoreLock::try_acquire(&tests_dir(&root).join("2"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(tests_held(&root), 2);
+        drop(one);
+        assert_eq!(tests_held(&root), 1, "a released marker is not held");
+        drop(two);
+        assert_eq!(tests_held(&root), 0);
     }
 
     #[cfg(unix)]
     #[test]
-    fn tests_live_counts_an_unreadable_directory_as_live() {
+    fn tests_held_counts_an_unreadable_directory_as_every_slot() {
         let dir = temp_cache();
         let root = scheduler_root(dir.path());
         fs::create_dir_all(&root).unwrap();
         fs::write(tests_dir(&root), b"not a directory").unwrap();
-        assert!(tests_live(&root));
+        assert_eq!(tests_held(&root), u32::MAX);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tests_held_counts_an_unprobeable_marker_as_every_slot() {
+        let dir = temp_cache();
+        let root = scheduler_root(dir.path());
+        let _held = StoreLock::try_acquire(&tests_dir(&root).join("1"))
+            .unwrap()
+            .unwrap();
+        // A marker that links to itself fails to open with ELOOP, so it is
+        // neither held nor free.
+        std::os::unix::fs::symlink("2", tests_dir(&root).join("2")).unwrap();
+        assert_eq!(tests_held(&root), u32::MAX);
     }
 
     #[test]
@@ -2502,6 +2555,7 @@ mod tests {
         assert_eq!(lease.held(), 6);
         assert_eq!(lease.marker_path(), tests_dir(&scheduler.root).join("2"));
         assert_eq!(permits_in_use(dir.path()), Some(6));
+        assert_eq!(tests_held(&scheduler.root), 6, "a marker per slot");
         for index in 0..2 {
             assert!(
                 StoreLock::try_acquire(&scheduler.permit_path(index))
@@ -2531,6 +2585,22 @@ mod tests {
         assert!(permit.is_some(), "a pool-sized compile takes the reserve");
         assert!(started.elapsed() < BUDGET);
         assert_eq!(permits_in_use(dir.path()), Some(4));
+    }
+
+    #[test]
+    fn heavy_compiles_take_what_tests_leave() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 8);
+        let _test = scheduler.acquire_test_lease(TestWant::Fixed(1)).unwrap();
+        let started = std::time::Instant::now();
+        let permit = scheduler.acquire_permit(8);
+        assert!(permit.is_some(), "the seven slots the test leaves");
+        assert!(started.elapsed() < BUDGET);
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(8),
+            "one test slot and seven compile slots, not just the reserve"
+        );
     }
 
     #[test]

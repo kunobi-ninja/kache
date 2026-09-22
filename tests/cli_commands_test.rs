@@ -28,8 +28,13 @@ const KACHE_BIN: &str = env!("CARGO_BIN_EXE_kache");
 /// config path, and HOME/CARGO_HOME so nothing touches the developer's real
 /// setup and no background daemon is contacted.
 fn kache(home: &Path, cache_dir: &Path) -> Command {
+    kache_as(Path::new(KACHE_BIN), home, cache_dir)
+}
+
+/// [`kache`], run through `program`: a compiler shim or a link to the binary.
+fn kache_as(program: &Path, home: &Path, cache_dir: &Path) -> Command {
     let mut cmd = Command::from(hermetic_command(
-        KACHE_BIN,
+        program,
         cache_dir,
         Some(&cache_dir.join("config.toml")),
     ));
@@ -1736,6 +1741,101 @@ fn init_leaves_unsupported_shells_and_managed_dotfiles_alone() {
     );
     assert!(!e.home.join(".bash_profile").exists());
     assert!(!e.home.join(".local/lib/kache/shims").exists());
+}
+
+/// A second kache binary at `link`: a hard link to the one under test, which
+/// resolves to its own path as a separate install does. A copy when the
+/// scratch directory is on another filesystem.
+#[cfg(unix)]
+fn second_kache_binary(link: &Path) {
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    if std::fs::hard_link(KACHE_BIN, link).is_err() {
+        std::fs::copy(KACHE_BIN, link).unwrap();
+    }
+}
+
+/// A PATH layout for shim tests: `dirs` in order, then a directory with a
+/// real `cc` that prints its arguments, then the system directories.
+#[cfg(unix)]
+fn shim_test_path(root: &Path, dirs: &[&Path]) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+    let real = root.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let cc = real.join("cc");
+    std::fs::write(&cc, "#!/bin/sh\necho \"real cc: $*\"\n").unwrap();
+    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path: Vec<&Path> = dirs.to_vec();
+    path.extend([real.as_path(), Path::new("/usr/bin"), Path::new("/bin")]);
+    std::env::join_paths(path).unwrap()
+}
+
+/// Two kache installs, each with a shim farm on PATH, must both reach the
+/// real compiler. Before the fix each resolved the other's shim as the real
+/// `cc`, and the two ran each other without end.
+#[cfg(unix)]
+#[test]
+fn two_kache_installs_on_path_do_not_run_each_other() {
+    let e = env();
+    let root = tempfile::Builder::new()
+        .tempdir_in(Path::new(KACHE_BIN).parent().unwrap())
+        .unwrap();
+    let root = root.path();
+    let other_kache = root.join("other-install/bin/kache");
+    second_kache_binary(&other_kache);
+
+    let shims_a = root.join("shims-a");
+    let shims_b = root.join("shims-b");
+    std::fs::create_dir_all(&shims_a).unwrap();
+    std::fs::create_dir_all(&shims_b).unwrap();
+    std::os::unix::fs::symlink(KACHE_BIN, shims_a.join("cc")).unwrap();
+    std::os::unix::fs::symlink(&other_kache, shims_b.join("cc")).unwrap();
+    let path = shim_test_path(root, &[&shims_a, &shims_b]);
+
+    for shim in [&shims_a, &shims_b] {
+        kache_as(&shim.join("cc"), &e.home, &e.cache)
+            .env("PATH", &path)
+            .arg("--version")
+            .timeout(std::time::Duration::from_secs(60))
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("real cc: --version"));
+    }
+}
+
+/// Shims kache cannot identify, copies with a compiler's name and no marker,
+/// still loop. The wrapper depth bound must stop that loop with an error
+/// that names the fix, and the marker must then break it.
+#[cfg(unix)]
+#[test]
+fn unidentifiable_shims_stop_at_the_depth_bound_until_marked() {
+    let e = env();
+    let root = tempfile::Builder::new()
+        .tempdir_in(Path::new(KACHE_BIN).parent().unwrap())
+        .unwrap();
+    let root = root.path();
+    let copies_a = root.join("copies-a");
+    let copies_b = root.join("copies-b");
+    second_kache_binary(&copies_a.join("cc"));
+    second_kache_binary(&copies_b.join("cc"));
+    let path = shim_test_path(root, &[&copies_a, &copies_b]);
+
+    kache_as(&copies_a.join("cc"), &e.home, &e.cache)
+        .env("PATH", &path)
+        .arg("--version")
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("loop"))
+        .stderr(predicates::str::contains(".kache-shims"));
+
+    std::fs::write(copies_b.join(".kache-shims"), "").unwrap();
+    kache_as(&copies_a.join("cc"), &e.home, &e.cache)
+        .env("PATH", &path)
+        .arg("--version")
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("real cc: --version"));
 }
 
 #[test]

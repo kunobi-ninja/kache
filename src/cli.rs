@@ -12929,6 +12929,12 @@ fn install_shims_named_with_output(
             .with_context(|| format!("creating shim {}", link.display()))?;
         created.push(name.clone());
     }
+    // Mark only a directory this run put shims into. Marking one where every
+    // name was already taken would hide those files from every kache.
+    if !created.is_empty() {
+        crate::compiler::shim::write_shim_marker(dir)
+            .with_context(|| format!("marking shim directory {}", dir.display()))?;
+    }
 
     if !verbose {
         return Ok(());
@@ -13255,9 +13261,33 @@ mod shim_install_tests {
         }
         assert_eq!(
             std::fs::read_dir(&shims).unwrap().count(),
-            SHIM_NAMES.len(),
-            "reinstall must not accumulate entries"
+            SHIM_NAMES.len() + 1,
+            "reinstall must not accumulate entries beyond the shims and the marker"
         );
+    }
+
+    /// Another kache install on PATH finds this farm by its marker, so it can
+    /// skip the farm even when the shims are not symlinks to a `kache` file.
+    #[test]
+    fn install_marks_the_directory_it_populates() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        install_shims(&shims, false).unwrap();
+        assert!(crate::compiler::shim::has_shim_marker(&shims));
+    }
+
+    /// A run that created nothing leaves the directory unmarked: every name
+    /// there belongs to something else, and a marker would hide it.
+    #[test]
+    fn install_that_creates_nothing_does_not_mark_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let shims = dir.path().join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        for name in SHIM_NAMES {
+            std::fs::write(shims.join(name), b"a real compiler").unwrap();
+        }
+        install_shims(&shims, false).unwrap();
+        assert!(!crate::compiler::shim::has_shim_marker(&shims));
     }
 
     /// An inspection failure that is NOT "missing" must surface rather than be

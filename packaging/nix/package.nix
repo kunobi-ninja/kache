@@ -90,6 +90,9 @@ buildRustPackage {
     for name in cc c++ gcc g++ clang clang++; do
       ln -s $out/bin/kache $out/lib/kache/$name
     done
+    # Marks the farm so another kache on PATH skips it (see
+    # compiler::shim::SHIM_DIR_MARKER).
+    touch $out/lib/kache/.kache-shims
     ln -s lib/kache $out/shims
   '';
 

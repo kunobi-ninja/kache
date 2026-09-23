@@ -166,10 +166,7 @@ impl Platform for MacOsPlatform {
         // is gated below — a Linux test that calls into this method
         // gets Ok(()) because the host check fails, no `codesign`
         // process is spawned.
-        if std::env::consts::ARCH != "aarch64" {
-            return Ok(Loadability::Unverified);
-        }
-        if std::env::consts::OS != "macos" {
+        if !signs_on_load(std::env::consts::ARCH, std::env::consts::OS) {
             return Ok(Loadability::Unverified);
         }
 
@@ -227,10 +224,14 @@ impl Platform for MacOsPlatform {
     /// Kept per kernel release: a check that passed under one macOS need not
     /// pass under the next, so an update starts the memo afresh.
     fn verified_loadable_dir(&self) -> Option<PathBuf> {
+        #[cfg(unix)]
+        let release = kernel_release;
+        #[cfg(not(unix))]
+        let release = || None;
         macos_verified_loadable_dir(
             std::env::consts::ARCH,
             std::env::consts::OS,
-            kernel_release,
+            release,
             &crate::config::probe_memo_dir(),
         )
     }
@@ -465,6 +466,13 @@ impl Platform for WindowsPlatform {
     }
 }
 
+/// Whether the loader requires a valid signature, so that
+/// [`MacOsPlatform::ensure_binary_loadable`] has something to check: arm64
+/// macOS only.
+fn signs_on_load(arch: &str, os: &str) -> bool {
+    arch == "aarch64" && os == "macos"
+}
+
 /// The memo directory under `probes` for a macOS host, or `None` where
 /// [`MacOsPlatform::ensure_binary_loadable`] checks nothing: every host but
 /// arm64 macOS. Unused outside tests on other hosts, like [`MacOsPlatform`].
@@ -475,7 +483,7 @@ fn macos_verified_loadable_dir(
     release: impl FnOnce() -> Option<String>,
     probes: &Path,
 ) -> Option<PathBuf> {
-    if arch != "aarch64" || os != "macos" {
+    if !signs_on_load(arch, os) {
         return None;
     }
     let release = release()?;
@@ -503,12 +511,6 @@ fn kernel_release() -> Option<String> {
         .ok()
         .filter(|release| !release.is_empty())
         .map(str::to_string)
-}
-
-#[cfg(not(unix))]
-#[allow(dead_code)]
-fn kernel_release() -> Option<String> {
-    None
 }
 
 #[cfg(test)]

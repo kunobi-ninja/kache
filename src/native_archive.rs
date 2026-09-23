@@ -428,6 +428,85 @@ fn bsd_archive_identity(bytes: &[u8]) -> Option<ArchiveIdentity> {
     })
 }
 
+/// The member names of the `ar` archive at `path`, in archive order, read
+/// from the headers alone. A GNU `/N` name resolves through the `//` table and
+/// loses its `/` terminator, as a short `name/` does; a BSD `#1/N` name is read
+/// from the start of its member. The symbol and long-name tables keep their
+/// reserved names (`/`, `//`, `__.SYMDEF`, ...). A thin archive, which names
+/// files outside itself, and any malformed header are errors.
+pub fn member_names(path: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let malformed = || format!("malformed ar archive {}", path.display());
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("reading metadata of {}", path.display()))?
+        .len();
+    let mut magic = [0_u8; AR_MAGIC.len()];
+    file.read_exact(&mut magic).with_context(malformed)?;
+    if &magic != AR_MAGIC {
+        anyhow::bail!("{} is not a regular ar archive", path.display());
+    }
+
+    let mut names = Vec::new();
+    let mut longnames: Option<Vec<u8>> = None;
+    let mut pos = AR_MAGIC.len() as u64;
+    while pos < len {
+        let mut header = [0_u8; AR_HEADER_LEN];
+        file.seek(SeekFrom::Start(pos)).with_context(malformed)?;
+        file.read_exact(&mut header).with_context(malformed)?;
+        let field = ar_name(&header[0..16])
+            .filter(|_| &header[58..60] == b"`\n")
+            .with_context(malformed)?;
+        let size = parse_ar_decimal(&header[48..58]).with_context(malformed)? as u64;
+        let data_end = (pos + AR_HEADER_LEN as u64)
+            .checked_add(size)
+            .filter(|end| *end <= len)
+            .with_context(malformed)?;
+        let mut read_data = |count: u64| -> anyhow::Result<Vec<u8>> {
+            let mut data = vec![0_u8; usize::try_from(count).with_context(malformed)?];
+            file.read_exact(&mut data).with_context(malformed)?;
+            Ok(data)
+        };
+        let name = if field == "//" {
+            longnames = Some(read_data(size)?);
+            field.to_string()
+        } else if let Some(count) = field.strip_prefix("#1/") {
+            let count = parse_ar_decimal(count.as_bytes())
+                .map(|count| count as u64)
+                .filter(|count| *count <= size)
+                .with_context(malformed)?;
+            let raw = read_data(count)?;
+            let end = raw.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+            String::from_utf8(raw[..end].to_vec()).with_context(malformed)?
+        } else if field == "/" || field == "/SYM64/" {
+            field.to_string()
+        } else if let Some(offset) = field.strip_prefix('/') {
+            gnu_long_name(longnames.as_deref(), offset).with_context(malformed)?
+        } else {
+            field.strip_suffix('/').unwrap_or(field).to_string()
+        };
+        names.push(name);
+        pos = data_end + (size & 1);
+    }
+    Ok(names)
+}
+
+/// The `//` table entry at a GNU `/N` reference. GNU ends an entry with `/\n`,
+/// a COFF `.lib` with NUL.
+fn gnu_long_name(table: Option<&[u8]>, offset: &str) -> Option<String> {
+    let entry = table?.get(parse_ar_decimal(offset.as_bytes())?..)?;
+    let end = entry
+        .iter()
+        .position(|&b| b == b'\n' || b == 0)
+        .unwrap_or(entry.len());
+    let name = std::str::from_utf8(&entry[..end]).ok()?;
+    Some(name.strip_suffix('/').unwrap_or(name).to_string())
+}
+
 // Mach-O constants used by the deliberately small, fail-closed object gate.
 // This is not a general Mach-O reader: it recognizes only load commands that
 // occur in ordinary clang-produced relocatable objects and rejects everything
@@ -1857,6 +1936,93 @@ mod tests {
         let mut a = b"!<thin>\n".to_vec();
         a.extend_from_slice(&member("/0", b"obj"));
         assert!(portable_static_archive_hash(&a).is_none());
+    }
+
+    fn names_of(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.a");
+        std::fs::write(&path, bytes).unwrap();
+        member_names(&path)
+    }
+
+    #[test]
+    fn member_names_resolve_gnu_short_and_long_names() {
+        let long = gnu_crs_longname_archive("cafca65b3467684e-probe.o", &elf_object(b"x"));
+        assert_eq!(
+            names_of(&long).unwrap(),
+            ["/", "//", "cafca65b3467684e-probe.o"]
+        );
+
+        // Odd-sized members are padded, and every reserved and short spelling
+        // keeps its own name.
+        let mixed = raw_archive(&[
+            ("/SYM64/", b"odd"),
+            ("//", b"first-long-name.o/\nsecond.obj\0tail-without-end"),
+            ("a.o/", b"12345"),
+            ("/0", b"x"),
+            ("/19", b"y"),
+            ("/30", b"z"),
+            ("lib.rmeta", b"meta"),
+        ]);
+        assert_eq!(
+            names_of(&mixed).unwrap(),
+            [
+                "/SYM64/",
+                "//",
+                "a.o",
+                "first-long-name.o",
+                "second.obj",
+                "tail-without-end",
+                "lib.rmeta",
+            ]
+        );
+    }
+
+    #[test]
+    fn member_names_read_bsd_inline_names() {
+        let bsd = bsd_archive(&[
+            ("__.SYMDEF SORTED", 20, BSD_SYMDEF),
+            ("foo.o", 8, b"obj"),
+            ("exact.o", 7, b""),
+        ]);
+        assert_eq!(
+            names_of(&bsd).unwrap(),
+            ["__.SYMDEF SORTED", "foo.o", "exact.o"]
+        );
+    }
+
+    #[test]
+    fn member_names_refuse_what_they_cannot_read() {
+        let mut thin = b"!<thin>\n".to_vec();
+        thin.extend_from_slice(&member("/0", b"obj"));
+        assert!(names_of(&thin).is_err(), "thin archives name outside files");
+        assert!(names_of(b"not an archive").is_err());
+        assert!(names_of(b"").is_err());
+
+        let mut bad_terminator = raw_archive(&[("a.o/", b"obj")]);
+        bad_terminator[AR_MAGIC.len() + 58] = b'X';
+        assert!(names_of(&bad_terminator).is_err());
+
+        let mut truncated = raw_archive(&[("a.o/", b"object")]);
+        truncated.truncate(truncated.len() - 1);
+        assert!(names_of(&truncated).is_err());
+
+        let mut short_header = raw_archive(&[("a.o/", b"object")]);
+        short_header.extend_from_slice(b"b.o/");
+        assert!(names_of(&short_header).is_err());
+
+        let mut long_inline = bsd_archive(&[("foo.o", 8, b"obj")]);
+        long_inline[AR_MAGIC.len()..AR_MAGIC.len() + 5].copy_from_slice(b"#1/12");
+        assert!(
+            names_of(&long_inline).is_err(),
+            "an inline name longer than its member"
+        );
+
+        let unresolved = raw_archive(&[("/0", b"obj")]);
+        assert!(
+            names_of(&unresolved).is_err(),
+            "no `//` table to resolve /0"
+        );
     }
 
     #[test]

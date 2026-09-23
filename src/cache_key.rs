@@ -926,6 +926,16 @@ const CRATE_TREE_MAX_ENTRIES: usize = 20_000;
 /// unit on the pre-pass.
 pub(crate) fn crate_tree_digest(file_hasher: &FileHasher<'_>) -> Option<String> {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
+    let out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
+    crate_tree_digest_in(manifest_dir, out_dir, file_hasher)
+}
+
+/// [`crate_tree_digest`] for the package at `manifest_dir`.
+fn crate_tree_digest_in(
+    manifest_dir: PathBuf,
+    out_dir: Option<PathBuf>,
+    file_hasher: &FileHasher<'_>,
+) -> Option<String> {
     // Only for published crates, whose package directory is immutable and
     // self-contained: a macro in one can only read files under the package or
     // its OUT_DIR. A workspace crate can point a macro at `../assets`, which
@@ -933,12 +943,19 @@ pub(crate) fn crate_tree_digest(file_hasher: &FileHasher<'_>) -> Option<String> 
     if !is_registry_package(&manifest_dir) {
         return None;
     }
-    let mut roots = vec![(manifest_dir, &b"manifest_dir"[..])];
-    if let Some(out_dir) = std::env::var_os("OUT_DIR").map(PathBuf::from) {
-        roots.push((out_dir, &b"out_dir"[..]));
+    let mut roots = vec![(manifest_dir, &b"manifest_dir"[..], MANIFEST_DIR_SKIPPED)];
+    if let Some(out_dir) = out_dir {
+        roots.push((out_dir, &b"out_dir"[..], &[]));
     }
     tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)
 }
+
+/// Names the tree guard skips directly under the crate directory. A build
+/// directory or a git checkout there is not what a macro reads, and `target`
+/// in particular is rewritten by the build this key belongs to. `OUT_DIR`
+/// skips nothing: a build script wrote all of it before this unit, and a
+/// macro scanning it reads a nested `target` like any other file.
+const MANIFEST_DIR_SKIPPED: &[&str] = &["target", ".git"];
 
 /// Cap on entries digested for the `OUT_DIR` guard. Generated code is a few
 /// files; a directory past this is a build tree, and the pre-pass stays
@@ -951,14 +968,15 @@ const OUT_DIR_TREE_MAX_ENTRIES: usize = 256;
 /// record says which generated files were read, not what else was generated.
 pub(crate) fn out_dir_tree_digest(out_dir: &Path, file_hasher: &FileHasher<'_>) -> Option<String> {
     tree_digest(
-        vec![(out_dir.to_path_buf(), &b"out_dir"[..])],
+        vec![(out_dir.to_path_buf(), &b"out_dir"[..], &[])],
         file_hasher,
         OUT_DIR_TREE_MAX_ENTRIES,
     )
 }
 
+/// Each root comes with the names directly under it to skip.
 fn tree_digest(
-    roots: Vec<(PathBuf, &[u8])>,
+    roots: Vec<(PathBuf, &[u8], &[&str])>,
     file_hasher: &FileHasher<'_>,
     max_entries: usize,
 ) -> Option<String> {
@@ -967,12 +985,9 @@ fn tree_digest(
     let mut budget = max_entries;
     // Roots are named by role, not by path: the identity the record is filed
     // under already knows the path, and the guard is about content.
-    for (root, role) in roots {
+    for (root, role, skipped) in roots {
         fold_field(&mut hasher, b"root:", role);
-        // A build directory or a git checkout under the crate is not what a
-        // macro reads, and `target` in particular is rewritten by the build
-        // this key belongs to.
-        let excluded = [root.join("target"), root.join(".git")];
+        let excluded: Vec<PathBuf> = skipped.iter().map(|name| root.join(name)).collect();
         crate_tree_fold(
             &root,
             &root,
@@ -10778,6 +10793,44 @@ mod tests {
         );
         std::fs::write(b.join("one-more"), "x").unwrap();
         assert_eq!(out_dir_tree_digest(&b, &hasher), None, "past the cap");
+    }
+
+    /// A build script can put anything in `OUT_DIR`, a nested `target` or a
+    /// git checkout included, and a macro scanning `OUT_DIR` reads it all.
+    /// Both guards that cover `OUT_DIR` digest it all; only the crate
+    /// directory skips those names.
+    #[test]
+    fn the_out_dir_guards_cover_target_and_git_under_out_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let hasher = FileHasher::new();
+        let package = dir.path().join("registry/src/index/kt-1.0.0");
+        let out = dir.path().join("out");
+        for directory in [&package, &out] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join("lib.rs"), "pub fn g() {}\n").unwrap();
+        }
+        let guards = || {
+            (
+                out_dir_tree_digest(&out, &hasher).unwrap(),
+                crate_tree_digest_in(package.clone(), Some(out.clone()), &hasher).unwrap(),
+            )
+        };
+        let before = guards();
+        for name in ["target", ".git"] {
+            std::fs::create_dir_all(package.join(name)).unwrap();
+            std::fs::write(package.join(name).join("x"), "x").unwrap();
+        }
+        assert_eq!(guards().1, before.1, "the crate directory skips them");
+        for name in ["target", ".git"] {
+            let nested = out.join(name);
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(nested.join("x"), "x").unwrap();
+            let after = guards();
+            assert_ne!(after.0, before.0, "{name} under OUT_DIR, OUT_DIR guard");
+            assert_ne!(after.1, before.1, "{name} under OUT_DIR, crate tree guard");
+            std::fs::remove_dir_all(nested).unwrap();
+        }
+        assert_eq!(guards(), before);
     }
 
     /// A relocated row round-trips, and neither decoder accepts the other's

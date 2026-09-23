@@ -1389,10 +1389,10 @@ fn out_dir_suffix(value: &std::ffi::OsStr, root: &Path) -> Option<String> {
 /// The bytes of `value` after `root`, when `value` is `root` itself (an
 /// empty suffix) or `root`, a separator, and components that never leave the
 /// directory `floor` levels below `root` ([`stays_below`]). `None` for a
-/// longer name that merely starts the same (`/o2` against `/o`), a `.`
-/// component, an empty one, a `..` that climbs too far, or a suffix that is
-/// not UTF-8. The suffix keeps its `..`, because a record has to reproduce
-/// the spelling rustc reported.
+/// longer name that merely starts the same (`/o2` against `/o`), an empty
+/// component, a `..` that climbs too far, or a suffix that is not UTF-8. The
+/// suffix keeps its `.` and `..`, because a record has to reproduce the
+/// spelling rustc reported.
 ///
 /// `\` separates components on Windows only, so the walk has to hold both
 /// with and without it: from `root`, `a\b/..` is one level down on Windows
@@ -1410,7 +1410,9 @@ fn suffix_within(value: &std::ffi::OsStr, root: &Path, floor: usize) -> Option<S
 }
 
 /// Does a walk down `components` stay inside the directory it reaches after
-/// the first `floor` of them? A `..` is only taken from deeper than that.
+/// the first `floor` of them? A `..` is only taken from deeper than that. A
+/// `.` stays where it is, as in the `src/./init.js` rustc reports for
+/// `include_str!("./init.js")`.
 ///
 /// The walk is lexical. It asks which directory the spelling names, and
 /// rustc and the key both open the recorded spelling itself, so a symlink
@@ -1421,7 +1423,8 @@ fn suffix_within(value: &std::ffi::OsStr, root: &Path, floor: usize) -> Option<S
 fn stays_below<'a>(components: impl IntoIterator<Item = &'a str>, floor: usize) -> bool {
     let mut depth = 0usize;
     components.into_iter().all(|component| match component {
-        "" | "." => false,
+        "" => false,
+        "." => true,
         ".." if depth > floor => {
             depth -= 1;
             true
@@ -10352,7 +10355,8 @@ mod tests {
         assert_eq!(suffix("/p/x", "/o"), None);
         assert_eq!(suffix("/o/../x", "/o"), None);
         assert_eq!(suffix("/o\\..\\x", "/o"), None);
-        assert_eq!(suffix("/o/./x", "/o"), None);
+        assert_eq!(suffix("/o/./x", "/o").as_deref(), Some("/./x"));
+        assert_eq!(suffix("/o/./../x", "/o"), None);
         assert_eq!(suffix("/o//x", "/o"), None);
         assert_eq!(suffix("/o/", "/o"), None);
         #[cfg(unix)]
@@ -10411,7 +10415,10 @@ mod tests {
         assert!(walk("i/p/src/a/b/../../x.rs", 2));
         assert!(!walk("i/p/src/../../q/x.rs", 2));
         assert!(!walk("i/../j/p/x.rs", 2), "below the floor too");
-        assert!(!walk("a/./b", 0));
+        assert!(walk("a/./b", 0), "a `.` stays where it is");
+        assert!(walk("./a", 0));
+        assert!(!walk("./../b", 0), "a `.` does not go down a level");
+        assert!(!walk("i/p/./../q/x.rs", 2));
         assert!(!walk("a//b", 0));
     }
 
@@ -10445,9 +10452,10 @@ mod tests {
         );
     }
 
-    /// Path shapes rustc reported for hk's registry dependencies, all refused
-    /// while any `..` was. A `..` that leaves the package is still refused,
-    /// even into another registry package.
+    /// Path shapes rustc reported for registry dependencies, all refused
+    /// while any `..` or `.` was: the `..` ones from hk, `src/./init.js` from
+    /// `include_str!("./init.js")`. A `..` that leaves the package is still
+    /// refused, even into another registry package.
     #[test]
     fn a_registry_unit_shares_a_parent_path_that_stays_in_its_package() {
         let target = Path::new("/w/target");
@@ -10464,6 +10472,7 @@ mod tests {
             "kt-1.0.0/src/crypto/aws_lc_rs/../ring/hash.rs",
             "kt-1.0.0/src/new/glibc/sysdeps/nptl/bits/../../x86/mod.rs",
             "other-1.0.0/src/../data/mod.rs",
+            "kt-1.0.0/src/./init.js",
         ] {
             assert!(can(&format!("{index}/{inside}")), "{inside}");
         }
@@ -10471,6 +10480,7 @@ mod tests {
             "kt-1.0.0/src/../../other-1.0/lib.rs",
             "kt-1.0.0/../other-1.0/lib.rs",
             "kt-1.0.0/src/../../../../../w/src/lib.rs",
+            "kt-1.0.0/./../other-1.0/lib.rs",
         ] {
             assert!(!can(&format!("{index}/{outside}")), "{outside}");
         }

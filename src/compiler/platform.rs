@@ -467,7 +467,8 @@ impl Platform for WindowsPlatform {
 
 /// The memo directory under `probes` for a macOS host, or `None` where
 /// [`MacOsPlatform::ensure_binary_loadable`] checks nothing: every host but
-/// arm64 macOS.
+/// arm64 macOS. Unused outside tests on other hosts, like [`MacOsPlatform`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn macos_verified_loadable_dir(
     arch: &str,
     os: &str,
@@ -487,6 +488,7 @@ fn macos_verified_loadable_dir(
 
 /// The running kernel's release (`uname -r`), such as `25.6.0`.
 #[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn kernel_release() -> Option<String> {
     // SAFETY: `utsname` is plain C data, valid when zeroed.
     let mut name: libc::utsname = unsafe { std::mem::zeroed() };
@@ -504,6 +506,7 @@ fn kernel_release() -> Option<String> {
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 fn kernel_release() -> Option<String> {
     None
 }

@@ -1008,6 +1008,10 @@ pub struct GcStats {
     /// starting a SQLite transaction. Included in entries_pinned.
     #[serde(default)]
     pub entries_recent_prefiltered: usize,
+    /// Candidates an automatic sweep kept because the remote delivered them
+    /// within [`IMPORT_PIN`] (#1008). Included in entries_pinned.
+    #[serde(default)]
+    pub entries_import_pinned: usize,
     /// Time spent in the eviction writes themselves, each entry's removal
     /// with its busy waits, summed over the run. Next to `entries_locked` it
     /// shows how much of a sweep went to waiting on builds for the index
@@ -1181,6 +1185,34 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
 /// own inode and is immune to a later blob unlink), so 2 minutes is generous
 /// headroom on a slow disk while staying far below any sensible cache lifetime.
 pub const EVICTION_IDLE_GRACE: Duration = Duration::from_secs(120);
+
+/// How long an automatic sweep keeps an entry the remote delivered, used or
+/// not (kunobi-ninja/kache#1008). A CI job imports a warm set, then runs
+/// several cargo commands; an upload between them used to evict whatever the
+/// job had not touched for [`EVICTION_IDLE_GRACE`], and the next command
+/// downloaded it again or missed. Six hours covers the longest GitHub-hosted
+/// job, and bounds how long a long-lived daemon keeps imports nobody used.
+pub const IMPORT_PIN: Duration = Duration::from_secs(6 * 3600);
+
+/// Who started a sweep. Automatic sweeps (after an upload, on a size hint,
+/// the daemon's timer, the detached worker) keep recent imports; a sweep the
+/// user asked for does not, so `kache gc` can always get back under budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepOrigin {
+    Automatic,
+    Requested,
+}
+
+impl SweepOrigin {
+    /// Seconds within which an import is kept, or `None` when imports get
+    /// no protection beyond [`EVICTION_IDLE_GRACE`].
+    fn import_pin_secs(self) -> Option<i64> {
+        match self {
+            SweepOrigin::Automatic => Some(IMPORT_PIN.as_secs() as i64),
+            SweepOrigin::Requested => None,
+        }
+    }
+}
 
 /// A hit re-stamps `last_accessed` only when the previous stamp is at least
 /// this old: well inside [`EVICTION_IDLE_GRACE`], so a restore in flight is
@@ -1690,6 +1722,10 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     // hash, recorded after the put by the rustc wrapper; a row without one
     // stands for every unit of its crate name.
     let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN unit_id TEXT NOT NULL DEFAULT ''");
+    // When the remote delivered this entry, in unix seconds; NULL for an
+    // entry this machine built. Automatic eviction keeps recent imports
+    // (kunobi-ninja/kache#1008, see [`IMPORT_PIN`]).
+    let _ = db.execute_batch("ALTER TABLE entries ADD COLUMN imported_at INTEGER");
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_entries_crate_name ON entries(crate_name);
          CREATE INDEX IF NOT EXISTS idx_entries_crate_unit ON entries(crate_name, unit_id);",
@@ -1761,7 +1797,9 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    index from before it never gained the index and the probe scanned).
 /// 5: `entries.unit_id` and `idx_entries_crate_unit`, so the probe can tell
 ///    two units of one crate name apart (every build script is one name).
-const INDEX_SCHEMA_GENERATION: i64 = 5;
+/// 6: `entries.imported_at`, so automatic eviction can keep what the remote
+///    delivered for the job still running (#1008).
+const INDEX_SCHEMA_GENERATION: i64 = 6;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's
@@ -2829,7 +2867,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, imported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, unixepoch())",
             params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64, meta.key_schema],
         )?;
         tx.commit()?;
@@ -3066,7 +3104,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             )?;
             tx.execute("DELETE FROM blobs WHERE refcount <= 0", [])?;
             let inserted = tx.execute(
-                "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+                "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, imported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, unixepoch())",
                 params![
                     entry.cache_key,
                     meta.crate_name,
@@ -4273,6 +4311,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// (kunobi-ninja/kache#595). The size-pressure sweep already loaded every
     /// row, so this is the same I/O shape it always had.
     pub fn eviction_candidates(&self) -> Result<Vec<crate::eviction::EntryFeatures>> {
+        self.eviction_candidates_for(SweepOrigin::Requested)
+    }
+
+    /// [`Self::eviction_candidates`], with each entry's import protection
+    /// judged for a sweep started by `origin`.
+    pub fn eviction_candidates_for(
+        &self,
+        origin: SweepOrigin,
+    ) -> Result<Vec<crate::eviction::EntryFeatures>> {
         let mut stmt = self.db.prepare(
             "SELECT cache_key, size, hit_count, content_hash, committed,
                     (julianday('now') - julianday(last_accessed)) * 24.0,
@@ -4283,12 +4330,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         AND eb.refs = b.refcount),
                     EXISTS(SELECT 1 FROM entry_blobs eb2
                             WHERE eb2.cache_key = entries.cache_key),
-                    last_accessed >= datetime('now', ?1)
+                    last_accessed >= datetime('now', ?1),
+                    COALESCE(imported_at >= unixepoch() - ?2, 0)
              FROM entries",
         )?;
         let rows = stmt
             .query_map(
-                params![format!("-{} seconds", EVICTION_IDLE_GRACE.as_secs())],
+                params![
+                    format!("-{} seconds", EVICTION_IDLE_GRACE.as_secs()),
+                    origin.import_pin_secs()
+                ],
                 |row| {
                     // Bytes this entry would actually free: blobs where it holds
                     // every remaining reference (#608). Entries not yet backfilled
@@ -4313,6 +4364,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         compile_time_ms: row.get(6)?,
                         reclaimable_bytes,
                         recently_accessed: row.get(9)?,
+                        recently_imported: row.get(10)?,
                     })
                 },
             )?
@@ -4414,6 +4466,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 stats.entries_recent_prefiltered += 1;
                 continue;
             }
+            if features.is_some_and(|f| f.recently_imported) {
+                stats.entries_pinned += 1;
+                stats.entries_import_pinned += 1;
+                continue;
+            }
             let write_started = std::time::Instant::now();
             let removal = self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE));
             let took = write_started.elapsed();
@@ -4492,8 +4549,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
+        origin: SweepOrigin,
     ) -> Result<GcStats> {
-        let candidates = self.eviction_candidates()?;
+        let candidates = self.eviction_candidates_for(origin)?;
         let order = policy.select(&candidates);
         if order.is_empty() {
             return Ok(GcStats::default());
@@ -4550,6 +4608,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// `kache gc`, the daemon's periodic sweep, and the post-upload check all
     /// get the same band (see [`crate::eviction::over_eviction_trigger`]).
     pub fn evict(&self) -> Result<GcStats> {
+        self.evict_for(SweepOrigin::Requested)
+    }
+
+    /// [`Self::evict`] for a sweep started by `origin`.
+    pub fn evict_for(&self, origin: SweepOrigin) -> Result<GcStats> {
         let target = crate::eviction::eviction_target(self.config.max_size);
         // Trigger, budget, and stop condition are all physical bytes on disk
         // (`SUM(blobs.size)`), not the logical `SUM(entries.size)`: on a
@@ -4571,12 +4634,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.evict_with(
             &crate::eviction::SizePressurePolicy,
             Some((size_before, target)),
+            origin,
         )
     }
 
     /// Evict entries older than the given duration.
     pub fn evict_older_than(&self, hours: u64) -> Result<GcStats> {
-        self.evict_with(&crate::eviction::OlderThanPolicy { hours }, None)
+        self.evict_with(
+            &crate::eviction::OlderThanPolicy { hours },
+            None,
+            SweepOrigin::Requested,
+        )
     }
 
     /// Remove entries written by a different (or unknown legacy) cache-key
@@ -4623,6 +4691,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// the same physical-byte target bounds this pass; the following ordinary
     /// size sweep recomputes pressure if duplicate removal was insufficient.
     pub fn evict_duplicate_entries(&self) -> Result<GcStats> {
+        self.evict_duplicate_entries_for(SweepOrigin::Requested)
+    }
+
+    /// [`Self::evict_duplicate_entries`] for a sweep started by `origin`.
+    pub fn evict_duplicate_entries_for(&self, origin: SweepOrigin) -> Result<GcStats> {
         let size_before = self.physical_size()?;
         if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
             return Ok(GcStats {
@@ -4636,6 +4709,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 size_before,
                 crate::eviction::eviction_target(self.config.max_size),
             )),
+            origin,
         )
     }
 
@@ -9258,6 +9332,7 @@ mod tests {
             compile_time_ms: 10,
             reclaimable_bytes: None,
             recently_accessed: false,
+            recently_imported: false,
         };
         store.record_tombstone(&features, "size-pressure", Some(("value-density", false)));
         assert_eq!(
@@ -9620,6 +9695,186 @@ mod tests {
         let stats = store.evict().unwrap();
         assert!(stats.entries_evicted > 0);
         assert!(!store.contains("live_key"));
+    }
+
+    /// Index `bytes` of artifact as if the remote had just delivered `key`.
+    fn import_test_entry(store: &Store, key: &str, bytes: usize) {
+        let entry_dir = store.entry_dir(key);
+        std::fs::create_dir_all(&entry_dir).unwrap();
+        let content = vec![b'i'; bytes];
+        std::fs::write(entry_dir.join("lib.rlib"), &content).unwrap();
+        let meta = EntryMeta {
+            cache_key: key.to_string(),
+            key_schema: kache_format::CACHE_KEY_VERSION,
+            crate_name: format!("{key}_crate"),
+            crate_types: vec!["lib".to_string()],
+            files: vec![CachedFile {
+                name: "lib.rlib".to_string(),
+                size: bytes as u64,
+                hash: blake3::hash(&content).to_hex().to_string(),
+                executable: false,
+            }],
+            stdout: String::new(),
+            stderr: String::new(),
+            features: vec![],
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            profile: "dev".to_string(),
+            compile_time_ms: 0,
+            emit_kinds: Vec::new(),
+        };
+        std::fs::write(
+            entry_dir.join("meta.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        store.import_downloaded_entry(key).unwrap();
+    }
+
+    /// Put `bytes` of artifact under `key`, as a local compile would.
+    fn put_test_entry(store: &Store, dir: &Path, key: &str, bytes: usize) {
+        let output = dir.join(format!("{key}.rlib"));
+        std::fs::write(&output, vec![b'b'; bytes]).unwrap();
+        store
+            .put(
+                key,
+                &format!("{key}_crate"),
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output.clone(), format!("lib{key}.rlib"))],
+                "",
+                "",
+            )
+            .unwrap();
+        std::fs::remove_file(&output).unwrap();
+    }
+
+    fn set_idle_past_grace(store: &Store) {
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+                [],
+            )
+            .unwrap();
+    }
+
+    /// kunobi-ninja/kache#1008: a CI job imports a warm set, builds, uploads a
+    /// miss, and the upload's sweep used to evict whatever the job had not
+    /// touched for two minutes. An automatic sweep now keeps the import and
+    /// evicts what this machine built instead; a sweep the user asked for
+    /// still evicts both.
+    #[test]
+    fn an_automatic_sweep_keeps_what_the_remote_just_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+        let store = Store::open(&config).unwrap();
+        import_test_entry(&store, "imported_key", 300);
+        put_test_entry(&store, dir.path(), "built_key", 300);
+        set_idle_past_grace(&store);
+
+        let automatic = store.evict_for(SweepOrigin::Automatic).unwrap();
+        assert!(store.contains("imported_key"), "the job's import survives");
+        assert!(!store.contains("built_key"), "the sweep still frees space");
+        assert_eq!(automatic.entries_import_pinned, 1);
+        assert_eq!(automatic.entries_pinned, 1, "counted as held back too");
+
+        let requested = store.evict().unwrap();
+        assert!(!store.contains("imported_key"), "`kache gc` can reclaim it");
+        assert_eq!(requested.entries_import_pinned, 0);
+    }
+
+    /// The pin runs out: a long-lived daemon must not keep an import nobody
+    /// used past [`IMPORT_PIN`].
+    #[test]
+    fn an_import_is_kept_only_within_the_import_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100;
+        let store = Store::open(&config).unwrap();
+        import_test_entry(&store, "inside_key", 300);
+        import_test_entry(&store, "outside_key", 300);
+        set_idle_past_grace(&store);
+        // Six hours, as documented: the longest GitHub-hosted job.
+        assert_eq!(IMPORT_PIN.as_secs(), 21_600);
+        let pin = IMPORT_PIN.as_secs() as i64;
+        let age = |key: &str, secs: i64| {
+            store
+                .db
+                .execute(
+                    "UPDATE entries SET imported_at = unixepoch() - ?1 WHERE cache_key = ?2",
+                    params![secs, key],
+                )
+                .unwrap();
+        };
+        age("inside_key", pin - 60);
+        age("outside_key", pin + 60);
+
+        let candidates = store
+            .eviction_candidates_for(SweepOrigin::Automatic)
+            .unwrap();
+        let imported = |key: &str| {
+            candidates
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap()
+                .recently_imported
+        };
+        assert!(imported("inside_key"));
+        assert!(!imported("outside_key"));
+
+        let stats = store.evict_for(SweepOrigin::Automatic).unwrap();
+        assert!(store.contains("inside_key"));
+        assert!(!store.contains("outside_key"));
+        assert_eq!(stats.entries_import_pinned, 1);
+    }
+
+    /// Only the remote's entries carry the stamp, and only an automatic
+    /// sweep reads it.
+    #[test]
+    fn only_imports_are_stamped_and_only_automatic_sweeps_keep_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config).unwrap();
+        import_test_entry(&store, "imported_key", 10);
+        put_test_entry(&store, dir.path(), "built_key", 10);
+        let stamped = |key: &str| -> bool {
+            store
+                .db
+                .query_row(
+                    "SELECT imported_at IS NOT NULL FROM entries WHERE cache_key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert!(stamped("imported_key"));
+        assert!(!stamped("built_key"));
+
+        let flags = |origin| -> Vec<(String, bool)> {
+            let mut flags: Vec<_> = store
+                .eviction_candidates_for(origin)
+                .unwrap()
+                .into_iter()
+                .map(|entry| (entry.key, entry.recently_imported))
+                .collect();
+            flags.sort();
+            flags
+        };
+        assert_eq!(
+            flags(SweepOrigin::Automatic),
+            vec![
+                ("built_key".to_string(), false),
+                ("imported_key".to_string(), true)
+            ]
+        );
+        assert!(
+            flags(SweepOrigin::Requested)
+                .iter()
+                .all(|(_, imported)| !imported)
+        );
     }
 
     /// kunobi-ninja/kache#326: the recency guard is eviction-only. Explicit
@@ -15800,6 +16055,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 2);
+        let stamped: i64 = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE imported_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 2, "a prefetched batch is an import too (#1008)");
         for key in keys {
             assert!(store.get(&key).unwrap().is_some());
         }

@@ -3101,6 +3101,15 @@ pub enum GcMode {
 }
 
 impl GcMode {
+    /// The detached worker a build spawned is automatic; a `kache gc` the
+    /// user typed is not, and may evict what the remote just delivered.
+    pub fn sweep_origin(self) -> crate::store::SweepOrigin {
+        match self {
+            GcMode::Cli => crate::store::SweepOrigin::Requested,
+            GcMode::Background => crate::store::SweepOrigin::Automatic,
+        }
+    }
+
     pub fn from_env() -> Self {
         if std::env::var_os("KACHE_AUTO_GC_WORKER").is_some() {
             GcMode::Background
@@ -3214,7 +3223,9 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         print!("Deduplicating entries...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
-    let dedup_stats = store.evict_duplicate_entries().unwrap_or_default();
+    let dedup_stats = store
+        .evict_duplicate_entries_for(mode.sweep_origin())
+        .unwrap_or_default();
     add_gc_stats(&mut combined, &dedup_stats);
     if verbose {
         if dedup_stats.entries_evicted > 0 {
@@ -3228,7 +3239,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         print!("Running eviction...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
-    let evict_stats = store.evict()?;
+    let evict_stats = store.evict_for(mode.sweep_origin())?;
     add_gc_stats(&mut combined, &evict_stats);
     if verbose {
         let over_limit = store_over_limit(store.physical_size().ok(), config.max_size);
@@ -3340,6 +3351,9 @@ fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats)
     total.entries_recent_prefiltered = total
         .entries_recent_prefiltered
         .saturating_add(part.entries_recent_prefiltered);
+    total.entries_import_pinned = total
+        .entries_import_pinned
+        .saturating_add(part.entries_import_pinned);
     total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
     total.skipped |= part.skipped;
 }
@@ -7349,6 +7363,7 @@ mod tests {
             entries_locked: 9,
             entries_busy_snapshot: 0,
             entries_recent_prefiltered: 0,
+            entries_import_pinned: 12,
             evict_write_ms: 11,
             // Set once by the driver, never summed over policies.
             housekeeping: None,
@@ -7366,6 +7381,7 @@ mod tests {
             entries_locked: 90,
             entries_busy_snapshot: 0,
             entries_recent_prefiltered: 0,
+            entries_import_pinned: 120,
             evict_write_ms: 110,
             // Set once by the driver, never summed over policies.
             housekeeping: None,
@@ -7381,6 +7397,7 @@ mod tests {
         assert_eq!(accumulated.entries_failed, 88);
         assert_eq!(accumulated.entries_locked, 99);
         assert_eq!(accumulated.evict_write_ms, 121);
+        assert_eq!(accumulated.entries_import_pinned, 132);
         assert!(accumulated.skipped);
     }
 

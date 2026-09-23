@@ -80,6 +80,10 @@ pub struct EntryFeatures {
     /// Recent at candidate selection time. GC skips their metadata read and
     /// transaction setup; removal checks the grace again for other entries.
     pub recently_accessed: bool,
+    /// Delivered by the remote within [`crate::store::IMPORT_PIN`], judged for
+    /// an automatic sweep; always false for a sweep the user asked for.
+    /// Eviction keeps it (kunobi-ninja/kache#1008).
+    pub recently_imported: bool,
 }
 
 /// Ranks or filters eviction candidates. Pure: no I/O, no store mutation.
@@ -345,6 +349,7 @@ mod tests {
             compile_time_ms: 0,
             reclaimable_bytes: None,
             recently_accessed: false,
+            recently_imported: false,
         }
     }
 

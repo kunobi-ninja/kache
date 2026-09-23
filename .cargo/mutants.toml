@@ -183,10 +183,12 @@ gitignore = true
 # tested directly (`external_measure_warnings`, `phase_speedup`, `disk_delta`,
 # `bytes_to_mib`, `MbxPhaseMetrics::from_report`).
 #
-# macOS SDK discovery and `macos_oso_prefix_flag` are compiled only on macOS,
-# while the diff mutation lane runs on Ubuntu. macOS tests exercise both SDK
-# discovery and the real flag wrapper. Exclude only the platform wrappers; the
-# extracted flag logic and key folding remain mutation-tested on every host.
+# macOS SDK discovery, `macos_oso_prefix_flag` and `oso_prefix_root_for_key`
+# are compiled only on macOS, while the diff mutation lane runs on Ubuntu, and
+# the other platforms' `oso_prefix_root_for_key` is a `None` stub. macOS tests
+# exercise SDK discovery and the real wrappers. Exclude only the platform
+# wrappers; the extracted flag logic, `oso_prefix_root_for_key_inner` and key
+# folding remain mutation-tested on every host.
 #
 # `cache_fs` also has thin macOS and Windows syscall wrappers which this Ubuntu
 # lane cannot compile. Their sizing and validation rules are extracted into
@@ -260,6 +262,7 @@ exclude_re = [
     "replace sdk_identity_for",
     "xcrun",
     "replace macos_oso_prefix_flag ->",
+    "replace oso_prefix_root_for_key ->",
     "probe_unsupported",
     "from struct AttrList",
     "regular_output_is_independent_windows",

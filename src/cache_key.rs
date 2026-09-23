@@ -4862,6 +4862,14 @@ impl<'db> FileHasher<'db> {
         self.too_new.saw_too_new.get()
     }
 
+    /// Keep `fingerprint` for the post-compile revalidation, when the guard
+    /// is armed.
+    fn guard_input(&self, fingerprint: &FileFingerprint) {
+        if self.too_new.invocation_start_ns > 0 {
+            self.guard_inputs.borrow_mut().push(fingerprint.clone());
+        }
+    }
+
     /// Drain the fingerprints hashed while the guard was armed. The wrapper
     /// carries them past the compile and hands them to
     /// [`FileHasher::guarded_inputs_unchanged_since_hash`].
@@ -5369,10 +5377,8 @@ impl<'db> FileHasher<'db> {
     pub fn hash(&self, path: &Path) -> Result<String> {
         let _trace = crate::phase_trace::phase("input_hash");
         let (hash, fingerprint) = self.hash_inner(path)?;
-        if self.too_new.invocation_start_ns > 0
-            && let Some(fingerprint) = &fingerprint
-        {
-            self.guard_inputs.borrow_mut().push(fingerprint.clone());
+        if let Some(fingerprint) = &fingerprint {
+            self.guard_input(fingerprint);
         }
         self.recent_hashes.borrow_mut().insert(
             absolute_path(path),
@@ -5688,9 +5694,7 @@ impl<'db> FileHasher<'db> {
                 .push((fingerprint.clone(), hash.clone()));
             hash
         };
-        if self.too_new.invocation_start_ns > 0 {
-            self.guard_inputs.borrow_mut().push(fingerprint.clone());
-        }
+        self.guard_input(fingerprint);
         self.recent_hashes.borrow_mut().insert(
             absolute_path(path),
             RecentHash {
@@ -15024,6 +15028,45 @@ pub fn g(_: &'static str) {}"#,
             .unwrap();
         assert_eq!(third.stats().cache_misses, 1);
         assert_ne!(hashes(&after)[0], hashes(&cold)[0]);
+    }
+
+    #[test]
+    fn an_unarmed_guard_keeps_no_headers_for_revalidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.h");
+        std::fs::write(&path, "#define H 1\n").unwrap();
+        let headers = vec![("h.h".to_string(), path)];
+        let mapped = |path: &Path| std::fs::read_to_string(path).ok();
+
+        let hasher = FileHasher::new();
+        hasher
+            .cc_preprocess_fingerprints(&headers, "maps", &mapped)
+            .unwrap();
+        assert!(hasher.take_guarded_inputs().is_empty());
+    }
+
+    #[test]
+    fn flushing_on_the_real_clock_keeps_a_long_settled_stamp() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        // Last changed at the epoch: settled by any clock this runs under.
+        let stamp = FileFingerprint {
+            path: "/old/header.h".to_string(),
+            size: 12,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            inode: 7,
+        };
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        hasher
+            .pending_memo
+            .borrow_mut()
+            .push((stamp.clone(), "hash".to_string()));
+        hasher.flush_memo();
+
+        let reader = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let memo = reader.memoised_hashes(std::iter::once(&stamp));
+        assert_eq!(memo.get("/old/header.h").map(String::as_str), Some("hash"));
     }
 
     #[test]

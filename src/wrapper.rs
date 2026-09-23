@@ -13146,7 +13146,7 @@ exit 0
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].schema, 20);
+        assert_eq!(events[0].schema, 21);
         let demands = &events[0].demands;
         assert_eq!(demands.len(), 1);
         assert_eq!(demands[0].cache_key, "local-demand-key");
@@ -13200,7 +13200,7 @@ exit 0
         assert_eq!(event.compile_time_ms, 20);
         assert_eq!(event.size, 30);
         assert_eq!(event.cache_key, "cache-key");
-        assert_eq!(event.schema, 20);
+        assert_eq!(event.schema, 21);
         assert_eq!(event.key_ms, 40);
         assert_eq!(event.key_hash_hits, 4);
         assert_eq!(event.key_hash_misses, 5);
@@ -13266,7 +13266,7 @@ exit 0
 
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         let event = &events[0];
-        assert_eq!(event.schema, 20);
+        assert_eq!(event.schema, 21);
         // Whatever other tests add is real time, far under the next band.
         for (name, value, floor, fed) in [
             ("startup_ms", event.startup_ms, before[0], STARTUP_MS),
@@ -13405,7 +13405,7 @@ exit 0
         let event = &events[0];
         assert_eq!(event.result, EventResult::Miss);
         assert_eq!(event.cache_key, "same-key");
-        assert_eq!(event.schema, 20);
+        assert_eq!(event.schema, 21);
         assert_eq!(
             event.lookup_rejection,
             "matching entry lacks dep-info required by this invocation"
@@ -13441,7 +13441,7 @@ exit 0
             0,
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
-        assert_eq!(events[0].schema, 20);
+        assert_eq!(events[0].schema, 21);
         assert_eq!(events[0].result, EventResult::LocalHit);
         assert!(
             events[0].verify_compare.is_empty(),
@@ -13466,7 +13466,7 @@ exit 0
         );
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
         assert_eq!(events.len(), 2);
-        assert_eq!(events[1].schema, 20);
+        assert_eq!(events[1].schema, 21);
         assert_eq!(
             events[1].verify_compare,
             "content: libfoo.rlib (byte mismatch)"

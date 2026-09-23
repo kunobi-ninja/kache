@@ -8762,8 +8762,20 @@ mod tests {
     /// and the auto-GC worker left the store over budget.
     #[test]
     fn evict_waits_for_a_competing_writer_and_still_evicts() {
+        static REMOVAL_WAITED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        // SQLite calls the busy handler only for a writer waiting to take
+        // the lock. A removal that reads first and then upgrades fails at
+        // once and never calls it.
+        fn wait_for_lock(count: i32) -> bool {
+            REMOVAL_WAITED.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1));
+            count < 5000
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let (store, config) = store_with_one_evictable_entry(dir.path(), "contended");
+        store.db.busy_handler(Some(wait_for_lock)).unwrap();
         // The wrapper that spawned the auto-GC worker is still writing its
         // own durability flag when the worker starts evicting.
         let competitor = Connection::open(config.index_db_path()).unwrap();
@@ -8771,14 +8783,24 @@ mod tests {
         competitor
             .execute("UPDATE entries SET durable = durable", [])
             .unwrap();
+        // Commit once the removal is waiting for the lock. A fixed sleep let
+        // a stalled test thread reach the removal after the commit, and the
+        // test then passed without the removal ever waiting.
         let committer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !REMOVAL_WAITED.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             competitor.execute_batch("COMMIT").unwrap();
         });
 
         let stats = store.evict().unwrap();
         committer.join().unwrap();
 
+        assert!(
+            REMOVAL_WAITED.load(Ordering::SeqCst),
+            "the removal never waited for the lock: {stats:?}"
+        );
         assert_eq!(stats.entries_locked, 0, "{stats:?}");
         assert_eq!(stats.entries_evicted, 1, "{stats:?}");
         assert!(!store.contains("contended"));

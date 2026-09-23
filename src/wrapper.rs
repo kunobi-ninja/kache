@@ -2052,7 +2052,6 @@ fn run_cc_with_store(
     }
 
     let _flight = precompiled.as_mut().and_then(|pre| pre.flight.take());
-    let deferred_compile = precompiled.is_some();
     let (result, compile_time_ms, inputs_changed) = match precompiled.take() {
         Some(pre) => {
             // Inputs are fingerprinted after a deferred compile; one written
@@ -2118,8 +2117,10 @@ fn run_cc_with_store(
     let daemon_publish = config.daemon_publish
         && crate::daemon::existing_daemon_run_lock_is_held(&config.socket_path()).unwrap_or(false);
     // A deferred compile's memo goes to the daemon with the entry; the
-    // wrapper records it only if the hand-off does not happen (below).
-    let handoff_memo = (daemon_publish && store_candidate && deferred_compile)
+    // wrapper records it only if the hand-off does not happen (below). Only
+    // a deferred compile captures one, and a compile that is no store
+    // candidate neither hands it off nor records it.
+    let handoff_memo = daemon_publish
         .then(|| compiler.captured_preprocess_memo())
         .flatten();
     if store_candidate && handoff_memo.is_none() {
@@ -11839,6 +11840,53 @@ exit 0
             !output.exists(),
             "found=false must not restore even when the local store already has the entry"
         );
+    }
+
+    /// A declined hand-off from the main store re-claims the key; a peer
+    /// that took it in the gap publishes, and the wrapper only logs its
+    /// event.
+    #[test]
+    fn a_declined_hand_off_yields_to_a_peer_that_took_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let key = blake3::hash(b"cc-handoff-peer").to_hex().to_string();
+        let BuildClaim::Acquired(_peer) = store.claim_build(&key).unwrap() else {
+            panic!("fresh key");
+        };
+        let object = dir.path().join("foo.o");
+        std::fs::write(&object, b"object bytes").unwrap();
+        let files = vec![(object, "foo.o".to_string())];
+        let now = std::time::Instant::now();
+        let handoff = CcHandoff {
+            cache_key: &key,
+            crate_name: "foo.c",
+            target: "x86_64",
+            files: &files,
+            stdout: "",
+            stderr: "",
+            compile_time_ms: 5,
+            publishes_to_remote: false,
+            event_root: "",
+            start: now,
+            size: 12,
+            key_ms: 0,
+            lookup_ms: 0,
+            lookup_rejection: "",
+            store_start: now,
+            memo: None,
+        };
+
+        // No daemon: the offer is declined and the key is the peer's.
+        let mut lock = None;
+        let outcome = hand_off_cc_store(&config, &store, &mut lock, handoff);
+
+        assert!(matches!(outcome, CcHandoffOutcome::Done));
+        assert!(lock.is_none());
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].result, EventResult::Miss);
+        assert!(!events[0].store_handed_off);
     }
 
     #[test]

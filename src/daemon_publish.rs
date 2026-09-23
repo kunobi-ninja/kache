@@ -230,9 +230,30 @@ impl Daemon {
     }
 }
 
-/// Run the publish worker until the queue closes and drains. Blocking: it is
-/// meant for `spawn_blocking`, and it opens its own store connection so the
-/// daemon's shared store mutex never waits on a put.
+/// Run [`run_publish_worker`] on a thread of its own. The receiver resolves
+/// once the worker has drained the queue and exited, and the caller bounds
+/// that wait. A plain thread rather than `spawn_blocking`: a worker wedged in
+/// a put must not hold up the runtime's teardown.
+pub(crate) fn spawn_publish_worker(
+    daemon: Arc<Daemon>,
+    rx: tokio::sync::mpsc::Receiver<PublishJob>,
+) -> std::io::Result<tokio::sync::oneshot::Receiver<()>> {
+    let runtime = tokio::runtime::Handle::current();
+    let (done_tx, done) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("kache-publish".to_string())
+        .spawn(move || {
+            // Uploads are queued through the runtime (see `enqueue_upload`).
+            let _runtime = runtime.enter();
+            run_publish_worker(daemon, rx);
+            let _ = done_tx.send(());
+        })?;
+    Ok(done)
+}
+
+/// Run the publish worker until the queue closes and drains. Blocking, with
+/// its own store connection so the daemon's shared store mutex never waits
+/// on a put.
 pub(crate) fn run_publish_worker(
     daemon: Arc<Daemon>,
     mut rx: tokio::sync::mpsc::Receiver<PublishJob>,
@@ -349,12 +370,8 @@ fn enqueue_upload(daemon: &Arc<Daemon>, config: &Config, request: &PublishCcRequ
     let daemon = Arc::clone(daemon);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let response = handle.block_on(daemon.handle_upload(&job));
-        if !response.ok {
-            tracing::debug!(
-                "upload of {} not queued: {}",
-                request.crate_name,
-                response.error.as_deref().unwrap_or("unknown")
-            );
+        if let Some(error) = response.error {
+            tracing::debug!("upload of {} not queued: {error}", request.crate_name);
         }
     }
 }
@@ -411,6 +428,15 @@ pub(crate) enum Handoff {
 /// Offer `request` to the daemon. Bounded by [`PUBLISH_HANDOFF_TIMEOUT`]:
 /// a daemon that is slow to answer is one the wrapper should not wait for.
 pub(crate) fn hand_off_cc_publish(config: &Config, request: &PublishCcRequest) -> Handoff {
+    hand_off_cc_publish_within(config, request, PUBLISH_HANDOFF_TIMEOUT)
+}
+
+/// [`hand_off_cc_publish`] with the wait for the daemon supplied.
+pub(crate) fn hand_off_cc_publish_within(
+    config: &Config,
+    request: &PublishCcRequest,
+    budget: Duration,
+) -> Handoff {
     let _trace = crate::phase_trace::phase("store_handoff");
     let socket = config.socket_path();
     #[cfg(unix)]
@@ -421,7 +447,7 @@ pub(crate) fn hand_off_cc_publish(config: &Config, request: &PublishCcRequest) -
         Ok(receipt) => receipt,
         Err(error) => return Handoff::Declined(format!("creating handoff receipt: {error:#}")),
     };
-    let reply = send_handoff(&socket, request, PUBLISH_HANDOFF_TIMEOUT);
+    let reply = send_handoff(&socket, request, budget);
     finish_handoff(&receipt, reply)
 }
 
@@ -544,7 +570,14 @@ fn send_handoff(socket: &Path, request: &PublishCcRequest, budget: Duration) -> 
 }
 
 #[cfg(windows)]
-fn send_handoff(socket: &Path, request: &PublishCcRequest, budget: Duration) -> Result<String> {
+use send_handoff_windows as send_handoff;
+
+#[cfg(windows)]
+fn send_handoff_windows(
+    socket: &Path,
+    request: &PublishCcRequest,
+    budget: Duration,
+) -> Result<String> {
     crate::daemon::send_request_with_timeout(
         socket,
         &crate::daemon::Request::PublishCc(Box::new(request.clone())),
@@ -828,6 +861,7 @@ mod tests {
         assert_eq!(handoff_file_name("foo.o"), "foo.o");
         assert_eq!(handoff_file_name("sub/dir/foo.d"), "sub_dir_foo.d");
         assert_eq!(handoff_file_name("../x"), ".._x");
+        assert_eq!(handoff_file_name("lib-a_b.o"), "lib-a_b.o");
     }
 
     fn handoff_request(config: &Config, key: &str, dir: &Path) -> PublishCcRequest {
@@ -863,10 +897,7 @@ mod tests {
         let daemon = Arc::new(Daemon::new(config.clone()));
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         daemon.publish_queue().set_sender(tx);
-        let worker = {
-            let d = Arc::clone(&daemon);
-            tokio::task::spawn_blocking(move || run_publish_worker(d, rx))
-        };
+        let worker = spawn_publish_worker(Arc::clone(&daemon), rx).unwrap();
         let mut request = handoff_request(&config, &key("accepted"), dir.path());
         let _request_receipt = HandoffReceipt::new(&request).unwrap();
         let header = dir.path().join("a.h");
@@ -886,7 +917,10 @@ mod tests {
         let response = daemon.handle_publish_cc(request.clone()).await;
         assert!(response.ok, "{:?}", response.error);
         daemon.publish_queue().close();
-        worker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("closing the queue lets the worker drain and exit")
+            .unwrap();
 
         let store = Store::open(&config).unwrap();
         let meta = store
@@ -913,6 +947,105 @@ mod tests {
         assert_eq!(event.result, EventResult::Miss);
         assert_eq!(event.store_new_blobs, 1);
         assert!(event.store_error.is_empty());
+        // The put's bytes are charged to the event, however they landed.
+        assert!(
+            event.store_reflinked_bytes + event.store_hardlinked_bytes + event.store_copied_bytes
+                > 0,
+            "{event:?}"
+        );
+    }
+
+    /// Only an entry the wrapper marked for the remote is queued for upload,
+    /// even when a remote is configured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_entry_marked_for_the_remote_is_queued_for_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (upload_tx, mut uploads) = tokio::sync::mpsc::unbounded_channel();
+        daemon.set_upload_tx(upload_tx);
+        for (label, publishes_to_remote) in [("local-only", false), ("shared", true)] {
+            let mut request = handoff_request(&config, &key(label), dir.path());
+            request.publishes_to_remote = publishes_to_remote;
+            let (daemon, config) = (Arc::clone(&daemon), config.clone());
+            tokio::task::spawn_blocking(move || {
+                let store = Store::open(&config).unwrap();
+                let BuildClaim::Acquired(lock) = store.claim_build(&request.cache_key).unwrap()
+                else {
+                    panic!("fresh key");
+                };
+                publish_one(
+                    &daemon,
+                    &config,
+                    &store,
+                    PublishJob {
+                        request,
+                        _lock: lock,
+                    },
+                );
+            })
+            .await
+            .unwrap();
+        }
+        let queued = uploads.try_recv().expect("the shared entry is queued");
+        assert_eq!(queued.key, key("shared"));
+        assert!(uploads.try_recv().is_err(), "the local-only entry is not");
+    }
+
+    /// The wrapper's side and the daemon's connection handler, over a real
+    /// socket: the request reaches the publish queue, the wrapper sees its
+    /// receipt accepted, and a wrapper built after the daemon starts its
+    /// restart like any other request would.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handoff_over_the_socket_reaches_the_publish_queue() {
+        use interprocess::local_socket::traits::tokio::Listener as _;
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        daemon.publish_queue().set_sender(tx);
+        let socket = config.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = crate::transport::ListenerOptions::new()
+            .name(crate::transport::socket_name(&socket).unwrap())
+            .create_tokio()
+            .unwrap();
+        let lifecycle = Arc::new(kunobi_daemon::Lifecycle::default());
+        let server = {
+            let (daemon, lifecycle) = (Arc::clone(&daemon), Arc::clone(&lifecycle));
+            tokio::spawn(async move {
+                let stream = listener.accept().await.unwrap();
+                crate::daemon::handle_connection(stream, &daemon, &lifecycle).await
+            })
+        };
+        let mut request = handoff_request(&config, &key("socket"), dir.path());
+        request.client_epoch = crate::daemon::build_epoch() + 1;
+        let outcome = {
+            let (config, request) = (config.clone(), request.clone());
+            tokio::task::spawn_blocking(move || {
+                hand_off_cc_publish_within(&config, &request, Duration::from_secs(10))
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(outcome, Handoff::Accepted);
+        let job = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the accepted job is queued")
+            .unwrap();
+        assert_eq!(job.request.cache_key, request.cache_key);
+        drop(job);
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the handler ends with the connection")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !lifecycle.accepting_calls(),
+            "a newer wrapper drains the daemon"
+        );
     }
 
     /// Refusals never take the key: a full queue, a foreign path, a key a
@@ -1151,6 +1284,9 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(send_handoff(&socket, &request, Duration::from_millis(500)).is_err());
         let elapsed = start.elapsed();
+        // A client that gave up before connecting would leave the server
+        // in `accept` for good; a connection of our own releases it.
+        let _unblock = std::os::unix::net::UnixStream::connect(&socket);
         done_tx.send(()).unwrap();
         server.join().unwrap();
         assert!(elapsed < Duration::from_secs(2), "handoff took {elapsed:?}");

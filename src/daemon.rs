@@ -7133,19 +7133,15 @@ async fn server_main(
     }
     tracing::info!("started {} upload workers", num_workers);
 
-    // Publication of compiles handed off by cc wrappers: one blocking worker
+    // Publication of compiles handed off by cc wrappers: one worker thread
     // with its own store connection, fed by a bounded queue the handler
     // fills only after it holds the key lock (see `daemon_publish`).
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel::<crate::daemon_publish::PublishJob>(
         crate::daemon_publish::PUBLISH_QUEUE_CAPACITY,
     );
     daemon.publish_queue().set_sender(publish_tx);
-    let publish_handle = {
-        let d = daemon.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::daemon_publish::run_publish_worker(d, publish_rx)
-        })
-    };
+    let publish_done = crate::daemon_publish::spawn_publish_worker(daemon.clone(), publish_rx)
+        .context("starting the publish worker")?;
 
     // Periodic GC task: run immediately on startup, then every 6 hours
     let gc_daemon = daemon.clone();
@@ -7402,7 +7398,7 @@ async fn server_main(
     // lost build.
     daemon.publish_queue().close();
     drop(daemon);
-    if tokio::time::timeout(Duration::from_secs(30), publish_handle)
+    if tokio::time::timeout(Duration::from_secs(30), publish_done)
         .await
         .is_err()
     {
@@ -8340,7 +8336,7 @@ async fn handle_connection_after_queue(
 }
 
 #[cfg(test)]
-async fn handle_connection(
+pub(crate) async fn handle_connection(
     stream: TokioStream,
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,

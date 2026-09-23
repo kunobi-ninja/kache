@@ -15051,6 +15051,102 @@ mod tests {
         }
     }
 
+    /// The per-process memo of the prefix maps answers only for the same
+    /// configured base dirs: a change there recomputes them.
+    #[test]
+    fn remembered_prefix_maps_follow_the_configured_base_dirs() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.c"), "int a;\n").unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
+            "OUT_DIR",
+            "SDKROOT",
+            "KACHE_CC_PATH_NORMALIZE",
+            "KACHE_BASE_DIR",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
+        // SAFETY: the process-state lock serialises environment edits.
+        unsafe {
+            for (name, _) in &saved {
+                std::env::remove_var(name);
+            }
+        }
+        let parsed = CcArgs::parse(&s(&["cc", "-c", "a.c", "-o", "a.o"])).unwrap();
+        let base = vec![
+            std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let is_base = |maps: &[CcPrefixMap]| {
+            maps.iter()
+                .any(|m| m.to == crate::path_normalizer::configured_base_dir_target(0))
+        };
+
+        assert!(!is_base(&cc_prefix_maps(&parsed, &[])));
+        let with_base = cc_prefix_maps(&parsed, &base);
+        assert!(is_base(&with_base), "{with_base:?}");
+        assert_eq!(with_base, cc_prefix_maps_uncached(&parsed, &base));
+        assert_eq!(cc_prefix_maps(&parsed, &base), with_base);
+
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// Only a memo captured from the compile's own read set goes to the
+    /// daemon; one from a preceding expansion stays on the revalidating path.
+    #[test]
+    fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
+        let input = crate::cache_key::CcPreprocessMemoInput {
+            name: "a.h".to_string(),
+            mapped: "m".repeat(64),
+            content: "c".repeat(64),
+            fingerprint: crate::cache_key::FileFingerprint {
+                path: "/x/a.h".to_string(),
+                size: 1,
+                mtime_ns: 2,
+                ctime_ns: 3,
+                inode: 4,
+            },
+        };
+        let pending = |captured| PendingCcPreprocessMemo {
+            memo_key: "k".repeat(64),
+            preprocessed_hash: "p".repeat(64),
+            fingerprints: vec![input.clone()],
+            prefix_maps: Vec::new(),
+            captured,
+        };
+        let compiler = CcCompiler::new();
+        assert!(compiler.captured_preprocess_memo().is_none());
+
+        compiler
+            .pending_preprocess_memo
+            .replace(Some(pending(false)));
+        assert!(compiler.captured_preprocess_memo().is_none());
+
+        compiler
+            .pending_preprocess_memo
+            .replace(Some(pending(true)));
+        let memo = compiler.captured_preprocess_memo().unwrap();
+        assert_eq!(memo.memo_key, "k".repeat(64));
+        assert_eq!(memo.preprocessed_hash, "p".repeat(64));
+        assert_eq!(memo.inputs, vec![input.clone()]);
+        // Handing it over leaves it pending until the daemon has taken it.
+        assert!(compiler.pending_preprocess_memo.borrow().is_some());
+
+        compiler.discard_preprocess_memo();
+        assert!(compiler.pending_preprocess_memo.borrow().is_none());
+    }
+
     /// A memo identity spelled in mapped or toolchain paths is shared by
     /// every checkout; one that spells a raw checkout root is not.
     #[test]

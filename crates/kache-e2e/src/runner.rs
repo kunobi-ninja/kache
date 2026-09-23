@@ -108,17 +108,8 @@ pub fn run_fixture(fixture: &Fixture, kache_path: &Path) -> Result<FixtureResult
     // run before we start measuring.
     daemon::stop(kache_path, cache_dir.path());
     if fixture.daemon {
-        // The daemon reads the same config the wrappers see; the runner sets
-        // none, so an empty file keeps `KACHE_CONFIG` from reaching the
-        // user's own configuration.
-        let kache_config = cache_dir.path().join("kache-config.toml");
-        std::fs::write(&kache_config, "").context("writing the daemon's empty config")?;
-        if !daemon::start(kache_path, cache_dir.path(), &kache_config) {
-            anyhow::bail!(
-                "{}: the fixture requires a daemon and `kache daemon start` failed",
-                fixture.name
-            );
-        }
+        daemon::start_for_fixture(kache_path, cache_dir.path())
+            .with_context(|| fixture.name.clone())?;
     }
 
     // Per-phase report deltas: snapshot the cumulative kache report
@@ -716,18 +707,8 @@ fn run_phase(
     let build_wall_s = started.elapsed().as_secs();
     let build_exit_code = build.exit.code().unwrap_or(1);
     if fixture.daemon {
-        // Work the wrappers handed to the daemon is published after they
-        // return. The report below must see it, so drain the daemon (its
-        // shutdown finishes the queue) and start a fresh one for the next
-        // phase, which also proves each phase can find the previous one's
-        // entries without the daemon that wrote them.
-        if !daemon::stop_and_wait(kache_path, cache_dir, std::time::Duration::from_secs(40)) {
-            anyhow::bail!("{}: the daemon did not stop after the build", fixture.name);
-        }
-        let kache_config = cache_dir.join("kache-config.toml");
-        if !daemon::start(kache_path, cache_dir, &kache_config) {
-            anyhow::bail!("{}: restarting the daemon failed", fixture.name);
-        }
+        // The report below must see what the wrappers handed off.
+        daemon::restart_after_build(kache_path, cache_dir).with_context(|| fixture.name.clone())?;
     }
 
     if !build.exit.success() {

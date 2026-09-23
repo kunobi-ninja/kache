@@ -48,14 +48,48 @@ fn wait_for_run_lock(cache_dir: &Path, timeout: std::time::Duration) -> bool {
     }
 }
 
+/// How long a daemon may take to finish its queued publications and exit.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+
 /// A benchmark must not read or replace a cache with queued publications.
 pub fn drain(kache_path: &Path, cache_dir: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(
-        stop_and_wait(kache_path, cache_dir, std::time::Duration::from_secs(40)),
+        stop_and_wait(kache_path, cache_dir, DRAIN_TIMEOUT),
         "daemon did not stop after the build: {}",
         cache_dir.display()
     );
     Ok(())
+}
+
+/// Start the daemon a fixture asks for. The runner sets no configuration,
+/// so an empty file keeps `KACHE_CONFIG` from reaching the user's own; the
+/// daemon then reads what the wrappers see.
+pub fn start_for_fixture(kache_path: &Path, cache_dir: &Path) -> anyhow::Result<()> {
+    let kache_config = fixture_config(cache_dir);
+    std::fs::write(&kache_config, "")
+        .map_err(|error| anyhow::anyhow!("writing the daemon's empty config: {error}"))?;
+    anyhow::ensure!(
+        start(kache_path, cache_dir, &kache_config),
+        "the fixture requires a daemon and `kache daemon start` failed"
+    );
+    Ok(())
+}
+
+/// Work the wrappers handed to the daemon is published after they return.
+/// Drain it (shutdown finishes the queue) and start a fresh daemon for the
+/// next phase, which also proves each phase finds the previous one's entries
+/// without the daemon that wrote them.
+pub fn restart_after_build(kache_path: &Path, cache_dir: &Path) -> anyhow::Result<()> {
+    drain(kache_path, cache_dir)?;
+    anyhow::ensure!(
+        start(kache_path, cache_dir, &fixture_config(cache_dir)),
+        "restarting the daemon failed"
+    );
+    Ok(())
+}
+
+fn fixture_config(cache_dir: &Path) -> std::path::PathBuf {
+    cache_dir.join("kache-config.toml")
 }
 
 /// Best-effort: start a kache daemon bound to `cache_dir`.
@@ -131,8 +165,66 @@ mod tests {
             !while_held,
             "a running daemon must block the cache snapshot"
         );
-        assert!(wait_for_run_lock(dir.path(), Duration::ZERO));
+        // Tests in this binary spawn processes, and a fork taken while a
+        // probe holds the lock keeps it until that child execs, so these
+        // probes may wait a moment. One that never released its lock still
+        // fails.
+        assert!(wait_for_run_lock(dir.path(), Duration::from_secs(5)));
         // The probe must release its own lock too.
-        assert!(wait_for_run_lock(dir.path(), Duration::ZERO));
+        assert!(wait_for_run_lock(dir.path(), Duration::from_secs(5)));
+    }
+
+    /// A lock released while the drain waits ends the wait with success.
+    #[test]
+    fn a_lock_released_within_the_timeout_ends_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "daemon::tests::run_lock_child"])
+            .env("KACHE_E2E_LOCK_TEST_DIR", dir.path())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("ready").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dir.path().join("ready").exists(), "child took the lock");
+        let release = dir.path().join("release");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::write(release, "release").unwrap();
+        });
+        assert!(wait_for_run_lock(dir.path(), Duration::from_secs(10)));
+        releaser.join().unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    /// A lock file that cannot even be opened is never taken for a stopped
+    /// daemon: draining fails at once instead of reading a live cache.
+    #[cfg(unix)]
+    #[test]
+    fn draining_fails_when_the_lock_cannot_be_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("daemon.run.lock")).unwrap();
+        let stopped = Path::new("true");
+        assert!(!stop_and_wait(stopped, dir.path(), Duration::from_secs(10)));
+        assert!(drain(stopped, dir.path()).is_err());
+        assert!(restart_after_build(stopped, dir.path()).is_err());
+    }
+
+    /// The fixture helpers pass on whether `kache daemon start` succeeded,
+    /// and a fixture's daemon reads an empty configuration.
+    #[cfg(unix)]
+    #[test]
+    fn fixture_daemons_report_a_failed_start() {
+        let dir = tempfile::tempdir().unwrap();
+        start_for_fixture(Path::new("true"), dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("kache-config.toml")).unwrap(),
+            ""
+        );
+        assert!(start_for_fixture(Path::new("false"), dir.path()).is_err());
+        restart_after_build(Path::new("true"), dir.path()).unwrap();
+        assert!(restart_after_build(Path::new("false"), dir.path()).is_err());
     }
 }

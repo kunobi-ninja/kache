@@ -358,20 +358,38 @@ mod tests {
         assert_eq!(marker, Some(std::ffi::OsStr::new("gc")));
     }
 
-    /// std has no getter for argv[0], so a real child reports it: `sh -c`
-    /// with no further operands sets `$0` to its own argv[0].
+    /// Prints this process's argv[0] when run as a child of
+    /// [`self_command_runs_as_kache_on_unix`].
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child fixture for self_command_runs_as_kache_on_unix"]
+    fn print_argv0_fixture() {
+        if std::env::var_os("KACHE_TEST_PRINT_ARGV0").is_some() {
+            println!("argv0={}", std::env::args().next().unwrap_or_default());
+        }
+    }
+
+    /// std has no getter for argv[0], so a real child reports it. The child
+    /// is this test binary: a shell can be a multi-call binary (busybox in
+    /// the Nix build) that picks its applet from argv[0].
     #[cfg(unix)]
     #[test]
     fn self_command_runs_as_kache_on_unix() {
-        let output = super::self_command(std::path::Path::new("/bin/sh"), "-c")
-            .arg(r#"printf %s "$0""#)
+        let exe = std::env::current_exe().unwrap();
+        let output = super::self_command(&exe, "--exact")
+            .args([
+                "platform::tests::print_argv0_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_PRINT_ARGV0", "1")
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "kache",
-            "argv[0] must be kache, not the path the program was started from"
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.lines().any(|line| line == "argv0=kache"),
+            "argv[0] must be kache, not the path the program was started from: {stdout}"
         );
     }
 

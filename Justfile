@@ -28,7 +28,7 @@ pr BASE="origin/main": check
   #!/usr/bin/env bash
   set -euo pipefail
   mkdir -p tmp/mutants
-  git diff --no-ext-diff --unified=1 "{{BASE}}...HEAD" -- '*.rs' > tmp/mutants/pr.diff
+  git diff --no-ext-diff --diff-algorithm=histogram --unified=1 "{{BASE}}...HEAD" -- '*.rs' > tmp/mutants/pr.diff
   if [ ! -s tmp/mutants/pr.diff ]; then
     echo "no Rust diff against {{BASE}}; skipping mutants-diff"
     exit 0

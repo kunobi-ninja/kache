@@ -641,7 +641,7 @@ pub(crate) fn target_dir(out_dir: &Path) -> Option<PathBuf> {
     Some(target.to_path_buf())
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return None;
     }

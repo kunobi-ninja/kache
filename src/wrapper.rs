@@ -5227,10 +5227,21 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
         &dep_info,
         tree.clone(),
     );
-    if crate::cache_key::shared_prediction_can_record(args, &dep_info)
-        && let Some(identity) = crate::cache_key::rustc_shared_prediction_identity(args)
+    // A source under target keeps the shared row out. A registry unit whose
+    // only such sources are its own OUT_DIR gets a relocated row instead.
+    if crate::cache_key::shared_prediction_can_record(args, &dep_info) {
+        if let Some(identity) = crate::cache_key::rustc_shared_prediction_identity(args) {
+            file_hasher.record_input_prediction(
+                &identity,
+                args.crate_name.as_deref(),
+                &dep_info,
+                tree,
+            );
+        }
+    } else if let Some((identity, record)) =
+        crate::cache_key::relocatable_record(args, &dep_info, tree.as_deref())
     {
-        file_hasher.record_input_prediction(&identity, args.crate_name.as_deref(), &dep_info, tree);
+        file_hasher.record_portable_prediction(&identity, args.crate_name.as_deref(), &record);
     }
 }
 
@@ -5289,6 +5300,18 @@ enum KeyDiscovery {
     /// guard is armed regardless of configuration: an input written during
     /// the compile must not be keyed as if the compiler had read it.
     Emitted(crate::cache_key::DepInfo),
+    /// Run the pre-pass again for a predicted key that missed. The caller
+    /// may hold this unit's discovery flight, and that lock is not
+    /// re-entrant, so this computation joins no flight.
+    Rederived,
+}
+
+/// Where this key computation may wait for a peer discovering the same
+/// unit: nowhere without the scheduler, and nowhere for a re-derivation,
+/// which would otherwise wait on the flight its own caller holds.
+fn discovery_flight_dir(config: &Config, discovery: &KeyDiscovery) -> Option<PathBuf> {
+    (config.scheduler && !matches!(discovery, KeyDiscovery::Rederived))
+        .then(|| config.cache_dir.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5308,6 +5331,7 @@ fn compute_rustc_cache_key(
 ) -> Result<ComputedKey> {
     let key_start = std::time::Instant::now();
     let emitted = matches!(discovery, KeyDiscovery::Emitted(_));
+    let flight_dir = discovery_flight_dir(config, &discovery);
     crate::cache_key::set_defer_discovery(matches!(discovery, KeyDiscovery::Deferrable));
     if let KeyDiscovery::Emitted(dep_info) = discovery {
         crate::cache_key::provide_dep_info(dep_info);
@@ -5317,7 +5341,7 @@ fn compute_rustc_cache_key(
         None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
     }
     .with_input_predictions(config.input_predictions)
-    .with_prediction_flights(config.scheduler.then(|| config.cache_dir.clone()));
+    .with_prediction_flights(flight_dir);
     if config.modified_input_guard || emitted {
         // Flag keyed inputs touched at/after this invocation started — their
         // content at hash time may differ from what rustc reads, so we'll look
@@ -5448,7 +5472,7 @@ fn recompute_key_without_prediction(
         false,
         0,
         Vec::new(),
-        KeyDiscovery::Immediate,
+        KeyDiscovery::Rederived,
     )
 }
 
@@ -7613,6 +7637,72 @@ mod tests {
                 .sources,
             closure.source_files,
             "a recording with no closure must leave the existing one alone"
+        );
+    }
+
+    /// A registry unit whose closure reads its own OUT_DIR cannot have the
+    /// shared row, so it gets the relocated one; without such a source it
+    /// gets the shared row.
+    #[test]
+    fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
+        if std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: no rustc");
+            return;
+        }
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.input_predictions = true;
+        let store = Store::open(&config).unwrap();
+        let package = dir.path().join("home/registry/src/index-1/kt-1.0.0");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        let target = dir.path().join("a/target");
+        let out = target.join("debug/build/kt-1/out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("gen.rs"), "pub fn g() {}\n").unwrap();
+        let _manifest =
+            crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(package.as_os_str()));
+        let _out = crate::config::tests::set_env_for_test("OUT_DIR", Some(out.as_os_str()));
+        let lib = package.join("src/lib.rs");
+        let args = rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            lib.to_str().unwrap(),
+            "--out-dir",
+            target.join("debug/deps").to_str().unwrap(),
+        ]);
+        let shared = crate::cache_key::rustc_shared_prediction_identity(&args)
+            .expect("a registry unit with an absolute target has a shared identity");
+        let reads_out_dir = crate::cache_key::DepInfo {
+            source_files: vec![lib.clone(), out.join("gen.rs")],
+            env_deps: Vec::new(),
+        };
+        let (relocatable, _) =
+            crate::cache_key::relocatable_record(&args, &reads_out_dir, Some("tree")).unwrap();
+
+        crate::cache_key::stash_last_dep_info_for_test(reads_out_dir);
+        crate::cache_key::stash_last_tree_digest_for_test("tree");
+        record_input_prediction(&config, Some(&store), &args, true);
+        let hasher = store.file_hasher();
+        assert!(hasher.input_prediction(&shared).is_none());
+        let record = hasher.portable_prediction(&relocatable).unwrap();
+        assert_eq!(record.tree, "tree");
+
+        let package_only = crate::cache_key::DepInfo {
+            source_files: vec![lib],
+            env_deps: Vec::new(),
+        };
+        crate::cache_key::stash_last_dep_info_for_test(package_only.clone());
+        crate::cache_key::stash_last_tree_digest_for_test("tree-2");
+        record_input_prediction(&config, Some(&store), &args, true);
+        assert_eq!(
+            hasher.input_prediction(&shared).unwrap().sources,
+            package_only.source_files
         );
     }
 
@@ -15678,6 +15768,87 @@ exit 0
         assert!(
             keyed.key_too_new,
             "a source written after the invocation started is too new"
+        );
+    }
+
+    #[test]
+    fn a_rederivation_never_waits_on_a_discovery_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.scheduler = true;
+        let flights = |discovery: KeyDiscovery| discovery_flight_dir(&config, &discovery);
+        assert_eq!(
+            flights(KeyDiscovery::Immediate),
+            Some(config.cache_dir.clone())
+        );
+        assert_eq!(
+            flights(KeyDiscovery::Deferrable),
+            Some(config.cache_dir.clone())
+        );
+        assert_eq!(
+            flights(KeyDiscovery::Rederived),
+            None,
+            "the caller may already hold the flight"
+        );
+        config.scheduler = false;
+        assert_eq!(
+            discovery_flight_dir(&config, &KeyDiscovery::Immediate),
+            None
+        );
+    }
+
+    /// A predicted key that missed is re-derived while the invocation may
+    /// still hold the unit's discovery flight. A flight lock is not
+    /// re-entrant, so joining it again would wait on itself for the whole
+    /// flight timeout. The re-derivation must not join one at all.
+    #[test]
+    fn a_rederived_key_holds_no_discovery_flight() {
+        if std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: no rustc");
+            return;
+        }
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.scheduler = true;
+        config.input_predictions = true;
+        let store = Store::open(&config).unwrap();
+        let lib = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        std::fs::write(&lib, "pub fn v() {}\n").unwrap();
+        let out = dir.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out).unwrap();
+        let args = RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "--crate-name",
+                "kt",
+                lib.to_str().unwrap(),
+                "--crate-type",
+                "lib",
+                "--emit=dep-info,metadata",
+                "--out-dir",
+                out.to_str().unwrap(),
+            ]))
+            .unwrap();
+        let keyed = recompute_key_without_prediction(
+            &config,
+            &RustcCompiler::new(),
+            &args,
+            None,
+            0,
+            Some(&store),
+            None,
+        )
+        .unwrap();
+        assert!(!keyed.cache_key.is_empty());
+        assert!(
+            keyed.discovery_flight.is_none(),
+            "a re-derivation joined a discovery flight"
         );
     }
 }

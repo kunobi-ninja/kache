@@ -146,7 +146,7 @@ fn failed_fallback_retries_once_preserving_compiler_inputs_and_events() {
         assert!(stderr.contains("kache: warning: fallback"));
         assert!(stderr.contains("compiling directly without fallback"));
         let event = fixture.event();
-        assert_eq!(event["schema"], 20);
+        assert_eq!(event["schema"], 21);
         assert_eq!(event["exit_code"], 0);
         assert_ne!(event["fallback"], true);
         assert_eq!(event["fallback_attempt"]["outcome"], "failed");

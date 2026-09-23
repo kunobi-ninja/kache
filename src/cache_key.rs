@@ -5227,6 +5227,7 @@ impl<'db> FileHasher<'db> {
         // the compile's own header work did on macOS.
         let mut stamped: Vec<(&String, &PathBuf, FileFingerprint)> =
             Vec::with_capacity(paths.len());
+        let _probe_loop = crate::phase_trace::phase("fp_stat_and_hash_loop");
         for (name, path) in paths {
             let fingerprint = match FileFingerprint::from_path(path) {
                 Ok(fingerprint) => fingerprint,
@@ -5257,6 +5258,8 @@ impl<'db> FileHasher<'db> {
             };
             pending.push((name.clone(), fingerprint, content, path.clone()));
         }
+        drop(_probe_loop);
+        let _probe_mapped = crate::phase_trace::phase("fp_mapped_query");
         let memo = self.cache.as_ref().filter(|_| !maps_key.is_empty());
         let known = match memo {
             Some(cache) => {

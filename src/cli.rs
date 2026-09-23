@@ -6620,6 +6620,12 @@ pub fn verify(config: &Config, checksums: bool, repair: bool) -> Result<VerifyOu
             swept_staging.removed,
             ByteSize(swept_staging.bytes_reclaimed)
         );
+        let handoffs = crate::daemon_publish::sweep_orphaned_handoffs(config, STAGING_SWEEP_GRACE);
+        println!(
+            "Repairing: reclaimed {} abandoned cc handoffs ({})",
+            handoffs.removed,
+            ByteSize(handoffs.bytes_reclaimed)
+        );
         let memos = store.file_hash_cache();
         match memos.prune_cc_preprocess_memos() {
             Ok((removed, inputs)) if removed + inputs > 0 => println!(

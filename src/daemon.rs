@@ -6752,6 +6752,19 @@ impl Daemon {
                 // Same grace for put-phase staging snapshots abandoned by a
                 // crash between staging and publish (review finding #3).
                 let staging_stats = store.sweep_stale_staging(crate::store::STAGING_SWEEP_GRACE);
+                // Handoff request directories the staging sweep does not
+                // enter: a daemon that died with publications queued.
+                let handoffs = crate::daemon_publish::sweep_orphaned_handoffs(
+                    &self.config,
+                    crate::store::STAGING_SWEEP_GRACE,
+                );
+                if handoffs.removed > 0 {
+                    tracing::info!(
+                        "swept {} abandoned cc handoffs ({})",
+                        handoffs.removed,
+                        crate::report::format_bytes(handoffs.bytes_reclaimed)
+                    );
+                }
                 if staging_stats.removed > 0 {
                     tracing::info!(
                         "swept {} stale staging files ({})",

@@ -600,6 +600,70 @@ fn handoff_file_name(store_name: &str) -> String {
         .collect()
 }
 
+/// What [`sweep_orphaned_handoffs`] reclaimed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HandoffSweep {
+    pub(crate) removed: usize,
+    pub(crate) bytes_reclaimed: u64,
+}
+
+/// Whether a request directory whose newest entry changed at `newest` has
+/// outlived every legitimate request.
+fn handoff_is_abandoned(
+    newest: std::time::SystemTime,
+    now: std::time::SystemTime,
+    grace: Duration,
+) -> bool {
+    now.duration_since(newest).is_ok_and(|age| age >= grace)
+}
+
+/// The latest mtime of `dir` and its entries, without following links. `None`
+/// when anything cannot be read, so an unreadable request is left alone.
+fn newest_mtime(dir: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let mut newest = std::fs::symlink_metadata(dir).ok()?.modified().ok()?;
+    let mut bytes = 0;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let meta = std::fs::symlink_metadata(entry.ok()?.path()).ok()?;
+        newest = newest.max(meta.modified().ok()?);
+        bytes += meta.len();
+    }
+    Some((newest, bytes))
+}
+
+/// Remove request directories a crash left under the handoff directory.
+///
+/// A request directory holds a wrapper's snapshots and receipt until the
+/// daemon has published them, which takes milliseconds from a bounded queue.
+/// One whose newest entry is older than `grace` belongs to no live request:
+/// the daemon that accepted it died, or the wrapper died before handing it
+/// over. The store's own staging sweep only looks at files and so never
+/// reached these. Only `cc-` directories directly under the handoff directory
+/// are considered, a link is never followed, and nothing else in the store is
+/// walked.
+pub(crate) fn sweep_orphaned_handoffs(config: &Config, grace: Duration) -> HandoffSweep {
+    let mut sweep = HandoffSweep::default();
+    let Ok(entries) = std::fs::read_dir(handoff_dir(config)) else {
+        return sweep;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_request = entry.file_name().to_string_lossy().starts_with("cc-")
+            && std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
+        if !is_request {
+            continue;
+        }
+        let Some((newest, bytes)) = newest_mtime(&path) else {
+            continue;
+        };
+        if handoff_is_abandoned(newest, now, grace) && std::fs::remove_dir_all(&path).is_ok() {
+            sweep.removed += 1;
+            sweep.bytes_reclaimed += bytes;
+        }
+    }
+    sweep
+}
+
 pub(crate) fn remove_handoff_files(files: &[HandoffFile]) {
     for file in files {
         let _ = std::fs::remove_file(&file.path);
@@ -614,6 +678,92 @@ pub(crate) fn remove_handoff_files(files: &[HandoffFile]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_is_abandoned_exactly_one_grace_after_its_last_change() {
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let grace = Duration::from_secs(3600);
+        assert!(!handoff_is_abandoned(now, now, grace));
+        assert!(!handoff_is_abandoned(
+            now - grace + Duration::from_nanos(1),
+            now,
+            grace
+        ));
+        assert!(handoff_is_abandoned(now - grace, now, grace));
+        // An entry dated after the clock (a skewed filesystem) is kept.
+        assert!(!handoff_is_abandoned(
+            now + Duration::from_secs(1),
+            now,
+            grace
+        ));
+    }
+
+    #[test]
+    fn the_handoff_sweep_reclaims_only_old_request_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let root = handoff_dir(&config);
+        let request = |name: &str| {
+            let path = root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("0-foo.o"), b"object").unwrap();
+            std::fs::write(path.join("accepted"), b"").unwrap();
+            path
+        };
+        let hours_ago = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - Duration::from_secs(2 * 3600),
+        );
+        let age = |path: &Path| {
+            for entry in std::fs::read_dir(path).unwrap() {
+                filetime::set_file_mtime(entry.unwrap().path(), hours_ago).unwrap();
+            }
+            filetime::set_file_mtime(path, hours_ago).unwrap();
+        };
+
+        let abandoned = request("cc-dead");
+        age(&abandoned);
+        let live = request("cc-live");
+        // Old directory, but one file is new: a request still being written.
+        let mixed = request("cc-mixed");
+        age(&mixed);
+        std::fs::write(mixed.join("1-bar.o"), b"new").unwrap();
+        // Not a request directory, however old.
+        let other = request("keep-me");
+        age(&other);
+        let stray = root.join("cc-file");
+        std::fs::write(&stray, b"x").unwrap();
+        filetime::set_file_mtime(&stray, hours_ago).unwrap();
+
+        let sweep = sweep_orphaned_handoffs(&config, Duration::from_secs(3600));
+
+        assert_eq!(sweep.removed, 1, "{sweep:?}");
+        assert_eq!(sweep.bytes_reclaimed, b"object".len() as u64);
+        assert!(!abandoned.exists());
+        assert!(live.exists());
+        assert!(mixed.exists());
+        assert!(other.exists());
+        assert!(stray.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_handoff_sweep_never_follows_a_link_out_of_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let root = handoff_dir(&config);
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("precious"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("cc-link")).unwrap();
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_symlink_file_times(root.join("cc-link"), old, old).unwrap();
+
+        let sweep = sweep_orphaned_handoffs(&config, Duration::from_secs(3600));
+
+        assert_eq!(sweep.removed, 0);
+        assert!(outside.join("precious").exists());
+    }
 
     #[test]
     fn handoff_paths_must_sit_under_the_store_handoff_dir() {

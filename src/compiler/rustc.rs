@@ -172,13 +172,17 @@ impl RustcCompiler {
         // not change the binary relative to an unwrapped rustc. `None` here
         // is that cache path (`execute` / isolated incremental).
         let cache_this_compile = skip_remap_override.is_none();
-        let compiler_args = match macos_oso_prefix_flag(parsed, all_args, cache_this_compile) {
-            Some(flag) => {
-                let mut extended = all_args.to_vec();
-                extended.push(flag);
-                Cow::Owned(extended)
-            }
-            None => Cow::Borrowed(all_args),
+        let injected: Vec<String> = [
+            macos_oso_prefix_flag(parsed, all_args, cache_this_compile),
+            macos_install_name_flag(parsed, all_args, cache_this_compile),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let compiler_args = if injected.is_empty() {
+            Cow::Borrowed(all_args)
+        } else {
+            Cow::Owned([all_args, injected.as_slice()].concat())
         };
         compile::run_rustc(
             &parsed.rustc,
@@ -369,6 +373,61 @@ fn wasm_link_refusal(parsed: &RustcArgs) -> Option<&'static str> {
     None
 }
 
+/// ld64 `-install_name` for a cached macOS proc-macro link.
+///
+/// rustc gives a dylib's `LC_ID_DYLIB` its absolute output path, so the same
+/// proc macro built fresh in two checkouts differs in that one field, and
+/// every dependent that hashes it misses in the second checkout
+/// (kunobi-ninja/kache#1009). rustc loads a proc macro by path, never by
+/// install name, so a checkout-independent `@rpath` name changes nothing it
+/// does. A `dylib` or `cdylib` keeps its name: something may link against it
+/// and record that name. The same conditions as `-oso_prefix` apply otherwise.
+#[cfg(target_os = "macos")]
+fn macos_install_name_flag(
+    parsed: &RustcArgs,
+    all_args: &[String],
+    cache_this_compile: bool,
+) -> Option<String> {
+    macos_install_name_flag_inner(parsed, all_args, cache_this_compile)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_install_name_flag(
+    _parsed: &RustcArgs,
+    _all_args: &[String],
+    _cache_this_compile: bool,
+) -> Option<String> {
+    None
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_install_name_flag_inner(
+    parsed: &RustcArgs,
+    all_args: &[String],
+    enabled: bool,
+) -> Option<String> {
+    if !enabled || !parsed.emits_link() {
+        return None;
+    }
+    if !parsed.crate_types.iter().any(|kind| kind == "proc-macro") {
+        return None;
+    }
+    if all_args.iter().any(|arg| arg.contains("-install_name")) {
+        return None;
+    }
+    if parsed
+        .target
+        .as_deref()
+        .is_some_and(|target| !target.contains("-apple-darwin"))
+    {
+        return None;
+    }
+    let crate_name = parsed.crate_name.as_deref()?;
+    Some(format!(
+        "-Clink-arg=-Wl,-install_name,@rpath/lib{crate_name}.dylib"
+    ))
+}
+
 /// ld64 `-oso_prefix` for a cached macOS debug link.
 ///
 /// A `-g` Mach-O records absolute object paths in `N_OSO`. Prefixing the
@@ -479,6 +538,78 @@ mod tests {
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
+    }
+
+    fn proc_macro_args(extra: &[&str]) -> RustcArgs {
+        let mut argv = vec![
+            "rustc",
+            "--crate-name",
+            "pm",
+            "--crate-type",
+            "proc-macro",
+            "--out-dir",
+            "/checkout/target/debug/deps",
+            "src/lib.rs",
+        ];
+        argv.extend_from_slice(extra);
+        RustcCompiler::new().parse(&s(&argv)).unwrap()
+    }
+
+    #[test]
+    fn a_cached_proc_macro_gets_a_checkout_independent_install_name() {
+        let parsed = proc_macro_args(&[]);
+        assert_eq!(
+            macos_install_name_flag_inner(&parsed, &parsed.all_args, true).as_deref(),
+            Some("-Clink-arg=-Wl,-install_name,@rpath/libpm.dylib")
+        );
+        let darwin = proc_macro_args(&["--target", "aarch64-apple-darwin"]);
+        assert!(macos_install_name_flag_inner(&darwin, &darwin.all_args, true).is_some());
+    }
+
+    #[test]
+    fn only_a_cached_proc_macro_link_of_ours_is_renamed() {
+        let passthrough = proc_macro_args(&[]);
+        assert_eq!(
+            macos_install_name_flag_inner(&passthrough, &passthrough.all_args, false),
+            None,
+            "a passthrough matches an unwrapped rustc"
+        );
+        let named = proc_macro_args(&["-C", "link-arg=-Wl,-install_name,@rpath/mine.dylib"]);
+        assert_eq!(
+            macos_install_name_flag_inner(&named, &named.all_args, true),
+            None,
+            "the caller's own install name stays"
+        );
+        let linux = proc_macro_args(&["--target", "x86_64-unknown-linux-gnu"]);
+        assert_eq!(
+            macos_install_name_flag_inner(&linux, &linux.all_args, true),
+            None
+        );
+        let metadata = proc_macro_args(&["--emit", "metadata"]);
+        assert_eq!(
+            macos_install_name_flag_inner(&metadata, &metadata.all_args, true),
+            None,
+            "nothing is linked"
+        );
+        for kind in ["dylib", "cdylib", "bin", "rlib"] {
+            let parsed = RustcCompiler::new()
+                .parse(&s(&[
+                    "rustc",
+                    "--crate-name",
+                    "pm",
+                    "--crate-type",
+                    kind,
+                    "--out-dir",
+                    "/checkout/target/debug/deps",
+                    "src/lib.rs",
+                ]))
+                .unwrap();
+            assert_eq!(
+                macos_install_name_flag_inner(&parsed, &parsed.all_args, true),
+                None,
+                "{kind} keeps the name its consumers may record"
+            );
+        }
     }
 
     #[test]

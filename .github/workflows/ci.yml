@@ -222,7 +222,7 @@ jobs:
 
           mkdir -p tmp/mutants
           git rev-parse --verify 'HEAD^1^{commit}'
-          git diff --no-ext-diff --unified=1 HEAD^1 HEAD -- '*.rs' \
+          git diff --no-ext-diff --diff-algorithm=histogram --unified=1 HEAD^1 HEAD -- '*.rs' \
             > tmp/mutants/pr.diff
           count="$(
             cargo mutants \

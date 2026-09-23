@@ -8,6 +8,28 @@ use std::path::{Path, PathBuf};
 
 pub const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
+/// How long a file must have been left alone before its hash may be memoised.
+///
+/// A memo row is trusted whenever the stamp matches. A file written, hashed and
+/// then written again inside one timestamp tick keeps the same stamp with
+/// different bytes, and a row recorded between the two writes would hand the
+/// old hash to every later lookup. Filesystems tick coarsely: HFS+ in whole
+/// seconds, FAT in two, ext4 at the kernel's coarse clock. Two seconds after
+/// the last change, a further write lands on a later tick and changes the
+/// stamp, so a row recorded then cannot be stale this way.
+pub const HASH_SETTLE_NS: i64 = 2_000_000_000;
+
+/// Whether `fingerprint`'s file last changed at least [`HASH_SETTLE_NS`]
+/// before `now_ns`. The ctime counts as well as the mtime: tools that restore
+/// an old mtime after writing cannot hold the ctime back.
+pub fn stamp_is_settled(fingerprint: &FileFingerprint, now_ns: i64) -> bool {
+    let changed = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
+    now_ns.saturating_sub(changed) >= HASH_SETTLE_NS
+}
+
+/// Paths per lookup statement, well under SQLite's bound-parameter limit.
+const FILE_HASH_LOOKUP_CHUNK: usize = 256;
+
 pub enum FileHashCache<'db> {
     Borrowed(&'db Connection),
     #[cfg(any(test, feature = "test-support"))]
@@ -74,6 +96,49 @@ impl<'db> FileHashCache<'db> {
                 |row| row.get(0),
             )
             .optional()
+    }
+
+    /// Memoised hashes for many files in one statement per chunk, keyed by
+    /// path. A row counts only when its whole stamp matches, so a file that
+    /// changed since it was recorded reads as absent, exactly as with [`get`].
+    ///
+    /// [`get`]: Self::get
+    pub fn get_many(
+        &self,
+        fingerprints: &[&FileFingerprint],
+    ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        let mut found = std::collections::HashMap::new();
+        for chunk in fingerprints.chunks(FILE_HASH_LOOKUP_CHUNK) {
+            let wanted: std::collections::HashSet<&FileFingerprint> =
+                chunk.iter().copied().collect();
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut stmt = self.db().prepare_cached(&format!(
+                "SELECT path, size, mtime_ns, ctime_ns, inode, hash FROM file_hashes
+                 WHERE path IN ({placeholders})"
+            ))?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(chunk.iter().map(|f| f.path.as_str())),
+                |row| {
+                    Ok((
+                        FileFingerprint {
+                            path: row.get(0)?,
+                            size: row.get(1)?,
+                            mtime_ns: row.get(2)?,
+                            ctime_ns: row.get(3)?,
+                            inode: row.get(4)?,
+                        },
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (stamp, hash) = row?;
+                if wanted.contains(&stamp) {
+                    found.insert(stamp.path, hash);
+                }
+            }
+        }
+        Ok(found)
     }
 
     pub fn put(&self, fingerprint: &FileFingerprint, hash: &str) -> rusqlite::Result<()> {
@@ -516,6 +581,78 @@ impl FileHashCache<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stamp(path: &str, mtime_ns: i64, ctime_ns: i64) -> FileFingerprint {
+        FileFingerprint {
+            path: path.to_string(),
+            size: 10,
+            mtime_ns,
+            ctime_ns,
+            inode: 7,
+        }
+    }
+
+    #[test]
+    fn a_stamp_settles_exactly_one_window_after_its_last_change() {
+        let changed = 1_000_000_000_000;
+        let file = stamp("/h.h", changed, changed);
+        assert!(!stamp_is_settled(&file, changed));
+        assert!(!stamp_is_settled(&file, changed + HASH_SETTLE_NS - 1));
+        assert!(stamp_is_settled(&file, changed + HASH_SETTLE_NS));
+        // A clock behind the file (network filesystems) is not settled.
+        assert!(!stamp_is_settled(&file, changed - 1));
+    }
+
+    #[test]
+    fn a_recent_ctime_holds_back_a_file_whose_mtime_was_restored() {
+        // `touch -r`, `cp -p` and rsync write new bytes, then put an old mtime
+        // back. Only the ctime shows the write.
+        let now = 1_000_000_000_000;
+        let old = now - 10 * HASH_SETTLE_NS;
+        assert!(!stamp_is_settled(&stamp("/h.h", old, now - 1), now));
+        assert!(stamp_is_settled(&stamp("/h.h", old, old), now));
+    }
+
+    #[test]
+    fn many_lookups_return_only_rows_whose_whole_stamp_matches() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        let same = stamp("/same.h", 1, 1);
+        let moved = stamp("/moved.h", 1, 1);
+        cache.put(&same, "h-same").unwrap();
+        cache.put(&moved, "h-moved").unwrap();
+        let mut rewritten = moved.clone();
+        rewritten.mtime_ns = 2;
+        let absent = stamp("/absent.h", 1, 1);
+
+        let found = cache.get_many(&[&same, &rewritten, &absent]).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found["/same.h"], "h-same");
+        assert!(
+            !found.contains_key("/moved.h"),
+            "a changed stamp reads as absent"
+        );
+    }
+
+    #[test]
+    fn many_lookups_span_more_paths_than_one_statement_binds() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        let stamps: Vec<FileFingerprint> = (0..FILE_HASH_LOOKUP_CHUNK * 2 + 3)
+            .map(|i| stamp(&format!("/h{i}.h"), 1, 1))
+            .collect();
+        for (i, s) in stamps.iter().enumerate() {
+            cache.put(s, &format!("hash{i}")).unwrap();
+        }
+        let refs: Vec<&FileFingerprint> = stamps.iter().collect();
+        let found = cache.get_many(&refs).unwrap();
+        assert_eq!(found.len(), stamps.len());
+        assert_eq!(found["/h0.h"], "hash0");
+        let last = stamps.len() - 1;
+        assert_eq!(found[&format!("/h{last}.h")], format!("hash{last}"));
+    }
 
     #[test]
     fn has_entry_for_unit_sees_only_that_crate_and_unit() {

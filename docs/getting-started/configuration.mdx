@@ -271,7 +271,9 @@ links it, so the first checkout still rebuilds it. A `crate:VAR` entry for
 `OUT_DIR`, or for a variable whose value is under it, keeps that crate on its
 own `OUT_DIR`. A macro that writes debug output into the shared directory fails
 with a hint: run `cargo clean -p <crate>` and rebuild with
-`KACHE_OUT_DIR_ALIAS=0`.
+`KACHE_OUT_DIR_ALIAS=0`. The hint needs rustc's error output, so a compile
+Kache passes straight to rustc, such as a `bypass_*` or `exclude` match or one
+on the `preserve_incremental` lane, fails with rustc's error alone.
 
 `key_env_vars` accepts exact names and trailing-star prefix patterns:
 

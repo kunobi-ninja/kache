@@ -6576,12 +6576,17 @@ fn rustc_output_in(reason: &str) -> &str {
     reason.strip_prefix(UNCACHEABLE_REASON).unwrap_or_default()
 }
 
-/// Every rustc compile whose exit code the wrapper returns ends here,
-/// whichever branch ran it, so a failure that came from a shared read-only
-/// `OUT_DIR` always gets the hint and the deny markers. `rustc_output` is
-/// what kache saw of rustc's output: a compile's captured stderr, or what a
-/// passthrough's reason quotes (see `rustc_output_in`). A passthrough's own
-/// stderr goes straight to Cargo, so kache never sees it.
+/// After a failed compile, the hint and the deny markers for a shared
+/// read-only `OUT_DIR` a macro could not write into. Both need rustc's words.
+/// `rustc_output` is the captured stderr of a keyed, deferred or adaptive
+/// compile, or the key error an `uncacheable|` passthrough reason quotes (see
+/// `rustc_output_in`).
+///
+/// Every other passthrough sends rustc's stderr straight to Cargo: a
+/// compiler refusal such as `--unpretty`, a user bypass or exclude rule, the
+/// preserve-incremental and untrusted-backend lanes, and kache's own errors.
+/// A write failure there gets rustc's error alone. Covering those lanes would
+/// mean capturing their stderr.
 fn after_rustc_exit(exit_code: i32, rustc_output: &str, externs: &[ExternDep]) {
     if exit_code != 0 {
         crate::out_dir_alias::after_failed_compile(rustc_output, externs);
@@ -6654,7 +6659,6 @@ fn rustc_direct_passthrough_with_event(
         return passthrough_with_event(config, args, crate_name, root, start, reason);
     }
     let output = passthrough(args, None, config.preserve_incremental)?;
-    after_rustc_exit(output.exit_code, rustc_output_in(reason), &args.externs);
     log_passthrough_event(
         config,
         root,
@@ -6677,7 +6681,6 @@ fn preserved_incremental_with_event(
     start: std::time::Instant,
 ) -> Result<i32> {
     let output = passthrough(args, None, true)?;
-    after_rustc_exit(output.exit_code, "", &args.externs);
     log_passthrough_event(
         config,
         root,

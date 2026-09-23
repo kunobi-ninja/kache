@@ -1373,18 +1373,31 @@ fn shared_sources_can_record(
     })
 }
 
-/// Is `source` spelled as a file under the registry, with nothing but
-/// normal components after it?
+/// Is `source` spelled as a file under the registry? A `..` may climb back
+/// up inside the package the path names, as in the `<pkg>/src/../README.md`
+/// rustc reports for `include_str!("../README.md")`, but not out of it. The
+/// index and the package are the two levels below the root it has to stay in.
 fn under_registry_src(source: &Path, registry_src: &Path) -> bool {
-    out_dir_suffix(source.as_os_str(), registry_src).is_some_and(|suffix| !suffix.is_empty())
+    suffix_within(source.as_os_str(), registry_src, 2).is_some_and(|suffix| !suffix.is_empty())
+}
+
+/// The bytes of `value` after `root`, for a path that stays inside `root`.
+fn out_dir_suffix(value: &std::ffi::OsStr, root: &Path) -> Option<String> {
+    suffix_within(value, root, 0)
 }
 
 /// The bytes of `value` after `root`, when `value` is `root` itself (an
-/// empty suffix) or `root`, a separator, and normal components. Both `/` and
-/// `\` count as separators everywhere, which can only refuse more. `None`
-/// for a longer name that merely starts the same (`/o2` against `/o`), a
-/// `.` or `..` component, an empty one, or a suffix that is not UTF-8.
-fn out_dir_suffix(value: &std::ffi::OsStr, root: &Path) -> Option<String> {
+/// empty suffix) or `root`, a separator, and components that never leave the
+/// directory `floor` levels below `root` ([`stays_below`]). `None` for a
+/// longer name that merely starts the same (`/o2` against `/o`), a `.`
+/// component, an empty one, a `..` that climbs too far, or a suffix that is
+/// not UTF-8. The suffix keeps its `..`, because a record has to reproduce
+/// the spelling rustc reported.
+///
+/// `\` separates components on Windows only, so the walk has to hold both
+/// with and without it: from `root`, `a\b/..` is one level down on Windows
+/// and back at `root` on Unix.
+fn suffix_within(value: &std::ffi::OsStr, root: &Path, floor: usize) -> Option<String> {
     let rest = value
         .as_encoded_bytes()
         .strip_prefix(root.as_os_str().as_encoded_bytes())?;
@@ -1392,10 +1405,33 @@ fn out_dir_suffix(value: &std::ffi::OsStr, root: &Path) -> Option<String> {
     let Some(components) = suffix.strip_prefix(['/', '\\']) else {
         return suffix.is_empty().then(String::new);
     };
-    components
-        .split(['/', '\\'])
-        .all(|component| !matches!(component, "" | "." | ".."))
+    (stays_below(components.split(['/', '\\']), floor) && stays_below(components.split('/'), floor))
         .then(|| suffix.to_string())
+}
+
+/// Does a walk down `components` stay inside the directory it reaches after
+/// the first `floor` of them? A `..` is only taken from deeper than that.
+///
+/// The walk is lexical. It asks which directory the spelling names, and
+/// rustc and the key both open the recorded spelling itself, so a symlink
+/// inside an unpacked package resolves the same way for both. The link is
+/// part of the package, the same in every checkout that shares the Cargo
+/// home, just as it is for a path with no `..`. Resolving links here would
+/// cost a syscall per path without changing what either one reads.
+fn stays_below<'a>(components: impl IntoIterator<Item = &'a str>, floor: usize) -> bool {
+    let mut depth = 0usize;
+    components.into_iter().all(|component| match component {
+        "" | "." => false,
+        ".." if depth > floor => {
+            depth -= 1;
+            true
+        }
+        ".." => false,
+        _ => {
+            depth += 1;
+            true
+        }
+    })
 }
 
 /// How often to check a prediction against the pre-pass it replaced.
@@ -4650,10 +4686,11 @@ pub(crate) struct PortableRoots {
 ///
 /// A source is either under `OUT_DIR` or under the registry. Anything else
 /// is refused: another unit's output, a canonical spelling of the target, a
-/// checkout path, a relative path, a `..`. At least one source must be under
-/// `OUT_DIR`, or the plain shared record already covers the unit. An env
-/// value under `OUT_DIR` is relocated too; any other value spelling the
-/// target is refused, and the rest are kept as they are.
+/// checkout path, a relative path, a `..` that leaves `OUT_DIR` or the
+/// package. At least one source must be under `OUT_DIR`, or the plain shared
+/// record already covers the unit. An env value under `OUT_DIR` is relocated
+/// too; any other value spelling the target is refused, and the rest are
+/// kept as they are.
 pub(crate) fn portable_prediction(
     dep_info: &DepInfo,
     roots: &PortableRoots,
@@ -10362,6 +10399,83 @@ mod tests {
         );
     }
 
+    /// A `..` counts only from deeper than `floor`, and a walk that leaves
+    /// never comes back in.
+    #[test]
+    fn a_walk_stays_below_its_floor() {
+        let walk = |path: &str, floor| stays_below(path.split('/'), floor);
+        assert!(walk("a/../b", 0));
+        assert!(!walk("../b", 0), "a `..` at the floor leaves it");
+        assert!(!walk("a/../../a/b", 0), "leaving and coming back");
+        assert!(walk("i/p/src/../README.md", 2));
+        assert!(walk("i/p/src/a/b/../../x.rs", 2));
+        assert!(!walk("i/p/src/../../q/x.rs", 2));
+        assert!(!walk("i/../j/p/x.rs", 2), "below the floor too");
+        assert!(!walk("a/./b", 0));
+        assert!(!walk("a//b", 0));
+    }
+
+    /// rustc reports `include_str!("../README.md")` as `src/../README.md`
+    /// and never normalizes it. Refusing every `..` kept such a package's
+    /// record out of other checkouts; one that stays inside the directory is
+    /// as portable as a path without it.
+    #[test]
+    fn an_out_dir_suffix_keeps_a_parent_component_that_stays_inside() {
+        let suffix =
+            |value: &str, root: &str| out_dir_suffix(std::ffi::OsStr::new(value), Path::new(root));
+        assert_eq!(
+            suffix("/o/x/../y.rs", "/o").as_deref(),
+            Some("/x/../y.rs"),
+            "spelled as rustc spelled it"
+        );
+        assert_eq!(
+            suffix("/o\\x\\..\\y.rs", "/o").as_deref(),
+            Some("\\x\\..\\y.rs")
+        );
+        assert_eq!(suffix("/o/x/../../y.rs", "/o"), None);
+        assert_eq!(
+            suffix("/o/x\\y/../../z.rs", "/o"),
+            None,
+            "on Unix `x\\y` is one level, so this leaves `/o`"
+        );
+        assert_eq!(
+            suffix("/o/x\\..\\..\\y.rs", "/o"),
+            None,
+            "on Windows this leaves `/o`"
+        );
+    }
+
+    /// Path shapes rustc reported for hk's registry dependencies, all refused
+    /// while any `..` was. A `..` that leaves the package is still refused,
+    /// even into another registry package.
+    #[test]
+    fn a_registry_unit_shares_a_parent_path_that_stays_in_its_package() {
+        let target = Path::new("/w/target");
+        let can = |source: &str| {
+            shared_sources_can_record(
+                &[PathBuf::from(source)],
+                target,
+                Some(Path::new(REGISTRY_PACKAGE_DIR)),
+            )
+        };
+        let index = "/h/registry/src/index-1";
+        for inside in [
+            "kt-1.0.0/src/../README.md",
+            "kt-1.0.0/src/crypto/aws_lc_rs/../ring/hash.rs",
+            "kt-1.0.0/src/new/glibc/sysdeps/nptl/bits/../../x86/mod.rs",
+            "other-1.0.0/src/../data/mod.rs",
+        ] {
+            assert!(can(&format!("{index}/{inside}")), "{inside}");
+        }
+        for outside in [
+            "kt-1.0.0/src/../../other-1.0/lib.rs",
+            "kt-1.0.0/../other-1.0/lib.rs",
+            "kt-1.0.0/src/../../../../../w/src/lib.rs",
+        ] {
+            assert!(!can(&format!("{index}/{outside}")), "{outside}");
+        }
+    }
+
     fn portable_roots_for_test() -> PortableRoots {
         PortableRoots {
             out_dir: PathBuf::from("/t/debug/build/kt-1/out"),
@@ -10435,7 +10549,7 @@ mod tests {
             ("src/lib.rs", "a relative path"),
             (
                 "/t/debug/build/kt-1/out/../../other-2/out/x.rs",
-                "a parent component",
+                "a parent component that leaves OUT_DIR",
             ),
             (
                 "/h/registry/src/../x.rs",
@@ -10476,6 +10590,39 @@ mod tests {
                 None,
                 "a literal that is not UTF-8"
             );
+        }
+    }
+
+    /// The relocated row follows the shared row's rule: a `..` inside the
+    /// package stays a literal, one inside `OUT_DIR` is relocated as spelled,
+    /// and one that leaves either refuses the row.
+    #[test]
+    fn a_portable_record_keeps_a_parent_path_inside_out_dir_or_the_package() {
+        let roots = portable_roots_for_test();
+        let readme = "/h/registry/src/index-1/kt-1.0.0/src/../README.md";
+        let generated = "/t/debug/build/kt-1/out/sub/../gen.rs";
+        let portable = |sources: &[&str]| {
+            let dep_info = DepInfo {
+                source_files: sources.iter().map(PathBuf::from).collect(),
+                env_deps: Vec::new(),
+            };
+            portable_prediction(&dep_info, &roots, Some("tree"))
+        };
+        assert_eq!(
+            portable(&[readme, generated]).map(|record| record.sources),
+            Some(vec![
+                Portable::Literal(readme.to_string()),
+                Portable::OutDir("/sub/../gen.rs".to_string()),
+            ])
+        );
+        for (source, why) in [
+            (
+                "/h/registry/src/index-1/kt-1.0.0/src/../../other-1.0/lib.rs",
+                "leaves the package",
+            ),
+            ("/t/debug/build/kt-1/out/../out/gen.rs", "leaves OUT_DIR"),
+        ] {
+            assert_eq!(portable(&[generated, source]), None, "{why}");
         }
     }
 

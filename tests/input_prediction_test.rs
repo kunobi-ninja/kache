@@ -385,6 +385,14 @@ impl OutDirUnit {
         }
     }
 
+    /// The unit with `content` at `path`, relative to the package.
+    fn with_file(self, path: &str, content: &str) -> Self {
+        let path = self.package.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+        self
+    }
+
     /// `<root>/<checkout>/target` with the generated file in its `OUT_DIR`
     /// and the proc macro copied byte for byte into its `deps`.
     fn target(&self, checkout: &str) -> PathBuf {
@@ -501,9 +509,8 @@ fn build_proc_macro(root: &Path) -> PathBuf {
 
 /// A registry unit built in a second target directory derives its closure
 /// from the first one's record, and gets the key the pre-pass would give.
-fn predicts_in_another_target(with_macro: bool) {
+fn predicts_in_another_target(unit: OutDirUnit) {
     build_kache();
-    let unit = OutDirUnit::new(REGISTRY_PACKAGE, with_macro);
     let a = unit.target("a");
     let b = unit.target("b");
 
@@ -529,12 +536,31 @@ fn predicts_in_another_target(with_macro: bool) {
 
 #[test]
 fn a_registry_unit_predicts_in_another_target() {
-    predicts_in_another_target(true);
+    predicts_in_another_target(OutDirUnit::new(REGISTRY_PACKAGE, true));
 }
 
 #[test]
 fn a_registry_unit_without_a_macro_predicts_in_another_target() {
-    predicts_in_another_target(false);
+    predicts_in_another_target(OutDirUnit::new(REGISTRY_PACKAGE, false));
+}
+
+const README_DOC: &str = "#![doc = include_str!(\"../README.md\")]\n";
+
+/// rustc reports `include_str!("../README.md")` as `src/../README.md`,
+/// without normalizing it. That path stays in the package, so the record
+/// still serves another checkout: the shared row when the unit reads nothing
+/// from `OUT_DIR`, the relocated row when it does.
+#[test]
+fn a_registry_unit_reading_its_readme_predicts_in_another_target() {
+    for lib in [
+        format!("{README_DOC}pub fn f() {{}}\n"),
+        format!("{README_DOC}include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n"),
+    ] {
+        let unit = OutDirUnit::new(REGISTRY_PACKAGE, false)
+            .with_file("README.md", "Docs.\n")
+            .with_file("src/lib.rs", &lib);
+        predicts_in_another_target(unit);
+    }
 }
 
 /// Build in A, then in B, and return B's event. `prepare` edits the two
@@ -576,6 +602,25 @@ fn a_generated_file_naming_the_target_keeps_the_record_local() {
     });
     assert_eq!(warm.dep_info_runs, 1);
     assert_eq!(warm.result, "local_hit");
+}
+
+/// A `..` may climb back up inside the package, not out of it, even into
+/// another registry package, so this record stays with the checkout that
+/// made it.
+#[test]
+fn a_registry_unit_reading_past_its_package_keeps_the_record_local() {
+    let other = "pub const OTHER: &str = include_str!(\"../../other-1.0.0/lib.rs\");\n";
+    for lib in [
+        other.to_string(),
+        format!("{other}include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n"),
+    ] {
+        let unit = OutDirUnit::new(REGISTRY_PACKAGE, false)
+            .with_file("../other-1.0.0/lib.rs", "other\n")
+            .with_file("src/lib.rs", &lib);
+        let warm = build_a_then_b(&unit, |_, _| {});
+        assert_eq!(warm.dep_info_runs, 1, "{lib}");
+        assert_eq!(warm.result, "local_hit");
+    }
 }
 
 /// Only a registry package is the same files in every checkout. The writer

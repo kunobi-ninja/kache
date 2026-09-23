@@ -11523,6 +11523,23 @@ mod tests {
     }
 
     #[test]
+    fn build_tree_roots_read_the_unit_out_dir_and_target() {
+        let args = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "src/main.rs".to_string(),
+            "--out-dir".to_string(),
+            "/w/target/x86_64-unknown-linux-gnu/debug/deps".to_string(),
+            "--target".to_string(),
+            "x86_64-unknown-linux-gnu".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            build_tree_roots(&args).first(),
+            Some(&PathBuf::from("/w/target")),
+            "the target dir comes from --out-dir and --target"
+        );
+    }
+    #[test]
     fn native_dir_archives_list_regular_archives_in_order() {
         let dir = tempfile::tempdir().unwrap();
         for name in [

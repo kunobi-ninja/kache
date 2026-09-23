@@ -9,15 +9,16 @@
 //! With none configured the planner stays open, as it always has.
 
 use anyhow::{Result, bail};
+pub use kunobi_auth::common::workload::{
+    GITHUB_ACTIONS_ISSUER as GITHUB_ISSUER, GITHUB_ACTIONS_PROVIDER as GITHUB_PROVIDER,
+};
 use kunobi_auth::{
-    AuthError, AuthIdentity, KunobiAuthDiscovery,
+    AuthError, AuthIdentity, ClaimAllowed, ClaimRule, KunobiAuthDiscovery,
     server::{AuthBuilder, AuthnProvider, ConfiguredAuth, JwtAuthConfig},
 };
 
-pub const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 pub const TOKEN_PROVIDER: &str = "kache";
 pub const KUNOBI_PROVIDER: &str = "kunobi";
-pub const GITHUB_PROVIDER: &str = "github-actions";
 
 /// Both issuers sign with RS256.
 const PRODUCTION_ALGORITHMS: &[&str] = &["RS256"];
@@ -82,11 +83,11 @@ impl AuthSettings {
     }
 }
 
-/// The configured providers plus the GitHub owner allow-list.
+/// The configured providers plus the rule a GitHub Actions token must meet.
 #[derive(Clone)]
 pub struct PlannerAuth {
     inner: ConfiguredAuth,
-    github_owners: Vec<String>,
+    github: ClaimRule,
 }
 
 impl PlannerAuth {
@@ -116,40 +117,29 @@ impl PlannerAuth {
             );
         }
         if let Some(audience) = &settings.github_audience {
+            let mut github = JwtAuthConfig::github_actions(audience.clone()).algorithms(algorithms);
+            // Tests stand in their own issuer; the key path stays GitHub's.
             let issuer = github_issuer.trim_end_matches('/');
-            builder = builder.jwt(
-                JwtAuthConfig::oidc(
-                    GITHUB_PROVIDER,
-                    issuer,
-                    format!("{issuer}/.well-known/jwks"),
-                    vec![audience.clone()],
-                )
-                .algorithms(algorithms),
-            );
+            github.jwks_url = github.jwks_url.replacen(&github.issuer, issuer, 1);
+            github.issuer = issuer.to_string();
+            builder = builder.jwt(github);
         }
         Some(PlannerAuth {
             inner: builder.build(),
-            github_owners: settings.github_owners.clone(),
+            github: ClaimRule::new([ClaimAllowed::any_of(
+                "repository_owner",
+                settings.github_owners.iter().cloned(),
+            )
+            .ignoring_ascii_case()]),
         })
     }
 
     pub async fn authenticate(&self, token: &str) -> Result<AuthIdentity, AuthError> {
         let identity = self.inner.authenticate(token).await?;
-        if identity.provider == GITHUB_PROVIDER {
-            let owner = identity
-                .claims
-                .get("repository_owner")
-                .and_then(|value| value.as_str());
-            let allowed = owner.is_some_and(|owner| {
-                self.github_owners
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(owner))
-            });
-            if !allowed {
-                return Err(AuthError::Unauthorized(
-                    "GitHub repository owner is not allowed".to_string(),
-                ));
-            }
+        if identity.provider == GITHUB_PROVIDER && !self.github.matches(&identity) {
+            return Err(AuthError::Unauthorized(
+                "GitHub repository owner is not allowed".to_string(),
+            ));
         }
         Ok(identity)
     }

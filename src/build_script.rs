@@ -82,6 +82,12 @@ pub fn is_shim_invocation() -> bool {
 /// bin` into `<profile>/build/<pkg>-<hash>/build_script_build-<hash>`, then
 /// hardlinks that to `build-script-build` and runs it.
 pub fn compiled_build_script(args: &RustcArgs) -> Option<PathBuf> {
+    build_script_output(args).filter(|path| path.is_file())
+}
+
+/// Where a build-script compilation writes its binary, decided from `args`
+/// alone. `None` for every other compilation.
+pub fn build_script_output(args: &RustcArgs) -> Option<PathBuf> {
     let crate_name = args.crate_name.as_deref()?;
     if !crate_name.starts_with("build_script_") || args.crate_types != ["bin"] {
         return None;
@@ -94,8 +100,7 @@ pub fn compiled_build_script(args: &RustcArgs) -> Option<PathBuf> {
         crate_name,
         args.extra_filename.as_deref().unwrap_or(""),
     );
-    let path = out_dir.join(stem);
-    path.is_file().then_some(path)
+    Some(out_dir.join(stem))
 }
 
 /// Replace a freshly produced build-script binary with the launcher.
@@ -1723,6 +1728,32 @@ mod tests {
         }
     }
 
+    /// A restore decides from the arguments before the binary exists.
+    #[test]
+    fn build_script_output_needs_no_binary_on_disk() {
+        let parse = |argv: &[&str]| {
+            RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let unit = Path::new("/nowhere/debug/build/pkg-1");
+        let args = parse(&[
+            "rustc",
+            "--crate-name",
+            "build_script_build",
+            "--crate-type",
+            "bin",
+            "build.rs",
+            "--out-dir",
+            unit.to_str().unwrap(),
+            "-C",
+            "extra-filename=-1",
+        ]);
+        assert_eq!(
+            build_script_output(&args),
+            Some(unit.join("build_script_build-1"))
+        );
+        assert_eq!(compiled_build_script(&args), None);
+    }
+
     #[test]
     fn an_empty_rerun_if_env_changed_name_is_not_a_declaration() {
         let env = environment(Path::new("/t/build/pkg-1/out"), Path::new("/src/pkg"));
@@ -2477,6 +2508,52 @@ mod tests {
             stored_binary_hash(&real).unwrap(),
             kache_store::file_hash::hash_file(&real).unwrap()
         );
+    }
+
+    /// A build script restored as a link to a read-only store blob. Installing
+    /// the launcher only renames that link aside, and a later install only
+    /// unlinks it, so the blob keeps its bytes and mode and the launcher never
+    /// shares its inode.
+    #[cfg(unix)]
+    #[test]
+    fn launcher_install_moves_a_shared_binary_without_writing_to_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("debug/build/pkg-1");
+        std::fs::create_dir_all(&unit).unwrap();
+        let blob = dir.path().join("blob");
+        kache_fs::testutil::write_executable(&blob, "#!/bin/sh\necho real\n");
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let executable = unit.join("build_script_build-1");
+        let real = with_suffix(&executable, REAL_SUFFIX);
+        let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+
+        for _ in 0..2 {
+            // A restore replaces whatever the path holds with a link.
+            let _ = std::fs::remove_file(&executable);
+            std::fs::hard_link(&blob, &executable).unwrap();
+            install(&executable).unwrap();
+
+            assert_eq!(ino(&real), ino(&blob));
+            assert_ne!(ino(&executable), ino(&blob));
+            assert_eq!(
+                std::fs::read_to_string(&blob).unwrap(),
+                "#!/bin/sh\necho real\n"
+            );
+            assert_eq!(
+                std::fs::metadata(&blob).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+        }
+        std::fs::remove_dir_all(dir.path().join("debug").join(SHIM_DIR)).unwrap();
+        let output = std::process::Command::new(&executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "real\n");
     }
 
     /// Cargo spells a `links` dependency's metadata keys as the script printed

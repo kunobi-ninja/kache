@@ -4413,20 +4413,6 @@ fn validate_extra_inputs_dep_info_before_store(
     Ok(())
 }
 
-/// How to materialize one restored artifact.
-///
-/// `kind` comes from the compile context, which does not always identify an
-/// executable. A `[[test]] harness = false` target supplies its own `main`, so
-/// cargo invokes rustc with neither `--test` nor `--crate-type`; its
-/// extensionless output classifies as `Other("rustc:unknown")`, whose strategy
-/// is `Hardlink` — no `0o755` on restore, and cargo then fails the run with
-/// "Permission denied (os error 13)".
-///
-/// The executable bit recorded at insert time is the reliable signal, and the
-/// insert side already trusts it over the filename (`store::hardlink_eligible`
-/// refuses to hardlink anything carrying a mode bit). Restore trusts it the
-/// same way, which also keeps executables on the independent-inode path so a
-/// post-build `strip` or codesign cannot reach back into the shared blob.
 /// Whether this invocation actually emits debug info that a store-time debug
 /// bundle could carry (kunobi-ninja/kache#319). rustc's default is no debug
 /// info, so an absent `-Cdebuginfo` counts as off, as do the explicit "none"
@@ -4462,11 +4448,56 @@ fn wants_debug_bundle(args: &RustcArgs) -> bool {
     args.is_user_facing_executable() && rustc_debuginfo_enabled(args)
 }
 
-fn restore_link_strategy(kind: ArtifactKind, executable: bool) -> link::LinkStrategy {
-    if executable {
+/// How to materialize one restored artifact.
+///
+/// `kind` comes from the compile context, which does not always identify an
+/// executable. A `[[test]] harness = false` target supplies its own `main`, so
+/// cargo invokes rustc with neither `--test` nor `--crate-type`; its
+/// extensionless output classifies as `Other("rustc:unknown")`, whose strategy
+/// is `Hardlink` — no `0o755` on restore, and cargo then fails the run with
+/// "Permission denied (os error 13)".
+///
+/// The executable bit recorded at insert time is the reliable signal, and the
+/// insert side already trusts it over the filename (`store::hardlink_eligible`
+/// refuses to hardlink anything carrying a mode bit). Restore trusts it the
+/// same way, which also keeps executables on the independent-inode path so a
+/// post-build `strip` or codesign cannot reach back into the shared blob.
+///
+/// The exception is `shared_loadable`, the executable kind of this compile
+/// that nothing rewrites in place (see [`shared_inode_loadable`]). It may
+/// share the blob's inode like an rlib.
+fn restore_link_strategy(
+    kind: ArtifactKind,
+    executable: bool,
+    shared_loadable: Option<ArtifactKind>,
+) -> link::LinkStrategy {
+    if shared_loadable == Some(kind) {
+        link::LinkStrategy::ExecutableHardlink
+    } else if executable {
         link::LinkStrategy::Copy
     } else {
         kind.link_strategy()
+    }
+}
+
+/// The executable output of this compile that nothing rewrites in place after
+/// a restore, so it may share the store blob's inode like an rlib: a
+/// proc-macro's dylib or a build script's binary. rustc refuses to write over
+/// a read-only output, the wrapper's pre-clean removes one first, and the
+/// build-script launcher only renames or removes the binary it preserves.
+///
+/// User-facing binaries, tests, examples and other dylibs stay private
+/// copies, because a post-build `strip` rewrites them in place. The platform
+/// decides the rest: macOS may re-sign a restored loadable in place.
+fn shared_inode_loadable(args: &RustcArgs, platform_allows: bool) -> Option<ArtifactKind> {
+    if !platform_allows {
+        None
+    } else if args.crate_types == ["proc-macro"] {
+        Some(ArtifactKind::DynamicLibrary)
+    } else if crate::build_script::build_script_output(args).is_some() {
+        Some(ArtifactKind::Executable)
+    } else {
+        None
     }
 }
 
@@ -4515,6 +4546,7 @@ fn materialize_cached_artifact(
     cached_file: &crate::store::CachedFile,
     target_path: &Path,
     kind: ArtifactKind,
+    shared_loadable: Option<ArtifactKind>,
     depinfo_anchor: &Path,
     depinfo_working_dir: &Path,
     depinfo_workspace_dir: Option<&Path>,
@@ -4583,7 +4615,7 @@ fn materialize_cached_artifact(
         }
     };
 
-    let strategy = restore_link_strategy(kind, cached_file.executable);
+    let strategy = restore_link_strategy(kind, cached_file.executable, shared_loadable);
     let rewrote_content = transformed.is_some();
     match transformed {
         Some(content) => {
@@ -5703,6 +5735,7 @@ fn restore_from_cache(
         meta.files.len(),
         platform.name()
     );
+    let shared_loadable = shared_inode_loadable(args, platform.may_share_restored_loadables());
 
     // Artifacts that came back as verbatim blob copies, each paired with the
     // digest the entry already recorded for it (kunobi-ninja/kache#540).
@@ -5743,6 +5776,7 @@ fn restore_from_cache(
             cached_file,
             &target_path,
             kind,
+            shared_loadable,
             &depinfo_anchor,
             &depinfo_working_dir,
             depinfo_workspace_dir,
@@ -9738,6 +9772,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::Library,
+            None,
             dir.path(),
             dir.path(),
             None,
@@ -9780,6 +9815,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::DepInfo,
+            None,
             &anchor,
             dir.path(),
             None,
@@ -9848,6 +9884,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::Other("rustc:unknown"),
+            None,
             dir.path(),
             dir.path(),
             None,
@@ -9888,6 +9925,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::Library,
+            None,
             dir.path(),
             dir.path(),
             None,
@@ -9904,6 +9942,209 @@ mod tests {
             0,
             "library must not become executable, got {mode:o}"
         );
+    }
+
+    // ── shared-inode restores of proc-macros and build scripts ─────────
+
+    #[test]
+    fn restore_link_strategy_shares_only_the_named_loadable_kind() {
+        use link::LinkStrategy::{Copy, ExecutableHardlink, Hardlink};
+        let proc_macro = Some(ArtifactKind::DynamicLibrary);
+        let build_script = Some(ArtifactKind::Executable);
+        assert_eq!(
+            restore_link_strategy(ArtifactKind::DynamicLibrary, true, proc_macro),
+            ExecutableHardlink
+        );
+        assert_eq!(
+            restore_link_strategy(ArtifactKind::Executable, true, build_script),
+            ExecutableHardlink
+        );
+        // The rest of the same compile keeps its ordinary strategy.
+        assert_eq!(
+            restore_link_strategy(ArtifactKind::DepInfo, false, proc_macro),
+            Hardlink
+        );
+        assert_eq!(
+            restore_link_strategy(ArtifactKind::Executable, true, proc_macro),
+            Copy
+        );
+        // Without the gate every executable is a private copy.
+        assert_eq!(
+            restore_link_strategy(ArtifactKind::DynamicLibrary, true, None),
+            Copy
+        );
+        assert_eq!(
+            restore_link_strategy(ArtifactKind::Other("rustc:unknown"), true, None),
+            Copy
+        );
+        assert_eq!(
+            restore_link_strategy(ArtifactKind::Library, false, None),
+            Hardlink
+        );
+    }
+
+    #[test]
+    fn only_proc_macros_and_build_scripts_may_share_a_restored_inode() {
+        let compile = |crate_name: &str, crate_type: &str, out_dir: &str| {
+            rustc_args(&[
+                "rustc",
+                "--crate-name",
+                crate_name,
+                "--crate-type",
+                crate_type,
+                "src/lib.rs",
+                "--out-dir",
+                out_dir,
+                "-C",
+                "extra-filename=-1",
+            ])
+        };
+        let proc_macro = compile("serde_derive", "proc-macro", "/t/debug/deps");
+        let build_script = compile("build_script_build", "bin", "/t/debug/build/pkg-1");
+        assert_eq!(
+            shared_inode_loadable(&proc_macro, true),
+            Some(ArtifactKind::DynamicLibrary)
+        );
+        assert_eq!(
+            shared_inode_loadable(&build_script, true),
+            Some(ArtifactKind::Executable)
+        );
+        // `strip` may rewrite these in place after the build.
+        for (label, other) in [
+            ("user bin", compile("hk", "bin", "/t/debug/deps")),
+            ("cdylib", compile("plugin", "cdylib", "/t/debug/deps")),
+            ("dylib", compile("shared", "dylib", "/t/debug/deps")),
+            ("lib", compile("serde", "lib", "/t/debug/deps")),
+            (
+                "bin named like a build script",
+                compile("build_script_x", "bin", "/t/debug/deps"),
+            ),
+            (
+                "test harness",
+                rustc_args(&["rustc", "--crate-name", "hk", "--test", "src/main.rs"]),
+            ),
+        ] {
+            assert_eq!(shared_inode_loadable(&other, true), None, "{label}");
+        }
+        // Platforms that may rewrite a restored loadable share nothing.
+        assert_eq!(shared_inode_loadable(&proc_macro, false), None);
+        assert_eq!(shared_inode_loadable(&build_script, false), None);
+    }
+
+    /// The Linux restore path for a proc-macro: the file comes back loadable,
+    /// the mtime stamp works on a read-only shared inode, and the blob keeps
+    /// its bytes and mode. Without reflink the file shares the blob's inode.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_shared_loadable_restores_a_loadable_file_and_leaves_the_blob() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let hash = "5555555555555555555555555555555555555555555555555555555555555555";
+        create_blob(&store, hash, b"proc-macro dylib");
+        let blob = store.blob_path(hash);
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let reflinks = crate::link::try_reflink(&blob, &dir.path().join("probe")).is_ok();
+
+        let mut cached = cached_file("libfoo_macros-1.so", hash);
+        cached.executable = true;
+        let target = dir.path().join("target/debug/deps/libfoo_macros-1.so");
+        let restored = materialize_cached_artifact(
+            &BlobSource::Store(&store),
+            &cached,
+            &target,
+            ArtifactKind::DynamicLibrary,
+            Some(ArtifactKind::DynamicLibrary),
+            dir.path(),
+            dir.path(),
+            None,
+            &[],
+            &crate::compiler::platform::LinuxPlatform,
+            "test restore",
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(restored, RestoredBytes::ExactBlobCopy(_)));
+        let restored_meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(restored_meta.permissions().mode() & 0o111, 0o111);
+        assert_eq!(std::fs::read(&target).unwrap(), b"proc-macro dylib");
+        let blob_meta = std::fs::metadata(&blob).unwrap();
+        assert_eq!(blob_meta.permissions().mode() & 0o777, 0o555);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"proc-macro dylib");
+        assert_eq!(restored_meta.ino() == blob_meta.ino(), !reflinks);
+    }
+
+    /// End to end on Linux without reflink: a proc-macro hit shares the
+    /// blob's inode, while a user binary restored the same way stays a
+    /// private, writable copy that `strip` cannot turn into a blob write.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_from_cache_shares_a_proc_macro_inode_but_copies_a_user_binary() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let out_dir = dir.path().join("target/debug/deps");
+        let out_dir_str = out_dir.to_str().unwrap();
+        let restore = |crate_name: &str, crate_type: &str, file: &str, hash: &str| {
+            create_blob(&store, hash, b"linked output");
+            let blob = store.blob_path(hash);
+            std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let args = rustc_args(&[
+                "rustc",
+                "--crate-name",
+                crate_name,
+                "--crate-type",
+                crate_type,
+                "src/lib.rs",
+                "--emit",
+                "link",
+                "--out-dir",
+                out_dir_str,
+                "-C",
+                "extra-filename=-1",
+            ]);
+            let mut cached = cached_file(file, hash);
+            cached.executable = true;
+            let meta = entry_meta(crate_name, vec![cached], &["link"]);
+            restore_from_cache(
+                &config,
+                &RustcCompiler::new(),
+                &BlobSource::Store(&store),
+                &args,
+                &meta,
+                None,
+            )
+            .unwrap();
+            (blob, out_dir.join(file))
+        };
+
+        let (macro_blob, macro_target) = restore(
+            "foo_macros",
+            "proc-macro",
+            "libfoo_macros-1.so",
+            "6666666666666666666666666666666666666666666666666666666666666666",
+        );
+        if crate::link::try_reflink(&macro_blob, &dir.path().join("probe")).is_ok() {
+            eprintln!("reflink available; the no-CoW restore path is not reachable here");
+            return;
+        }
+        let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+        assert_eq!(ino(&macro_target), ino(&macro_blob));
+
+        let (bin_blob, bin_target) = restore(
+            "hk",
+            "bin",
+            "hk-1",
+            "7777777777777777777777777777777777777777777777777777777777777777",
+        );
+        assert_ne!(ino(&bin_target), ino(&bin_blob));
+        let mode = std::fs::metadata(&bin_target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     // ── restored-blob digest reuse (kunobi-ninja/kache#540) ──────────
@@ -9926,6 +10167,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::Library,
+            None,
             dir.path(),
             dir.path(),
             None,
@@ -9962,6 +10204,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::DepInfo,
+            None,
             &dir.path().join("target"),
             dir.path(),
             None,
@@ -9996,6 +10239,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::DynamicLibrary,
+            None,
             dir.path(),
             dir.path(),
             None,
@@ -10037,6 +10281,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::Library,
+            None,
             dir.path(),
             dir.path(),
             None,
@@ -10109,6 +10354,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::DynamicLibrary,
+            None,
             dir.path(),
             dir.path(),
             None,
@@ -10285,6 +10531,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::DebugBundle,
+            None,
             dir.path(),
             dir.path(),
             None,
@@ -10378,6 +10625,7 @@ mod tests {
             &cached,
             &target,
             ArtifactKind::DebugBundle,
+            None,
             restore_dir.path(),
             restore_dir.path(),
             None,

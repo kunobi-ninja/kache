@@ -557,7 +557,10 @@ impl PostRestoreAction {
     /// The caller guarantees `path` is a **private, writable** file —
     /// not a shared link to a store blob — because external tools mutate
     /// the file in place and must never reach the cache blob. Only
-    /// meaningful when [`Self::is_content_transform`] is false.
+    /// meaningful when [`Self::is_content_transform`] is false. A restored
+    /// loadable may still be a read-only link when
+    /// [`Platform::may_share_restored_loadables`] allows it, because that
+    /// platform's signing never writes to the file.
     ///
     /// `platform` is the host abstraction for OS-specific concerns
     /// (codesigning today; debug-path rewriting later). Passing it

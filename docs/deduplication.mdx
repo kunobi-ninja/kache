@@ -20,10 +20,10 @@ Entries refer to blobs through metadata and the SQLite index. Identical bytes sh
 Kache chooses the safest available method per artifact:
 
 1. copy-on-write clone on APFS, ReFS, btrfs, or reflink-capable XFS
-2. one exclusive Unix hardlink carrier for immutable `.rlib` and `.rmeta` artifacts
+2. one exclusive Unix hardlink carrier for immutable `.rlib` and `.rmeta` artifacts, and on Linux for proc-macro libraries and build-script binaries
 3. byte copy
 
-Executable and loadable outputs use clone or copy, never the hardlink fallback, because signing, stripping, or another consumer may modify them. Windows copies on non-CoW volumes unless the unsafe `windows_hardlink` option is enabled.
+Other executable and loadable outputs use clone or copy, never the hardlink fallback, because signing, stripping, or another consumer may modify them. Nothing rewrites a proc-macro library or a build-script binary after a restore, so on Linux they share the blob's inode when the blob is read-only and executable. A blob without every execute bit, such as one imported from a remote cache, is copied. Windows copies on non-CoW volumes unless the unsafe `windows_hardlink` option is enabled.
 
 Restored reflinks and copies are writable by their owner, so a later compiler invocation can overwrite them after you remove the Kache wrapper. Adding owner write access to a reflink preserves its other permissions and leaves the cache blob read-only. A real hardlink shares permissions with the blob and stays read-only; rebuilding those outputs without Kache can require removing them first.
 

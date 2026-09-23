@@ -888,14 +888,21 @@ pub(crate) fn stash_last_dep_info_for_test(dep_info: DepInfo) {
 }
 
 thread_local! {
-    /// The crate tree digest the last guarded key computation on this thread
-    /// used, so the record made from it carries the same digest.
+    /// The tree digest the last guarded key computation on this thread used,
+    /// so the record made from it carries the same digest.
     static LAST_KEY_TREE_DIGEST: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Take (consume) the crate tree digest of the last computed rustc key, if it
-/// was a proc-macro-dependent unit.
+/// Put a tree digest in the stash as a guarded key computation would.
+#[cfg(test)]
+pub(crate) fn stash_last_tree_digest_for_test(tree: &str) {
+    let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(tree.to_string()));
+}
+
+/// Take (consume) the tree digest of the last computed rustc key: the crate
+/// tree of a proc-macro-dependent unit, or the `OUT_DIR` guard of a registry
+/// unit that looked for a relocated record.
 pub(crate) fn take_last_tree_digest() -> Option<String> {
     LAST_KEY_TREE_DIGEST
         .try_with(|stash| stash.borrow_mut().take())
@@ -930,9 +937,34 @@ pub(crate) fn crate_tree_digest(file_hasher: &FileHasher<'_>) -> Option<String> 
     if let Some(out_dir) = std::env::var_os("OUT_DIR").map(PathBuf::from) {
         roots.push((out_dir, &b"out_dir"[..]));
     }
+    tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)
+}
+
+/// Cap on entries digested for the `OUT_DIR` guard. Generated code is a few
+/// files; a directory past this is a build tree, and the pre-pass stays
+/// cheaper than digesting it.
+const OUT_DIR_TREE_MAX_ENTRIES: usize = 256;
+
+/// A content digest of `out_dir` alone: the guard for a relocated record of
+/// a unit with no proc-macro dependency. Such a unit reads nothing it does
+/// not name, so the package needs no digest; `OUT_DIR` does, because the
+/// record says which generated files were read, not what else was generated.
+pub(crate) fn out_dir_tree_digest(out_dir: &Path, file_hasher: &FileHasher<'_>) -> Option<String> {
+    tree_digest(
+        vec![(out_dir.to_path_buf(), &b"out_dir"[..])],
+        file_hasher,
+        OUT_DIR_TREE_MAX_ENTRIES,
+    )
+}
+
+fn tree_digest(
+    roots: Vec<(PathBuf, &[u8])>,
+    file_hasher: &FileHasher<'_>,
+    max_entries: usize,
+) -> Option<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"kache-crate-tree-v1\n");
-    let mut budget = CRATE_TREE_MAX_ENTRIES;
+    let mut budget = max_entries;
     // Roots are named by role, not by path: the identity the record is filed
     // under already knows the path, and the guard is about content.
     for (root, role) in roots {
@@ -965,6 +997,15 @@ fn is_registry_package(manifest_dir: &Path) -> bool {
         (Some(std::path::Component::Normal(src)), Some(std::path::Component::Normal(registry)))
             if src == "src" && registry == "registry"
     )
+}
+
+/// `<CARGO_HOME>/registry/src` for a registry package, the directory every
+/// extracted package lives under whichever checkout builds it.
+fn registry_src_root(manifest_dir: &Path) -> Option<&Path> {
+    if !is_registry_package(manifest_dir) {
+        return None;
+    }
+    manifest_dir.parent()?.parent()
 }
 
 fn crate_tree_fold(
@@ -1148,8 +1189,17 @@ fn rustc_prediction_identity_with_args(
 /// source paths, cfg values and environment retain their original identity.
 /// A record containing a source under target is never published here.
 pub(crate) fn rustc_shared_prediction_identity(args: &RustcArgs) -> Option<String> {
+    rustc_shared_prediction_identity_in(args, std::env::vars_os().collect())
+}
+
+/// [`rustc_shared_prediction_identity`] against an environment snapshot.
+fn rustc_shared_prediction_identity_in(
+    args: &RustcArgs,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<String> {
     let target = args.target_dir()?;
-    if !target.is_absolute() || !prediction_applies(&args.externs) {
+    let manifest_dir = env_var_in(&vars, "CARGO_MANIFEST_DIR").map(Path::new);
+    if !target.is_absolute() || !shared_prediction_eligible(&args.externs, manifest_dir) {
         return None;
     }
     let source = args.source_file.as_ref()?;
@@ -1157,10 +1207,57 @@ pub(crate) fn rustc_shared_prediction_identity(args: &RustcArgs) -> Option<Strin
         shared_prediction_args(&closure_shaping_args(source, &args.all_args), &target);
     let identity = rustc_prediction_identity_with_args(
         args,
-        shared_prediction_vars(std::env::vars_os(), &target),
+        shared_prediction_vars(vars.into_iter(), &target),
         Some(closure_args),
     )?;
-    Some(format!("shared-target-v2:{identity}"))
+    Some(format!("{SHARED_PREDICTION_PREFIX}{identity}"))
+}
+
+const SHARED_PREDICTION_PREFIX: &str = "shared-target-v2:";
+
+/// Rows whose `OUT_DIR` sources are written relative to `OUT_DIR`
+/// ([`PortablePrediction`]). The hash is the shared one, so a row here and
+/// a row there always describe the same unit.
+const RELOCATABLE_PREDICTION_PREFIX: &str = "shared-out-dir-v1:";
+
+/// May a unit's record be shared across target directories?
+///
+/// A unit with no proc-macro dependency can: its closure is everything it
+/// reads. A registry unit with one can too, because a macro there reads its
+/// package and `OUT_DIR`, and the record carries a digest of both that the
+/// reader checks before use. The target paths that differ between checkouts
+/// only reach the key as extern content, which the key hashes.
+fn shared_prediction_eligible(
+    externs: &[crate::args::ExternDep],
+    manifest_dir: Option<&Path>,
+) -> bool {
+    prediction_applies(externs) || manifest_dir.is_some_and(is_registry_package)
+}
+
+/// The value of `name` in an environment snapshot.
+fn env_var_in<'a>(
+    vars: &'a [(std::ffi::OsString, std::ffi::OsString)],
+    name: &str,
+) -> Option<&'a std::ffi::OsStr> {
+    vars.iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_os_str())
+}
+
+/// The identity of a registry unit's relocated record: the shared hash
+/// under its own prefix. `None` for any other unit, and for one with no
+/// `OUT_DIR` to relocate.
+fn relocatable_prediction_identity(
+    args: &RustcArgs,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<String> {
+    let manifest_dir = Path::new(env_var_in(&vars, "CARGO_MANIFEST_DIR")?);
+    if !is_registry_package(manifest_dir) || env_var_in(&vars, "OUT_DIR").is_none() {
+        return None;
+    }
+    let shared = rustc_shared_prediction_identity_in(args, vars)?;
+    let hash = shared.strip_prefix(SHARED_PREDICTION_PREFIX)?;
+    Some(format!("{RELOCATABLE_PREDICTION_PREFIX}{hash}"))
 }
 
 /// The environment a shared record is identified by, with this build's own
@@ -1244,12 +1341,52 @@ fn shared_prediction_args(args: &[String], target: &Path) -> Vec<String> {
 }
 
 pub(crate) fn shared_prediction_can_record(args: &RustcArgs, dep_info: &DepInfo) -> bool {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
     args.target_dir().is_some_and(|target| {
-        !dep_info
-            .source_files
-            .iter()
-            .any(|source| source.starts_with(&target))
+        shared_sources_can_record(&dep_info.source_files, &target, manifest_dir.as_deref())
     })
+}
+
+/// No source under `target`, and for a registry unit, every source under the
+/// registry. A registry file is the same file for every checkout; anything
+/// else a registry unit read, such as a workspace file a macro found through
+/// a target path, may name a different file in the next checkout, so that
+/// record stays with this one.
+fn shared_sources_can_record(
+    sources: &[PathBuf],
+    target: &Path,
+    manifest_dir: Option<&Path>,
+) -> bool {
+    let registry_src = manifest_dir.and_then(registry_src_root);
+    sources.iter().all(|source| {
+        !source.starts_with(target)
+            && registry_src.is_none_or(|root| under_registry_src(source, root))
+    })
+}
+
+/// Is `source` spelled as a file under the registry, with nothing but
+/// normal components after it?
+fn under_registry_src(source: &Path, registry_src: &Path) -> bool {
+    out_dir_suffix(source.as_os_str(), registry_src).is_some_and(|suffix| !suffix.is_empty())
+}
+
+/// The bytes of `value` after `root`, when `value` is `root` itself (an
+/// empty suffix) or `root`, a separator, and normal components. Both `/` and
+/// `\` count as separators everywhere, which can only refuse more. `None`
+/// for a longer name that merely starts the same (`/o2` against `/o`), a
+/// `.` or `..` component, an empty one, or a suffix that is not UTF-8.
+fn out_dir_suffix(value: &std::ffi::OsStr, root: &Path) -> Option<String> {
+    let rest = value
+        .as_encoded_bytes()
+        .strip_prefix(root.as_os_str().as_encoded_bytes())?;
+    let suffix = std::str::from_utf8(rest).ok()?;
+    let Some(components) = suffix.strip_prefix(['/', '\\']) else {
+        return suffix.is_empty().then(String::new);
+    };
+    components
+        .split(['/', '\\'])
+        .all(|component| !matches!(component, "" | "." | ".."))
+        .then(|| suffix.to_string())
 }
 
 /// How often to check a prediction against the pre-pass it replaced.
@@ -1435,10 +1572,12 @@ fn predicted_key_inputs(
         Some(digest)
     };
     let identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
-    let record = file_hasher
+    let Some(record) = file_hasher
         .input_prediction(&identity)
         .or_else(|| file_hasher.input_prediction(&rustc_shared_prediction_identity(args)?))
-        .ok_or(Rejection::NoRecord)?;
+    else {
+        return relocated_key_inputs(args, file_hasher, tree);
+    };
     if let Some(tree) = &tree {
         match &record.tree {
             Some(recorded) if recorded == tree => {}
@@ -1448,6 +1587,46 @@ fn predicted_key_inputs(
     }
     validate_prediction(
         &record,
+        |path| std::fs::metadata(path).ok(),
+        |path| path.exists(),
+        |var| std::env::var(var).ok(),
+    )
+}
+
+/// The third lookup, after this checkout's row and the shared one both
+/// missed: a registry unit's record from another target directory, with
+/// `OUT_DIR` relocated to this one.
+///
+/// The guard is `tree` for a proc-macro dependent and a digest of `OUT_DIR`
+/// otherwise. It is stashed before the lookup, so a record made from this
+/// invocation, after a deferred compile included, carries the digest taken
+/// before rustc ran. Only this row is checked against it.
+fn relocated_key_inputs(
+    args: &RustcArgs,
+    file_hasher: &FileHasher<'_>,
+    tree: Option<String>,
+) -> std::result::Result<DepInfo, Rejection> {
+    let vars: Vec<_> = std::env::vars_os().collect();
+    let out_dir = env_var_in(&vars, "OUT_DIR")
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_string);
+    let identity = relocatable_prediction_identity(args, vars).ok_or(Rejection::NoRecord)?;
+    let out_dir = out_dir.ok_or(Rejection::NoRecord)?;
+    let guard = match tree {
+        Some(tree) => tree,
+        None => {
+            let _trace = crate::phase_trace::phase("out_dir_tree");
+            out_dir_tree_digest(Path::new(&out_dir), file_hasher).ok_or(Rejection::NoRecord)?
+        }
+    };
+    let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(guard.clone()));
+    let record = file_hasher
+        .portable_prediction(&identity)
+        .ok_or(Rejection::NoRecord)?;
+    validate_portable_prediction(
+        &record,
+        &guard,
+        &out_dir,
         |path| std::fs::metadata(path).ok(),
         |path| path.exists(),
         |var| std::env::var(var).ok(),
@@ -4403,7 +4582,9 @@ pub(crate) struct InputPrediction {
     /// without it entering the closure, so the closure alone cannot say
     /// whether the record still applies; the tree can. Absent on records made
     /// for units that need no such guard, and on rows written before it
-    /// existed, which the guard then treats as unusable.
+    /// existed, which the guard then treats as unusable. A unit with no proc
+    /// macro may carry its `OUT_DIR` guard here, which nothing checks on this
+    /// row.
     #[serde(default)]
     pub(crate) tree: Option<String>,
 }
@@ -4417,6 +4598,238 @@ impl InputPrediction {
             tree,
         }
     }
+}
+
+/// Version of [`PortablePrediction`]. Far from [`PREDICTION_SCHEMA`] so the
+/// two decoders can never accept each other's rows.
+pub(crate) const PORTABLE_PREDICTION_SCHEMA: u32 = 101;
+
+/// A registry unit's closure with its own `OUT_DIR` written as a placeholder,
+/// so another target directory can use it.
+///
+/// Only a registry unit, whose other inputs are the same files in every
+/// checkout, and only when `OUT_DIR` holds what it held for the recorder:
+/// `tree` is a digest of it, and the reader refuses the row without an equal
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PortablePrediction {
+    pub(crate) schema: u32,
+    pub(crate) sources: Vec<Portable>,
+    pub(crate) env_deps: Vec<(String, Portable)>,
+    pub(crate) tree: String,
+}
+
+/// One recorded path or env value: as spelled, or as the bytes after
+/// `OUT_DIR` ([`out_dir_suffix`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Portable {
+    Literal(String),
+    OutDir(String),
+}
+
+/// The directories a portable record is written against.
+#[derive(Debug, Clone)]
+pub(crate) struct PortableRoots {
+    pub(crate) out_dir: PathBuf,
+    pub(crate) target: PathBuf,
+    pub(crate) canonical_target: PathBuf,
+    pub(crate) registry_src: PathBuf,
+}
+
+/// The closure with `OUT_DIR` made relative, or `None` when any part of it
+/// could name a different file in another target directory.
+///
+/// A source is either under `OUT_DIR` or under the registry. Anything else
+/// is refused: another unit's output, a canonical spelling of the target, a
+/// checkout path, a relative path, a `..`. At least one source must be under
+/// `OUT_DIR`, or the plain shared record already covers the unit. An env
+/// value under `OUT_DIR` is relocated too; any other value spelling the
+/// target is refused, and the rest are kept as they are.
+pub(crate) fn portable_prediction(
+    dep_info: &DepInfo,
+    roots: &PortableRoots,
+    tree: Option<&str>,
+) -> Option<PortablePrediction> {
+    let tree = tree?;
+    let sources = dep_info
+        .source_files
+        .iter()
+        .map(|source| portable_source(source, roots))
+        .collect::<Option<Vec<_>>>()?;
+    if !sources
+        .iter()
+        .any(|source| matches!(source, Portable::OutDir(_)))
+    {
+        return None;
+    }
+    let env_deps = dep_info
+        .env_deps
+        .iter()
+        .map(|(name, value)| Some((name.clone(), portable_env_value(value, roots)?)))
+        .collect::<Option<Vec<_>>>()?;
+    Some(PortablePrediction {
+        schema: PORTABLE_PREDICTION_SCHEMA,
+        sources,
+        env_deps,
+        tree: tree.to_string(),
+    })
+}
+
+fn portable_source(source: &Path, roots: &PortableRoots) -> Option<Portable> {
+    if let Some(suffix) = out_dir_suffix(source.as_os_str(), &roots.out_dir) {
+        return Some(Portable::OutDir(suffix));
+    }
+    if !under_registry_src(source, &roots.registry_src) {
+        return None;
+    }
+    Some(Portable::Literal(source.to_str()?.to_string()))
+}
+
+fn portable_env_value(value: &str, roots: &PortableRoots) -> Option<Portable> {
+    if let Some(suffix) = out_dir_suffix(std::ffi::OsStr::new(value), &roots.out_dir) {
+        return Some(Portable::OutDir(suffix));
+    }
+    let spells = |root: &Path| {
+        value
+            .as_bytes()
+            .starts_with(root.as_os_str().as_encoded_bytes())
+    };
+    if spells(&roots.target) || spells(&roots.canonical_target) {
+        return None;
+    }
+    Some(Portable::Literal(value.to_string()))
+}
+
+impl PortablePrediction {
+    /// The record this invocation would have made: each relocated entry gets
+    /// `out_dir`'s bytes in front of its suffix. The result is then checked
+    /// like any other record, raw env values included.
+    pub(crate) fn resolve(&self, out_dir: &str) -> InputPrediction {
+        let place = |portable: &Portable| match portable {
+            Portable::Literal(value) => value.clone(),
+            Portable::OutDir(suffix) => format!("{out_dir}{suffix}"),
+        };
+        InputPrediction {
+            schema: PREDICTION_SCHEMA,
+            sources: self
+                .sources
+                .iter()
+                .map(|source| PathBuf::from(place(source)))
+                .collect(),
+            env_deps: self
+                .env_deps
+                .iter()
+                .map(|(name, value)| (name.clone(), place(value)))
+                .collect(),
+            tree: Some(self.tree.clone()),
+        }
+    }
+}
+
+/// Use a relocated record: its digest must equal the guard this invocation
+/// computed, and the resolved closure must pass [`validate_prediction`].
+fn validate_portable_prediction(
+    record: &PortablePrediction,
+    guard: &str,
+    out_dir: &str,
+    stat: impl Fn(&Path) -> Option<std::fs::Metadata>,
+    exists: impl Fn(&Path) -> bool,
+    env_value: impl Fn(&str) -> Option<String>,
+) -> std::result::Result<DepInfo, Rejection> {
+    if record.tree != guard {
+        return Err(Rejection::TreeChanged);
+    }
+    validate_prediction(&record.resolve(out_dir), stat, exists, env_value)
+}
+
+/// Does `content` spell any of `roots`, as-is or with each `\` doubled the
+/// way a string literal escapes it?
+///
+/// A generated file that names the target could make rustc read a file
+/// relocation does not move, so such an `OUT_DIR` is not relocated.
+pub(crate) fn mentions_root(content: &[u8], roots: &[&Path]) -> bool {
+    roots.iter().any(|root| {
+        let raw = root.as_os_str().as_encoded_bytes();
+        let doubled: Vec<u8> = raw
+            .iter()
+            .flat_map(|&byte| std::iter::repeat_n(byte, if byte == b'\\' { 2 } else { 1 }))
+            .collect();
+        crate::build_script::find_bytes(content, raw).is_some()
+            || crate::build_script::find_bytes(content, &doubled).is_some()
+    })
+}
+
+/// True only when every entry under `out_dir` was read and none spells any
+/// of `roots`: file content and symlink text alike. Past
+/// [`OUT_DIR_TREE_MAX_ENTRIES`], or on any read error, the answer is false.
+fn out_dir_spells_no_root(out_dir: &Path, roots: &[&Path]) -> bool {
+    fn walk(directory: &Path, roots: &[&Path], budget: &mut usize) -> Option<()> {
+        for entry in std::fs::read_dir(directory).ok()? {
+            let path = entry.ok()?.path();
+            *budget = budget.checked_sub(1)?;
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            let content = if metadata.file_type().is_symlink() {
+                std::fs::read_link(&path)
+                    .ok()?
+                    .into_os_string()
+                    .into_encoded_bytes()
+            } else if metadata.is_dir() {
+                walk(&path, roots, budget)?;
+                continue;
+            } else if metadata.is_file() {
+                std::fs::read(&path).ok()?
+            } else {
+                return None;
+            };
+            if mentions_root(&content, roots) {
+                return None;
+            }
+        }
+        Some(())
+    }
+    let mut budget = OUT_DIR_TREE_MAX_ENTRIES;
+    walk(out_dir, roots, &mut budget).is_some()
+}
+
+/// The relocated record for this invocation and the identity to file it
+/// under, or `None` when the unit or its closure is not relocatable.
+pub(crate) fn relocatable_record(
+    args: &RustcArgs,
+    dep_info: &DepInfo,
+    tree: Option<&str>,
+) -> Option<(String, PortablePrediction)> {
+    relocatable_record_in(args, dep_info, tree, std::env::vars_os().collect())
+}
+
+/// [`relocatable_record`] against an environment snapshot.
+fn relocatable_record_in(
+    args: &RustcArgs,
+    dep_info: &DepInfo,
+    tree: Option<&str>,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<(String, PortablePrediction)> {
+    let roots = portable_roots(args, &vars)?;
+    let identity = relocatable_prediction_identity(args, vars)?;
+    let record = portable_prediction(dep_info, &roots, tree)?;
+    out_dir_spells_no_root(&roots.out_dir, &[&roots.target, &roots.canonical_target])
+        .then_some((identity, record))
+}
+
+/// This invocation's roots: its `OUT_DIR`, a target directory that exists,
+/// and a registry package.
+fn portable_roots(
+    args: &RustcArgs,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Option<PortableRoots> {
+    let out_dir = PathBuf::from(env_var_in(vars, "OUT_DIR")?);
+    let target = args.target_dir()?;
+    let registry_src = registry_src_root(Path::new(env_var_in(vars, "CARGO_MANIFEST_DIR")?))?;
+    Some(PortableRoots {
+        canonical_target: std::fs::canonicalize(&target).ok()?,
+        registry_src: registry_src.to_path_buf(),
+        out_dir,
+        target,
+    })
 }
 
 /// Why a recorded closure could not be used for this invocation.
@@ -4447,6 +4860,7 @@ pub(crate) enum Rejection {
     Sibling,
     /// The unit depends on a proc macro and the crate tree is not the one the
     /// record was made against, so a file the macro reads may have changed.
+    /// Also a relocated record whose `OUT_DIR` held something else.
     TreeChanged,
 }
 
@@ -5073,6 +5487,54 @@ impl<'db> FileHasher<'db> {
             Ok(_) => None,
             Err(error) => {
                 tracing::debug!("input prediction decode failed: {error}");
+                None
+            }
+        }
+    }
+
+    /// Remember a relocated closure. Best-effort, like
+    /// [`FileHasher::record_input_prediction`].
+    pub(crate) fn record_portable_prediction(
+        &self,
+        identity: &str,
+        crate_name: Option<&str>,
+        record: &PortablePrediction,
+    ) {
+        let Some(cache) = self.cache.as_ref() else {
+            return;
+        };
+        let json = match serde_json::to_string(record) {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::debug!("portable prediction encode failed: {error}");
+                return;
+            }
+        };
+        if let Err(error) = cache.put_input_prediction(identity, record.schema, crate_name, &json) {
+            tracing::debug!("portable prediction record failed: {error}");
+        }
+    }
+
+    /// The relocated closure recorded for `identity`, read under the same
+    /// rules as [`FileHasher::input_prediction`].
+    pub(crate) fn portable_prediction(&self, identity: &str) -> Option<PortablePrediction> {
+        let _trace = crate::phase_trace::phase("prediction_read");
+        let cache = self.cache.as_ref()?;
+        let (schema, json) = match cache.get_input_prediction(identity) {
+            Ok(row) => row?,
+            Err(error) => {
+                tracing::debug!("portable prediction lookup failed: {error}");
+                return None;
+            }
+        };
+        if schema != PORTABLE_PREDICTION_SCHEMA {
+            return None;
+        }
+        match serde_json::from_str::<PortablePrediction>(&json) {
+            Ok(record) if record.schema == PORTABLE_PREDICTION_SCHEMA => Some(record),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::debug!("portable prediction decode failed: {error}");
                 None
             }
         }
@@ -8382,6 +8844,10 @@ mod tests {
     fn discovery_flight_identity_names_the_unit_with_or_without_predictions() {
         // Identity helpers read cwd and environment, which other tests mutate.
         let _lock = key_test_lock();
+        let _workspace = crate::config::tests::set_env_for_test(
+            "CARGO_MANIFEST_DIR",
+            Some(std::ffi::OsStr::new("/w/a")),
+        );
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("index.db");
         let parse = |args: &[&str]| {
@@ -8443,6 +8909,20 @@ mod tests {
             rustc_prediction_identity(&with_macro),
             "no record identity, so the unit's name serves as the flight"
         );
+
+        // In a registry package the same unit shares its record under the
+        // tree guard, so it flies under the shared identity.
+        let _manifest = crate::config::tests::set_env_for_test(
+            "CARGO_MANIFEST_DIR",
+            Some(std::ffi::OsStr::new("/h/registry/src/index-1/a-1.0.0")),
+        );
+        let shared = rustc_shared_prediction_identity(&with_macro)
+            .expect("a registry proc-macro dependent has a shared identity");
+        assert_eq!(
+            discovery_flight_identity(&with_macro, &off),
+            Some(shared.clone())
+        );
+        assert_eq!(discovery_flight_identity(&with_macro, &on), Some(shared));
     }
 
     /// A crate the store has never held is a certain miss under any key, so
@@ -9663,6 +10143,660 @@ mod tests {
         assert!(!shared_prediction_can_record(&args, &dep));
         let no_target = RustcArgs::parse(&["rustc".into(), "src/lib.rs".into()]).unwrap();
         assert!(!shared_prediction_can_record(&no_target, &dep));
+    }
+
+    const REGISTRY_PACKAGE_DIR: &str = "/h/registry/src/index-1/kt-1.0.0";
+
+    fn os_vars(pairs: &[(&str, &str)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect()
+    }
+
+    /// An absolute target directory for checkout `name` on any platform.
+    fn checkout_target(name: &str) -> String {
+        if cfg!(windows) {
+            format!("C:/{name}/target")
+        } else {
+            format!("/{name}/target")
+        }
+    }
+
+    fn registry_unit_args(checkout: &str, externs: &[&str]) -> RustcArgs {
+        let target = checkout_target(checkout);
+        let mut argv = vec![
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "kt".to_string(),
+            format!("{REGISTRY_PACKAGE_DIR}/src/lib.rs"),
+            "--out-dir".to_string(),
+            format!("{target}/debug/deps"),
+        ];
+        for name in externs {
+            argv.push("--extern".to_string());
+            argv.push(format!("{name}={target}/debug/deps/lib{name}-1.so"));
+        }
+        RustcArgs::parse(&argv).unwrap()
+    }
+
+    fn unit_vars(
+        checkout: &str,
+        manifest_dir: &str,
+    ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        let target = checkout_target(checkout);
+        os_vars(&[
+            ("CARGO_MANIFEST_DIR", manifest_dir),
+            ("OUT_DIR", &format!("{target}/debug/build/kt-1/out")),
+        ])
+    }
+
+    #[test]
+    fn shared_prediction_eligibility_takes_either_rule() {
+        let dep = |path: &str| crate::args::ExternDep {
+            name: "dep".to_string(),
+            path: Some(PathBuf::from(path)),
+        };
+        let plain = [dep("/t/debug/deps/libserde-1.rlib")];
+        let with_macro = [dep("/t/debug/deps/libpm-1.so")];
+        let registry = Path::new(REGISTRY_PACKAGE_DIR);
+        let workspace = Path::new("/w/kt");
+        assert!(shared_prediction_eligible(&plain, Some(workspace)));
+        assert!(shared_prediction_eligible(&plain, None));
+        assert!(
+            shared_prediction_eligible(&with_macro, Some(registry)),
+            "a registry unit's record carries the tree guard"
+        );
+        assert!(!shared_prediction_eligible(&with_macro, Some(workspace)));
+        assert!(!shared_prediction_eligible(&with_macro, None));
+    }
+
+    /// A proc-macro dependent in a registry package gets one shared identity
+    /// whichever target directory builds it; in a workspace it gets none.
+    #[test]
+    fn shared_identity_covers_tree_guarded_registry_units() {
+        let _lock = key_test_lock();
+        if get_rustc_version(Path::new("rustc")).is_err() {
+            return;
+        }
+        let identity = |checkout: &str, manifest_dir: &str| {
+            rustc_shared_prediction_identity_in(
+                &registry_unit_args(checkout, &["pm"]),
+                unit_vars(checkout, manifest_dir),
+            )
+        };
+        let a = identity("a", REGISTRY_PACKAGE_DIR);
+        assert!(
+            a.as_deref()
+                .is_some_and(|a| a.starts_with("shared-target-v2:"))
+        );
+        assert_eq!(a, identity("b", REGISTRY_PACKAGE_DIR));
+        assert_eq!(identity("a", "/w/kt"), None);
+    }
+
+    /// The relocated row is filed under the shared hash, the same for every
+    /// target directory, and only for a registry unit with an `OUT_DIR`.
+    #[test]
+    fn a_relocatable_identity_is_the_shared_hash_of_a_registry_unit_with_an_out_dir() {
+        let _lock = key_test_lock();
+        if get_rustc_version(Path::new("rustc")).is_err() {
+            return;
+        }
+        let args = registry_unit_args("a", &[]);
+        let vars = unit_vars("a", REGISTRY_PACKAGE_DIR);
+        let shared = rustc_shared_prediction_identity_in(&args, vars.clone()).unwrap();
+        let relocatable = relocatable_prediction_identity(&args, vars).unwrap();
+        assert_eq!(
+            relocatable.strip_prefix("shared-out-dir-v1:"),
+            shared.strip_prefix("shared-target-v2:")
+        );
+        assert_eq!(
+            relocatable_prediction_identity(
+                &registry_unit_args("b", &[]),
+                unit_vars("b", REGISTRY_PACKAGE_DIR)
+            ),
+            Some(relocatable)
+        );
+        assert_eq!(
+            relocatable_prediction_identity(
+                &args,
+                os_vars(&[("CARGO_MANIFEST_DIR", REGISTRY_PACKAGE_DIR)])
+            ),
+            None,
+            "no OUT_DIR to relocate"
+        );
+        let workspace = unit_vars("a", "/w/kt");
+        assert!(rustc_shared_prediction_identity_in(&args, workspace.clone()).is_some());
+        assert_eq!(
+            relocatable_prediction_identity(&args, workspace),
+            None,
+            "a workspace unit"
+        );
+    }
+
+    #[test]
+    fn the_registry_src_root_is_two_levels_above_a_registry_package() {
+        assert_eq!(
+            registry_src_root(Path::new(REGISTRY_PACKAGE_DIR)),
+            Some(Path::new("/h/registry/src"))
+        );
+        assert_eq!(registry_src_root(Path::new("/w/kt")), None);
+    }
+
+    #[test]
+    fn an_out_dir_suffix_is_the_bytes_after_the_directory() {
+        let suffix =
+            |value: &str, root: &str| out_dir_suffix(std::ffi::OsStr::new(value), Path::new(root));
+        assert_eq!(
+            suffix("/o", "/o").as_deref(),
+            Some(""),
+            "the directory itself"
+        );
+        assert_eq!(suffix("/o/x/y.rs", "/o").as_deref(), Some("/x/y.rs"));
+        assert_eq!(suffix("/o\\x\\y.rs", "/o").as_deref(), Some("\\x\\y.rs"));
+        assert_eq!(
+            suffix("/o2/x", "/o"),
+            None,
+            "a longer name is another directory"
+        );
+        assert_eq!(suffix("/p/x", "/o"), None);
+        assert_eq!(suffix("/o/../x", "/o"), None);
+        assert_eq!(suffix("/o\\..\\x", "/o"), None);
+        assert_eq!(suffix("/o/./x", "/o"), None);
+        assert_eq!(suffix("/o//x", "/o"), None);
+        assert_eq!(suffix("/o/", "/o"), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(
+                out_dir_suffix(std::ffi::OsStr::from_bytes(b"/o/\xff"), Path::new("/o")),
+                None,
+                "a suffix that is not UTF-8"
+            );
+        }
+        assert!(under_registry_src(
+            Path::new("/r/src/i/p/lib.rs"),
+            Path::new("/r/src")
+        ));
+        assert!(
+            !under_registry_src(Path::new("/r/src"), Path::new("/r/src")),
+            "the root is not a file under it"
+        );
+    }
+
+    /// Every source of a registry unit's shared row is a registry file; the
+    /// rule for other units is unchanged.
+    #[test]
+    fn a_registry_unit_shares_only_sources_under_the_registry() {
+        let target = Path::new("/w/target");
+        let can = |sources: &[&str], manifest_dir: Option<&str>| {
+            let sources: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
+            shared_sources_can_record(&sources, target, manifest_dir.map(Path::new))
+        };
+        let lib = "/h/registry/src/index-1/kt-1.0.0/src/lib.rs";
+        let registry = Some(REGISTRY_PACKAGE_DIR);
+        assert!(can(
+            &[lib, "/h/registry/src/index-2/other-1.0.0/x.rs"],
+            registry
+        ));
+        assert!(!can(&[lib, "/w/Cargo.lock"], registry), "a checkout file");
+        assert!(!can(&["/h/registry/src/index-1/../../x.rs"], registry));
+        assert!(can(&["/w/kt/src/lib.rs"], Some("/w/kt")));
+        assert!(can(&["/w/kt/src/lib.rs"], None));
+        assert!(
+            !can(&["/w/target/debug/build/kt-1/out/gen.rs"], Some("/w/kt")),
+            "no unit shares a target source"
+        );
+    }
+
+    fn portable_roots_for_test() -> PortableRoots {
+        PortableRoots {
+            out_dir: PathBuf::from("/t/debug/build/kt-1/out"),
+            target: PathBuf::from("/t"),
+            canonical_target: PathBuf::from("/private/t"),
+            registry_src: PathBuf::from("/h/registry/src"),
+        }
+    }
+
+    fn portable_test_record() -> PortablePrediction {
+        PortablePrediction {
+            schema: PORTABLE_PREDICTION_SCHEMA,
+            sources: vec![
+                Portable::Literal("/h/registry/src/index-1/kt-1.0.0/src/lib.rs".to_string()),
+                Portable::OutDir("\\version.expr".to_string()),
+                Portable::OutDir("/gen.rs".to_string()),
+            ],
+            env_deps: vec![
+                ("OUT_DIR".to_string(), Portable::OutDir(String::new())),
+                (
+                    "CARGO_PKG_NAME".to_string(),
+                    Portable::Literal("kt".to_string()),
+                ),
+            ],
+            tree: "tree-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_portable_record_relocates_out_dir_and_keeps_registry_paths() {
+        let dep_info = DepInfo {
+            source_files: vec![
+                PathBuf::from("/h/registry/src/index-1/kt-1.0.0/src/lib.rs"),
+                PathBuf::from("/t/debug/build/kt-1/out\\version.expr"),
+                PathBuf::from("/t/debug/build/kt-1/out/gen.rs"),
+            ],
+            env_deps: vec![
+                ("OUT_DIR".to_string(), "/t/debug/build/kt-1/out".to_string()),
+                ("CARGO_PKG_NAME".to_string(), "kt".to_string()),
+            ],
+        };
+        assert_eq!(
+            portable_prediction(&dep_info, &portable_roots_for_test(), Some("tree-1")),
+            Some(portable_test_record())
+        );
+    }
+
+    #[test]
+    fn a_portable_record_refuses_anything_that_could_name_another_file() {
+        let roots = portable_roots_for_test();
+        let lib = "/h/registry/src/index-1/kt-1.0.0/src/lib.rs";
+        let generated = "/t/debug/build/kt-1/out/gen.rs";
+        let portable = |sources: &[&str], env: &[(&str, &str)], tree: Option<&str>| {
+            let dep_info = DepInfo {
+                source_files: sources.iter().map(PathBuf::from).collect(),
+                env_deps: env
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+            };
+            portable_prediction(&dep_info, &roots, tree)
+        };
+        assert!(portable(&[lib, generated], &[], Some("tree")).is_some());
+        for (source, why) in [
+            ("/t/debug/build/other-2/out/x.rs", "another unit's output"),
+            (
+                "/private/t/debug/build/kt-1/out/gen.rs",
+                "a canonical spelling of the target",
+            ),
+            ("/w/src/lib.rs", "a checkout path"),
+            ("src/lib.rs", "a relative path"),
+            (
+                "/t/debug/build/kt-1/out/../../other-2/out/x.rs",
+                "a parent component",
+            ),
+            (
+                "/h/registry/src/../x.rs",
+                "a parent component under the registry",
+            ),
+        ] {
+            assert_eq!(
+                portable(&[lib, generated, source], &[], Some("tree")),
+                None,
+                "{why}"
+            );
+        }
+        assert_eq!(portable(&[lib, generated], &[], None), None, "no guard");
+        assert_eq!(
+            portable(&[lib], &[], Some("tree")),
+            None,
+            "nothing to relocate"
+        );
+        for value in ["/t/debug/deps", "/private/t/debug/build/kt-1/out"] {
+            assert_eq!(
+                portable(&[lib, generated], &[("X", value)], Some("tree")),
+                None,
+                "{value} spells the target"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let dep_info = DepInfo {
+                source_files: vec![
+                    PathBuf::from(generated),
+                    PathBuf::from(std::ffi::OsStr::from_bytes(b"/h/registry/src/i/\xff.rs")),
+                ],
+                env_deps: Vec::new(),
+            };
+            assert_eq!(
+                portable_prediction(&dep_info, &roots, Some("tree")),
+                None,
+                "a literal that is not UTF-8"
+            );
+        }
+    }
+
+    #[test]
+    fn a_portable_record_resolves_to_this_out_dir_byte_for_byte() {
+        assert_eq!(
+            portable_test_record().resolve("/u/debug/build/kt-1/out"),
+            InputPrediction {
+                schema: PREDICTION_SCHEMA,
+                sources: vec![
+                    PathBuf::from("/h/registry/src/index-1/kt-1.0.0/src/lib.rs"),
+                    PathBuf::from("/u/debug/build/kt-1/out\\version.expr"),
+                    PathBuf::from("/u/debug/build/kt-1/out/gen.rs"),
+                ],
+                env_deps: vec![
+                    ("OUT_DIR".to_string(), "/u/debug/build/kt-1/out".to_string()),
+                    ("CARGO_PKG_NAME".to_string(), "kt".to_string()),
+                ],
+                tree: Some("tree-1".to_string()),
+            }
+        );
+    }
+
+    /// Relocation replaces the prefix only; the raw env value still has to
+    /// agree, and the guard has to be the one the row was made with.
+    #[test]
+    fn a_relocated_record_is_checked_against_this_out_dir_and_guard() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let record = PortablePrediction {
+            schema: PORTABLE_PREDICTION_SCHEMA,
+            sources: vec![Portable::OutDir("/gen.rs".to_string())],
+            env_deps: vec![("OUT_DIR".to_string(), Portable::OutDir(String::new()))],
+            tree: "tree-1".to_string(),
+        };
+        let check = |guard: &str, env_out_dir: &str| {
+            validate_portable_prediction(
+                &record,
+                guard,
+                "/u/out",
+                |_| std::fs::metadata(file.path()).ok(),
+                |_| false,
+                |var| (var == "OUT_DIR").then(|| env_out_dir.to_string()),
+            )
+        };
+        assert_eq!(
+            check("tree-1", "/u/out"),
+            Ok(DepInfo {
+                source_files: vec![PathBuf::from("/u/out/gen.rs")],
+                env_deps: vec![("OUT_DIR".to_string(), "/u/out".to_string())],
+            })
+        );
+        assert_eq!(check("tree-1", "/v/out"), Err(Rejection::EnvChanged));
+        assert_eq!(check("tree-2", "/u/out"), Err(Rejection::TreeChanged));
+    }
+
+    #[test]
+    fn mentions_root_finds_raw_canonical_and_escaped_spellings() {
+        let raw = Path::new("/t/target");
+        let canonical = Path::new("/private/t/target");
+        assert!(mentions_root(b"// built in /t/target/debug\n", &[raw]));
+        assert!(
+            mentions_root(
+                b"x /private/t/target/y",
+                &[Path::new("/nowhere"), canonical]
+            ),
+            "any root"
+        );
+        assert!(!mentions_root(b"pub fn generated() {}", &[raw, canonical]));
+        let windows = Path::new("C:\\t\\target");
+        assert!(mentions_root(b"C:\\t\\target\\x", &[windows]), "as-is");
+        assert!(
+            mentions_root(b"\"C:\\\\t\\\\target\\\\x.rs\"", &[windows]),
+            "escaped in a string literal"
+        );
+        assert!(!mentions_root(b"C:/t/target", &[windows]));
+    }
+
+    #[test]
+    fn an_out_dir_is_relocatable_only_when_no_file_names_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let out = target.join("debug/build/kt-1/out");
+        std::fs::create_dir_all(out.join("nested")).unwrap();
+        std::fs::write(out.join("gen.rs"), "pub fn g() {}\n").unwrap();
+        std::fs::write(out.join("nested/more.rs"), "pub fn h() {}\n").unwrap();
+        let roots = [target.as_path()];
+        assert!(out_dir_spells_no_root(&out, &roots));
+        std::fs::write(
+            out.join("nested/more.rs"),
+            format!("// {}\n", target.display()),
+        )
+        .unwrap();
+        assert!(!out_dir_spells_no_root(&out, &roots), "a nested file");
+        std::fs::write(out.join("nested/more.rs"), "pub fn h() {}\n").unwrap();
+        #[cfg(unix)]
+        {
+            let link = out.join("link.rs");
+            std::os::unix::fs::symlink(target.join("elsewhere.rs"), &link).unwrap();
+            assert!(!out_dir_spells_no_root(&out, &roots), "a symlink's text");
+            std::fs::remove_file(link).unwrap();
+        }
+        assert!(out_dir_spells_no_root(&out, &roots));
+        assert!(
+            !out_dir_spells_no_root(&dir.path().join("absent"), &roots),
+            "a directory that cannot be read"
+        );
+        // 3 entries so far; the cap counts every entry.
+        for index in 3..OUT_DIR_TREE_MAX_ENTRIES {
+            std::fs::write(out.join(format!("f{index}")), "x").unwrap();
+        }
+        assert!(out_dir_spells_no_root(&out, &roots), "exactly at the cap");
+        std::fs::write(out.join("one-more"), "x").unwrap();
+        assert!(!out_dir_spells_no_root(&out, &roots), "past the cap");
+    }
+
+    #[test]
+    fn the_out_dir_guard_follows_content_and_stops_at_its_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let hasher = FileHasher::new();
+        let a = dir.path().join("a/out");
+        let b = dir.path().join("b/out");
+        for out in [&a, &b] {
+            std::fs::create_dir_all(out).unwrap();
+            std::fs::write(out.join("gen.rs"), "pub fn g() {}\n").unwrap();
+        }
+        let guard = out_dir_tree_digest(&a, &hasher).unwrap();
+        assert_eq!(
+            out_dir_tree_digest(&b, &hasher).as_deref(),
+            Some(guard.as_str())
+        );
+        std::fs::write(b.join("extra.rs"), "").unwrap();
+        assert_ne!(
+            out_dir_tree_digest(&b, &hasher).unwrap(),
+            guard,
+            "a new file"
+        );
+        for index in 2..OUT_DIR_TREE_MAX_ENTRIES {
+            std::fs::write(b.join(format!("f{index}")), "x").unwrap();
+        }
+        assert!(
+            out_dir_tree_digest(&b, &hasher).is_some(),
+            "exactly at the cap"
+        );
+        std::fs::write(b.join("one-more"), "x").unwrap();
+        assert_eq!(out_dir_tree_digest(&b, &hasher), None, "past the cap");
+    }
+
+    /// A relocated row round-trips, and neither decoder accepts the other's
+    /// schema, whatever identity it is looked up under.
+    #[test]
+    fn a_portable_prediction_round_trips_and_no_other_decoder_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let hasher = FileHasher::persistent(&db);
+        let record = portable_test_record();
+        assert_eq!(hasher.portable_prediction("unit"), None);
+        hasher.record_portable_prediction("unit", Some("kt"), &record);
+        assert_eq!(
+            FileHasher::persistent(&db).portable_prediction("unit"),
+            Some(record)
+        );
+        assert_eq!(hasher.input_prediction("unit"), None);
+        hasher.record_input_prediction(
+            "plain",
+            Some("kt"),
+            &DepInfo {
+                source_files: vec![PathBuf::from("/w/src/lib.rs")],
+                env_deps: Vec::new(),
+            },
+            Some("tree".to_string()),
+        );
+        assert_eq!(hasher.portable_prediction("plain"), None);
+        let cache = hasher.cache.as_ref().unwrap();
+        cache
+            .put_input_prediction("corrupt", PORTABLE_PREDICTION_SCHEMA, None, "not json")
+            .unwrap();
+        assert_eq!(hasher.portable_prediction("corrupt"), None);
+        let stale = serde_json::to_string(&PortablePrediction {
+            schema: PREDICTION_SCHEMA,
+            ..portable_test_record()
+        })
+        .unwrap();
+        cache
+            .put_input_prediction("mismatched", PORTABLE_PREDICTION_SCHEMA, None, &stale)
+            .unwrap();
+        assert_eq!(hasher.portable_prediction("mismatched"), None);
+
+        let no_db = FileHasher::new();
+        no_db.record_portable_prediction("unit", None, &portable_test_record());
+        assert_eq!(no_db.portable_prediction("unit"), None);
+    }
+
+    /// A tree the recorder wrote the relocated row from, in a temporary
+    /// registry: the package, and target `a` with its OUT_DIR.
+    fn relocatable_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("home/registry/src/index-1/kt-1.0.0");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(package.join("src/lib.rs"), "include!(\"x\");\n").unwrap();
+        let target = dir.path().join("a/target");
+        let out = target.join("debug/build/kt-1/out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::write(out.join("gen.rs"), "pub fn g() {}\n").unwrap();
+        (dir, package, target, out)
+    }
+
+    fn unit_args_in(package: &Path, target: &Path) -> RustcArgs {
+        RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "kt".to_string(),
+            package.join("src/lib.rs").display().to_string(),
+            "--out-dir".to_string(),
+            target.join("debug/deps").display().to_string(),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn a_relocatable_record_needs_a_registry_unit_and_a_clean_out_dir() {
+        let _lock = key_test_lock();
+        if get_rustc_version(Path::new("rustc")).is_err() {
+            return;
+        }
+        let (dir, package, target, out) = relocatable_fixture();
+        let args = unit_args_in(&package, &target);
+        let vars = |manifest_dir: &Path| {
+            vec![
+                ("CARGO_MANIFEST_DIR".into(), manifest_dir.into()),
+                ("OUT_DIR".into(), out.clone().into()),
+            ]
+        };
+        let dep_info = DepInfo {
+            source_files: vec![package.join("src/lib.rs"), out.join("gen.rs")],
+            env_deps: Vec::new(),
+        };
+        let (identity, record) =
+            relocatable_record_in(&args, &dep_info, Some("tree"), vars(&package)).unwrap();
+        assert_eq!(
+            Some(identity),
+            relocatable_prediction_identity(&args, vars(&package))
+        );
+        assert_eq!(
+            record.sources,
+            vec![
+                Portable::Literal(package.join("src/lib.rs").display().to_string()),
+                Portable::OutDir(format!("{}gen.rs", std::path::MAIN_SEPARATOR)),
+            ]
+        );
+        assert_eq!(
+            relocatable_record_in(
+                &args,
+                &dep_info,
+                Some("tree"),
+                vars(&dir.path().join("w/kt"))
+            ),
+            None,
+            "a workspace unit"
+        );
+        let canonical = std::fs::canonicalize(&target).unwrap();
+        for spelled in [&target, &canonical] {
+            std::fs::write(out.join("gen.rs"), format!("// {}\n", spelled.display())).unwrap();
+            assert_eq!(
+                relocatable_record_in(&args, &dep_info, Some("tree"), vars(&package)),
+                None,
+                "{} is spelled in OUT_DIR",
+                spelled.display()
+            );
+        }
+    }
+
+    /// After this checkout's row and the shared one miss, a registry unit
+    /// reads the relocated row under its OUT_DIR guard, and stashes that guard
+    /// before the lookup so the record it makes carries it.
+    #[test]
+    fn a_registry_unit_reads_a_relocated_record_under_its_out_dir_guard() {
+        let _lock = key_test_lock();
+        if get_rustc_version(Path::new("rustc")).is_err() {
+            return;
+        }
+        let (dir, package, _, _) = relocatable_fixture();
+        let target = dir.path().join("b/target");
+        let out = target.join("debug/build/kt-1/out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("gen.rs"), "pub fn g() {}\n").unwrap();
+        let _manifest =
+            crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(package.as_os_str()));
+        let _out = crate::config::tests::set_env_for_test("OUT_DIR", Some(out.as_os_str()));
+        let args = unit_args_in(&package, &target);
+        let hasher =
+            FileHasher::persistent(&dir.path().join("index.db")).with_input_predictions(true);
+        let guard = out_dir_tree_digest(&out, &hasher).unwrap();
+
+        take_last_tree_digest();
+        assert_eq!(
+            predicted_key_inputs(&args, &hasher),
+            Err(Rejection::NoRecord)
+        );
+        assert_eq!(
+            take_last_tree_digest().as_deref(),
+            Some(guard.as_str()),
+            "a cold build records the guard it saw before compiling"
+        );
+
+        let identity =
+            relocatable_prediction_identity(&args, std::env::vars_os().collect()).unwrap();
+        let record = PortablePrediction {
+            schema: PORTABLE_PREDICTION_SCHEMA,
+            sources: vec![
+                Portable::Literal(package.join("src/lib.rs").display().to_string()),
+                Portable::OutDir("/gen.rs".to_string()),
+            ],
+            env_deps: vec![("OUT_DIR".to_string(), Portable::OutDir(String::new()))],
+            tree: guard.clone(),
+        };
+        hasher.record_portable_prediction(&identity, Some("kt"), &record);
+        let dep_info = predicted_key_inputs(&args, &hasher).unwrap();
+        assert_eq!(
+            dep_info.source_files,
+            vec![package.join("src/lib.rs"), out.join("gen.rs")]
+        );
+        assert_eq!(
+            dep_info.env_deps,
+            vec![("OUT_DIR".to_string(), out.display().to_string())]
+        );
+        assert_eq!(take_last_tree_digest(), Some(guard));
+
+        std::fs::write(out.join("extra.rs"), "").unwrap();
+        assert_eq!(
+            predicted_key_inputs(&args, &hasher),
+            Err(Rejection::TreeChanged),
+            "a file added under OUT_DIR changes the guard"
+        );
     }
 
     /// What is written has to be exactly what comes back, or a prediction
@@ -17661,6 +18795,10 @@ pub fn value() -> (&'static str, u8) {
     #[test]
     fn a_shared_identity_needs_an_absolute_target_and_a_predictable_unit() {
         let _lock = key_test_lock();
+        let _workspace = crate::config::tests::set_env_for_test(
+            "CARGO_MANIFEST_DIR",
+            Some(std::ffi::OsStr::new("/w/kt")),
+        );
         let parse = |argv: &[&str]| {
             RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
         };
@@ -17701,7 +18839,7 @@ pub fn value() -> (&'static str, u8) {
         ]);
         assert!(
             rustc_shared_prediction_identity(&with_macro).is_none(),
-            "a proc-macro dependency is not predictable by closure alone"
+            "a proc-macro dependency outside the registry is not predictable by closure alone"
         );
     }
 

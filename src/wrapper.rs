@@ -5227,10 +5227,21 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
         &dep_info,
         tree.clone(),
     );
-    if crate::cache_key::shared_prediction_can_record(args, &dep_info)
-        && let Some(identity) = crate::cache_key::rustc_shared_prediction_identity(args)
+    // A source under target keeps the shared row out. A registry unit whose
+    // only such sources are its own OUT_DIR gets a relocated row instead.
+    if crate::cache_key::shared_prediction_can_record(args, &dep_info) {
+        if let Some(identity) = crate::cache_key::rustc_shared_prediction_identity(args) {
+            file_hasher.record_input_prediction(
+                &identity,
+                args.crate_name.as_deref(),
+                &dep_info,
+                tree,
+            );
+        }
+    } else if let Some((identity, record)) =
+        crate::cache_key::relocatable_record(args, &dep_info, tree.as_deref())
     {
-        file_hasher.record_input_prediction(&identity, args.crate_name.as_deref(), &dep_info, tree);
+        file_hasher.record_portable_prediction(&identity, args.crate_name.as_deref(), &record);
     }
 }
 
@@ -7613,6 +7624,70 @@ mod tests {
                 .sources,
             closure.source_files,
             "a recording with no closure must leave the existing one alone"
+        );
+    }
+
+    /// A registry unit whose closure reads its own OUT_DIR cannot have the
+    /// shared row, so it gets the relocated one; without such a source it
+    /// gets the shared row and nothing else.
+    #[test]
+    fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.input_predictions = true;
+        let store = Store::open(&config).unwrap();
+        let package = dir.path().join("home/registry/src/index-1/kt-1.0.0");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        let target = dir.path().join("a/target");
+        let out = target.join("debug/build/kt-1/out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("gen.rs"), "pub fn g() {}\n").unwrap();
+        let _manifest =
+            crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(package.as_os_str()));
+        let _out = crate::config::tests::set_env_for_test("OUT_DIR", Some(out.as_os_str()));
+        let lib = package.join("src/lib.rs");
+        let args = rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            lib.to_str().unwrap(),
+            "--out-dir",
+            target.join("debug/deps").to_str().unwrap(),
+        ]);
+        let Some(shared) = crate::cache_key::rustc_shared_prediction_identity(&args) else {
+            return; // no compiler on this host; nothing to identify against
+        };
+        let reads_out_dir = crate::cache_key::DepInfo {
+            source_files: vec![lib.clone(), out.join("gen.rs")],
+            env_deps: Vec::new(),
+        };
+        let (relocatable, _) =
+            crate::cache_key::relocatable_record(&args, &reads_out_dir, Some("tree")).unwrap();
+
+        crate::cache_key::stash_last_dep_info_for_test(reads_out_dir);
+        crate::cache_key::stash_last_tree_digest_for_test("tree");
+        record_input_prediction(&config, Some(&store), &args, true);
+        let hasher = store.file_hasher();
+        assert!(hasher.input_prediction(&shared).is_none());
+        let record = hasher.portable_prediction(&relocatable).unwrap();
+        assert_eq!(record.tree, "tree");
+
+        let package_only = crate::cache_key::DepInfo {
+            source_files: vec![lib],
+            env_deps: Vec::new(),
+        };
+        crate::cache_key::stash_last_dep_info_for_test(package_only.clone());
+        crate::cache_key::stash_last_tree_digest_for_test("tree-2");
+        record_input_prediction(&config, Some(&store), &args, true);
+        assert_eq!(
+            hasher.input_prediction(&shared).unwrap().sources,
+            package_only.source_files
+        );
+        assert_eq!(
+            hasher.portable_prediction(&relocatable).unwrap().tree,
+            "tree",
+            "the shared row was written, so the relocated one was left alone"
         );
     }
 

@@ -4418,11 +4418,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let removal = self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE));
             let took = write_started.elapsed();
             eviction_writes += took;
+            // Every removal that returns Ok held the index write lock, also
+            // when it kept the entry (pinned, or still linked into a target
+            // directory), so each one counts toward the write slice.
+            if removal.is_ok()
+                && let Some(pause) = pacer.after_write(took)
+            {
+                std::thread::sleep(pause);
+            }
             match removal {
                 Ok(GuardedRemoval::Reclaimed(reclaim)) => {
-                    if let Some(pause) = pacer.after_write(took) {
-                        std::thread::sleep(pause);
-                    }
                     stats.entries_evicted += 1;
                     // Budget on bytes the removal *actually* freed on disk, not
                     // the entry's logical size: evicting an entry whose blobs
@@ -5228,7 +5233,40 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             hook();
         }
 
-        let tx = self.db.unchecked_transaction()?;
+        // Eviction only: refuse to drop an entry whose last-ref blobs are
+        // still cloned into a worktree (kunobi-ninja/kache#725). Unlinking
+        // those names frees no disk and destroys a still-usable hit.
+        // Explicit `remove_entry` (purge / doctor) passes `skip_if_idle_lt =
+        // None` and still unlinks. The filesystem probe runs before the write
+        // lock is taken: the lock does not stop a restore from linking a
+        // blob, so probing under it adds no safety and keeps builds waiting.
+        let retained_blobs: Vec<(&str, i64)> =
+            if skip_if_idle_lt.is_some() && !self.config.gc_evict_shared {
+                let mut held_refs: std::collections::HashMap<&str, i64> =
+                    std::collections::HashMap::new();
+                for hash in &hashes {
+                    *held_refs.entry(hash.as_str()).or_insert(0) += 1;
+                }
+                held_refs
+                    .into_iter()
+                    .filter(|(hash, _)| {
+                        crate::filesystem::blob_has_external_retainer(&self.blob_path(hash))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        // IMMEDIATE takes the write lock before the first read. A DEFERRED
+        // transaction would read first and upgrade to a writer at the DELETE,
+        // and SQLite fails that upgrade at once with SQLITE_BUSY (or
+        // SQLITE_BUSY_SNAPSHOT) without calling the busy handler. A build
+        // writing to the index at that moment then made the sweep skip the
+        // entry instead of waiting a few milliseconds for it.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
 
         // Active-pin guard (kunobi-ninja/kache#326, #182): bail out — under
         // the write lock, before any decrement or unlink — if the entry was
@@ -5247,30 +5285,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        // Eviction only: refuse to drop an entry whose last-ref blobs are
-        // still cloned into a worktree (kunobi-ninja/kache#725). Unlinking
-        // those names frees no disk and destroys a still-usable hit.
-        // Explicit `remove_entry` (purge / doctor) passes `skip_if_idle_lt =
-        // None` and still unlinks.
-        if skip_if_idle_lt.is_some() && !self.config.gc_evict_shared {
-            let mut last_ref_count: std::collections::HashMap<&str, i64> =
-                std::collections::HashMap::new();
-            for hash in &hashes {
-                *last_ref_count.entry(hash.as_str()).or_insert(0) += 1;
-            }
-            for (hash, held) in last_ref_count {
-                let rc: i64 = tx.query_row(
-                    "SELECT refcount FROM blobs WHERE hash = ?1",
-                    params![hash],
-                    |row| row.get(0),
-                )?;
-                if externally_retained_last_reference(
-                    rc,
-                    held,
-                    crate::filesystem::blob_has_external_retainer(&self.blob_path(hash)),
-                ) {
-                    return Ok(RemovalAttempt::Unreclaimable);
-                }
+        // A blob found retained above blocks the removal only while this
+        // entry holds its last references, and that needs the lock.
+        for (hash, held) in retained_blobs {
+            let rc: i64 = tx.query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )?;
+            if holds_last_reference(rc, held) {
+                return Ok(RemovalAttempt::Unreclaimable);
             }
         }
 
@@ -5720,8 +5744,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 }
 
-fn externally_retained_last_reference(rc: i64, held: i64, retained: bool) -> bool {
-    rc > 0 && rc <= held && retained
+/// Does an entry holding `held` references to a blob hold all of the blob's
+/// `rc` remaining ones? An `rc` of zero or less means the index no longer
+/// counts the blob at all.
+fn holds_last_reference(rc: i64, held: i64) -> bool {
+    rc > 0 && rc <= held
 }
 
 /// Content-dedup statistics.
@@ -8728,8 +8755,10 @@ mod tests {
     fn evict_counts_lock_contention_apart_from_bad_data() {
         let dir = tempfile::tempdir().unwrap();
         let (store, config) = store_with_one_evictable_entry(dir.path(), "busy");
-        // A second writer holding the database, as a live build does when it
-        // records a hit; the removal waits out the busy timeout and fails.
+        // A second writer holding the database for the whole sweep; the
+        // removal waits out the busy timeout and fails. The timeout is cut
+        // from 5 s so the test does not sit through it.
+        store.db.busy_timeout(Duration::from_millis(50)).unwrap();
         let blocker = Connection::open(config.index_db_path()).unwrap();
         blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
@@ -8742,9 +8771,57 @@ mod tests {
             stats.entries_locked, 1,
             "contention is counted as locked: {stats:?}"
         );
-        // The removal that lost the lock fails at once instead of waiting out
-        // the store's 5 s busy timeout, so this run's eviction write time
-        // stays small; the lost-lock count above is the figure to watch.
+    }
+
+    /// A build holding the index write lock when a sweep reaches an entry
+    /// delays that entry's removal; it must not cancel it. The removal used
+    /// to read before it wrote, and SQLite fails a read-to-write upgrade at
+    /// once instead of calling the busy handler, so the entry was skipped
+    /// and the auto-GC worker left the store over budget.
+    #[test]
+    fn evict_waits_for_a_competing_writer_and_still_evicts() {
+        static REMOVAL_WAITED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        // SQLite calls the busy handler only for a writer waiting to take
+        // the lock. A removal that reads first and then upgrades fails at
+        // once and never calls it.
+        fn wait_for_lock(count: i32) -> bool {
+            REMOVAL_WAITED.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1));
+            count < 5000
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (store, config) = store_with_one_evictable_entry(dir.path(), "contended");
+        store.db.busy_handler(Some(wait_for_lock)).unwrap();
+        // The wrapper that spawned the auto-GC worker is still writing its
+        // own durability flag when the worker starts evicting.
+        let competitor = Connection::open(config.index_db_path()).unwrap();
+        competitor.execute_batch("BEGIN IMMEDIATE").unwrap();
+        competitor
+            .execute("UPDATE entries SET durable = durable", [])
+            .unwrap();
+        // Commit once the removal is waiting for the lock. A fixed sleep let
+        // a stalled test thread reach the removal after the commit, and the
+        // test then passed without the removal ever waiting.
+        let committer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !REMOVAL_WAITED.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            competitor.execute_batch("COMMIT").unwrap();
+        });
+
+        let stats = store.evict().unwrap();
+        committer.join().unwrap();
+
+        assert!(
+            REMOVAL_WAITED.load(Ordering::SeqCst),
+            "the removal never waited for the lock: {stats:?}"
+        );
+        assert_eq!(stats.entries_locked, 0, "{stats:?}");
+        assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+        assert!(!store.contains("contended"));
     }
 
     #[test]
@@ -8847,11 +8924,12 @@ mod tests {
 
     #[test]
     fn shared_entry_retention_requires_the_last_positive_reference() {
-        assert!(externally_retained_last_reference(1, 1, true));
-        assert!(externally_retained_last_reference(2, 2, true));
-        assert!(!externally_retained_last_reference(2, 1, true));
-        assert!(!externally_retained_last_reference(0, 1, true));
-        assert!(!externally_retained_last_reference(1, 1, false));
+        assert!(holds_last_reference(1, 1));
+        assert!(holds_last_reference(2, 2));
+        assert!(holds_last_reference(1, 2));
+        assert!(!holds_last_reference(2, 1));
+        assert!(!holds_last_reference(0, 1));
+        assert!(!holds_last_reference(-1, 1));
     }
 
     #[cfg(unix)]
@@ -16742,6 +16820,9 @@ mod tests {
         let mut gc_config = config.clone();
         gc_config.max_size = 1;
         let gc = Store::open(&gc_config).unwrap();
+        // Each removal waits out the busy timeout before it gives up. Cut it
+        // from 5 s so three lost locks do not take fifteen seconds.
+        gc.db.busy_timeout(Duration::from_millis(50)).unwrap();
         let started = std::time::Instant::now();
         let stats = gc.evict().unwrap();
         let elapsed = started.elapsed();
@@ -16789,6 +16870,49 @@ mod tests {
         assert!(
             elapsed >= writing + pause,
             "{writing:?} of writes must include a pause, swept in {elapsed:?}"
+        );
+    }
+
+    /// Deciding that an entry cannot be reclaimed also takes the write lock,
+    /// so the sweep paces those entries like removals. It used to move to the
+    /// next one at once, and a run of entries still linked into target
+    /// directories took the lock back to back.
+    #[test]
+    fn eviction_paces_entries_it_cannot_reclaim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        put_evictable_entries(&store, dir.path(), 3);
+        // Every blob is still hardlinked into a build's target directory.
+        let hashes: Vec<String> = store
+            .db
+            .prepare("SELECT hash FROM blobs")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(hashes.len(), 3);
+        for hash in &hashes {
+            let retainer = dir.path().join(format!("retained-{hash}"));
+            std::fs::hard_link(store.blob_path(hash), retainer).unwrap();
+        }
+
+        let mut gc_config = config.clone();
+        gc_config.max_size = 1;
+        let mut gc = Store::open(&gc_config).unwrap();
+        // A zero slice pauses after every entry that took the lock.
+        let pause = Duration::from_millis(150);
+        gc.eviction_pacing = (Duration::ZERO, pause);
+        let started = std::time::Instant::now();
+        let stats = gc.evict().unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(stats.entries_unreclaimable, 3, "{stats:?}");
+        assert!(
+            elapsed >= pause * 3,
+            "one pause per entry, swept in {elapsed:?}"
         );
     }
 

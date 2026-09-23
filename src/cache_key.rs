@@ -11960,6 +11960,118 @@ mod tests {
         );
     }
 
+    /// An aliased `OUT_DIR` (see `out_dir_alias`) is one path outside every
+    /// target directory, so the shared identity keeps it as it is. Two target
+    /// directories that alias the unit read one shared row, and a build with
+    /// its own `OUT_DIR` never reads that row.
+    ///
+    /// With `macro_dep` the unit links a proc macro, so the row is read under
+    /// the crate tree guard, and the guard digests the alias as the unit's
+    /// `OUT_DIR`.
+    fn an_aliased_out_dir_takes_the_shared_row(macro_dep: bool) {
+        let _lock = key_test_lock();
+        if get_rustc_version(Path::new("rustc")).is_err() {
+            return;
+        }
+        let (dir, package, target_a, _) = relocatable_fixture();
+        let target_b = dir.path().join("b/target");
+        let own_out_dir = target_b.join("debug/build/kt-1/out");
+        std::fs::create_dir_all(&own_out_dir).unwrap();
+        std::fs::create_dir_all(target_b.join("debug/deps")).unwrap();
+        let alias = dir
+            .path()
+            .join("cache/out-dirs/v1/d/kt-0123456789abcdef/out");
+        std::fs::create_dir_all(&alias).unwrap();
+        let vars = |out_dir: &Path| {
+            vec![
+                ("CARGO_MANIFEST_DIR".into(), package.clone().into()),
+                ("OUT_DIR".into(), out_dir.into()),
+            ]
+        };
+        let args_in = |target: &Path| {
+            let deps = target.join("debug/deps");
+            let mut argv = vec![
+                "rustc".to_string(),
+                "--crate-name".to_string(),
+                "kt".to_string(),
+                package.join("src/lib.rs").display().to_string(),
+                "--out-dir".to_string(),
+                deps.display().to_string(),
+            ];
+            if macro_dep {
+                argv.push("--extern".to_string());
+                argv.push(format!("pm={}", deps.join("libpm-1.so").display()));
+            }
+            RustcArgs::parse(&argv).unwrap()
+        };
+        let args_a = args_in(&target_a);
+        let args_b = args_in(&target_b);
+        assert_eq!(prediction_applies(&args_a.externs), !macro_dep);
+        let shared = |args: &RustcArgs, out_dir: &Path| {
+            rustc_shared_prediction_identity_in(args, vars(out_dir)).unwrap()
+        };
+        assert_eq!(shared(&args_a, &alias), shared(&args_b, &alias));
+        assert_ne!(shared(&args_b, &alias), shared(&args_b, &own_out_dir));
+
+        let debug_dir = alias.join("debug");
+        let dep_info = DepInfo {
+            source_files: vec![package.join("src/lib.rs")],
+            env_deps: vec![
+                ("OUT_DIR".to_string(), alias.display().to_string()),
+                (
+                    "DEBUG_OUTPUT_DIR".to_string(),
+                    debug_dir.display().to_string(),
+                ),
+            ],
+        };
+        for args in [&args_a, &args_b] {
+            assert!(shared_prediction_can_record_in(
+                args,
+                &dep_info,
+                Some(&package)
+            ));
+        }
+
+        let _manifest =
+            crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(package.as_os_str()));
+        let _out = crate::config::tests::set_env_for_test("OUT_DIR", Some(alias.as_os_str()));
+        let _debug =
+            crate::config::tests::set_env_for_test("DEBUG_OUTPUT_DIR", Some(debug_dir.as_os_str()));
+        let hasher =
+            FileHasher::persistent(&dir.path().join("index.db")).with_input_predictions(true);
+        let tree = macro_dep.then(|| crate_tree_digest(&hasher).unwrap());
+        let identity = rustc_shared_prediction_identity(&args_a).unwrap();
+        hasher.record_input_prediction(&identity, Some("kt"), &dep_info, tree);
+        assert_eq!(predicted_key_inputs(&args_b, &hasher), Ok(dep_info));
+
+        if macro_dep {
+            std::fs::write(alias.join("stray.rs"), "").unwrap();
+            assert_eq!(
+                predicted_key_inputs(&args_b, &hasher),
+                Err(Rejection::TreeChanged),
+                "the tree guard reads the alias as OUT_DIR"
+            );
+            std::fs::remove_file(alias.join("stray.rs")).unwrap();
+        }
+
+        let _own = crate::config::tests::set_env_for_test("OUT_DIR", Some(own_out_dir.as_os_str()));
+        assert_eq!(
+            predicted_key_inputs(&args_b, &hasher),
+            Err(Rejection::NoRecord),
+            "a build with its own OUT_DIR has another identity"
+        );
+    }
+
+    #[test]
+    fn an_aliased_out_dir_takes_the_shared_row_without_a_macro_dependency() {
+        an_aliased_out_dir_takes_the_shared_row(false);
+    }
+
+    #[test]
+    fn an_aliased_out_dir_takes_the_shared_row_under_the_tree_guard() {
+        an_aliased_out_dir_takes_the_shared_row(true);
+    }
+
     /// What is written has to be exactly what comes back, or a prediction
     /// would reproduce a different `sources` group than the pre-pass did.
     #[test]

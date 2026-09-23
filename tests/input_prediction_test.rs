@@ -13,7 +13,10 @@
 //!   - a shadowing sibling that rustc would reject never restores,
 //!   - a registry unit that includes a file from its `OUT_DIR` uses, in a
 //!     second target directory, the record the first one made, and only
-//!     while that `OUT_DIR` holds the same files.
+//!     while that `OUT_DIR` holds the same files,
+//!   - a registry proc macro that compiles against the shared read-only
+//!     `OUT_DIR` does too, with or without a proc macro of its own to
+//!     expand, and keys as the pre-pass would.
 
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -438,34 +441,58 @@ impl OutDirUnit {
             args.push(format!("pm={}", self.macro_in(target).display()));
         }
         let config_path = write_test_config(&self.cache, predictions);
-        let mut command = std::process::Command::new(kache_binary());
-        command
-            .args(&args)
-            .current_dir(&self.package)
-            .env("KACHE_CACHE_DIR", &self.cache)
-            .env("KACHE_CONFIG", config_path)
-            .env("CARGO_MANIFEST_DIR", &self.package)
-            .env("OUT_DIR", out_dir_in(target))
-            .env_remove("KACHE_DISABLED")
-            .env_remove("KACHE_NAMESPACE")
-            .env_remove("KACHE_BASE_DIR")
-            .env_remove("KACHE_SOCKET_PATH")
-            .env_remove("KACHE_ACTIVE")
-            .env_remove("KACHE_FAMILY_PROBE_ACTIVE")
-            .env_remove("RUSTC_WRAPPER")
-            .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
-        match verify {
-            Some(mode) => command.env("KACHE_VERIFY_INPUT_PREDICTIONS", mode),
-            None => command.env_remove("KACHE_VERIFY_INPUT_PREDICTIONS"),
-        };
-        let output = command.output().expect("failed to run kache rustc");
-        assert!(
-            output.status.success(),
-            "kache rustc failed.\nargs: {args:?}\nstderr: {}",
-            String::from_utf8_lossy(&output.stderr),
-        );
-        last_event(&self.cache)
+        let out_dir = out_dir_in(target);
+        let envs = [
+            ("CARGO_MANIFEST_DIR", self.package.as_os_str()),
+            ("OUT_DIR", out_dir.as_os_str()),
+        ];
+        kache_rustc_in(
+            &self.package,
+            &self.cache,
+            &config_path,
+            &args,
+            &envs,
+            verify,
+        )
     }
+}
+
+/// Run `kache` as rustc from `package`, as Cargo runs a registry unit, and
+/// return the unit's event.
+fn kache_rustc_in(
+    package: &Path,
+    cache: &Path,
+    config_path: &Path,
+    args: &[String],
+    envs: &[(&str, &std::ffi::OsStr)],
+    verify: Option<&str>,
+) -> LastEvent {
+    let mut command = std::process::Command::new(kache_binary());
+    command
+        .args(args)
+        .current_dir(package)
+        .env("KACHE_CACHE_DIR", cache)
+        .env("KACHE_CONFIG", config_path)
+        .envs(envs.iter().copied())
+        .env_remove("KACHE_DISABLED")
+        .env_remove("KACHE_NAMESPACE")
+        .env_remove("KACHE_BASE_DIR")
+        .env_remove("KACHE_SOCKET_PATH")
+        .env_remove("KACHE_ACTIVE")
+        .env_remove("KACHE_FAMILY_PROBE_ACTIVE")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
+    match verify {
+        Some(mode) => command.env("KACHE_VERIFY_INPUT_PREDICTIONS", mode),
+        None => command.env_remove("KACHE_VERIFY_INPUT_PREDICTIONS"),
+    };
+    let output = command.output().expect("failed to run kache rustc");
+    assert!(
+        output.status.success(),
+        "kache rustc failed.\nargs: {args:?}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    last_event(cache)
 }
 
 /// A proc macro built with plain rustc, never through kache: it is fixed
@@ -900,4 +927,198 @@ fn a_registry_unit_with_a_macro_predicts_in_its_own_target() {
     let warm = unit.build(&a, true, None);
     assert_eq!(warm.result, "local_hit");
     assert_eq!(warm.dep_info_runs, 0);
+}
+
+/// A registry proc macro that expands to its `OUT_DIR`, with a build script
+/// that left that directory empty. Kache compiles it against the shared
+/// read-only directory under the cache (see `out_dir_alias`), unless
+/// `alias` turns that off. With `with_macro` it also expands a real proc
+/// macro, which puts its record under the crate tree guard.
+#[cfg(unix)]
+struct EmptyOutDirMacro {
+    root: TempDir,
+    cache: PathBuf,
+    package: PathBuf,
+    alias: bool,
+    proc_macro: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+impl EmptyOutDirMacro {
+    fn new(alias: bool, with_macro: bool) -> Self {
+        let root = TempDir::new().unwrap();
+        let package = root.path().join(REGISTRY_PACKAGE);
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(package.join("Cargo.toml"), "[package]\nname = \"kt\"\n").unwrap();
+        let mut lib = String::from(
+            "#[proc_macro]\n\
+             pub fn out_dir(_input: proc_macro::TokenStream) -> proc_macro::TokenStream {\n\
+             \x20   format!(\"{:?}\", env!(\"OUT_DIR\")).parse().unwrap()\n\
+             }\n",
+        );
+        if with_macro {
+            // A proc-macro crate exports only its macros, so what `pm`
+            // expands to stays in a private module.
+            lib.push_str(
+                "mod expanded {\n\
+                 \x20   pm::answer!();\n\
+                 }\n\
+                 #[proc_macro]\n\
+                 pub fn answer(_input: proc_macro::TokenStream) -> proc_macro::TokenStream {\n\
+                 \x20   expanded::answer().to_string().parse().unwrap()\n\
+                 }\n",
+            );
+        }
+        std::fs::write(package.join("src/lib.rs"), lib).unwrap();
+        let proc_macro = with_macro.then(|| build_proc_macro(root.path()));
+        let cache = root.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        Self {
+            root,
+            cache,
+            package,
+            alias,
+            proc_macro,
+        }
+    }
+
+    /// `<root>/<checkout>/target` with an empty `OUT_DIR`, the build script
+    /// output Cargo leaves next to it, and the proc macro copied byte for
+    /// byte into its `deps`.
+    fn target(&self, checkout: &str) -> PathBuf {
+        let target = self.root.path().join(checkout).join("target");
+        let out_dir = out_dir_in(&target);
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(
+            out_dir.parent().unwrap().join("output"),
+            "cargo:rerun-if-changed=build.rs\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        if let Some(proc_macro) = &self.proc_macro {
+            std::fs::copy(proc_macro, self.macro_in(&target)).unwrap();
+        }
+        target
+    }
+
+    fn macro_in(&self, target: &Path) -> PathBuf {
+        let name = self.proc_macro.as_ref().unwrap().file_name().unwrap();
+        target.join("debug/deps").join(name)
+    }
+
+    /// Where the shared directory for this unit lives.
+    fn shared_out_dir(&self) -> PathBuf {
+        std::fs::canonicalize(&self.cache)
+            .unwrap()
+            .join("out-dirs/v1/d")
+            .join(BUILD_UNIT)
+            .join("out")
+    }
+
+    /// Compile the macro into `target` the way Cargo would.
+    fn build(&self, target: &Path, predictions: bool, verify: Option<&str>) -> LastEvent {
+        let deps = target.join("debug/deps");
+        let mut args: Vec<String> = vec![
+            rustc_path(),
+            "--crate-name".into(),
+            "kt".into(),
+            "--edition=2021".into(),
+            self.package.join("src/lib.rs").display().to_string(),
+            "--crate-type".into(),
+            "proc-macro".into(),
+            "--emit=dep-info,link".into(),
+            "-C".into(),
+            "prefer-dynamic".into(),
+            "-C".into(),
+            "metadata=fedcba9876543210".into(),
+            "-C".into(),
+            "extra-filename=-fedcba9876543210".into(),
+            "--out-dir".into(),
+            deps.display().to_string(),
+            "-L".into(),
+            format!("dependency={}", deps.display()),
+            "--extern".into(),
+            "proc_macro".into(),
+        ];
+        if self.proc_macro.is_some() {
+            args.push("--extern".into());
+            args.push(format!("pm={}", self.macro_in(target).display()));
+        }
+        let config_path = write_test_config(&self.cache, predictions);
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str(&format!("out_dir_alias = {}\n", self.alias));
+        std::fs::write(&config_path, config).unwrap();
+        let out_dir = out_dir_in(target);
+        let envs = [
+            ("CARGO_MANIFEST_DIR", self.package.as_os_str()),
+            ("CARGO_PKG_NAME", std::ffi::OsStr::new("kt")),
+            ("OUT_DIR", out_dir.as_os_str()),
+        ];
+        kache_rustc_in(
+            &self.package,
+            &self.cache,
+            &config_path,
+            &args,
+            &envs,
+            verify,
+        )
+    }
+}
+
+/// The shared `OUT_DIR` is one path outside every target directory, so the
+/// macro's record goes on the shared row and B keys from A's record with no
+/// pre-pass. The key a prediction gives is the one the pre-pass gives. With
+/// the alias off, B's key needs B's own `OUT_DIR`, so B misses.
+#[cfg(unix)]
+fn predicts_on_the_shared_out_dir(with_macro: bool) {
+    // As root nothing is aliased: the mode bits would not stop root's writes.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping the shared OUT_DIR test as root");
+        return;
+    }
+    build_kache();
+
+    let own = EmptyOutDirMacro::new(false, with_macro);
+    let (a, b) = (own.target("a"), own.target("b"));
+    assert_eq!(own.build(&a, true, None).result, "miss");
+    assert_eq!(own.build(&b, true, None).result, "miss");
+    assert!(!own.shared_out_dir().exists());
+
+    let unit = EmptyOutDirMacro::new(true, with_macro);
+    let (a, b) = (unit.target("a"), unit.target("b"));
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    assert!(unit.shared_out_dir().is_dir(), "the macro was not aliased");
+
+    let warm = unit.build(&b, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "B uses the record A made");
+    assert_eq!(warm.compiler_runs, 0);
+    assert_eq!(warm.cache_key, cold.cache_key);
+
+    let off = unit.build(&b, false, None);
+    assert_eq!(off.result, "local_hit");
+    assert_eq!(off.dep_info_runs, 1);
+    assert_eq!(off.cache_key, warm.cache_key);
+
+    let verified = unit.build(&b, true, Some("always"));
+    assert_eq!(verified.result, "local_hit");
+    assert_eq!(verified.dep_info_runs, 1);
+    assert_eq!(verified.prediction_mismatches, 0);
+    assert_eq!(verified.cache_key, warm.cache_key);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_macro_on_the_shared_out_dir_predicts_in_another_target() {
+    predicts_on_the_shared_out_dir(false);
+}
+
+/// A macro that expands another proc macro is a registry unit with a
+/// proc-macro dependency. It gets a shared row too, read under the crate
+/// tree guard, which digests the shared `OUT_DIR` as the unit's own.
+#[cfg(unix)]
+#[test]
+fn a_macro_expanding_a_macro_on_the_shared_out_dir_predicts_in_another_target() {
+    predicts_on_the_shared_out_dir(true);
 }

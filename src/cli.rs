@@ -746,13 +746,22 @@ fn otel_snapshot_from_stats(config: &Config, snap: &StatsSnapshot) -> crate::ote
 // ── kache stats ────────────────────────────────────────────────────────────
 
 fn cloned_targets_line(disk: &crate::machine::DiskView) -> Option<String> {
-    (disk.cloned_into_targets_bytes > 0).then(|| {
-        format!(
-            "On disk:    {} private; {} cloned into target/",
-            ByteSize(disk.disk_private_bytes),
-            ByteSize(disk.cloned_into_targets_bytes)
-        )
-    })
+    let cloned = disk.cloned_into_targets_bytes;
+    let snapshot = disk.snapshot_retained_bytes;
+    if cloned == 0 && snapshot == 0 {
+        return None;
+    }
+    let mut line = format!("On disk:    {} private", ByteSize(disk.disk_private_bytes));
+    if cloned > 0 {
+        line.push_str(&format!("; {} cloned into target/", ByteSize(cloned)));
+    }
+    if snapshot > 0 {
+        line.push_str(&format!(
+            "; {} held only by filesystem snapshots",
+            ByteSize(snapshot)
+        ));
+    }
+    Some(line)
 }
 
 /// Print a one-shot stats summary to stdout.
@@ -846,7 +855,7 @@ pub fn stats(
                 remote: remote.as_deref(),
                 host_config: host_config.as_deref(),
             },
-            crate::machine::next_for_clones(disk.cloned_into_targets_bytes),
+            crate::machine::next_for_clones(&disk),
         );
     }
 
@@ -2203,7 +2212,7 @@ pub(crate) fn describe_eviction(stats: &crate::store::GcStats, over_limit: bool)
         let leftover = stats.bytes_freed.saturating_sub(stats.disk_bytes_reclaimed);
         if leftover > 0 {
             msg.push_str(&format!(
-                "\n  {} remains cloned in build outputs.",
+                "\n  {} is still held by clones in build outputs or by filesystem snapshots.",
                 ByteSize(leftover)
             ));
         }
@@ -2437,6 +2446,7 @@ fn windows_storage_observation(
             sharing: crate::sharing::Sharing {
                 shared: false,
                 private_bytes: 0,
+                snapshot_bytes: 0,
             },
             hardlink: None,
         },
@@ -7263,7 +7273,21 @@ mod tests {
         disk.cloned_into_targets_bytes = 7;
         let line = cloned_targets_line(&disk).expect("cloned blocks need a summary");
         assert!(line.contains("3 B"), "{line}");
-        assert!(line.contains("7 B"), "{line}");
+        assert!(line.contains("7 B cloned"), "{line}");
+        assert!(!line.contains("snapshots"), "{line}");
+
+        disk.snapshot_retained_bytes = 5;
+        let line = cloned_targets_line(&disk).expect("both retainers are named");
+        assert!(line.contains("7 B cloned"), "{line}");
+        assert!(
+            line.contains("5 B held only by filesystem snapshots"),
+            "{line}"
+        );
+
+        disk.cloned_into_targets_bytes = 0;
+        let line = cloned_targets_line(&disk).expect("snapshot blocks need a summary");
+        assert!(!line.contains("cloned"), "{line}");
+        assert!(line.contains("5 B held only"), "{line}");
     }
 
     #[test]
@@ -8023,7 +8047,7 @@ mod tests {
             why the store may still be over budget: {msg}"
         );
         assert!(msg.contains("became free on disk"), "{msg}");
-        assert!(msg.contains("remains cloned"), "{msg}");
+        assert!(msg.contains("is still held by clones"), "{msg}");
         assert!(msg.contains("2 entries left in place"), "{msg}");
     }
 
@@ -8043,7 +8067,7 @@ mod tests {
         let msg = describe_eviction(&stats, false);
         assert!(msg.contains("1 entry"), "{msg}");
         assert!(!msg.contains("1 entries"), "{msg}");
-        assert!(!msg.contains("remains cloned"), "{msg}");
+        assert!(!msg.contains("is still held by clones"), "{msg}");
         assert!(!msg.contains("more 0 entries"), "{msg}");
         assert!(!msg.contains("0 entries left in place"), "{msg}");
     }
@@ -8453,6 +8477,7 @@ mod tests {
                 sharing: crate::sharing::Sharing {
                     shared: true,
                     private_bytes: 4_000,
+                    snapshot_bytes: 0,
                 },
                 hardlink: None,
             },
@@ -8575,6 +8600,7 @@ mod tests {
                 sharing: crate::sharing::Sharing {
                     shared: true,
                     private_bytes: 25,
+                    snapshot_bytes: 0,
                 },
                 hardlink: None,
             },

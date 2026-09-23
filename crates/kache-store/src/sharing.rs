@@ -7,8 +7,13 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sharing {
+    /// Blocks are shared with another live file (a clone or reflink).
     pub shared: bool,
     pub private_bytes: u64,
+    /// Bytes no other live file holds, only filesystem snapshots (APFS local
+    /// snapshots, e.g. Time Machine's). Unlinking frees them once the
+    /// snapshots are deleted, so they do not pin a cache entry.
+    pub snapshot_bytes: u64,
 }
 
 impl Sharing {
@@ -16,6 +21,7 @@ impl Sharing {
         Self {
             shared: false,
             private_bytes: size,
+            snapshot_bytes: 0,
         }
     }
 }
@@ -37,16 +43,33 @@ pub fn probe(path: &Path, size: u64) -> Sharing {
 /// store refuse to evict blobs it can free.
 pub fn probe_with_links(path: &Path, size: u64) -> (Sharing, u64) {
     match kache_fs::measure_file(path) {
-        Ok(s) => (from_measurement(s.sharing, s.unique, size), s.nlink),
+        Ok(s) => (
+            from_measurement(s.sharing, s.unique, s.snapshot_held(), size),
+            s.nlink,
+        ),
         Err(_) => (Sharing::unknown_for(size), 1),
     }
 }
 
-fn from_measurement(sharing: kache_fs::Sharing, unique: Option<u64>, size: u64) -> Sharing {
+fn from_measurement(
+    sharing: kache_fs::Sharing,
+    unique: Option<u64>,
+    snapshot_held: Option<u64>,
+    size: u64,
+) -> Sharing {
     let shared = matches!(
         sharing,
         kache_fs::Sharing::Partial | kache_fs::Sharing::Full
     );
+    // Shared blocks with no other live clone are held by snapshots only.
+    if shared && let Some(snapshot) = snapshot_held.filter(|&bytes| bytes > 0) {
+        let private_bytes = unique.unwrap_or(0).min(size);
+        return Sharing {
+            shared: false,
+            private_bytes,
+            snapshot_bytes: snapshot.min(size - private_bytes),
+        };
+    }
     // Preserve the cache's treatment of delayed allocation and empty maps.
     if !shared && unique == Some(0) {
         return Sharing::unknown_for(size);
@@ -54,6 +77,7 @@ fn from_measurement(sharing: kache_fs::Sharing, unique: Option<u64>, size: u64) 
     Sharing {
         shared,
         private_bytes: unique.unwrap_or(size).min(size),
+        snapshot_bytes: 0,
     }
 }
 
@@ -65,45 +89,93 @@ mod tests {
     fn capability_test_probe(path: &Path, size: u64) -> Option<Sharing> {
         let s = kache_fs::measure_file(path).expect("filesystem measurement");
         s.unique
-            .map(|_| from_measurement(s.sharing, s.unique, size))
+            .map(|_| from_measurement(s.sharing, s.unique, s.snapshot_held(), size))
     }
 
     #[test]
     fn cache_fallback_and_clamp_preserve_existing_estimates() {
         use kache_fs::Sharing as S;
         assert_eq!(
-            from_measurement(S::Unknown, None, 4096),
+            from_measurement(S::Unknown, None, None, 4096),
             Sharing::unknown_for(4096)
         );
         assert_eq!(
-            from_measurement(S::None, Some(0), 4096),
+            from_measurement(S::None, Some(0), None, 4096),
             Sharing::unknown_for(4096)
         );
         assert_eq!(
-            from_measurement(S::None, Some(0), 0),
+            from_measurement(S::None, Some(0), None, 0),
             Sharing::unknown_for(0)
         );
         assert_eq!(
-            from_measurement(S::None, Some(65536), 4096).private_bytes,
+            from_measurement(S::None, Some(65536), None, 4096).private_bytes,
             4096
         );
         assert_eq!(
-            from_measurement(S::None, Some(2048), 4096).private_bytes,
+            from_measurement(S::None, Some(2048), None, 4096).private_bytes,
             2048
         );
         assert_eq!(
-            from_measurement(S::Full, Some(0), 4096),
+            from_measurement(S::Full, Some(0), None, 4096),
             Sharing {
                 shared: true,
-                private_bytes: 0
+                private_bytes: 0,
+                snapshot_bytes: 0,
             }
         );
         assert_eq!(
-            from_measurement(S::Partial, None, 4096),
+            from_measurement(S::Partial, None, None, 4096),
             Sharing {
                 shared: true,
-                private_bytes: 4096
+                private_bytes: 4096,
+                snapshot_bytes: 0,
             }
+        );
+    }
+
+    #[test]
+    fn snapshot_only_blocks_are_not_a_live_clone() {
+        use kache_fs::Sharing as S;
+        assert_eq!(
+            from_measurement(S::Full, Some(0), Some(4096), 4096),
+            Sharing {
+                shared: false,
+                private_bytes: 0,
+                snapshot_bytes: 4096,
+            },
+            "a blob whose only other holder is a snapshot"
+        );
+        assert_eq!(
+            from_measurement(S::Partial, Some(1024), Some(3072), 4096),
+            Sharing {
+                shared: false,
+                private_bytes: 1024,
+                snapshot_bytes: 3072,
+            },
+            "rewritten after the snapshot: part private, part snapshot"
+        );
+        assert_eq!(
+            from_measurement(S::Full, Some(0), Some(8192), 4096).snapshot_bytes,
+            4096,
+            "clamped to the blob's size"
+        );
+        assert_eq!(
+            from_measurement(S::Full, Some(0), Some(0), 4096),
+            Sharing {
+                shared: true,
+                private_bytes: 0,
+                snapshot_bytes: 0,
+            },
+            "another live clone holds the blocks"
+        );
+        assert_eq!(
+            from_measurement(S::None, Some(4096), Some(4096), 4096),
+            Sharing {
+                shared: false,
+                private_bytes: 4096,
+                snapshot_bytes: 0,
+            },
+            "nothing shared means nothing for snapshots to hold"
         );
     }
 

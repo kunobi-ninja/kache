@@ -46,15 +46,28 @@ pub fn blob_reclaimable_bytes(path: &Path) -> Option<u64> {
     retainer_from_meta(path).map(|r| r.private_bytes)
 }
 
-/// Would unlinking this store name free none of the blob's blocks?
+/// Would unlinking this store name leave the blob's blocks held by another
+/// live file? Blocks held only by snapshots do not count: they are freed
+/// once the snapshots are deleted, and keeping the entry would pin the store
+/// over its size limit for as long as any snapshot exists.
 pub fn blob_has_external_retainer(path: &Path) -> bool {
-    blob_reclaimable_bytes(path) == Some(0)
+    retainer_from_meta(path).is_some_and(|r| r.held_by_live_file())
 }
 
 pub struct BlobRetainer {
     pub size: u64,
+    /// Another live file (hardlink or clone) holds every block.
     pub cloned: bool,
     pub private_bytes: u64,
+    /// Bytes only filesystem snapshots hold.
+    pub snapshot_bytes: u64,
+}
+
+impl BlobRetainer {
+    /// True when unlinking frees nothing now and nothing later either.
+    pub fn held_by_live_file(&self) -> bool {
+        self.private_bytes == 0 && self.snapshot_bytes == 0
+    }
 }
 
 pub fn retainer_from_meta(path: &Path) -> Option<BlobRetainer> {
@@ -76,6 +89,7 @@ pub fn retainer_from_meta(path: &Path) -> Option<BlobRetainer> {
             size,
             cloned: true,
             private_bytes: 0,
+            snapshot_bytes: 0,
         });
     }
     Some(retainer_from_sharing(size, sharing))
@@ -91,6 +105,7 @@ pub fn retainer_from_sharing(size: u64, sharing: Sharing) -> BlobRetainer {
         } else {
             sharing.private_bytes.min(size)
         },
+        snapshot_bytes: sharing.snapshot_bytes,
     }
 }
 
@@ -105,6 +120,7 @@ mod tests {
             Sharing {
                 shared: true,
                 private_bytes: 0,
+                snapshot_bytes: 0,
             },
         );
         assert!(r.cloned);
@@ -118,10 +134,47 @@ mod tests {
             Sharing {
                 shared: false,
                 private_bytes: 4096,
+                snapshot_bytes: 0,
             },
         );
         assert!(!r.cloned);
         assert_eq!(r.private_bytes, 4096);
+    }
+
+    #[test]
+    fn snapshot_only_blobs_do_not_block_eviction() {
+        let snapshot = retainer_from_sharing(
+            4096,
+            Sharing {
+                shared: false,
+                private_bytes: 0,
+                snapshot_bytes: 4096,
+            },
+        );
+        assert!(!snapshot.cloned, "no live file holds the blocks");
+        assert_eq!(snapshot.private_bytes, 0, "nothing frees right away");
+        assert_eq!(snapshot.snapshot_bytes, 4096);
+        assert!(!snapshot.held_by_live_file());
+
+        let cloned = retainer_from_sharing(
+            4096,
+            Sharing {
+                shared: true,
+                private_bytes: 0,
+                snapshot_bytes: 0,
+            },
+        );
+        assert!(cloned.held_by_live_file());
+
+        let private = retainer_from_sharing(
+            4096,
+            Sharing {
+                shared: false,
+                private_bytes: 4096,
+                snapshot_bytes: 0,
+            },
+        );
+        assert!(!private.held_by_live_file());
     }
 
     #[test]
@@ -131,6 +184,7 @@ mod tests {
             Sharing {
                 shared: true,
                 private_bytes: 1024,
+                snapshot_bytes: 0,
             },
         );
         assert!(!r.cloned, "partly private blobs can reclaim some disk");

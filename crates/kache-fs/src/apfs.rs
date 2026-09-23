@@ -77,6 +77,7 @@ struct Reply {
     privatesize: Option<i64>,
     cloneid: Option<u64>,
     ext_flags: Option<u64>,
+    clone_refcount: Option<u32>,
 }
 
 fn parse_reply(buf: &[u8]) -> Option<Reply> {
@@ -119,9 +120,11 @@ fn parse_reply(buf: &[u8]) -> Option<Reply> {
     } else {
         None
     };
-    if fork & ATTR_CMNEXT_CLONE_REFCNT != 0 {
-        reader.u32()?;
-    }
+    let clone_refcount = if fork & ATTR_CMNEXT_CLONE_REFCNT != 0 {
+        Some(reader.u32()?)
+    } else {
+        None
+    };
     Some(Reply {
         returned,
         allocsize,
@@ -129,6 +132,7 @@ fn parse_reply(buf: &[u8]) -> Option<Reply> {
         privatesize,
         cloneid,
         ext_flags,
+        clone_refcount,
     })
 }
 
@@ -223,6 +227,7 @@ struct BulkEntry<'a> {
     privatesize: Option<i64>,
     cloneid: Option<u64>,
     ext_flags: Option<u64>,
+    clone_refcount: Option<u32>,
 }
 
 /// Parse the entry at the start of `buf`. Returns the entry and its total
@@ -275,6 +280,9 @@ fn parse_entry(buf: &[u8]) -> Option<(BulkEntry<'_>, usize)> {
     let ext_flags = (fork & ATTR_CMNEXT_EXT_FLAGS != 0)
         .then(|| reader.u64())
         .flatten();
+    let clone_refcount = (fork & ATTR_CMNEXT_CLONE_REFCNT != 0)
+        .then(|| reader.u32())
+        .flatten();
     Some((
         BulkEntry {
             name,
@@ -287,6 +295,7 @@ fn parse_entry(buf: &[u8]) -> Option<(BulkEntry<'_>, usize)> {
             privatesize,
             cloneid,
             ext_flags,
+            clone_refcount,
         },
         len,
     ))
@@ -376,7 +385,10 @@ impl ApfsProbe {
                 | ATTR_CMN_OBJTYPE
                 | ATTR_CMN_FILEID,
             fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE | ATTR_FILE_DATALENGTH,
-            forkattr: ATTR_CMNEXT_PRIVATESIZE | ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_EXT_FLAGS,
+            forkattr: ATTR_CMNEXT_PRIVATESIZE
+                | ATTR_CMNEXT_CLONEID
+                | ATTR_CMNEXT_EXT_FLAGS
+                | ATTR_CMNEXT_CLONE_REFCNT,
             ..Default::default()
         };
         let mut buf = vec![0u8; BULK_BUFFER_BYTES];
@@ -451,6 +463,7 @@ impl ApfsProbe {
             },
             nlink: u64::from(nlink),
             clone_id: entry.cloneid,
+            clone_refcount: entry.clone_refcount,
         }))
     }
 }
@@ -491,6 +504,7 @@ impl SizeProbe for ApfsProbe {
             },
             nlink: md.nlink(),
             clone_id: r.cloneid,
+            clone_refcount: r.clone_refcount,
         })
     }
 
@@ -560,6 +574,7 @@ mod tests {
         assert_eq!(reply.privatesize, Some(4096));
         assert_eq!(reply.cloneid, Some(77));
         assert_eq!(reply.ext_flags, Some(1));
+        assert_eq!(reply.clone_refcount, Some(2));
         for end in 0..bytes.len() {
             assert!(parse_reply(&bytes[..end]).is_none());
         }
@@ -576,6 +591,7 @@ mod tests {
         assert_eq!(reply.privatesize, Some(123));
         assert_eq!(reply.cloneid, None);
         assert_eq!(reply.ext_flags, Some(64));
+        assert_eq!(reply.clone_refcount, None);
         let bytes = single_reply(0, ATTR_CMNEXT_PRIVATESIZE, &[]);
         assert!(
             parse_reply(&bytes).is_none(),
@@ -657,6 +673,7 @@ mod tests {
                     assert_eq!(l.unique, r.unique);
                     assert_eq!(l.sharing, r.sharing);
                     assert_eq!(l.clone_id, r.clone_id);
+                    assert_eq!(l.clone_refcount, r.clone_refcount);
                 }
                 other => panic!("entry kinds differ: {other:?}"),
             }
@@ -720,6 +737,18 @@ mod tests {
             c.allocated >= 4 * 1024 * 1024,
             "yet du still bills it in full"
         );
+        assert_eq!(c.clone_refcount, Some(2), "the original is the other clone");
+        assert_eq!(c.snapshot_held(), Some(0), "a live clone holds the blocks");
+
+        std::fs::remove_file(&orig).unwrap();
+        let alone = probe.measure_file(&clone).unwrap();
+        assert_eq!(alone.clone_refcount, Some(1), "the group is down to one");
+        assert_eq!(
+            alone.unique,
+            Some(alone.allocated),
+            "written after any snapshot, so every block is private again"
+        );
+        assert_eq!(alone.snapshot_held(), Some(0));
 
         std::fs::remove_dir_all(&dir).ok();
     }

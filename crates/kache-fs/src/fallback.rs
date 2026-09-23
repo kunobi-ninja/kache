@@ -28,6 +28,7 @@ impl SizeProbe for FallbackProbe {
             inode,
             nlink,
             clone_id: None,
+            clone_refcount: None,
         })
     }
 

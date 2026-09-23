@@ -108,6 +108,7 @@ mod tests {
             inode: InodeId { dev: 1, ino },
             nlink,
             clone_id: None,
+            clone_refcount: None,
         }
     }
 

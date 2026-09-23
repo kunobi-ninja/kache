@@ -32,6 +32,9 @@ pub struct DiskView {
     pub store_limit_bytes: u64,
     pub disk_private_bytes: u64,
     pub cloned_into_targets_bytes: u64,
+    /// Bytes only filesystem snapshots hold. Evictable: they are freed when
+    /// the snapshots are deleted, not by cleaning build outputs.
+    pub snapshot_retained_bytes: u64,
     pub cloned_coverage: ClonedCoverage,
 }
 
@@ -94,18 +97,21 @@ fn disk_view_from_probe(store_bytes: u64, store_limit_bytes: u64, probed: ProbeT
     // Prefer the indexed store size when the walk and the index disagree:
     // the index is what `max_size` bounds. Scale the probe split to it when
     // the walk found anything.
-    let (private, cloned) = if probed.apparent_bytes == 0 {
-        (store_bytes, 0)
-    } else {
-        let cloned = ((probed.cloned_bytes as u128 * store_bytes as u128)
-            / probed.apparent_bytes as u128) as u64;
-        (store_bytes.saturating_sub(cloned), cloned)
+    let scale = |bytes: u64| {
+        if probed.apparent_bytes == 0 {
+            0
+        } else {
+            ((bytes as u128 * store_bytes as u128) / probed.apparent_bytes as u128) as u64
+        }
     };
+    let cloned = scale(probed.cloned_bytes);
+    let snapshot = scale(probed.snapshot_bytes);
     DiskView {
         store_bytes,
         store_limit_bytes,
-        disk_private_bytes: private,
+        disk_private_bytes: store_bytes.saturating_sub(cloned).saturating_sub(snapshot),
         cloned_into_targets_bytes: cloned,
+        snapshot_retained_bytes: snapshot,
         cloned_coverage: cloned_coverage(),
     }
 }
@@ -114,13 +120,11 @@ fn disk_view_from_probe(store_bytes: u64, store_limit_bytes: u64, probed: ProbeT
 struct ProbeTotals {
     apparent_bytes: u64,
     cloned_bytes: u64,
+    snapshot_bytes: u64,
 }
 
 fn probe_store_blobs(store_dir: &Path) -> ProbeTotals {
-    let mut totals = ProbeTotals {
-        apparent_bytes: 0,
-        cloned_bytes: 0,
-    };
+    let mut totals = ProbeTotals::default();
     let blobs_dir = store_dir.join("blobs");
     let Ok(shards) = std::fs::read_dir(&blobs_dir) else {
         return totals;
@@ -143,19 +147,37 @@ fn probe_store_blobs(store_dir: &Path) -> ProbeTotals {
             if retainer.cloned {
                 totals.cloned_bytes = totals.cloned_bytes.saturating_add(retainer.size);
             } else {
-                let cloned = retainer.size.saturating_sub(retainer.private_bytes);
+                let cloned = retainer
+                    .size
+                    .saturating_sub(retainer.private_bytes)
+                    .saturating_sub(retainer.snapshot_bytes);
                 totals.cloned_bytes = totals.cloned_bytes.saturating_add(cloned);
+                totals.snapshot_bytes = totals
+                    .snapshot_bytes
+                    .saturating_add(retainer.snapshot_bytes);
             }
         }
     }
     totals
 }
 
-pub fn next_for_clones(cloned_bytes: u64) -> Vec<NextAction> {
-    if cloned_bytes == 0 {
-        return Vec::new();
+pub fn next_for_clones(disk: &DiskView) -> Vec<NextAction> {
+    let mut next = Vec::new();
+    if disk.cloned_into_targets_bytes > 0 {
+        next.extend(clean_tracked_targets_action());
     }
-    clean_tracked_targets_action()
+    next.extend(snapshot_action(disk));
+    next
+}
+
+/// Snapshot-held bytes are freed by deleting snapshots, not build outputs.
+fn snapshot_action(disk: &DiskView) -> Option<NextAction> {
+    (disk.snapshot_retained_bytes > 0).then(|| NextAction {
+        argv: vec!["tmutil".into(), "listlocalsnapshots".into(), "/".into()],
+        why: "filesystem snapshots still hold blocks of evicted or evictable blobs; \
+              they are freed when the snapshots are thinned or deleted"
+            .into(),
+    })
 }
 
 fn clean_tracked_targets_action() -> Vec<NextAction> {
@@ -179,11 +201,13 @@ pub fn next_after_gc(
     store_removed: u64,
 ) -> Vec<NextAction> {
     let leftover = store_removed.saturating_sub(disk_reclaimed);
-    if unreclaimable > 0 || leftover > 0 || disk.cloned_into_targets_bytes > 0 {
+    let mut next = if unreclaimable > 0 || leftover > 0 || disk.cloned_into_targets_bytes > 0 {
         clean_tracked_targets_action()
     } else {
         Vec::new()
-    }
+    };
+    next.extend(snapshot_action(disk));
+    next
 }
 
 #[cfg(test)]
@@ -197,6 +221,7 @@ mod tests {
         assert_eq!(view.store_bytes, 0);
         assert_eq!(view.disk_private_bytes, 0);
         assert_eq!(view.cloned_into_targets_bytes, 0);
+        assert_eq!(view.snapshot_retained_bytes, 0);
         assert_eq!(view.store_limit_bytes, 1024);
     }
 
@@ -208,10 +233,12 @@ mod tests {
             ProbeTotals {
                 apparent_bytes: 400,
                 cloned_bytes: 100,
+                snapshot_bytes: 40,
             },
         );
-        assert_eq!(view.disk_private_bytes, 750);
+        assert_eq!(view.disk_private_bytes, 650);
         assert_eq!(view.cloned_into_targets_bytes, 250);
+        assert_eq!(view.snapshot_retained_bytes, 100);
         assert_eq!(view.store_bytes, 1_000);
         assert_eq!(view.store_limit_bytes, 2_000);
     }
@@ -240,21 +267,46 @@ mod tests {
         assert!(error.contains("the alternative"), "{error}");
     }
 
-    #[test]
-    fn next_for_clones_is_silent_when_nothing_is_cloned() {
-        assert!(next_for_clones(0).is_empty());
-        assert_eq!(next_for_clones(1)[0].argv[1], "clean");
-    }
-
-    #[test]
-    fn next_after_gc_covers_each_retention_signal_boundary() {
-        let empty = DiskView {
+    fn empty_view() -> DiskView {
+        DiskView {
             store_bytes: 0,
             store_limit_bytes: 0,
             disk_private_bytes: 0,
             cloned_into_targets_bytes: 0,
+            snapshot_retained_bytes: 0,
             cloned_coverage: ClonedCoverage::Unknown,
+        }
+    }
+
+    #[test]
+    fn next_for_clones_points_at_whatever_holds_the_blocks() {
+        let empty = empty_view();
+        assert!(next_for_clones(&empty).is_empty());
+        let cloned = DiskView {
+            cloned_into_targets_bytes: 1,
+            ..empty_view()
         };
+        let next = next_for_clones(&cloned);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].argv[1], "clean");
+        let snapshot = DiskView {
+            snapshot_retained_bytes: 1,
+            ..empty_view()
+        };
+        let next = next_for_clones(&snapshot);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].argv[0], "tmutil");
+        let both = DiskView {
+            cloned_into_targets_bytes: 1,
+            snapshot_retained_bytes: 1,
+            ..empty_view()
+        };
+        assert_eq!(next_for_clones(&both).len(), 2);
+    }
+
+    #[test]
+    fn next_after_gc_covers_each_retention_signal_boundary() {
+        let empty = empty_view();
         assert!(next_after_gc(&empty, 0, 0, 0).is_empty());
         assert!(!next_after_gc(&empty, 1, 0, 0).is_empty());
         assert!(!next_after_gc(&empty, 0, 0, 1).is_empty());
@@ -265,5 +317,13 @@ mod tests {
             ..empty
         };
         assert!(!next_after_gc(&cloned, 0, 0, 0).is_empty());
+
+        let snapshot = DiskView {
+            snapshot_retained_bytes: 1,
+            ..empty
+        };
+        let next = next_after_gc(&snapshot, 0, 0, 0);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].argv[0], "tmutil");
     }
 }

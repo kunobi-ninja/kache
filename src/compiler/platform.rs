@@ -47,6 +47,17 @@ use anyhow::{Context as _, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// What [`Platform::ensure_binary_loadable`] established about a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loadability {
+    /// The existing signature was checked and is valid; the file was not
+    /// touched. The same bytes will pass the same check on this host again.
+    Verified,
+    /// Nothing was proven: the host has no check, the tool could not run,
+    /// or the file had to be signed.
+    Unverified,
+}
+
 /// Platform-specific behavior the cache layer needs to apply to
 /// restored artifacts. One impl per OS; today only [`MacOsPlatform`]
 /// does non-trivial work.
@@ -73,7 +84,16 @@ pub trait Platform: Send + Sync {
     /// wrapper's restore loop. Returning `Err` is reserved for
     /// failures so structural that the next action would also fail
     /// (e.g. the path doesn't exist).
-    fn ensure_binary_loadable(&self, path: &Path) -> Result<()>;
+    fn ensure_binary_loadable(&self, path: &Path) -> Result<Loadability>;
+
+    /// Where this host remembers the store blobs whose restored copy
+    /// [`Self::ensure_binary_loadable`] found [`Loadability::Verified`], one
+    /// empty file per blob hash. A blob is content-addressed, so a restore
+    /// that did not rewrite its bytes can skip the check next time. `None`,
+    /// the default, where the check costs nothing.
+    fn verified_loadable_dir(&self) -> Option<PathBuf> {
+        None
+    }
 
     /// Produce a self-contained, relocatable debug-info companion for a
     /// just-linked binary, as ONE flat file inside `staging_dir`
@@ -140,17 +160,17 @@ impl Platform for MacOsPlatform {
         "macos"
     }
 
-    fn ensure_binary_loadable(&self, path: &Path) -> Result<()> {
+    fn ensure_binary_loadable(&self, path: &Path) -> Result<Loadability> {
         // Compiled in on every host so unit tests can construct
         // MacOsPlatform from Linux. The actual `codesign` invocation
         // is gated below — a Linux test that calls into this method
         // gets Ok(()) because the host check fails, no `codesign`
         // process is spawned.
         if std::env::consts::ARCH != "aarch64" {
-            return Ok(());
+            return Ok(Loadability::Unverified);
         }
         if std::env::consts::OS != "macos" {
-            return Ok(());
+            return Ok(Loadability::Unverified);
         }
 
         // verify-then-sign: skip mutation when ld64's signature is
@@ -167,7 +187,7 @@ impl Platform for MacOsPlatform {
                     "unable to run codesign --verify for {}: {err}",
                     path.display()
                 );
-                return Ok(());
+                return Ok(Loadability::Unverified);
             }
         };
 
@@ -176,7 +196,7 @@ impl Platform for MacOsPlatform {
                 "ad-hoc signature already valid for {}, skipping re-sign",
                 path.display()
             );
-            return Ok(());
+            return Ok(Loadability::Verified);
         }
 
         tracing::debug!(
@@ -194,14 +214,25 @@ impl Platform for MacOsPlatform {
                     "unable to run codesign --sign for {}: {err}",
                     path.display()
                 );
-                return Ok(());
+                return Ok(Loadability::Unverified);
             }
         };
 
         if !status.success() {
             tracing::warn!("ad-hoc codesign failed for {}", path.display());
         }
-        Ok(())
+        Ok(Loadability::Unverified)
+    }
+
+    /// Kept per kernel release: a check that passed under one macOS need not
+    /// pass under the next, so an update starts the memo afresh.
+    fn verified_loadable_dir(&self) -> Option<PathBuf> {
+        macos_verified_loadable_dir(
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            kernel_release,
+            &crate::config::probe_memo_dir(),
+        )
     }
 
     fn package_debug_bundle(&self, binary: &Path, staging_dir: &Path) -> Result<Option<PathBuf>> {
@@ -389,8 +420,8 @@ impl Platform for LinuxPlatform {
         "linux"
     }
 
-    fn ensure_binary_loadable(&self, _path: &Path) -> Result<()> {
-        Ok(())
+    fn ensure_binary_loadable(&self, _path: &Path) -> Result<Loadability> {
+        Ok(Loadability::Unverified)
     }
 
     fn package_debug_bundle(&self, _binary: &Path, _staging_dir: &Path) -> Result<Option<PathBuf>> {
@@ -422,8 +453,8 @@ impl Platform for WindowsPlatform {
         "windows"
     }
 
-    fn ensure_binary_loadable(&self, _path: &Path) -> Result<()> {
-        Ok(())
+    fn ensure_binary_loadable(&self, _path: &Path) -> Result<Loadability> {
+        Ok(Loadability::Unverified)
     }
 
     fn package_debug_bundle(&self, _binary: &Path, _staging_dir: &Path) -> Result<Option<PathBuf>> {
@@ -432,6 +463,49 @@ impl Platform for WindowsPlatform {
         // investigation; until it lands there is nothing to package.
         Ok(None)
     }
+}
+
+/// The memo directory under `probes` for a macOS host, or `None` where
+/// [`MacOsPlatform::ensure_binary_loadable`] checks nothing: every host but
+/// arm64 macOS.
+fn macos_verified_loadable_dir(
+    arch: &str,
+    os: &str,
+    release: impl FnOnce() -> Option<String>,
+    probes: &Path,
+) -> Option<PathBuf> {
+    if arch != "aarch64" || os != "macos" {
+        return None;
+    }
+    let release = release()?;
+    Some(
+        probes
+            .join("verified-loadables")
+            .join(format!("darwin-{release}")),
+    )
+}
+
+/// The running kernel's release (`uname -r`), such as `25.6.0`.
+#[cfg(unix)]
+fn kernel_release() -> Option<String> {
+    // SAFETY: `utsname` is plain C data, valid when zeroed.
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: `uname` writes only into the struct it is handed.
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return None;
+    }
+    // SAFETY: on success `release` holds a NUL-terminated string.
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+    release
+        .to_str()
+        .ok()
+        .filter(|release| !release.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(not(unix))]
+fn kernel_release() -> Option<String> {
+    None
 }
 
 #[cfg(test)]
@@ -445,6 +519,7 @@ pub(crate) mod tests {
     pub struct CountingPlatform {
         ensure_binary_loadable_calls: AtomicUsize,
         package_debug_bundle_calls: AtomicUsize,
+        verified_dir: Option<PathBuf>,
     }
 
     impl CountingPlatform {
@@ -452,6 +527,15 @@ pub(crate) mod tests {
             Self {
                 ensure_binary_loadable_calls: AtomicUsize::new(0),
                 package_debug_bundle_calls: AtomicUsize::new(0),
+                verified_dir: None,
+            }
+        }
+
+        /// A platform whose check always passes, remembered under `dir`.
+        pub fn verifying_into(dir: PathBuf) -> Self {
+            Self {
+                verified_dir: Some(dir),
+                ..Self::new()
             }
         }
 
@@ -468,10 +552,17 @@ pub(crate) mod tests {
         fn name(&self) -> &'static str {
             "counting"
         }
-        fn ensure_binary_loadable(&self, _path: &Path) -> Result<()> {
+        fn ensure_binary_loadable(&self, _path: &Path) -> Result<Loadability> {
             self.ensure_binary_loadable_calls
                 .fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            Ok(if self.verified_dir.is_some() {
+                Loadability::Verified
+            } else {
+                Loadability::Unverified
+            })
+        }
+        fn verified_loadable_dir(&self) -> Option<PathBuf> {
+            self.verified_dir.clone()
         }
         fn package_debug_bundle(
             &self,
@@ -500,6 +591,60 @@ pub(crate) mod tests {
             panic!("unsupported host OS in test")
         };
         assert_eq!(platform.name(), expected);
+    }
+
+    #[test]
+    fn only_macos_on_arm64_keeps_a_verified_loadable_memo() {
+        assert_eq!(LinuxPlatform.verified_loadable_dir(), None);
+        assert_eq!(WindowsPlatform.verified_loadable_dir(), None);
+        let dir = MacOsPlatform.verified_loadable_dir();
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            let dir = dir.expect("arm64 macOS checks signatures, so it keeps the memo");
+            let scope = dir.file_name().unwrap().to_str().unwrap();
+            assert!(scope.starts_with("darwin-") && scope.len() > "darwin-".len());
+            assert_eq!(
+                dir.parent().unwrap().file_name().unwrap(),
+                "verified-loadables"
+            );
+        } else {
+            assert_eq!(dir, None);
+        }
+    }
+
+    #[test]
+    fn the_memo_is_kept_per_kernel_release_on_arm64_macos_only() {
+        let probes = Path::new("/cache/probes");
+        let release = || Some("25.6.0".to_string());
+        assert_eq!(
+            macos_verified_loadable_dir("aarch64", "macos", release, probes),
+            Some(probes.join("verified-loadables/darwin-25.6.0")),
+        );
+        for (arch, os) in [
+            ("x86_64", "macos"),
+            ("aarch64", "linux"),
+            ("x86_64", "linux"),
+        ] {
+            assert_eq!(
+                macos_verified_loadable_dir(arch, os, release, probes),
+                None,
+                "{arch}/{os} checks nothing, so it keeps no memo"
+            );
+        }
+        assert_eq!(
+            macos_verified_loadable_dir("aarch64", "macos", || None, probes),
+            None,
+            "without a kernel release an update could reuse old passes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kernel_release_reads_the_running_kernel() {
+        let release = kernel_release().expect("uname works on unix");
+        assert!(
+            release.chars().next().unwrap().is_ascii_digit(),
+            "{release}"
+        );
     }
 
     #[test]

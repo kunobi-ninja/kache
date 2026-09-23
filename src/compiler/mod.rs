@@ -27,7 +27,7 @@ pub mod nvcc;
 pub mod platform;
 pub mod rustc;
 
-pub use platform::Platform;
+pub use platform::{Loadability, Platform};
 
 pub use crate::compile::CompileResult;
 
@@ -567,7 +567,7 @@ impl PostRestoreAction {
     /// explicitly — rather than calling `platform::current()` here —
     /// keeps tests deterministic: a unit test can inject a counting /
     /// failing / no-op platform.
-    pub fn apply(&self, path: &std::path::Path, platform: &dyn Platform) -> Result<()> {
+    pub fn apply(&self, path: &std::path::Path, platform: &dyn Platform) -> Result<Loadability> {
         match self {
             PostRestoreAction::Sign(SigningPurpose::OsLoading) => {
                 // Verify-then-sign lives inside the platform impl so
@@ -575,7 +575,9 @@ impl PostRestoreAction {
                 // signatures) can't be reintroduced from this site.
                 platform.ensure_binary_loadable(path)
             }
-            PostRestoreAction::UnpackDebugBundle => unpack_debug_bundle(path),
+            PostRestoreAction::UnpackDebugBundle => {
+                unpack_debug_bundle(path).map(|()| Loadability::Unverified)
+            }
             PostRestoreAction::ExpandDepInfoPaths => {
                 // A content transform — handled in memory via
                 // `transform()` before materialization, never here.
@@ -583,7 +585,7 @@ impl PostRestoreAction {
                     false,
                     "ExpandDepInfoPaths is a content transform; route it through transform()"
                 );
-                Ok(())
+                Ok(Loadability::Unverified)
             }
         }
     }

@@ -134,13 +134,16 @@ gitignore = true
 # `render_key_divergence` (which fields count as diverged), and
 # `key_divergence_report` (reading both phase logs off disk).
 #
-# `install_shims`'s two `!x.is_empty()` guards decide only which summary line
-# prints ("Created N shim(s)" plus the optional created/skipped name lists).
+# In `install_shims_named_with_output`, `!verbose` and the summary guards
+# (`!created.is_empty()`, `!skipped.is_empty()`, `!marked`) decide only what
+# prints: the created and skipped name lists and the unmarked-directory note.
 # Nothing an in-process test can observe changes: the shim set it creates, the
 # entries it preserves, and the errors it reports are all asserted directly by
 # the tests around it. Same shape as the `run_gc_local` progress strings above.
-# The function's behaviour, its `--force` semantics, and its error
-# classification all stay in scope and are killed by those tests.
+# The pattern also matches the function's other `!` guards (`--force`, the
+# extra-name checks), which those tests kill. Whether the `.kache-shims`
+# marker is written is decided in `compiler::shim::holds_only_shims`, which
+# the pattern does not match, so that decision stays in scope.
 #
 # Replacing `Config::socket_path` with an empty `PathBuf` is not a survivor:
 # `test_config_socket_path` and the runtime-isolation tests reject it directly.
@@ -311,6 +314,10 @@ exclude_re = [
     "replace print_sccache_summary with \\(\\)",
     "crates/kache-e2e/src/disk_usage.rs:.*other::",
     "crates/kache-e2e/src/bench_host.rs:.*(macos|other)::",
+    # The test runner's Windows console adapter, the `disk_usage::other`
+    # shape: the ubuntu lane never compiles it. The Unix `signals` module
+    # stays in scope, and the runner's integration tests kill its mutants.
+    "src/test_runner.rs:.*windows_signals::",
     "replace run_cold_phase .* with Ok",
     "src/cache_fs.rs:.*replace probe_windows",
     "src/cache_fs.rs:.*replace statfs_total_bytes_macos",
@@ -338,7 +345,7 @@ exclude_re = [
     "replace \\+= with \\*= in StoreLock::wait_until_available",
     "replace \\+= with \\*= in Scheduler::wait_for_permit",
     "replace \\+= with \\*= in wait_for_lock",
-    "replace \\+= with \\*= in acquire_discovery",
+    "replace \\+= with \\*= in acquire_within",
     # Printing rustc's captured stdout/stderr is gated on `!is_empty()`, so
     # dropping the gate prints an empty string: a no-op.
     "delete ! in run_parsed_rustc",

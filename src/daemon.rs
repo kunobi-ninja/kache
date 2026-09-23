@@ -9416,13 +9416,21 @@ fn strip_ambient_remote_env(command: &mut std::process::Command) {
     }
 }
 
+/// `kache daemon run` for the binary at `exe`. A wrapper running behind a
+/// compiler shim can start the daemon, and there `exe` can be the shim, so
+/// this goes through [`crate::platform::self_command`].
+fn daemon_run_command(exe: &Path) -> std::process::Command {
+    let mut command = crate::platform::self_command(exe, "daemon");
+    command.arg("run");
+    command
+}
+
 fn spawn_detached_daemon(
     exe: &Path,
     stderr_target: std::process::Stdio,
 ) -> Result<std::process::Child> {
-    let mut command = std::process::Command::new(exe);
+    let mut command = daemon_run_command(exe);
     command
-        .args(["daemon", "run"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr_target);
@@ -9585,6 +9593,26 @@ mod tests {
             command.get_envs().all(|(_, value)| value.is_none()),
             "the spawn should only remove variables, never set them"
         );
+    }
+
+    /// A wrapper behind a compiler shim can start the daemon with the shim as
+    /// its executable. The child must still parse `daemon run` as the CLI.
+    #[test]
+    fn daemon_spawn_is_marked_as_a_self_spawn() {
+        let exe = Path::new("/x/shims/cc");
+        let command = daemon_run_command(exe);
+        assert_eq!(command.get_program(), exe.as_os_str());
+        let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+        assert_eq!(args, ["daemon", "run"]);
+        let argv: Vec<String> = std::iter::once("/x/shims/cc")
+            .chain(args.iter().filter_map(|arg| arg.to_str()))
+            .map(str::to_string)
+            .collect();
+        let marker = command
+            .get_envs()
+            .find(|(name, _)| *name == crate::platform::SELF_SPAWN_ENV)
+            .and_then(|(_, value)| value);
+        assert!(crate::platform::is_self_spawn(&argv, marker));
     }
 
     /// Set/remove an env var for one test and restore it on drop. Local to
@@ -10621,6 +10649,7 @@ mod tests {
             heartbeat_secs: 30,
             explain_miss: false,
             scheduler: true,
+            test_lease: None,
             path_only_env_vars: Vec::new(),
             incremental_crates: Vec::new(),
             key_env_vars: Vec::new(),

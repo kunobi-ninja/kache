@@ -219,10 +219,15 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_from(write_workspace)
+}
+
+/// A fixture around the workspace `write` lays out.
+fn fixture_from(write: fn(&Path)) -> Fixture {
     let workspace = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
-    write_workspace(workspace.path());
+    write(workspace.path());
     std::fs::create_dir_all(home.path().join(".cargo")).unwrap();
     Fixture {
         workspace: workspace.path().to_path_buf(),
@@ -694,4 +699,214 @@ fn clippy_units_hit_with_their_diagnostics() {
         results_for(&events_since(&fx.cache, mark), "leaf"),
         vec!["miss"]
     );
+}
+
+/// The variable `bundler`'s build script bakes into its archive.
+const BUNDLED_VALUE: &str = "KACHE_TEST_BUNDLED_VALUE";
+
+/// `bundler`'s build script writes a one-object archive whose function returns
+/// `KACHE_TEST_BUNDLED_VALUE`, and names it with a link modifier, as scripts
+/// that need every object linked do. Its library bundles the archive and
+/// `app` prints the value. The object comes from `$RUSTC --emit=obj` and the
+/// archive is written by hand, so no C toolchain or `ar` is involved.
+fn write_bundling_workspace(root: &Path) {
+    let write = |relative: &str, content: &str| {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"bundler\", \"app\"]\nresolver = \"2\"\n",
+    );
+    write(
+        "bundler/Cargo.toml",
+        "[package]\nname = \"bundler\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        "bundler/build.rs",
+        r##"use std::path::PathBuf;
+
+/// A one-object ar archive. ld64 wants each object on an 8-byte boundary, so
+/// for Apple targets the name follows the header, NUL-padded, as Apple's own
+/// tools write it.
+fn archive(object: &[u8], apple: bool) -> Vec<u8> {
+    let header = |name: &str, size: usize| {
+        format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644)
+    };
+    let mut bytes = b"!<arch>\n".to_vec();
+    if apple {
+        let name = b"value.o\0\0\0\0\0";
+        bytes.extend_from_slice(header("#1/12", name.len() + object.len()).as_bytes());
+        bytes.extend_from_slice(name);
+    } else {
+        bytes.extend_from_slice(header("value.o/", object.len()).as_bytes());
+    }
+    bytes.extend_from_slice(object);
+    if bytes.len() % 2 == 1 {
+        bytes.push(b'\n');
+    }
+    bytes
+}
+
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=KACHE_TEST_BUNDLED_VALUE");
+    let value: u32 = std::env::var("KACHE_TEST_BUNDLED_VALUE").unwrap().parse().unwrap();
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let source = out.join("value.rs");
+    std::fs::write(
+        &source,
+        format!("#![no_std]\n#[no_mangle]\npub extern \"C\" fn bundled_value() -> u32 {{ {value} }}\n"),
+    )
+    .unwrap();
+    let object = out.join("value.o");
+    let status = std::process::Command::new(std::env::var("RUSTC").unwrap())
+        .args(["--crate-type=lib", "--crate-name=value", "--emit=obj"])
+        .args(["-Cpanic=abort", "-Ccodegen-units=1", "--target"])
+        .arg(std::env::var("TARGET").unwrap())
+        .arg("-o")
+        .arg(&object)
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success(), "compiling the archive's object failed");
+    let apple = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap() == "apple";
+    let bytes = archive(&std::fs::read(&object).unwrap(), apple);
+    std::fs::write(out.join("libbundled.a"), bytes).unwrap();
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static:+whole-archive=bundled");
+}
+"##,
+    );
+    write(
+        "bundler/src/lib.rs",
+        "extern \"C\" {\n    fn bundled_value() -> u32;\n}\n\n\
+         pub fn value() -> u32 {\n    unsafe { bundled_value() }\n}\n",
+    );
+    write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nbundler = { path = \"../bundler\" }\n",
+    );
+    write(
+        "app/src/main.rs",
+        "fn main() {\n    println!(\"bundled value {}\", bundler::value());\n}\n",
+    );
+    let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+    for entry in walkdir(root) {
+        let _ = filetime::set_file_mtime(&entry, old);
+    }
+}
+
+/// A build script that rewrites its archive in place, named
+/// `static:+whole-archive=bundled`. The rlib that bundles the archive must
+/// recompile when the archive changes. Restoring the rlib built from the old
+/// archive links the old object into the binary (#421).
+#[test]
+fn a_rebuilt_whole_archive_lib_reaches_the_binary() {
+    let fx = fixture_from(write_bundling_workspace);
+    let build = |target: &Path, value: &str| -> (Vec<String>, String) {
+        let mark = event_count(&fx.cache);
+        run(&mut cargo(
+            "build",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            target,
+            &[(BUNDLED_VALUE, value)],
+        ));
+        let events = events_since(&fx.cache, mark);
+        let results = results_for(&events, "bundler")
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let output = Command::new(target.join("debug/app")).output().unwrap();
+        assert!(output.status.success(), "app failed: {output:?}");
+        let printed = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        (results, printed)
+    };
+
+    let cold = target(&fx, "cold");
+    assert_eq!(
+        build(&cold, "1"),
+        (vec!["miss".to_string()], "bundled value 1".to_string())
+    );
+    // A fresh target directory restores the library, so the rebuild below
+    // cannot pass because the library was never cached.
+    let warm = target(&fx, "warm");
+    assert_eq!(
+        build(&warm, "1"),
+        (vec!["local_hit".to_string()], "bundled value 1".to_string())
+    );
+    // The declared variable changes: Cargo reruns the script, which rewrites
+    // the archive under the same name, and recompiles the library.
+    assert_eq!(
+        build(&warm, "2"),
+        (vec!["miss".to_string()], "bundled value 2".to_string()),
+        "the library must recompile against the rebuilt archive"
+    );
+}
+
+/// `stamped`'s build script reports the `ZERO_AR_DATE` it runs with.
+#[cfg(target_os = "macos")]
+fn write_stamped_workspace(root: &Path) {
+    let write = |relative: &str, content: &str| {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"stamped\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    );
+    write(
+        "build.rs",
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let seen = std::env::var("ZERO_AR_DATE").unwrap_or_else(|_| "unset".to_string());
+    println!("cargo:warning=stamped saw ZERO_AR_DATE={seen}");
+}
+"#,
+    );
+    write("src/lib.rs", "");
+    let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+    for entry in walkdir(root) {
+        let _ = filetime::set_file_mtime(&entry, old);
+    }
+}
+
+/// Apple `ar` stamps each member with its mtime unless `ZERO_AR_DATE` is set,
+/// so a script that archives without it writes new bytes on every run. kache
+/// runs build scripts with `ZERO_AR_DATE=1` on macOS, keeps a value the user
+/// set, and does not restore a run recorded under another value.
+#[cfg(target_os = "macos")]
+#[test]
+fn build_scripts_run_with_zero_ar_date_on_macos() {
+    let fx = fixture_from(write_stamped_workspace);
+    for (name, value, seen) in [
+        ("default", None, "stamped saw ZERO_AR_DATE=1"),
+        ("user", Some("0"), "stamped saw ZERO_AR_DATE=0"),
+    ] {
+        let mut command = cargo(
+            "check",
+            &fx.workspace,
+            &fx.home,
+            &fx.cache,
+            &target(&fx, name),
+            &[],
+        );
+        match value {
+            Some(value) => command.env("ZERO_AR_DATE", value),
+            None => command.env_remove("ZERO_AR_DATE"),
+        };
+        let mark = event_count(&fx.cache);
+        let output = run(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(seen), "{name}: {stderr}");
+        assert_eq!(
+            results_for(&events_since(&fx.cache, mark), "build_script_run"),
+            vec!["miss"],
+            "{name}: a run recorded under another ZERO_AR_DATE is not restored"
+        );
+    }
 }

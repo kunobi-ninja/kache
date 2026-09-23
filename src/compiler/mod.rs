@@ -1970,20 +1970,89 @@ pub(crate) mod shim {
         super::cc::CcCompiler::recognizes(std::slice::from_ref(&arg0.to_string()))
     }
 
+    /// File that marks a directory of kache shims. The packages that build a
+    /// shim farm write it, and `kache install-shims` does when the directory
+    /// holds nothing else. Every entry in a marked directory is taken to be a
+    /// shim, whichever kache it belongs to.
+    pub(crate) const SHIM_DIR_MARKER: &str = ".kache-shims";
+
+    /// Whether `dir` holds [`SHIM_DIR_MARKER`].
+    pub(crate) fn has_shim_marker(dir: &Path) -> bool {
+        dir.join(SHIM_DIR_MARKER).is_file()
+    }
+
+    /// Mark `dir` as a shim directory. Only the Unix generator writes shims.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn write_shim_marker(dir: &Path) -> std::io::Result<()> {
+        std::fs::write(
+            dir.join(SHIM_DIR_MARKER),
+            "kache compiler shims. kache skips this directory when it looks for \
+             the real compiler, so keep only shims here.\n",
+        )
+    }
+
+    /// Whether `dir` may be marked: every entry in it other than the marker
+    /// resolves to `self_exe` or to a binary named `kache`. The marker hides
+    /// every entry in the directory from every kache, so a real compiler, or
+    /// any other file, keeps the directory unmarked.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn holds_only_shims(
+        dir: &Path,
+        self_exe: Option<&Path>,
+        resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        let self_real = self_exe.and_then(resolve);
+        entries.into_iter().all(|entry| {
+            entry.is_ok_and(|entry| {
+                entry.file_name() == SHIM_DIR_MARKER
+                    || resolves_to_kache(&entry.path(), self_real.as_deref(), resolve)
+            })
+        })
+    }
+
+    /// Whether a resolved path is a kache binary by its file name. This
+    /// catches the shims of another kache install, including farms made
+    /// before the marker existed.
+    pub(super) fn is_kache_binary(resolved: &Path) -> bool {
+        resolved.file_name().is_some_and(|name| {
+            name.eq_ignore_ascii_case("kache") || name.eq_ignore_ascii_case("kache.exe")
+        })
+    }
+
+    /// Whether `candidate` resolves to this kache binary or to any binary
+    /// named `kache`.
+    fn resolves_to_kache(
+        candidate: &Path,
+        self_real: Option<&Path>,
+        resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+    ) -> bool {
+        resolve(candidate)
+            .is_some_and(|real| self_real == Some(real.as_path()) || is_kache_binary(&real))
+    }
+
     /// The real compiler behind a shim: the first `name` on `PATH` that is not
-    /// kache itself.
+    /// a kache shim.
     ///
     /// Skipping by *resolved identity* rather than by directory is what makes
     /// this safe. It finds every shim wherever the user put them, tolerates
     /// several shim directories, and cannot be defeated by a relative or
     /// symlinked `PATH` entry — all of which would otherwise re-select the
     /// shim and recurse.
+    ///
+    /// Shims of a *different* kache install are skipped too: two installs on
+    /// the same PATH would otherwise each pick the other's shim as the real
+    /// compiler and run each other in a loop. They are recognized by the
+    /// directory marker, or by resolving to a binary named `kache`.
     pub(crate) fn resolve_real_compiler(
         name: &str,
         path_dirs: &[PathBuf],
         self_exe: Option<&Path>,
         is_candidate: &dyn Fn(&Path) -> bool,
         resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+        is_marked: &dyn Fn(&Path) -> bool,
     ) -> Option<PathBuf> {
         let self_real = self_exe.and_then(resolve);
         for dir in path_dirs {
@@ -1991,10 +2060,10 @@ pub(crate) mod shim {
             if !is_candidate(&candidate) {
                 continue;
             }
-            // A candidate that resolves to our own binary IS the shim.
-            if let (Some(real), Some(mine)) = (resolve(&candidate), self_real.as_deref())
-                && real == mine
-            {
+            if is_marked(dir) {
+                continue;
+            }
+            if resolves_to_kache(&candidate, self_real.as_deref(), resolve) {
                 continue;
             }
             return Some(candidate);
@@ -2002,18 +2071,28 @@ pub(crate) mod shim {
         None
     }
 
+    /// [`resolve_real_compiler`] against the real filesystem.
+    pub(crate) fn resolve_real_compiler_on(
+        name: &str,
+        path_dirs: &[PathBuf],
+        self_exe: Option<&Path>,
+    ) -> Option<PathBuf> {
+        resolve_real_compiler(
+            name,
+            path_dirs,
+            self_exe,
+            &|candidate| super::is_executable(candidate),
+            &|path| std::fs::canonicalize(path).ok(),
+            &|dir| has_shim_marker(dir),
+        )
+    }
+
     /// Live wiring for [`resolve_real_compiler`].
     pub(crate) fn resolve_real_compiler_from_env(name: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
         let self_exe = std::env::current_exe().ok();
-        resolve_real_compiler(
-            name,
-            &dirs,
-            self_exe.as_deref(),
-            &|candidate| super::is_executable(candidate),
-            &|path| std::fs::canonicalize(path).ok(),
-        )
+        resolve_real_compiler_on(name, &dirs, self_exe.as_deref())
     }
 
     /// User-level farm created by `kache install-shims` with no directory argument.
@@ -2032,17 +2111,22 @@ pub(crate) mod shim {
     ///
     /// `kache install-shims --from-path` uses this so versioned and
     /// target-prefixed drivers (`gcc-13`, `x86_64-pc-linux-gnu-gcc`) get a
-    /// symlink without a second hardcoded list. Entries that resolve to kache
-    /// itself are skipped, otherwise a re-run would treat the farm as compilers.
+    /// symlink without a second hardcoded list. Shims are skipped by the same
+    /// rules as [`resolve_real_compiler`], otherwise a re-run would treat a
+    /// farm, this one or another install's, as compilers.
     pub(crate) fn extra_compiler_names(
         path_dirs: &[PathBuf],
         self_exe: Option<&Path>,
         is_candidate: &dyn Fn(&Path) -> bool,
         resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+        is_marked: &dyn Fn(&Path) -> bool,
     ) -> Vec<String> {
         let self_real = self_exe.and_then(resolve);
         let mut names = BTreeSet::new();
         for dir in path_dirs {
+            if is_marked(dir) {
+                continue;
+            }
             let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
             };
@@ -2051,9 +2135,7 @@ pub(crate) mod shim {
                 if !is_candidate(&path) {
                     continue;
                 }
-                if let (Some(real), Some(mine)) = (resolve(&path), self_real.as_deref())
-                    && real == mine
-                {
+                if resolves_to_kache(&path, self_real.as_deref(), resolve) {
                     continue;
                 }
                 let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -2081,6 +2163,7 @@ pub(crate) mod shim {
             self_exe.as_deref(),
             &|candidate| super::is_executable(candidate),
             &|path| std::fs::canonicalize(path).ok(),
+            &|dir| has_shim_marker(dir),
         )
     }
 
@@ -2252,6 +2335,7 @@ mod shim_tests {
             Some(&kache),
             &exists,
             &resolve,
+            &|_| false,
         );
         assert_eq!(found, Some(PathBuf::from("/usr/bin/cc")));
     }
@@ -2265,6 +2349,7 @@ mod shim_tests {
             Some(&kache),
             &|_| true,
             &|_| Some(kache.clone()),
+            &|_| false,
         );
         assert_eq!(found, None, "must report no real compiler, not recurse");
     }
@@ -2281,8 +2366,284 @@ mod shim_tests {
             Some(&kache),
             &|path: &Path| path.starts_with("/usr/bin"),
             &|path: &Path| Some(path.to_path_buf()),
+            &|_| false,
         );
         assert_eq!(found, Some(PathBuf::from("/usr/bin/cc")));
+    }
+
+    /// Resolution with nothing named `kache` and no marker, so only the
+    /// identity rule can skip the first entry.
+    #[test]
+    fn resolve_skips_this_binary_even_when_it_is_not_named_kache() {
+        let me = PathBuf::from("/opt/dev/bin/kache-dev");
+        let resolve = |path: &Path| -> Option<PathBuf> {
+            if path.starts_with("/shims") {
+                Some(me.clone())
+            } else {
+                Some(path.to_path_buf())
+            }
+        };
+        let found = resolve_real_compiler(
+            "cc",
+            &[PathBuf::from("/shims"), PathBuf::from("/usr/bin")],
+            Some(&me),
+            &|_| true,
+            &resolve,
+            &|_| false,
+        );
+        assert_eq!(found, Some(PathBuf::from("/usr/bin/cc")));
+    }
+
+    /// Two kache installs on one PATH: the other install's shim resolves to a
+    /// different binary, so identity alone would pick it and the two would run
+    /// each other forever. Its `kache` file name is what skips it.
+    #[test]
+    fn resolve_skips_the_shim_of_another_kache_install() {
+        let me = PathBuf::from("/home/me/.cargo/bin/kache-dev");
+        for other in ["/usr/bin/kache", "C:/kache/kache.exe", "C:/Kache/KACHE.EXE"] {
+            let resolve = |path: &Path| -> Option<PathBuf> {
+                if path.starts_with("/usr/lib/kache") {
+                    Some(PathBuf::from(other))
+                } else {
+                    Some(path.to_path_buf())
+                }
+            };
+            let found = resolve_real_compiler(
+                "cc",
+                &[PathBuf::from("/usr/lib/kache"), PathBuf::from("/usr/bin")],
+                Some(&me),
+                &|_| true,
+                &resolve,
+                &|_| false,
+            );
+            assert_eq!(found, Some(PathBuf::from("/usr/bin/cc")), "{other}");
+        }
+    }
+
+    /// The name rule must not need to know this binary's own path.
+    #[test]
+    fn resolve_skips_another_kache_without_knowing_its_own_path() {
+        let resolve = |path: &Path| -> Option<PathBuf> {
+            if path.starts_with("/usr/lib/kache") {
+                Some(PathBuf::from("/usr/bin/kache"))
+            } else {
+                Some(path.to_path_buf())
+            }
+        };
+        let found = resolve_real_compiler(
+            "cc",
+            &[PathBuf::from("/usr/lib/kache"), PathBuf::from("/usr/bin")],
+            None,
+            &|_| true,
+            &resolve,
+            &|_| false,
+        );
+        assert_eq!(found, Some(PathBuf::from("/usr/bin/cc")));
+    }
+
+    /// A shim that is a copy of kache under the compiler's name (the Windows
+    /// setup) resolves to itself, so neither identity nor name can tell it
+    /// from a compiler. The directory marker does.
+    #[test]
+    fn resolve_skips_every_entry_in_a_marked_directory() {
+        let me = PathBuf::from("/opt/dev/bin/kache-dev");
+        let dirs = [PathBuf::from("/copies"), PathBuf::from("/usr/bin")];
+        let identity = |path: &Path| Some(path.to_path_buf());
+        let marked = |dir: &Path| dir == Path::new("/copies");
+
+        let found = resolve_real_compiler("cc", &dirs, Some(&me), &|_| true, &identity, &marked);
+        assert_eq!(found, Some(PathBuf::from("/usr/bin/cc")));
+
+        let unmarked =
+            resolve_real_compiler("cc", &dirs, Some(&me), &|_| true, &identity, &|_| false);
+        assert_eq!(
+            unmarked,
+            Some(PathBuf::from("/copies/cc")),
+            "without the marker the copy is indistinguishable from a compiler"
+        );
+    }
+
+    #[test]
+    fn kache_binary_names_are_recognized_case_insensitively() {
+        for path in [
+            "/usr/bin/kache",
+            "C:/kache/kache.exe",
+            "C:/kache/KACHE.EXE",
+            "/opt/Kache",
+        ] {
+            assert!(is_kache_binary(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/usr/bin/cc",
+            "/usr/bin/kache-dev",
+            "/usr/bin/kache.sh",
+            "/opt/kache/bin/gcc",
+            "/",
+        ] {
+            assert!(!is_kache_binary(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn shim_marker_round_trips_through_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!has_shim_marker(dir.path()));
+        write_shim_marker(dir.path()).unwrap();
+        assert!(has_shim_marker(dir.path()));
+        assert!(dir.path().join(SHIM_DIR_MARKER).is_file());
+    }
+
+    /// A directory that happens to be named like the marker is not one.
+    #[test]
+    fn a_marker_must_be_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(SHIM_DIR_MARKER)).unwrap();
+        assert!(!has_shim_marker(dir.path()));
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Two kache installs, each with its own shim farm on PATH, against the
+    /// real filesystem. Before the fix install A resolved to B's shim and B
+    /// resolved back to A's, and each ran the other.
+    #[cfg(unix)]
+    #[test]
+    fn two_installs_on_path_both_reach_the_real_compiler() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let kache_a = root.join("install-a/bin/kache");
+        let kache_b = root.join("install-b/lib/kache");
+        write_executable(&kache_a, "#!/bin/sh\nexit 1\n");
+        write_executable(&kache_b, "#!/bin/sh\nexit 1\n");
+        let shims_a = root.join("shims-a");
+        let shims_b = root.join("shims-b");
+        std::fs::create_dir_all(&shims_a).unwrap();
+        std::fs::create_dir_all(&shims_b).unwrap();
+        std::os::unix::fs::symlink(&kache_a, shims_a.join("cc")).unwrap();
+        std::os::unix::fs::symlink(&kache_b, shims_b.join("cc")).unwrap();
+        let real = root.join("real/cc");
+        write_executable(&real, "#!/bin/sh\nexit 0\n");
+
+        let path = [shims_a.clone(), shims_b.clone(), root.join("real")];
+        for (me, other) in [(&kache_a, &shims_b), (&kache_b, &shims_a)] {
+            let found = resolve_real_compiler_on("cc", &path, Some(me));
+            assert_eq!(
+                found.as_deref(),
+                Some(real.as_path()),
+                "{} must skip {} and reach the real compiler",
+                me.display(),
+                other.display()
+            );
+        }
+    }
+
+    /// The same situation when the other farm holds copies rather than
+    /// symlinks. Only its marker identifies it.
+    #[cfg(unix)]
+    #[test]
+    fn a_marked_farm_of_copies_is_skipped_on_the_real_filesystem() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let me = root.join("install-a/bin/kache");
+        write_executable(&me, "#!/bin/sh\nexit 1\n");
+        let copies = root.join("copies");
+        write_executable(&copies.join("cc"), "#!/bin/sh\nexit 1\n");
+        let real = root.join("real/cc");
+        write_executable(&real, "#!/bin/sh\nexit 0\n");
+        let path = [copies.clone(), root.join("real")];
+
+        assert_eq!(
+            resolve_real_compiler_on("cc", &path, Some(&me)).as_deref(),
+            Some(copies.join("cc").as_path()),
+            "an unmarked copy looks like a compiler"
+        );
+        write_shim_marker(&copies).unwrap();
+        assert_eq!(
+            resolve_real_compiler_on("cc", &path, Some(&me)).as_deref(),
+            Some(real.as_path())
+        );
+    }
+
+    /// `--from-path` must not list shims: this install's own, another
+    /// install's found by its `kache` target, or anything in a marked farm.
+    #[cfg(unix)]
+    #[test]
+    fn extra_names_skip_marked_dirs_and_other_installs() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let me = root.join("mine/kache-dev");
+        write_executable(&me, "#!/bin/sh\nexit 1\n");
+        let other_kache = root.join("other/kache");
+        write_executable(&other_kache, "#!/bin/sh\nexit 1\n");
+
+        let own = root.join("own-shims");
+        std::fs::create_dir_all(&own).unwrap();
+        std::os::unix::fs::symlink(&me, own.join("gcc-12")).unwrap();
+        let other = root.join("other-shims");
+        std::fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(&other_kache, other.join("gcc-13")).unwrap();
+        let marked = root.join("marked");
+        write_executable(&marked.join("gcc-14"), "#!/bin/sh\nexit 1\n");
+        write_shim_marker(&marked).unwrap();
+        let real = root.join("real");
+        write_executable(&real.join("gcc-15"), "#!/bin/sh\nexit 0\n");
+
+        let names = extra_compiler_names(
+            &[own, other, marked, real],
+            Some(&me),
+            &|candidate| super::is_executable(candidate),
+            &|path| std::fs::canonicalize(path).ok(),
+            &|dir| has_shim_marker(dir),
+        );
+        assert_eq!(names, vec!["gcc-15".to_string()]);
+    }
+
+    /// A directory of links to this install and to another install, plus the
+    /// marker a previous run wrote, may be marked. A real compiler or any
+    /// other file in it keeps it unmarked.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_directory_of_kache_links_may_be_marked() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let me = root.join("mine/kache-dev");
+        write_executable(&me, "#!/bin/sh\nexit 1\n");
+        let other_kache = root.join("other/kache");
+        write_executable(&other_kache, "#!/bin/sh\nexit 1\n");
+        let farm = root.join("farm");
+        std::fs::create_dir_all(&farm).unwrap();
+        std::os::unix::fs::symlink(&me, farm.join("cc")).unwrap();
+        std::os::unix::fs::symlink(&other_kache, farm.join("gcc")).unwrap();
+        write_shim_marker(&farm).unwrap();
+        let resolve = |path: &Path| std::fs::canonicalize(path).ok();
+        assert!(holds_only_shims(&farm, Some(&me), &resolve));
+
+        let real = farm.join("clang");
+        write_executable(&real, "#!/bin/sh\nexit 0\n");
+        assert!(
+            !holds_only_shims(&farm, Some(&me), &resolve),
+            "a real compiler"
+        );
+        std::fs::remove_file(&real).unwrap();
+        std::fs::write(farm.join("README"), "notes").unwrap();
+        assert!(
+            !holds_only_shims(&farm, Some(&me), &resolve),
+            "a plain file"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_read_may_not_be_marked() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        let identity = |path: &Path| Some(path.to_path_buf());
+        assert!(!holds_only_shims(&missing, None, &identity));
     }
 
     /// Guard that restores PATH even if the test panics; process env is

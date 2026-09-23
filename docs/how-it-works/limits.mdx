@@ -14,3 +14,7 @@ The permit pool size is `std::thread::available_parallelism()`, with a floor of 
 If the scheduler directory cannot be used, compilation continues without a permit. Set `KACHE_SCHEDULER=0` or `[cache] scheduler = false` to turn it off.
 
 Two cargo processes that miss the same crate still share one real compile when the first stores an entry the second can restore. Distinct target directories remain required.
+
+## Several test runs at once
+
+Test binaries can wait for the same pool. Set `kache test-runner` as Cargo's target runner and each test binary takes slots above a compile reserve of a quarter of the pool, at least one slot, until it exits. Builds started inside a running test use that test's slots. See [Test runner](/docs/getting-started/configuration#test-runner) to turn it on.

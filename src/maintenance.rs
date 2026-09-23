@@ -61,8 +61,9 @@ impl RequestClock {
     }
 }
 
-/// Quiet means no compile holds a permit and no wrapper request arrived for
-/// [`QUIET_AFTER`]. Unreadable permit slots are not quiet.
+/// Quiet means no compile or leased test binary holds a permit and no
+/// wrapper request arrived for [`QUIET_AFTER`]. Unreadable permit slots are
+/// not quiet.
 pub(crate) fn is_quiet(permits: Option<u32>, since_last_request: Duration) -> bool {
     permits == Some(0) && since_last_request >= QUIET_AFTER
 }

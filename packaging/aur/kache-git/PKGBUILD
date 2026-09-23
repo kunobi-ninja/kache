@@ -53,6 +53,9 @@ package() {
   for name in cc c++ gcc g++ clang clang++; do
     ln -s /usr/bin/kache "$pkgdir/usr/lib/kache/$name"
   done
+  # Marks the farm so another kache on PATH skips it (see
+  # compiler::shim::SHIM_DIR_MARKER).
+  install -Dm0644 /dev/null "$pkgdir/usr/lib/kache/.kache-shims"
 
   install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

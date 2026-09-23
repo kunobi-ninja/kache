@@ -289,7 +289,33 @@ fn real_command(real: &Path, argv: &[std::ffi::OsString]) -> Command {
     let mut command = Command::new(real);
     command.args(argv);
     command.env_remove(SHIM_PATH_ENV);
+    if let Some(value) = zero_ar_date(
+        std::env::var_os(ZERO_AR_DATE_ENV),
+        cfg!(target_os = "macos"),
+    ) {
+        command.env(ZERO_AR_DATE_ENV, value);
+    }
     command
+}
+
+/// Apple `ar` and `libtool` write each member's mtime into the archive unless
+/// `ZERO_AR_DATE` is set. The `cc` crate sets it for its own archives, but a
+/// script driving `make` or CMake does not, so every rerun gives the archive
+/// new bytes and re-keys the crate that bundles it.
+const ZERO_AR_DATE_ENV: &str = "ZERO_AR_DATE";
+
+/// The `ZERO_AR_DATE` a build script runs with: whatever the user set, else
+/// `1` on an Apple host. Elsewhere the variable has no effect and is left
+/// alone.
+fn zero_ar_date(
+    inherited: Option<std::ffi::OsString>,
+    apple_host: bool,
+) -> Option<std::ffi::OsString> {
+    match inherited {
+        Some(value) => Some(value),
+        None if apple_host => Some("1".into()),
+        None => None,
+    }
 }
 
 fn run_real(real: &Path, argv: &[std::ffi::OsString]) -> i32 {
@@ -765,6 +791,15 @@ impl Run {
     /// The key a recorded run is stored under: everything Cargo would compare
     /// before deciding the script need not rerun, plus the host it ran on.
     fn action_key(&self, prediction: &Prediction) -> Result<String> {
+        self.action_key_with(prediction, std::env::var_os(ZERO_AR_DATE_ENV))
+    }
+
+    /// [`Self::action_key`], given the `ZERO_AR_DATE` the script inherits.
+    fn action_key_with(
+        &self,
+        prediction: &Prediction,
+        inherited_zero_ar_date: Option<std::ffi::OsString>,
+    ) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
         fold(&mut hasher, "kind", b"kache-build-script-action-v1");
         fold(
@@ -817,6 +852,13 @@ impl Run {
             };
             let state = input_state(&path, &excluded, &file_hasher, &mut budget, 0)?;
             fold(&mut hasher, "state", state.as_bytes());
+        }
+        // It changes the archives the script writes, so it is keyed where it
+        // is set. Other hosts keep their existing keys.
+        if cfg!(target_os = "macos")
+            && let Some(value) = zero_ar_date(inherited_zero_ar_date, true)
+        {
+            fold(&mut hasher, "zero_ar_date", value.as_encoded_bytes());
         }
         if !prediction.portable_out_dir {
             fold(
@@ -1511,6 +1553,25 @@ mod tests {
     }
 
     #[test]
+    fn zero_ar_date_defaults_on_apple_hosts_and_keeps_user_values() {
+        assert_eq!(zero_ar_date(None, true), Some("1".into()));
+        assert_eq!(zero_ar_date(None, false), None);
+        assert_eq!(zero_ar_date(Some("0".into()), true), Some("0".into()));
+        assert_eq!(zero_ar_date(Some("0".into()), false), Some("0".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_command_zeroes_archive_dates_on_macos() {
+        let command = real_command(Path::new("/bin/true"), &[]);
+        let value = command
+            .get_envs()
+            .find(|(name, _)| *name == ZERO_AR_DATE_ENV)
+            .and_then(|(_, value)| value);
+        assert!(value.is_some(), "build scripts must run with ZERO_AR_DATE");
+    }
+
+    #[test]
     fn cargo_environment_lists_fixed_and_prefixed_variables_with_normalized_values() {
         let _lock = crate::test_support::process_state_test_lock();
         let env = environment(Path::new("/t/debug/build/pkg-1/out"), Path::new("/src/pkg"));
@@ -2106,6 +2167,54 @@ mod tests {
             stripped, complete,
             "a DEP_ key that is not a shell identifier is part of the action key"
         );
+    }
+
+    /// The action keys of one run for each inherited `ZERO_AR_DATE`.
+    fn zero_ar_date_keys<const N: usize>(values: [Option<&str>; N]) -> [String; N] {
+        // The key still reads Cargo's variables, which other tests edit
+        // under this lock.
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let run = Run {
+            store: Store::open(&config).unwrap(),
+            config: config.clone(),
+            binary_hash: "aaaa".to_string(),
+            environment: environment(&dir.path().join("out"), &dir.path().join("pkg")),
+            start: std::time::Instant::now(),
+        };
+        let prediction = Prediction {
+            version: PREDICTION_SCHEMA,
+            inputs: Vec::new(),
+            env: Vec::new(),
+            default_package: false,
+            portable_out_dir: true,
+        };
+        values.map(|value| {
+            run.action_key_with(&prediction, value.map(Into::into))
+                .unwrap()
+        })
+    }
+
+    /// Apple `ar` stamps member dates unless `ZERO_AR_DATE` is set, so on
+    /// macOS the value a script runs with keys its run. Unset runs as `1`,
+    /// and a run under a user's `0` is not restored for the default.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zero_ar_date_keys_build_script_runs_on_macos() {
+        let [unset, one, zero] = zero_ar_date_keys([None, Some("1"), Some("0")]);
+        assert_eq!(unset, one, "an unset ZERO_AR_DATE runs as 1");
+        assert_ne!(unset, zero, "a different ZERO_AR_DATE is a different run");
+    }
+
+    /// Elsewhere the variable changes nothing a script writes, so it leaves
+    /// the keys as they were.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn zero_ar_date_leaves_build_script_keys_alone_off_macos() {
+        let [unset, one, zero] = zero_ar_date_keys([None, Some("1"), Some("0")]);
+        assert_eq!(unset, one);
+        assert_eq!(unset, zero);
     }
 
     #[test]

@@ -45,7 +45,7 @@ export PATH="/usr/lib/kache:$PATH"
 
 Nix packages include the same symlinks in `${kache}/shims`, also available at `${kache}/lib/kache`. Add that directory to `PATH` using the [Nix configuration example](/docs/getting-started/installation#nix); no `kache install-shims` step is needed.
 
-`kache install-shims` creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++`. Keep the real compilers later in `PATH`; Kache skips any entry that resolves back to itself.
+`kache install-shims` creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++`. Keep the real compilers later in `PATH`. When Kache looks for the real compiler it skips any entry that resolves to itself or to a binary named `kache`, and every entry in a directory that holds a `.kache-shims` file. The packages write that file, and `kache install-shims` does when the directory holds only Kache links, so two Kache installs on one `PATH` do not run each other. Keep the shim directory for shims only.
 
 Versioned and target-prefixed names (`gcc-13`, `x86_64-pc-linux-gnu-gcc`) work if you create them by hand or scan `PATH`:
 
@@ -84,7 +84,7 @@ For clang-cl driver mode:
 $env:CC = "kache clang-cl"
 ```
 
-Windows has no `install-shims` generator yet. Use `CC`/`CXX`, or copy `kache.exe` to `gcc.exe` and put that directory first on `PATH`.
+Windows has no `install-shims` generator yet. Use `CC`/`CXX`, or copy `kache.exe` to `gcc.exe` and put that directory first on `PATH`. Create an empty `.kache-shims` file in that directory as well, so another Kache install does not mistake the copies for compilers.
 
 ## Cached invocations
 

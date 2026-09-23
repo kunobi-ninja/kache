@@ -12,6 +12,8 @@ remove|deconfigure)
         rm -f "$path"
       fi
     done
+    # install-shims writes this marker next to the links.
+    rm -f /usr/lib/kache/.kache-shims
     rmdir /usr/lib/kache 2>/dev/null || true
   fi
   ;;

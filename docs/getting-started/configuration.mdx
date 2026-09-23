@@ -80,9 +80,40 @@ input_predictions = true
 | `KACHE_DISABLED` | none | `false` | Pass all compiler work through when set to `1` or `true` |
 | `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Ignore all remote and planner configuration while keeping local caching |
 | `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes. Untrusted CI (pull requests, tags, unprotected branches) also forces this on; `=0` does not turn that off. |
-| `KACHE_SCHEDULER` | `cache.scheduler` | `true` | Pace real compiler processes across concurrent builds after a miss. Hits and passthroughs never wait. `0` or `false` turns it off. |
+| `KACHE_SCHEDULER` | `cache.scheduler` | `true` | Pace real compiler processes across concurrent builds after a miss. Hits and passthroughs never wait. `0` or `false` turns it off. With the [test runner](#test-runner), it paces test binaries too. |
 
 On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CACHE_HOME/kache` or `~/.cache/kache`; on Windows it is under `%LOCALAPPDATA%`.
+
+## Test runner
+
+Several `cargo test` runs on one machine each start a test thread per CPU. `kache test-runner` makes test binaries wait for slots in the scheduler's pool instead, the same pool compiles use. It is off until you set it as Cargo's target runner in the project's `.cargo/config.toml`:
+
+```toml title=".cargo/config.toml"
+[target.'cfg(all())']
+runner = ["kache", "test-runner"]
+```
+
+For a single run, pass the same setting to Cargo:
+
+```bash
+cargo test --config "target.'cfg(all())'.runner = ['kache', 'test-runner']"
+```
+
+`CARGO_TARGET_<TRIPLE>_RUNNER="kache test-runner"` works too, for example `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`. Cargo rejects two `cfg` runners that both match a target, so if the project already sets one, replace it rather than adding a second.
+
+What a scheduled test binary does:
+
+- It takes slots from the top of the pool. A quarter of the pool, at least one slot, is kept for compiles, so tests never lock a build out.
+- With no thread count set, it takes every free test slot, at least one, and runs with `RUST_TEST_THREADS` set to the number it holds. The reserve stays free even when nothing else runs, so a lone `cargo test` gets fewer threads than without the runner: 12 on 16 CPUs, 3 on 4, 1 on 2. With `--test-threads` or `RUST_TEST_THREADS`, it takes that many slots and the setting is left alone. Under nextest's process-per-test mode, each test takes one slot.
+- On Unix, Kache records the binary's peak memory. A binary that used more than 512 MiB takes at least one slot per 512 MiB on its next run. Under nextest's process-per-test mode it records each test's peak instead, so a heavy test does not raise the others.
+- It waits up to 30 minutes for slots, then runs without them. Under nextest the wait is 2 minutes, because nextest counts it toward the test's timeouts.
+- Builds and test binaries started inside a test count against that test's slots and wait for none of their own. A nested `cargo build` can therefore run more compiles at once than its test holds slots.
+- While tests hold slots, a compile that has waited asks for no more than the slots the tests leave, and never less than the reserve, so a test waiting on a build does not block it.
+- Exit codes, signals, stdin and Ctrl-C behave as if the binary ran directly. The runner writes nothing to stdout.
+
+These run unchanged, without waiting: binaries Cargo does not name with a hash (`cargo run`, doctests), test listing (`--list`, which nextest uses), benchmarks (`--bench`), and every run when `KACHE_SCHEDULER=0` or `[cache] scheduler = false`.
+
+A nested build finds its test's slots through `KACHE_TEST_LEASE`. A build that runs with a cleared environment cannot see it, so it waits for slots of its own, up to the same limit.
 
 ## GC and shared build outputs
 
@@ -116,7 +147,7 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 
 ### Daemon index maintenance
 
-The daemon looks after `index.db` on its own. It checks 60 seconds after it starts, every 5 minutes after that, and once at shutdown. Each check runs two steps in order: it heals the blob index, then compacts the file. Both steps hold the index write lock while they work, so both wait for a quiet machine: no compile holds a scheduler permit and the daemon has received no build request for 60 seconds. Stats polling and an open `kache monitor` do not count as build requests. Neither step overlaps a GC sweep.
+The daemon looks after `index.db` on its own. It checks 60 seconds after it starts, every 5 minutes after that, and once at shutdown. Each check runs two steps in order: it heals the blob index, then compacts the file. Both steps hold the index write lock while they work, so both wait for a quiet machine: no compile, and no test binary run through the [test runner](#test-runner), holds a scheduler slot, and the daemon has received no build request for 60 seconds. Stats polling and an open `kache monitor` do not count as build requests. Neither step overlaps a GC sweep.
 
 Set `cache.index_auto_compact = false` or `KACHE_INDEX_AUTO_COMPACT=0` to turn both steps off. `kache doctor --repair` does the same work on demand either way.
 

@@ -541,6 +541,16 @@ fn run_auto_gc_check(
     spawn_worker(config);
 }
 
+/// The `kache gc` worker command. `exe` is `current_exe`, which under a
+/// compiler shim can be the shim, so this goes through
+/// [`crate::platform::self_command`] to run as `kache gc` rather than `cc gc`.
+fn auto_gc_worker_command(exe: &Path) -> std::process::Command {
+    let mut cmd = crate::platform::self_command(exe, "gc");
+    cmd.env("KACHE_AUTO_GC_WORKER", "1")
+        .stdin(std::process::Stdio::null());
+    cmd
+}
+
 /// Spawn a fully detached `kache gc`. Never waits on the child; stdio is null
 /// so it cannot pollute the compiler's output streams.
 fn spawn_auto_gc_worker(config: &Config) {
@@ -556,10 +566,7 @@ fn spawn_auto_gc_worker(config: &Config) {
         .append(true)
         .open(config.cache_dir.join("auto-gc.log"));
 
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("gc")
-        .env("KACHE_AUTO_GC_WORKER", "1")
-        .stdin(std::process::Stdio::null());
+    let mut cmd = auto_gc_worker_command(&exe);
 
     match log_file {
         Ok(f) => {
@@ -844,7 +851,14 @@ fn admit_scheduler_miss(
     }
     let identity = identity.with_key(cache_key);
     loop {
-        match scheduler::begin_miss(&config.cache_dir, true, &identity, crate_name, is_link) {
+        match scheduler::begin_miss(
+            &config.cache_dir,
+            true,
+            &identity,
+            crate_name,
+            is_link,
+            config.test_lease.as_deref(),
+        ) {
             scheduler::BeginMiss::Recheck => {
                 if let Some(meta) = take_recheck_hit(store, cache_key, &entry_ok) {
                     return (MissGuard::empty(), Some(meta));
@@ -7504,6 +7518,36 @@ mod tests {
     fn recorded_gc_runs(cfg: &Config) -> usize {
         std::fs::read_to_string(crate::report::gc_runs_log_path(&cfg.cache_dir))
             .map_or(0, |log| log.lines().count())
+    }
+
+    /// Under a compiler shim `current_exe` can be the shim. The worker must
+    /// still run as `kache gc`: before the fix it ran as `cc gc`, the real
+    /// compiler failed on it, and automatic GC never ran.
+    #[test]
+    fn auto_gc_worker_runs_gc_even_from_a_shim_path() {
+        let exe = Path::new("/x/shims/cc");
+        let cmd = auto_gc_worker_command(exe);
+        assert_eq!(cmd.get_program(), exe.as_os_str());
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, ["gc"]);
+        let env = |name: &str| {
+            cmd.get_envs()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value)
+        };
+        assert_eq!(env("KACHE_AUTO_GC_WORKER"), Some(std::ffi::OsStr::new("1")));
+        let argv = ["/x/shims/cc".to_string(), "gc".to_string()];
+        assert!(
+            crate::platform::is_self_spawn(&argv, env(crate::platform::SELF_SPAWN_ENV)),
+            "the child must route to the CLI despite its shim-named argv[0]"
+        );
+        // argv[0] has no getter. The worker must be `self_command` plus its
+        // own variable, and platform's tests check that command's argv[0]
+        // with a real child. Comparing the two Debug strings does not depend
+        // on how std formats them.
+        let mut expected = crate::platform::self_command(exe, "gc");
+        expected.env("KACHE_AUTO_GC_WORKER", "1");
+        assert_eq!(format!("{cmd:?}"), format!("{expected:?}"));
     }
 
     #[test]
@@ -14481,7 +14525,7 @@ exit 0
         let crate_name = std::env::var("KACHE_TEST_FLIGHT_CRATE").expect("fixture crate name");
         let key = std::env::var("KACHE_TEST_FLIGHT_KEY").expect("fixture cache key");
         let identity = FlightIdentity::rustc(&crate_name, &["lib".into()], false).with_key(&key);
-        let guard = match scheduler::begin_miss(&root, true, &identity, &crate_name, false) {
+        let guard = match scheduler::begin_miss(&root, true, &identity, &crate_name, false, None) {
             scheduler::BeginMiss::Compile(guard) => guard,
             scheduler::BeginMiss::Recheck => panic!("fixture must own the flight"),
         };

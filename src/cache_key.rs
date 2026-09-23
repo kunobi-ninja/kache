@@ -1986,10 +1986,11 @@ pub fn compute_cache_key(
     // place — same `-l` name, same `-L` path, different bytes. rustc bundles a
     // `static=` archive INTO the produced rlib/binary, so its bytes are part of
     // the output: an unchanged key there is a stale-artifact false hit (#421).
-    // Resolve each `static=` lib against the kept build-script search dirs and
-    // fold its content hash. Phase 1 is deliberately narrow — only `static=`
-    // (the bundled, output-affecting case) and only build-script `native=`/bare
-    // dirs (the OUT_DIR false-hit trigger). `dylib=` is normally referenced
+    // Resolve each `static` lib, with or without modifiers, against the kept
+    // build-script search dirs and fold its content hash. Only the `static`
+    // kind (the bundled, output-affecting case) and only build-script
+    // `native=`/bare dirs (the OUT_DIR false-hit trigger) are resolved; a
+    // `:RENAME` or unknown modifier is uncacheable. `dylib=` is normally referenced
     // rather than bundled and is left name-only here. Direct command-line
     // native Windows MSVC libraries are handled separately below: their
     // import-library bytes affect the executable and are hashed as part of the
@@ -2503,9 +2504,10 @@ fn lexically_resolve_path(input: &str) -> String {
     }
 }
 
-/// Resolve a `-l` spec to a plain `static=` archive in one of the build-script
+/// Resolve a `-l` spec to a `static` archive in one of the build-script
 /// search dirs and return `(path, content_hash)`, or `None` when it is not a
-/// clean `static=NAME` or no candidate is found. Ambiguous/read/identity
+/// `static` kind or no candidate is found. A `static` spec whose file cannot
+/// be modelled (`:RENAME`, unknown modifier) is an error. Ambiguous/read/identity
 /// failures return an error so the invocation passes through uncached.
 /// Used to fold a native static lib's content into the cache key so an in-place
 /// rebuild of `lib<name>.a` (same name, same path, changed bytes) no longer
@@ -2517,8 +2519,13 @@ fn resolve_native_static_lib(
     file_hasher: &FileHasher<'_>,
     usage: StaticLibUse,
 ) -> Result<Option<(PathBuf, String)>> {
-    let Some(name) = clean_static_lib_name(spec) else {
-        return Ok(None);
+    let file_names = match static_lib_spec(spec) {
+        StaticLibSpec::NotStatic => return Ok(None),
+        StaticLibSpec::Archive(file_names) => file_names,
+        // The archive is bundled or linked, but we cannot tell which file.
+        StaticLibSpec::Unmodeled(spec) => {
+            anyhow::bail!("native static library spec {spec:?} is not cacheable")
+        }
     };
     // Probe the common platform conventions by existence (host-agnostic; the
     // file only exists where the build produced it). Build scripts can emit the
@@ -2529,14 +2536,14 @@ fn resolve_native_static_lib(
     // fail the cache key rather than risk hashing the wrong file.
     let mut found: Option<PathBuf> = None;
     for dir in search_dirs {
-        for filename in [format!("lib{name}.a"), format!("{name}.lib")] {
-            let candidate = dir.join(&filename);
+        for filename in &file_names {
+            let candidate = dir.join(filename);
             if candidate.is_file() {
                 if found.as_ref().is_some_and(|path| path == &candidate) {
                     continue;
                 }
                 if found.is_some() {
-                    anyhow::bail!("ambiguous native static library {name:?}");
+                    anyhow::bail!("ambiguous native static library {spec:?}");
                 }
                 found = Some(candidate);
             }
@@ -2668,24 +2675,48 @@ fn ascii_prefix_eq_ignore_case(value: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
-/// `Some(name)` only for a plain `static=NAME` with no kind modifiers and no
-/// `:RENAME`. Anything fancier is returned as `None` so the caller falls back to
-/// name-only rather than mis-resolve or over-key:
-/// - `static:+verbatim=` / `static:-bundle=` etc. — modifiers change whether the
-///   archive is bundled into the output and how the name maps to a file;
-/// - `static=foo:bar` — a `:RENAME` form whose linked file is not simply `foo`;
-/// - `dylib=` / bare `-l name` — referenced, not bundled, so content must not
-///   key the consumer.
-fn clean_static_lib_name(spec: &str) -> Option<&str> {
-    let (kind, name) = spec.split_once('=')?;
-    // Exactly `static`: a modifier suffix (`static:+bundle`) makes `kind != "static"`.
+/// How a `-l` spec maps to an archive the cache key must hash.
+#[derive(Debug, PartialEq, Eq)]
+enum StaticLibSpec<'a> {
+    /// Not a `static` kind (`dylib=`, `framework=`, bare `-l name`): referenced
+    /// rather than bundled, so the name alone keys it.
+    NotStatic,
+    /// A `static` archive rustc looks up under these file names in the `-L`
+    /// dirs. `+whole-archive`, `+bundle` and `+as-needed` change how the
+    /// archive is linked, not which file it is; the raw spec already keys them.
+    Archive(Vec<String>),
+    /// A `:RENAME` or an unknown modifier. Which file rustc reads is not
+    /// modelled, so the invocation must not be cached on the name alone.
+    Unmodeled(&'a str),
+}
+
+/// Classify a `-l` spec (`[KIND[:MODIFIERS]=]NAME[:RENAME]`).
+fn static_lib_spec(spec: &str) -> StaticLibSpec<'_> {
+    let Some((kind, name)) = spec.split_once('=') else {
+        return StaticLibSpec::NotStatic;
+    };
+    let (kind, modifiers) = kind.split_once(':').unwrap_or((kind, ""));
     if kind != "static" {
-        return None;
+        return StaticLibSpec::NotStatic;
     }
     if name.is_empty() || name.contains(':') {
-        return None;
+        return StaticLibSpec::Unmodeled(spec);
     }
-    Some(name)
+    let mut verbatim = false;
+    for modifier in modifiers.split(',').filter(|m| !m.is_empty()) {
+        match modifier {
+            "+verbatim" => verbatim = true,
+            "-verbatim" => verbatim = false,
+            "+bundle" | "-bundle" | "+whole-archive" | "-whole-archive" | "+as-needed"
+            | "-as-needed" => {}
+            _ => return StaticLibSpec::Unmodeled(spec),
+        }
+    }
+    if verbatim {
+        StaticLibSpec::Archive(vec![name.to_string()])
+    } else {
+        StaticLibSpec::Archive(vec![format!("lib{name}.a"), format!("{name}.lib")])
+    }
 }
 
 /// The normalized key value for a path-only env dep: the `<OUT_DIR:unit>`
@@ -9213,16 +9244,39 @@ mod tests {
     }
 
     #[test]
-    fn clean_static_lib_name_accepts_only_plain_static() {
-        assert_eq!(clean_static_lib_name("static=foo"), Some("foo"));
-        // Modifiers, a :RENAME, other kinds, and bare names are all rejected so
-        // the caller falls back to name-only rather than mis-resolve / over-key.
-        assert_eq!(clean_static_lib_name("static:+verbatim=foo"), None);
-        assert_eq!(clean_static_lib_name("static:-bundle=foo"), None);
-        assert_eq!(clean_static_lib_name("static=foo:bar"), None);
-        assert_eq!(clean_static_lib_name("dylib=foo"), None);
-        assert_eq!(clean_static_lib_name("foo"), None);
-        assert_eq!(clean_static_lib_name("static="), None);
+    fn static_lib_spec_models_kind_modifiers_and_rename() {
+        let plain = || StaticLibSpec::Archive(vec!["libfoo.a".into(), "foo.lib".into()]);
+        assert_eq!(static_lib_spec("static=foo"), plain());
+        // Modifiers that change how the archive links, not which file it is.
+        assert_eq!(static_lib_spec("static:+whole-archive=foo"), plain());
+        assert_eq!(static_lib_spec("static:-bundle=foo"), plain());
+        assert_eq!(static_lib_spec("static:+bundle,-as-needed=foo"), plain());
+        // `+verbatim` names the file exactly; a later `-verbatim` undoes it.
+        assert_eq!(
+            static_lib_spec("static:+whole-archive,+verbatim=foo.a"),
+            StaticLibSpec::Archive(vec!["foo.a".into()])
+        );
+        assert_eq!(static_lib_spec("static:+verbatim,-verbatim=foo"), plain());
+        // Rename, unknown modifiers and an empty name are not modelled.
+        assert_eq!(
+            static_lib_spec("static=foo:bar"),
+            StaticLibSpec::Unmodeled("static=foo:bar")
+        );
+        assert_eq!(
+            static_lib_spec("static:+link-arg=foo"),
+            StaticLibSpec::Unmodeled("static:+link-arg=foo")
+        );
+        assert_eq!(
+            static_lib_spec("static="),
+            StaticLibSpec::Unmodeled("static=")
+        );
+        // Other kinds are referenced, not bundled.
+        assert_eq!(static_lib_spec("dylib=foo"), StaticLibSpec::NotStatic);
+        assert_eq!(
+            static_lib_spec("dylib:+verbatim=foo"),
+            StaticLibSpec::NotStatic
+        );
+        assert_eq!(static_lib_spec("foo"), StaticLibSpec::NotStatic);
     }
 
     #[test]
@@ -9255,8 +9309,8 @@ mod tests {
             .unwrap();
         assert_ne!(h1, h2, "content change must change the resolved hash");
 
-        // `dylib=`/bare are referenced not bundled → never content-hashed; a
-        // missing lib and a modifier/rename spec also do not resolve.
+        // `dylib=`/bare are referenced not bundled → never content-hashed, and
+        // a missing lib does not resolve.
         assert!(
             resolve_native_static_lib("dylib=foo", &dirs, &fh, StaticLibUse::Bundled)
                 .unwrap()
@@ -9264,11 +9318,6 @@ mod tests {
         );
         assert!(
             resolve_native_static_lib("foo", &dirs, &fh, StaticLibUse::Bundled)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            resolve_native_static_lib("static:+verbatim=foo", &dirs, &fh, StaticLibUse::Bundled)
                 .unwrap()
                 .is_none()
         );
@@ -9299,6 +9348,38 @@ mod tests {
         assert!(
             resolve_native_static_lib("static=foo", &dirs, &fh, StaticLibUse::Bundled).is_err(),
             "ambiguous .a/.lib match must fail closed"
+        );
+    }
+
+    #[test]
+    fn resolve_native_static_lib_hashes_archives_named_with_modifiers() {
+        let fh = FileHasher::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = vec![dir.path().to_path_buf()];
+        let lib = dir.path().join("libfoo.a");
+        std::fs::write(&lib, b"v1 archive bytes").unwrap();
+
+        // `cargo:rustc-link-lib=static:+whole-archive=foo` bundles libfoo.a
+        // just like `static=foo`, so a rebuilt archive must change the hash.
+        let hash_of = |spec| {
+            resolve_native_static_lib(spec, &dirs, &fh, StaticLibUse::Bundled)
+                .unwrap()
+                .expect("modifier spec must resolve its archive")
+        };
+        let (path, h1) = hash_of("static:+whole-archive=foo");
+        assert_eq!(path, lib);
+        std::fs::write(&lib, b"v2 different bytes").unwrap();
+        let (_, h2) = hash_of("static:+whole-archive=foo");
+        assert_ne!(h1, h2, "rebuilt whole-archive lib must change the hash");
+
+        // `+verbatim` resolves the exact file name and nothing else.
+        std::fs::write(dir.path().join("foo.a"), b"verbatim bytes").unwrap();
+        let (verbatim, _) = hash_of("static:+verbatim=foo.a");
+        assert_eq!(verbatim, dir.path().join("foo.a"));
+
+        // A rename is refused rather than keyed by its name.
+        assert!(
+            resolve_native_static_lib("static=foo:bar", &dirs, &fh, StaticLibUse::Bundled).is_err()
         );
     }
 
@@ -9944,6 +10025,102 @@ mod tests {
             k1, k2,
             "a static lib under `-L all=` must be content-keyed too (#421)"
         );
+    }
+
+    /// Argv for an rlib, where a build-script archive does its damage: rustc
+    /// copies the archive into the rlib and every later link reads that copy.
+    fn rlib_base(source: &Path, extra: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = ["rustc", "--crate-name", "mylib", "--crate-type", "lib"]
+            .map(String::from)
+            .into();
+        args.push(source.to_string_lossy().into_owned());
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    }
+
+    /// A build script can name its archive with link modifiers:
+    /// `static:+whole-archive=foo` still reads `libfoo.a`, and
+    /// `static:+verbatim=foo.a` reads `foo.a`. Either is bundled like a plain
+    /// `static=foo`, so rebuilding the archive in place must change the key.
+    #[test]
+    fn native_static_lib_named_with_modifiers_is_content_keyed() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let libdir = dir.path().join("out");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let search = format!("native={}", libdir.display());
+
+        for (spec, file) in [
+            ("static:+whole-archive=foo", "libfoo.a"),
+            ("static:+verbatim=foo.a", "foo.a"),
+        ] {
+            let lib = libdir.join(file);
+            let flags = ["-L", search.as_str(), "-l", spec];
+            std::fs::write(&lib, b"v1 archive bytes").unwrap();
+            let k1 = key_of(&rlib_base(&source, &flags));
+            std::fs::write(&lib, b"v2 archive bytes - DIFFERENT").unwrap();
+            let k2 = key_of(&rlib_base(&source, &flags));
+            assert_ne!(k1, k2, "{spec}: a rebuilt archive must change the key");
+            std::fs::write(&lib, b"v1 archive bytes").unwrap();
+            let k3 = key_of(&rlib_base(&source, &flags));
+            assert_eq!(k1, k3, "{spec}: identical bytes must reproduce the key");
+            std::fs::remove_file(&lib).unwrap();
+        }
+    }
+
+    /// `static=foo:bar` makes rustc link `bar` wherever a `#[link]` attribute
+    /// names `foo`. Which archive that reads is not modelled, and keying it by
+    /// name could restore an rlib bundling an older archive, so the key fails.
+    #[test]
+    fn renamed_native_static_lib_is_not_cacheable() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let libdir = dir.path().join("out");
+        std::fs::create_dir_all(&libdir).unwrap();
+        std::fs::write(libdir.join("libfoo.a"), b"archive bytes").unwrap();
+        std::fs::write(libdir.join("libbar.a"), b"archive bytes").unwrap();
+        let search = format!("native={}", libdir.display());
+        let flags = ["-L", search.as_str(), "-l", "static=foo:bar"];
+
+        let parsed = RustcArgs::parse(&rlib_base(&source, &flags)).unwrap();
+        let error =
+            compute_cache_key(&parsed, &FileHasher::new(), &PathNormalizer::empty()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("is not cacheable"),
+            "a renamed static lib must fail the key: {error:#}"
+        );
+    }
+
+    /// A `dylib` lib is referenced, not copied into the rlib, so its bytes
+    /// stay out of the key while `static` specs with modifiers are hashed.
+    /// `+verbatim` names the file itself, so a `dylib` wrongly taken for a
+    /// `static` would be found and hashed.
+    #[test]
+    fn native_dylib_stays_name_only_for_an_rlib() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, b"pub fn hello() {}").unwrap();
+        let libdir = dir.path().join("out");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let lib = libdir.join("libfoo.so");
+        let search = format!("native={}", libdir.display());
+
+        for spec in ["dylib=foo", "dylib:+verbatim=libfoo.so"] {
+            let flags = ["-L", search.as_str(), "-l", spec];
+            std::fs::write(&lib, b"so v1").unwrap();
+            let k1 = key_of(&rlib_base(&source, &flags));
+            std::fs::write(&lib, b"so v2 changed").unwrap();
+            let k2 = key_of(&rlib_base(&source, &flags));
+            assert_eq!(
+                k1, k2,
+                "{spec}: a dynamic lib's content must not key the rlib"
+            );
+        }
     }
 
     /// Rustc's `-O` / `-g` shorthands must share keys with their exact `-C`

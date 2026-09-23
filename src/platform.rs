@@ -277,6 +277,39 @@ pub fn configure_process_group(cmd: &mut std::process::Command) {
     }
 }
 
+/// Set on a kache process that kache started for one of its own
+/// subcommands. The value is that subcommand.
+pub const SELF_SPAWN_ENV: &str = "KACHE_SELF_SPAWN";
+
+/// A command that runs the kache binary at `exe` as `kache <subcommand>`.
+///
+/// Under a compiler-name shim `exe` can be the shim itself: macOS reports
+/// the symlink it was started through (`.../shims/cc`), and a Windows shim
+/// is a copy named `gcc.exe`. main routes on argv[0] before it parses a
+/// subcommand, so the child would run as the compiler. On Unix argv[0] is
+/// set to `kache`. Windows cannot set it, so [`SELF_SPAWN_ENV`] tells main
+/// which subcommand to expect there, and on Unix as a second guard.
+pub fn self_command(exe: &std::path::Path, subcommand: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.arg0("kache");
+    }
+    cmd.arg(subcommand).env(SELF_SPAWN_ENV, subcommand);
+    cmd
+}
+
+/// Whether this process is a [`self_command`] child: [`SELF_SPAWN_ENV`] is
+/// set and names the subcommand in argv[1]. Both are required, so a leaked
+/// variable cannot turn a compile into a CLI call.
+pub fn is_self_spawn(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> bool {
+    match (argv.get(1), self_spawn) {
+        (Some(subcommand), Some(expected)) => std::ffi::OsStr::new(subcommand) == expected,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Is a usable `ps` on PATH? Tests that assert on the parent-chain walk
@@ -307,6 +340,78 @@ mod tests {
     fn current_process_is_alive() {
         // The test process itself is, by definition, running.
         assert!(super::is_process_alive(std::process::id()));
+    }
+
+    /// The program stays the path kache was started through; only argv
+    /// changes, so the child is the same binary under the name `kache`.
+    #[test]
+    fn self_command_names_the_subcommand_in_argv_and_the_environment() {
+        let exe = std::path::Path::new("/x/shims/cc");
+        let cmd = super::self_command(exe, "gc");
+        assert_eq!(cmd.get_program(), exe.as_os_str());
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["gc"]);
+        let marker = cmd
+            .get_envs()
+            .find(|(name, _)| *name == super::SELF_SPAWN_ENV)
+            .and_then(|(_, value)| value);
+        assert_eq!(marker, Some(std::ffi::OsStr::new("gc")));
+    }
+
+    /// Prints this process's argv[0] when run as a child of
+    /// [`self_command_runs_as_kache_on_unix`].
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child fixture for self_command_runs_as_kache_on_unix"]
+    fn print_argv0_fixture() {
+        if std::env::var_os("KACHE_TEST_PRINT_ARGV0").is_some() {
+            println!("argv0={}", std::env::args().next().unwrap_or_default());
+        }
+    }
+
+    /// std has no getter for argv[0], so a real child reports it. The child
+    /// is this test binary: a shell can be a multi-call binary (busybox in
+    /// the Nix build) that picks its applet from argv[0].
+    #[cfg(unix)]
+    #[test]
+    fn self_command_runs_as_kache_on_unix() {
+        let exe = std::env::current_exe().unwrap();
+        let output = super::self_command(&exe, "--exact")
+            .args([
+                "platform::tests::print_argv0_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_PRINT_ARGV0", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.lines().any(|line| line == "argv0=kache"),
+            "argv[0] must be kache, not the path the program was started from: {stdout}"
+        );
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn self_spawn_needs_the_marker_to_name_argv1() {
+        use std::ffi::OsStr;
+        let gc = Some(OsStr::new("gc"));
+        assert!(super::is_self_spawn(&argv(&["/x/shims/cc", "gc"]), gc));
+        assert!(super::is_self_spawn(
+            &argv(&["gcc.exe", "daemon", "run"]),
+            Some(OsStr::new("daemon"))
+        ));
+        // A user compile under a leaked marker stays a compile.
+        assert!(!super::is_self_spawn(&argv(&["cc", "foo.c"]), gc));
+        // The subcommand without the marker is a compile of a file named gc.
+        assert!(!super::is_self_spawn(&argv(&["cc", "gc"]), None));
+        assert!(!super::is_self_spawn(&argv(&["cc"]), gc));
+        assert!(!super::is_self_spawn(&[], gc));
     }
 
     #[cfg(unix)]

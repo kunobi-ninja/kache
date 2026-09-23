@@ -26,6 +26,7 @@ Run `kache <command> --help` for the exact syntax in your installed version.
 | `report` | Produce text, Markdown, JSON, or trace output |
 | `config` | Open the configuration editor |
 | `install-shims` | Create Unix compiler-name symlinks |
+| `test-runner` | Run a test binary as Cargo's target runner, paced by the scheduler |
 | `completions` | Generate shell completion scripts |
 
 ## `kache cargo`
@@ -382,7 +383,16 @@ kache install-shims --from-path
 kache install-shims --force ~/.local/lib/kache/shims
 ```
 
-Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. See [C and C++](/docs/getting-started/c-cpp).
+Unix only. Creates `cc`, `c++`, `gcc`, `g++`, `clang`, and `clang++` symlinks to Kache. With no directory argument the farm is `~/.local/lib/kache/shims`. `--from-path` also wraps compiler names already on `PATH` (`gcc-13`, target-prefixed drivers). Put the directory before the real compilers in `PATH`. When the directory then holds only Kache links, the run also writes a `.kache-shims` marker, and Kache skips everything in a marked directory when it looks for the real compiler. A directory that also holds other files, such as a real compiler, is left unmarked. See [C and C++](/docs/getting-started/c-cpp).
+
+## `kache test-runner`
+
+```toml title=".cargo/config.toml"
+[target.'cfg(all())']
+runner = ["kache", "test-runner"]
+```
+
+Cargo runs each test binary as `kache test-runner <binary> <args>`. The binary waits for slots in the scheduler's pool, then runs with its arguments, stdin, exit code and signals unchanged. Cargo is the caller, so the command is not listed in `kache --help`. See [Test runner](/docs/getting-started/configuration#test-runner).
 
 ## `kache completions`
 

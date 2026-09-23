@@ -64,6 +64,7 @@ mod since;
 use kache_store::sharing;
 mod compiler_store;
 use compiler_store as store;
+mod test_runner;
 #[cfg(test)]
 mod test_support;
 mod timeline;
@@ -612,10 +613,60 @@ fn init_logging(mode: LogMode) {
         .init();
 }
 
+/// How main reads argv, decided before any of it is parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryRoute {
+    /// kache started itself for a subcommand: parse the CLI whatever
+    /// argv[0] is. A self-spawn under a shim keeps the shim's name there.
+    SelfSpawn,
+    /// argv[0] names a compiler: kache runs behind a compiler-name shim.
+    Shim,
+    /// kache under its own name: argv[1..] picks wrapper or CLI mode.
+    Argv,
+}
+
+/// Route a process from argv and the [`platform::SELF_SPAWN_ENV`] value.
+fn entry_route(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> EntryRoute {
+    if platform::is_self_spawn(argv, self_spawn) {
+        return EntryRoute::SelfSpawn;
+    }
+    if argv
+        .first()
+        .is_some_and(|arg0| compiler::shim::invoked_as_compiler(arg0))
+    {
+        return EntryRoute::Shim;
+    }
+    EntryRoute::Argv
+}
+
+/// The test binary and its arguments when kache runs as a Cargo target
+/// runner (`kache test-runner <binary> <args>`). Behind a compiler-name shim
+/// argv[1] is a compiler argument, so `cc test-runner` stays a compile.
+fn test_runner_args(raw_args: &[std::ffi::OsString]) -> Option<&[std::ffi::OsString]> {
+    match raw_args.get(1) {
+        Some(arg)
+            if arg == "test-runner"
+                && !raw_args.first().is_some_and(|arg0| {
+                    compiler::shim::invoked_as_compiler(&arg0.to_string_lossy())
+                }) =>
+        {
+            Some(&raw_args[2..])
+        }
+        _ => None,
+    }
+}
+
 fn main() -> Result<()> {
     // First, before argv or config: `startup_ms` on every build event is
     // measured from here.
     opcounts::mark_process_start();
+    // Cargo target runner. Checked before the probe and shim guards, which
+    // exit without running anything: a test must always run.
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(args) = test_runner_args(&raw_args) {
+        init_logging(LogMode::Wrapper);
+        std::process::exit(test_runner::run(args));
+    }
     if std::env::var_os("KACHE_FAMILY_PROBE_ACTIVE").is_some() {
         // Prevent unbounded recursion when a probed wrapper calls back into kache.
         return Ok(());
@@ -630,7 +681,6 @@ fn main() -> Result<()> {
     // Keep the original argv byte-preserving for `kache cargo`. Compiler
     // adapters still parse UTF-8 option syntax; a wrapper invocation with a
     // non-UTF-8 path is detected here and fails closed below.
-    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let env_args: Option<Vec<String>> = raw_args
         .iter()
         .cloned()
@@ -651,8 +701,19 @@ fn main() -> Result<()> {
     // symlink, so the compiler is our own argv[0] rather than argv[1]. Checked
     // BEFORE `detect_log_mode`, which only ever inspects argv[1..] and would
     // classify `gcc foo.c` as CLI mode and fail parsing `foo.c` as a
-    // subcommand.
-    let shim_args = compiler::shim::wrapper_args(detection_args);
+    // subcommand. A process kache started for its own subcommand can carry a
+    // shim's name in argv[0] too, so its marker is checked first.
+    let self_spawn = std::env::var_os(platform::SELF_SPAWN_ENV);
+    let shim_args = match entry_route(detection_args, self_spawn.as_deref()) {
+        EntryRoute::Shim => compiler::shim::wrapper_args(detection_args),
+        EntryRoute::SelfSpawn => {
+            // SAFETY: no thread has been spawned yet. Removing the marker
+            // keeps it out of every process this one starts.
+            unsafe { std::env::remove_var(platform::SELF_SPAWN_ENV) };
+            None
+        }
+        EntryRoute::Argv => None,
+    };
     if let Some(shim_args) = shim_args {
         init_logging(LogMode::Wrapper);
         let shim_args = shim_args.map_err(anyhow::Error::msg)?;
@@ -963,8 +1024,48 @@ fn main() -> Result<()> {
 /// Environment breadcrumb a kache wrapper sets before spawning any
 /// child compiler. A kache process that sees it already set is running
 /// *inside* another kache — see [`run_wrapper_mode`]'s re-entrancy
-/// guard.
+/// guard. The value counts the wrappers above the child: the outermost
+/// writes `1` and each nested wrapper one more.
 const KACHE_ACTIVE_ENV: &str = "KACHE_ACTIVE";
+
+/// How many kache wrappers may sit above this one before the chain is
+/// taken to be a loop. Real nesting stays at one or two, such as a
+/// compiler or a script it runs calling a shimmed `cc`.
+const MAX_WRAPPERS_ABOVE: u32 = 8;
+
+/// How many kache wrappers sit above this process, from the value of
+/// [`KACHE_ACTIVE_ENV`]. `None` when it is the outermost. A value that is
+/// not a number counts as one: older kache versions always wrote `1`.
+fn wrappers_above(active: Option<&std::ffi::OsStr>) -> Option<u32> {
+    let active = active?;
+    Some(active.to_str().and_then(|v| v.parse().ok()).unwrap_or(1))
+}
+
+/// The [`KACHE_ACTIVE_ENV`] value a nested wrapper hands to its compiler.
+fn next_wrapper_depth(above: u32) -> u32 {
+    above.saturating_add(1)
+}
+
+/// Stop a chain of nested wrappers that only a loop could produce.
+///
+/// Shim resolution skips every PATH entry it can identify as kache, so a
+/// loop that still gets here runs through shims it cannot identify: a farm
+/// of copies with no marker. Nothing left on PATH is known to be the real
+/// compiler, so skipping ahead could pick the wrong one. Failing names the
+/// cause, where the loop would otherwise start processes without end.
+fn check_wrapper_depth(above: u32, compiler: Option<&str>) -> Result<()> {
+    if above < MAX_WRAPPERS_ABOVE {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "kache is running inside {above} other kache wrappers to run `{}`, so two \
+         compiler shims are running each other in a loop. Another kache install's shim \
+         directory is on PATH and holds copies that kache cannot tell apart from a \
+         compiler. Remove that directory from PATH, or create an empty `.kache-shims` \
+         file in it so every kache skips it.",
+        compiler.unwrap_or("?")
+    )
+}
 
 /// Run the requested compiler directly, with no caching: `args[0]` is
 /// the compiler, `args[1..]` its arguments.
@@ -1190,7 +1291,14 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     // spawning any child, so a wrapper that already sees it set knows
     // it is nested. This runs before the `disabled` check below, so
     // the loop is broken even when caching is turned off.
-    if std::env::var_os(KACHE_ACTIVE_ENV).is_some() {
+    if let Some(above) = wrappers_above(std::env::var_os(KACHE_ACTIVE_ENV).as_deref()) {
+        // The compiler run here can itself be a kache shim that nothing
+        // identified. Counting the depth ends that loop at a fixed bound.
+        check_wrapper_depth(above, args.first().map(String::as_str))?;
+        // SAFETY: as below, no thread has been spawned yet.
+        unsafe {
+            std::env::set_var(KACHE_ACTIVE_ENV, next_wrapper_depth(above).to_string());
+        }
         let config = config::Config::load()?;
         // No preservation here: the outer kache already applied the
         // incremental policy, and `isolate_incremental_flags` is
@@ -1324,6 +1432,95 @@ mod tests {
             }
             result => result,
         }
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// The auto-GC worker started from a wrapper behind a shim, on macOS where
+    /// `current_exe` is the shim path. Before the fix it routed to shim mode
+    /// and handed `gc` to the real compiler.
+    #[test]
+    fn a_self_spawned_gc_under_a_shim_path_routes_to_the_cli() {
+        let gc = Some(std::ffi::OsStr::new("gc"));
+        let args = argv(&["/x/shims/cc", "gc"]);
+        assert_eq!(entry_route(&args, gc), EntryRoute::SelfSpawn);
+        assert_eq!(
+            detect_log_mode_with_rustc(&args, None),
+            LogMode::Cli,
+            "the rest of argv must then parse as the gc subcommand"
+        );
+        // A Windows shim is a copy, so argv[0] stays the compiler's name.
+        let daemon = Some(std::ffi::OsStr::new("daemon"));
+        let args = argv(&["C:/shims/gcc.exe", "daemon", "run"]);
+        assert_eq!(entry_route(&args, daemon), EntryRoute::SelfSpawn);
+        assert_eq!(detect_log_mode_with_rustc(&args, None), LogMode::Cli);
+    }
+
+    /// The marker alone is not enough: a compile run under a leaked marker
+    /// still goes to the compiler.
+    #[test]
+    fn a_compile_through_a_shim_stays_a_compile() {
+        let gc = Some(std::ffi::OsStr::new("gc"));
+        let compile = argv(&["/x/shims/cc", "-c", "foo.c"]);
+        assert_eq!(entry_route(&compile, gc), EntryRoute::Shim);
+        assert_eq!(entry_route(&compile, None), EntryRoute::Shim);
+        // Without the marker, `cc gc` compiles a file named gc.
+        assert_eq!(
+            entry_route(&argv(&["/x/shims/cc", "gc"]), None),
+            EntryRoute::Shim
+        );
+    }
+
+    #[test]
+    fn kache_under_its_own_name_routes_on_the_rest_of_argv() {
+        assert_eq!(entry_route(&argv(&["kache", "gc"]), None), EntryRoute::Argv);
+        assert_eq!(
+            entry_route(&argv(&["kache", "cc", "-c", "foo.c"]), None),
+            EntryRoute::Argv
+        );
+        assert_eq!(entry_route(&[], None), EntryRoute::Argv);
+        // The self-spawn marker wins over any argv[0].
+        assert_eq!(
+            entry_route(
+                &argv(&["kache", "daemon", "run"]),
+                Some(std::ffi::OsStr::new("daemon"))
+            ),
+            EntryRoute::SelfSpawn
+        );
+    }
+
+    #[test]
+    fn wrappers_above_reads_the_depth_and_treats_old_values_as_one() {
+        use std::ffi::OsStr;
+        assert_eq!(wrappers_above(None), None, "the outermost wrapper");
+        assert_eq!(wrappers_above(Some(OsStr::new("1"))), Some(1));
+        assert_eq!(wrappers_above(Some(OsStr::new("5"))), Some(5));
+        assert_eq!(wrappers_above(Some(OsStr::new(""))), Some(1));
+        assert_eq!(wrappers_above(Some(OsStr::new("yes"))), Some(1));
+    }
+
+    #[test]
+    fn a_nested_wrapper_hands_down_one_more_level() {
+        assert_eq!(next_wrapper_depth(1), 2);
+        assert_eq!(next_wrapper_depth(7), 8);
+        assert_eq!(next_wrapper_depth(u32::MAX), u32::MAX);
+    }
+
+    /// Pinned at the bound: one level short still runs, the bound itself
+    /// stops the chain with a message that says how to fix it.
+    #[test]
+    fn wrapper_depth_is_refused_at_the_bound() {
+        assert!(check_wrapper_depth(1, Some("cc")).is_ok());
+        assert!(check_wrapper_depth(MAX_WRAPPERS_ABOVE - 1, Some("cc")).is_ok());
+        let err = check_wrapper_depth(MAX_WRAPPERS_ABOVE, Some("/copies/cc"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/copies/cc"), "{err}");
+        assert!(err.contains("loop"), "{err}");
+        assert!(err.contains(".kache-shims"), "{err}");
+        assert!(check_wrapper_depth(MAX_WRAPPERS_ABOVE + 1, None).is_err());
     }
 
     #[test]
@@ -1675,6 +1872,36 @@ mod tests {
             "{argv}"
         );
         assert!(!argv.contains(&format!("-Cincremental={}\n", incremental.display())));
+    }
+
+    #[test]
+    fn test_runner_args_take_everything_after_the_subcommand() {
+        let os = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+        let argv = os(&[
+            "kache",
+            "test-runner",
+            "/t/probe-0123456789abcdef",
+            "--exact",
+        ]);
+        assert_eq!(
+            test_runner_args(&argv),
+            Some(&argv[2..]),
+            "the binary and its arguments"
+        );
+        let bare = os(&["kache", "test-runner"]);
+        assert_eq!(test_runner_args(&bare), Some(&bare[2..]));
+        assert_eq!(
+            test_runner_args(&os(&["kache", "rustc", "test-runner"])),
+            None
+        );
+        assert_eq!(test_runner_args(&os(&["kache"])), None);
+        // A compile through a shim whose first input is named `test-runner`.
+        assert_eq!(
+            test_runner_args(&os(&["/x/shims/cc", "test-runner", "-o", "app"])),
+            None
+        );
     }
 
     #[test]

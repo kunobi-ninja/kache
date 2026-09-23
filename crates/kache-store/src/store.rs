@@ -9797,6 +9797,8 @@ mod tests {
         import_test_entry(&store, "inside_key", 300);
         import_test_entry(&store, "outside_key", 300);
         set_idle_past_grace(&store);
+        // Six hours, as documented: the longest GitHub-hosted job.
+        assert_eq!(IMPORT_PIN.as_secs(), 21_600);
         let pin = IMPORT_PIN.as_secs() as i64;
         let age = |key: &str, secs: i64| {
             store

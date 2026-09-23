@@ -1785,19 +1785,24 @@ fn workspace_roots(
     args: &RustcArgs,
     vars: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Option<WorkspaceRoots> {
+    workspace_roots_in(args, vars, &std::env::current_dir().ok()?)
+}
+
+/// [`workspace_roots`] for rustc running in `current_dir`. The root is
+/// [`RustcArgs::verified_workspace_root`]: absolute, the parent of the target
+/// directory, and holding a manifest.
+fn workspace_roots_in(
+    args: &RustcArgs,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+    current_dir: &Path,
+) -> Option<WorkspaceRoots> {
     let manifest_dir = Path::new(env_var_in(vars, "CARGO_MANIFEST_DIR")?);
     if is_registry_package(manifest_dir) {
         return None;
     }
-    let current_dir = std::env::current_dir().ok()?;
-    let root = args.verified_workspace_root(&current_dir)?;
+    let root = args.verified_workspace_root(current_dir)?;
     let target = args.target_dir()?;
-    if !root.is_absolute()
-        || suffix_within(manifest_dir.as_os_str(), &root, 0).is_none()
-        || suffix_within(target.as_os_str(), &root, 0).is_none_or(|suffix| suffix.is_empty())
-    {
-        return None;
-    }
+    suffix_within(manifest_dir.as_os_str(), &root, 0)?;
     let canonical_root = std::fs::canonicalize(&root).ok()?;
     // The working directory may be spelled through either root: on macOS
     // `current_dir` reports `/private/var/...` for a root Cargo spells
@@ -5154,7 +5159,7 @@ fn workspace_portable_prediction(
         .source_files
         .iter()
         .map(|source| {
-            if source.is_relative() {
+            if !source.has_root() {
                 return workspace_relative_source(source, workspace);
             }
             let relocated = workspace_portable_value(source.as_os_str(), workspace)?;
@@ -10888,6 +10893,81 @@ mod tests {
         assert_eq!(same_tree_guard(None, true, true), None);
     }
 
+    /// A two-member-free workspace at `dir/<name>` with its target inside,
+    /// and the member invocation Cargo would run there.
+    fn workspace_invocation(dir: &Path, name: &str, crate_name: &str) -> (PathBuf, RustcArgs) {
+        let root = dir.join(name);
+        std::fs::create_dir_all(root.join("kt/src")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let deps = root.join("target/debug/deps").display().to_string();
+        let argv: Vec<String> = [
+            "rustc",
+            "--crate-name",
+            crate_name,
+            "--edition=2021",
+            "kt/src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--out-dir",
+            &deps,
+            "-L",
+            &format!("dependency={deps}"),
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        (root, RustcArgs::parse(&argv).unwrap())
+    }
+
+    fn manifest_vars(manifest_dir: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        vec![(
+            "CARGO_MANIFEST_DIR".into(),
+            manifest_dir.as_os_str().to_owned(),
+        )]
+    }
+
+    #[test]
+    fn only_a_package_inside_the_workspace_is_a_workspace_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, args) = workspace_invocation(dir.path(), "a", "kt");
+        let inside = workspace_roots_in(&args, &manifest_vars(&root.join("kt")), &root).unwrap();
+        assert_eq!(inside.cwd, "");
+        assert_eq!(inside.target, root.join("target"));
+        let member_cwd =
+            workspace_roots_in(&args, &manifest_vars(&root.join("kt")), &root.join("kt"));
+        assert_eq!(
+            member_cwd.map(|roots| roots.cwd),
+            Some(format!("{}kt", std::path::MAIN_SEPARATOR))
+        );
+        assert!(
+            workspace_roots_in(&args, &manifest_vars(&dir.path().join("elsewhere")), &root)
+                .is_none(),
+            "a package outside the workspace"
+        );
+        let registry = dir.path().join("home/registry/src/index-1/kt-1.0.0");
+        assert!(workspace_roots_in(&args, &manifest_vars(&registry), &root).is_none());
+        assert!(
+            workspace_roots_in(&args, &[], &root).is_none(),
+            "no package at all"
+        );
+    }
+
+    #[test]
+    fn a_workspace_identity_is_the_same_in_every_checkout_and_per_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = |name: &str, crate_name: &str| {
+            let (root, args) = workspace_invocation(dir.path(), name, crate_name);
+            let vars = manifest_vars(&root.join("kt"));
+            let roots = workspace_roots_in(&args, &vars, &root).unwrap();
+            workspace_prediction_identity(&args, vars, &roots).unwrap()
+        };
+        let a = identity("a", "kt");
+        assert!(a.starts_with(WORKSPACE_PREDICTION_PREFIX), "{a}");
+        assert_eq!(a, identity("b", "kt"), "another checkout of the same unit");
+        assert_ne!(a, identity("c", "other"), "another unit");
+    }
+
     #[test]
     fn a_workspace_value_is_relocated_refused_or_kept() {
         let roots = workspace_test_roots();
@@ -10933,6 +11013,11 @@ mod tests {
         );
         assert_eq!(source("../outside.txt", &roots), None);
         assert_eq!(source("kt//lib.rs", &roots), None);
+        assert_eq!(
+            source("kt\\..\\..\\outside.txt", &roots),
+            None,
+            "a Windows walk that leaves, which a `/` split alone would miss"
+        );
         roots.cwd = "/kt".to_string();
         assert_eq!(source("../assets/a.txt", &roots), kept("../assets/a.txt"));
         assert_eq!(source("../../outside.txt", &roots), None);

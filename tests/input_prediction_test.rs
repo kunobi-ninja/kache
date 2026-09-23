@@ -888,3 +888,16 @@ fn a_proc_macro_member_reading_outside_the_workspace_keeps_the_pre_pass() {
     assert_eq!(warm.result, "local_hit");
     assert_eq!(warm.dep_info_runs, 1);
 }
+
+/// A registry unit with a proc-macro dependency keeps its guarded row in its
+/// own target: the workspace rules leave registry units alone.
+#[test]
+fn a_registry_unit_with_a_macro_predicts_in_its_own_target() {
+    build_kache();
+    let unit = OutDirUnit::new(REGISTRY_PACKAGE, true);
+    let a = unit.target("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0);
+}

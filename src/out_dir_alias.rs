@@ -1947,7 +1947,8 @@ mod tests {
             assert!(build_output_allows_alias(&build));
             std::fs::write(build.join("output"), "cargo:KEY=V\n").unwrap();
             assert!(!build_output_allows_alias(&build));
-            let limit = usize::try_from(MAX_BUILD_OUTPUT_BYTES).unwrap();
+            // An independent literal, so a change to the constant fails here.
+            let limit: usize = 64 << 10;
             std::fs::write(build.join("output"), "x".repeat(limit)).unwrap();
             assert!(build_output_allows_alias(&build));
             std::fs::write(build.join("output"), "x".repeat(limit + 1)).unwrap();

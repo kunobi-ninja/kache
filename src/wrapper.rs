@@ -3464,7 +3464,7 @@ fn run_parsed_rustc(
             // The pre-pass expands macros, so a macro that cannot write fails
             // here first; its error carries rustc's own message.
             if exit != 0 {
-                crate::out_dir_alias::after_failed_compile(&reason);
+                crate::out_dir_alias::after_failed_compile(&reason, &args.externs);
             }
             return Ok(exit);
         }
@@ -3484,6 +3484,8 @@ fn run_parsed_rustc(
         // key from what rustc emitted. `_discovery_flight` stays held across
         // the recursion so peers wait for this compile.
         tracing::debug!("no closure record for {crate_name}; compiling before keying");
+        // Cargo starts pipelined consumers on the rmeta, before this key.
+        crate::out_dir_alias::register_before_compile();
         let compile_start = std::time::Instant::now();
         let result = match compiler.execute_streaming(args) {
             Ok(result) => result,
@@ -3506,7 +3508,7 @@ fn run_parsed_rustc(
             std::io::stderr(),
         );
         if result.exit_code != 0 {
-            crate::out_dir_alias::after_failed_compile(&result.stderr);
+            crate::out_dir_alias::after_failed_compile(&result.stderr, &args.externs);
             let elapsed = start.elapsed().as_millis() as u64;
             log_event_with_hash_stats(
                 config,
@@ -3977,7 +3979,7 @@ fn run_parsed_rustc(
 
     // Don't cache failures
     if result.exit_code != 0 {
-        crate::out_dir_alias::after_failed_compile(&result.stderr);
+        crate::out_dir_alias::after_failed_compile(&result.stderr, &args.externs);
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
             config,

@@ -64,9 +64,10 @@ pub(crate) enum Tier {
 /// What a compile that links a candidate lib says about that lib.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConsumerKind {
-    /// A proc macro, or a proc macro's test harness.
+    /// A proc macro: its code runs inside rustc.
     ProcMacro,
-    /// Anything else: a lib, a bin, a build script, a test.
+    /// Anything else: a lib, a bin, a build script, a test harness (a proc
+    /// macro's too, which runs the lib natively).
     Other,
 }
 
@@ -160,10 +161,10 @@ pub(crate) struct UnitFacts {
     pub denied: bool,
 }
 
-/// Can this host alias at all: the setting is on, on Unix, and not as root,
-/// whose writes the alias's mode bits would not stop.
-pub(crate) fn host_allows(enabled: bool, unix: bool, euid: u32) -> bool {
-    enabled && unix && euid != 0
+/// Can this host alias at all: on Unix, and not as root, whose writes the
+/// alias's mode bits would not stop.
+pub(crate) fn host_allows(unix: bool, euid: u32) -> bool {
+    unix && euid != 0
 }
 
 /// The tier a unit's crate types put it in, if any.
@@ -228,8 +229,7 @@ pub(crate) fn unit_dir_name(out_dir: &Path, pkg: &str) -> Option<String> {
     }
     let name = unit.file_name()?.to_str()?;
     let hash = name.strip_prefix(pkg)?.strip_prefix('-')?;
-    let hex = hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
-    hex.then(|| name.to_string())
+    is_unit_hash(hash).then(|| name.to_string())
 }
 
 /// Whether every `cargo:` / `cargo::` line of a build script's output is one
@@ -317,24 +317,13 @@ pub(crate) fn root_location_ok(root: &Path, checkout_dirs: &[PathBuf]) -> bool {
     !checkout_dirs.iter().any(|dir| root.starts_with(dir))
 }
 
-/// Does this compile link the `proc_macro` crate the way Cargo passes it to a
-/// proc macro and its test harness: a bare `--extern proc_macro`?
-pub(crate) fn links_proc_macro(externs: &[ExternDep]) -> bool {
-    externs
-        .iter()
-        .any(|dep| dep.name == "proc_macro" && dep.path.is_none())
-}
-
-/// What linking a candidate lib from this compile says about the lib.
-pub(crate) fn consumer_kind(
-    crate_types: &[String],
-    is_test: bool,
-    bare_proc_macro: bool,
-) -> ConsumerKind {
-    let proc_macro = crate_types
-        .iter()
-        .any(|crate_type| crate_type == "proc-macro")
-        || (is_test && bare_proc_macro);
+/// What linking a candidate lib from this compile says about the lib. A test
+/// harness is a native program whatever it tests.
+pub(crate) fn consumer_kind(crate_types: &[String], is_test: bool) -> ConsumerKind {
+    let proc_macro = !is_test
+        && crate_types
+            .iter()
+            .any(|crate_type| crate_type == "proc-macro");
     if proc_macro {
         ConsumerKind::ProcMacro
     } else {
@@ -370,24 +359,104 @@ fn alias_unit_of<'a>(path: &'a Path, root: &Path) -> Option<&'a str> {
     relative.components().next()?.as_os_str().to_str()
 }
 
-/// The package whose alias `stderr` names, for the hint.
-fn named_package<'a>(stderr: &'a str, root: &Path) -> Option<&'a str> {
-    let prefix = format!("{}/", root.join(LAYOUT).join("d").display());
-    let start = stderr.find(&prefix)? + prefix.len();
-    let unit = stderr[start..].split('/').next()?;
-    unit.rsplit_once('-').map(|(package, _)| package)
+/// Is `hash` the 16 hex digits Cargo puts after a unit's package name?
+fn is_unit_hash(hash: &str) -> bool {
+    hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// The one-line hint for a compile that failed to write, when an alias root
-/// exists on this machine.
-pub(crate) fn permission_hint(stderr: &str, root: &Path, root_exists: bool) -> Option<String> {
-    (root_exists && is_permission_failure(stderr)).then(|| {
-        let package = named_package(stderr, root).unwrap_or("<macro crate>");
-        format!(
-            "[kache] shared OUT_DIRs are read-only; to let a macro write debug output, run \
-             `cargo clean -p {package}` and rebuild with KACHE_OUT_DIR_ALIAS=0"
-        )
-    })
+/// The package of a `<pkg>-<16 hex>` unit dir.
+fn unit_package(unit: &str) -> Option<&str> {
+    let (package, hash) = unit.rsplit_once('-')?;
+    (!package.is_empty() && is_unit_hash(hash)).then_some(package)
+}
+
+/// Every `<pkg>-<hash>` whose alias `bytes` spells a path in.
+fn alias_units_in(bytes: &[u8], root: &Path) -> BTreeSet<String> {
+    let mut prefix = root
+        .join(LAYOUT)
+        .join("d")
+        .into_os_string()
+        .into_encoded_bytes();
+    prefix.push(b'/');
+    let mut units = BTreeSet::new();
+    let mut rest = bytes;
+    while let Some(at) = rest
+        .windows(prefix.len())
+        .position(|window| window == prefix)
+    {
+        rest = &rest[at + prefix.len()..];
+        let len = rest
+            .iter()
+            .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_'))
+            .unwrap_or(rest.len());
+        let unit = std::str::from_utf8(&rest[..len]).unwrap_or_default();
+        if unit_package(unit).is_some() {
+            units.insert(unit.to_string());
+        }
+    }
+    units
+}
+
+/// The proc macros a compile loads: its `--extern` dylibs.
+fn loaded_macros(externs: &[ExternDep]) -> impl Iterator<Item = &Path> {
+    externs
+        .iter()
+        .filter_map(|dep| dep.path.as_deref())
+        .filter(|path| path.extension() == Some(OsStr::new(std::env::consts::DLL_EXTENSION)))
+}
+
+/// Every alias a proc macro this compile loads has baked in. A lib's alias is
+/// baked into the macro that links it, not into the compile that fails.
+fn loaded_aliases(externs: &[ExternDep], root: &Path) -> BTreeSet<String> {
+    loaded_macros(externs)
+        .filter_map(|path| std::fs::read(path).ok())
+        .flat_map(|bytes| alias_units_in(&bytes, root))
+        .collect()
+}
+
+/// The one-line hint for a compile that failed to write, naming the packages
+/// of `units`.
+pub(crate) fn permission_hint(units: &BTreeSet<String>) -> String {
+    let packages: BTreeSet<&str> = units.iter().filter_map(|unit| unit_package(unit)).collect();
+    let clean = if packages.is_empty() {
+        "-p <macro crate>".to_string()
+    } else {
+        packages
+            .iter()
+            .map(|package| format!("-p {package}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    format!(
+        "[kache] shared OUT_DIRs are read-only; to let a macro write debug output, run \
+         `cargo clean {clean}` and rebuild with KACHE_OUT_DIR_ALIAS=0"
+    )
+}
+
+/// For a compile that failed to write while an alias root exists: the hint,
+/// naming every alias it may have tried to write into.
+///
+/// Its own alias and any alias its stderr names are known to be involved, so
+/// they are also denied: the rebuild and later checkouts compile them
+/// unaliased. A panic such as `Os { code: 13, .. }` names no path, and then
+/// any alias a loaded macro bakes may be the one; those are only named, since
+/// denying all of them would stop sharing units that had nothing to do with it.
+fn failure_hint(
+    stderr: &str,
+    externs: &[ExternDep],
+    root: &Path,
+    own: Option<&str>,
+) -> Option<String> {
+    if !(root.exists() && is_permission_failure(stderr)) {
+        return None;
+    }
+    let mut known = alias_units_in(stderr.as_bytes(), root);
+    known.extend(own.map(str::to_string));
+    for unit in &known {
+        let _ = deny(root, unit);
+    }
+    known.extend(loaded_aliases(externs, root));
+    Some(permission_hint(&known))
 }
 
 /// `<out-dir>/lib<crate><extra>.kache-alias` for a lib compile.
@@ -467,18 +536,28 @@ fn alias_root(cache_dir: &Path) -> Option<PathBuf> {
     Some(std::fs::canonicalize(cache_dir).ok()?.join(ROOT_NAME))
 }
 
-/// Rule 6: the root exists (created 0700 if missing), is private to this user,
-/// and is outside the checkout.
-fn root_is_safe(root: &Path, args: &RustcArgs, euid: u32) -> bool {
-    let checkout_dirs: Vec<PathBuf> = args
-        .path_normalization_root()
+/// The checkout directories a compile knows of: its normalization root, its
+/// target dir, and the workspace that target dir sits in. A registry unit's
+/// normalization root is its package dir, since Cargo runs it from there, so
+/// the workspace comes from the target dir, when a manifest says it is one.
+fn checkout_dirs(args: &RustcArgs) -> Vec<PathBuf> {
+    let workspace = args
+        .workspace_root()
+        .filter(|dir| dir.join("Cargo.toml").is_file());
+    args.path_normalization_root()
         .map(Path::to_path_buf)
         .into_iter()
         .chain(args.target_dir())
+        .chain(workspace)
         .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
-        .collect();
+        .collect()
+}
+
+/// Rule 6: the root exists (created 0700 if missing), is private to this user,
+/// and is outside the checkout.
+fn root_is_safe(root: &Path, args: &RustcArgs, euid: u32) -> bool {
     let _ = create_private_dir_all(root);
-    is_private_dir(root, euid) && root_location_ok(root, &checkout_dirs)
+    is_private_dir(root, euid) && root_location_ok(root, &checkout_dirs(args))
 }
 
 /// Does `dir` exist with no entries?
@@ -611,9 +690,36 @@ pub(crate) fn consumer_checks(
     Some(1)
 }
 
+/// What every rustc run does before the decision, with the alias on or off:
+/// record evidence, run the tripwire, and drop this unit's marker, which an
+/// aliased build of it left and only a new aliased decision may write again.
+/// `Some(exit code)` when the compile must not run.
+fn checks_before_decision(args: &RustcArgs, root: &Path, stderr: &mut dyn Write) -> Option<i32> {
+    let kind = consumer_kind(&args.crate_types, args.is_test);
+    if let Some(code) = consumer_checks(root, &args.externs, kind, stderr) {
+        return Some(code);
+    }
+    if let Some(path) = sidecar_path(args) {
+        let _ = write_sidecar(&path, false);
+    }
+    None
+}
+
 /// Mark `<root>/v1/libs/<unit id>/` so consumers record evidence for it.
 pub(crate) fn register_candidate(root: &Path, unit_id: &str) -> std::io::Result<()> {
     create_private_dir_all(&libs_dir(root).join(unit_id))
+}
+
+/// Keep a candidate whose key bakes `OUT_DIR` registered. Drop any other,
+/// with whatever evidence its consumers left while it was registered.
+fn settle_candidate(root: &Path, unit_id: &str, bakes_out_dir: bool) -> std::io::Result<()> {
+    if bakes_out_dir {
+        return register_candidate(root, unit_id);
+    }
+    match std::fs::remove_dir_all(libs_dir(root).join(unit_id)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// Keep the unit off the alias from now on.
@@ -732,22 +838,29 @@ static PLAN: OnceLock<Plan> = OnceLock::new();
 /// value under it at the alias. Must run while the wrapper is still single
 /// threaded: it changes the process environment. `Some(exit code)` means the
 /// compile must not run.
+///
+/// With the alias off, only the decision is skipped. Libs built while it was
+/// on keep their alias until they rebuild, so the tripwire, the stale marker
+/// and the failure hint still apply to them.
 pub(crate) fn apply(config: &Config, wrapper_args: &[String]) -> Option<i32> {
     let _trace = crate::phase_trace::phase("out_dir_alias");
     let euid = effective_uid();
-    if !host_allows(config.out_dir_alias, cfg!(unix), euid) {
+    if !host_allows(cfg!(unix), euid) {
         return None;
     }
     let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
     let args = compiler.parse(wrapper_args).ok()?;
     let root = alias_root(&config.cache_dir)?;
-    let kind = consumer_kind(
-        &args.crate_types,
-        args.is_test,
-        links_proc_macro(&args.externs),
-    );
-    if let Some(code) = consumer_checks(&root, &args.externs, kind, &mut std::io::stderr()) {
+    if let Some(code) = checks_before_decision(&args, &root, &mut std::io::stderr()) {
         return Some(code);
+    }
+    if !config.out_dir_alias {
+        let _ = PLAN.set(Plan {
+            root,
+            alias: None,
+            candidate: None,
+        });
+        return None;
     }
 
     let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
@@ -793,9 +906,6 @@ pub(crate) fn apply(config: &Config, wrapper_args: &[String]) -> Option<i32> {
                 "[key:{crate_name}] out_dir_alias: skip: {}",
                 reason.as_str()
             );
-            if let Some(path) = &sidecar {
-                let _ = write_sidecar(path, false);
-            }
         }
     }
     let _ = PLAN.set(Plan {
@@ -811,14 +921,27 @@ pub(crate) fn active_alias() -> Option<&'static Path> {
     PLAN.get()?.alias.as_ref().map(|(dir, _)| dir.as_path())
 }
 
-/// After the key: register a candidate lib whose key keeps an `OUT_DIR`
-/// value, so later compiles record who links it.
+/// Before a compile whose key is not known yet: register a candidate lib now.
+/// Cargo starts the lib's pipelined consumers on its rmeta, before the key,
+/// and they have to be recorded too. The key drops the lib again if it turns
+/// out not to bake `OUT_DIR`.
+pub(crate) fn register_before_compile() {
+    let Some(plan) = PLAN.get() else {
+        return;
+    };
+    if let Some(unit_id) = plan.candidate.as_deref() {
+        let _ = register_candidate(&plan.root, unit_id);
+    }
+}
+
+/// After the key: keep a candidate lib whose key keeps an `OUT_DIR` value
+/// registered, so later compiles record who links it, and drop any other.
 pub(crate) fn register_after_key(bakes_out_dir: bool) {
     let Some(plan) = PLAN.get() else {
         return;
     };
-    if let Some(unit_id) = plan.candidate.as_deref().filter(|_| bakes_out_dir) {
-        let _ = register_candidate(&plan.root, unit_id);
+    if let Some(unit_id) = plan.candidate.as_deref() {
+        let _ = settle_candidate(&plan.root, unit_id, bakes_out_dir);
     }
 }
 
@@ -859,17 +982,15 @@ pub(crate) fn store_gate(args: &RustcArgs) -> bool {
     false
 }
 
-/// After a failed compile: the hint, and a deny marker for this unit's alias.
-pub(crate) fn after_failed_compile(stderr: &str) {
+/// After a failed compile: the hint, and deny markers for the aliases known
+/// to be involved (see `failure_hint`).
+pub(crate) fn after_failed_compile(stderr: &str, externs: &[ExternDep]) {
     let Some(plan) = PLAN.get() else {
         return;
     };
-    let Some(hint) = permission_hint(stderr, &plan.root, plan.root.exists()) else {
-        return;
-    };
-    eprintln!("{hint}");
-    if let Some((_, unit_dir)) = &plan.alias {
-        let _ = deny(&plan.root, unit_dir);
+    let own = plan.alias.as_ref().map(|(_, unit_dir)| unit_dir.as_str());
+    if let Some(hint) = failure_hint(stderr, externs, &plan.root, own) {
+        eprintln!("{hint}");
     }
 }
 
@@ -913,11 +1034,10 @@ mod tests {
     }
 
     #[test]
-    fn host_allows_only_an_enabled_unix_non_root_host() {
-        assert!(host_allows(true, true, 501));
-        assert!(!host_allows(false, true, 501));
-        assert!(!host_allows(true, false, 501));
-        assert!(!host_allows(true, true, 0));
+    fn host_allows_only_a_unix_non_root_host() {
+        assert!(host_allows(true, 501));
+        assert!(!host_allows(false, 501));
+        assert!(!host_allows(true, 0));
     }
 
     #[test]
@@ -1261,36 +1381,28 @@ mod tests {
     }
 
     #[test]
-    fn consumer_kind_is_proc_macro_only_for_macros_and_their_harnesses() {
+    fn consumer_kind_is_proc_macro_only_for_a_proc_macro_itself() {
         assert_eq!(
-            consumer_kind(&strings(&["proc-macro"]), false, true),
+            consumer_kind(&strings(&["proc-macro"]), false),
             ConsumerKind::ProcMacro
         );
-        assert_eq!(consumer_kind(&[], true, true), ConsumerKind::ProcMacro);
-        assert_eq!(consumer_kind(&[], true, false), ConsumerKind::Other);
-        assert_eq!(consumer_kind(&[], false, true), ConsumerKind::Other);
+        // A test harness runs natively, whatever it tests.
         assert_eq!(
-            consumer_kind(&strings(&["lib"]), false, false),
+            consumer_kind(&strings(&["proc-macro"]), true),
+            ConsumerKind::Other
+        );
+        assert_eq!(consumer_kind(&[], true), ConsumerKind::Other);
+        assert_eq!(consumer_kind(&[], false), ConsumerKind::Other);
+        assert_eq!(
+            consumer_kind(&strings(&["lib"]), false),
             ConsumerKind::Other
         );
         assert_eq!(
-            consumer_kind(&strings(&["bin"]), false, false),
+            consumer_kind(&strings(&["bin"]), false),
             ConsumerKind::Other
         );
         assert_eq!(ConsumerKind::ProcMacro.marker(), "pm");
         assert_eq!(ConsumerKind::Other.marker(), "other");
-    }
-
-    #[test]
-    fn links_proc_macro_needs_the_bare_extern() {
-        let path = Path::new("/t/libproc_macro.rlib");
-        assert!(links_proc_macro(&[
-            dep("x", Some(path)),
-            dep("proc_macro", None)
-        ]));
-        assert!(!links_proc_macro(&[dep("proc_macro", Some(path))]));
-        assert!(!links_proc_macro(&[dep("std", None)]));
-        assert!(!links_proc_macro(&[]));
     }
 
     #[test]
@@ -1335,21 +1447,64 @@ mod tests {
     }
 
     #[test]
-    fn permission_hint_names_the_package_whose_alias_failed() {
+    fn unit_package_needs_a_name_and_cargos_hash() {
+        assert_eq!(unit_package("sp-api-0123456789abcdef"), Some("sp-api"));
+        assert_eq!(unit_package("dmac-0123456789ABCDEF"), Some("dmac"));
+        for unit in [
+            "",
+            "dmac",
+            "-0123456789abcdef",
+            "dmac-0123456789abcde",
+            "dmac-0123456789abcdef0",
+            "dmac-0123456789abcdeg",
+        ] {
+            assert_eq!(unit_package(unit), None, "{unit}");
+        }
+    }
+
+    #[test]
+    fn alias_units_in_finds_every_alias_spelled_in_bytes() {
         let root = Path::new("/c/out-dirs");
-        let stderr = "error: failed to write /c/out-dirs/v1/d/sp-api-0123456789abcdef/out/x.rs: \
-                      Permission denied (os error 13)";
-        let hint = permission_hint(stderr, root, true).unwrap();
-        assert!(hint.contains("cargo clean -p sp-api`"), "{hint}");
-        assert!(hint.contains("KACHE_OUT_DIR_ALIAS=0"), "{hint}");
-        let generic = permission_hint("Permission denied", root, true).unwrap();
+        let mut bytes = b"\x7fELF\0/c/out-dirs/v1/d/sp-api-0123456789abcdef/out/x.rs\xff".to_vec();
+        bytes.extend(b"/c/out-dirs/v1/d/my_mac-fedcba9876543210\"");
+        bytes.extend(b"/c/out-dirs/v1/d/short-0123/out");
+        bytes.extend(b"/c/out-dirs/v1/libs/lib-0123456789abcdef/pm");
+        bytes.extend(b"/d/out-dirs/v1/d/elsewhere-0123456789abcdef/out");
+        bytes.extend(b"/c/out-dirs/v1/d/end-0123456789abcdef");
+        assert_eq!(
+            alias_units_in(&bytes, root).into_iter().collect::<Vec<_>>(),
+            [
+                "end-0123456789abcdef",
+                "my_mac-fedcba9876543210",
+                "sp-api-0123456789abcdef"
+            ]
+        );
+        assert!(alias_units_in(b"/c/out-dirs/v1/d/", root).is_empty());
+        assert!(alias_units_in(b"", root).is_empty());
+    }
+
+    #[test]
+    fn permission_hint_names_the_packages_to_clean() {
+        let units = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| name.to_string()).collect()
+        };
+        let one = permission_hint(&units(&["sp-api-0123456789abcdef"]));
+        assert!(one.contains("`cargo clean -p sp-api` and"), "{one}");
+        assert!(one.contains("KACHE_OUT_DIR_ALIAS=0"), "{one}");
+        let two = permission_hint(&units(&[
+            "wasm-macro-0123456789abcdef",
+            "expander-0123456789abcdef",
+            "expander-fedcba9876543210",
+        ]));
         assert!(
-            generic.contains("cargo clean -p <macro crate>`"),
+            two.contains("`cargo clean -p expander -p wasm-macro` and"),
+            "{two}"
+        );
+        let generic = permission_hint(&units(&[]));
+        assert!(
+            generic.contains("`cargo clean -p <macro crate>` and"),
             "{generic}"
         );
-        assert_eq!(permission_hint(stderr, root, false), None);
-        assert_eq!(permission_hint("error: mismatched types", root, true), None);
-        assert_eq!(named_package("/c/out-dirs/v1/d/", root), None);
     }
 
     #[test]
@@ -1406,7 +1561,8 @@ mod tests {
             let euid = effective_uid();
             let dir = alias_dir(tmp.path(), "dmac-0123456789abcdef");
             assert!(ensure_alias_dir(&dir, euid));
-            assert_eq!(mode(&dir), 0o555);
+            // The umask can take read bits away too; what matters is no write bit.
+            assert_eq!(mode(&dir) & 0o222, 0);
             assert_eq!(mode(dir.parent().unwrap()) & 0o077, 0);
             assert_eq!(alias_state(&dir, euid), AliasState::Usable);
             // Already there and still usable.
@@ -1558,6 +1714,196 @@ mod tests {
             assert!(rlib.exists());
             assert_eq!(read_verdict(&root, "0123456789abcdef"), LibVerdict::Other);
             assert!(!libs_dir(&root).join("fedcba9876543210").exists());
+        }
+
+        fn parse(args: &[&str]) -> RustcArgs {
+            RustcCompiler::new().parse(&strings(args)).unwrap()
+        }
+
+        /// A proc macro's unit-test harness links its lib dependency and runs
+        /// it natively, so it counts as `other`: with default profiles it can
+        /// be the only consumer of that unit.
+        #[test]
+        fn a_proc_macro_test_harness_is_a_native_consumer() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (root, rlib, files) = aliased_lib(tmp.path());
+            std::fs::remove_file(&files[2]).unwrap();
+            let harness = parse(&[
+                "rustc",
+                "--crate-name",
+                "pm2",
+                "src/lib.rs",
+                "--test",
+                "--extern",
+                "proc_macro",
+                "--extern",
+                &format!("helper={}", rlib.display()),
+            ]);
+            let mut stderr = Vec::new();
+            assert_eq!(checks_before_decision(&harness, &root, &mut stderr), None);
+            assert_eq!(read_verdict(&root, "0123456789abcdef"), LibVerdict::Other);
+
+            // An aliased lib it links trips, like for any native consumer.
+            let (root, _, files) = aliased_lib(&tmp.path().join("again"));
+            let harness = parse(&[
+                "rustc",
+                "--crate-name",
+                "pm2",
+                "src/lib.rs",
+                "--test",
+                "--extern",
+                "proc_macro",
+                "--extern",
+                &format!("helper={}", files[0].display()),
+            ]);
+            assert_eq!(
+                checks_before_decision(&harness, &root, &mut stderr),
+                Some(1)
+            );
+            assert!(files.iter().all(|file| !file.exists()));
+        }
+
+        /// A lib rebuilt without the alias, as the hint asks after
+        /// `cargo clean -p`, must not keep the marker its aliased build left.
+        #[test]
+        fn the_marker_an_aliased_build_left_goes_before_the_decision() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (root, rlib, [_, _, sidecar]) = aliased_lib(tmp.path());
+            let deps = rlib.parent().unwrap();
+            let lib = parse(&[
+                "rustc",
+                "--crate-name",
+                "helper",
+                "--crate-type",
+                "lib",
+                "src/lib.rs",
+                "--out-dir",
+                deps.to_str().unwrap(),
+                "-C",
+                "extra-filename=-0123456789abcdef",
+            ]);
+            let mut stderr = Vec::new();
+            assert_eq!(checks_before_decision(&lib, &root, &mut stderr), None);
+            assert!(!sidecar.exists());
+            assert!(rlib.exists());
+            assert!(stderr.is_empty());
+            // Nothing to remove is fine too.
+            assert_eq!(checks_before_decision(&lib, &root, &mut stderr), None);
+        }
+
+        #[test]
+        fn a_candidate_stays_registered_only_while_its_key_bakes_out_dir() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("out-dirs");
+            settle_candidate(&root, "aaaa", true).unwrap();
+            assert!(listed_candidates(&root).contains("aaaa"));
+            std::fs::write(libs_dir(&root).join("aaaa/pm"), b"").unwrap();
+            settle_candidate(&root, "aaaa", true).unwrap();
+            assert_eq!(read_verdict(&root, "aaaa"), LibVerdict::MacrosOnly);
+
+            settle_candidate(&root, "aaaa", false).unwrap();
+            assert!(listed_candidates(&root).is_empty());
+            assert_eq!(read_verdict(&root, "aaaa"), LibVerdict::Unseen);
+            // Never registered is fine.
+            settle_candidate(&root, "aaaa", false).unwrap();
+            // Something that cannot be removed is an error.
+            std::fs::write(libs_dir(&root).join("file"), b"").unwrap();
+            assert!(settle_candidate(&root, "file/x", false).is_err());
+        }
+
+        /// wasmtime's and wit-bindgen's debug writes panic with
+        /// `Os { code: 13, .. }` and no path, and a lib's alias is baked into
+        /// the macro that links it. The hint still names both. Neither is
+        /// denied: which loaded macro failed is unknown.
+        #[test]
+        fn a_path_less_write_failure_names_the_aliases_a_loaded_macro_bakes() {
+            use std::os::unix::ffi::OsStrExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("out-dirs");
+            create_private_dir_all(&root).unwrap();
+            let deps = tmp.path().join("deps");
+            std::fs::create_dir_all(&deps).unwrap();
+            let spelled = |unit: &str| alias_dir(&root, unit).as_os_str().as_bytes().to_vec();
+
+            let dylib = deps.join(format!(
+                "libwasm_macro-0123.{}",
+                std::env::consts::DLL_EXTENSION
+            ));
+            let mut bytes = b"\x7fELF\0".to_vec();
+            bytes.extend(spelled("wasm-macro-0123456789abcdef"));
+            bytes.extend(b"\0\x01");
+            bytes.extend(spelled("expander-fedcba9876543210"));
+            bytes.extend(b"/gen.rs\0");
+            std::fs::write(&dylib, bytes).unwrap();
+            // An rlib is linked, not loaded: its bytes run nowhere in rustc.
+            let rlib = deps.join("libother-0123.rlib");
+            std::fs::write(&rlib, spelled("other-0123456789abcdef")).unwrap();
+
+            let stderr = "error: proc macro panicked\n  = help: message: called \
+                          `Result::unwrap()` on an `Err` value: Os { code: 13, kind: \
+                          PermissionDenied, message: \"Permission denied\" }";
+            let externs = [
+                dep("wasm_macro", Some(&dylib)),
+                dep("other", Some(&rlib)),
+                dep("missing", Some(&deps.join("libgone-0123.dylib"))),
+                dep("proc_macro", None),
+            ];
+            let hint = failure_hint(stderr, &externs, &root, None).unwrap();
+            assert!(
+                hint.contains("`cargo clean -p expander -p wasm-macro` and"),
+                "{hint}"
+            );
+            assert!(!root.join(LAYOUT).join("deny").exists());
+            let with_path = format!(
+                "{stderr}\n{}",
+                alias_dir(&root, "sp-api-0123456789abcdef").display()
+            );
+            let hint = failure_hint(&with_path, &externs, &root, None).unwrap();
+            assert!(
+                hint.contains("`cargo clean -p expander -p sp-api -p wasm-macro` and"),
+                "{hint}"
+            );
+            let denied: Vec<_> = std::fs::read_dir(root.join(LAYOUT).join("deny"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(denied, ["sp-api-0123456789abcdef"]);
+
+            assert_eq!(
+                failure_hint("error: mismatched types", &externs, &root, None),
+                None
+            );
+            assert_eq!(
+                failure_hint(stderr, &externs, &tmp.path().join("gone"), None),
+                None
+            );
+        }
+
+        #[test]
+        fn a_write_failure_denies_its_own_alias_and_the_one_its_stderr_names() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("out-dirs");
+            create_private_dir_all(&root).unwrap();
+            let named = alias_dir(&root, "sp-api-0123456789abcdef").join("x.rs");
+            let stderr = format!(
+                "error: failed to write {}: Permission denied (os error 13)",
+                named.display()
+            );
+            let hint = failure_hint(&stderr, &[], &root, Some("dmac-fedcba9876543210")).unwrap();
+            assert!(
+                hint.contains("`cargo clean -p dmac -p sp-api` and"),
+                "{hint}"
+            );
+            assert!(deny_path(&root, "sp-api-0123456789abcdef").is_file());
+            assert!(deny_path(&root, "dmac-fedcba9876543210").is_file());
+
+            // Nothing to name: the generic hint, and nothing denied.
+            let other = tempfile::tempdir().unwrap();
+            let empty = other.path().join("out-dirs");
+            create_private_dir_all(&empty).unwrap();
+            let generic = failure_hint("os error 13", &[], &empty, None).unwrap();
+            assert!(generic.contains("-p <macro crate>`"), "{generic}");
+            assert!(!empty.join(LAYOUT).join("deny").exists());
         }
 
         #[test]
@@ -1731,6 +2077,16 @@ mod tests {
             layout.root = target.join("out-dirs");
             assert!(!gather(&layout, &[]).facts.root_safe);
             assert!(is_private_dir(&layout.root, effective_uid()));
+
+            // A registry unit runs from its package dir, so the workspace
+            // comes from the target dir. Next to the target, a cache dir is
+            // inside the checkout only when a manifest says it is one.
+            let workspace = target.parent().unwrap().to_path_buf();
+            layout.root = workspace.join(".kache/out-dirs");
+            assert!(gather(&layout, &[]).facts.root_safe);
+            std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            assert!(!gather(&layout, &[]).facts.root_safe);
+            assert!(checkout_dirs(&layout.args).contains(&workspace));
         }
 
         #[test]

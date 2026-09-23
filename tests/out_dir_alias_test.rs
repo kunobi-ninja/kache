@@ -13,12 +13,16 @@
 //! - `dumpmac`: a proc macro whose build script sets `DEBUG_OUTPUT_DIR` to its
 //!   `OUT_DIR`, and which expands to that value;
 //! - `helper`: a lib returning its `OUT_DIR`, linked only by proc macro `pm2`;
+//! - `plain`: a lib with an empty build script that never reads `OUT_DIR`,
+//!   also linked by `pm2`. There is nothing to share, so it is not tracked;
 //! - `scratchy`: the same shape, linked by lib `mid`, a build dependency of
-//!   `bapp`. It must never be aliased: `mid` runs outside rustc.
+//!   `bapp`, and by proc macro `pm3`. It must never be aliased: `mid` runs
+//!   outside rustc.
 //!
 //! `app` prints what `dumpmac` and `pm2` expand to. The first checkout learns
 //! who links `helper`; later checkouts alias it and hit. `DUMPMAC_WRITE` makes
-//! `dumpmac` write debug output into its directory, which the alias refuses.
+//! `dumpmac` write debug output into its directory, which the alias refuses,
+//! and panic without naming the path, as wasmtime's `bindgen!` does.
 
 #![cfg(unix)]
 
@@ -80,24 +84,25 @@ fn write_fixture(root: &Path, probe: Option<&Path>) {
 pub fn debug_dir(_input: TokenStream) -> TokenStream {
     let dir = env!("DEBUG_OUTPUT_DIR");
     if std::env::var_os("DUMPMAC_WRITE").is_some() {
-        let path = std::path::Path::new(dir).join("expanded.rs");
-        if let Err(error) = std::fs::write(&path, "// expanded\n") {
-            panic!("writing {}: {error}", path.display());
-        }
+        std::fs::write(std::path::Path::new(dir).join("expanded.rs"), "// expanded\n").unwrap();
     }
     format!("{dir:?}").parse().unwrap()
 }
 "#,
     );
 
-    for name in ["helper", "scratchy"] {
+    // `scratchy` also takes long to codegen, so `mid`, which Cargo starts on
+    // its rmeta, starts well before a first build has keyed it.
+    let bakes = "pub fn out_dir() -> &'static str {\n    env!(\"OUT_DIR\")\n}\n";
+    for (name, source) in [
+        ("helper", bakes.to_string()),
+        ("scratchy", format!("{bakes}{}", slow_codegen())),
+        ("plain", "pub fn plain() {}\n".to_string()),
+    ] {
         let lib = fixture.join(name);
         write(&lib.join("Cargo.toml"), &manifest(name, ""));
         write(&lib.join("build.rs"), "fn main() {}\n");
-        write(
-            &lib.join("src/lib.rs"),
-            "pub fn out_dir() -> &'static str {\n    env!(\"OUT_DIR\")\n}\n",
-        );
+        write(&lib.join("src/lib.rs"), &source);
     }
 
     let pm2 = fixture.join("pm2");
@@ -105,7 +110,8 @@ pub fn debug_dir(_input: TokenStream) -> TokenStream {
         &pm2.join("Cargo.toml"),
         &manifest(
             "pm2",
-            "\n[lib]\nproc-macro = true\n\n[dependencies]\nhelper = { path = \"../helper\" }\n",
+            "\n[lib]\nproc-macro = true\n\n[dependencies]\nhelper = { path = \"../helper\" }\n\
+             plain = { path = \"../plain\" }\n",
         ),
     );
     write(
@@ -115,6 +121,27 @@ pub fn debug_dir(_input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn helper_dir(_input: TokenStream) -> TokenStream {
     format!("{:?}", helper::out_dir()).parse().unwrap()
+}
+"#,
+    );
+
+    // A proc macro that links `scratchy` too, so `mid` is what keeps it
+    // unaliased.
+    let pm3 = fixture.join("pm3");
+    write(
+        &pm3.join("Cargo.toml"),
+        &manifest(
+            "pm3",
+            "\n[lib]\nproc-macro = true\n\n[dependencies]\nscratchy = { path = \"../scratchy\" }\n",
+        ),
+    );
+    write(
+        &pm3.join("src/lib.rs"),
+        r#"use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn scratch_dir(_input: TokenStream) -> TokenStream {
+    format!("{:?}", scratchy::out_dir()).parse().unwrap()
 }
 "#,
     );
@@ -151,7 +178,8 @@ pub fn helper_dir(_input: TokenStream) -> TokenStream {
         &root.join("bapp/Cargo.toml"),
         &manifest(
             "bapp",
-            "\n[build-dependencies]\nmid = { path = \"../registry/src/fixture/mid\" }\n",
+            "\n[dependencies]\npm3 = { path = \"../registry/src/fixture/pm3\" }\n\n\
+             [build-dependencies]\nmid = { path = \"../registry/src/fixture/mid\" }\n",
         ),
     );
     write(
@@ -169,18 +197,50 @@ pub fn helper_dir(_input: TokenStream) -> TokenStream {
             &root.join("inc/src/lib.rs"),
             &format!("pub const PROBE: &str = include_str!({probe:?});\n"),
         );
-        write(
-            &root.join("hbin/Cargo.toml"),
-            &manifest(
-                "hbin",
-                "\n[dependencies]\nhelper = { path = \"../registry/src/fixture/helper\" }\n",
-            ),
-        );
-        write(
-            &root.join("hbin/src/main.rs"),
-            "fn main() {\n    println!(\"{}\", helper::out_dir());\n}\n",
-        );
+        write_hbin(root);
     }
+}
+
+/// Functions that give `scratchy` a codegen well past its rmeta.
+fn slow_codegen() -> String {
+    (0..1500)
+        .map(|i| {
+            format!(
+                "#[inline(never)]\npub fn f{i}(x: u64) -> u64 {{\n    let mut y = x ^ {i};\n    \
+                 for i in 0..64u64 {{\n        \
+                 y = y.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left((i % 63) as u32) ^ i;\n    \
+                 }}\n    y\n}}\n"
+            )
+        })
+        .collect()
+}
+
+/// A bin that links `helper`: a consumer outside rustc.
+fn write_hbin(root: &Path) {
+    write(
+        &root.join("hbin/Cargo.toml"),
+        &manifest(
+            "hbin",
+            "\n[dependencies]\nhelper = { path = \"../registry/src/fixture/helper\" }\n",
+        ),
+    );
+    write(
+        &root.join("hbin/src/main.rs"),
+        "fn main() {\n    println!(\"{}\", helper::out_dir());\n}\n",
+    );
+}
+
+/// Add `hbin` to a tree that was written without it.
+fn add_hbin(root: &Path) {
+    write_hbin(root);
+    let manifest = root.join("Cargo.toml");
+    let body = std::fs::read_to_string(&manifest).unwrap();
+    let members = r#"members = ["app", "bapp"]"#;
+    assert!(body.contains(members), "{body}");
+    write(
+        &manifest,
+        &body.replace(members, r#"members = ["app", "bapp", "hbin"]"#),
+    );
 }
 
 fn cargo_build(workspace: &Path, cache: &Path) -> Output {
@@ -243,8 +303,22 @@ fn events(cache: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// The `*.kache-alias` markers in a tree's `deps`.
+fn alias_markers(tree: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(tree.join("target/debug/deps"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "kache-alias"))
+        .collect()
+}
+
 #[test]
 fn units_that_bake_an_empty_out_dir_hit_in_another_checkout() {
+    // As root nothing is aliased: the mode bits would not stop root's writes.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping the OUT_DIR alias test as root");
+        return;
+    }
     build_kache();
     let tmp = TempDir::new().unwrap();
     let base = std::fs::canonicalize(tmp.path()).unwrap();
@@ -260,6 +334,10 @@ fn units_that_bake_an_empty_out_dir_hit_in_another_checkout() {
     // `a` learns that only `pm2` links `helper`; `b` compiles `helper` and
     // what depends on it against the alias.
     assert_built(&cargo_build(&tree("a"), &cache), "a");
+    // Only libs whose key bakes OUT_DIR stay tracked: helper and scratchy,
+    // not plain.
+    let tracked = std::fs::read_dir(out_dirs.join("v1/libs")).unwrap().count();
+    assert_eq!(tracked, 2);
     assert_built(&cargo_build(&tree("b"), &cache), "b");
 
     let before = events(&cache).len();
@@ -348,14 +426,17 @@ fn units_that_bake_an_empty_out_dir_hit_in_another_checkout() {
     );
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(!refused.status.success(), "dumpmac wrote into its alias");
+    // The panic names no path. The hint names the aliases the macros `app`
+    // loads bake in: dumpmac's, and helper's through `pm2`.
     assert!(
-        stderr.contains("`cargo clean -p dumpmac` and rebuild with KACHE_OUT_DIR_ALIAS=0"),
+        stderr
+            .contains("`cargo clean -p dumpmac -p helper` and rebuild with KACHE_OUT_DIR_ALIAS=0"),
         "{stderr}"
     );
     let cleaned = cargo(
         &tree("d"),
         &cache,
-        &["clean", "--offline", "-p", "dumpmac"],
+        &["clean", "--offline", "-p", "dumpmac", "-p", "helper"],
         &[],
     );
     assert_built(&cleaned, "d clean");
@@ -383,8 +464,9 @@ fn units_that_bake_an_empty_out_dir_hit_in_another_checkout() {
     for unit in &aliased {
         let dir = out_dirs.join("v1/d").join(unit).join("out");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "{unit}");
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o555, "{unit}");
+        // Created 0555; the umask may take read bits too, never add a write bit.
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o222, 0, "{unit}");
     }
 
     // A bin that links `helper` trips: kache removes the aliased lib and
@@ -414,4 +496,40 @@ fn units_that_bake_an_empty_out_dir_hit_in_another_checkout() {
         .collect();
     assert_eq!(inc, ["skipped"], "inc was stored");
     assert!(out_dirs.join("v1/deny/probe-0123456789abcdef").is_file());
+
+    // With the alias off, `helper` in `c` is still the aliased build, so a
+    // new bin that links it trips all the same.
+    let off = [("KACHE_OUT_DIR_ALIAS", Path::new("0"))];
+    let build = ["build", "--offline", "--workspace"];
+    add_hbin(&tree("c"));
+    let tripped = cargo(&tree("c"), &cache, &build, &off);
+    let stderr = String::from_utf8_lossy(&tripped.stderr);
+    assert!(!tripped.status.success(), "c linked the alias with it off");
+    assert!(
+        stderr.contains("helper was built with a shared read-only OUT_DIR"),
+        "{stderr}"
+    );
+    assert_built(&cargo(&tree("c"), &cache, &build, &off), "c again");
+    let hbin = printed_paths(&tree("c").join("target/debug/hbin"));
+    assert!(hbin[0].starts_with(tree("c").join("target")), "{hbin:?}");
+
+    // Following the hint in `e` rebuilds `helper` with its own OUT_DIR, and
+    // its marker goes with the alias, so a new bin does not trip on it.
+    assert_eq!(alias_markers(&tree("e")).len(), 1);
+    let cleaned = cargo(
+        &tree("e"),
+        &cache,
+        &["clean", "--offline", "-p", "helper"],
+        &[],
+    );
+    assert_built(&cleaned, "e clean");
+    assert_built(
+        &cargo(&tree("e"), &cache, &build, &off),
+        "e without the alias",
+    );
+    assert_eq!(alias_markers(&tree("e")), Vec::<PathBuf>::new());
+    add_hbin(&tree("e"));
+    assert_built(&cargo_build(&tree("e"), &cache), "e with hbin");
+    let hbin = printed_paths(&tree("e").join("target/debug/hbin"));
+    assert!(hbin[0].starts_with(tree("e").join("target")), "{hbin:?}");
 }

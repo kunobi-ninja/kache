@@ -83,7 +83,7 @@ On a trusted builder that keeps a disk across jobs, point `KACHE_CACHE_DIR` at t
 
 ## Progress and reports
 
-Kache is quiet in compiler-wrapper mode by default because Cargo can retain wrapper stderr as compiler diagnostics.
+Kache is quiet in compiler-wrapper mode by default because Cargo keeps a compiler's stderr and replays it when the unit is fresh. `KACHE_PROGRESS` turns on progress lines. From a terminal they go straight to it, out of Cargo's reach. In CI there is no terminal, so they go to stderr, and a later Cargo command in the same job can replay a line for a unit kache did not run again.
 
 ```yaml
 env:

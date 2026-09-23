@@ -35,6 +35,7 @@ mod maintenance;
 mod miss_chain;
 mod native_archive;
 mod native_link_key;
+mod notice;
 mod opcounts;
 mod otel;
 mod path_normalizer;

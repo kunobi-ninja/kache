@@ -34,7 +34,7 @@ use hit::HitCompletion;
 mod rustc_hit;
 use rustc_hit::RustcHitContext;
 
-/// Check whether progress lines should be printed to stderr.
+/// Check whether progress lines should be shown ([`crate::notice`]).
 ///
 /// Controlled by `KACHE_PROGRESS` env var (off by default):
 /// - `1` / `hits`    — print hits only
@@ -49,10 +49,8 @@ fn progress_level() -> u8 {
 }
 
 /// Heartbeats describe an in-progress cache miss, so only the verbose progress
-/// modes may write them to the compiler wrapper's stderr. Cargo fingerprints
-/// that stderr and replays it on later builds; keeping the default silent
-/// prevents stale `still compiling` lines from appearing at build start.
-fn heartbeat_stderr_enabled(level: u8) -> bool {
+/// modes show them.
+fn heartbeat_lines_enabled(level: u8) -> bool {
     level >= 2
 }
 
@@ -74,7 +72,7 @@ fn progress_label(result: EventResult, level: u8) -> Option<&'static str> {
     }
 }
 
-/// Print a concise progress line to stderr.
+/// Show a concise progress line ([`crate::notice`]).
 fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: u64) {
     let level = progress_level();
     if level == 0 {
@@ -97,7 +95,9 @@ fn print_progress(crate_name: &str, result: EventResult, elapsed_ms: u64, size: 
         format!("{}ms", elapsed_ms)
     };
 
-    eprintln!("[kache] {crate_name}: {label} ({elapsed_str}{size_str})");
+    crate::notice::show_requested(&format!(
+        "[kache] {crate_name}: {label} ({elapsed_str}{size_str})"
+    ));
 }
 
 /// Build the user-facing diagnostic shown when the cache index can't be
@@ -3208,7 +3208,7 @@ fn run_parsed_rustc(
         config.event_log_path(),
         config.socket_path(),
         event_root.clone(),
-        heartbeat_stderr_enabled(progress_level()),
+        heartbeat_lines_enabled(progress_level()),
     );
     // Mutation testing repeatedly changes a local crate while keeping its
     // dependencies stable. Exact artifact keys necessarily miss for each new
@@ -7197,9 +7197,9 @@ fn explain_miss_diff(
     // check an identical-fields diff would mislabel the miss as
     // `salt_or_extra_inputs` (cross-family review finding).
     if last_hit.cache_key == cache_key {
-        eprintln!(
+        crate::notice::show(&format!(
             "[kache] miss: crate {crate_name} (key unchanged since last hit —              entry evicted or store cleared?)"
-        );
+        ));
         return vec!["none:entry-evicted".to_string()];
     }
     let mut changed: Vec<String> = key_fields
@@ -7226,12 +7226,12 @@ fn explain_miss_diff(
         .signed_duration_since(last_hit.ts)
         .num_minutes()
         .max(0);
-    eprintln!(
+    crate::notice::show(&format!(
         "[kache] miss: crate {} (last hit {}m ago; key changed in: {})",
         crate_name,
         ago,
         changed.join(", ")
-    );
+    ));
     changed
 }
 
@@ -11422,10 +11422,10 @@ exit 0
     }
 
     #[test]
-    fn heartbeat_stderr_requires_verbose_progress() {
-        assert!(!heartbeat_stderr_enabled(0));
-        assert!(!heartbeat_stderr_enabled(1));
-        assert!(heartbeat_stderr_enabled(2));
+    fn heartbeat_lines_require_verbose_progress() {
+        assert!(!heartbeat_lines_enabled(0));
+        assert!(!heartbeat_lines_enabled(1));
+        assert!(heartbeat_lines_enabled(2));
     }
 
     /// `KACHE_PROGRESS` parsing is the only env-dependent part of progress

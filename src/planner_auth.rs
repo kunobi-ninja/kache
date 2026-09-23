@@ -2,9 +2,10 @@
 //!
 //! First match wins:
 //! 1. an explicit token (`KACHE_PLANNER_TOKEN` / `cache.planner.token`);
-//! 2. inside GitHub Actions, the job's OIDC ID token, whose audience is the
-//!    planner's own base URL so no other endpoint can replay it (the job
-//!    needs `id-token: write`);
+//! 2. the job's workload token (kunobi-auth's `client::workload`): the
+//!    GitHub Actions ID token, a GitLab CI ID token, or a Kubernetes
+//!    service-account token, minted for the planner's own base URL so no
+//!    other endpoint can replay it (a GitHub job needs `id-token: write`);
 //! 3. the Kunobi session `kache login` stored for this planner;
 //! 4. nothing.
 //!
@@ -18,17 +19,12 @@
 
 use crate::config::PlannerConfig;
 use anyhow::{Context, Result, bail};
-use base64::Engine as _;
+use kunobi_auth::client::workload::{self, WorkloadSources};
 use kunobi_auth::client::{ServiceConfig, StoredToken, TofuStore, TokenStorage, TokenStore};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-const GITHUB_REQUEST_URL: &str = "ACTIONS_ID_TOKEN_REQUEST_URL";
-const GITHUB_REQUEST_TOKEN: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
-/// Refresh a token this long before it expires, so a request in flight does
-/// not carry one that lapses on arrival.
-const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 /// How long a planner's advertised login is reused. The daemon is long-lived;
 /// a planner's auth configuration rarely moves. Trust (the pin) is checked on
 /// every use, so a fresh `kache login` takes effect at once.
@@ -39,23 +35,6 @@ const NO_LOGIN_TTL: Duration = Duration::from_secs(60);
 /// refresh itself may take: a stalled IdP must not hold the lock forever.
 const REFRESH_BOUND: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CachedToken {
-    pub token: String,
-    pub expires_at: SystemTime,
-}
-
-impl CachedToken {
-    fn is_fresh(&self) -> bool {
-        self.is_fresh_at(SystemTime::now())
-    }
-
-    fn is_fresh_at(&self, now: SystemTime) -> bool {
-        now + EXPIRY_MARGIN < self.expires_at
-    }
-}
-
-static GITHUB_TOKENS: Mutex<Option<HashMap<String, CachedToken>>> = Mutex::new(None);
 /// When a planner was asked for its login, and what it answered (`None`: it
 /// offers none).
 type Discovered = (Instant, Option<ServiceConfig>);
@@ -72,10 +51,8 @@ pub async fn bearer(config: &PlannerConfig, deadline: tokio::time::Instant) -> O
         return Some(token.clone());
     }
     crate::planner_client::ensure_crypto_provider();
-    let github = std::env::var(GITHUB_REQUEST_URL)
-        .ok()
-        .zip(std::env::var(GITHUB_REQUEST_TOKEN).ok());
-    match tokio::time::timeout_at(deadline, resolve(config, github)).await {
+    let sources = WorkloadSources::from_env();
+    match tokio::time::timeout_at(deadline, resolve(config, &sources)).await {
         Ok(token) => token,
         Err(_) => {
             tracing::debug!("planner auth: resolving a bearer ran out of time; sending none");
@@ -84,21 +61,20 @@ pub async fn bearer(config: &PlannerConfig, deadline: tokio::time::Instant) -> O
     }
 }
 
-/// `github` is the Actions runtime's token request URL and bearer, when set.
-async fn resolve(config: &PlannerConfig, github: Option<(String, String)>) -> Option<String> {
+/// `sources` are the workload tokens this process can present.
+async fn resolve(config: &PlannerConfig, sources: &WorkloadSources) -> Option<String> {
     let base = planner_base(&config.endpoint);
-    if !credentials_allowed(&base) {
+    if !workload::may_receive(&base) {
         tracing::debug!("planner auth: {base} is not HTTPS; sending no automatic credential");
         return None;
     }
-    if let Some((url, request_token)) = github {
-        // Always the planner's own URL: an audience taken from config would let
-        // a project point `endpoint` elsewhere and collect a token minted for
-        // a real planner.
-        match cached_github_token(&url, &request_token, &base).await {
-            Ok(token) => return Some(token),
-            Err(error) => tracing::debug!("planner auth: GitHub Actions ID token: {error:#}"),
-        }
+    // Always the planner's own URL as the audience: one taken from config
+    // would let a project point `endpoint` elsewhere and collect a token
+    // minted for a real planner.
+    match workload::token_from(sources, &base, &base).await {
+        Ok(Some(token)) => return Some(token.token),
+        Ok(None) => {}
+        Err(error) => tracing::debug!("planner auth: workload token: {error:#}"),
     }
     match kunobi_session_token(&base).await {
         Ok(token) => token,
@@ -107,86 +83,6 @@ async fn resolve(config: &PlannerConfig, github: Option<(String, String)>) -> Op
             None
         }
     }
-}
-
-/// Automatic credentials travel only over TLS, or to this machine.
-fn credentials_allowed(base: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(base) else {
-        return false;
-    };
-    match url.scheme() {
-        "https" => true,
-        "http" => matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
-        _ => false,
-    }
-}
-
-async fn cached_github_token(url: &str, request_token: &str, audience: &str) -> Result<String> {
-    let cached = GITHUB_TOKENS
-        .lock()
-        .ok()
-        .and_then(|cache| cache.as_ref()?.get(audience).cloned())
-        .filter(CachedToken::is_fresh);
-    if let Some(cached) = cached {
-        return Ok(cached.token);
-    }
-    let fresh = github_actions_token(url, request_token, audience).await?;
-    if let Ok(mut cache) = GITHUB_TOKENS.lock() {
-        cache
-            .get_or_insert_with(HashMap::new)
-            .insert(audience.to_string(), fresh.clone());
-    }
-    Ok(fresh.token)
-}
-
-/// Ask the Actions runtime for this job's OIDC ID token.
-pub(crate) async fn github_actions_token(
-    request_url: &str,
-    request_token: &str,
-    audience: &str,
-) -> Result<CachedToken> {
-    #[derive(serde::Deserialize)]
-    struct Response {
-        value: String,
-    }
-    let mut url = reqwest::Url::parse(request_url).context("parsing the Actions ID token URL")?;
-    url.query_pairs_mut().append_pair("audience", audience);
-    let response: Response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?
-        .get(url)
-        .bearer_auth(request_token)
-        .send()
-        .await
-        .context("requesting the GitHub Actions ID token")?
-        .error_for_status()
-        .context(
-            "GitHub Actions refused the ID token request (does the job have `id-token: write`?)",
-        )?
-        .json()
-        .await
-        .context("decoding the GitHub Actions ID token response")?;
-    let expires_at = jwt_expiry(&response.value)?;
-    Ok(CachedToken {
-        token: response.value,
-        expires_at,
-    })
-}
-
-/// The `exp` of a JWT, read without verifying it: the token is ours to send,
-/// not to trust, and only its lifetime matters here.
-fn jwt_expiry(jwt: &str) -> Result<SystemTime> {
-    let payload = jwt.split('.').nth(1).context("ID token is not a JWT")?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .context("ID token payload is not base64url")?;
-    let claims: serde_json::Value =
-        serde_json::from_slice(&bytes).context("ID token payload is not JSON")?;
-    let exp = claims
-        .get("exp")
-        .and_then(serde_json::Value::as_u64)
-        .context("ID token has no numeric `exp`")?;
-    Ok(UNIX_EPOCH + Duration::from_secs(exp))
 }
 
 /// Kunobi sessions keyed by issuer **and** client id. kunobi-auth's shared
@@ -449,8 +345,10 @@ pub(crate) fn planner_base(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -531,57 +429,6 @@ mod tests {
             token: None,
         };
         assert_eq!(bearer(&config, soon()).await, None);
-    }
-
-    #[test]
-    fn credentials_need_https_or_loopback() {
-        assert!(credentials_allowed("https://planner.example.com"));
-        assert!(credentials_allowed("http://127.0.0.1:8080"));
-        assert!(credentials_allowed("http://localhost:8080"));
-        assert!(credentials_allowed("http://[::1]:8080"));
-        assert!(!credentials_allowed("http://planner.example.com"));
-        assert!(!credentials_allowed("ftp://planner.example.com"));
-        assert!(!credentials_allowed("not a url"));
-    }
-
-    #[tokio::test]
-    async fn github_actions_token_requests_the_audience_and_reads_its_expiry() {
-        crate::planner_client::ensure_crypto_provider();
-        let exp = in_an_hour();
-        let (url, _) = stub_github(jwt_with_exp(exp), "kache-test").await;
-        let token = github_actions_token(&url, "runtime-token", "kache-test")
-            .await
-            .unwrap();
-        assert_eq!(token.token, jwt_with_exp(exp));
-        assert_eq!(token.expires_at, UNIX_EPOCH + Duration::from_secs(exp));
-    }
-
-    #[tokio::test]
-    async fn github_token_is_cached_until_near_expiry() {
-        crate::planner_client::ensure_crypto_provider();
-        let (url, hits) = stub_github(jwt_with_exp(in_an_hour()), "kache-test").await;
-        let first = cached_github_token(&url, "runtime-token", "kache-test")
-            .await
-            .unwrap();
-        let second = cached_github_token(&url, "runtime-token", "kache-test")
-            .await
-            .unwrap();
-        assert_eq!(first, second);
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn a_token_near_expiry_is_not_fresh() {
-        let soon = CachedToken {
-            token: "t".into(),
-            expires_at: SystemTime::now() + Duration::from_secs(30),
-        };
-        assert!(!soon.is_fresh());
-    }
-
-    #[test]
-    fn jwt_expiry_rejects_a_non_jwt() {
-        assert!(jwt_expiry("not-a-jwt").is_err());
     }
 
     #[test]
@@ -727,17 +574,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn a_token_exactly_at_the_margin_is_not_fresh() {
-        let now = SystemTime::now();
-        let token = |expires_at| CachedToken {
-            token: "t".into(),
-            expires_at,
-        };
-        assert!(!token(now + EXPIRY_MARGIN).is_fresh_at(now));
-        assert!(token(now + EXPIRY_MARGIN + Duration::from_secs(1)).is_fresh_at(now));
-    }
-
     #[tokio::test]
     async fn resolve_sends_the_actions_token_to_a_loopback_planner_bound_to_its_url() {
         crate::planner_client::ensure_crypto_provider();
@@ -749,8 +585,11 @@ mod tests {
             timeout_ms: 1000,
             token: None,
         };
-        let github = Some((url.clone(), "runtime-token".to_string()));
-        assert_eq!(resolve(&config, github).await, Some(token));
+        let sources = WorkloadSources {
+            github: Some((url.clone(), "runtime-token".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&config, &sources).await, Some(token));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         // The same runtime never mints a token for a plain-HTTP remote planner.
@@ -758,10 +597,7 @@ mod tests {
             endpoint: "http://planner.example.com".to_string(),
             ..config
         };
-        assert_eq!(
-            resolve(&remote, Some((url, "runtime-token".to_string()))).await,
-            None
-        );
+        assert_eq!(resolve(&remote, &sources).await, None);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 

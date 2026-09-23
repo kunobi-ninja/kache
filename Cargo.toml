@@ -84,7 +84,7 @@ tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 # `kache login` and planner bearer sessions. The -core features keep reqwest
 # on `rustls-no-provider`, so ring stays the only TLS provider (no aws-lc).
-kunobi-auth = { version = "0.12.0", default-features = false, features = ["client-core", "browser-login-core", "rust_crypto"] }
+kunobi-auth = { version = "0.13.0", default-features = false, features = ["client-core", "browser-login-core", "rust_crypto"] }
 interprocess = { version = "2.4.4", features = ["tokio"] }
 unicode-normalization = "0.1"
 # Used by `src/compiler/flags.rs` (the cc / future Swift / future MSVC

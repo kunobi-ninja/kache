@@ -4418,11 +4418,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let removal = self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE));
             let took = write_started.elapsed();
             eviction_writes += took;
+            // Every removal that returns Ok held the index write lock, also
+            // when it kept the entry (pinned, or still linked into a target
+            // directory), so each one counts toward the write slice.
+            if removal.is_ok()
+                && let Some(pause) = pacer.after_write(took)
+            {
+                std::thread::sleep(pause);
+            }
             match removal {
                 Ok(GuardedRemoval::Reclaimed(reclaim)) => {
-                    if let Some(pause) = pacer.after_write(took) {
-                        std::thread::sleep(pause);
-                    }
                     stats.entries_evicted += 1;
                     // Budget on bytes the removal *actually* freed on disk, not
                     // the entry's logical size: evicting an entry whose blobs
@@ -5228,6 +5233,30 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             hook();
         }
 
+        // Eviction only: refuse to drop an entry whose last-ref blobs are
+        // still cloned into a worktree (kunobi-ninja/kache#725). Unlinking
+        // those names frees no disk and destroys a still-usable hit.
+        // Explicit `remove_entry` (purge / doctor) passes `skip_if_idle_lt =
+        // None` and still unlinks. The filesystem probe runs before the write
+        // lock is taken: the lock does not stop a restore from linking a
+        // blob, so probing under it adds no safety and keeps builds waiting.
+        let retained_blobs: Vec<(&str, i64)> =
+            if skip_if_idle_lt.is_some() && !self.config.gc_evict_shared {
+                let mut held_refs: std::collections::HashMap<&str, i64> =
+                    std::collections::HashMap::new();
+                for hash in &hashes {
+                    *held_refs.entry(hash.as_str()).or_insert(0) += 1;
+                }
+                held_refs
+                    .into_iter()
+                    .filter(|(hash, _)| {
+                        crate::filesystem::blob_has_external_retainer(&self.blob_path(hash))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
         // IMMEDIATE takes the write lock before the first read. A DEFERRED
         // transaction would read first and upgrade to a writer at the DELETE,
         // and SQLite fails that upgrade at once with SQLITE_BUSY (or
@@ -5256,30 +5285,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        // Eviction only: refuse to drop an entry whose last-ref blobs are
-        // still cloned into a worktree (kunobi-ninja/kache#725). Unlinking
-        // those names frees no disk and destroys a still-usable hit.
-        // Explicit `remove_entry` (purge / doctor) passes `skip_if_idle_lt =
-        // None` and still unlinks.
-        if skip_if_idle_lt.is_some() && !self.config.gc_evict_shared {
-            let mut last_ref_count: std::collections::HashMap<&str, i64> =
-                std::collections::HashMap::new();
-            for hash in &hashes {
-                *last_ref_count.entry(hash.as_str()).or_insert(0) += 1;
-            }
-            for (hash, held) in last_ref_count {
-                let rc: i64 = tx.query_row(
-                    "SELECT refcount FROM blobs WHERE hash = ?1",
-                    params![hash],
-                    |row| row.get(0),
-                )?;
-                if externally_retained_last_reference(
-                    rc,
-                    held,
-                    crate::filesystem::blob_has_external_retainer(&self.blob_path(hash)),
-                ) {
-                    return Ok(RemovalAttempt::Unreclaimable);
-                }
+        // A blob found retained above blocks the removal only while this
+        // entry holds its last references, and that needs the lock.
+        for (hash, held) in retained_blobs {
+            let rc: i64 = tx.query_row(
+                "SELECT refcount FROM blobs WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )?;
+            if holds_last_reference(rc, held) {
+                return Ok(RemovalAttempt::Unreclaimable);
             }
         }
 
@@ -5729,8 +5744,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 }
 
-fn externally_retained_last_reference(rc: i64, held: i64, retained: bool) -> bool {
-    rc > 0 && rc <= held && retained
+/// Does an entry holding `held` references to a blob hold all of the blob's
+/// `rc` remaining ones? An `rc` of zero or less means the index no longer
+/// counts the blob at all.
+fn holds_last_reference(rc: i64, held: i64) -> bool {
+    rc > 0 && rc <= held
 }
 
 /// Content-dedup statistics.
@@ -8906,11 +8924,12 @@ mod tests {
 
     #[test]
     fn shared_entry_retention_requires_the_last_positive_reference() {
-        assert!(externally_retained_last_reference(1, 1, true));
-        assert!(externally_retained_last_reference(2, 2, true));
-        assert!(!externally_retained_last_reference(2, 1, true));
-        assert!(!externally_retained_last_reference(0, 1, true));
-        assert!(!externally_retained_last_reference(1, 1, false));
+        assert!(holds_last_reference(1, 1));
+        assert!(holds_last_reference(2, 2));
+        assert!(holds_last_reference(1, 2));
+        assert!(!holds_last_reference(2, 1));
+        assert!(!holds_last_reference(0, 1));
+        assert!(!holds_last_reference(-1, 1));
     }
 
     #[cfg(unix)]
@@ -16851,6 +16870,49 @@ mod tests {
         assert!(
             elapsed >= writing + pause,
             "{writing:?} of writes must include a pause, swept in {elapsed:?}"
+        );
+    }
+
+    /// Deciding that an entry cannot be reclaimed also takes the write lock,
+    /// so the sweep paces those entries like removals. It used to move to the
+    /// next one at once, and a run of entries still linked into target
+    /// directories took the lock back to back.
+    #[test]
+    fn eviction_paces_entries_it_cannot_reclaim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = true;
+        let store = Store::open(&config).unwrap();
+        put_evictable_entries(&store, dir.path(), 3);
+        // Every blob is still hardlinked into a build's target directory.
+        let hashes: Vec<String> = store
+            .db
+            .prepare("SELECT hash FROM blobs")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(hashes.len(), 3);
+        for hash in &hashes {
+            let retainer = dir.path().join(format!("retained-{hash}"));
+            std::fs::hard_link(store.blob_path(hash), retainer).unwrap();
+        }
+
+        let mut gc_config = config.clone();
+        gc_config.max_size = 1;
+        let mut gc = Store::open(&gc_config).unwrap();
+        // A zero slice pauses after every entry that took the lock.
+        let pause = Duration::from_millis(150);
+        gc.eviction_pacing = (Duration::ZERO, pause);
+        let started = std::time::Instant::now();
+        let stats = gc.evict().unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(stats.entries_unreclaimable, 3, "{stats:?}");
+        assert!(
+            elapsed >= pause * 3,
+            "one pause per entry, swept in {elapsed:?}"
         );
     }
 

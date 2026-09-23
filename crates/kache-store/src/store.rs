@@ -5228,7 +5228,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             hook();
         }
 
-        let tx = self.db.unchecked_transaction()?;
+        // IMMEDIATE takes the write lock before the first read. A DEFERRED
+        // transaction would read first and upgrade to a writer at the DELETE,
+        // and SQLite fails that upgrade at once with SQLITE_BUSY (or
+        // SQLITE_BUSY_SNAPSHOT) without calling the busy handler. A build
+        // writing to the index at that moment then made the sweep skip the
+        // entry instead of waiting a few milliseconds for it.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
 
         // Active-pin guard (kunobi-ninja/kache#326, #182): bail out — under
         // the write lock, before any decrement or unlink — if the entry was
@@ -8728,8 +8737,10 @@ mod tests {
     fn evict_counts_lock_contention_apart_from_bad_data() {
         let dir = tempfile::tempdir().unwrap();
         let (store, config) = store_with_one_evictable_entry(dir.path(), "busy");
-        // A second writer holding the database, as a live build does when it
-        // records a hit; the removal waits out the busy timeout and fails.
+        // A second writer holding the database for the whole sweep; the
+        // removal waits out the busy timeout and fails. The timeout is cut
+        // from 5 s so the test does not sit through it.
+        store.db.busy_timeout(Duration::from_millis(50)).unwrap();
         let blocker = Connection::open(config.index_db_path()).unwrap();
         blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
@@ -8742,9 +8753,35 @@ mod tests {
             stats.entries_locked, 1,
             "contention is counted as locked: {stats:?}"
         );
-        // The removal that lost the lock fails at once instead of waiting out
-        // the store's 5 s busy timeout, so this run's eviction write time
-        // stays small; the lost-lock count above is the figure to watch.
+    }
+
+    /// A build holding the index write lock when a sweep reaches an entry
+    /// delays that entry's removal; it must not cancel it. The removal used
+    /// to read before it wrote, and SQLite fails a read-to-write upgrade at
+    /// once instead of calling the busy handler, so the entry was skipped
+    /// and the auto-GC worker left the store over budget.
+    #[test]
+    fn evict_waits_for_a_competing_writer_and_still_evicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, config) = store_with_one_evictable_entry(dir.path(), "contended");
+        // The wrapper that spawned the auto-GC worker is still writing its
+        // own durability flag when the worker starts evicting.
+        let competitor = Connection::open(config.index_db_path()).unwrap();
+        competitor.execute_batch("BEGIN IMMEDIATE").unwrap();
+        competitor
+            .execute("UPDATE entries SET durable = durable", [])
+            .unwrap();
+        let committer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            competitor.execute_batch("COMMIT").unwrap();
+        });
+
+        let stats = store.evict().unwrap();
+        committer.join().unwrap();
+
+        assert_eq!(stats.entries_locked, 0, "{stats:?}");
+        assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+        assert!(!store.contains("contended"));
     }
 
     #[test]
@@ -16742,6 +16779,9 @@ mod tests {
         let mut gc_config = config.clone();
         gc_config.max_size = 1;
         let gc = Store::open(&gc_config).unwrap();
+        // Each removal waits out the busy timeout before it gives up. Cut it
+        // from 5 s so three lost locks do not take fifteen seconds.
+        gc.db.busy_timeout(Duration::from_millis(50)).unwrap();
         let started = std::time::Instant::now();
         let stats = gc.evict().unwrap();
         let elapsed = started.elapsed();

@@ -5300,6 +5300,18 @@ enum KeyDiscovery {
     /// guard is armed regardless of configuration: an input written during
     /// the compile must not be keyed as if the compiler had read it.
     Emitted(crate::cache_key::DepInfo),
+    /// Run the pre-pass again for a predicted key that missed. The caller
+    /// may hold this unit's discovery flight, and that lock is not
+    /// re-entrant, so this computation joins no flight.
+    Rederived,
+}
+
+/// Where this key computation may wait for a peer discovering the same
+/// unit: nowhere without the scheduler, and nowhere for a re-derivation,
+/// which would otherwise wait on the flight its own caller holds.
+fn discovery_flight_dir(config: &Config, discovery: &KeyDiscovery) -> Option<PathBuf> {
+    (config.scheduler && !matches!(discovery, KeyDiscovery::Rederived))
+        .then(|| config.cache_dir.clone())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5319,6 +5331,7 @@ fn compute_rustc_cache_key(
 ) -> Result<ComputedKey> {
     let key_start = std::time::Instant::now();
     let emitted = matches!(discovery, KeyDiscovery::Emitted(_));
+    let flight_dir = discovery_flight_dir(config, &discovery);
     crate::cache_key::set_defer_discovery(matches!(discovery, KeyDiscovery::Deferrable));
     if let KeyDiscovery::Emitted(dep_info) = discovery {
         crate::cache_key::provide_dep_info(dep_info);
@@ -5328,7 +5341,7 @@ fn compute_rustc_cache_key(
         None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
     }
     .with_input_predictions(config.input_predictions)
-    .with_prediction_flights(config.scheduler.then(|| config.cache_dir.clone()));
+    .with_prediction_flights(flight_dir);
     if config.modified_input_guard || emitted {
         // Flag keyed inputs touched at/after this invocation started — their
         // content at hash time may differ from what rustc reads, so we'll look
@@ -5459,7 +5472,7 @@ fn recompute_key_without_prediction(
         false,
         0,
         Vec::new(),
-        KeyDiscovery::Immediate,
+        KeyDiscovery::Rederived,
     )
 }
 
@@ -15753,6 +15766,87 @@ exit 0
         assert!(
             keyed.key_too_new,
             "a source written after the invocation started is too new"
+        );
+    }
+
+    #[test]
+    fn a_rederivation_never_waits_on_a_discovery_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.scheduler = true;
+        let flights = |discovery: KeyDiscovery| discovery_flight_dir(&config, &discovery);
+        assert_eq!(
+            flights(KeyDiscovery::Immediate),
+            Some(config.cache_dir.clone())
+        );
+        assert_eq!(
+            flights(KeyDiscovery::Deferrable),
+            Some(config.cache_dir.clone())
+        );
+        assert_eq!(
+            flights(KeyDiscovery::Rederived),
+            None,
+            "the caller may already hold the flight"
+        );
+        config.scheduler = false;
+        assert_eq!(
+            discovery_flight_dir(&config, &KeyDiscovery::Immediate),
+            None
+        );
+    }
+
+    /// A predicted key that missed is re-derived while the invocation may
+    /// still hold the unit's discovery flight. A flight lock is not
+    /// re-entrant, so joining it again would wait on itself for the whole
+    /// flight timeout. The re-derivation must not join one at all.
+    #[test]
+    fn a_rederived_key_holds_no_discovery_flight() {
+        if std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: no rustc");
+            return;
+        }
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path().join("cache"));
+        config.scheduler = true;
+        config.input_predictions = true;
+        let store = Store::open(&config).unwrap();
+        let lib = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        std::fs::write(&lib, "pub fn v() {}\n").unwrap();
+        let out = dir.path().join("target/debug/deps");
+        std::fs::create_dir_all(&out).unwrap();
+        let args = RustcCompiler::new()
+            .parse(&s(&[
+                "rustc",
+                "--crate-name",
+                "kt",
+                lib.to_str().unwrap(),
+                "--crate-type",
+                "lib",
+                "--emit=dep-info,metadata",
+                "--out-dir",
+                out.to_str().unwrap(),
+            ]))
+            .unwrap();
+        let keyed = recompute_key_without_prediction(
+            &config,
+            &RustcCompiler::new(),
+            &args,
+            None,
+            0,
+            Some(&store),
+            None,
+        )
+        .unwrap();
+        assert!(!keyed.cache_key.is_empty());
+        assert!(
+            keyed.discovery_flight.is_none(),
+            "a re-derivation joined a discovery flight"
         );
     }
 }

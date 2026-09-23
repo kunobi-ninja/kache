@@ -634,3 +634,270 @@ fn a_workspace_unit_keeps_its_out_dir_record_local() {
     assert_eq!(warm.dep_info_runs, 1);
     assert_eq!(warm.result, "local_hit");
 }
+
+/// Two checkouts of one Cargo workspace, `<root>/<checkout>`, each with its
+/// own `target`, sharing one cache. The member `kt` reads a file elsewhere in
+/// the workspace and a generated file from `OUT_DIR`, and may expand a proc
+/// macro (kunobi-ninja/kache#1005).
+struct WorkspaceUnit {
+    root: TempDir,
+    cache: PathBuf,
+    lib: String,
+    files: Vec<(String, String)>,
+    proc_macro: Option<PathBuf>,
+}
+
+impl WorkspaceUnit {
+    fn new(with_macro: bool) -> Self {
+        let root = TempDir::new().unwrap();
+        let cache = root.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut lib = String::new();
+        if with_macro {
+            lib.push_str("pm::answer!();\n");
+        }
+        lib.push_str("pub const SHARED: &str = include_str!(\"../../assets/shared.txt\");\n");
+        lib.push_str("include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n");
+        let proc_macro = with_macro.then(|| build_proc_macro(root.path()));
+        Self {
+            root,
+            cache,
+            lib,
+            files: vec![("assets/shared.txt".into(), "shared\n".into())],
+            proc_macro,
+        }
+    }
+
+    /// The member's `lib.rs` becomes `lib`.
+    fn with_lib(mut self, lib: &str) -> Self {
+        self.lib = lib.to_string();
+        self
+    }
+
+    /// `<root>/<name>`, a checkout of the workspace with its target set up
+    /// the way Cargo leaves it before compiling `kt`.
+    fn checkout(&self, name: &str) -> PathBuf {
+        let checkout = self.root.path().join(name);
+        let write = |path: &str, content: &str| {
+            let path = checkout.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write("Cargo.toml", "[workspace]\nmembers = [\"kt\"]\n");
+        write("kt/Cargo.toml", "[package]\nname = \"kt\"\n");
+        write("kt/src/lib.rs", &self.lib);
+        for (path, content) in &self.files {
+            write(path, content);
+        }
+        let target = checkout.join("target");
+        std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+        std::fs::create_dir_all(out_dir_in(&target)).unwrap();
+        std::fs::write(out_dir_in(&target).join("gen.rs"), GENERATED).unwrap();
+        if let Some(proc_macro) = &self.proc_macro {
+            std::fs::copy(proc_macro, self.macro_in(&target)).unwrap();
+        }
+        checkout
+    }
+
+    fn macro_in(&self, target: &Path) -> PathBuf {
+        let name = self.proc_macro.as_ref().unwrap().file_name().unwrap();
+        target.join("debug/deps").join(name)
+    }
+
+    /// Compile `kt` in `checkout` the way Cargo compiles a workspace member:
+    /// from the workspace root, with a relative crate root.
+    fn build(&self, checkout: &Path, predictions: bool, verify: Option<&str>) -> LastEvent {
+        let target = checkout.join("target");
+        let deps = target.join("debug/deps");
+        let mut args: Vec<String> = vec![
+            rustc_path(),
+            "--crate-name".into(),
+            "kt".into(),
+            "--edition=2021".into(),
+            "kt/src/lib.rs".into(),
+            "--crate-type".into(),
+            "lib".into(),
+            "--emit=dep-info,metadata,link".into(),
+            "-C".into(),
+            "metadata=fedcba9876543210".into(),
+            "-C".into(),
+            "extra-filename=-fedcba9876543210".into(),
+            "--out-dir".into(),
+            deps.display().to_string(),
+            "-L".into(),
+            format!("dependency={}", deps.display()),
+        ];
+        if self.proc_macro.is_some() {
+            args.push("--extern".into());
+            args.push(format!("pm={}", self.macro_in(&target).display()));
+        }
+        let config_path = write_test_config(&self.cache, predictions);
+        let mut command = std::process::Command::new(kache_binary());
+        command
+            .args(&args)
+            .current_dir(checkout)
+            .env("KACHE_CACHE_DIR", &self.cache)
+            .env("KACHE_CONFIG", config_path)
+            .env("CARGO_MANIFEST_DIR", checkout.join("kt"))
+            .env("OUT_DIR", out_dir_in(&target))
+            .env_remove("KACHE_DISABLED")
+            .env_remove("KACHE_NAMESPACE")
+            .env_remove("KACHE_BASE_DIR")
+            .env_remove("KACHE_SOCKET_PATH")
+            .env_remove("KACHE_ACTIVE")
+            .env_remove("KACHE_FAMILY_PROBE_ACTIVE")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
+        match verify {
+            Some(mode) => command.env("KACHE_VERIFY_INPUT_PREDICTIONS", mode),
+            None => command.env_remove("KACHE_VERIFY_INPUT_PREDICTIONS"),
+        };
+        let output = command.output().expect("failed to run kache rustc");
+        assert!(
+            output.status.success(),
+            "kache rustc failed.\nargs: {args:?}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        last_event(&self.cache)
+    }
+
+    /// Build in checkout A, let `prepare` edit checkout B, and return B's
+    /// event.
+    fn build_a_then_b(&self, prepare: impl FnOnce(&Path)) -> LastEvent {
+        build_kache();
+        let a = self.checkout("a");
+        let b = self.checkout("b");
+        prepare(&b);
+        assert_eq!(self.build(&a, true, None).result, "miss");
+        self.build(&b, true, None)
+    }
+}
+
+/// A workspace member built in a second checkout derives its closure from
+/// the first checkout's record and gets the key the pre-pass would give.
+fn workspace_unit_predicts_in_another_checkout(unit: WorkspaceUnit) {
+    let warm = unit.build_a_then_b(|_| {});
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0, "B uses the record A made");
+    assert_eq!(warm.compiler_runs, 0);
+
+    let b = unit.root.path().join("b");
+    let off = unit.build(&b, false, None);
+    assert_eq!(off.result, "local_hit");
+    assert_eq!(off.dep_info_runs, 1);
+    assert_eq!(warm.cache_key, off.cache_key);
+
+    let verified = unit.build(&b, true, Some("always"));
+    assert_eq!(verified.dep_info_runs, 1);
+    assert_eq!(verified.prediction_mismatches, 0);
+    assert_eq!(verified.cache_key, off.cache_key);
+}
+
+#[test]
+fn a_workspace_unit_predicts_in_another_checkout() {
+    workspace_unit_predicts_in_another_checkout(WorkspaceUnit::new(false));
+}
+
+#[test]
+fn a_workspace_unit_with_a_proc_macro_predicts_in_another_checkout() {
+    workspace_unit_predicts_in_another_checkout(WorkspaceUnit::new(true));
+}
+
+/// Under the workspace guard, a member with a direct proc-macro dependency
+/// no longer runs the pre-pass on a warm rebuild of its own checkout.
+#[test]
+fn a_workspace_unit_with_a_proc_macro_predicts_in_its_own_checkout() {
+    build_kache();
+    let unit = WorkspaceUnit::new(true);
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0);
+}
+
+/// A file the closure does not name, anywhere in the workspace, could be one
+/// a macro reads, so B's extra file keeps A's record out.
+#[test]
+fn a_new_file_anywhere_in_the_workspace_refuses_the_record() {
+    for with_macro in [false, true] {
+        let unit = WorkspaceUnit::new(with_macro);
+        let warm = unit.build_a_then_b(|b| {
+            std::fs::create_dir_all(b.join("docs")).unwrap();
+            std::fs::write(b.join("docs/notes.md"), "not read\n").unwrap();
+        });
+        assert_eq!(warm.dep_info_runs, 1, "with_macro={with_macro}");
+        assert_eq!(
+            warm.result, "local_hit",
+            "the closure itself did not change"
+        );
+    }
+}
+
+/// A file outside the workspace may be a different file for another
+/// checkout, so a record that names one stays with its checkout.
+#[test]
+fn a_workspace_unit_reading_outside_the_workspace_keeps_the_record_local() {
+    let outside = TempDir::new().unwrap();
+    let file = outside.path().join("outside.txt");
+    std::fs::write(&file, "outside\n").unwrap();
+    let lib = format!(
+        "pub const OUTSIDE: &str = include_str!({:?});\n",
+        file.display().to_string()
+    );
+    let unit = WorkspaceUnit::new(false).with_lib(&lib);
+    let warm = unit.build_a_then_b(|_| {});
+    assert_eq!(warm.dep_info_runs, 1);
+    assert_eq!(warm.result, "local_hit");
+}
+
+/// A generated file that names A's checkout could send rustc to a file the
+/// relocation does not move, so A keeps its record to itself.
+#[test]
+fn a_generated_file_naming_the_checkout_keeps_the_record_local() {
+    let unit = WorkspaceUnit::new(false);
+    let a = unit.root.path().join("a");
+    let generated = format!("// generated in {}\n{GENERATED}", a.display());
+    let warm = unit.build_a_then_b(|b| {
+        let a_out = out_dir_in(&a.join("target"));
+        std::fs::write(a_out.join("gen.rs"), &generated).unwrap();
+        std::fs::write(out_dir_in(&b.join("target")).join("gen.rs"), &generated).unwrap();
+    });
+    assert_eq!(warm.dep_info_runs, 1);
+    assert_eq!(warm.result, "local_hit");
+}
+
+/// A member whose macro-dependent closure reads a file outside the workspace
+/// keeps the pre-pass even in its own checkout: the guard covers only the
+/// workspace, so a macro scanning that outside directory could find a new
+/// file there without the guard changing.
+#[test]
+fn a_proc_macro_member_reading_outside_the_workspace_keeps_the_pre_pass() {
+    build_kache();
+    let outside = TempDir::new().unwrap();
+    let file = outside.path().join("outside.txt");
+    std::fs::write(&file, "outside\n").unwrap();
+    let lib = format!(
+        "pm::answer!();\npub const OUTSIDE: &str = include_str!({:?});\n",
+        file.display().to_string()
+    );
+    let unit = WorkspaceUnit::new(true).with_lib(&lib);
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 1);
+}
+
+/// A registry unit with a proc-macro dependency keeps its guarded row in its
+/// own target: the workspace rules leave registry units alone.
+#[test]
+fn a_registry_unit_with_a_macro_predicts_in_its_own_target() {
+    build_kache();
+    let unit = OutDirUnit::new(REGISTRY_PACKAGE, true);
+    let a = unit.target("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 0);
+}

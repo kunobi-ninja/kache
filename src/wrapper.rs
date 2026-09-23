@@ -5271,12 +5271,22 @@ fn record_input_prediction(config: &Config, store: Option<&Store>, args: &RustcA
     // Present exactly when the key was computed under the tree guard; the
     // record must carry it or the guard will never accept the record.
     let tree = crate::cache_key::take_last_tree_digest();
+    // A workspace or path unit gets a row another checkout of the workspace
+    // can use, when the guard was taken before rustc ran (kunobi-ninja/kache#1005).
+    let workspace = crate::cache_key::workspace_record(args, &dep_info, tree.as_deref());
     file_hasher.record_input_prediction(
         &identity,
         args.crate_name.as_deref(),
         &dep_info,
-        tree.clone(),
+        crate::cache_key::same_tree_guard(
+            tree.clone(),
+            crate::cache_key::is_workspace_unit(args),
+            workspace.is_some(),
+        ),
     );
+    if let Some((identity, record)) = workspace {
+        file_hasher.record_portable_prediction(&identity, args.crate_name.as_deref(), &record);
+    }
     // A source under target keeps the shared row out. A registry unit whose
     // only such sources are its own OUT_DIR gets a relocated row instead.
     if crate::cache_key::shared_prediction_can_record(args, &dep_info) {

@@ -100,6 +100,148 @@ fn canonical_cargo_home_alias_keeps_existing_cargo_unit_fresh() {
     assert_eq!(events[0]["compiler_runs"], 1, "events: {events:#?}");
 }
 
+fn write_key_fixture(project: &Path) {
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"proxy_key_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("src/lib.rs"),
+        "#[cfg(not(kache_proxy_fixture))]\ncompile_error!(\"config rustflags were lost\");\n\
+         pub fn answer() -> u8 { 42 }\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn collapsed_rustflags_stay_out_of_the_environment_cargo_passes_on() {
+    // Canonical, so the plain clone has no `/var` vs `/private/var` alias of
+    // CARGO_HOME on macOS.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let cargo_home = home.join(".cargo");
+    let cache = root.join("cache");
+    let plain = home.join("plain/project");
+    let aliased = home.join("aliased/project");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(
+        cargo_home.join("config.toml"),
+        "[build]\nrustflags = [\"--cfg\", \"kache_proxy_fixture\"]\n",
+    )
+    .unwrap();
+    write_key_fixture(&plain);
+    write_key_fixture(&aliased);
+    std::os::unix::fs::symlink(&cargo_home, home.join("aliased/.cargo")).unwrap();
+
+    // Both clones give rustc the same arguments. Only the aliased clone needs
+    // collapsed flags, and only Cargo may see them: the wrapper keys
+    // `CARGO_ENCODED_RUSTFLAGS` from its environment, and a nested Cargo
+    // started by rustc or a proc macro would adopt it as its own flags.
+    for (project, target) in [(&plain, "target-plain"), (&aliased, "target-aliased")] {
+        let mut command = proxied_cargo(&home, &cache, &root.join(target));
+        command
+            .args(["cargo", "--", "check", "--quiet"])
+            .current_dir(project)
+            .env("KACHE_REAL_CARGO", env!("CARGO"));
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "proxied cargo failed in {}: {}",
+            project.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let events: Vec<Value> = std::fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|event: &Value| event["crate_name"] == "proxy_key_fixture")
+        .collect();
+    assert_eq!(events.len(), 2, "events: {events:#?}");
+    assert_eq!(events[0]["result"], "miss", "events: {events:#?}");
+    assert_eq!(
+        events[1]["result"], "local_hit",
+        "the wrapper saw the proxy's rustflags in its environment: {events:#?}"
+    );
+    assert_eq!(events[0]["cache_key"], events[1]["cache_key"]);
+}
+
+#[test]
+fn worktree_build_dir_stays_out_of_nested_cargo_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let cache = root.join("cache");
+    let guest = root.join("guest");
+    let host = root.join("host");
+    let nested_target = root.join("nested-target");
+    std::fs::create_dir_all(home.join(".cargo")).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::create_dir_all(guest.join("src")).unwrap();
+    std::fs::create_dir_all(host.join("src")).unwrap();
+    std::fs::write(
+        guest.join("Cargo.toml"),
+        "[package]\nname = \"proxy_guest\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(guest.join("src/lib.rs"), "pub fn guest() {}\n").unwrap();
+    std::fs::write(
+        host.join("Cargo.toml"),
+        "[package]\nname = \"proxy_host\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(host.join("src/lib.rs"), "pub fn host() {}\n").unwrap();
+    // The usual guest-build shape: a build script runs Cargo on another
+    // workspace and picks a private target directory for it.
+    std::fs::write(
+        host.join("build.rs"),
+        format!(
+            "fn main() {{\n    \
+                 let status = std::process::Command::new(std::env::var_os(\"CARGO\").unwrap())\n        \
+                     .args([\"build\", \"--quiet\", \"--manifest-path\", {:?}, \"--target-dir\", {:?}])\n        \
+                     .status()\n        \
+                     .unwrap();\n    \
+                 assert!(status.success(), \"nested cargo failed\");\n\
+             }}\n",
+            guest.join("Cargo.toml"),
+            nested_target,
+        ),
+    )
+    .unwrap();
+
+    let mut command = proxied_cargo(&home, &cache, &root.join("target"));
+    command
+        .args(["cargo", "--", "build", "--quiet"])
+        .current_dir(&host)
+        .env("KACHE_REAL_CARGO", env!("CARGO"))
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_BUILD_DIR");
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "proxied cargo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        host.join("target/debug/.fingerprint").is_dir(),
+        "the proxied build keeps its own intermediates in the worktree"
+    );
+    assert!(
+        nested_target.join("debug/.fingerprint").is_dir(),
+        "the nested build must keep its intermediates where its build script put them"
+    );
+    assert!(
+        !guest.join("target").exists(),
+        "the proxy's build-dir redirected a nested Cargo build into its source tree"
+    );
+}
+
 #[test]
 fn explicit_rustflags_keep_their_cargo_precedence() {
     let dir = tempfile::tempdir().unwrap();
@@ -205,7 +347,7 @@ fn configured_build_dir_reaches_cargo_without_proxy_override() {
     .unwrap();
     kache_fs::testutil::write_executable(
         &fake_cargo,
-        "#!/bin/sh\nprintf '%s' \"${CARGO_BUILD_BUILD_DIR-unset}\" > \"$KACHE_TEST_CAPTURE\"\n",
+        "#!/bin/sh\nprintf '%s %s' \"${CARGO_BUILD_BUILD_DIR-unset}\" \"$*\" > \"$KACHE_TEST_CAPTURE\"\n",
     );
 
     let output = Command::new(KACHE_BIN)
@@ -226,7 +368,7 @@ fn configured_build_dir_reaches_cargo_without_proxy_override() {
     );
     assert_eq!(
         std::fs::read_to_string(capture).unwrap(),
-        "unset",
+        "unset build",
         "a config-defined build-dir must retain Cargo precedence"
     );
 }

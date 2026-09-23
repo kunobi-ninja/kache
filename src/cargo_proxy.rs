@@ -12,7 +12,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ENCODED_SEPARATOR: char = '\x1f';
-const WORKTREE_BUILD_DIR: &str = "{workspace-root}/target";
+const WORKTREE_BUILD_DIR_CONFIG: &str = "build.build-dir=\"{workspace-root}/target\"";
+/// Where the collapsed flags go. `--config` arrays append to config-file
+/// arrays, so `build.rustflags` cannot be replaced from the command line.
+/// Cargo uses matching `target.*.rustflags` instead of `build.rustflags`, and
+/// `cfg(all())` matches every target. No plan is made when target rustflags or
+/// a rustflags environment variable exist, so nothing else is shadowed.
+/// Cargo's first target-info probe runs before `cfg` keys match and still sees
+/// the duplicate; compiled units do not.
+const ALL_TARGETS_RUSTFLAGS_KEY: &str = "target.\"cfg(all())\".rustflags";
 
 #[derive(Debug, Clone)]
 struct ConfigSource {
@@ -25,7 +33,7 @@ struct ConfigSource {
 
 #[derive(Debug)]
 struct NormalizationPlan {
-    encoded_rustflags: String,
+    rustflags: Vec<String>,
     snapshots: Vec<ConfigSource>,
     cwd: PathBuf,
     cargo_home: PathBuf,
@@ -56,8 +64,10 @@ enum PlanDecision {
 pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the Cargo working directory")?;
     let cargo = real_cargo_program()?;
-    let mut command = Command::new(&cargo);
-    command.args(&cargo_args).current_dir(&cwd);
+    // Overrides reach Cargo as `--config` arguments, which only this Cargo
+    // process reads. Exported variables would also reach rustc, build scripts,
+    // and any nested Cargo they start.
+    let mut config_overrides = Vec::new();
 
     // Cargo owns freshness before RUSTC_WRAPPER runs. Sharing its intermediate
     // fingerprint directory across worktrees can therefore declare the wrong
@@ -92,7 +102,7 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
                     aliases = ?plan.duplicate_paths,
                     "collapsing canonical duplicate Cargo rustflags source"
                 );
-                command.env("CARGO_ENCODED_RUSTFLAGS", &plan.encoded_rustflags);
+                config_overrides.push(rustflags_config_override(&plan.rustflags));
             }
         }
         PlanDecision::Refused(reason) => {
@@ -109,7 +119,7 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
     // override a newly configured build-dir policy with stale information.
     if let Some(plan) = build_dir_plan {
         if build_dir_plan_is_current(&plan) {
-            command.env("CARGO_BUILD_BUILD_DIR", WORKTREE_BUILD_DIR);
+            config_overrides.push(WORKTREE_BUILD_DIR_CONFIG.to_string());
         } else {
             eprintln!(
                 "kache: Cargo config changed while build-dir isolation was being inspected; \
@@ -117,6 +127,11 @@ pub(crate) fn run(cargo_args: Vec<OsString>) -> Result<()> {
             );
         }
     }
+
+    let mut command = Command::new(&cargo);
+    command
+        .args(cargo_invocation_args(&cargo_args, &config_overrides))
+        .current_dir(&cwd);
 
     #[cfg(unix)]
     {
@@ -233,9 +248,8 @@ fn normalization_plan(cwd: &Path, cargo_args: &[OsString]) -> PlanDecision {
             "the canonical duplicate has no array-valued build.rustflags".into(),
         );
     }
-    let encoded_rustflags = rustflags.join("\x1f");
     PlanDecision::Apply(NormalizationPlan {
-        encoded_rustflags,
+        rustflags,
         snapshots: sources,
         cwd: cwd.to_path_buf(),
         cargo_home,
@@ -272,10 +286,7 @@ fn supported_cargo_command(args: &[OsString]) -> std::result::Result<(), String>
     let Some((first, remaining)) = args.split_first() else {
         return Err("no Cargo build/check command was provided".into());
     };
-    let (command, trailing) = if first
-        .to_str()
-        .is_some_and(|argument| argument.starts_with('+'))
-    {
+    let (command, trailing) = if is_toolchain_selector(first) {
         remaining
             .split_first()
             .ok_or_else(|| "no Cargo build/check command was provided".to_string())?
@@ -295,6 +306,30 @@ fn supported_cargo_command(args: &[OsString]) -> std::result::Result<(), String>
         return Err("Cargo -C/-Z/--config arguments are not normalized".into());
     }
     Ok(())
+}
+
+/// rustup reads a `+toolchain` selector only as Cargo's first argument.
+fn is_toolchain_selector(arg: &OsStr) -> bool {
+    arg.to_str().is_some_and(|arg| arg.starts_with('+'))
+}
+
+/// Insert `--config` overrides ahead of the Cargo command, after any
+/// toolchain selector.
+fn cargo_invocation_args(args: &[OsString], overrides: &[String]) -> Vec<OsString> {
+    let selector = args.first().is_some_and(|arg| is_toolchain_selector(arg));
+    let (selector, rest) = args.split_at(usize::from(selector));
+    let mut invocation = selector.to_vec();
+    for value in overrides {
+        invocation.push("--config".into());
+        invocation.push(value.into());
+    }
+    invocation.extend_from_slice(rest);
+    invocation
+}
+
+fn rustflags_config_override(flags: &[String]) -> String {
+    let flags = toml::Value::Array(flags.iter().cloned().map(toml::Value::String).collect());
+    format!("{ALL_TARGETS_RUSTFLAGS_KEY}={flags}")
 }
 
 fn worktree_build_dir_isolation_plan(
@@ -593,6 +628,50 @@ mod tests {
     }
 
     #[test]
+    fn config_overrides_follow_a_toolchain_selector() {
+        let args = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        let overrides = ["a=1".to_string(), "b=2".to_string()];
+        assert_eq!(
+            cargo_invocation_args(&args(&["build", "--quiet"]), &overrides),
+            args(&["--config", "a=1", "--config", "b=2", "build", "--quiet"])
+        );
+        assert_eq!(
+            cargo_invocation_args(&args(&["+nightly", "check"]), &overrides),
+            args(&["+nightly", "--config", "a=1", "--config", "b=2", "check"])
+        );
+        assert_eq!(
+            cargo_invocation_args(&args(&["+nightly", "check"]), &[]),
+            args(&["+nightly", "check"])
+        );
+        assert_eq!(
+            cargo_invocation_args(&[], &overrides[..1]),
+            args(&["--config", "a=1"])
+        );
+    }
+
+    #[test]
+    fn config_overrides_name_the_intended_cargo_keys() {
+        let flags = [
+            "--cfg".to_string(),
+            "a=\"b c\"".to_string(),
+            "-Clink-arg=C:\\lib".to_string(),
+        ];
+        let parsed: toml::Table = toml::from_str(&rustflags_config_override(&flags)).unwrap();
+        assert_eq!(parsed.len(), 1, "one dotted key: {parsed:?}");
+        let expected: Vec<toml::Value> = flags.iter().cloned().map(toml::Value::String).collect();
+        assert_eq!(
+            parsed["target"]["cfg(all())"]["rustflags"],
+            toml::Value::Array(expected)
+        );
+
+        let parsed: toml::Table = toml::from_str(WORKTREE_BUILD_DIR_CONFIG).unwrap();
+        assert_eq!(
+            parsed["build"]["build-dir"].as_str(),
+            Some("{workspace-root}/target")
+        );
+    }
+
+    #[test]
     fn worktree_build_dir_is_scoped_and_respects_explicit_env() {
         let build = [OsString::from("build")];
         let check = [OsString::from("check"), OsString::from("--workspace")];
@@ -816,7 +895,7 @@ mod tests {
             .map(|(path, _)| path)
             .collect();
         let plan = NormalizationPlan {
-            encoded_rustflags: "--cfg=home".into(),
+            rustflags: vec!["--cfg=home".into()],
             snapshots: vec![read_source(home_config, true).unwrap()],
             cwd: cwd.clone(),
             cargo_home,

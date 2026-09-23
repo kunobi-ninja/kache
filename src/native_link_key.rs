@@ -778,8 +778,9 @@ pub(crate) struct LinkArgInputs {
 /// output or a pattern is skipped (see [`takes_non_input_value`]). `-L<dir>`
 /// and `-L <dir>` add a search directory; any other search-path spelling
 /// (`-L=`, `--library-path`, a dangling `-L`) is an error rather than a
-/// directory we would not search. `-l<name>`, `-l <name>`, `--library=<name>`
-/// and `--library <name>` add a library for the caller to resolve.
+/// directory we would not search. `-l<name>`, `-l <name>`, `--library=<name>`,
+/// `--library <name>` and ld64's `-hidden-l<name>` and its kin (see
+/// [`ld64_library_option`]) add a library for the caller to resolve.
 pub(crate) fn unix_link_arg_inputs(key: &str, value: &str) -> Result<LinkArgInputs> {
     let arguments: Vec<&str> = if key == "link-args" {
         value.split_whitespace().collect()
@@ -816,6 +817,7 @@ pub(crate) fn unix_link_arg_inputs(key: &str, value: &str) -> Result<LinkArgInpu
         } else if let Some(name) = token
             .strip_prefix("--library=")
             .or_else(|| token.strip_prefix("-l"))
+            .or_else(|| ld64_library_option(token))
         {
             if name.is_empty() {
                 bail!("`{token}` without a library in linker argument {value:?}");
@@ -839,6 +841,27 @@ pub(crate) fn unix_link_arg_inputs(key: &str, value: &str) -> Result<LinkArgInpu
         }
     }
     Ok(inputs)
+}
+
+/// The name an ld64 `-<modifier>-l<name>` option asks for: `man ld` says each
+/// of these looks the library up like `-l`, and `-hidden-l` and `-force-l`
+/// take only an archive. `None` for any other token, `-rpath-link` included.
+/// A token that starts with `-l` is a plain `-l`, as GNU ld reads it.
+fn ld64_library_option(token: &str) -> Option<&str> {
+    let (modifier, name) = token.strip_prefix('-')?.split_once("-l")?;
+    matches!(
+        modifier,
+        "hidden"
+            | "force"
+            | "needed"
+            | "reexport"
+            | "upward"
+            | "weak"
+            | "assert-weak"
+            | "delay"
+            | "merge"
+    )
+    .then_some(name)
 }
 
 /// A `-l` name as `(name, verbatim)`: `:file` names the file itself.
@@ -3731,6 +3754,8 @@ mod tests {
             ("link-arg", "-Wl,-l,"),
             ("link-arg", "-Wl,--library"),
             ("link-arg", "-Wl,--library="),
+            ("link-arg", "-Wl,-hidden-l"),
+            ("link-arg", "-Wl,-needed-l,"),
         ] {
             assert!(
                 unix_link_arg_inputs(key, value).is_err(),
@@ -3758,6 +3783,30 @@ mod tests {
         assert_eq!(libs("link-arg", "-Wl,--library,foo"), lib("foo", false));
         let inputs = unix_link_arg_inputs("link-args", "-lfoo /b/extra.o").unwrap();
         assert_eq!(inputs.files, [PathBuf::from("/b/extra.o")]);
+
+        // ld64 looks the name after each of these modifiers up like `-l`.
+        for modifier in [
+            "hidden",
+            "force",
+            "needed",
+            "reexport",
+            "upward",
+            "weak",
+            "assert-weak",
+            "delay",
+            "merge",
+        ] {
+            assert_eq!(
+                libs("link-arg", &format!("-Wl,-{modifier}-lfoo")),
+                lib("foo", false),
+                "{modifier}"
+            );
+        }
+        assert_eq!(
+            libs("link-args", "-Wl,-hidden-l:libfoo.a"),
+            lib("libfoo.a", true)
+        );
+        assert!(libs("link-arg", "-Wl,-rpath-link,/d").is_empty());
     }
 
     /// The value of an option that names an output or a pattern is no input,

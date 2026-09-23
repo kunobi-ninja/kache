@@ -67,6 +67,15 @@ gitignore = true
 # helpers (build_deterministic_tar, collect_files_recursively) are NOT
 # excluded; Linux-runnable tests cover them.
 #
+# `MacOsPlatform::verified_loadable_dir` and the host gate at the top of
+# `MacOsPlatform::ensure_binary_loadable` are the same situation: on this
+# lane the method returns None, or Unverified without running `codesign`,
+# whatever the gate does, because `codesign` does not exist here either. The
+# decision itself is `signs_on_load`, which stays in scope and is tested for
+# every arch and OS pair, as is `macos_verified_loadable_dir`. The same
+# `delete !` pattern also names the `!status.success()` after signing, which
+# only runs where `codesign` does.
+#
 # `default_cache_executables` is a per-platform constant: on this lane the
 # real value IS true, so the with-true replacement is value-identical here
 # (the with-false variant is caught); the macOS/Windows Test lanes pin
@@ -280,6 +289,8 @@ exclude_re = [
     # all asserted.
     "replace != with == in capture_rustc_stderr",
     "MacOsPlatform>::package_debug_bundle",
+    "replace <impl Platform for MacOsPlatform>::verified_loadable_dir -> Option<PathBuf> with None",
+    "delete ! in <impl Platform for MacOsPlatform>::ensure_binary_loadable",
     "replace default_cache_executables -> bool with true",
     "replace \\| with \\^ in touch_mtime_write_clock",
     "replace \\| with & in touch_mtime_write_clock",

@@ -4948,10 +4948,24 @@ fn materialize_cached_artifact(
         .then(|| crate::cache_key::FileFingerprint::from_path(target_path).ok())
         .flatten();
 
+    // A blob whose restored bytes this host already verified needs no second
+    // check: the file about to be checked is that blob, byte for byte.
+    let verified = (!rewrote_content)
+        .then(|| platform.verified_loadable_dir())
+        .flatten()
+        .map(|dir| VerifiedLoadable::new(&dir, &cached_file.hash));
+    let known_loadable = verified.as_ref().is_some_and(VerifiedLoadable::is_recorded);
+    let mut verified_now = false;
     for action in &external {
-        action
+        if known_loadable && matches!(action, crate::compiler::PostRestoreAction::Sign(_)) {
+            continue;
+        }
+        let loadability = action
             .apply(target_path, platform)
             .with_context(|| format!("{context}: applying {action:?}"))?;
+        if loadability == crate::compiler::Loadability::Verified {
+            verified_now = true;
+        }
     }
 
     if rewrote_content {
@@ -4961,11 +4975,47 @@ fn materialize_cached_artifact(
         return Ok(RestoredBytes::Rewritten);
     };
     let untouched = external.is_empty() || before.is_some_and(|before| before == after);
+    if untouched
+        && verified_now
+        && let Some(verified) = &verified
+    {
+        verified.record();
+    }
     Ok(if untouched {
         RestoredBytes::ExactBlobCopy(after)
     } else {
         RestoredBytes::Rewritten
     })
+}
+
+/// The memo that one store blob, restored unchanged, passed this host's
+/// loadability check: an empty file named by the blob's hash under
+/// [`crate::compiler::Platform::verified_loadable_dir`].
+struct VerifiedLoadable(PathBuf);
+
+impl VerifiedLoadable {
+    fn new(dir: &Path, hash: &str) -> Self {
+        Self(dir.join(hash))
+    }
+
+    fn is_recorded(&self) -> bool {
+        self.0.is_file()
+    }
+
+    /// Best effort: without the memo the next restore runs the check again.
+    fn record(&self) {
+        let written = self
+            .0
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&self.0, b""));
+        if let Err(error) = written {
+            tracing::debug!(
+                "could not remember {} as loadable: {error}",
+                self.0.display()
+            );
+        }
+    }
 }
 
 /// Restore cached artifacts to the target output paths.
@@ -10737,16 +10787,20 @@ mod tests {
     #[test]
     fn materialize_reports_a_mutating_external_action_as_not_exact() {
         /// Stands in for `codesign` re-signing a restored binary.
-        struct RewritingPlatform;
+        struct RewritingPlatform(PathBuf);
         impl crate::compiler::Platform for RewritingPlatform {
             fn name(&self) -> &'static str {
                 "rewriting"
             }
-            fn ensure_binary_loadable(&self, path: &Path) -> Result<()> {
+            fn ensure_binary_loadable(&self, path: &Path) -> Result<crate::compiler::Loadability> {
                 let mut content = std::fs::read(path)?;
                 content.extend_from_slice(b"signature");
                 std::fs::write(path, content)?;
-                Ok(())
+                // Claims a pass, so only the rewrite keeps it from the memo.
+                Ok(crate::compiler::Loadability::Verified)
+            }
+            fn verified_loadable_dir(&self) -> Option<PathBuf> {
+                Some(self.0.clone())
             }
             fn package_debug_bundle(
                 &self,
@@ -10775,7 +10829,7 @@ mod tests {
             dir.path(),
             None,
             &[],
-            &RewritingPlatform,
+            &RewritingPlatform(dir.path().join("verified")),
             "test restore",
             None,
         )
@@ -10787,6 +10841,101 @@ mod tests {
             b"\x7fELF unsignedsignature",
             "the double should have rewritten the restored artifact"
         );
+        assert!(
+            !dir.path().join("verified").join(hash).exists(),
+            "a check that changed the file proves nothing about the blob"
+        );
+    }
+
+    /// Restore `hash` as a dynamic library at `target` through `platform`.
+    fn restore_loadable(
+        store: &Store,
+        hash: &str,
+        target: &Path,
+        platform: &dyn crate::compiler::Platform,
+    ) -> RestoredBytes {
+        let anchor = target.parent().unwrap();
+        materialize_cached_artifact(
+            &BlobSource::Store(store),
+            &cached_file("libmac.so", hash),
+            target,
+            ArtifactKind::DynamicLibrary,
+            None,
+            anchor,
+            anchor,
+            None,
+            &[],
+            platform,
+            "test restore",
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A blob restored unchanged that passed the check once is not checked
+    /// again on this host, and both restores stay exact.
+    #[test]
+    fn a_blob_that_passed_the_loadability_check_is_not_checked_again() {
+        use crate::compiler::platform::tests::CountingPlatform;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&test_config(dir.path().join("cache"))).unwrap();
+        let hash = "5555555555555555555555555555555555555555555555555555555555555555";
+        create_blob(&store, hash, b"\x7fELF signed");
+        let memo = dir.path().join("verified");
+        let platform = CountingPlatform::verifying_into(memo.clone());
+
+        let first = restore_loadable(&store, hash, &dir.path().join("a/libmac.so"), &platform);
+        assert_eq!(platform.ensure_calls(), 1);
+        assert!(
+            memo.join(hash).is_file(),
+            "the pass is remembered by blob hash"
+        );
+
+        let second = restore_loadable(&store, hash, &dir.path().join("b/libmac.so"), &platform);
+        assert_eq!(
+            platform.ensure_calls(),
+            1,
+            "the second restore skips the check"
+        );
+        assert!(matches!(first, RestoredBytes::ExactBlobCopy(_)));
+        assert!(matches!(second, RestoredBytes::ExactBlobCopy(_)));
+    }
+
+    /// Only a pass is remembered: a host that proved nothing checks every time.
+    #[test]
+    fn an_unproven_loadability_check_runs_on_every_restore() {
+        struct Unproven(PathBuf, std::sync::atomic::AtomicUsize);
+        impl crate::compiler::Platform for Unproven {
+            fn name(&self) -> &'static str {
+                "unproven"
+            }
+            fn ensure_binary_loadable(&self, _path: &Path) -> Result<crate::compiler::Loadability> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(crate::compiler::Loadability::Unverified)
+            }
+            fn verified_loadable_dir(&self) -> Option<PathBuf> {
+                Some(self.0.clone())
+            }
+            fn package_debug_bundle(
+                &self,
+                _binary: &Path,
+                _staging_dir: &Path,
+            ) -> Result<Option<PathBuf>> {
+                Ok(None)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&test_config(dir.path().join("cache"))).unwrap();
+        let hash = "6666666666666666666666666666666666666666666666666666666666666666";
+        create_blob(&store, hash, b"\x7fELF unchecked");
+        let platform = Unproven(dir.path().join("verified"), Default::default());
+
+        restore_loadable(&store, hash, &dir.path().join("a/libmac.so"), &platform);
+        restore_loadable(&store, hash, &dir.path().join("b/libmac.so"), &platform);
+        assert_eq!(platform.1.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(!dir.path().join("verified").join(hash).exists());
     }
 
     // ── debug bundles (kunobi-ninja/kache#319) ───────────────────────

@@ -755,13 +755,17 @@ pub(crate) fn ends_with_ignore_ascii_case(token: &str, suffix: &str) -> bool {
 }
 
 /// What a `-C link-arg`/`link-args` value hands a Unix linker driver besides
-/// flags: input files named by path, and `-L` search directories.
+/// flags: input files named by path, `-L` search directories and `-l`
+/// libraries.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct LinkArgInputs {
     /// Linker inputs named by path, in argument order.
     pub files: Vec<PathBuf>,
     /// `-L` search directories, in argument order.
     pub dirs: Vec<PathBuf>,
+    /// `-l` libraries as `(name, verbatim)`, in argument order. `-l:file`
+    /// names the file itself.
+    pub libs: Vec<(String, bool)>,
 }
 
 /// Parse one `link-arg` or `link-args` value (`key`) for a Unix link.
@@ -770,10 +774,12 @@ pub(crate) struct LinkArgInputs {
 /// a `-Wl,` argument carries comma-separated linker tokens. A token that names
 /// an input file by extension (see [`link_token_names_input_file`]), bare or
 /// as the value of a `--option=value`, must be an absolute path, so the key
-/// can hash the file the linker reads. `-L<dir>` and `-L <dir>` add a search
-/// directory; any other search-path spelling (`-L=`, `--library-path`, a
-/// dangling `-L`) is an error rather than a directory we would not search.
-/// `-l` names are left to the caller's `-L` resolution.
+/// can hash the file the linker reads. The value of an option that names an
+/// output or a pattern is skipped (see [`takes_non_input_value`]). `-L<dir>`
+/// and `-L <dir>` add a search directory; any other search-path spelling
+/// (`-L=`, `--library-path`, a dangling `-L`) is an error rather than a
+/// directory we would not search. `-l<name>`, `-l <name>`, `--library=<name>`
+/// and `--library <name>` add a library for the caller to resolve.
 pub(crate) fn unix_link_arg_inputs(key: &str, value: &str) -> Result<LinkArgInputs> {
     let arguments: Vec<&str> = if key == "link-args" {
         value.split_whitespace().collect()
@@ -789,20 +795,37 @@ pub(crate) fn unix_link_arg_inputs(key: &str, value: &str) -> Result<LinkArgInpu
     }
     let mut inputs = LinkArgInputs::default();
     let mut tokens = tokens.into_iter();
+    let value_of = |option: &str, next: Option<&str>| {
+        next.filter(|next| !next.is_empty())
+            .map(str::to_string)
+            .with_context(|| format!("`{option}` without a value in linker argument {value:?}"))
+    };
     while let Some(token) = tokens.next() {
         if token == "-L" {
-            let dir = tokens
-                .next()
-                .filter(|dir| !dir.is_empty())
-                .with_context(|| {
-                    format!("`-L` without a directory in linker argument {value:?}")
-                })?;
-            inputs.dirs.push(PathBuf::from(dir));
+            inputs
+                .dirs
+                .push(PathBuf::from(value_of(token, tokens.next())?));
         } else if token.starts_with("-L=") || token.starts_with("--library-path") {
             bail!("unmodeled library search path {token:?} in linker argument {value:?}");
         } else if let Some(dir) = token.strip_prefix("-L") {
             inputs.dirs.push(PathBuf::from(dir));
-        } else if !token.starts_with("-l") {
+        } else if token == "-l" || token == "--library" {
+            inputs
+                .libs
+                .push(library_request(&value_of(token, tokens.next())?));
+        } else if let Some(name) = token
+            .strip_prefix("--library=")
+            .or_else(|| token.strip_prefix("-l"))
+        {
+            if name.is_empty() {
+                bail!("`{token}` without a library in linker argument {value:?}");
+            }
+            inputs.libs.push(library_request(name));
+        } else if takes_non_input_value(token) {
+            if !token.contains('=') {
+                tokens.next();
+            }
+        } else {
             let operand = match token.strip_prefix("--") {
                 Some(_) => token.split_once('=').map_or(token, |(_, value)| value),
                 None => token,
@@ -816,6 +839,28 @@ pub(crate) fn unix_link_arg_inputs(key: &str, value: &str) -> Result<LinkArgInpu
         }
     }
     Ok(inputs)
+}
+
+/// A `-l` name as `(name, verbatim)`: `:file` names the file itself.
+fn library_request(name: &str) -> (String, bool) {
+    match name.strip_prefix(':') {
+        Some(file) => (file.to_string(), true),
+        None => (name.to_string(), false),
+    }
+}
+
+/// Whether `token` is a linker option whose value names an output or a
+/// pattern, though it may end like an input: `--exclude-libs libssl.a`,
+/// `--out-implib foo.dll.a`, `-object_path_lto lto.o`. Either dash count, with
+/// the value after `=` or in the next token.
+fn takes_non_input_value(token: &str) -> bool {
+    let option = token.split_once('=').map_or(token, |(option, _)| option);
+    option.strip_prefix('-').is_some_and(|option| {
+        matches!(
+            option.trim_start_matches('-'),
+            "exclude-libs" | "out-implib" | "object_path_lto"
+        )
+    })
 }
 
 fn windows_tool_from_name(path: &Path) -> Option<WindowsTool> {
@@ -3649,8 +3694,8 @@ mod tests {
             paths(&["/b/syms.o"])
         );
         assert_eq!(files("link-arg", "/b/FOO.LIB"), paths(&["/b/FOO.LIB"]));
-        // Names for the caller's `-L` resolution and plain flags carry no file.
-        for value in ["-lfoo", "-l:libfoo.a", "-fuse-ld=lld", "--gc-sections"] {
+        // Plain flags carry no file.
+        for value in ["-fuse-ld=lld", "--gc-sections"] {
             assert_eq!(
                 parse("link-arg", value),
                 LinkArgInputs::default(),
@@ -3682,12 +3727,67 @@ mod tests {
             ("link-arg", "-L=/d"),
             ("link-arg", "-Wl,--library-path=/d"),
             ("link-args", "--library-path /d"),
+            ("link-arg", "-l"),
+            ("link-arg", "-Wl,-l,"),
+            ("link-arg", "-Wl,--library"),
+            ("link-arg", "-Wl,--library="),
         ] {
             assert!(
                 unix_link_arg_inputs(key, value).is_err(),
                 "{key}={value} must fail"
             );
         }
+    }
+
+    /// `-l` libraries a link argument names, in each spelling, for the
+    /// caller to resolve.
+    #[cfg(unix)]
+    #[test]
+    fn unix_link_arg_inputs_collect_libraries() {
+        let libs = |key: &str, value: &str| unix_link_arg_inputs(key, value).unwrap().libs;
+        let lib = |name: &str, verbatim| vec![(name.to_string(), verbatim)];
+        assert_eq!(libs("link-arg", "-lfoo"), lib("foo", false));
+        assert_eq!(libs("link-arg", "-l:libfoo.a"), lib("libfoo.a", true));
+        assert_eq!(
+            libs("link-arg", "-Wl,--whole-archive,-lfoo,--no-whole-archive"),
+            lib("foo", false)
+        );
+        assert_eq!(libs("link-args", "-l foo"), lib("foo", false));
+        assert_eq!(libs("link-arg", "-Wl,-l,:foo.a"), lib("foo.a", true));
+        assert_eq!(libs("link-arg", "-Wl,--library=foo"), lib("foo", false));
+        assert_eq!(libs("link-arg", "-Wl,--library,foo"), lib("foo", false));
+        let inputs = unix_link_arg_inputs("link-args", "-lfoo /b/extra.o").unwrap();
+        assert_eq!(inputs.files, [PathBuf::from("/b/extra.o")]);
+    }
+
+    /// The value of an option that names an output or a pattern is no input,
+    /// whatever it ends in, and an input after it still counts.
+    #[cfg(unix)]
+    #[test]
+    fn unix_link_arg_inputs_skip_output_and_pattern_values() {
+        let files = |key: &str, value: &str| unix_link_arg_inputs(key, value).unwrap().files;
+        for (key, value) in [
+            ("link-arg", "-Wl,--exclude-libs,libssl.a"),
+            ("link-arg", "-Wl,--exclude-libs=libssl.a:libcrypto.a"),
+            ("link-arg", "-Wl,-exclude-libs,libssl.a"),
+            ("link-arg", "-Wl,--out-implib,/abs/foo.dll.a"),
+            ("link-arg", "-Wl,--out-implib=/abs/foo.dll.a"),
+            ("link-arg", "-Wl,-object_path_lto,/abs/lto.o"),
+            ("link-args", "-Wl,--exclude-libs libssl.a"),
+            ("link-arg", "-Wl,--exclude-libs"),
+        ] {
+            assert!(files(key, value).is_empty(), "{key}={value}");
+        }
+        assert_eq!(
+            files("link-arg", "-Wl,--exclude-libs=libssl.a,/b/libfoo.a"),
+            [PathBuf::from("/b/libfoo.a")]
+        );
+        assert_eq!(
+            files("link-arg", "-Wl,--exclude-libs,libssl.a,/b/libfoo.a"),
+            [PathBuf::from("/b/libfoo.a")]
+        );
+        assert!(!takes_non_input_value("exclude-libs"), "an operand");
+        assert!(!takes_non_input_value("--whole-archive"));
     }
 
     #[test]

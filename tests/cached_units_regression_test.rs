@@ -767,11 +767,22 @@ fn main() {{
     )
 }
 
-/// A workspace of `bundler` (see [`bundler_build_script`]), whose library
-/// calls the archive's function, and `app`, which prints its value.
-/// `attribute` goes on bundler's `extern` block. With `mid`, app reaches
-/// bundler only through a `mid` library in between.
-fn write_bundler_workspace(root: &Path, link: &str, attribute: &str, mid: bool) {
+/// Where the `extern` block that calls the archive's function lives.
+#[derive(Clone, Copy, PartialEq)]
+enum Caller {
+    /// In `bundler`; `app` depends on it.
+    Bundler,
+    /// In `bundler`; `app` reaches it only through a `mid` library.
+    BundlerBehindMid,
+    /// In `mid`, which depends on `bundler` for its `-L` alone; `app`
+    /// depends on mid.
+    Mid,
+}
+
+/// A workspace of `bundler` (see [`bundler_build_script`]), a library that
+/// calls the archive's function (see [`Caller`]), and `app`, which prints its
+/// value. `attribute` goes on the `extern` block.
+fn write_bundler_workspace(root: &Path, link: &str, attribute: &str, caller: Caller) {
     let write = |relative: &str, content: &str| {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -787,6 +798,7 @@ fn write_bundler_workspace(root: &Path, link: &str, attribute: &str, mid: bool) 
         }
         manifest
     };
+    let mid = caller != Caller::Bundler;
     let members = if mid {
         "[\"bundler\", \"mid\", \"app\"]"
     } else {
@@ -798,19 +810,22 @@ fn write_bundler_workspace(root: &Path, link: &str, attribute: &str, mid: bool) 
     );
     write("bundler/Cargo.toml", &package("bundler", None));
     write("bundler/build.rs", &bundler_build_script(link));
-    write(
-        "bundler/src/lib.rs",
-        &format!(
-            "{attribute}\nextern \"C\" {{\n    fn bundled_value() -> u32;\n}}\n\n\
-             pub fn value() -> u32 {{\n    unsafe {{ bundled_value() }}\n}}\n"
-        ),
+    let calling = format!(
+        "{attribute}\nextern \"C\" {{\n    fn bundled_value() -> u32;\n}}\n\n\
+         pub fn value() -> u32 {{\n    unsafe {{ bundled_value() }}\n}}\n"
     );
+    let forwarding = "pub fn value() -> u32 {\n    bundler::value()\n}\n";
+    let (bundler, mid_source) = match caller {
+        Caller::Bundler | Caller::BundlerBehindMid => (calling.as_str(), forwarding),
+        Caller::Mid => (
+            "//! Only the build script's search path is used.\n",
+            calling.as_str(),
+        ),
+    };
+    write("bundler/src/lib.rs", bundler);
     let direct = if mid {
         write("mid/Cargo.toml", &package("mid", Some("bundler")));
-        write(
-            "mid/src/lib.rs",
-            "pub fn value() -> u32 {\n    bundler::value()\n}\n",
-        );
+        write("mid/src/lib.rs", mid_source);
         "mid"
     } else {
         "bundler"
@@ -833,7 +848,7 @@ fn write_bundling_workspace(root: &Path) {
         root,
         "println!(\"cargo:rustc-link-lib=static:+whole-archive=bundled\");",
         "",
-        false,
+        Caller::Bundler,
     );
 }
 
@@ -844,7 +859,7 @@ fn write_transitive_bundling_workspace(root: &Path) {
         root,
         "println!(\"cargo:rustc-link-lib=static=bundled\");",
         "",
-        true,
+        Caller::BundlerBehindMid,
     );
 }
 
@@ -855,7 +870,18 @@ fn write_attribute_bundling_workspace(root: &Path) {
         root,
         "",
         "#[link(name = \"bundled\", kind = \"static\")]",
-        false,
+        Caller::Bundler,
+    );
+}
+
+/// `mid` names bundler's archive in a `#[link]` attribute, so it bundles an
+/// archive from a dependency's OUT_DIR, not its own.
+fn write_dependency_attribute_bundling_workspace(root: &Path) {
+    write_bundler_workspace(
+        root,
+        "",
+        "#[link(name = \"bundled\", kind = \"static\")]",
+        Caller::Mid,
     );
 }
 
@@ -962,25 +988,44 @@ fn a_rebuilt_archive_two_crates_down_reaches_the_binary() {
 }
 
 /// A `#[link(kind = "static")]` attribute bundles the archive into the rlib
-/// with no `-l` on the command line, so the key cannot see the archive. The
-/// rlib is not stored: a fresh target directory compiles it again, and a
-/// rebuilt archive reaches the binary.
+/// with no `-l` on the command line. The archive is in bundler's own OUT_DIR,
+/// whose archives key its rlib, so the rlib is stored and restored, and a
+/// rebuilt archive re-keys it.
 #[test]
-fn rlib_bundling_unkeyed_archive_is_not_stored() {
+fn rlib_bundling_its_own_out_dir_archive_is_keyed() {
     let fx = fixture_from(write_attribute_bundling_workspace);
     let crates = ["bundler", "app"];
 
     let (cold, printed) = build_bundled(&fx, &target(&fx, "cold"), "1", &crates);
-    assert_eq!(cold[0], ["skipped"], "bundler is compiled, not stored");
+    assert_eq!(cold[0], ["miss"]);
     assert_eq!(printed, "bundled value 1");
 
     let warm = target(&fx, "warm");
     let (second, printed) = build_bundled(&fx, &warm, "1", &crates);
-    assert_eq!(
-        second[0],
-        ["skipped"],
-        "the second build must compile bundler"
-    );
+    assert_eq!(second[0], ["local_hit"], "bundler is restored");
+    assert_eq!(printed, "bundled value 1");
+
+    let (rebuilt, printed) = build_bundled(&fx, &warm, "2", &crates);
+    assert_eq!(printed, "bundled value 2", "{rebuilt:?}");
+    assert_eq!(rebuilt[0], ["miss"], "the rebuilt archive re-keys bundler");
+}
+
+/// An attribute in `mid` bundles an archive from bundler's OUT_DIR, which
+/// Cargo hands mid only as a search path. The key cannot see that archive, so
+/// mid's rlib is not stored: a fresh target directory compiles it again, and
+/// a rebuilt archive reaches the binary.
+#[test]
+fn rlib_bundling_unkeyed_archive_is_not_stored() {
+    let fx = fixture_from(write_dependency_attribute_bundling_workspace);
+    let crates = ["mid", "app"];
+
+    let (cold, printed) = build_bundled(&fx, &target(&fx, "cold"), "1", &crates);
+    assert_eq!(cold[0], ["skipped"], "mid is compiled, not stored");
+    assert_eq!(printed, "bundled value 1");
+
+    let warm = target(&fx, "warm");
+    let (second, printed) = build_bundled(&fx, &warm, "1", &crates);
+    assert_eq!(second[0], ["skipped"], "the second build must compile mid");
     assert_eq!(printed, "bundled value 1");
 
     let (rebuilt, printed) = build_bundled(&fx, &warm, "2", &crates);

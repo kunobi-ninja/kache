@@ -771,8 +771,20 @@ thread_local! {
 pub struct KeyedNativeArchives {
     /// Archives whose content the key folded.
     pub archives: Vec<PathBuf>,
+    /// The keyed archives the unit's rlib carries, through a bundled `-l
+    /// static` spec. The other keyed archives are not in the rlib.
+    pub bundled: Vec<BundledArchive>,
     /// The unit's `native=`, `all=` and bare `-L` dirs, without repeats.
     pub dirs: Vec<PathBuf>,
+}
+
+/// A keyed archive an rlib bundles, and how rustc stores it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundledArchive {
+    pub path: PathBuf,
+    /// Stored as one member named after the archive file (`+whole-archive`)
+    /// rather than member by member.
+    pub packed: bool,
 }
 
 thread_local! {
@@ -1978,6 +1990,8 @@ pub fn compute_cache_key(
     // OUT_DIR dirs a `cc`/`cmake` build script emits; `dependency=`/`crate=` are
     // cargo's own rlib dirs (redundant with content-hashed externs).
     let mut native_search_dirs: Vec<PathBuf> = Vec::new();
+    // `framework=` dirs, the only ones rustc hands the linker as `-F`.
+    let mut framework_search_dirs: Vec<PathBuf> = Vec::new();
     for spec in &args.link_search {
         // Only split on a *recognized* kind so a path containing '='
         // isn't mis-parsed (matches rustc's own `-L` parsing).
@@ -1992,6 +2006,9 @@ pub fn compute_cache_key(
         // default kind is `all`); a `static=` lib can resolve in any of them.
         if matches!(kind, None | Some("native") | Some("all")) {
             native_search_dirs.push(PathBuf::from(path));
+        }
+        if kind == Some("framework") {
+            framework_search_dirs.push(PathBuf::from(path));
         }
         let normalized = path_normalizer.normalize(path);
         hasher.update(b"link_search:");
@@ -2014,8 +2031,8 @@ pub fn compute_cache_key(
     // the output: an unchanged key there is a stale-artifact false hit (#421).
     // [`fold_native_link_inputs`] hashes the archives a unit's output carries:
     // its `static` specs, the archives a Unix link picks for its other `-l`
-    // specs, files named in its link arguments, and every archive in its
-    // build-tree `-L` dirs. A `:RENAME` or unknown modifier is uncacheable.
+    // specs, files named in its link arguments, and every archive in its `-L`
+    // dirs. A `:RENAME` or unknown modifier is uncacheable.
     // Direct command-line native Windows MSVC libraries are handled separately
     // below: their import-library bytes affect the executable and are hashed
     // as part of the host link identity, which refuses files handed to LINK
@@ -2034,11 +2051,37 @@ pub fn compute_cache_key(
         cfg!(target_os = "windows"),
         get_rustc_version,
     )?;
+    // Only a link searches for libraries, so only a link reads the host.
+    let link_rustc_version = if args.invokes_linker() {
+        Some(rustc_version_for_native_link(
+            args,
+            &rustc_version,
+            get_rustc_version,
+        )?)
+    } else {
+        None
+    };
+    let rustc_host = link_rustc_version.as_deref().and_then(rustc_host_triple);
+    let target = link_target(args.target.as_deref(), rustc_host);
+    let unit_out_dir = std::env::var_os("OUT_DIR").map(PathBuf::from);
     let native_archives = fold_native_link_inputs(
         &mut hasher,
         args,
-        &native_search_dirs,
-        native_windows_msvc,
+        &NativeSearchDirs {
+            native: &native_search_dirs,
+            framework: &framework_search_dirs,
+        },
+        &NativeLinkContext {
+            native_windows_msvc,
+            target,
+            default_dirs: default_library_dirs(
+                target,
+                rustc_host,
+                std::env::var_os("LIBRARY_PATH").as_deref(),
+            ),
+            out_dir: unit_out_dir.as_deref(),
+            path_normalizer,
+        },
         file_hasher,
     )?;
     // An rlib that bundles an archive the key did not hash is refused at
@@ -2647,14 +2690,15 @@ fn unix_library_request(spec: &str) -> Option<(&str, bool)> {
 
 /// The archive a Unix linker takes for `-l name`, if it takes one. The first
 /// dir with a candidate wins. It supplies the archive when it holds no shared
-/// library (`.so`, `.dylib`, `.tbd`) for the name, or when the link is static
-/// (`prefer_static`), where shared libraries are not candidates. A verbatim
-/// name is its own only candidate.
+/// library for the name (`lib{name}.{ext}` for each of `shared_extensions`),
+/// or when the link is static (`prefer_static`), where shared libraries are
+/// not candidates. A verbatim name is its own only candidate.
 fn resolve_unix_library(
     name: &str,
     verbatim: bool,
     dirs: &[PathBuf],
     prefer_static: bool,
+    shared_extensions: &[&str],
     is_file: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
     let (archive, shared) = if verbatim {
@@ -2665,8 +2709,11 @@ fn resolve_unix_library(
     } else if prefer_static {
         (format!("lib{name}.a"), Vec::new())
     } else {
-        let shared = ["so", "dylib", "tbd"].map(|extension| format!("lib{name}.{extension}"));
-        (format!("lib{name}.a"), shared.to_vec())
+        let shared = shared_extensions
+            .iter()
+            .map(|extension| format!("lib{name}.{extension}"))
+            .collect();
+        (format!("lib{name}.a"), shared)
     };
     for dir in dirs {
         let has_archive = is_file(&dir.join(&archive));
@@ -2676,6 +2723,17 @@ fn resolve_unix_library(
         }
     }
     None
+}
+
+/// The shared libraries a Unix linker for `target` prefers to `lib{name}.a`
+/// in the same dir: ld64 also reads `.tbd` and `.dylib`, ELF linkers only
+/// `.so`.
+fn shared_library_extensions(target: &str) -> &'static [&'static str] {
+    if target.contains("-apple-") {
+        &["tbd", "dylib", "so"]
+    } else {
+        &["so"]
+    }
 }
 
 /// Whether the linker takes only archives for `-l`: the last `crt-static`
@@ -2694,41 +2752,119 @@ fn prefers_static_libraries(target_features: &[&str], target: &str) -> bool {
         .unwrap_or_else(|| target.contains("musl"))
 }
 
+/// The target a unit links for: `--target`, or else the wrapped rustc's host
+/// (from `rustc -vV`), never the target kache itself was built for.
+fn link_target<'a>(target: Option<&'a str>, rustc_host: Option<&'a str>) -> &'a str {
+    target.or(rustc_host).unwrap_or("unknown")
+}
+
+/// The dirs a host-native Unix linker searches for `-l` after the `-L` dirs,
+/// in its order: `LIBRARY_PATH`, then the system and local install dirs,
+/// where a library the build names only by `-l` may live. A cross link
+/// searches its own sysroot, and other targets resolve libraries elsewhere,
+/// so both get none. The compiler's private library dir is left to its
+/// identity.
+fn default_library_dirs(
+    target: &str,
+    rustc_host: Option<&str>,
+    library_path: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    if rustc_host != Some(target) {
+        return Vec::new();
+    }
+    let fixed: Vec<String> = if target.contains("-apple-") {
+        vec!["/usr/lib".into(), "/usr/local/lib".into()]
+    } else if target.contains("-linux-") {
+        let multiarch = multiarch_name(target);
+        vec![
+            format!("/usr/local/lib/{multiarch}"),
+            format!("/lib/{multiarch}"),
+            format!("/usr/lib/{multiarch}"),
+            "/usr/local/lib64".into(),
+            "/lib64".into(),
+            "/usr/lib64".into(),
+            "/usr/local/lib".into(),
+            "/lib".into(),
+            "/usr/lib".into(),
+        ]
+    } else {
+        return Vec::new();
+    };
+    library_path
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .chain(fixed.into_iter().map(PathBuf::from))
+        .collect()
+}
+
+/// A Debian-style multiarch dir name: the triple without its vendor
+/// (`x86_64-unknown-linux-gnu` is `x86_64-linux-gnu`).
+fn multiarch_name(target: &str) -> String {
+    match target.split('-').collect::<Vec<_>>()[..] {
+        [arch, _vendor, os, env] => format!("{arch}-{os}-{env}"),
+        _ => target.to_string(),
+    }
+}
+
 /// Whether a file name marks a native archive: `*.a` or `*.lib`, in any case.
 fn is_native_archive_name(name: &str) -> bool {
     crate::native_link_key::ends_with_ignore_ascii_case(name, ".a")
         || crate::native_link_key::ends_with_ignore_ascii_case(name, ".lib")
 }
 
-/// The dirs among `dirs` that lie under one of `roots` (the build tree), in
-/// order and without repeats. Archives there are the build's own; the rest
-/// are system libraries the toolchain identity already stands for.
-fn build_tree_native_dirs(dirs: &[PathBuf], roots: &[PathBuf]) -> Vec<PathBuf> {
+/// Whether a path, in the key's normalized spelling, lies inside a Cargo
+/// registry package or git checkout. Cargo treats both as fixed for the
+/// version or revision the path names, and so does the scan: the key holds
+/// that path, so an archive shipped in such a package is not read.
+fn is_cargo_package_dir(normalized: &str) -> bool {
+    let Some(rest) = normalized.strip_prefix("<CARGO_HOME>") else {
+        return false;
+    };
+    let mut parts = rest.split(['/', '\\']).filter(|part| !part.is_empty());
+    matches!(
+        (parts.next(), parts.next()),
+        (Some("registry"), Some("src")) | (Some("git"), Some("checkouts"))
+    )
+}
+
+/// `dirs` in order, without repeats.
+fn unique_dirs<'a>(dirs: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
     let mut kept: Vec<PathBuf> = Vec::new();
     for dir in dirs {
-        if roots.iter().any(|root| dir.starts_with(root)) && !kept.contains(dir) {
+        if !kept.contains(dir) {
             kept.push(dir.clone());
         }
     }
     kept
 }
 
+/// The dirs among `dirs` outside Cargo packages (see [`is_cargo_package_dir`]),
+/// each spelled for the key by `normalize`.
+fn dirs_outside_packages<'a>(
+    dirs: &'a [PathBuf],
+    normalize: impl Fn(&str) -> String + 'a,
+) -> impl Iterator<Item = &'a PathBuf> {
+    dirs.iter()
+        .filter(move |dir| !is_cargo_package_dir(&normalize(&dir.to_string_lossy())))
+}
+
+/// The dirs among `dirs` inside `root`. Both are compared resolved: a build
+/// script can spell its OUT_DIR through a symlink the environment does not.
+fn dirs_under(dirs: &[PathBuf], root: &Path) -> Vec<PathBuf> {
+    let root = resolved_path(root);
+    dirs.iter()
+        .filter(|dir| resolved_path(dir).starts_with(&root))
+        .cloned()
+        .collect()
+}
+
 /// The regular `*.a` and `*.lib` files directly in `dir`, sorted. A missing
 /// dir holds none; any other read failure is an error.
 pub(crate) fn native_dir_archives(dir: &Path) -> Result<Vec<PathBuf>> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading native search dir {}", dir.display()));
-        }
-    };
     let mut archives = Vec::new();
-    for entry in entries {
-        let path = entry
-            .with_context(|| format!("reading native search dir {}", dir.display()))?
-            .path();
+    for path in native_dir_entries(dir)? {
         if path
             .file_name()
             .is_some_and(|name| is_native_archive_name(&name.to_string_lossy()))
@@ -2737,22 +2873,69 @@ pub(crate) fn native_dir_archives(dir: &Path) -> Result<Vec<PathBuf>> {
             archives.push(path);
         }
     }
-    archives.sort();
     Ok(archives)
 }
 
-/// Fold every archive in `dirs` (see [`native_dir_archives`]) as
-/// `<dir index>/<file name>=<digest>`, and return the archives hashed.
+/// The static frameworks directly in `dir`, sorted: `Name.framework/Name`
+/// when it is an `ar` archive. ld64 links such a framework into the output
+/// like an archive; a dynamic one is referenced by name.
+fn native_dir_static_frameworks(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut frameworks = Vec::new();
+    for path in native_dir_entries(dir)? {
+        let Some(name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".framework"))
+        else {
+            continue;
+        };
+        let binary = path.join(name);
+        if binary.is_file() && crate::native_archive::has_archive_magic(&binary)? {
+            frameworks.push(binary);
+        }
+    }
+    Ok(frameworks)
+}
+
+/// The entries of `dir`, sorted. A missing dir has none; any other read
+/// failure is an error.
+fn native_dir_entries(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading native search dir {}", dir.display()));
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        paths.push(
+            entry
+                .with_context(|| format!("reading native search dir {}", dir.display()))?
+                .path(),
+        );
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Fold every archive `list` finds in `dirs` as `<dir index>/<path in the
+/// dir>=<digest>`, and return the archives hashed.
 fn fold_native_dir_archives<H: KeyFold>(
     hasher: &mut H,
     dirs: &[PathBuf],
+    list: impl Fn(&Path) -> Result<Vec<PathBuf>>,
     hash: impl Fn(&Path) -> Result<String>,
 ) -> Result<Vec<PathBuf>> {
     let mut hashed = Vec::new();
     for (index, dir) in dirs.iter().enumerate() {
-        for archive in native_dir_archives(dir)? {
+        for archive in list(dir)? {
             let digest = hash(&archive)?;
-            let name = archive.file_name().unwrap_or_default().to_string_lossy();
+            let name = archive
+                .strip_prefix(dir)
+                .unwrap_or(&archive)
+                .to_string_lossy();
             fold_field(
                 hasher,
                 b"native_dir_archive.v1:",
@@ -2777,7 +2960,32 @@ pub(crate) fn needs_native_bundle_audit(args: &RustcArgs, native_dirs: &[PathBuf
     args.emits_rlib() && !native_dirs.is_empty()
 }
 
-/// The `-L` dirs and input files of this unit's `link-arg`/`link-args` values.
+/// Whether `-Z packed-bundled-libs` makes rustc store every bundled archive
+/// as one member. Its value is not read: counting the flag as on only
+/// credits an rlib less (see the wrapper's bundle audit).
+fn packs_bundled_libs(unstable_flags: &[String]) -> bool {
+    unstable_flags.iter().any(|flag| {
+        let name = flag.split_once('=').map_or(flag.as_str(), |(name, _)| name);
+        name.replace('_', "-") == "packed-bundled-libs"
+    })
+}
+
+/// Whether this compile's rlib carries the archive a `static` `spec`
+/// resolves to, and if so whether packed as one member (`Some(true)`) or
+/// member by member (`Some(false)`). `packs_all` is [`packs_bundled_libs`].
+fn rlib_bundle(spec: &StaticLibSpec<'_>, emits_rlib: bool, packs_all: bool) -> Option<bool> {
+    match spec {
+        StaticLibSpec::Archive {
+            bundle: true,
+            whole_archive,
+            ..
+        } if emits_rlib => Some(*whole_archive || packs_all),
+        _ => None,
+    }
+}
+
+/// The `-L` dirs, input files and `-l` libraries of this unit's
+/// `link-arg`/`link-args` values.
 fn unix_link_arguments(args: &RustcArgs) -> Result<crate::native_link_key::LinkArgInputs> {
     let mut inputs = crate::native_link_key::LinkArgInputs::default();
     for (key, value) in &args.codegen_opts {
@@ -2785,9 +2993,57 @@ fn unix_link_arguments(args: &RustcArgs) -> Result<crate::native_link_key::LinkA
             let parsed = crate::native_link_key::unix_link_arg_inputs(key, value)?;
             inputs.files.extend(parsed.files);
             inputs.dirs.extend(parsed.dirs);
+            inputs.libs.extend(parsed.libs);
         }
     }
     Ok(inputs)
+}
+
+/// A unit's `-L` dirs that name native libraries: `native=`, `all=` and bare
+/// (`native`), and `framework=` (`framework`).
+struct NativeSearchDirs<'a> {
+    native: &'a [PathBuf],
+    framework: &'a [PathBuf],
+}
+
+/// What [`fold_native_link_inputs`] knows about a unit beyond its argv.
+struct NativeLinkContext<'a> {
+    /// A native Windows MSVC link, whose libraries and link-argument files
+    /// the MSVC identity keys instead.
+    native_windows_msvc: bool,
+    /// The target the unit links for (see [`link_target`]).
+    target: &'a str,
+    /// Where a Unix linker looks for `-l` after the `-L` dirs (see
+    /// [`default_library_dirs`]).
+    default_dirs: Vec<PathBuf>,
+    /// The unit's own OUT_DIR, which Cargo sets for a package with a build
+    /// script.
+    out_dir: Option<&'a Path>,
+    /// Gives dirs their key spelling (see [`is_cargo_package_dir`]).
+    path_normalizer: &'a PathNormalizer,
+}
+
+/// The `-L` dirs (`dirs`) whose every archive keys this unit. A unit whose
+/// output carries the native closure (see [`RustcArgs::links_native_closure`])
+/// takes all of them but those inside a Cargo package. An rlib takes those
+/// under its own OUT_DIR, which a `#[link(kind = "static")]` attribute can
+/// bundle from with no `-l` on argv. Other units take none.
+fn native_scan_dirs(
+    args: &RustcArgs,
+    dirs: &[PathBuf],
+    context: &NativeLinkContext<'_>,
+) -> Vec<PathBuf> {
+    if args.links_native_closure() {
+        unique_dirs(dirs_outside_packages(dirs, |dir| {
+            context.path_normalizer.normalize(dir)
+        }))
+    } else if args.emits_rlib()
+        && let Some(out_dir) = context.out_dir
+    {
+        unique_dirs(&dirs_under(dirs, out_dir))
+    } else {
+        Vec::new()
+    }
 }
 
 /// Fold the native inputs that reach this unit's output and return what was
@@ -2797,28 +3053,40 @@ fn unix_link_arguments(args: &RustcArgs) -> Result<crate::native_link_key::LinkA
 ///   unit that finds it in no `-L` dir refuses the key, since the linker may
 ///   take a system copy);
 /// - on a Unix link, the archive the linker picks for a kindless or `dylib`
-///   spec, and the files its link arguments name;
-/// - on a linking unit or staticlib, every archive in its `-L` dirs under the
-///   Cargo profile dir or the workspace root. Cargo hands a build script's
-///   `-L` to every dependent, so this keys archives that reach the output
-///   only through a dependency's rlib, whose own bytes no `--extern` of this
-///   unit covers.
+///   spec, and the files and `-l` libraries its link arguments name, looked
+///   up in the `-L` dirs and then the linker's default dirs;
+/// - every archive in the `-L` dirs [`native_scan_dirs`] picks, and on a
+///   linking unit every static framework in its `framework=` dirs. Cargo
+///   hands a build script's `-L` to every dependent, so this keys archives
+///   that reach the output only through a dependency's rlib, whose own bytes
+///   no `--extern` of this unit covers.
+///
+/// The scan keys a linked output to every archive its `-L` dirs hold, so an
+/// archive a build script rebuilds with different bytes each run (a build
+/// date, say) re-keys every linked unit downstream, as its output changes
+/// too. An archive whose members the portable digest does not admit (wasm or
+/// COFF objects, LTO bitcode) keys with its path, so a linked output that
+/// finds one in a build-tree dir hits only in the checkout that stored it.
+///
+/// Not keyed: a library a dependency's metadata names and the linker finds
+/// only in its default dirs, which no argv of this unit shows, and the
+/// compiler's own library dirs, which its identity stands for.
 fn fold_native_link_inputs<H: KeyFold>(
     hasher: &mut H,
     args: &RustcArgs,
-    native_search_dirs: &[PathBuf],
-    native_windows_msvc: bool,
+    search: &NativeSearchDirs<'_>,
+    context: &NativeLinkContext<'_>,
     file_hasher: &FileHasher<'_>,
 ) -> Result<KeyedNativeArchives> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
     let links = args.invokes_linker();
-    let unix_link = links && !native_windows_msvc;
+    let unix_link = links && !context.native_windows_msvc;
     let link_arguments = if unix_link {
         unix_link_arguments(args)?
     } else {
         crate::native_link_key::LinkArgInputs::default()
     };
-    // Compared resolved, like the scan dirs below.
+    // Compared resolved, like OUT_DIR in [`dirs_under`].
     let oso_root =
         crate::compiler::rustc::oso_prefix_root_for_key(args).map(|root| resolved_path(&root));
     let archive_use = |path: &Path| match oso_root.as_deref() {
@@ -2836,48 +3104,61 @@ fn fold_native_link_inputs<H: KeyFold>(
         );
         Ok::<_, anyhow::Error>(digest)
     };
-    let mut lib_dirs = native_search_dirs.to_vec();
+    let mut lib_dirs = search.native.to_vec();
     lib_dirs.extend(link_arguments.dirs.iter().cloned());
+    // Where a Unix linker looks for an `-l`: the `-L` dirs, then its own.
+    let mut library_dirs = lib_dirs.clone();
+    library_dirs.extend(context.default_dirs.iter().cloned());
     let target_features: Vec<&str> = args
         .codegen_opts
         .iter()
         .filter(|(key, _)| key == "target-feature")
         .filter_map(|(_, value)| value.as_deref())
         .collect();
-    let target = args
-        .target
-        .as_deref()
-        .unwrap_or_else(|| host_target_triple());
-    let prefer_static = prefers_static_libraries(&target_features, target);
+    let prefer_static = prefers_static_libraries(&target_features, context.target);
+    let shared_extensions = shared_library_extensions(context.target);
+    let packs_all = packs_bundled_libs(&args.unstable_flags);
 
     let mut archives = Vec::new();
+    let mut bundled = Vec::new();
     for lib in &args.link_libs {
         hasher.update(b"link_lib:");
         hasher.update(lib.as_bytes());
         hasher.update(b"\n");
         tracing::trace!("[key:{}] link_lib:{}", crate_name, lib);
 
-        let dirs = if unix_link {
-            &lib_dirs
-        } else {
-            native_search_dirs
-        };
+        let dirs = if unix_link { &lib_dirs } else { search.native };
+        let spec = static_lib_spec(lib);
         let mut resolved = resolve_native_static_lib(lib, dirs, file_hasher, links, archive_use)?;
-        let is_static = matches!(static_lib_spec(lib), StaticLibSpec::Archive { .. });
+        let is_static = matches!(spec, StaticLibSpec::Archive { .. });
         if resolved.is_none()
             && is_static
-            && unresolved_static_lib_is_error(links, native_windows_msvc)
+            && unresolved_static_lib_is_error(links, context.native_windows_msvc)
         {
             anyhow::bail!(
                 "native static library {lib:?} is in no -L directory; the linker could take \
                  a copy the key does not hash"
             );
         }
+        if let Some((path, _)) = &resolved
+            && let Some(packed) = rlib_bundle(&spec, args.emits_rlib(), packs_all)
+        {
+            bundled.push(BundledArchive {
+                path: path.clone(),
+                packed,
+            });
+        }
         if resolved.is_none()
             && unix_link
             && let Some((name, verbatim)) = unix_library_request(lib)
-            && let Some(path) =
-                resolve_unix_library(name, verbatim, &lib_dirs, prefer_static, Path::is_file)
+            && let Some(path) = resolve_unix_library(
+                name,
+                verbatim,
+                &library_dirs,
+                prefer_static,
+                shared_extensions,
+                Path::is_file,
+            )
         {
             let hash = hash_archive(&path)?;
             resolved = Some((path, hash));
@@ -2916,31 +3197,52 @@ fn fold_native_link_inputs<H: KeyFold>(
         tracing::trace!("[key:{}] link_arg_input:{}", crate_name, file.display());
     }
 
-    if args.links_native_closure() {
-        // Compared resolved: a restored build-script run can report its
-        // OUT_DIR through a symlink-free spelling of the same target dir.
-        let dirs: Vec<PathBuf> = lib_dirs.iter().map(|dir| resolved_path(dir)).collect();
-        let roots: Vec<PathBuf> = [
-            args.out_dir
-                .as_deref()
-                .and_then(crate::compiler::platform::cargo_profile_dir),
-            args.path_normalization_root().map(Path::to_path_buf),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|root| resolved_path(&root))
-        .collect();
-        let tree_dirs = build_tree_native_dirs(&dirs, &roots);
-        archives.extend(fold_native_dir_archives(hasher, &tree_dirs, hash_archive)?);
-    }
-
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for dir in native_search_dirs {
-        if !dirs.contains(dir) {
-            dirs.push(dir.clone());
+    // A `-Bstatic` in the link arguments can make the linker skip a shared
+    // library, so the first archive for the name counts.
+    for (index, (name, verbatim)) in link_arguments.libs.iter().enumerate() {
+        if let Some(path) = resolve_unix_library(
+            name,
+            *verbatim,
+            &library_dirs,
+            true,
+            shared_extensions,
+            Path::is_file,
+        ) {
+            let digest = hash_archive(&path)?;
+            fold_field(
+                hasher,
+                b"link_arg_library.v1:",
+                format!("{index}={digest}").as_bytes(),
+            );
+            tracing::trace!("[key:{}] link_arg_library:{}", crate_name, path.display());
+            archives.push(path);
         }
     }
-    Ok(KeyedNativeArchives { archives, dirs })
+
+    let scan_dirs = native_scan_dirs(args, &lib_dirs, context);
+    archives.extend(fold_native_dir_archives(
+        hasher,
+        &scan_dirs,
+        native_dir_archives,
+        hash_archive,
+    )?);
+    if links {
+        let framework_dirs = unique_dirs(dirs_outside_packages(search.framework, |dir| {
+            context.path_normalizer.normalize(dir)
+        }));
+        archives.extend(fold_native_dir_archives(
+            hasher,
+            &framework_dirs,
+            native_dir_static_frameworks,
+            hash_archive,
+        )?);
+    }
+
+    Ok(KeyedNativeArchives {
+        archives,
+        bundled,
+        dirs: unique_dirs(search.native),
+    })
 }
 
 /// Auxiliary linker files are not yet captured/restored as cache artifacts.
@@ -3035,8 +3337,13 @@ enum StaticLibSpec<'a> {
     /// dirs. `+whole-archive` and `+as-needed` change how the archive is
     /// linked, not which file it is; the raw spec already keys them. `bundle`
     /// is the last `±bundle`: an rlib or staticlib leaves a `-bundle` archive
-    /// out of its output.
-    Archive { files: Vec<String>, bundle: bool },
+    /// out of its output. `whole_archive` is the last `±whole-archive`, under
+    /// which an rlib stores the archive as one member.
+    Archive {
+        files: Vec<String>,
+        bundle: bool,
+        whole_archive: bool,
+    },
     /// A `:RENAME` or an unknown modifier. Which file rustc reads is not
     /// modelled, so the invocation must not be cached on the name alone.
     Unmodeled(&'a str),
@@ -3059,13 +3366,16 @@ fn static_lib_spec(spec: &str) -> StaticLibSpec<'_> {
     }
     let mut verbatim = false;
     let mut bundle = true;
+    let mut whole_archive = false;
     for modifier in modifiers.split(',').filter(|m| !m.is_empty()) {
         match modifier {
             "+verbatim" => verbatim = true,
             "-verbatim" => verbatim = false,
             "+bundle" => bundle = true,
             "-bundle" => bundle = false,
-            "+whole-archive" | "-whole-archive" | "+as-needed" | "-as-needed" => {}
+            "+whole-archive" => whole_archive = true,
+            "-whole-archive" => whole_archive = false,
+            "+as-needed" | "-as-needed" => {}
             _ => return StaticLibSpec::Unmodeled(spec),
         }
     }
@@ -3074,7 +3384,11 @@ fn static_lib_spec(spec: &str) -> StaticLibSpec<'_> {
     } else {
         vec![format!("lib{name}.a"), format!("{name}.lib")]
     };
-    StaticLibSpec::Archive { files, bundle }
+    StaticLibSpec::Archive {
+        files,
+        bundle,
+        whole_archive,
+    }
 }
 
 /// The normalized key value for a path-only env dep: the `<OUT_DIR:unit>`
@@ -9603,17 +9917,24 @@ mod tests {
 
     #[test]
     fn static_lib_spec_models_kind_modifiers_and_rename() {
-        let archive = |files: &[&str], bundle| StaticLibSpec::Archive {
+        let archive = |files: &[&str], bundle, whole_archive| StaticLibSpec::Archive {
             files: files.iter().map(|file| file.to_string()).collect(),
             bundle,
+            whole_archive,
         };
-        let plain = || archive(&["libfoo.a", "foo.lib"], true);
+        let plain = || archive(&["libfoo.a", "foo.lib"], true, false);
+        let whole = || archive(&["libfoo.a", "foo.lib"], true, true);
         assert_eq!(static_lib_spec("static=foo"), plain());
         // Modifiers that change how the archive links, not which file it is.
-        assert_eq!(static_lib_spec("static:+whole-archive=foo"), plain());
+        assert_eq!(static_lib_spec("static:+whole-archive=foo"), whole());
+        // The last `±whole-archive` wins.
+        assert_eq!(
+            static_lib_spec("static:+whole-archive,-whole-archive=foo"),
+            plain()
+        );
         assert_eq!(
             static_lib_spec("static:-bundle=foo"),
-            archive(&["libfoo.a", "foo.lib"], false)
+            archive(&["libfoo.a", "foo.lib"], false, false)
         );
         assert_eq!(static_lib_spec("static:+bundle,-as-needed=foo"), plain());
         // The last `±bundle` wins.
@@ -9621,7 +9942,7 @@ mod tests {
         // `+verbatim` names the file exactly; a later `-verbatim` undoes it.
         assert_eq!(
             static_lib_spec("static:+whole-archive,+verbatim=foo.a"),
-            archive(&["foo.a"], true)
+            archive(&["foo.a"], true, true)
         );
         assert_eq!(static_lib_spec("static:+verbatim,-verbatim=foo"), plain());
         // Rename, unknown modifiers and an empty name are not modelled.
@@ -10544,7 +10865,6 @@ mod tests {
     struct NativeTree {
         _tmp: tempfile::TempDir,
         deps: PathBuf,
-        #[cfg_attr(windows, allow(dead_code))]
         out: PathBuf,
         elsewhere: PathBuf,
     }
@@ -10591,11 +10911,55 @@ mod tests {
     }
 
     /// Key `argv`, rewrite `file` with new bytes, and key it again.
+    #[cfg(not(windows))]
     fn keys_around_rewrite(argv: &[String], file: &Path) -> (String, String) {
         std::fs::write(file, b"v1 native bytes").unwrap();
         let before = key_of_flags(argv);
         std::fs::write(file, b"v2 native bytes, different").unwrap();
         (before, key_of_flags(argv))
+    }
+
+    /// A Unix link context for `target` with no default dirs, no OUT_DIR and
+    /// no path rules.
+    fn unix_context<'a>(target: &'a str, normalizer: &'a PathNormalizer) -> NativeLinkContext<'a> {
+        NativeLinkContext {
+            native_windows_msvc: false,
+            target,
+            default_dirs: Vec::new(),
+            out_dir: None,
+            path_normalizer: normalizer,
+        }
+    }
+
+    /// [`fold_native_link_inputs`] for `argv` with explicit search dirs and
+    /// context: the fold's digest and what it reports.
+    fn fold_inputs(
+        argv: &[String],
+        native: &[PathBuf],
+        framework: &[PathBuf],
+        context: &NativeLinkContext<'_>,
+    ) -> Result<(String, KeyedNativeArchives)> {
+        let args = RustcArgs::parse(argv).unwrap();
+        let mut hasher = blake3::Hasher::new();
+        let keyed = fold_native_link_inputs(
+            &mut hasher,
+            &args,
+            &NativeSearchDirs { native, framework },
+            context,
+            &FileHasher::new(),
+        )?;
+        Ok((hasher.finalize().to_hex().to_string(), keyed))
+    }
+
+    /// Whether rewriting `file` with new `ar` bytes changes the fold.
+    fn fold_rewrites(
+        file: &Path,
+        fold: impl Fn() -> Result<(String, KeyedNativeArchives)>,
+    ) -> bool {
+        std::fs::write(file, b"!<arch>\nv1 native bytes").unwrap();
+        let before = fold().unwrap().0;
+        std::fs::write(file, b"!<arch>\nv2 native bytes, different").unwrap();
+        before != fold().unwrap().0
     }
 
     /// Cargo passes a build script's `-L` to every dependent, so a binary two
@@ -10615,65 +10979,163 @@ mod tests {
         }
     }
 
-    /// The scan keys linked outputs only, and only archives in the build tree.
+    /// A `-L` dir outside the build tree (`OPENSSL_DIR`, a sibling build) is
+    /// handed to dependents too, and a dependency's rlib can carry its
+    /// archives just the same, so it is scanned like an OUT_DIR. So is a
+    /// `-L` in the link arguments.
     #[cfg(not(windows))]
     #[test]
-    fn build_tree_archive_scan_leaves_other_units_and_files_alone() {
+    fn linked_output_keys_archives_in_every_native_dir() {
         let _lock = key_test_lock();
         let tree = native_tree();
-        let search = format!("native={}", tree.out.display());
-        let rewrites = |argv: &[String], file: &Path| {
-            let (before, after) = keys_around_rewrite(argv, file);
-            before != after
+        let archive = tree.elsewhere.join("libssl.a");
+        let search = format!("native={}", tree.elsewhere.display());
+        for crate_type in ["bin", "test", "cdylib", "staticlib"] {
+            let argv = unit_args(crate_type, &tree.deps, &["-L", &search]);
+            let (before, after) = keys_around_rewrite(&argv, &archive);
+            assert_ne!(before, after, "{crate_type}");
+        }
+        let link_search = format!("-Clink-arg=-L{}", tree.elsewhere.display());
+        let (before, after) =
+            keys_around_rewrite(&unit_args("bin", &tree.deps, &[&link_search]), &archive);
+        assert_ne!(before, after, "a link-argument -L dir");
+
+        // A static framework in a `framework=` dir.
+        let bundle = tree.elsewhere.join("Foo.framework");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let frameworks = format!("framework={}", tree.elsewhere.display());
+        let bin = unit_args("bin", &tree.deps, &["-L", &frameworks]);
+        std::fs::write(bundle.join("Foo"), b"!<arch>\nv1 framework").unwrap();
+        let before = key_of_flags(&bin);
+        std::fs::write(bundle.join("Foo"), b"!<arch>\nv2 framework").unwrap();
+        assert_ne!(before, key_of_flags(&bin), "a static framework");
+    }
+
+    /// The scan keys linked outputs only, and only archives.
+    #[test]
+    fn archive_scan_leaves_other_units_and_files_alone() {
+        let tree = native_tree();
+        let normalizer = PathNormalizer::empty();
+        let context = unix_context("x86_64-unknown-linux-gnu", &normalizer);
+        let dirs = [tree.elsewhere.clone()];
+        let rewrites = |argv: Vec<String>, file: &Path| {
+            fold_rewrites(file, || fold_inputs(&argv, &dirs, &[], &context))
         };
-        let archive = tree.out.join("libfoo.a");
+        let archive = tree.elsewhere.join("libfoo.a");
+        assert!(!rewrites(unit_args("rlib", &tree.deps, &[]), &archive));
         assert!(!rewrites(
-            &unit_args("rlib", &tree.deps, &["-L", &search]),
+            unit_args("bin", &tree.deps, &["--emit=metadata"]),
             &archive
         ));
-        assert!(!rewrites(
-            &unit_args("bin", &tree.deps, &["-L", &search, "--emit=metadata"]),
-            &archive
-        ));
-        let outside = format!("native={}", tree.elsewhere.display());
-        assert!(!rewrites(
-            &unit_args("bin", &tree.deps, &["-L", &outside]),
-            &tree.elsewhere.join("libfoo.a")
-        ));
-        let bin = unit_args("bin", &tree.deps, &["-L", &search]);
-        assert!(!rewrites(&bin, &tree.out.join("libfoo.so")));
-        assert!(!rewrites(&bin, &tree.out.join("foo.o")));
+        let bin = unit_args("bin", &tree.deps, &[]);
+        assert!(rewrites(bin.clone(), &archive));
+        assert!(!rewrites(bin.clone(), &tree.elsewhere.join("libfoo.so")));
+        assert!(!rewrites(bin, &tree.elsewhere.join("foo.o")));
+    }
+
+    /// A `#[link(kind = "static")]` attribute bundles an archive into an rlib
+    /// with no `-l` on argv. The archives under the unit's own OUT_DIR key its
+    /// rlib, so the audit need not refuse it; dirs elsewhere do not.
+    #[test]
+    fn rlib_keys_archives_under_its_own_out_dir() {
+        let tree = native_tree();
+        let normalizer = PathNormalizer::empty();
+        let unit_out = tree.out.clone();
+        let own = tree.out.join("x64");
+        std::fs::create_dir_all(&own).unwrap();
+        let dirs = [own.clone(), tree.elsewhere.clone()];
+        let rlib = unit_args("rlib", &tree.deps, &[]);
+        let fold_with = |argv: &[String], out_dir: Option<&Path>| {
+            let context = NativeLinkContext {
+                out_dir,
+                ..unix_context("x86_64-unknown-linux-gnu", &normalizer)
+            };
+            fold_inputs(argv, &dirs, &[], &context)
+        };
+        let archive = own.join("libWebView2LoaderStatic.a");
+        assert!(fold_rewrites(&archive, || fold_with(
+            &rlib,
+            Some(&unit_out)
+        )));
+        assert_eq!(
+            fold_with(&rlib, Some(&unit_out)).unwrap().1.archives,
+            std::slice::from_ref(&archive)
+        );
+        assert!(!fold_rewrites(&tree.elsewhere.join("libdep.a"), || {
+            fold_with(&rlib, Some(&unit_out))
+        }));
+        assert!(!fold_rewrites(&archive, || fold_with(&rlib, None)));
+        let metadata = unit_args("rlib", &tree.deps, &["--emit=metadata"]);
+        assert!(!fold_rewrites(&archive, || fold_with(
+            &metadata,
+            Some(&unit_out)
+        )));
+
+        // Cargo's OUT_DIR and the build script's `-L` may spell the same dir
+        // differently.
+        #[cfg(unix)]
+        {
+            let alias = tree.elsewhere.join("alias");
+            std::os::unix::fs::symlink(&unit_out, &alias).unwrap();
+            assert!(fold_rewrites(&archive, || fold_with(&rlib, Some(&alias))));
+        }
     }
 
     #[test]
-    fn build_tree_native_dirs_keep_dirs_under_either_root_once() {
-        let profile = PathBuf::from("/w/target/debug");
-        let workspace = PathBuf::from("/w/src");
-        let dirs = [
-            "/w/target/debug/build/s-1/out",
-            "/usr/lib",
-            "/w/src/vendor/lib",
-            "/w/target/debug/build/s-1/out",
-            "/w/target/release/lib",
-        ]
-        .map(PathBuf::from);
-        let kept = |roots: &[PathBuf]| build_tree_native_dirs(&dirs, roots);
+    fn native_scan_dirs_follow_the_unit_and_skip_cargo_packages() {
+        let tree = native_tree();
+        let normalizer = PathNormalizer::empty();
+        let unit_out = tree.out.parent().unwrap().to_path_buf();
+        let context = NativeLinkContext {
+            out_dir: Some(&unit_out),
+            ..unix_context("x86_64-unknown-linux-gnu", &normalizer)
+        };
+        let dirs = [tree.out.clone(), tree.elsewhere.clone(), tree.out.clone()];
+        let scan = |crate_type: &str| {
+            let args = RustcArgs::parse(&unit_args(crate_type, &tree.deps, &[])).unwrap();
+            native_scan_dirs(&args, &dirs, &context)
+        };
+        assert_eq!(scan("bin"), [tree.out.clone(), tree.elsewhere.clone()]);
+        assert_eq!(scan("rlib"), std::slice::from_ref(&tree.out));
+        assert_eq!(scan("rlib,staticlib"), scan("bin"));
+
+        let package = PathBuf::from("/home/u/.cargo/registry/src/index-1/windows_x-0.52.6/lib");
+        let dirs = [package.clone(), tree.elsewhere.clone()];
+        let kept: Vec<&PathBuf> =
+            dirs_outside_packages(&dirs, |dir| dir.replace("/home/u/.cargo", "<CARGO_HOME>"))
+                .collect();
+        assert_eq!(kept, [&tree.elsewhere]);
+    }
+
+    #[test]
+    fn cargo_package_dirs_are_registry_sources_and_git_checkouts() {
+        assert!(is_cargo_package_dir(
+            "<CARGO_HOME>/registry/src/index.crates.io-1/foo-1.0.0/lib"
+        ));
+        assert!(is_cargo_package_dir(
+            "<CARGO_HOME>\\registry\\src\\index.crates.io-1\\foo-1.0.0\\lib"
+        ));
+        assert!(is_cargo_package_dir(
+            "<CARGO_HOME>/git/checkouts/foo-1a2b/3c4d/lib"
+        ));
+        assert!(!is_cargo_package_dir("<CARGO_HOME>/registry/cache/x"));
+        assert!(!is_cargo_package_dir("<CARGO_HOME>/git/db/x"));
+        assert!(!is_cargo_package_dir("<CARGO_HOME>/src/registry"));
+        assert!(!is_cargo_package_dir("/w/registry/src/index/foo-1.0.0/lib"));
+        assert!(!is_cargo_package_dir("<WORKSPACE>/registry/src/x"));
+    }
+
+    #[test]
+    fn dirs_under_compare_resolved_paths() {
+        let tree = native_tree();
+        let root = tree.out.parent().unwrap();
+        let dirs = [tree.out.clone(), tree.elsewhere.clone()];
+        assert_eq!(dirs_under(&dirs, root), std::slice::from_ref(&tree.out));
+        assert!(dirs_under(&dirs, &tree.deps).is_empty());
         assert_eq!(
-            kept(std::slice::from_ref(&profile)),
-            [PathBuf::from("/w/target/debug/build/s-1/out")]
+            unique_dirs(&[tree.out.clone(), tree.elsewhere.clone(), tree.out.clone()]),
+            [tree.out.clone(), tree.elsewhere.clone()]
         );
-        assert_eq!(
-            kept(std::slice::from_ref(&workspace)),
-            [PathBuf::from("/w/src/vendor/lib")]
-        );
-        assert_eq!(
-            kept(&[profile, workspace]),
-            [
-                PathBuf::from("/w/target/debug/build/s-1/out"),
-                PathBuf::from("/w/src/vendor/lib"),
-            ]
-        );
-        assert!(kept(&[]).is_empty());
     }
 
     #[test]
@@ -10712,8 +11174,55 @@ mod tests {
         assert!(!is_native_archive_name("libfoo.so"));
     }
 
-    /// Each scanned archive folds under its dir index and file name; a thin
-    /// archive, whose members live elsewhere, refuses the key.
+    /// ld64 links a static framework's binary into the output like an
+    /// archive; a dynamic framework, or a dir that is no framework, is not
+    /// one.
+    #[test]
+    fn native_dir_static_frameworks_list_archive_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        for (framework, bytes) in [
+            ("Static", &b"!<arch>\nmembers"[..]),
+            ("Dynamic", b"\xcf\xfa\xed\xfe dylib"),
+        ] {
+            let bundle = dir.path().join(format!("{framework}.framework"));
+            std::fs::create_dir_all(&bundle).unwrap();
+            std::fs::write(bundle.join(framework), bytes).unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("Empty.framework")).unwrap();
+        std::fs::create_dir_all(dir.path().join("Other")).unwrap();
+        std::fs::write(dir.path().join("Other/Other"), b"!<arch>\nx").unwrap();
+        assert_eq!(
+            native_dir_static_frameworks(dir.path()).unwrap(),
+            [dir.path().join("Static.framework/Static")]
+        );
+        assert!(
+            native_dir_static_frameworks(&dir.path().join("absent"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A linking unit hashes the static frameworks in its `framework=` dirs;
+    /// an rlib does not link them.
+    #[test]
+    fn linking_unit_keys_static_frameworks() {
+        let tree = native_tree();
+        let normalizer = PathNormalizer::empty();
+        let context = unix_context("aarch64-apple-darwin", &normalizer);
+        let bundle = tree.elsewhere.join("Foo.framework");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let binary = bundle.join("Foo");
+        let frameworks = [tree.elsewhere.clone()];
+        let rewrites = |crate_type: &str| {
+            let argv = unit_args(crate_type, &tree.deps, &["-l", "framework=Foo"]);
+            fold_rewrites(&binary, || fold_inputs(&argv, &[], &frameworks, &context))
+        };
+        assert!(rewrites("bin"));
+        assert!(!rewrites("rlib"));
+    }
+
+    /// Each scanned archive folds under its dir index and its path in the
+    /// dir; a thin archive, whose members live elsewhere, refuses the key.
     #[test]
     fn fold_native_dir_archives_names_dir_index_and_file() {
         let first = tempfile::tempdir().unwrap();
@@ -10723,7 +11232,7 @@ mod tests {
         let dirs = [first.path().to_path_buf(), second.path().to_path_buf()];
         let fold = |dirs: &[PathBuf]| {
             let mut hasher = blake3::Hasher::new();
-            let hashed = fold_native_dir_archives(&mut hasher, dirs, |path| {
+            let hashed = fold_native_dir_archives(&mut hasher, dirs, native_dir_archives, |path| {
                 Ok(std::fs::read_to_string(path)?)
             })
             .unwrap();
@@ -10740,61 +11249,130 @@ mod tests {
         );
         assert_eq!(fold(&[]).0, blake3::Hasher::new().finalize());
 
+        // A framework binary names its bundle too.
+        let bundle = first.path().join("Foo.framework");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("Foo"), b"!<arch>\nf").unwrap();
+        let mut hasher = blake3::Hasher::new();
+        fold_native_dir_archives(
+            &mut hasher,
+            &dirs[..1],
+            native_dir_static_frameworks,
+            |_| Ok("d".to_string()),
+        )
+        .unwrap();
+        let mut expected = blake3::Hasher::new();
+        let binary = Path::new("Foo.framework").join("Foo");
+        fold_field(
+            &mut expected,
+            b"native_dir_archive.v1:",
+            format!("0/{}=d", binary.display()).as_bytes(),
+        );
+        assert_eq!(hasher.finalize(), expected.finalize());
+
         std::fs::write(first.path().join("libthin.a"), b"!<thin>\n").unwrap();
         let mut hasher = blake3::Hasher::new();
-        let thin = fold_native_dir_archives(&mut hasher, &dirs, |path| {
+        let thin = fold_native_dir_archives(&mut hasher, &dirs, native_dir_archives, |path| {
             FileHasher::new().hash_static_lib(path)
         });
         assert!(thin.is_err(), "a thin archive refuses the key");
     }
 
     /// An rlib or staticlib leaves a `-bundle` archive out of its output, so
-    /// the archive must not key it; the unit that links it later does.
+    /// the archive must not key it by its spec; the unit that links it later
+    /// does.
     #[test]
     fn unbundled_static_lib_keys_only_the_unit_that_links_it() {
-        let _lock = key_test_lock();
         let tree = native_tree();
-        let search = format!("native={}", tree.elsewhere.display());
+        let normalizer = PathNormalizer::empty();
+        let context = unix_context("x86_64-unknown-linux-gnu", &normalizer);
+        let dirs = [tree.elsewhere.clone()];
         let archive = tree.elsewhere.join("libfoo.a");
         let rewrites = |crate_type: &str, spec: &str| {
-            let argv = unit_args(crate_type, &tree.deps, &["-L", &search, "-l", spec]);
-            let (before, after) = keys_around_rewrite(&argv, &archive);
-            before != after
+            let argv = unit_args(crate_type, &tree.deps, &["-l", spec]);
+            fold_rewrites(&archive, || fold_inputs(&argv, &dirs, &[], &context))
         };
         assert!(!rewrites("rlib", "static:-bundle=foo"));
-        assert!(!rewrites("staticlib", "static:-bundle=foo"));
         assert!(rewrites("rlib", "static:-bundle,+bundle=foo"));
-        #[cfg(not(windows))]
         assert!(rewrites("bin", "static:-bundle=foo"));
     }
 
-    /// A Unix linker takes `libfoo.a` for `-l foo` or `-l dylib=foo` when the
-    /// first dir that has the name holds no shared library, and always under
-    /// `+crt-static`.
-    #[cfg(not(windows))]
+    /// A Unix linker looks for `-l foo` or `-l dylib=foo` in the `-L` dirs,
+    /// then in its default dirs (`/usr/local/lib`, ...), and takes
+    /// `libfoo.a` when the first dir that has the name holds no shared
+    /// library, or always under `+crt-static`.
     #[test]
-    fn unix_link_keys_the_archive_it_picks_for_a_kindless_or_dylib_lib() {
-        let _lock = key_test_lock();
+    fn unix_link_keys_a_library_only_a_default_dir_holds() {
         let tree = native_tree();
-        let search = format!("native={}", tree.elsewhere.display());
+        let normalizer = PathNormalizer::empty();
         let archive = tree.elsewhere.join("libfoo.a");
-        let rewrites = |crate_type: &str, spec: &str, extra: &[&str]| {
-            let mut flags = vec!["-L", search.as_str(), "-l", spec];
+        let fold_with = |crate_type: &str, spec: &str, extra: &[&str], target: &str| {
+            let mut flags = vec!["-l", spec];
             flags.extend_from_slice(extra);
-            let (before, after) =
-                keys_around_rewrite(&unit_args(crate_type, &tree.deps, &flags), &archive);
-            before != after
+            let argv = unit_args(crate_type, &tree.deps, &flags);
+            let context = NativeLinkContext {
+                default_dirs: vec![tree.elsewhere.clone()],
+                ..unix_context(target, &normalizer)
+            };
+            let native = [tree.out.clone()];
+            fold_rewrites(&archive, || fold_inputs(&argv, &native, &[], &context))
         };
-        assert!(rewrites("bin", "foo", &[]));
-        assert!(rewrites("bin", "dylib=foo", &[]));
-        assert!(!rewrites("rlib", "foo", &[]), "an rlib does not link");
+        let gnu = "x86_64-unknown-linux-gnu";
+        assert!(fold_with("bin", "foo", &[], gnu));
+        assert!(fold_with("bin", "dylib=foo", &[], gnu));
+        assert!(!fold_with("rlib", "foo", &[], gnu), "an rlib does not link");
 
         std::fs::write(tree.elsewhere.join("libfoo.so"), b"shared").unwrap();
         assert!(
-            !rewrites("bin", "foo", &[]),
+            !fold_with("bin", "foo", &[], gnu),
             "the shared library wins in its dir"
         );
-        assert!(rewrites("bin", "foo", &["-Ctarget-feature=+crt-static"]));
+        assert!(fold_with(
+            "bin",
+            "foo",
+            &["-Ctarget-feature=+crt-static"],
+            gnu
+        ));
+        assert!(
+            fold_with("bin", "foo", &[], "x86_64-unknown-linux-musl"),
+            "musl links statically by default"
+        );
+        std::fs::remove_file(tree.elsewhere.join("libfoo.so")).unwrap();
+
+        // A shared library in a `-L` dir comes first.
+        std::fs::write(tree.out.join("libfoo.so"), b"shared").unwrap();
+        assert!(!fold_with("bin", "foo", &[], gnu));
+    }
+
+    /// A library a link argument names is looked up like `-l`, and its
+    /// first archive counts even beside a shared library, since the link
+    /// arguments may say `-Bstatic`.
+    #[test]
+    fn unix_link_keys_libraries_named_in_link_arguments() {
+        let tree = native_tree();
+        let normalizer = PathNormalizer::empty();
+        let context = NativeLinkContext {
+            default_dirs: vec![tree.elsewhere.clone()],
+            ..unix_context("x86_64-unknown-linux-gnu", &normalizer)
+        };
+        std::fs::write(tree.elsewhere.join("libfoo.so"), b"shared").unwrap();
+        let rewrites = |crate_type: &str, flag: &str, file: &Path| {
+            let argv = unit_args(crate_type, &tree.deps, &[flag]);
+            fold_rewrites(file, || fold_inputs(&argv, &[], &[], &context))
+        };
+        let archive = tree.elsewhere.join("libfoo.a");
+        assert!(rewrites(
+            "bin",
+            "-Clink-arg=-Wl,-Bstatic,-lfoo,-Bdynamic",
+            &archive
+        ));
+        assert!(rewrites("bin", "-Clink-arg=-l:libfoo.a", &archive));
+        assert!(!rewrites("rlib", "-Clink-arg=-lfoo", &archive));
+        assert!(!rewrites(
+            "bin",
+            "-Clink-arg=-lbar",
+            &tree.elsewhere.join("libbaz.a")
+        ));
     }
 
     #[test]
@@ -10802,8 +11380,9 @@ mod tests {
         let first = PathBuf::from("/one");
         let second = PathBuf::from("/two");
         let dirs = [first.clone(), second.clone()];
+        let all = ["so", "dylib", "tbd"];
         let resolve = |present: &[&str], name: &str, verbatim: bool, prefer_static: bool| {
-            resolve_unix_library(name, verbatim, &dirs, prefer_static, |path| {
+            resolve_unix_library(name, verbatim, &dirs, prefer_static, &all, |path| {
                 present.iter().any(|file| path == Path::new(file))
             })
         };
@@ -10841,6 +11420,29 @@ mod tests {
             Some(second.join("foo.a"))
         );
         assert_eq!(resolve(&["/one/libfoo.so"], "libfoo.so", true, false), None);
+
+        // An ELF linker does not read a stray `.dylib` beside the archive.
+        let elf = resolve_unix_library(
+            "foo",
+            false,
+            &dirs,
+            false,
+            shared_library_extensions("x86_64-unknown-linux-gnu"),
+            |path| path == Path::new("/one/libfoo.dylib") || path == Path::new("/one/libfoo.a"),
+        );
+        assert_eq!(elf, archive_in(&first));
+    }
+
+    #[test]
+    fn shared_library_extensions_follow_the_object_format() {
+        assert_eq!(
+            shared_library_extensions("aarch64-apple-darwin"),
+            ["tbd", "dylib", "so"]
+        );
+        assert_eq!(
+            shared_library_extensions("x86_64-unknown-linux-gnu"),
+            ["so"]
+        );
     }
 
     #[test]
@@ -10857,6 +11459,70 @@ mod tests {
         assert!(prefers_static_libraries(&[], musl));
         assert!(!prefers_static_libraries(&["-crt-static"], musl));
         assert!(prefers_static_libraries(&["+sse2"], musl));
+    }
+
+    /// With no `--target`, a link is for the wrapped rustc's host, as `rustc
+    /// -vV` reports it, not for whatever kache was built for: a musl host
+    /// links statically by default.
+    #[test]
+    fn link_target_defaults_to_the_wrapped_rustc_host() {
+        let version = "rustc 1.98.0\nhost: x86_64-unknown-linux-musl\nrelease: 1.98.0\n";
+        let host = rustc_host_triple(version);
+        assert_eq!(link_target(None, host), "x86_64-unknown-linux-musl");
+        assert!(prefers_static_libraries(&[], link_target(None, host)));
+        assert_eq!(
+            link_target(Some("aarch64-unknown-linux-gnu"), host),
+            "aarch64-unknown-linux-gnu"
+        );
+        assert_eq!(link_target(None, None), "unknown");
+    }
+
+    /// A host-native Unix link searches `LIBRARY_PATH` and then the system
+    /// and local install dirs; a cross link and other targets search none of
+    /// them.
+    #[test]
+    fn default_library_dirs_follow_a_host_native_unix_target() {
+        let linux = "x86_64-unknown-linux-gnu";
+        let dirs = |target: &str, host: &str, library_path: Option<&str>| {
+            default_library_dirs(target, Some(host), library_path.map(std::ffi::OsStr::new))
+        };
+        let expected: Vec<PathBuf> = [
+            "/usr/local/lib/x86_64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/local/lib64",
+            "/lib64",
+            "/usr/lib64",
+            "/usr/local/lib",
+            "/lib",
+            "/usr/lib",
+        ]
+        .map(PathBuf::from)
+        .into();
+        assert_eq!(dirs(linux, linux, None), expected);
+        #[cfg(unix)]
+        {
+            let mut with_path = vec![PathBuf::from("/opt/a"), PathBuf::from("/opt/b")];
+            with_path.extend(expected.clone());
+            assert_eq!(dirs(linux, linux, Some("/opt/a::/opt/b")), with_path);
+        }
+        let apple = "aarch64-apple-darwin";
+        assert_eq!(
+            dirs(apple, apple, None),
+            [PathBuf::from("/usr/lib"), PathBuf::from("/usr/local/lib")]
+        );
+        assert!(dirs("aarch64-unknown-linux-gnu", linux, None).is_empty());
+        assert!(default_library_dirs(linux, None, None).is_empty());
+        let windows = "x86_64-pc-windows-gnu";
+        assert!(dirs(windows, windows, Some("/opt/a")).is_empty());
+        assert_eq!(
+            multiarch_name("aarch64-unknown-linux-gnu"),
+            "aarch64-linux-gnu"
+        );
+        assert_eq!(
+            multiarch_name("x86_64-linux-android"),
+            "x86_64-linux-android"
+        );
     }
 
     #[test]
@@ -10952,9 +11618,44 @@ mod tests {
         assert!(!unresolved_static_lib_is_error(false, false));
     }
 
+    #[test]
+    fn packed_bundled_libs_flag_is_read_in_either_spelling() {
+        let flags = |items: &[&str]| {
+            items
+                .iter()
+                .map(|flag| flag.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(packs_bundled_libs(&flags(&["packed-bundled-libs"])));
+        assert!(packs_bundled_libs(&flags(&[
+            "share-generics",
+            "packed_bundled_libs=yes"
+        ])));
+        assert!(!packs_bundled_libs(&flags(&[
+            "share-generics=packed-bundled-libs"
+        ])));
+        assert!(!packs_bundled_libs(&[]));
+    }
+
+    /// An rlib carries a `static` spec's archive unless `-bundle`; it packs
+    /// one under `+whole-archive` or `-Z packed-bundled-libs`.
+    #[test]
+    fn rlib_bundle_follows_bundle_and_packing() {
+        let spec = static_lib_spec;
+        assert_eq!(rlib_bundle(&spec("static=foo"), true, false), Some(false));
+        assert_eq!(
+            rlib_bundle(&spec("static:+whole-archive=foo"), true, false),
+            Some(true)
+        );
+        assert_eq!(rlib_bundle(&spec("static=foo"), true, true), Some(true));
+        assert_eq!(rlib_bundle(&spec("static:-bundle=foo"), true, false), None);
+        assert_eq!(rlib_bundle(&spec("static=foo"), false, false), None);
+        assert_eq!(rlib_bundle(&spec("foo"), true, false), None);
+    }
+
     /// The bundle-audit marker keys rlibs with a native dir apart from
     /// entries stored without the audit, and the stash reports what the key
-    /// hashed.
+    /// hashed and what the rlib carries.
     #[test]
     fn native_bundle_audit_marks_rlibs_with_a_native_dir() {
         let _lock = key_test_lock();
@@ -10976,12 +11677,23 @@ mod tests {
         key_of_flags(&unit_args(
             "rlib",
             &tree.deps,
-            &["-L", &search, "-L", &search, "-l", "static=foo"],
+            &[
+                "-L",
+                &search,
+                "-L",
+                &search,
+                "-l",
+                "static:+whole-archive=foo",
+            ],
         ));
         assert_eq!(
             take_last_key_native_archives(),
             Some(KeyedNativeArchives {
                 archives: vec![tree.elsewhere.join("libfoo.a")],
+                bundled: vec![BundledArchive {
+                    path: tree.elsewhere.join("libfoo.a"),
+                    packed: true,
+                }],
                 dirs: vec![tree.elsewhere.clone()],
             })
         );

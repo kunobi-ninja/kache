@@ -5,7 +5,7 @@ use chrono::Utc;
 pub(crate) use kache_store::markers::*;
 use std::path::{Component, Path, PathBuf};
 
-use crate::args::RustcArgs;
+use crate::args::{ExternDep, RustcArgs};
 use crate::cache_key::FileHashStats;
 use crate::cache_key::FileHasher;
 use crate::compile;
@@ -3452,21 +3452,16 @@ fn run_parsed_rustc(
     ) {
         Ok(keyed) => keyed,
         Err(e) => {
-            // `{e:#}` — the alternate form walks the cause chain. Plain
-            // `{e}` prints only the outermost context, which is how the
-            // substrate bench's 60 dep-info refusals stayed undiagnosable:
-            // the log said "dep-info pre-pass failed for src/lib.rs" and
-            // dropped rustc's own reason underneath it (kunobi-ninja/kache#431).
+            // `{:#}` walks the cause chain; see `uncacheable_reason`.
             tracing::warn!("failed to compute cache key for {}: {:#}", crate_name, e);
-            let reason = format!("uncacheable|{e:#}");
-            let exit =
-                passthrough_with_event(config, args, crate_name, &event_root, start, &*reason)?;
-            // The pre-pass expands macros, so a macro that cannot write fails
-            // here first; its error carries rustc's own message.
-            if exit != 0 {
-                crate::out_dir_alias::after_failed_compile(&reason, &args.externs);
-            }
-            return Ok(exit);
+            return passthrough_with_event(
+                config,
+                args,
+                crate_name,
+                &event_root,
+                start,
+                uncacheable_reason(&e),
+            );
         }
     };
     let ComputedKey {
@@ -3507,8 +3502,8 @@ fn run_parsed_rustc(
             std::io::stdout(),
             std::io::stderr(),
         );
+        after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
         if result.exit_code != 0 {
-            crate::out_dir_alias::after_failed_compile(&result.stderr, &args.externs);
             let elapsed = start.elapsed().as_millis() as u64;
             log_event_with_hash_stats(
                 config,
@@ -3818,7 +3813,7 @@ fn run_parsed_rustc(
                     crate_name,
                     &event_root,
                     start,
-                    format!("uncacheable|{e:#}"),
+                    uncacheable_reason(&e),
                 );
             }
         }
@@ -3978,8 +3973,8 @@ fn run_parsed_rustc(
     }
 
     // Don't cache failures
+    after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
     if result.exit_code != 0 {
-        crate::out_dir_alias::after_failed_compile(&result.stderr, &args.externs);
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
             config,
@@ -6515,6 +6510,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         std::io::stdout(),
         std::io::stderr(),
     );
+    after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
     let reusable = lease.finish(result.exit_code == 0);
     tracing::debug!(
         ?kind,
@@ -6556,6 +6552,42 @@ thread_local! {
     static PRECOMPILED_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
+/// Category of the passthrough reason for a rustc compile kache could not
+/// key. Everything after it is the key error.
+const UNCACHEABLE_REASON: &str = "uncacheable|";
+
+/// The passthrough reason for a compile whose key could not be computed.
+///
+/// `{error:#}`: the alternate form walks the cause chain. Plain `{error}`
+/// prints only the outermost context, which is how the substrate bench's 60
+/// dep-info refusals stayed undiagnosable: the log said "dep-info pre-pass
+/// failed for src/lib.rs" and dropped rustc's own reason underneath it
+/// (kunobi-ninja/kache#431).
+fn uncacheable_reason(error: &anyhow::Error) -> String {
+    format!("{UNCACHEABLE_REASON}{error:#}")
+}
+
+/// What a passthrough reason quotes of rustc's own output. A failed pre-pass
+/// ran rustc's macro expansion, so a macro that cannot write fails there
+/// first, and the key error carries rustc's first error line. Every other
+/// reason is kache's own words: a store error that says "Permission denied"
+/// is not a macro failing to write.
+fn rustc_output_in(reason: &str) -> &str {
+    reason.strip_prefix(UNCACHEABLE_REASON).unwrap_or_default()
+}
+
+/// Every rustc compile whose exit code the wrapper returns ends here,
+/// whichever branch ran it, so a failure that came from a shared read-only
+/// `OUT_DIR` always gets the hint and the deny markers. `rustc_output` is
+/// what kache saw of rustc's output: a compile's captured stderr, or what a
+/// passthrough's reason quotes (see `rustc_output_in`). A passthrough's own
+/// stderr goes straight to Cargo, so kache never sees it.
+fn after_rustc_exit(exit_code: i32, rustc_output: &str, externs: &[ExternDep]) {
+    if exit_code != 0 {
+        crate::out_dir_alias::after_failed_compile(rustc_output, externs);
+    }
+}
+
 fn passthrough_with_event<R: Into<String>>(
     config: &Config,
     args: &RustcArgs,
@@ -6586,19 +6618,15 @@ fn passthrough_with_event<R: Into<String>>(
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
         return Ok(exit_code);
     }
+    let reason = reason.into();
     let output = passthrough(
         args,
         config.fallback.as_deref(),
         config.preserve_incremental,
     )?;
-    log_passthrough_event(
-        config,
-        root,
-        crate_name,
-        start.elapsed().as_millis() as u64,
-        reason.into(),
-        &output,
-    );
+    let elapsed = start.elapsed().as_millis() as u64;
+    after_rustc_exit(output.exit_code, rustc_output_in(&reason), &args.externs);
+    log_passthrough_event(config, root, crate_name, elapsed, reason, &output);
     Ok(output.exit_code)
 }
 
@@ -6626,6 +6654,7 @@ fn rustc_direct_passthrough_with_event(
         return passthrough_with_event(config, args, crate_name, root, start, reason);
     }
     let output = passthrough(args, None, config.preserve_incremental)?;
+    after_rustc_exit(output.exit_code, rustc_output_in(reason), &args.externs);
     log_passthrough_event(
         config,
         root,
@@ -6648,6 +6677,7 @@ fn preserved_incremental_with_event(
     start: std::time::Instant,
 ) -> Result<i32> {
     let output = passthrough(args, None, true)?;
+    after_rustc_exit(output.exit_code, "", &args.externs);
     log_passthrough_event(
         config,
         root,
@@ -8728,6 +8758,30 @@ mod tests {
             .is_err(),
             "without a deferred compile the passthrough runs the (missing) compiler"
         );
+    }
+
+    /// The failure handling after a passthrough reads rustc's words only: the
+    /// key error a failed pre-pass left in the reason, never kache's own.
+    #[test]
+    fn only_an_uncacheable_reason_quotes_rustc_output() {
+        let error = anyhow::anyhow!("writing /x: Permission denied (os error 13)")
+            .context("dep-info pre-pass failed");
+        let reason = uncacheable_reason(&error);
+        assert_eq!(
+            reason,
+            "uncacheable|dep-info pre-pass failed: writing /x: Permission denied (os error 13)"
+        );
+        assert_eq!(
+            rustc_output_in(&reason),
+            "dep-info pre-pass failed: writing /x: Permission denied (os error 13)"
+        );
+        for reason in [
+            "store lookup failed: Permission denied (os error 13)",
+            "adaptive passthrough: uncacheable|x",
+            "",
+        ] {
+            assert_eq!(rustc_output_in(reason), "", "{reason}");
+        }
     }
 
     #[test]

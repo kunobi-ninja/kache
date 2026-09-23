@@ -268,7 +268,9 @@ fn cargo(workspace: &Path, cache: &Path, args: &[&str], envs: &[(&str, &Path)]) 
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("KACHE_DISABLED")
         .env_remove("KACHE_LOG_FILE")
-        .env_remove("DUMPMAC_WRITE");
+        .env_remove("DUMPMAC_WRITE")
+        .env_remove("EXPMAC_WRITE")
+        .env_remove("KACHE_VERIFY_INPUT_PREDICTIONS");
     for (name, value) in envs {
         command.env(name, value);
     }
@@ -532,4 +534,150 @@ fn units_that_bake_an_empty_out_dir_hit_in_another_checkout() {
     assert_built(&cargo_build(&tree("e"), &cache), "e with hbin");
     let hbin = printed_paths(&tree("e").join("target/debug/hbin"));
     assert!(hbin[0].starts_with(tree("e").join("target")), "{hbin:?}");
+}
+
+/// A registry proc macro that bakes its `OUT_DIR` and, with `EXPMAC_WRITE`
+/// set, writes a file there and panics naming the path when it cannot, as
+/// `expander` does. `revision` changes the macro's bytes. `usemac` is a
+/// registry lib that expands it, and `app` prints what it expanded to.
+fn write_expander_fixture(root: &Path, revision: u32) {
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+    );
+    let fixture = root.join("registry/src/fixture");
+    let expmac = fixture.join("expmac");
+    write(
+        &expmac.join("Cargo.toml"),
+        &manifest("expmac", "\n[lib]\nproc-macro = true\n"),
+    );
+    write(
+        &expmac.join("build.rs"),
+        r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-env=DEBUG_OUTPUT_DIR={}", std::env::var("OUT_DIR").unwrap());
+}
+"#,
+    );
+    write(
+        &expmac.join("src/lib.rs"),
+        &format!(
+            r#"use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn expand(_input: TokenStream) -> TokenStream {{
+    let dir = env!("DEBUG_OUTPUT_DIR");
+    if std::env::var_os("EXPMAC_WRITE").is_some() {{
+        let path = std::path::Path::new(dir).join("expanded.rs");
+        if let Err(error) = std::fs::write(&path, "// revision {revision}\n") {{
+            panic!("writing {{}}: {{error}}", path.display());
+        }}
+    }}
+    format!("{{dir:?}}").parse().unwrap()
+}}
+"#
+        ),
+    );
+    let usemac = fixture.join("usemac");
+    write(
+        &usemac.join("Cargo.toml"),
+        &manifest(
+            "usemac",
+            "\n[dependencies]\nexpmac = { path = \"../expmac\" }\n",
+        ),
+    );
+    write(
+        &usemac.join("src/lib.rs"),
+        "pub fn dir() -> &'static str {\n    expmac::expand!()\n}\n",
+    );
+    write(
+        &root.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "\n[dependencies]\nusemac = { path = \"../registry/src/fixture/usemac\" }\n",
+        ),
+    );
+    write(
+        &root.join("app/src/main.rs"),
+        "fn main() {\n    println!(\"{}\", usemac::dir());\n}\n",
+    );
+}
+
+/// A lib whose key came from an input prediction re-derives it with the
+/// pre-pass when the predicted key misses. A macro that cannot write into its
+/// shared directory fails that pre-pass, and the failure still gets the hint
+/// and denies the alias, so the rebuild the hint asks for can write.
+#[test]
+fn a_failed_rederivation_hints_and_denies_the_alias() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping the OUT_DIR alias test as root");
+        return;
+    }
+    build_kache();
+    let tmp = TempDir::new().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let cache = base.join("cache");
+    let tree = base.join("tree");
+    let out_dirs = cache.join("out-dirs");
+    let build = ["build", "--offline", "--workspace"];
+    let predictions = ("KACHE_INPUT_PREDICTIONS", Path::new("1"));
+    let write_env = ("EXPMAC_WRITE", Path::new("1"));
+
+    // The first build aliases expmac and records usemac's input closure.
+    write_expander_fixture(&tree, 1);
+    assert_built(
+        &cargo(&tree, &cache, &build, &[predictions]),
+        "the first build",
+    );
+    let printed = printed_paths(&tree.join("target/debug/app"));
+    assert!(printed[0].starts_with(&out_dirs), "{printed:?}");
+
+    // New macro bytes change usemac's key but not its recorded closure, so
+    // the predicted key misses and the pre-pass runs the writing macro.
+    write_expander_fixture(&tree, 2);
+    let log = base.join("key.log");
+    let refused = cargo(
+        &tree,
+        &cache,
+        &build,
+        &[
+            predictions,
+            write_env,
+            ("KACHE_LOG_FILE", Path::new("kache::cache_key=trace")),
+            ("KACHE_LOG_FILE_PATH", &log),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "expmac wrote into its alias");
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        log.lines()
+            .any(|line| line.contains("[key:usemac] inputs=predicted")),
+        "usemac did not key from its prediction"
+    );
+    assert!(
+        stderr.contains("`cargo clean -p expmac` and rebuild with KACHE_OUT_DIR_ALIAS=0"),
+        "{stderr}"
+    );
+    let denied: Vec<String> = std::fs::read_dir(out_dirs.join("v1/deny"))
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        denied.len() == 1 && denied[0].starts_with("expmac-"),
+        "{denied:?}"
+    );
+
+    // The denied macro rebuilds with its own OUT_DIR, where it can write.
+    let cleaned = cargo(&tree, &cache, &["clean", "--offline", "-p", "expmac"], &[]);
+    assert_built(&cleaned, "clean");
+    assert_built(
+        &cargo(&tree, &cache, &build, &[predictions, write_env]),
+        "the rebuild",
+    );
+    let printed = printed_paths(&tree.join("target/debug/app"));
+    assert!(printed[0].starts_with(tree.join("target")), "{printed:?}");
 }

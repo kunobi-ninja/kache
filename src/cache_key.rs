@@ -900,6 +900,20 @@ pub(crate) fn stash_last_tree_digest_for_test(tree: &str) {
     let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(tree.to_string()));
 }
 
+thread_local! {
+    /// Did the last key computed on this thread keep an OUT_DIR path (OUT_DIR
+    /// itself, or a value under it) as a literal? A lib whose key does is one
+    /// whose consumers are worth recording (see `out_dir_alias`).
+    static LAST_KEY_BAKES_OUT_DIR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take (consume) whether the last computed rustc key keeps an OUT_DIR path.
+pub(crate) fn take_last_key_bakes_out_dir() -> bool {
+    LAST_KEY_BAKES_OUT_DIR
+        .try_with(|stash| stash.replace(false))
+        .unwrap_or(false)
+}
+
 /// Take (consume) the tree digest of the last computed rustc key: the crate
 /// tree of a proc-macro-dependent unit, or the `OUT_DIR` guard of a registry
 /// unit that looked for a relocated record.
@@ -1001,7 +1015,7 @@ fn tree_digest(
 }
 
 /// Is `manifest_dir` an extracted registry package (`<CARGO_HOME>/registry/src/<index>/<pkg>`)?
-fn is_registry_package(manifest_dir: &Path) -> bool {
+pub(crate) fn is_registry_package(manifest_dir: &Path) -> bool {
     let mut components = manifest_dir.components().rev();
     let _package = components.next();
     let _index = components.next();
@@ -2213,6 +2227,7 @@ pub fn compute_cache_key(
     let _ = LAST_KEY_DEP_INFO.try_with(|stash| *stash.borrow_mut() = None);
     let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = None);
     let _ = LAST_KEY_USED_PREDICTION.try_with(|stash| stash.set(false));
+    let _ = LAST_KEY_BAKES_OUT_DIR.try_with(|stash| stash.set(false));
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
     hasher.update(b"key_version:");
@@ -2450,6 +2465,8 @@ pub fn compute_cache_key(
         }
 
         hasher.set_group("env_deps");
+        let aliased_out_dir = crate::out_dir_alias::active_alias();
+        let mut bakes_out_dir = false;
         for (var, val) in &dep_info.env_deps {
             let normalized_env_dep = normalize_env_dep_value_with_hasher(
                 crate_name,
@@ -2458,7 +2475,11 @@ pub fn compute_cache_key(
                 &dep_info.source_files,
                 file_hasher,
                 path_normalizer,
+                aliased_out_dir,
             );
+            bakes_out_dir |= env_dep_bakes_out_dir(var, normalized_env_dep.decision, || {
+                value_is_under_out_dir(val)
+            });
             fold_field(&mut hasher, b"env_dep_var:", var.as_bytes());
             fold_field(
                 &mut hasher,
@@ -2473,6 +2494,7 @@ pub fn compute_cache_key(
                 normalized_env_dep.decision.as_str()
             );
         }
+        let _ = LAST_KEY_BAKES_OUT_DIR.try_with(|stash| stash.set(bakes_out_dir));
     }
 
     // ── Group B: extern crate artifacts ──
@@ -3097,9 +3119,18 @@ enum EnvDepNormalizationDecision {
     /// Normalized because the var (optionally crate-scoped) is in the
     /// user-asserted force list, bypassing the source scans.
     ForcedPathOnly,
+    /// Kept raw: the value is at or under the shared read-only OUT_DIR this
+    /// unit compiles with (see `out_dir_alias`), the same string in every
+    /// checkout.
+    AliasedOutDir,
 }
 
 impl EnvDepNormalizationDecision {
+    /// Does the key hold the value as rustc sees it, rather than a sentinel?
+    fn keeps_literal_value(self) -> bool {
+        !matches!(self, Self::NormalizedPathOnly | Self::ForcedPathOnly)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Unchanged => "unchanged",
@@ -3110,6 +3141,7 @@ impl EnvDepNormalizationDecision {
             Self::KeptAbsoluteRuntimeUse => "kept absolute: value use in source",
             Self::KeptAbsoluteScanError => "kept absolute: source scan failed",
             Self::ForcedPathOnly => "forced path-only (user-asserted)",
+            Self::AliasedOutDir => "aliased OUT_DIR",
         }
     }
 }
@@ -4247,7 +4279,18 @@ fn normalize_env_dep_value_with_hasher(
     source_files: &[std::path::PathBuf],
     file_hasher: &FileHasher<'_>,
     path_normalizer: &PathNormalizer,
+    aliased_out_dir: Option<&Path>,
 ) -> NormalizedEnvDep {
+    // The shared OUT_DIR is one string on this machine whatever the checkout,
+    // and the artifact bakes exactly that string. A sentinel from a rule that
+    // happens to cover the cache dir (`<HOME>`) would give one key to
+    // artifacts that bake different strings, so the value stays raw.
+    if aliased_out_dir.is_some_and(|dir| value_at_or_under(val, dir)) {
+        return NormalizedEnvDep {
+            value: val.to_string(),
+            decision: EnvDepNormalizationDecision::AliasedOutDir,
+        };
+    }
     // Resolve the value to the SAME canonical form the rule prefixes use
     // (kunobi-ninja/kache#399). Windows cargo joins a relative CARGO_TARGET_DIR
     // literally, so an out-of-tree `OUT_DIR` arrives as `...\pkg\..\oot-target\...`
@@ -4345,7 +4388,24 @@ fn normalize_env_dep_value(
         source_files,
         &FileHasher::new(),
         path_normalizer,
+        None,
     )
+}
+
+/// Is `value` the path `dir` or a path under it, by components?
+pub(crate) fn value_at_or_under(value: &str, dir: &Path) -> bool {
+    Path::new(value).starts_with(dir)
+}
+
+/// Does this env dep leave an OUT_DIR path in the key as a literal? `under`
+/// answers whether the value sits under the unit's OUT_DIR; it is only asked
+/// when the rest cannot settle it.
+fn env_dep_bakes_out_dir(
+    var: &str,
+    decision: EnvDepNormalizationDecision,
+    under: impl FnOnce() -> bool,
+) -> bool {
+    decision.keeps_literal_value() && (var == "OUT_DIR" || under())
 }
 
 /// Whether `var`'s value may be path-normalized in the cache key:
@@ -15826,9 +15886,162 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
                 EnvDepNormalizationDecision::ForcedPathOnly,
                 "forced path-only (user-asserted)",
             ),
+            (
+                EnvDepNormalizationDecision::AliasedOutDir,
+                "aliased OUT_DIR",
+            ),
         ] {
             assert_eq!(decision.as_str(), expected);
         }
+    }
+
+    /// The same unit in two checkouts gets two OUT_DIRs. Pointed at one
+    /// shared alias, both its OUT_DIR and a `rustc-env` var under it key the
+    /// same, and never through a sentinel.
+    #[test]
+    fn aliased_out_dir_values_key_the_same_in_every_checkout() {
+        let alias = Path::new("/cache/out-dirs/v1/d/dmac-0123456789abcdef/out");
+        // A rule over the cache dir must not turn the alias into a sentinel.
+        let pn = PathNormalizer::empty().with_base_dirs(&["/cache".to_string()]);
+        assert_ne!(
+            pn.normalize(alias.to_str().unwrap()),
+            alias.to_str().unwrap()
+        );
+        let keyed = |checkout: &str| {
+            let real = PathBuf::from(format!(
+                "/{checkout}/target/debug/build/dmac-0123456789abcdef/out"
+            ));
+            let env = vec![
+                ("OUT_DIR".into(), real.clone().into_os_string()),
+                ("DEBUG_OUTPUT_DIR".into(), real.clone().into_os_string()),
+            ];
+            let rewrites = crate::out_dir_alias::env_rewrites(&env, &[], &[&real], alias)
+                .expect("nothing else mentions OUT_DIR");
+            rewrites
+                .iter()
+                .map(|(var, value)| {
+                    normalize_env_dep_value_with_hasher(
+                        "dmac",
+                        var.to_str().unwrap(),
+                        value.to_str().unwrap(),
+                        &[],
+                        &FileHasher::new(),
+                        &pn,
+                        Some(alias),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = keyed("a");
+        let b = keyed("b");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 2);
+        for dep in &a {
+            assert_eq!(dep.decision, EnvDepNormalizationDecision::AliasedOutDir);
+            assert_eq!(dep.value, alias.to_str().unwrap());
+        }
+    }
+
+    #[test]
+    fn only_values_at_or_under_the_alias_take_the_aliased_decision() {
+        let alias = Path::new("/c/d/out");
+        let pn = PathNormalizer::empty();
+        let decide = |value: &str, aliased: Option<&Path>| {
+            normalize_env_dep_value_with_hasher(
+                "dmac",
+                "V",
+                value,
+                &[],
+                &FileHasher::new(),
+                &pn,
+                aliased,
+            )
+            .decision
+        };
+        assert_eq!(
+            decide("/c/d/out/gen.rs", Some(alias)),
+            EnvDepNormalizationDecision::AliasedOutDir
+        );
+        assert_ne!(
+            decide("/c/d/out2", Some(alias)),
+            EnvDepNormalizationDecision::AliasedOutDir
+        );
+        assert_ne!(
+            decide("/c/d/out", None),
+            EnvDepNormalizationDecision::AliasedOutDir
+        );
+        assert!(value_at_or_under("/c/d/out", alias));
+        assert!(value_at_or_under("/c/d/out/", alias));
+        assert!(!value_at_or_under("/c/d", alias));
+        assert!(!value_at_or_under("x/c/d/out", alias));
+    }
+
+    #[test]
+    fn env_dep_bakes_out_dir_when_an_out_dir_path_stays_literal() {
+        use EnvDepNormalizationDecision as D;
+        let literal = [
+            D::Unchanged,
+            D::KeptAbsoluteNotPathOnly,
+            D::KeptAbsoluteManifestDir,
+            D::KeptAbsoluteNoIncludeProof,
+            D::KeptAbsoluteRuntimeUse,
+            D::KeptAbsoluteScanError,
+            D::AliasedOutDir,
+        ];
+        for decision in literal {
+            assert!(decision.keeps_literal_value(), "{decision:?}");
+            assert!(env_dep_bakes_out_dir("OUT_DIR", decision, || false));
+            assert!(env_dep_bakes_out_dir("GEN", decision, || true));
+            assert!(!env_dep_bakes_out_dir("GEN", decision, || false));
+        }
+        for decision in [D::NormalizedPathOnly, D::ForcedPathOnly] {
+            assert!(!decision.keeps_literal_value(), "{decision:?}");
+            assert!(!env_dep_bakes_out_dir("OUT_DIR", decision, || true));
+        }
+    }
+
+    /// The key says whether it kept an OUT_DIR path, and a later key that
+    /// did not starts clean.
+    #[test]
+    fn key_computation_stashes_whether_it_bakes_out_dir() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(&source, "pub fn f() {}").unwrap();
+        let args = RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "helper".to_string(),
+            source.to_str().unwrap().to_string(),
+        ])
+        .unwrap();
+        let key_with = |env_deps: Vec<(String, String)>| {
+            provide_dep_info(DepInfo {
+                source_files: vec![source.clone()],
+                env_deps,
+            });
+            compute_cache_key(&args, &FileHasher::new(), &PathNormalizer::empty()).unwrap();
+        };
+
+        key_with(vec![("OUT_DIR".into(), "/nowhere/out".into())]);
+        assert!(take_last_key_bakes_out_dir());
+        assert!(!take_last_key_bakes_out_dir(), "taken, not copied");
+
+        key_with(vec![("CARGO_PKG_NAME".into(), "helper".into())]);
+        assert!(!take_last_key_bakes_out_dir());
+
+        // Any one baking value is enough, however many there are.
+        key_with(vec![
+            ("OUT_DIR".into(), "/nowhere/out".into()),
+            ("OUT_DIR".into(), "/nowhere/out".into()),
+        ]);
+        assert!(take_last_key_bakes_out_dir());
+
+        key_with(vec![("OUT_DIR".into(), "/nowhere/out".into())]);
+        let mut no_source = args.clone();
+        no_source.source_file = None;
+        compute_cache_key(&no_source, &FileHasher::new(), &PathNormalizer::empty()).unwrap();
+        assert!(!take_last_key_bakes_out_dir(), "reset by the next key");
     }
 
     #[test]
@@ -15960,6 +16173,7 @@ pub const OUT_DIR_AT_COMPILE_TIME: &str = env!("OUT_DIR");
             &source_files,
             file_hasher,
             &PathNormalizer::from_env(Some(&workspace)),
+            None,
         )
         .decision
     }

@@ -262,6 +262,17 @@ embeds it in crate metadata, and every crate's sources live under it, so the
 checks above would pass for a value that does change the artifact. Kache warns
 when a list names it and ignores the entry.
 
+Registry crates that bake an empty `OUT_DIR` need no entry. On Unix, Kache
+compiles a registry proc macro whose `OUT_DIR` is empty, or a registry lib that
+only proc macros link, against `<cache>/out-dirs/v1/d/<pkg>-<hash>/out`: an
+empty directory with mode 0555 at the same path in every checkout. A lib is
+shared only once a build on this machine has shown that nothing but proc macros
+links it, so the first checkout still rebuilds it. A `crate:VAR` entry for
+`OUT_DIR`, or for a variable whose value is under it, keeps that crate on its
+own `OUT_DIR`. A macro that writes debug output into the shared directory fails
+with a hint: run `cargo clean -p <crate>` and rebuild with
+`KACHE_OUT_DIR_ALIAS=0`.
+
 `key_env_vars` accepts exact names and trailing-star prefix patterns:
 
 ```toml
@@ -400,6 +411,7 @@ Session and GC history are opt-in. `kache telemetry write` reads index rows and 
 | `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Warn when storage layout forces copies. CLI commands print the advice; compiler wrappers log it at `warn` (see `KACHE_LOG`) so it never lands in compiler output |
 | `KACHE_WINDOWS_HARDLINK` | `cache.windows_hardlink` | `false` | Unsafe opt-in hardlink restores on non-CoW Windows volumes |
 | `KACHE_DEFERRED_DISCOVERY` | `cache.deferred_discovery` | `true` | On a certain miss (no closure record, no remote), compile first and key from the dep-info rustc emits instead of running the dep-info pre-pass; a C compile with no recorded read set likewise compiles first and keys from the dependency file it writes. Set to `0` to keep the pre-pass and the preprocessor probe on every miss. |
+| `KACHE_OUT_DIR_ALIAS` | `cache.out_dir_alias` | `true` | On Unix, compile a registry proc macro whose `OUT_DIR` is empty, or a registry lib that only proc macros link, against one shared read-only directory under `<cache>/out-dirs` instead of its own `OUT_DIR`, so the path it bakes in is the same in every checkout. A macro that writes debug output there fails with a hint; set to `0` to turn this off. |
 | `KACHE_DEFERRED_DURABILITY` | `cache.deferred_durability` | `true` | Store a miss without an fsync and let a background worker flush it a moment later; a hit on an entry not yet flushed verifies its bytes first. Set to `0` to flush every entry inside the compile that stored it. |
 | `KACHE_SHARED_HARDLINK_RESTORES` | `cache.shared_hardlink_restores` | `false` | Let every target directory hardlink the same store blob on filesystems without reflink. Only for single-use target directories (a CI job's tree): the restore-time mtime stamp on a shared inode re-dates the artifact in every other tree that links it. |
 | `KACHE_PROGRESS` | none | off | `hits` or `verbose` compiler progress |

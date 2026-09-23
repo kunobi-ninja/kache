@@ -38,6 +38,7 @@ mod native_link_key;
 mod notice;
 mod opcounts;
 mod otel;
+mod out_dir_alias;
 mod path_normalizer;
 mod phase_trace;
 mod planner_auth;
@@ -1370,7 +1371,18 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         );
     };
     let exit_code = match wrapper_target(adapter) {
-        Some(WrapperTarget::Rustc) => wrapper::run(&config, args)?,
+        Some(WrapperTarget::Rustc) => {
+            // Started here so the trace also covers the OUT_DIR alias check.
+            let trace = phase_trace::start("rustc", args);
+            // Still single-threaded, like the KACHE_ACTIVE write above:
+            // `apply` may change OUT_DIR and the vars under it.
+            let exit = match out_dir_alias::apply(&config, args) {
+                Some(exit) => exit,
+                None => wrapper::run(&config, args)?,
+            };
+            drop(trace);
+            exit
+        }
         Some(WrapperTarget::Cc) => wrapper::run_cc(&config, args)?,
         Some(WrapperTarget::Nvcc) => wrapper::run_nvcc(&config, args)?,
         None => anyhow::bail!(

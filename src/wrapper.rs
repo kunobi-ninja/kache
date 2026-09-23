@@ -3458,14 +3458,15 @@ fn run_parsed_rustc(
             // the log said "dep-info pre-pass failed for src/lib.rs" and
             // dropped rustc's own reason underneath it (kunobi-ninja/kache#431).
             tracing::warn!("failed to compute cache key for {}: {:#}", crate_name, e);
-            return passthrough_with_event(
-                config,
-                args,
-                crate_name,
-                &event_root,
-                start,
-                format!("uncacheable|{e:#}"),
-            );
+            let reason = format!("uncacheable|{e:#}");
+            let exit =
+                passthrough_with_event(config, args, crate_name, &event_root, start, &*reason)?;
+            // The pre-pass expands macros, so a macro that cannot write fails
+            // here first; its error carries rustc's own message.
+            if exit != 0 {
+                crate::out_dir_alias::after_failed_compile(&reason);
+            }
+            return Ok(exit);
         }
     };
     let ComputedKey {
@@ -3505,6 +3506,7 @@ fn run_parsed_rustc(
             std::io::stderr(),
         );
         if result.exit_code != 0 {
+            crate::out_dir_alias::after_failed_compile(&result.stderr);
             let elapsed = start.elapsed().as_millis() as u64;
             log_event_with_hash_stats(
                 config,
@@ -3579,6 +3581,7 @@ fn run_parsed_rustc(
         // outputs are in place.
         return stored.or(Ok(exit_code));
     }
+    crate::out_dir_alias::register_after_key(crate::cache_key::take_last_key_bakes_out_dir());
     // A force-list request that could not obtain its immediate lease must not
     // retry through the post-key adaptive seed path in the same invocation.
     // It stays on the normal cache path with incremental stripped.
@@ -3974,6 +3977,7 @@ fn run_parsed_rustc(
 
     // Don't cache failures
     if result.exit_code != 0 {
+        crate::out_dir_alias::after_failed_compile(&result.stderr);
         let elapsed = start.elapsed().as_millis() as u64;
         log_event_with_hash_stats(
             config,
@@ -4019,6 +4023,30 @@ fn run_parsed_rustc(
             EventResult::Skipped,
             elapsed,
             0,
+            0,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            0,
+            0,
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
+    // A shared read-only OUT_DIR that gained a file or a write bit, or a
+    // dep-info that lists a file under the alias root, is not stored.
+    if !crate::out_dir_alias::store_gate(args) {
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event_with_hash_stats(
+            config,
+            &event_root,
+            crate_name,
+            EventResult::Skipped,
+            elapsed,
+            compile_time_ms,
             0,
             &cache_key,
             key_ms,

@@ -381,6 +381,12 @@ pub struct Config {
     /// default; `KACHE_DEFERRED_DISCOVERY=0` or
     /// `[cache] deferred_discovery = false` keeps the pre-pass on every miss.
     pub deferred_discovery: bool,
+    /// Compile a registry proc macro, or a lib only proc macros link, whose
+    /// `OUT_DIR` is empty against one shared read-only directory under the
+    /// cache dir, so the path it bakes is the same in every checkout. On by
+    /// default on Unix; `KACHE_OUT_DIR_ALIAS=0` or
+    /// `[cache] out_dir_alias = false` turns it off.
+    pub out_dir_alias: bool,
     /// Store new entries without an fsync on the build path. The daemon (or
     /// the next `kache gc`) flushes them shortly after; until then a hit on
     /// such an entry verifies its bytes before restoring. On by default;
@@ -724,6 +730,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) shared_hardlink_restores: Option<bool>,
     /// Compile-before-key toggle. See [`Config::deferred_discovery`].
     pub(crate) deferred_discovery: Option<bool>,
+    /// Shared read-only OUT_DIR toggle. See [`Config::out_dir_alias`].
+    pub(crate) out_dir_alias: Option<bool>,
     /// Deferred store flush toggle. See [`Config::deferred_durability`].
     pub(crate) deferred_durability: Option<bool>,
     /// Daemon hand-off toggle. See [`Config::daemon_publish`].
@@ -1149,6 +1157,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_SHARED_HARDLINK_RESTORES",
     "KACHE_DEFERRED_DISCOVERY",
     "KACHE_DAEMON_PUBLISH",
+    "KACHE_OUT_DIR_ALIAS",
     "KACHE_DEFERRED_DURABILITY",
     "KACHE_AUTO_GC",
     "KACHE_INDEX_AUTO_COMPACT",
@@ -1235,6 +1244,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "cache.shared_hardlink_restores",
     ),
     ("KACHE_DEFERRED_DISCOVERY", "cache.deferred_discovery"),
+    ("KACHE_OUT_DIR_ALIAS", "cache.out_dir_alias"),
     ("KACHE_DEFERRED_DURABILITY", "cache.deferred_durability"),
     ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
@@ -1262,6 +1272,15 @@ fn env_or_ignored(name: &str, ignore_env: bool) -> Result<String, std::env::VarE
         Err(std::env::VarError::NotPresent)
     } else {
         std::env::var(name)
+    }
+}
+
+/// The OUT_DIR alias setting from an env value, else the file, else on. Only
+/// `0` and `false` turn it off.
+fn out_dir_alias_setting(env: Option<&str>, file: Option<bool>) -> bool {
+    match env {
+        Some(value) => !(value == "0" || value.eq_ignore_ascii_case("false")),
+        None => file.unwrap_or(true),
     }
 }
 
@@ -1763,6 +1782,7 @@ impl Config {
         let windows_hardlink = Self::windows_hardlink_enabled(&file_config);
         let shared_hardlink_restores = Self::shared_hardlink_restores_enabled(&file_config);
         let deferred_discovery = Self::deferred_discovery_enabled(&file_config);
+        let out_dir_alias = Self::out_dir_alias_enabled(&file_config);
         let deferred_durability = Self::deferred_durability_enabled(&file_config);
         let daemon_publish = Self::daemon_publish_enabled(&file_config);
         let project_rules = ProjectRules::from_file_config(&file_config);
@@ -1824,6 +1844,7 @@ impl Config {
             windows_hardlink,
             shared_hardlink_restores,
             deferred_discovery,
+            out_dir_alias,
             deferred_durability,
             daemon_publish,
             project_rules,
@@ -2283,6 +2304,22 @@ impl Config {
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.daemon_publish)
             .unwrap_or(true)
+    }
+
+    /// Shared read-only OUT_DIR: `KACHE_OUT_DIR_ALIAS` (env wins), else
+    /// `[cache] out_dir_alias`, else on. See [`Config::out_dir_alias`].
+    fn out_dir_alias_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        out_dir_alias_setting(
+            env_or_ignored("KACHE_OUT_DIR_ALIAS", ignore_env)
+                .ok()
+                .as_deref(),
+            file_config
+                .as_ref()
+                .ok()
+                .and_then(|c| c.cache.as_ref())
+                .and_then(|c| c.out_dir_alias),
+        )
     }
 
     fn deferred_durability_enabled(file_config: &Result<FileConfig>) -> bool {
@@ -5540,6 +5577,41 @@ remote_key_cache_refresh_secs = 900
     }
 
     #[test]
+    fn out_dir_alias_setting_is_on_unless_switched_off() {
+        assert!(out_dir_alias_setting(None, None));
+        assert!(out_dir_alias_setting(None, Some(true)));
+        assert!(!out_dir_alias_setting(None, Some(false)));
+        for (value, expected) in [
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("", true),
+        ] {
+            assert_eq!(out_dir_alias_setting(Some(value), Some(false)), expected);
+            assert_eq!(out_dir_alias_setting(Some(value), Some(true)), expected);
+            assert_eq!(out_dir_alias_setting(Some(value), None), expected);
+        }
+    }
+
+    /// `ignore_env` keeps the environment out of it, so the file decides.
+    #[test]
+    fn out_dir_alias_follows_the_file() {
+        let file = |body: &str| -> Result<FileConfig> {
+            Ok(toml::from_str(&format!("[cache]\nignore_env = true\n{body}")).unwrap())
+        };
+        assert!(Config::out_dir_alias_enabled(&file("")));
+        assert!(Config::out_dir_alias_enabled(&file(
+            "out_dir_alias = true\n"
+        )));
+        assert!(!Config::out_dir_alias_enabled(&file(
+            "out_dir_alias = false\n"
+        )));
+    }
+
+    #[test]
     fn deferred_discovery_is_on_unless_switched_off() {
         let _lock = config_path_lock();
         let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
@@ -5680,6 +5752,7 @@ remote_key_cache_refresh_secs = 900
                 windows_hardlink: None,
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
+                out_dir_alias: None,
                 deferred_durability: None,
                 daemon_publish: None,
                 auto_gc: None,
@@ -6211,6 +6284,7 @@ remote_key_cache_refresh_secs = 900
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            out_dir_alias: true,
             deferred_durability: false,
             daemon_publish: false,
             project_rules: ProjectRules::default(),
@@ -6278,6 +6352,7 @@ remote_key_cache_refresh_secs = 900
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            out_dir_alias: true,
             deferred_durability: false,
             daemon_publish: false,
             project_rules: ProjectRules::default(),
@@ -6341,6 +6416,7 @@ remote_key_cache_refresh_secs = 900
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            out_dir_alias: true,
             deferred_durability: false,
             daemon_publish: false,
             project_rules: ProjectRules::default(),
@@ -6423,6 +6499,7 @@ remote_key_cache_refresh_secs = 900
             windows_hardlink: false,
             shared_hardlink_restores: false,
             deferred_discovery: true,
+            out_dir_alias: true,
             deferred_durability: false,
             daemon_publish: false,
             project_rules: ProjectRules::default(),
@@ -7090,6 +7167,7 @@ exclude = ["src/generated/**", "vendor/problem/**"]
                 windows_hardlink: None,
                 shared_hardlink_restores: None,
                 deferred_discovery: None,
+                out_dir_alias: None,
                 deferred_durability: None,
                 daemon_publish: None,
                 auto_gc: None,

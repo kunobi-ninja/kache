@@ -1295,7 +1295,9 @@ fn parse_verify_predictions(value: Option<&str>) -> VerifyPredictions {
 /// Hashing the identity also makes the sample stable: the same units are
 /// checked on every build, so a disagreement is reproducible rather than a
 /// one-off nobody can chase. Different units are covered across a graph
-/// because the identities differ, not because a counter advanced.
+/// because the identities differ, not because a counter advanced. The caller
+/// passes [`prediction_sample_identity`], so every checkout of a project
+/// checks the same units too.
 fn should_verify_this_prediction(mode: VerifyPredictions, identity: &str) -> bool {
     match mode {
         VerifyPredictions::Off => false,
@@ -1313,6 +1315,45 @@ fn sampled_by_identity(identity: &str, rate: usize) -> bool {
     let digest = blake3::hash(identity.as_bytes());
     let bucket = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or([0; 8]));
     bucket % (rate as u64) == 0
+}
+
+/// The unit as every checkout of the project names it. The sample is drawn
+/// by this.
+///
+/// Not the prediction identity: that folds the working directory and the
+/// absolute extern and search paths, so two checkouts of one project checked
+/// different units. A perf gate builds base and head in separate checkouts,
+/// so it counted pre-passes that the change under test did not cause.
+///
+/// Cargo's `-C metadata` separates units that share a crate name, such as
+/// every `build_script_build`. Cargo derives it from package ids written
+/// relative to the workspace, so it is the same in every checkout.
+fn prediction_sample_identity(args: &RustcArgs, current_dir: Option<&Path>) -> String {
+    let source = args
+        .source_file
+        .as_deref()
+        .map(|source| checkout_relative(source, current_dir).to_string_lossy());
+    serde_json::to_string(&(
+        args.crate_name.as_deref(),
+        &args.crate_types,
+        args.is_test,
+        args.target.as_deref(),
+        args.get_codegen_opt("metadata"),
+        &args.cfgs,
+        source,
+    ))
+    .unwrap()
+}
+
+/// `path` relative to the working directory when it lies under it.
+///
+/// Cargo runs rustc from the workspace root for a member, whose source is
+/// already relative, and from the package root for a dependency, whose source
+/// is absolute. Both come out the same in every checkout.
+fn checkout_relative<'a>(path: &'a Path, current_dir: Option<&Path>) -> &'a Path {
+    current_dir
+        .and_then(|dir| path.strip_prefix(dir).ok())
+        .unwrap_or(path)
 }
 
 /// Do the two closures agree on what rustc reads?
@@ -1342,7 +1383,7 @@ fn closures_agree(predicted: &DepInfo, discovered: &DepInfo) -> bool {
 fn predicted_key_inputs(
     args: &RustcArgs,
     file_hasher: &FileHasher<'_>,
-) -> std::result::Result<(DepInfo, String), Rejection> {
+) -> std::result::Result<DepInfo, Rejection> {
     let _trace = crate::phase_trace::phase("prediction_validate");
     if !file_hasher.uses_input_predictions() {
         return Err(Rejection::Disabled);
@@ -1359,13 +1400,10 @@ fn predicted_key_inputs(
         let _ = LAST_KEY_TREE_DIGEST.try_with(|stash| *stash.borrow_mut() = Some(digest.clone()));
         Some(digest)
     };
-    let mut identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
+    let identity = rustc_prediction_identity(args).ok_or(Rejection::Disabled)?;
     let record = file_hasher
         .input_prediction(&identity)
-        .or_else(|| {
-            identity = rustc_shared_prediction_identity(args)?;
-            file_hasher.input_prediction(&identity)
-        })
+        .or_else(|| file_hasher.input_prediction(&rustc_shared_prediction_identity(args)?))
         .ok_or(Rejection::NoRecord)?;
     if let Some(tree) = &tree {
         match &record.tree {
@@ -1374,15 +1412,12 @@ fn predicted_key_inputs(
             None => return Err(Rejection::NoRecord),
         }
     }
-    let dep_info = validate_prediction(
+    validate_prediction(
         &record,
         |path| std::fs::metadata(path).ok(),
         |path| path.exists(),
         |var| std::env::var(var).ok(),
-    )?;
-    // The identity travels with the closure: the sampled cross-check selects
-    // by it, so it must be the one this record actually came from.
-    Ok((dep_info, identity))
+    )
 }
 
 /// Join only when an eligible unit needs discovery. A peer holds the lock
@@ -1449,7 +1484,7 @@ fn resolve_key_inputs(
             prediction = predicted_key_inputs(args, file_hasher);
         }
         match prediction {
-            Ok((dep_info, identity)) => {
+            Ok(dep_info) => {
                 crate::phase_trace::decision("prediction", "validated");
                 let mode = parse_verify_predictions(
                     std::env::var("KACHE_VERIFY_INPUT_PREDICTIONS")
@@ -1459,7 +1494,9 @@ fn resolve_key_inputs(
                 // Verification is the exceptional path: it runs the pre-pass
                 // anyway and uses ITS answer, so a disagreement is reported
                 // rather than acted on.
-                if should_verify_this_prediction(mode, &identity) {
+                let sample =
+                    prediction_sample_identity(args, std::env::current_dir().ok().as_deref());
+                if should_verify_this_prediction(mode, &sample) {
                     crate::phase_trace::decision("prediction", "verify-sampled");
                     let discovered = dep_info_pre_pass(args)?;
                     if discovered
@@ -8590,6 +8627,200 @@ mod tests {
         }
     }
 
+    /// One Cargo unit, placed in a checkout by [`SampleUnit::in_checkout`].
+    struct SampleUnit {
+        package: String,
+        registry: bool,
+        crate_name: &'static str,
+        source: &'static str,
+        crate_type: &'static str,
+        metadata: String,
+    }
+
+    impl SampleUnit {
+        /// The argv and working directory Cargo gives rustc for this unit in
+        /// the checkout at `root`, with its registry under `cargo_home`. A
+        /// member runs from the workspace root with a relative source; a
+        /// registry dependency runs from its package root with an absolute
+        /// one. Output, search and extern paths sit under the checkout.
+        fn in_checkout(&self, root: &str, cargo_home: &str) -> (RustcArgs, PathBuf) {
+            let (cwd, source) = if self.registry {
+                let package = format!(
+                    "{cargo_home}/registry/src/index.crates.io-0000/{}",
+                    self.package
+                );
+                let source = format!("{package}/{}", self.source);
+                (package, source)
+            } else {
+                (
+                    root.to_string(),
+                    format!("{}/{}", self.package, self.source),
+                )
+            };
+            let deps = format!("{root}/target/debug/deps");
+            let argv = vec![
+                "rustc".to_string(),
+                "--crate-name".to_string(),
+                self.crate_name.to_string(),
+                "--edition=2021".to_string(),
+                source,
+                "--error-format=json".to_string(),
+                "--crate-type".to_string(),
+                self.crate_type.to_string(),
+                "--emit=dep-info,metadata,link".to_string(),
+                "--cfg".to_string(),
+                "feature=\"default\"".to_string(),
+                "-C".to_string(),
+                format!("metadata={}", self.metadata),
+                "-C".to_string(),
+                format!("extra-filename=-{}", self.metadata),
+                "--out-dir".to_string(),
+                deps.clone(),
+                "-L".to_string(),
+                format!("dependency={deps}"),
+                "--extern".to_string(),
+                format!("dep={deps}/libdep-0123456789abcdef.rmeta"),
+            ];
+            (RustcArgs::parse(&argv).unwrap(), PathBuf::from(cwd))
+        }
+    }
+
+    /// The units `sampled` picks in one checkout.
+    fn sampled_units(units: &[SampleUnit], root: &str, cargo_home: &str) -> Vec<usize> {
+        units
+            .iter()
+            .enumerate()
+            .filter(|(_, unit)| {
+                let (args, cwd) = unit.in_checkout(root, cargo_home);
+                should_verify_this_prediction(
+                    VerifyPredictions::Sampled,
+                    &prediction_sample_identity(&args, Some(&cwd)),
+                )
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// A perf gate builds base and head in separate checkouts. Sampling by
+    /// the prediction identity checked different units in each, because that
+    /// identity folds the working directory and absolute paths: hk counted 7
+    /// checks against 2, and eza showed a significant speedup that was only 3
+    /// checks against none. Both checkouts must check the same units.
+    #[test]
+    fn prediction_sample_is_the_same_in_every_checkout() {
+        let units: Vec<SampleUnit> = (0..VERIFY_PREDICTION_RATE * 8)
+            .map(|i| SampleUnit {
+                package: format!("pkg{i}-1.0.0"),
+                registry: i % 2 == 0,
+                crate_name: ["alpha", "beta", "build_script_build"][i % 3],
+                source: ["src/lib.rs", "src/main.rs", "build.rs"][i % 3],
+                crate_type: ["lib", "bin", "bin"][i % 3],
+                metadata: format!("{i:016x}"),
+            })
+            .collect();
+        let base = ("/scratch/base/hk", "/scratch/base/cargo");
+        let head = ("/scratch/head/hk", "/home/ci/.cargo");
+        for (i, unit) in units.iter().enumerate() {
+            let (a, a_cwd) = unit.in_checkout(base.0, base.1);
+            let (b, b_cwd) = unit.in_checkout(head.0, head.1);
+            assert_eq!(
+                prediction_sample_identity(&a, Some(&a_cwd)),
+                prediction_sample_identity(&b, Some(&b_cwd)),
+                "unit {i} must be sampled the same way in both checkouts"
+            );
+        }
+        let in_base = sampled_units(&units, base.0, base.1);
+        assert!(!in_base.is_empty(), "some unit must be checked");
+        assert_eq!(in_base, sampled_units(&units, head.0, head.1));
+    }
+
+    /// The same in every checkout must not mean one decision for a whole
+    /// crate name: every registry build script is `build_script_build` from
+    /// `build.rs` in its package root, and only Cargo's metadata tells them
+    /// apart.
+    #[test]
+    fn prediction_sample_spreads_across_units_that_share_a_name() {
+        let build_scripts: Vec<SampleUnit> = (0..VERIFY_PREDICTION_RATE * 20)
+            .map(|i| SampleUnit {
+                package: format!("pkg{i}-1.0.0"),
+                registry: true,
+                crate_name: "build_script_build",
+                source: "build.rs",
+                crate_type: "bin",
+                metadata: format!("{i:016x}"),
+            })
+            .collect();
+        let chosen = sampled_units(&build_scripts, "/scratch/base/hk", "/scratch/base/cargo");
+        assert!(
+            (5..=40).contains(&chosen.len()),
+            "about 1 in {VERIFY_PREDICTION_RATE} of {} should be checked, got {}",
+            build_scripts.len(),
+            chosen.len()
+        );
+        assert_eq!(
+            chosen,
+            sampled_units(&build_scripts, "/scratch/head/hk", "/home/ci/.cargo"),
+            "another checkout checks the same build scripts"
+        );
+
+        // Each part of the unit's name separates it from its neighbours.
+        let sample = |argv: &str| {
+            let argv: Vec<String> = argv.split(' ').map(str::to_string).collect();
+            prediction_sample_identity(&RustcArgs::parse(&argv).unwrap(), Some(Path::new("/w")))
+        };
+        let unit = "rustc --crate-name a a.rs --crate-type lib";
+        let base = sample(&format!("{unit} -C metadata=aa"));
+        for (part, other) in [
+            ("metadata", format!("{unit} -C metadata=bb")),
+            (
+                "crate type",
+                format!("{unit} -C metadata=aa --crate-type rlib"),
+            ),
+            ("test harness", format!("{unit} -C metadata=aa --test")),
+            (
+                "target",
+                format!("{unit} -C metadata=aa --target wasm32-wasip1"),
+            ),
+            (
+                "cfg",
+                format!("{unit} -C metadata=aa --cfg feature=\"std\""),
+            ),
+            (
+                "crate name",
+                "rustc --crate-name b a.rs --crate-type lib -C metadata=aa".into(),
+            ),
+            (
+                "source",
+                "rustc --crate-name a b.rs --crate-type lib -C metadata=aa".into(),
+            ),
+        ] {
+            assert_ne!(sample(&other), base, "{part} must separate units");
+        }
+    }
+
+    /// The source a unit is sampled by is the one every checkout spells the
+    /// same way.
+    #[test]
+    fn checkout_relative_drops_only_the_working_directory() {
+        let cwd = Path::new("/home/ci/.cargo/registry/src/index/serde-1.0.0");
+        assert_eq!(
+            checkout_relative(&cwd.join("src/lib.rs"), Some(cwd)),
+            Path::new("src/lib.rs")
+        );
+        assert_eq!(
+            checkout_relative(Path::new("src/lib.rs"), Some(cwd)),
+            Path::new("src/lib.rs")
+        );
+        assert_eq!(
+            checkout_relative(Path::new("/elsewhere/src/lib.rs"), Some(cwd)),
+            Path::new("/elsewhere/src/lib.rs")
+        );
+        assert_eq!(
+            checkout_relative(&cwd.join("src/lib.rs"), None),
+            cwd.join("src/lib.rs")
+        );
+    }
+
     /// Two closures naming the same files agree however they are ordered: the
     /// key sorts both before folding, so order cannot change a key and must
     /// not be reported as a disagreement.
@@ -9296,7 +9527,7 @@ mod tests {
             Err(Rejection::TreeChanged)
         );
         std::fs::remove_file(package.join("macro-input.txt")).unwrap();
-        assert_eq!(predicted_key_inputs(&args, &hasher).unwrap().0, closure);
+        assert_eq!(predicted_key_inputs(&args, &hasher).unwrap(), closure);
         // An emitted closure without a prior guarded discovery must not
         // inherit the preceding invocation's tree.
         take_last_tree_digest();

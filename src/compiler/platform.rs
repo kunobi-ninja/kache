@@ -659,6 +659,9 @@ pub(crate) mod tests {
 
     #[test]
     fn debug_bundle_command_resolves_relative_arguments_before_changing_directory() {
+        // Both the command and this test resolve against the current
+        // directory, which other tests move while holding this lock.
+        let _lock = crate::test_support::process_state_test_lock();
         let binary = Path::new("target/debug/deps/demo");
         let bundle = Path::new("target/debug/deps/demo.dSYM");
         let command = debug_bundle_command(binary, bundle).unwrap();

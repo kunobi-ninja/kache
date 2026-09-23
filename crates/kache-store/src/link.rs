@@ -478,6 +478,9 @@ fn hardlink_or_copy_with_prelink_hook(
     // source failure.
     #[cfg_attr(not(unix), allow(unused_variables))]
     let shared = SHARED_HARDLINK_RESTORES.load(Ordering::Relaxed);
+    // Every fallback below copies the same way, so an executable stays
+    // runnable whichever check sends it there.
+    let copy_instead = || copy_hardlink_fallback(store_path, target_path, bytes, executable);
     #[cfg(unix)]
     match fs::metadata(store_path) {
         Ok(meta) => {
@@ -490,7 +493,7 @@ fn hardlink_or_copy_with_prelink_hook(
                     target_path.display()
                 );
                 crate::opcounts::record_restore_copy_exclusive(bytes);
-                return copy_hardlink_fallback(store_path, target_path, bytes, executable);
+                return copy_instead();
             }
         }
         Err(error) => {
@@ -501,7 +504,7 @@ fn hardlink_or_copy_with_prelink_hook(
                 target_path.display()
             );
             crate::opcounts::record_restore_copy_other(bytes);
-            return copy_hardlink_fallback(store_path, target_path, bytes, executable);
+            return copy_instead();
         }
     }
 
@@ -528,7 +531,7 @@ fn hardlink_or_copy_with_prelink_hook(
         // EXDEV/EPERM also emit the once-per-session layout advisory.
         // What gets linked is unchanged — this still falls back to a copy.
         warn_hardlink_fallback_once(store_path, target_path, reason, &e);
-        return copy_hardlink_fallback(store_path, target_path, bytes, executable);
+        return copy_instead();
     }
 
     // Two restorers may both observe nlink == 1 before either creates its
@@ -554,7 +557,7 @@ fn hardlink_or_copy_with_prelink_hook(
                     )
                 })?;
                 crate::opcounts::record_restore_copy_exclusive(bytes);
-                return copy_hardlink_fallback(store_path, target_path, bytes, executable);
+                return copy_instead();
             }
             Err(source_error) => {
                 verify_orphaned_hardlink(target_path, fs::metadata(target_path), source_error)?
@@ -4196,6 +4199,61 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         assert_eq!(fs::read(&blob).unwrap(), b"build script");
         assert_eq!(fs::read(&tree_b).unwrap(), b"rebuilt in b");
         assert_eq!(mode_of(&blob), 0o555);
+    }
+
+    /// A shareable blob whose `link(2)` fails, for example with the store on
+    /// another filesystem, is copied to a private file that still runs.
+    #[cfg(unix)]
+    #[test]
+    fn executable_hardlink_link_failure_copies_a_runnable_file() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        for kind in [
+            std::io::ErrorKind::CrossesDevices,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let blob = dir.path().join(format!("blob-{kind:?}"));
+            let target = dir.path().join(format!("build_script_build-{kind:?}"));
+            fs::write(&blob, b"build script").unwrap();
+            fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
+            let _inject = InjectRestoreHardlinkError::enable(kind);
+
+            link_to_target_via(&blob, &target, LinkStrategy::ExecutableHardlink, no_reflink)
+                .unwrap();
+
+            assert_ne!(ino_of(&target), ino_of(&blob), "{kind:?}");
+            assert_eq!(mode_of(&target), 0o755, "{kind:?}");
+            assert_eq!(mode_of(&blob), 0o555, "{kind:?}");
+        }
+    }
+
+    /// A restorer that another link beats between its precheck and its own
+    /// link drops the link and gets a private file that still runs.
+    #[cfg(unix)]
+    #[test]
+    fn executable_hardlink_that_loses_the_link_race_copies_a_runnable_file() {
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        let other = dir.path().join("other/build_script_build-1");
+        let target = dir.path().join("build_script_build-1");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&blob, b"build script").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+
+        hardlink_or_copy_with_prelink_hook(&blob, &target, bytes, true, || {
+            fs::hard_link(&blob, &other).unwrap();
+        })
+        .unwrap();
+
+        assert_ne!(ino_of(&target), ino_of(&blob));
+        assert_eq!(mode_of(&target), 0o755);
+        assert_eq!(ino_of(&other), ino_of(&blob), "the winner keeps its link");
     }
 
     #[cfg(unix)]

@@ -1079,7 +1079,8 @@ mod tests {
 
     /// A proc-macro dylib or build-script binary restored as a link to a
     /// `0o555` blob is removed before the compiler writes a new one, so a
-    /// rebuild in that tree never writes through into the store.
+    /// rebuild in that tree never writes through into the store. This pins
+    /// existing pre-clean behavior that shared executable restores rely on.
     #[cfg(unix)]
     #[test]
     fn pre_clean_removes_shared_executable_links_without_touching_the_blob() {

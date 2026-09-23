@@ -2513,7 +2513,8 @@ mod tests {
     /// A build script restored as a link to a read-only store blob. Installing
     /// the launcher only renames that link aside, and a later install only
     /// unlinks it, so the blob keeps its bytes and mode and the launcher never
-    /// shares its inode.
+    /// shares its inode. This pins existing launcher behavior that shared
+    /// build-script restores rely on.
     #[cfg(unix)]
     #[test]
     fn launcher_install_moves_a_shared_binary_without_writing_to_it() {
@@ -2546,8 +2547,12 @@ mod tests {
                 0o555
             );
         }
-        std::fs::remove_dir_all(dir.path().join("debug").join(SHIM_DIR)).unwrap();
-        let output = std::process::Command::new(&executable).output().unwrap();
+        assert_eq!(find_real(&executable), Some(real.clone()));
+        // Run the shared inode itself, not the launcher. This process wrote
+        // the launcher, so a fork on another test thread can still hold it
+        // open for writing and the spawn would fail with ETXTBSY. A child
+        // shell wrote the blob, so nothing here holds it open.
+        let output = std::process::Command::new(&real).output().unwrap();
         assert!(
             output.status.success(),
             "{}",

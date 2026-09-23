@@ -124,7 +124,11 @@ def stage_instrument(commit, staging):
     """
     with at_commit(commit, "kache-e2e", "kache-scenario", "instrument") as tree:
         shutil.copy2(tree / "target" / "release" / "kache-scenario", staging / "kache-scenario")
-        shutil.copytree(tree / "scenarios", staging / "scenarios", dirs_exist_ok=True)
+        # Fixtures keep symlinks that dangle outside their build (the
+        # symlinked-target scenario), so copy links as links.
+        shutil.copytree(
+            tree / "scenarios", staging / "scenarios", symlinks=True, dirs_exist_ok=True
+        )
         copy_instrument_scripts(tree / "scripts", staging)
 
 

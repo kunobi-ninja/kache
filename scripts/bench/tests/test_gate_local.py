@@ -2,7 +2,9 @@
 """The local gate measures the same way CI does, and cleans up after itself."""
 
 import argparse
+import contextlib
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -62,6 +64,31 @@ class StagingTests(unittest.TestCase):
                     cwd=tmp,
                 )
                 self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
+    def test_scenario_symlinks_are_staged_as_links(self):
+        """A fixture's link may dangle until its build creates the target."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = Path(tmp) / "tree"
+            (tree / "target" / "release").mkdir(parents=True)
+            (tree / "target" / "release" / "kache-scenario").write_text("")
+            source = tree / "scenarios" / "fixture" / "source"
+            source.mkdir(parents=True)
+            (source / "oot-link").symlink_to("../missing")
+            staging = Path(tmp) / "instrument"
+            staging.mkdir()
+
+            @contextlib.contextmanager
+            def fake_at_commit(*args, **kwargs):
+                yield tree
+
+            with patch.object(local, "at_commit", fake_at_commit):
+                with patch.object(local, "copy_instrument_scripts", lambda *args: None):
+                    local.stage_instrument("abc123", staging)
+
+            link = staging / "scenarios" / "fixture" / "source" / "oot-link"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.readlink(link), "../missing")
 
 
 class MeasureTests(unittest.TestCase):

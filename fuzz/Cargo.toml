@@ -10,6 +10,7 @@ license = "Apache-2.0"
 cargo-fuzz = true
 
 [dependencies]
+anyhow = "1"
 blake3 = "1"
 libfuzzer-sys = "0.4"
 

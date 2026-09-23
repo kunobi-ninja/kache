@@ -5,6 +5,8 @@ use libfuzzer_sys::fuzz_target;
 #[allow(dead_code)]
 #[path = "../../src/checked_regions.rs"]
 mod checked_regions;
+// The file readers used by the cache key are not fuzzed here.
+#[allow(dead_code)]
 #[path = "../../src/native_archive.rs"]
 mod native_archive;
 

@@ -282,7 +282,6 @@ pub(crate) fn debug_bundle_command(binary: &Path, bundle_dir: &Path) -> Result<C
 /// script in `<profile>/build/<pkg>-<hash>`. Only those two levels are
 /// examined, so a project that happens to live under a directory called
 /// `deps` cannot drag the prefix up to it.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
     let parent = out_dir.parent();
     for cursor in [Some(out_dir), parent].into_iter().flatten() {

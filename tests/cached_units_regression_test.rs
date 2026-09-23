@@ -705,51 +705,37 @@ fn clippy_units_hit_with_their_diagnostics() {
 const BUNDLED_VALUE: &str = "KACHE_TEST_BUNDLED_VALUE";
 
 /// `bundler`'s build script writes a one-object archive whose function returns
-/// `KACHE_TEST_BUNDLED_VALUE`, and names it with a link modifier, as scripts
-/// that need every object linked do. Its library bundles the archive and
-/// `app` prints the value. The object comes from `$RUSTC --emit=obj` and the
-/// archive is written by hand, so no C toolchain or `ar` is involved.
-fn write_bundling_workspace(root: &Path) {
-    let write = |relative: &str, content: &str| {
-        let path = root.join(relative);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, content).unwrap();
-    };
-    write(
-        "Cargo.toml",
-        "[workspace]\nmembers = [\"bundler\", \"app\"]\nresolver = \"2\"\n",
-    );
-    write(
-        "bundler/Cargo.toml",
-        "[package]\nname = \"bundler\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    );
-    write(
-        "bundler/build.rs",
+/// `KACHE_TEST_BUNDLED_VALUE` into its OUT_DIR, adds that dir to the search
+/// path, and prints `link` (a `cargo:rustc-link-lib` line, or nothing). The
+/// object comes from `$RUSTC --emit=obj` and the archive is written by hand, so
+/// no C toolchain or `ar` is involved.
+fn bundler_build_script(link: &str) -> String {
+    format!(
         r##"use std::path::PathBuf;
 
 /// A one-object ar archive. ld64 wants each object on an 8-byte boundary, so
 /// for Apple targets the name follows the header, NUL-padded, as Apple's own
 /// tools write it.
-fn archive(object: &[u8], apple: bool) -> Vec<u8> {
-    let header = |name: &str, size: usize| {
-        format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644)
-    };
+fn archive(object: &[u8], apple: bool) -> Vec<u8> {{
+    let header = |name: &str, size: usize| {{
+        format!("{{name:<16}}{{:<12}}{{:<6}}{{:<6}}{{:<8}}{{size:<10}}`\n", 0, 0, 0, 644)
+    }};
     let mut bytes = b"!<arch>\n".to_vec();
-    if apple {
+    if apple {{
         let name = b"value.o\0\0\0\0\0";
         bytes.extend_from_slice(header("#1/12", name.len() + object.len()).as_bytes());
         bytes.extend_from_slice(name);
-    } else {
+    }} else {{
         bytes.extend_from_slice(header("value.o/", object.len()).as_bytes());
-    }
+    }}
     bytes.extend_from_slice(object);
-    if bytes.len() % 2 == 1 {
+    if bytes.len() % 2 == 1 {{
         bytes.push(b'\n');
-    }
+    }}
     bytes
-}
+}}
 
-fn main() {
+fn main() {{
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=KACHE_TEST_BUNDLED_VALUE");
     let value: u32 = std::env::var("KACHE_TEST_BUNDLED_VALUE").unwrap().parse().unwrap();
@@ -757,7 +743,7 @@ fn main() {
     let source = out.join("value.rs");
     std::fs::write(
         &source,
-        format!("#![no_std]\n#[no_mangle]\npub extern \"C\" fn bundled_value() -> u32 {{ {value} }}\n"),
+        format!("#![no_std]\n#[no_mangle]\npub extern \"C\" fn bundled_value() -> u32 {{{{ {{value}} }}}}\n"),
     )
     .unwrap();
     let object = out.join("value.o");
@@ -774,28 +760,167 @@ fn main() {
     let apple = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap() == "apple";
     let bytes = archive(&std::fs::read(&object).unwrap(), apple);
     std::fs::write(out.join("libbundled.a"), bytes).unwrap();
-    println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static:+whole-archive=bundled");
+    println!("cargo:rustc-link-search=native={{}}", out.display());
+    {link}
+}}
+"##
+    )
 }
-"##,
-    );
+
+/// Where the `extern` block that calls the archive's function lives.
+#[derive(Clone, Copy, PartialEq)]
+enum Caller {
+    /// In `bundler`; `app` depends on it.
+    Bundler,
+    /// In `bundler`; `app` reaches it only through a `mid` library.
+    BundlerBehindMid,
+    /// In `mid`, which depends on `bundler` for its `-L` alone; `app`
+    /// depends on mid.
+    Mid,
+}
+
+/// A workspace of `bundler` (see [`bundler_build_script`]), a library that
+/// calls the archive's function (see [`Caller`]), and `app`, which prints its
+/// value. `attribute` goes on the `extern` block.
+fn write_bundler_workspace(root: &Path, link: &str, attribute: &str, caller: Caller) {
+    let write = |relative: &str, content: &str| {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    let package = |name: &str, dependency: Option<&str>| {
+        let mut manifest =
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+        if let Some(dependency) = dependency {
+            manifest.push_str(&format!(
+                "\n[dependencies]\n{dependency} = {{ path = \"../{dependency}\" }}\n"
+            ));
+        }
+        manifest
+    };
+    let mid = caller != Caller::Bundler;
+    let members = if mid {
+        "[\"bundler\", \"mid\", \"app\"]"
+    } else {
+        "[\"bundler\", \"app\"]"
+    };
     write(
-        "bundler/src/lib.rs",
-        "extern \"C\" {\n    fn bundled_value() -> u32;\n}\n\n\
-         pub fn value() -> u32 {\n    unsafe { bundled_value() }\n}\n",
+        "Cargo.toml",
+        &format!("[workspace]\nmembers = {members}\nresolver = \"2\"\n"),
     );
-    write(
-        "app/Cargo.toml",
-        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nbundler = { path = \"../bundler\" }\n",
+    write("bundler/Cargo.toml", &package("bundler", None));
+    write("bundler/build.rs", &bundler_build_script(link));
+    let calling = format!(
+        "{attribute}\nextern \"C\" {{\n    fn bundled_value() -> u32;\n}}\n\n\
+         pub fn value() -> u32 {{\n    unsafe {{ bundled_value() }}\n}}\n"
     );
+    let forwarding = "pub fn value() -> u32 {\n    bundler::value()\n}\n";
+    let (bundler, mid_source) = match caller {
+        Caller::Bundler | Caller::BundlerBehindMid => (calling.as_str(), forwarding),
+        Caller::Mid => (
+            "//! Only the build script's search path is used.\n",
+            calling.as_str(),
+        ),
+    };
+    write("bundler/src/lib.rs", bundler);
+    let direct = if mid {
+        write("mid/Cargo.toml", &package("mid", Some("bundler")));
+        write("mid/src/lib.rs", mid_source);
+        "mid"
+    } else {
+        "bundler"
+    };
+    write("app/Cargo.toml", &package("app", Some(direct)));
     write(
         "app/src/main.rs",
-        "fn main() {\n    println!(\"bundled value {}\", bundler::value());\n}\n",
+        &format!("fn main() {{\n    println!(\"bundled value {{}}\", {direct}::value());\n}}\n"),
     );
     let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
     for entry in walkdir(root) {
         let _ = filetime::set_file_mtime(&entry, old);
     }
+}
+
+/// `bundler` names its archive with a link modifier, as scripts that need
+/// every object linked do.
+fn write_bundling_workspace(root: &Path) {
+    write_bundler_workspace(
+        root,
+        "println!(\"cargo:rustc-link-lib=static:+whole-archive=bundled\");",
+        "",
+        Caller::Bundler,
+    );
+}
+
+/// `app` reaches `bundler` through `mid`, and bundler names its archive with
+/// a plain `static=` spec.
+fn write_transitive_bundling_workspace(root: &Path) {
+    write_bundler_workspace(
+        root,
+        "println!(\"cargo:rustc-link-lib=static=bundled\");",
+        "",
+        Caller::BundlerBehindMid,
+    );
+}
+
+/// `bundler` names its archive only in a `#[link]` attribute; its build
+/// script adds the search path and no `-l`.
+fn write_attribute_bundling_workspace(root: &Path) {
+    write_bundler_workspace(
+        root,
+        "",
+        "#[link(name = \"bundled\", kind = \"static\")]",
+        Caller::Bundler,
+    );
+}
+
+/// `mid` names bundler's archive in a `#[link]` attribute, so it bundles an
+/// archive from a dependency's OUT_DIR, not its own.
+fn write_dependency_attribute_bundling_workspace(root: &Path) {
+    write_bundler_workspace(
+        root,
+        "",
+        "#[link(name = \"bundled\", kind = \"static\")]",
+        Caller::Mid,
+    );
+}
+
+/// Build the workspace in `target` with `value` baked into the archive, then
+/// run `app`. Returns each named crate's results and what app printed. The
+/// binary is cached too, so a stale restore of it would show.
+fn build_bundled(
+    fx: &Fixture,
+    target: &Path,
+    value: &str,
+    crates: &[&str],
+) -> (Vec<Vec<String>>, String) {
+    let mark = event_count(&fx.cache);
+    let mut command = cargo(
+        "build",
+        &fx.workspace,
+        &fx.home,
+        &fx.cache,
+        target,
+        &[(BUNDLED_VALUE, value)],
+    );
+    let base = std::fs::read_to_string(fx.cache.join("config.toml")).unwrap();
+    let config = fx.cache.join("config-executables.toml");
+    std::fs::write(&config, format!("{base}cache_executables = true\n")).unwrap();
+    run(command.env("KACHE_CONFIG", &config));
+    let events = events_since(&fx.cache, mark);
+    let results = crates
+        .iter()
+        .map(|name| {
+            results_for(&events, name)
+                .into_iter()
+                .map(String::from)
+                .collect()
+        })
+        .collect();
+    let output = Command::new(target.join("debug/app")).output().unwrap();
+    assert!(output.status.success(), "app failed: {output:?}");
+    let printed = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    (results, printed)
 }
 
 /// A build script that rewrites its archive in place, named
@@ -806,24 +931,8 @@ fn main() {
 fn a_rebuilt_whole_archive_lib_reaches_the_binary() {
     let fx = fixture_from(write_bundling_workspace);
     let build = |target: &Path, value: &str| -> (Vec<String>, String) {
-        let mark = event_count(&fx.cache);
-        run(&mut cargo(
-            "build",
-            &fx.workspace,
-            &fx.home,
-            &fx.cache,
-            target,
-            &[(BUNDLED_VALUE, value)],
-        ));
-        let events = events_since(&fx.cache, mark);
-        let results = results_for(&events, "bundler")
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let output = Command::new(target.join("debug/app")).output().unwrap();
-        assert!(output.status.success(), "app failed: {output:?}");
-        let printed = String::from_utf8(output.stdout).unwrap().trim().to_string();
-        (results, printed)
+        let (mut results, printed) = build_bundled(&fx, target, value, &["bundler"]);
+        (results.remove(0), printed)
     };
 
     let cold = target(&fx, "cold");
@@ -845,6 +954,82 @@ fn a_rebuilt_whole_archive_lib_reaches_the_binary() {
         (vec!["miss".to_string()], "bundled value 2".to_string()),
         "the library must recompile against the rebuilt archive"
     );
+}
+
+/// `app` depends on `mid`, which depends on `bundler`. A rebuilt archive
+/// changes bundler's rlib but not its metadata, which is what mid compiles
+/// against, so mid's rlib stays byte for byte the same, and app names only mid
+/// in its `--extern`s. App links the archive through bundler's rlib, so it
+/// must still miss: Cargo hands it bundler's `-L`, and the archive there is
+/// part of its key.
+#[test]
+fn a_rebuilt_archive_two_crates_down_reaches_the_binary() {
+    let fx = fixture_from(write_transitive_bundling_workspace);
+    let crates = ["bundler", "mid", "app"];
+    let results = |values: &[&str]| -> Vec<Vec<String>> {
+        values.iter().map(|value| vec![value.to_string()]).collect()
+    };
+
+    let (cold, printed) = build_bundled(&fx, &target(&fx, "cold"), "1", &crates);
+    assert_eq!(cold, results(&["miss", "miss", "miss"]));
+    assert_eq!(printed, "bundled value 1");
+    let warm = target(&fx, "warm");
+    let (restored, printed) = build_bundled(&fx, &warm, "1", &crates);
+    assert_eq!(restored, results(&["local_hit", "local_hit", "local_hit"]));
+    assert_eq!(printed, "bundled value 1");
+
+    let (rebuilt, printed) = build_bundled(&fx, &warm, "2", &crates);
+    assert_eq!(
+        printed, "bundled value 2",
+        "the binary must link the rebuilt archive: {rebuilt:?}"
+    );
+    assert_eq!(rebuilt[0], ["miss"], "bundler bundles the new archive");
+    assert_eq!(rebuilt[2], ["miss"], "app links it");
+}
+
+/// A `#[link(kind = "static")]` attribute bundles the archive into the rlib
+/// with no `-l` on the command line. The archive is in bundler's own OUT_DIR,
+/// whose archives key its rlib, so the rlib is stored and restored, and a
+/// rebuilt archive re-keys it.
+#[test]
+fn rlib_bundling_its_own_out_dir_archive_is_keyed() {
+    let fx = fixture_from(write_attribute_bundling_workspace);
+    let crates = ["bundler", "app"];
+
+    let (cold, printed) = build_bundled(&fx, &target(&fx, "cold"), "1", &crates);
+    assert_eq!(cold[0], ["miss"]);
+    assert_eq!(printed, "bundled value 1");
+
+    let warm = target(&fx, "warm");
+    let (second, printed) = build_bundled(&fx, &warm, "1", &crates);
+    assert_eq!(second[0], ["local_hit"], "bundler is restored");
+    assert_eq!(printed, "bundled value 1");
+
+    let (rebuilt, printed) = build_bundled(&fx, &warm, "2", &crates);
+    assert_eq!(printed, "bundled value 2", "{rebuilt:?}");
+    assert_eq!(rebuilt[0], ["miss"], "the rebuilt archive re-keys bundler");
+}
+
+/// An attribute in `mid` bundles an archive from bundler's OUT_DIR, which
+/// Cargo hands mid only as a search path. The key cannot see that archive, so
+/// mid's rlib is not stored: a fresh target directory compiles it again, and
+/// a rebuilt archive reaches the binary.
+#[test]
+fn rlib_bundling_unkeyed_archive_is_not_stored() {
+    let fx = fixture_from(write_dependency_attribute_bundling_workspace);
+    let crates = ["mid", "app"];
+
+    let (cold, printed) = build_bundled(&fx, &target(&fx, "cold"), "1", &crates);
+    assert_eq!(cold[0], ["skipped"], "mid is compiled, not stored");
+    assert_eq!(printed, "bundled value 1");
+
+    let warm = target(&fx, "warm");
+    let (second, printed) = build_bundled(&fx, &warm, "1", &crates);
+    assert_eq!(second[0], ["skipped"], "the second build must compile mid");
+    assert_eq!(printed, "bundled value 1");
+
+    let (rebuilt, printed) = build_bundled(&fx, &warm, "2", &crates);
+    assert_eq!(printed, "bundled value 2", "{rebuilt:?}");
 }
 
 /// `stamped`'s build script reports the `ZERO_AR_DATE` it runs with.

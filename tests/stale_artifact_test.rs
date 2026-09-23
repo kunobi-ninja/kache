@@ -660,3 +660,137 @@ fn unrestorable_cache_entry_falls_back_to_recompile() {
         "fallback recompile must produce identical output"
     );
 }
+
+/// Whether `tool` can be started at all.
+#[cfg(unix)]
+fn tool_runs(tool: &str) -> bool {
+    std::process::Command::new(tool)
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// A workspace where `app` depends on `m` and `m` on `s`, whose build script
+/// compiles `value.c` with `cc` and archives it with `ar` as `libvalue.a`.
+#[cfg(unix)]
+fn write_native_chain(root: &Path) {
+    let write = |relative: &str, content: &str| {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    let package = |name: &str, dependency: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\n{dependency}"
+        )
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"s\", \"m\", \"app\"]\nresolver = \"2\"\n",
+    );
+    write("s/Cargo.toml", &package("s", ""));
+    write("s/value.c", "int native_value(void) { return 1; }\n");
+    write(
+        "s/build.rs",
+        r#"use std::process::Command;
+
+fn main() {
+    println!("cargo:rerun-if-changed=value.c");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let object = out.join("value.o");
+    let archive = out.join("libvalue.a");
+    let status = Command::new("cc")
+        .args(["-c", "value.c", "-o"])
+        .arg(&object)
+        .status()
+        .unwrap();
+    assert!(status.success(), "cc failed");
+    let _ = std::fs::remove_file(&archive);
+    let status = Command::new("ar")
+        .arg("crs")
+        .arg(&archive)
+        .arg(&object)
+        .status()
+        .unwrap();
+    assert!(status.success(), "ar failed");
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=value");
+}
+"#,
+    );
+    write(
+        "s/src/lib.rs",
+        "extern \"C\" {\n    fn native_value() -> i32;\n}\n\n\
+         pub fn value() -> i32 {\n    unsafe { native_value() }\n}\n",
+    );
+    write("m/Cargo.toml", &package("m", "s = { path = \"../s\" }\n"));
+    write(
+        "m/src/lib.rs",
+        "pub fn value() -> i32 {\n    s::value()\n}\n",
+    );
+    write(
+        "app/Cargo.toml",
+        &package("app", "m = { path = \"../m\" }\n"),
+    );
+    write(
+        "app/src/main.rs",
+        "fn main() {\n    println!(\"value {}\", m::value());\n}\n",
+    );
+}
+
+/// Editing the C source of an archive two crates below the binary must reach
+/// the binary on a warm rebuild. `s`'s rlib changes, but `m` compiles against
+/// `s`'s unchanged metadata and the binary names only `m`, so nothing in the
+/// binary's `--extern`s moves: the archive in the `-L` dir Cargo hands the
+/// binary is what re-keys it.
+#[cfg(unix)]
+#[test]
+fn stale_native_archive_two_crates_down_reaches_the_binary() {
+    if !tool_runs("cc") || !tool_runs("ar") {
+        eprintln!("skipping: cc or ar is missing");
+        return;
+    }
+    build_kache();
+    let project = TempDir::new().unwrap();
+    write_native_chain(project.path());
+    let cache_dir = TempDir::new().unwrap();
+    let target_dir = TempDir::new().unwrap();
+    let config = isolated_config_path(cache_dir.path());
+    std::fs::write(
+        &config,
+        "[cache]\nlocal_only = true\ncache_executables = true\n",
+    )
+    .unwrap();
+    let build_and_run = || {
+        let output = hermetic_command("cargo", cache_dir.path(), Some(&config))
+            .args(["build"])
+            .current_dir(project.path())
+            .env("RUSTC_WRAPPER", kache_binary())
+            .env("CARGO_TARGET_DIR", target_dir.path())
+            .env("CARGO_INCREMENTAL", "0")
+            .output()
+            .expect("failed to run cargo build");
+        assert!(
+            output.status.success(),
+            "cargo build failed.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let run = std::process::Command::new(target_dir.path().join("debug/app"))
+            .output()
+            .unwrap();
+        String::from_utf8(run.stdout).unwrap().trim().to_string()
+    };
+
+    assert_eq!(build_and_run(), "value 1");
+    std::fs::write(
+        project.path().join("s/value.c"),
+        "int native_value(void) { return 2; }\n",
+    )
+    .unwrap();
+    assert_eq!(
+        build_and_run(),
+        "value 2",
+        "the binary must link the rebuilt archive"
+    );
+}

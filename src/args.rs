@@ -999,6 +999,26 @@ impl RustcArgs {
                     .flat_map(|kinds| kinds.split(','))
                     .any(|kind| LINKED.contains(&kind.trim())))
     }
+
+    /// Whether this invocation's output carries the native archives its `-L`
+    /// dirs hold: it runs the linker, or it writes a staticlib, which rustc
+    /// fills with the archives it bundles.
+    pub fn links_native_closure(&self) -> bool {
+        self.invokes_linker()
+            || (self.emits_link() && self.has_crate_type(|kind| kind == "staticlib"))
+    }
+
+    /// Whether this invocation writes an rlib.
+    pub fn emits_rlib(&self) -> bool {
+        self.emits_link() && self.has_crate_type(|kind| kind == "lib" || kind == "rlib")
+    }
+
+    fn has_crate_type(&self, matches: impl Fn(&str) -> bool) -> bool {
+        self.crate_types
+            .iter()
+            .flat_map(|kinds| kinds.split(','))
+            .any(|kind| matches(kind.trim()))
+    }
 }
 
 fn parse_extern(s: &str) -> ExternDep {
@@ -1880,6 +1900,34 @@ mod tests {
             "no crate type is a bin"
         );
         assert!(!parse(&["--crate-type", "bin", "--emit=metadata"]).invokes_linker());
+    }
+
+    #[test]
+    fn native_closure_and_rlib_output_follow_crate_type_and_emit() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["rustc", "--crate-name", "foo", "src/lib.rs"];
+            argv.extend_from_slice(extra);
+            RustcArgs::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let link = "--emit=dep-info,metadata,link";
+        let metadata = "--emit=dep-info,metadata";
+        let closure = |extra: &[&str]| parse(extra).links_native_closure();
+        let rlib = |extra: &[&str]| parse(extra).emits_rlib();
+
+        assert!(closure(&["--crate-type", "bin", link]));
+        assert!(closure(&["--crate-type", "staticlib", link]));
+        assert!(closure(&["--crate-type", "rlib,staticlib", link]));
+        assert!(!closure(&["--crate-type", "staticlib", metadata]));
+        assert!(!closure(&["--crate-type", "lib", link]));
+        assert!(!closure(&["--crate-type", "rlib", link]));
+
+        assert!(rlib(&["--crate-type", "lib", link]));
+        assert!(rlib(&["--crate-type", "rlib", link]));
+        assert!(rlib(&["--crate-type", "staticlib, rlib", link]));
+        assert!(!rlib(&["--crate-type", "lib", metadata]));
+        assert!(!rlib(&["--crate-type", "staticlib", link]));
+        assert!(!rlib(&["--crate-type", "bin", link]));
+        assert!(!rlib(&[link]), "no crate type is a bin");
     }
 
     #[test]

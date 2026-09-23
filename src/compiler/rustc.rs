@@ -7,7 +7,6 @@
 
 use anyhow::Result;
 use std::borrow::Cow;
-#[cfg(any(test, target_os = "macos"))]
 use std::path::PathBuf;
 
 use crate::args::RustcArgs;
@@ -448,6 +447,26 @@ use super::platform::cargo_profile_dir;
 fn macos_oso_prefix_root(parsed: &RustcArgs) -> Option<PathBuf> {
     let out_dir = parsed.out_dir.as_ref()?;
     Some(cargo_profile_dir(out_dir).unwrap_or_else(|| out_dir.clone()))
+}
+
+/// The directory a cached link strips from its `N_OSO` paths through the
+/// `-oso_prefix` kache injects, or `None` when this link gets no injected
+/// prefix. An archive under it is named relative to that root in the debug
+/// map, so the key may use the archive's portable digest.
+#[cfg(target_os = "macos")]
+pub(crate) fn oso_prefix_root_for_key(parsed: &RustcArgs) -> Option<PathBuf> {
+    oso_prefix_root_for_key_inner(parsed)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn oso_prefix_root_for_key(_parsed: &RustcArgs) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn oso_prefix_root_for_key_inner(parsed: &RustcArgs) -> Option<PathBuf> {
+    macos_oso_prefix_flag_inner(parsed, &parsed.all_args, true)?;
+    macos_oso_prefix_root(parsed)
 }
 
 #[cfg(test)]
@@ -1282,5 +1301,27 @@ mod tests {
             macos_oso_prefix_flag_inner(&parsed, &argv, false).is_none(),
             "passthrough must not rewrite the link"
         );
+    }
+
+    /// The key reads the root only where kache injects the prefix: a debug
+    /// link without a prefix of the caller's own.
+    #[test]
+    fn oso_prefix_root_for_key_follows_the_injected_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("target/debug");
+        let out_dir = profile.join("deps");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let (parsed, _) = debug_bin_args(&out_dir, &[]);
+        assert_eq!(
+            oso_prefix_root_for_key_inner(&parsed),
+            Some(profile.clone())
+        );
+        let host_root = cfg!(target_os = "macos").then_some(profile);
+        assert_eq!(oso_prefix_root_for_key(&parsed), host_root);
+
+        let (user_prefix, _) =
+            debug_bin_args(&out_dir, &["-Clink-arg=-Wl,-oso_prefix,/elsewhere/"]);
+        assert_eq!(oso_prefix_root_for_key_inner(&user_prefix), None);
     }
 }

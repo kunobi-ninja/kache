@@ -3959,6 +3959,40 @@ fn run_parsed_rustc(
         return Ok(result.exit_code);
     }
 
+    // Bundle audit: an rlib must not be stored when it carries an archive from
+    // its `-L` dirs that the key did not hash (a `#[link(kind = "static")]`
+    // attribute, say). The compile already ran; we only decline to cache it.
+    let native_archives = crate::cache_key::take_last_key_native_archives().unwrap_or_default();
+    let unaudited = match unaudited_native_bundle(args, &result.artifacts, &native_archives) {
+        Ok(None) => None,
+        Ok(Some(member)) => Some(format!(
+            "its rlib bundles `{member}` from an archive the key does not hash"
+        )),
+        Err(error) => Some(format!("its native bundle audit failed: {error:#}")),
+    };
+    if let Some(reason) = unaudited {
+        tracing::warn!("not caching {crate_name}: {reason}");
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event_with_hash_stats(
+            config,
+            &event_root,
+            crate_name,
+            EventResult::Skipped,
+            elapsed,
+            compile_time_ms,
+            0,
+            &cache_key,
+            key_ms,
+            key_hash_stats,
+            lookup_ms,
+            0,
+            0,
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
     // Put-side admission control: the compile already ran and its outputs are
     // in place; a configured threshold may decline local retention. A writable
     // remote always reaches the store-and-upload path below.
@@ -4657,6 +4691,147 @@ fn missing_requested_emit(args: &RustcArgs, artifacts: &ArtifactSet) -> Option<S
                 && !present.contains(kind.as_str())
         })
         .cloned()
+}
+
+/// The first member of this compile's rlib that rustc bundled from an archive
+/// in the unit's scanned `-L` dirs the key did not hash, if any.
+///
+/// A `#[link(kind = "static")]` attribute bundles an archive that no `-l` on
+/// argv names, so the key holds the attribute text but not the archive bytes.
+/// Storing that rlib would restore it after the archive is rebuilt in place.
+/// Only rlibs with a scanned native dir are audited, the units whose key
+/// carries the `native_bundle_audit` marker; a system library dir outside the
+/// build tree is never read. A file in those dirs that is no `ar` archive (a
+/// linker script) cannot be bundled, so it is no candidate.
+fn unaudited_native_bundle(
+    args: &RustcArgs,
+    artifacts: &ArtifactSet,
+    native: &crate::cache_key::KeyedNativeArchives,
+) -> Result<Option<String>> {
+    if !crate::cache_key::needs_native_bundle_audit(args, &native.dirs) {
+        return Ok(None);
+    }
+    let Some(rlib) = artifacts
+        .outputs()
+        .iter()
+        .find(|artifact| artifact.store_name.ends_with(".rlib"))
+    else {
+        return Ok(None);
+    };
+    let members = without_import_members(&crate::native_archive::members(&rlib.path)?);
+    let keyed = bundle_credits(&native.bundled)?;
+    if unkeyed_rlib_members(&members, &keyed).is_empty() {
+        return Ok(None);
+    }
+    let mut candidates = Vec::new();
+    for dir in &native.dirs {
+        for archive in crate::cache_key::native_dir_archives(dir)? {
+            if !native.archives.contains(&archive)
+                && crate::native_archive::has_archive_magic(&archive)?
+            {
+                candidates.extend(archive_names(&archive)?);
+            }
+        }
+    }
+    Ok(unaudited_bundled_member(&members, &keyed, &candidates))
+}
+
+/// The names of the rlib members an archive the key hashed accounts for:
+/// the file name of one rustc packs as a single member, the member names of
+/// one it unpacks. A keyed archive the rlib does not carry accounts for none,
+/// so a same-named member of an unkeyed archive stays unaccounted for.
+fn bundle_credits(bundled: &[crate::cache_key::BundledArchive]) -> Result<Vec<String>> {
+    let mut credits = Vec::new();
+    for archive in bundled {
+        if archive.packed {
+            credits.extend(
+                archive
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+            );
+        } else {
+            credits.extend(crate::native_archive::member_names(&archive.path)?);
+        }
+    }
+    Ok(credits)
+}
+
+/// The rlib's member names without its import-library members: every member
+/// that shares a name with a COFF short import object, which is the DLL name
+/// (`kernel32.dll`). rustc writes these for `kind = "raw-dylib"` from the
+/// source text, not from a file in the `-L` dirs. An import library bundled
+/// as a static archive is not audited either.
+fn without_import_members(members: &[crate::native_archive::ArchiveMember]) -> Vec<String> {
+    let dlls: std::collections::HashSet<&str> = members
+        .iter()
+        .filter(|member| member.short_import)
+        .map(|member| member.name.as_str())
+        .collect();
+    members
+        .iter()
+        .filter(|member| !dlls.contains(member.name.as_str()))
+        .map(|member| member.name.clone())
+        .collect()
+}
+
+/// An archive's member names and its own file name, which rustc uses for the
+/// single member that packs a `+whole-archive` library.
+fn archive_names(archive: &Path) -> Result<Vec<String>> {
+    let mut names = crate::native_archive::member_names(archive)?;
+    names.extend(
+        archive
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+    );
+    Ok(names)
+}
+
+/// Members rustc writes into every rlib: the symbol and name tables, the
+/// crate metadata and the codegen units, with their split DWARF objects.
+fn is_rustc_rlib_member(name: &str) -> bool {
+    matches!(name, "/" | "//" | "/SYM64/")
+        || name.starts_with("__.SYMDEF")
+        || name.starts_with("lib.rmeta")
+        || name.ends_with(".rcgu.o")
+        || name.ends_with(".rcgu.dwo")
+}
+
+/// The rlib members that are neither rustc's own nor accounted for by a
+/// `keyed` name. Each keyed name covers one member, so a name bundled twice
+/// needs two keyed sources.
+fn unkeyed_rlib_members<'a>(rlib_members: &'a [String], keyed: &[String]) -> Vec<&'a str> {
+    let mut remaining: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for name in keyed {
+        *remaining.entry(name).or_default() += 1;
+    }
+    rlib_members
+        .iter()
+        .map(String::as_str)
+        .filter(|member| !is_rustc_rlib_member(member))
+        .filter(|member| match remaining.get_mut(member) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// The first unkeyed rlib member (see [`unkeyed_rlib_members`]) that one of
+/// the unkeyed archives in the unit's native dirs could have supplied, by a
+/// member name or its file name. A member that matches nothing there is left
+/// alone: rustc bundles only from `native=`/`all=` dirs and the sysroot.
+fn unaudited_bundled_member(
+    rlib_members: &[String],
+    keyed: &[String],
+    candidates: &[String],
+) -> Option<String> {
+    unkeyed_rlib_members(rlib_members, keyed)
+        .into_iter()
+        .find(|member| candidates.iter().any(|candidate| candidate == member))
+        .map(str::to_string)
 }
 
 struct ComputedKey {
@@ -12786,6 +12961,271 @@ exit 0
             "debug-info".to_string(),
         ];
         assert_eq!(missing_requested_emit(&args, &artifacts), None);
+    }
+
+    fn names(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn unaudited_bundled_member_finds_only_uncovered_archive_members() {
+        let rustc_own = [
+            "/",
+            "//",
+            "/SYM64/",
+            "__.SYMDEF SORTED",
+            "lib.rmeta",
+            "lib.rmeta-link",
+            "mylib-0123.mylib.a1b2-cgu.0.rcgu.o",
+            "mylib-0123.mylib.a1b2-cgu.0.rcgu.dwo",
+        ];
+        let mut candidates = names(&rustc_own);
+        candidates.extend(names(&["util.o", "libfoo.a"]));
+        assert_eq!(
+            unaudited_bundled_member(&names(&rustc_own), &[], &candidates),
+            None,
+            "rustc's own members are never foreign"
+        );
+
+        let with = |extra: &[&str]| {
+            let mut members = names(&rustc_own);
+            members.extend(names(extra));
+            members
+        };
+        assert_eq!(
+            unaudited_bundled_member(&with(&["util.o"]), &names(&["util.o"]), &candidates),
+            None,
+            "a keyed archive covers its member"
+        );
+        assert_eq!(
+            unaudited_bundled_member(&with(&["libfoo.a"]), &[], &candidates),
+            Some("libfoo.a".to_string()),
+            "a packed +whole-archive library matches its file name"
+        );
+        assert_eq!(
+            unaudited_bundled_member(
+                &with(&["util.o", "util.o"]),
+                &names(&["util.o"]),
+                &candidates
+            ),
+            Some("util.o".to_string()),
+            "one keyed name covers one member"
+        );
+        assert_eq!(
+            unaudited_bundled_member(&with(&["other.o"]), &[], &candidates),
+            None,
+            "a member no candidate holds came from elsewhere"
+        );
+    }
+
+    /// A GNU `ar` archive of short-named members, each holding `data` (of
+    /// even length, so no member needs padding).
+    fn ar_archive_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = b"!<arch>\n".to_vec();
+        for (member, data) in members {
+            assert_eq!(data.len() % 2, 0);
+            let name = format!("{member}/");
+            bytes.extend_from_slice(
+                format!(
+                    "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                    0,
+                    0,
+                    0,
+                    644,
+                    data.len()
+                )
+                .as_bytes(),
+            );
+            bytes.extend_from_slice(data);
+        }
+        bytes
+    }
+
+    /// [`ar_archive_of`] with two bytes in each member.
+    fn ar_archive(members: &[&str]) -> Vec<u8> {
+        let members: Vec<(&str, &[u8])> = members.iter().map(|name| (*name, &b"xx"[..])).collect();
+        ar_archive_of(&members)
+    }
+
+    fn keyed_native(
+        archives: Vec<PathBuf>,
+        bundled: Vec<(PathBuf, bool)>,
+        dirs: Vec<PathBuf>,
+    ) -> crate::cache_key::KeyedNativeArchives {
+        crate::cache_key::KeyedNativeArchives {
+            archives,
+            bundled: bundled
+                .into_iter()
+                .map(|(path, packed)| crate::cache_key::BundledArchive { path, packed })
+                .collect(),
+            dirs,
+        }
+    }
+
+    /// An `ArtifactSet` holding one rlib with these members.
+    fn rlib_artifacts(dir: &Path, members: &[(&str, &[u8])]) -> ArtifactSet {
+        let rlib = dir.join("libmylib.rlib");
+        std::fs::write(&rlib, ar_archive_of(members)).unwrap();
+        ArtifactSet::from_output_files(
+            vec![(rlib, "libmylib.rlib".to_string())],
+            classify_by_filename,
+        )
+    }
+
+    /// An rlib that carries a member of an unkeyed archive in its `-L` dir is
+    /// refused; the same rlib with that archive keyed, a unit that is no rlib,
+    /// and an rlib with no native dir are not audited.
+    #[test]
+    fn unaudited_native_bundle_reads_the_rlib_and_its_native_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let archive = out.join("libbundled.a");
+        std::fs::write(&archive, ar_archive(&["value.o"])).unwrap();
+        std::fs::write(out.join("libother.a"), ar_archive(&["other.o"])).unwrap();
+        let artifacts = rlib_artifacts(dir.path(), &[("lib.rmeta", b"xx"), ("value.o", b"xx")]);
+        let lib = rustc_args(&["rustc", "src/lib.rs", "--crate-type", "lib"]);
+
+        let unkeyed = keyed_native(vec![], vec![], vec![out.clone()]);
+        assert_eq!(
+            unaudited_native_bundle(&lib, &artifacts, &unkeyed).unwrap(),
+            Some("value.o".to_string())
+        );
+        let keyed = keyed_native(
+            vec![archive.clone()],
+            vec![(archive.clone(), false)],
+            vec![out.clone()],
+        );
+        assert_eq!(
+            unaudited_native_bundle(&lib, &artifacts, &keyed).unwrap(),
+            None
+        );
+        let bin = rustc_args(&["rustc", "src/main.rs", "--crate-type", "bin"]);
+        assert_eq!(
+            unaudited_native_bundle(&bin, &artifacts, &unkeyed).unwrap(),
+            None
+        );
+        assert_eq!(
+            unaudited_native_bundle(&lib, &artifacts, &keyed_native(vec![], vec![], vec![]))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            unaudited_native_bundle(&lib, &ArtifactSet::default(), &unkeyed).unwrap(),
+            None,
+            "no rlib output, nothing to audit"
+        );
+
+        // glibc ships `libm.a` as a linker script; rustc cannot bundle it.
+        std::fs::write(out.join("libm.a"), b"/* GNU ld script */\nGROUP ( x )\n").unwrap();
+        assert_eq!(
+            unaudited_native_bundle(&lib, &artifacts, &unkeyed).unwrap(),
+            Some("value.o".to_string()),
+            "a file that is no archive is no candidate"
+        );
+
+        std::fs::write(out.join("libthin.a"), b"!<thin>\n").unwrap();
+        assert!(
+            unaudited_native_bundle(&lib, &artifacts, &unkeyed).is_err(),
+            "a candidate that cannot be read refuses the store"
+        );
+        assert_eq!(
+            unaudited_native_bundle(&lib, &artifacts, &keyed).unwrap(),
+            None,
+            "candidates are read only for an uncovered member"
+        );
+    }
+
+    /// A keyed archive accounts only for the members the rlib takes from it.
+    /// A packed `+whole-archive` library is one member under its file name,
+    /// so its own members must not cover an unkeyed archive's same-named one.
+    #[test]
+    fn bundle_audit_credits_only_what_the_rlib_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let foo = out.join("libfoo.a");
+        std::fs::write(&foo, ar_archive(&["util.o"])).unwrap();
+        std::fs::write(out.join("libbar.a"), ar_archive(&["util.o"])).unwrap();
+        let lib = rustc_args(&["rustc", "src/lib.rs", "--crate-type", "lib"]);
+        let audit = |members: &[(&str, &[u8])], bundled: Vec<(PathBuf, bool)>| {
+            let artifacts = rlib_artifacts(dir.path(), members);
+            let native = keyed_native(vec![foo.clone()], bundled, vec![out.clone()]);
+            unaudited_native_bundle(&lib, &artifacts, &native).unwrap()
+        };
+
+        let packed = [
+            ("lib.rmeta", &b"xx"[..]),
+            ("libfoo.a", b"xx"),
+            ("util.o", b"xx"),
+        ];
+        assert_eq!(
+            audit(&packed, vec![(foo.clone(), true)]),
+            Some("util.o".to_string()),
+            "bar's util.o beside a packed foo"
+        );
+        assert_eq!(
+            audit(&packed, vec![]),
+            Some("util.o".to_string()),
+            "a keyed archive the rlib does not bundle covers nothing"
+        );
+        let unpacked = [("lib.rmeta", &b"xx"[..]), ("util.o", b"xx")];
+        assert_eq!(audit(&unpacked, vec![(foo.clone(), false)]), None);
+
+        assert_eq!(
+            bundle_credits(&keyed_native(vec![], vec![(foo.clone(), true)], vec![]).bundled)
+                .unwrap(),
+            ["libfoo.a"]
+        );
+        assert_eq!(
+            bundle_credits(&keyed_native(vec![], vec![(foo.clone(), false)], vec![]).bundled)
+                .unwrap(),
+            ["util.o"]
+        );
+    }
+
+    /// rustc writes `raw-dylib` imports into the rlib as import-library
+    /// members named after the DLL; an import library in the `-L` dirs holds
+    /// members of the same names, and neither is a bundled archive.
+    #[test]
+    fn bundle_audit_leaves_raw_dylib_import_members_alone() {
+        const STUB: &[u8] = b"\0\0\xff\xff\x64\x86stub";
+        let member = |name: &str, short_import| crate::native_archive::ArchiveMember {
+            name: name.to_string(),
+            short_import,
+        };
+        assert_eq!(
+            without_import_members(&[
+                member("lib.rmeta", false),
+                member("kernel32.dll", true),
+                member("kernel32.dll", false),
+                member("util.o", false),
+            ]),
+            ["lib.rmeta", "util.o"]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let lib_dir = dir.path().join("lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(
+            lib_dir.join("windows.0.53.0.lib"),
+            ar_archive_of(&[("kernel32.dll", STUB), ("kernel32.dll", b"desc")]),
+        )
+        .unwrap();
+        let artifacts = rlib_artifacts(
+            dir.path(),
+            &[
+                ("lib.rmeta", b"xx"),
+                ("kernel32.dll", STUB),
+                ("kernel32.dll", b"desc"),
+            ],
+        );
+        let lib = rustc_args(&["rustc", "src/lib.rs", "--crate-type", "lib"]);
+        let native = keyed_native(vec![], vec![], vec![lib_dir]);
+        assert_eq!(
+            unaudited_native_bundle(&lib, &artifacts, &native).unwrap(),
+            None
+        );
     }
 
     /// An entry whose recorded emit set is narrower than the invocation is

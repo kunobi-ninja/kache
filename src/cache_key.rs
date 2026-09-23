@@ -1295,9 +1295,9 @@ fn parse_verify_predictions(value: Option<&str>) -> VerifyPredictions {
 /// Hashing the identity also makes the sample stable: the same units are
 /// checked on every build, so a disagreement is reproducible rather than a
 /// one-off nobody can chase. Different units are covered across a graph
-/// because the identities differ, not because a counter advanced. The caller
-/// passes [`prediction_sample_identity`], so every checkout of a project
-/// checks the same units too.
+/// because the identities differ, not because a counter advanced.
+/// [`verifies_prediction`] passes [`prediction_sample_identity`], so every
+/// checkout of a project checks the same units too.
 fn should_verify_this_prediction(mode: VerifyPredictions, identity: &str) -> bool {
     match mode {
         VerifyPredictions::Off => false,
@@ -1317,6 +1317,19 @@ fn sampled_by_identity(identity: &str, rate: usize) -> bool {
     bucket % (rate as u64) == 0
 }
 
+/// Is this validated prediction checked against the pre-pass it replaced?
+///
+/// The caller reads the working directory and the environment; everything
+/// that turns them into the decision is here, where tests reach it.
+fn verifies_prediction(
+    mode: VerifyPredictions,
+    args: &RustcArgs,
+    current_dir: Option<&Path>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    should_verify_this_prediction(mode, &prediction_sample_identity(args, current_dir, env))
+}
+
 /// The unit as every checkout of the project names it. The sample is drawn
 /// by this.
 ///
@@ -1325,34 +1338,55 @@ fn sampled_by_identity(identity: &str, rate: usize) -> bool {
 /// different units. A perf gate builds base and head in separate checkouts,
 /// so it counted pre-passes that the change under test did not cause.
 ///
-/// Cargo's `-C metadata` separates units that share a crate name, such as
-/// every `build_script_build`. Cargo derives it from package ids written
-/// relative to the workspace, so it is the same in every checkout.
-fn prediction_sample_identity(args: &RustcArgs, current_dir: Option<&Path>) -> String {
-    let source = args
-        .source_file
-        .as_deref()
-        .map(|source| checkout_relative(source, current_dir).to_string_lossy());
+/// Cargo's package name and version separate units that share a crate name,
+/// such as every `build_script_build`. Its `-C metadata` would too, but that
+/// folds the absolute path of a path dependency outside the workspace root,
+/// and every unit depending on one inherits it. A target spec is folded by
+/// name because Cargo passes its absolute path.
+fn prediction_sample_identity(
+    args: &RustcArgs,
+    current_dir: Option<&Path>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> String {
+    let manifest_dir = env("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    let source = args.source_file.as_deref().map(|source| {
+        checkout_relative(source, &[manifest_dir.as_deref(), current_dir]).to_string_lossy()
+    });
+    let package = ["CARGO_PKG_NAME", "CARGO_PKG_VERSION"]
+        .map(|var| env(var).map(|value| value.to_string_lossy().into_owned()));
     serde_json::to_string(&(
         args.crate_name.as_deref(),
         &args.crate_types,
         args.is_test,
-        args.target.as_deref(),
-        args.get_codegen_opt("metadata"),
+        args.target.as_deref().map(target_name),
+        package,
         &args.cfgs,
         source,
     ))
     .unwrap()
 }
 
-/// `path` relative to the working directory when it lies under it.
+/// The name rustc knows a target by: a spec file goes by its stem.
+fn target_name(target: &str) -> &str {
+    target
+        .strip_suffix(".json")
+        .and_then(|spec| Path::new(spec).file_name()?.to_str())
+        .unwrap_or(target)
+}
+
+/// `path` relative to the first of `roots` it lies under.
 ///
 /// Cargo runs rustc from the workspace root for a member, whose source is
 /// already relative, and from the package root for a dependency, whose source
-/// is absolute. Both come out the same in every checkout.
-fn checkout_relative<'a>(path: &'a Path, current_dir: Option<&Path>) -> &'a Path {
-    current_dir
-        .and_then(|dir| path.strip_prefix(dir).ok())
+/// is absolute. Both come out the same in every checkout. The roots include
+/// Cargo's package root because Cargo spells it as it spells the source,
+/// while the working directory comes back with symlinks resolved (`/tmp`
+/// reads as `/private/tmp` on macOS).
+fn checkout_relative<'a>(path: &'a Path, roots: &[Option<&Path>]) -> &'a Path {
+    roots
+        .iter()
+        .flatten()
+        .find_map(|root| path.strip_prefix(root).ok())
         .unwrap_or(path)
 }
 
@@ -1494,9 +1528,10 @@ fn resolve_key_inputs(
                 // Verification is the exceptional path: it runs the pre-pass
                 // anyway and uses ITS answer, so a disagreement is reported
                 // rather than acted on.
-                let sample =
-                    prediction_sample_identity(args, std::env::current_dir().ok().as_deref());
-                if should_verify_this_prediction(mode, &sample) {
+                let current_dir = std::env::current_dir().ok();
+                if verifies_prediction(mode, args, current_dir.as_deref(), |var| {
+                    std::env::var_os(var)
+                }) {
                     crate::phase_trace::decision("prediction", "verify-sampled");
                     let discovered = dep_info_pre_pass(args)?;
                     if discovered
@@ -8627,38 +8662,101 @@ mod tests {
         }
     }
 
+    /// Where a unit's package lives, which decides how Cargo runs rustc.
+    #[derive(Clone, Copy)]
+    enum SamplePlace {
+        /// A workspace member: run from the workspace root, relative source.
+        Member,
+        /// A path dependency outside the workspace root: run from its package
+        /// root, absolute source.
+        OutsideWorkspace,
+        /// A registry package under the Cargo home, run the same way.
+        Registry,
+    }
+
     /// One Cargo unit, placed in a checkout by [`SampleUnit::in_checkout`].
     struct SampleUnit {
         package: String,
-        registry: bool,
+        version: &'static str,
+        place: SamplePlace,
         crate_name: &'static str,
         source: &'static str,
         crate_type: &'static str,
-        metadata: String,
+        target: Option<&'static str>,
+    }
+
+    /// What the wrapper sees for one unit: argv, the working directory as
+    /// `getcwd` reports it, and the environment Cargo sets.
+    struct SampleCall {
+        args: RustcArgs,
+        cwd: PathBuf,
+        env: HashMap<&'static str, std::ffi::OsString>,
+    }
+
+    impl SampleCall {
+        fn identity(&self) -> String {
+            prediction_sample_identity(&self.args, Some(&self.cwd), |var| {
+                self.env.get(var).cloned()
+            })
+        }
+
+        fn verified(&self) -> bool {
+            verifies_prediction(
+                VerifyPredictions::Sampled,
+                &self.args,
+                Some(&self.cwd),
+                |var| self.env.get(var).cloned(),
+            )
+        }
+    }
+
+    /// `path` as macOS `getcwd` spells it: `/tmp` is a symlink there.
+    fn physical(path: &str) -> String {
+        match path.strip_prefix("/tmp/") {
+            Some(rest) => format!("/private/tmp/{rest}"),
+            None => path.to_string(),
+        }
     }
 
     impl SampleUnit {
-        /// The argv and working directory Cargo gives rustc for this unit in
-        /// the checkout at `root`, with its registry under `cargo_home`. A
-        /// member runs from the workspace root with a relative source; a
-        /// registry dependency runs from its package root with an absolute
-        /// one. Output, search and extern paths sit under the checkout.
-        fn in_checkout(&self, root: &str, cargo_home: &str) -> (RustcArgs, PathBuf) {
-            let (cwd, source) = if self.registry {
-                let package = format!(
-                    "{cargo_home}/registry/src/index.crates.io-0000/{}",
-                    self.package
-                );
-                let source = format!("{package}/{}", self.source);
-                (package, source)
-            } else {
-                (
-                    root.to_string(),
-                    format!("{}/{}", self.package, self.source),
-                )
+        /// This unit in the checkout at `root`, whose workspace is `rust/`,
+        /// with its registry under `cargo_home`.
+        ///
+        /// Cargo hashes a registry package id the same way everywhere, but a
+        /// path dependency outside the workspace root by its absolute path,
+        /// and every member depending on one inherits that in its
+        /// `-C metadata`. The metadata here does the same. A target spec is
+        /// passed as an absolute path, as Cargo does.
+        fn in_checkout(&self, root: &str, cargo_home: &str) -> SampleCall {
+            let workspace = format!("{root}/rust");
+            let package_dir = match self.place {
+                SamplePlace::Member => format!("{workspace}/{}", self.package),
+                SamplePlace::OutsideWorkspace => format!("{root}/{}", self.package),
+                SamplePlace::Registry => format!(
+                    "{cargo_home}/registry/src/index.crates.io-0000/{}-{}",
+                    self.package, self.version
+                ),
             };
-            let deps = format!("{root}/target/debug/deps");
-            let argv = vec![
+            let (cwd, source, hashed) = match self.place {
+                SamplePlace::Member => (
+                    workspace.clone(),
+                    format!("{}/{}", self.package, self.source),
+                    package_dir.clone(),
+                ),
+                SamplePlace::OutsideWorkspace => (
+                    package_dir.clone(),
+                    format!("{package_dir}/{}", self.source),
+                    package_dir.clone(),
+                ),
+                SamplePlace::Registry => (
+                    package_dir.clone(),
+                    format!("{package_dir}/{}", self.source),
+                    format!("{}-{}", self.package, self.version),
+                ),
+            };
+            let metadata = blake3::hash(hashed.as_bytes()).to_hex()[..16].to_string();
+            let deps = format!("{workspace}/target/debug/deps");
+            let mut argv = vec![
                 "rustc".to_string(),
                 "--crate-name".to_string(),
                 self.crate_name.to_string(),
@@ -8671,9 +8769,9 @@ mod tests {
                 "--cfg".to_string(),
                 "feature=\"default\"".to_string(),
                 "-C".to_string(),
-                format!("metadata={}", self.metadata),
+                format!("metadata={metadata}"),
                 "-C".to_string(),
-                format!("extra-filename=-{}", self.metadata),
+                format!("extra-filename=-{metadata}"),
                 "--out-dir".to_string(),
                 deps.clone(),
                 "-L".to_string(),
@@ -8681,7 +8779,24 @@ mod tests {
                 "--extern".to_string(),
                 format!("dep={deps}/libdep-0123456789abcdef.rmeta"),
             ];
-            (RustcArgs::parse(&argv).unwrap(), PathBuf::from(cwd))
+            if let Some(target) = self.target {
+                argv.push("--target".to_string());
+                argv.push(if target.ends_with(".json") {
+                    format!("{workspace}/{target}")
+                } else {
+                    target.to_string()
+                });
+            }
+            let env = HashMap::from([
+                ("CARGO_MANIFEST_DIR", package_dir.into()),
+                ("CARGO_PKG_NAME", self.package.clone().into()),
+                ("CARGO_PKG_VERSION", self.version.into()),
+            ]);
+            SampleCall {
+                args: RustcArgs::parse(&argv).unwrap(),
+                cwd: PathBuf::from(physical(&cwd)),
+                env,
+            }
         }
     }
 
@@ -8690,16 +8805,16 @@ mod tests {
         units
             .iter()
             .enumerate()
-            .filter(|(_, unit)| {
-                let (args, cwd) = unit.in_checkout(root, cargo_home);
-                should_verify_this_prediction(
-                    VerifyPredictions::Sampled,
-                    &prediction_sample_identity(&args, Some(&cwd)),
-                )
-            })
+            .filter(|(_, unit)| unit.in_checkout(root, cargo_home).verified())
             .map(|(i, _)| i)
             .collect()
     }
+
+    /// Two checkouts of one project, as a perf gate builds base and head. The
+    /// base Cargo home sits behind a symlink, as anything under `/tmp` does on
+    /// macOS.
+    const SAMPLE_BASE: (&str, &str) = ("/scratch/base/hk", "/tmp/cargo");
+    const SAMPLE_HEAD: (&str, &str) = ("/scratch/head/hk", "/home/ci/.cargo");
 
     /// A perf gate builds base and head in separate checkouts. Sampling by
     /// the prediction identity checked different units in each, because that
@@ -8710,47 +8825,104 @@ mod tests {
     fn prediction_sample_is_the_same_in_every_checkout() {
         let units: Vec<SampleUnit> = (0..VERIFY_PREDICTION_RATE * 8)
             .map(|i| SampleUnit {
-                package: format!("pkg{i}-1.0.0"),
-                registry: i % 2 == 0,
-                crate_name: ["alpha", "beta", "build_script_build"][i % 3],
-                source: ["src/lib.rs", "src/main.rs", "build.rs"][i % 3],
-                crate_type: ["lib", "bin", "bin"][i % 3],
-                metadata: format!("{i:016x}"),
+                package: format!("pkg{i}"),
+                version: "1.0.0",
+                place: [
+                    SamplePlace::Member,
+                    SamplePlace::OutsideWorkspace,
+                    SamplePlace::Registry,
+                ][i % 3],
+                crate_name: ["alpha", "beta", "build_script_build", "delta"][i % 4],
+                source: ["src/lib.rs", "src/main.rs", "build.rs", "src/lib.rs"][i % 4],
+                crate_type: ["lib", "bin", "bin", "lib"][i % 4],
+                target: [
+                    None,
+                    Some("aarch64-apple-darwin"),
+                    Some("specs/os.json"),
+                    None,
+                    None,
+                ][i % 5],
             })
             .collect();
-        let base = ("/scratch/base/hk", "/scratch/base/cargo");
-        let head = ("/scratch/head/hk", "/home/ci/.cargo");
         for (i, unit) in units.iter().enumerate() {
-            let (a, a_cwd) = unit.in_checkout(base.0, base.1);
-            let (b, b_cwd) = unit.in_checkout(head.0, head.1);
             assert_eq!(
-                prediction_sample_identity(&a, Some(&a_cwd)),
-                prediction_sample_identity(&b, Some(&b_cwd)),
+                unit.in_checkout(SAMPLE_BASE.0, SAMPLE_BASE.1).identity(),
+                unit.in_checkout(SAMPLE_HEAD.0, SAMPLE_HEAD.1).identity(),
                 "unit {i} must be sampled the same way in both checkouts"
             );
         }
-        let in_base = sampled_units(&units, base.0, base.1);
+        let in_base = sampled_units(&units, SAMPLE_BASE.0, SAMPLE_BASE.1);
         assert!(!in_base.is_empty(), "some unit must be checked");
-        assert_eq!(in_base, sampled_units(&units, head.0, head.1));
+        assert_eq!(in_base, sampled_units(&units, SAMPLE_HEAD.0, SAMPLE_HEAD.1));
+    }
+
+    /// A path dependency outside the workspace root, such as `rust/`
+    /// depending on `../proto`, gets a `-C metadata` that names the checkout,
+    /// and so does every member that depends on it. The sample must not read
+    /// it.
+    #[test]
+    fn prediction_sample_ignores_metadata_that_names_the_checkout() {
+        for place in [SamplePlace::OutsideWorkspace, SamplePlace::Member] {
+            let unit = SampleUnit {
+                package: "proto".to_string(),
+                version: "0.1.0",
+                place,
+                crate_name: "proto",
+                source: "src/lib.rs",
+                crate_type: "lib",
+                target: None,
+            };
+            let base = unit.in_checkout(SAMPLE_BASE.0, SAMPLE_BASE.1);
+            let head = unit.in_checkout(SAMPLE_HEAD.0, SAMPLE_HEAD.1);
+            assert_ne!(
+                base.args.get_codegen_opt("metadata"),
+                head.args.get_codegen_opt("metadata")
+            );
+            assert_eq!(base.identity(), head.identity());
+        }
+    }
+
+    /// Cargo names a registry package's root and its source through the Cargo
+    /// home as given, but `getcwd` resolves symlinks. Stripping only the
+    /// working directory left the source absolute behind a symlinked Cargo
+    /// home, and every registry unit sampled differently.
+    #[test]
+    fn prediction_sample_strips_the_package_root_as_cargo_spells_it() {
+        let unit = SampleUnit {
+            package: "serde".to_string(),
+            version: "1.0.0",
+            place: SamplePlace::Registry,
+            crate_name: "serde",
+            source: "src/lib.rs",
+            crate_type: "lib",
+            target: None,
+        };
+        let base = unit.in_checkout(SAMPLE_BASE.0, SAMPLE_BASE.1);
+        assert!(base.cwd.starts_with("/private/tmp"));
+        assert!(base.args.source_file.as_ref().unwrap().starts_with("/tmp"));
+        assert_eq!(
+            base.identity(),
+            unit.in_checkout(SAMPLE_HEAD.0, SAMPLE_HEAD.1).identity()
+        );
     }
 
     /// The same in every checkout must not mean one decision for a whole
     /// crate name: every registry build script is `build_script_build` from
-    /// `build.rs` in its package root, and only Cargo's metadata tells them
-    /// apart.
+    /// `build.rs` in its package root, and only its package tells them apart.
     #[test]
     fn prediction_sample_spreads_across_units_that_share_a_name() {
         let build_scripts: Vec<SampleUnit> = (0..VERIFY_PREDICTION_RATE * 20)
             .map(|i| SampleUnit {
-                package: format!("pkg{i}-1.0.0"),
-                registry: true,
+                package: format!("pkg{i}"),
+                version: "1.0.0",
+                place: SamplePlace::Registry,
                 crate_name: "build_script_build",
                 source: "build.rs",
                 crate_type: "bin",
-                metadata: format!("{i:016x}"),
+                target: None,
             })
             .collect();
-        let chosen = sampled_units(&build_scripts, "/scratch/base/hk", "/scratch/base/cargo");
+        let chosen = sampled_units(&build_scripts, SAMPLE_BASE.0, SAMPLE_BASE.1);
         assert!(
             (5..=40).contains(&chosen.len()),
             "about 1 in {VERIFY_PREDICTION_RATE} of {} should be checked, got {}",
@@ -8759,65 +8931,92 @@ mod tests {
         );
         assert_eq!(
             chosen,
-            sampled_units(&build_scripts, "/scratch/head/hk", "/home/ci/.cargo"),
+            sampled_units(&build_scripts, SAMPLE_HEAD.0, SAMPLE_HEAD.1),
             "another checkout checks the same build scripts"
         );
 
         // Each part of the unit's name separates it from its neighbours.
-        let sample = |argv: &str| {
+        let sample = |argv: &str, package: [&str; 2]| {
             let argv: Vec<String> = argv.split(' ').map(str::to_string).collect();
-            prediction_sample_identity(&RustcArgs::parse(&argv).unwrap(), Some(Path::new("/w")))
+            let env = |var: &str| match var {
+                "CARGO_PKG_NAME" => Some(package[0].into()),
+                "CARGO_PKG_VERSION" => Some(package[1].into()),
+                _ => None,
+            };
+            prediction_sample_identity(
+                &RustcArgs::parse(&argv).unwrap(),
+                Some(Path::new("/w")),
+                env,
+            )
         };
         let unit = "rustc --crate-name a a.rs --crate-type lib";
-        let base = sample(&format!("{unit} -C metadata=aa"));
+        let package = ["a", "1.0.0"];
+        let base = sample(unit, package);
         for (part, other) in [
-            ("metadata", format!("{unit} -C metadata=bb")),
+            ("package name", sample(unit, ["b", "1.0.0"])),
+            ("package version", sample(unit, ["a", "2.0.0"])),
             (
                 "crate type",
-                format!("{unit} -C metadata=aa --crate-type rlib"),
+                sample(&format!("{unit} --crate-type rlib"), package),
             ),
-            ("test harness", format!("{unit} -C metadata=aa --test")),
+            ("test harness", sample(&format!("{unit} --test"), package)),
             (
                 "target",
-                format!("{unit} -C metadata=aa --target wasm32-wasip1"),
+                sample(&format!("{unit} --target wasm32-wasip1"), package),
             ),
             (
                 "cfg",
-                format!("{unit} -C metadata=aa --cfg feature=\"std\""),
+                sample(&format!("{unit} --cfg feature=\"std\""), package),
             ),
             (
                 "crate name",
-                "rustc --crate-name b a.rs --crate-type lib -C metadata=aa".into(),
+                sample("rustc --crate-name b a.rs --crate-type lib", package),
             ),
             (
                 "source",
-                "rustc --crate-name a b.rs --crate-type lib -C metadata=aa".into(),
+                sample("rustc --crate-name a b.rs --crate-type lib", package),
             ),
         ] {
-            assert_ne!(sample(&other), base, "{part} must separate units");
+            assert_ne!(other, base, "{part} must separate units");
         }
+        assert_ne!(
+            sample(&format!("{unit} --target /w/a.json"), package),
+            sample(&format!("{unit} --target /w/b.json"), package),
+            "target specs must separate units"
+        );
+    }
+
+    /// Cargo passes a target spec as an absolute path; rustc names the target
+    /// by the file's stem.
+    #[test]
+    fn target_name_is_a_spec_file_stem() {
+        assert_eq!(target_name("wasm32-wasip1"), "wasm32-wasip1");
+        assert_eq!(target_name("/scratch/base/hk/specs/os.json"), "os");
+        assert_eq!(target_name("os.json"), "os");
     }
 
     /// The source a unit is sampled by is the one every checkout spells the
     /// same way.
     #[test]
-    fn checkout_relative_drops_only_the_working_directory() {
-        let cwd = Path::new("/home/ci/.cargo/registry/src/index/serde-1.0.0");
+    fn checkout_relative_drops_the_first_root_the_path_is_under() {
+        let package = Path::new("/tmp/cargo/registry/src/index/serde-1.0.0");
+        let resolved = Path::new("/private/tmp/cargo/registry/src/index/serde-1.0.0");
+        let source = package.join("src/lib.rs");
+        let relative = Path::new("src/lib.rs");
         assert_eq!(
-            checkout_relative(&cwd.join("src/lib.rs"), Some(cwd)),
-            Path::new("src/lib.rs")
+            checkout_relative(&source, &[Some(package), Some(resolved)]),
+            relative
         );
         assert_eq!(
-            checkout_relative(Path::new("src/lib.rs"), Some(cwd)),
-            Path::new("src/lib.rs")
+            checkout_relative(&source, &[Some(resolved), Some(package)]),
+            relative
         );
+        assert_eq!(checkout_relative(&source, &[None, Some(resolved)]), source);
+        assert_eq!(checkout_relative(&source, &[]), source);
+        assert_eq!(checkout_relative(relative, &[Some(package)]), relative);
         assert_eq!(
-            checkout_relative(Path::new("/elsewhere/src/lib.rs"), Some(cwd)),
+            checkout_relative(Path::new("/elsewhere/src/lib.rs"), &[Some(package)]),
             Path::new("/elsewhere/src/lib.rs")
-        );
-        assert_eq!(
-            checkout_relative(&cwd.join("src/lib.rs"), None),
-            cwd.join("src/lib.rs")
         );
     }
 

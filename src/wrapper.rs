@@ -4694,14 +4694,15 @@ fn missing_requested_emit(args: &RustcArgs, artifacts: &ArtifactSet) -> Option<S
 }
 
 /// The first member of this compile's rlib that rustc bundled from an archive
-/// in the unit's `-L` dirs the key did not hash, if any.
+/// in the unit's build-tree `-L` dirs the key did not hash, if any.
 ///
 /// A `#[link(kind = "static")]` attribute bundles an archive that no `-l` on
 /// argv names, so the key holds the attribute text but not the archive bytes.
 /// Storing that rlib would restore it after the archive is rebuilt in place.
-/// Only rlibs with a native dir are audited, the units whose key carries the
-/// `native_bundle_audit` marker. A file in those dirs that is no `ar` archive
-/// (a linker script) cannot be bundled, so it is no candidate.
+/// Only rlibs with a native dir in the build tree are audited, the units
+/// whose key carries the `native_bundle_audit` marker; a dir outside it (a
+/// system lib dir) is never read. A file in those dirs that is no `ar`
+/// archive (a linker script) cannot be bundled, so it is no candidate.
 fn unaudited_native_bundle(
     args: &RustcArgs,
     artifacts: &ArtifactSet,

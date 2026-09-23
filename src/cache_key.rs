@@ -4746,7 +4746,33 @@ impl<'db> FileHasher<'db> {
     /// for longer than the short wait here) drops them rather than stalling
     /// a hit; the next process hashes those files again.
     pub fn flush_memo(&self) {
-        let pending = std::mem::take(&mut *self.pending_memo.borrow_mut());
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
+            });
+        self.flush_memo_at(now_ns);
+    }
+
+    /// [`flush_memo`](Self::flush_memo) with the clock supplied. A file that
+    /// changed within [`HASH_SETTLE_NS`] of `now_ns` is left out:
+    /// its hash was right for this process, but a second write in the same
+    /// timestamp tick would leave a row that no stamp check could catch.
+    /// Flush as if every pending file had been left alone for the settle
+    /// window, for tests that write a file and then expect its row.
+    #[cfg(test)]
+    pub(crate) fn flush_memo_as_if_settled(&self) {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
+            });
+        self.flush_memo_at(now_ns.saturating_add(HASH_SETTLE_NS));
+    }
+
+    pub(crate) fn flush_memo_at(&self, now_ns: i64) {
+        let mut pending = std::mem::take(&mut *self.pending_memo.borrow_mut());
+        pending.retain(|(fingerprint, _)| stamp_is_settled(fingerprint, now_ns));
         if pending.is_empty() {
             return;
         }
@@ -5112,7 +5138,11 @@ impl<'db> FileHasher<'db> {
             return None;
         }
         let _trace = crate::phase_trace::phase("cc_fingerprints");
-        let mut pending: Vec<(String, FileFingerprint, String, PathBuf)> =
+        // Every stamp first, then one lookup for all of them. A translation
+        // unit reads a couple of hundred headers, most of them the same ones
+        // its neighbours read; opening and hashing each again cost more than
+        // the compile's own header work did on macOS.
+        let mut stamped: Vec<(&String, &PathBuf, FileFingerprint)> =
             Vec::with_capacity(paths.len());
         for (name, path) in paths {
             let fingerprint = match FileFingerprint::from_path(path) {
@@ -5126,7 +5156,13 @@ impl<'db> FileHasher<'db> {
                 }
             };
             self.note_too_new(&fingerprint);
-            let content = match self.hash(path) {
+            stamped.push((name, path, fingerprint));
+        }
+        let memoised = self.memoised_hashes(stamped.iter().map(|(_, _, stamp)| stamp));
+        let mut pending: Vec<(String, FileFingerprint, String, PathBuf)> =
+            Vec::with_capacity(stamped.len());
+        for (name, path, fingerprint) in stamped {
+            let content = match self.header_hash(path, &fingerprint, &memoised) {
                 Ok(content) => content,
                 Err(error) => {
                     tracing::debug!(
@@ -5590,6 +5626,78 @@ impl<'db> FileHasher<'db> {
         let hash = compute_static_lib_hash(path, usage)?;
         self.record_miss(size);
         self.pending_memo.borrow_mut().push((key, hash.clone()));
+        Ok(hash)
+    }
+
+    /// Memoised hashes for many stamps in one lookup, keyed by path. Nothing
+    /// memoised, or no index, reads as an empty map: every file is hashed.
+    fn memoised_hashes<'a>(
+        &self,
+        stamps: impl Iterator<Item = &'a FileFingerprint>,
+    ) -> HashMap<String, String> {
+        let Some(cache) = &self.cache else {
+            return HashMap::new();
+        };
+        let stamps: Vec<&FileFingerprint> = stamps.collect();
+        cache.get_many(&stamps).unwrap_or_else(|error| {
+            tracing::debug!("file hash memo batch lookup failed: {error}");
+            HashMap::new()
+        })
+    }
+
+    /// A header's content hash, from the daemon's prefetch or the memo when
+    /// either has this exact stamp, else read and queued for the memo.
+    ///
+    /// Unlike [`hash`](Self::hash), small files are memoised too: a header
+    /// is read by every unit that includes it, so the lookup is paid back
+    /// many times. [`flush_memo`](Self::flush_memo) still holds back any file
+    /// changed too recently to trust its stamp. The bookkeeping matches
+    /// `hash`, so the too-new guard and later revalidation see these files.
+    fn header_hash(
+        &self,
+        path: &Path,
+        fingerprint: &FileFingerprint,
+        memoised: &HashMap<String, String>,
+    ) -> Result<String> {
+        if self.cache.is_none() {
+            return self.hash(path);
+        }
+        let prefetched = self.prefetched.borrow().get(fingerprint).map(|prefetched| {
+            (
+                prefetched.hash.clone(),
+                prefetched.cache_hit,
+                prefetched.bytes_hashed,
+            )
+        });
+        let hash = if let Some((hash, cache_hit, bytes_hashed)) = prefetched {
+            if cache_hit {
+                self.record_hit();
+            } else {
+                self.record_miss_count();
+                self.record_miss_bytes(bytes_hashed);
+            }
+            hash
+        } else if let Some(hash) = memoised.get(&fingerprint.path) {
+            self.record_hit();
+            hash.clone()
+        } else {
+            let hash = hash_file(path)?;
+            self.record_miss(fingerprint.size);
+            self.pending_memo
+                .borrow_mut()
+                .push((fingerprint.clone(), hash.clone()));
+            hash
+        };
+        if self.too_new.invocation_start_ns > 0 {
+            self.guard_inputs.borrow_mut().push(fingerprint.clone());
+        }
+        self.recent_hashes.borrow_mut().insert(
+            absolute_path(path),
+            RecentHash {
+                hash: hash.clone(),
+                fingerprint: Some(fingerprint.clone()),
+            },
+        );
         Ok(hash)
     }
 
@@ -10646,7 +10754,7 @@ mod tests {
         assert_ne!(computed, "legacy-unguarded-macho-sentinel");
         assert_ne!(computed, "legacy-path-bound-dwarf-sentinel");
         assert_ne!(computed, "legacy-path-bound-blank-longname-sentinel");
-        fh.flush_memo();
+        fh.flush_memo_as_if_settled();
         assert_eq!(cache.get(&current_key).unwrap(), Some(computed.clone()));
         assert_eq!(fh.hash_static_lib(&lib).unwrap(), computed);
     }
@@ -10798,7 +10906,7 @@ mod tests {
             bundled
         );
 
-        fh.flush_memo();
+        fh.flush_memo_as_if_settled();
         let fingerprint = FileFingerprint::from_path(&lib).unwrap();
         let cache = fh.cache.as_ref().expect("persistent cache opens");
         for (namespace, expected) in [
@@ -10828,7 +10936,7 @@ mod tests {
             let lib = dir.path().join(name);
             std::fs::write(&lib, vec![b'x'; len]).unwrap();
             let hash = fh.hash_static_lib(&lib).unwrap();
-            fh.flush_memo();
+            fh.flush_memo_as_if_settled();
             let fingerprint = FileFingerprint::from_path(&lib).unwrap();
             let key = FileFingerprint {
                 path: format!("static-ar-v7\0{}", fingerprint.path),
@@ -14862,6 +14970,89 @@ pub fn g(_: &'static str) {}"#,
     }
 
     #[test]
+    fn a_units_headers_come_from_one_memo_lookup_once_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        // Small on purpose: `hash` never memoises these, the capture does.
+        let headers: Vec<(String, PathBuf)> = (0..5)
+            .map(|i| {
+                let path = dir.path().join(format!("h{i}.h"));
+                std::fs::write(&path, format!("#define H{i} {i}\n")).unwrap();
+                (format!("h{i}.h"), path)
+            })
+            .collect();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let mapped = |path: &Path| std::fs::read_to_string(path).ok();
+
+        let mut first = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        first.arm_too_new_guard(1, 0);
+        let cold = first
+            .cc_preprocess_fingerprints(&headers, "maps", &mapped)
+            .unwrap();
+        assert_eq!(first.stats().cache_misses, 5);
+        assert_eq!(first.stats().cache_hits, 0);
+        // Every header is registered for the post-compile revalidation and
+        // remembered for later users in this process.
+        assert_eq!(first.guard_inputs.borrow().len(), 5);
+        for (_, path) in &headers {
+            assert!(
+                first
+                    .recent_hashes
+                    .borrow()
+                    .contains_key(&absolute_path(path))
+            );
+        }
+        first.flush_memo_as_if_settled();
+
+        let second = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let warm = second
+            .cc_preprocess_fingerprints(&headers, "maps", &mapped)
+            .unwrap();
+        assert_eq!(second.stats().cache_hits, 5, "all five from the memo");
+        assert_eq!(second.stats().cache_misses, 0);
+        assert_eq!(second.stats().bytes_hashed, 0);
+        let hashes = |inputs: &[CcPreprocessMemoInput]| {
+            inputs.iter().map(|i| i.content.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(hashes(&warm), hashes(&cold));
+
+        // A header rewritten since then is hashed again, not served stale.
+        std::fs::write(&headers[0].1, "#define H0 changed\n").unwrap();
+        let third = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let after = third
+            .cc_preprocess_fingerprints(&headers, "maps", &mapped)
+            .unwrap();
+        assert_eq!(third.stats().cache_misses, 1);
+        assert_ne!(hashes(&after)[0], hashes(&cold)[0]);
+    }
+
+    #[test]
+    fn a_file_changed_within_the_settle_window_is_hashed_but_not_memoised() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fresh.h");
+        std::fs::write(&file, vec![1u8; 70 * 1024]).unwrap();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let hasher = FileHasher::from_cache(FileHashCache::Borrowed(&db));
+        let hash = hasher.hash(&file).unwrap();
+        hasher.flush_memo();
+        let stamp = FileFingerprint::from_path(&file).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        assert_eq!(
+            cache.get(&stamp).unwrap(),
+            None,
+            "a second write in this timestamp tick could reuse this stamp"
+        );
+        // Once settled, the same flush records it.
+        hasher
+            .pending_memo
+            .borrow_mut()
+            .push((stamp.clone(), hash.clone()));
+        hasher.flush_memo_as_if_settled();
+        assert_eq!(cache.get(&stamp).unwrap(), Some(hash));
+    }
+
+    #[test]
     fn test_file_hasher_persistent_cache_invalidates_on_metadata_change() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
@@ -14870,7 +15061,7 @@ pub fn g(_: &'static str) {}"#,
 
         let hasher = FileHasher::persistent(&db_path);
         let first = hasher.hash(&file).unwrap();
-        hasher.flush_memo();
+        hasher.flush_memo_as_if_settled();
         let first_stats = hasher.stats();
         assert_eq!(first_stats.cache_hits, 0);
         assert_eq!(first_stats.cache_misses, 1);

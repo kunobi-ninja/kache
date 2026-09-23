@@ -2244,6 +2244,10 @@ mod tests {
                 },
                 |path| hasher.hash(path),
             );
+            // The objects were written moments ago; persist their rows as a
+            // later build would, once they have sat longer than the settle
+            // window.
+            hasher.flush_memo_as_if_settled();
             (result, hasher.stats())
         };
         let (first, cold) = run();

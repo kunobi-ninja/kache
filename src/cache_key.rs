@@ -1342,8 +1342,17 @@ fn shared_prediction_args(args: &[String], target: &Path) -> Vec<String> {
 
 pub(crate) fn shared_prediction_can_record(args: &RustcArgs, dep_info: &DepInfo) -> bool {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    shared_prediction_can_record_in(args, dep_info, manifest_dir.as_deref())
+}
+
+/// [`shared_prediction_can_record`] for the package at `manifest_dir`.
+fn shared_prediction_can_record_in(
+    args: &RustcArgs,
+    dep_info: &DepInfo,
+    manifest_dir: Option<&Path>,
+) -> bool {
     args.target_dir().is_some_and(|target| {
-        shared_sources_can_record(&dep_info.source_files, &target, manifest_dir.as_deref())
+        shared_sources_can_record(&dep_info.source_files, &target, manifest_dir)
     })
 }
 
@@ -10137,12 +10146,16 @@ mod tests {
             source_files: vec![root.path().join("src/lib.rs")],
             env_deps: vec![],
         };
-        assert!(shared_prediction_can_record(&args, &dep));
+        // A workspace package, whatever package runs this test.
+        let can_record = |args: &RustcArgs, dep: &DepInfo| {
+            shared_prediction_can_record_in(args, dep, Some(root.path()))
+        };
+        assert!(can_record(&args, &dep));
         dep.source_files
             .push(target.join("debug/build/pkg/out/generated.rs"));
-        assert!(!shared_prediction_can_record(&args, &dep));
+        assert!(!can_record(&args, &dep));
         let no_target = RustcArgs::parse(&["rustc".into(), "src/lib.rs".into()]).unwrap();
-        assert!(!shared_prediction_can_record(&no_target, &dep));
+        assert!(!can_record(&no_target, &dep));
     }
 
     const REGISTRY_PACKAGE_DIR: &str = "/h/registry/src/index-1/kt-1.0.0";
@@ -10733,6 +10746,90 @@ mod tests {
                 spelled.display()
             );
         }
+    }
+
+    /// Through a symlink, the canonical target shares nothing with the raw
+    /// spelling, so the scan has to look for it on its own.
+    #[cfg(unix)]
+    #[test]
+    fn an_out_dir_naming_only_the_canonical_target_is_not_relocated() {
+        let _lock = key_test_lock();
+        if get_rustc_version(Path::new("rustc")).is_err() {
+            return;
+        }
+        let (dir, package, _, _) = relocatable_fixture();
+        let real = std::fs::canonicalize(dir.path()).unwrap().join("real");
+        std::fs::create_dir_all(real.join("debug/build/kt-1/out")).unwrap();
+        std::fs::create_dir_all(real.join("debug/deps")).unwrap();
+        let target = dir.path().join("b/target");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &target).unwrap();
+        let out = target.join("debug/build/kt-1/out");
+        let args = unit_args_in(&package, &target);
+        let vars = || {
+            vec![
+                ("CARGO_MANIFEST_DIR".into(), package.clone().into()),
+                ("OUT_DIR".into(), out.clone().into()),
+            ]
+        };
+        let dep_info = DepInfo {
+            source_files: vec![package.join("src/lib.rs"), out.join("gen.rs")],
+            env_deps: Vec::new(),
+        };
+        std::fs::write(out.join("gen.rs"), "pub fn g() {}\n").unwrap();
+        assert!(relocatable_record_in(&args, &dep_info, Some("tree"), vars()).is_some());
+
+        let content = format!("// {}\n", real.display());
+        assert!(!mentions_root(content.as_bytes(), &[&target]));
+        std::fs::write(out.join("gen.rs"), content).unwrap();
+        assert_eq!(
+            relocatable_record_in(&args, &dep_info, Some("tree"), vars()),
+            None
+        );
+    }
+
+    /// A workspace unit never reads a relocated row, even one filed under the
+    /// identity it would have: its package is not the same files in another
+    /// checkout.
+    #[test]
+    fn a_workspace_unit_never_reads_a_relocated_record() {
+        let _lock = key_test_lock();
+        if get_rustc_version(Path::new("rustc")).is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("w/kt");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(package.join("src/lib.rs"), "include!(\"x\");\n").unwrap();
+        let target = dir.path().join("b/target");
+        let out = target.join("debug/build/kt-1/out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("gen.rs"), "pub fn g() {}\n").unwrap();
+        let _manifest =
+            crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(package.as_os_str()));
+        let _out = crate::config::tests::set_env_for_test("OUT_DIR", Some(out.as_os_str()));
+        let args = unit_args_in(&package, &target);
+        let hasher =
+            FileHasher::persistent(&dir.path().join("index.db")).with_input_predictions(true);
+        let shared = rustc_shared_prediction_identity(&args).unwrap();
+        let would_be = format!(
+            "{RELOCATABLE_PREDICTION_PREFIX}{}",
+            shared.strip_prefix(SHARED_PREDICTION_PREFIX).unwrap()
+        );
+        let record = PortablePrediction {
+            schema: PORTABLE_PREDICTION_SCHEMA,
+            sources: vec![
+                Portable::Literal(package.join("src/lib.rs").display().to_string()),
+                Portable::OutDir("/gen.rs".to_string()),
+            ],
+            env_deps: vec![("OUT_DIR".to_string(), Portable::OutDir(String::new()))],
+            tree: out_dir_tree_digest(&out, &hasher).unwrap(),
+        };
+        hasher.record_portable_prediction(&would_be, Some("kt"), &record);
+        assert_eq!(
+            predicted_key_inputs(&args, &hasher),
+            Err(Rejection::NoRecord)
+        );
     }
 
     /// After this checkout's row and the shared one miss, a registry unit

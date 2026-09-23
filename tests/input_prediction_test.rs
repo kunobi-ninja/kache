@@ -578,7 +578,10 @@ fn a_generated_file_naming_the_target_keeps_the_record_local() {
     assert_eq!(warm.result, "local_hit");
 }
 
-/// Only a registry package is the same files in every checkout.
+/// Only a registry package is the same files in every checkout. The writer
+/// checks that twice, in the relocated identity and again when it looks for
+/// the registry root, so this test fails only when both checks go. A unit
+/// test pins the reader's check on its own.
 #[test]
 fn a_workspace_unit_keeps_its_out_dir_record_local() {
     let unit = OutDirUnit::new("ws/kt", false);

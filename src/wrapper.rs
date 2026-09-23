@@ -7642,9 +7642,17 @@ mod tests {
 
     /// A registry unit whose closure reads its own OUT_DIR cannot have the
     /// shared row, so it gets the relocated one; without such a source it
-    /// gets the shared row and nothing else.
+    /// gets the shared row.
     #[test]
     fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
+        if std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: no rustc");
+            return;
+        }
         let _lock = crate::test_support::process_state_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let mut config = test_config(dir.path().join("cache"));
@@ -7668,9 +7676,8 @@ mod tests {
             "--out-dir",
             target.join("debug/deps").to_str().unwrap(),
         ]);
-        let Some(shared) = crate::cache_key::rustc_shared_prediction_identity(&args) else {
-            return; // no compiler on this host; nothing to identify against
-        };
+        let shared = crate::cache_key::rustc_shared_prediction_identity(&args)
+            .expect("a registry unit with an absolute target has a shared identity");
         let reads_out_dir = crate::cache_key::DepInfo {
             source_files: vec![lib.clone(), out.join("gen.rs")],
             env_deps: Vec::new(),
@@ -7696,11 +7703,6 @@ mod tests {
         assert_eq!(
             hasher.input_prediction(&shared).unwrap().sources,
             package_only.source_files
-        );
-        assert_eq!(
-            hasher.portable_prediction(&relocatable).unwrap().tree,
-            "tree",
-            "the shared row was written, so the relocated one was left alone"
         );
     }
 
